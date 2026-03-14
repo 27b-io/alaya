@@ -8,11 +8,26 @@ pub struct Memory {
     pub content_hash: String,
     pub tags: Vec<String>,
     pub memory_type: String,
+    #[serde(default)]
     pub metadata: Option<HashMap<String, serde_json::Value>>,
     pub created_at: f64,
     pub updated_at: f64,
+    #[serde(default)]
     pub embedding: Option<Vec<f32>>,
+    #[serde(default)]
     pub summary: Option<String>,
+    #[serde(default)]
+    pub salience_score: f64,
+    #[serde(default)]
+    pub access_count: u64,
+    #[serde(default)]
+    pub access_timestamps: Vec<f64>,
+    #[serde(default)]
+    pub emotional_valence: Option<HashMap<String, serde_json::Value>>,
+    #[serde(default)]
+    pub encoding_context: Option<HashMap<String, serde_json::Value>>,
+    #[serde(default)]
+    pub provenance: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// A memory with a similarity/relevance score from search.

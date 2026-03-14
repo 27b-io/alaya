@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use alaya_types::{
-    graph::{Direction, Edge, UserRelationType},
+    graph::{Direction, Edge, SystemRelationType, UserRelationType},
     memory::validate_content_hash,
 };
 
@@ -40,6 +40,14 @@ pub struct DeleteEdgeRequest {
     pub relation_type: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CreateSystemEdgeRequest {
+    pub source: String,
+    pub target: String,
+    pub relation_type: String,
+    pub created_at: f64,
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Parse a relation_type string into a `UserRelationType`.
@@ -60,6 +68,14 @@ fn parse_direction(s: &str) -> Result<Direction, StatusCode> {
         "outgoing" => Ok(Direction::Outgoing),
         "incoming" => Ok(Direction::Incoming),
         "both" => Ok(Direction::Both),
+        _ => Err(StatusCode::UNPROCESSABLE_ENTITY),
+    }
+}
+
+/// Parse a system relation_type string into a `SystemRelationType`.
+fn parse_system_relation(s: &str) -> Result<SystemRelationType, StatusCode> {
+    match s {
+        "SUPERSEDES" => Ok(SystemRelationType::Supersedes),
         _ => Err(StatusCode::UNPROCESSABLE_ENTITY),
     }
 }
@@ -170,4 +186,22 @@ pub async fn delete(
 
     let count = result.count().unwrap_or(0);
     Ok(Json(json!({ "deleted": count > 0 })))
+}
+
+/// POST /edges/create-system
+pub async fn create_system(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateSystemEdgeRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    if !validate_content_hash(&req.source) || !validate_content_hash(&req.target) {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let rel = parse_system_relation(&req.relation_type)?;
+    let (cypher, params, readonly) =
+        cypher::create_system_edge(&req.source, &req.target, rel, req.created_at);
+    let result = exec_query(&state, &cypher, params, readonly).await?;
+
+    let count = result.count().unwrap_or(0);
+    Ok(Json(json!({ "created": count > 0 })))
 }

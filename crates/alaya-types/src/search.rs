@@ -1,5 +1,20 @@
 use serde::{Deserialize, Serialize};
 
+/// Filter criteria for vector storage queries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PayloadFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub tags_match_all: bool,
+    #[serde(default)]
+    pub exclude_superseded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_trust_score: Option<f64>,
+}
+
 /// Search mode — dispatches to different code paths in MemoryService.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -1,0 +1,15 @@
+[package]
+name = "alaya-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+alaya-types = { path = "../alaya-types" }
+alaya-backends = { path = "../alaya-backends" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+regex = { workspace = true }
