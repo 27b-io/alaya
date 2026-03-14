@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
 
 mod auth;
+pub mod cypher;
 mod routes;
 
 #[tokio::main]
