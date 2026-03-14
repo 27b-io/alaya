@@ -3,12 +3,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, Json};
-use serde_json::{json, Value};
+use axum::{Json, extract::State, http::StatusCode};
+use serde_json::{Value, json};
 
 use alaya_types::graph::GraphStats;
 
-use crate::{cypher, handlers::exec_query, AppState};
+use crate::{AppState, cypher, handlers::exec_query};
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
@@ -27,9 +27,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
 /// GET /stats
 ///
 /// Executes graph statistics queries and returns a `GraphStats` snapshot.
-pub async fn stats(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Value>, StatusCode> {
+pub async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Value>, StatusCode> {
     let queries = cypher::get_graph_stats();
     // Queries: [node_count, hebbian_count, RELATES_TO, PRECEDES, CONTRADICTS, SUPERSEDES]
     if queries.len() < 6 {

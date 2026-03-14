@@ -3,13 +3,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{Json, extract::State, http::StatusCode};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use alaya_types::graph::Contradiction;
 
-use crate::{cypher, handlers::exec_query, AppState};
+use crate::{AppState, cypher, handlers::exec_query};
 
 // ─── Request types ────────────────────────────────────────────────────────────
 
@@ -51,7 +51,12 @@ pub async fn all(
         }
         let confidence = row.get(2).and_then(Value::as_f64);
         let created_at = row.get(3).and_then(Value::as_f64);
-        contradictions.push(Contradiction { memory_a_hash, memory_b_hash, confidence, created_at });
+        contradictions.push(Contradiction {
+            memory_a_hash,
+            memory_b_hash,
+            confidence,
+            created_at,
+        });
     }
 
     Ok(Json(json!({ "contradictions": contradictions })))

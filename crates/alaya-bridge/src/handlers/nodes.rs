@@ -2,17 +2,13 @@
 
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    Json,
-};
+use axum::{Json, extract::State, http::StatusCode};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use alaya_types::memory::validate_content_hash;
 
-use crate::{cypher, handlers::exec_query, AppState};
+use crate::{AppState, cypher, handlers::exec_query};
 
 // ─── Request types ────────────────────────────────────────────────────────────
 

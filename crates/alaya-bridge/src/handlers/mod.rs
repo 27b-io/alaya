@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use axum::http::StatusCode;
 use serde_json::Value;
 
-use crate::{resp::FalkorResult, AppState};
+use crate::{AppState, resp::FalkorResult};
 
 // ─── Redis execution ──────────────────────────────────────────────────────────
 
@@ -30,7 +30,11 @@ pub async fn exec_query(
     params: HashMap<String, Value>,
     readonly: bool,
 ) -> Result<FalkorResult, StatusCode> {
-    let cmd_name = if readonly { "GRAPH.RO_QUERY" } else { "GRAPH.QUERY" };
+    let cmd_name = if readonly {
+        "GRAPH.RO_QUERY"
+    } else {
+        "GRAPH.QUERY"
+    };
 
     let cypher_with_params = if params.is_empty() {
         cypher.to_string()
@@ -49,13 +53,10 @@ pub async fn exec_query(
     cmd.arg("--compact");
 
     let mut conn = state.redis.clone();
-    let raw: redis::Value = cmd
-        .query_async(&mut conn)
-        .await
-        .map_err(|e| {
-            tracing::error!("Redis error: {e}");
-            StatusCode::BAD_GATEWAY
-        })?;
+    let raw: redis::Value = cmd.query_async(&mut conn).await.map_err(|e| {
+        tracing::error!("Redis error: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
 
     FalkorResult::parse(&raw).map_err(|e| {
         tracing::error!("FalkorDB parse error: {e}");
@@ -131,9 +132,6 @@ mod tests {
 
     #[test]
     fn array_recursive() {
-        assert_eq!(
-            value_to_cypher_literal(&json!(["a", "b"])),
-            "['a', 'b']"
-        );
+        assert_eq!(value_to_cypher_literal(&json!(["a", "b"])), "['a', 'b']");
     }
 }

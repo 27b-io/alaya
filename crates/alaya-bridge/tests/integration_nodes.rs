@@ -38,7 +38,11 @@ async fn ensure_node_creates_new_node() -> anyhow::Result<()> {
             true,
         )
         .await;
-    assert_eq!(count_result.count(), Some(1), "node must exist after ensure");
+    assert_eq!(
+        count_result.count(),
+        Some(1),
+        "node must exist after ensure"
+    );
 
     ctx.cleanup().await;
     Ok(())
@@ -64,7 +68,10 @@ async fn ensure_node_is_idempotent() -> anyhow::Result<()> {
         .get("Nodes created")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    assert_eq!(nodes_created, 0, "second ensure_node must not create a duplicate");
+    assert_eq!(
+        nodes_created, 0,
+        "second ensure_node must not create a duplicate"
+    );
 
     // Count must still be 1.
     let count_result = ctx
@@ -74,7 +81,11 @@ async fn ensure_node_is_idempotent() -> anyhow::Result<()> {
             true,
         )
         .await;
-    assert_eq!(count_result.count(), Some(1), "must still have exactly one node");
+    assert_eq!(
+        count_result.count(),
+        Some(1),
+        "must still have exactly one node"
+    );
 
     ctx.cleanup().await;
     Ok(())
@@ -105,7 +116,11 @@ async fn delete_node_removes_existing_node() -> anyhow::Result<()> {
             true,
         )
         .await;
-    assert_eq!(count_result.count(), Some(0), "node must be gone after delete");
+    assert_eq!(
+        count_result.count(),
+        Some(0),
+        "node must be gone after delete"
+    );
 
     ctx.cleanup().await;
     Ok(())

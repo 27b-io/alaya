@@ -46,11 +46,12 @@ async fn get_neighbors_returns_hebbian_targets() -> anyhow::Result<()> {
     )
     .await;
 
-    let result = ctx
-        .exec_tuple(cypher::get_neighbors(H1, 1, 0.1, 10))
-        .await;
+    let result = ctx.exec_tuple(cypher::get_neighbors(H1, 1, 0.1, 10)).await;
 
-    assert!(!result.result_set.is_empty(), "must find H2 as a neighbor of H1");
+    assert!(
+        !result.result_set.is_empty(),
+        "must find H2 as a neighbor of H1"
+    );
 
     let first_hash = result.result_set[0][0].as_str().unwrap_or("");
     assert_eq!(first_hash, H2, "neighbor hash must be H2");
@@ -94,16 +95,15 @@ async fn spreading_activation_reaches_non_seed_nodes() -> anyhow::Result<()> {
     }
 
     // Seed from H1 — should reach H2 and H3.
-    let result = ctx
-        .exec_tuple(cypher::spreading_activation(&[H1], 2))
-        .await;
+    let result = ctx.exec_tuple(cypher::spreading_activation(&[H1], 2)).await;
 
     assert!(
         result.result_set.len() >= 2,
         "spreading activation must reach at least H2 and H3"
     );
 
-    let reached: Vec<&str> = result.result_set
+    let reached: Vec<&str> = result
+        .result_set
         .iter()
         .map(|r| r[0].as_str().unwrap_or(""))
         .collect();
@@ -149,10 +149,14 @@ async fn hebbian_boosts_within_finds_mutual_edges() -> anyhow::Result<()> {
         .exec_tuple(cypher::hebbian_boosts_within(&[H1, H2]))
         .await;
 
-    assert!(!result.result_set.is_empty(), "must find edges within the set");
+    assert!(
+        !result.result_set.is_empty(),
+        "must find edges within the set"
+    );
 
     // Each row: [hash, max_weight].  H1 outgoing max = 0.4, H2 outgoing max = 0.6.
-    let max_weights: Vec<f64> = result.result_set
+    let max_weights: Vec<f64> = result
+        .result_set
         .iter()
         .map(|r| r[1].as_f64().unwrap_or(0.0))
         .collect();
@@ -182,8 +186,16 @@ async fn strengthen_edge_increases_weight_on_second_call() -> anyhow::Result<()>
         .await;
 
     // Second call — should increase weight via LTP formula.
-    ctx.exec_tuple(cypher::strengthen_edge(H1, H2, 0.1, 0.15, 1.0, 1.0, ts + 1.0))
-        .await;
+    ctx.exec_tuple(cypher::strengthen_edge(
+        H1,
+        H2,
+        0.1,
+        0.15,
+        1.0,
+        1.0,
+        ts + 1.0,
+    ))
+    .await;
 
     let result = ctx
         .exec(
@@ -200,14 +212,21 @@ async fn strengthen_edge_increases_weight_on_second_call() -> anyhow::Result<()>
 
     assert!(!result.result_set.is_empty(), "HEBBIAN edge must exist");
 
-    let weight = result.result_set[0][0].as_f64().expect("weight must be float");
+    let weight = result.result_set[0][0]
+        .as_f64()
+        .expect("weight must be float");
     assert!(
         weight > 0.1,
         "weight must have increased above initial 0.1, got {weight}"
     );
 
-    let co_count = result.result_set[0][1].as_i64().expect("co_access_count must be int");
-    assert_eq!(co_count, 2, "co_access_count must be 2 after two strengthen calls");
+    let co_count = result.result_set[0][1]
+        .as_i64()
+        .expect("co_access_count must be int");
+    assert_eq!(
+        co_count, 2,
+        "co_access_count must be 2 after two strengthen calls"
+    );
 
     ctx.cleanup().await;
     Ok(())
@@ -260,9 +279,14 @@ async fn decay_all_edges_reduces_weight() -> anyhow::Result<()> {
         )
         .await;
 
-    assert!(!result.result_set.is_empty(), "HEBBIAN edge must still exist after decay");
+    assert!(
+        !result.result_set.is_empty(),
+        "HEBBIAN edge must still exist after decay"
+    );
 
-    let weight = result.result_set[0][0].as_f64().expect("weight must be float");
+    let weight = result.result_set[0][0]
+        .as_f64()
+        .expect("weight must be float");
     assert!(
         (weight - initial_weight * decay).abs() < 1e-5,
         "weight must be ~{}, got {weight}",
@@ -320,7 +344,11 @@ async fn prune_weak_edges_removes_below_threshold() -> anyhow::Result<()> {
             true,
         )
         .await;
-    assert_eq!(weak.count(), Some(0), "weak edge (w=0.02) must have been pruned");
+    assert_eq!(
+        weak.count(),
+        Some(0),
+        "weak edge (w=0.02) must have been pruned"
+    );
 
     // Strong edge must survive.
     let strong = ctx
@@ -335,7 +363,11 @@ async fn prune_weak_edges_removes_below_threshold() -> anyhow::Result<()> {
             true,
         )
         .await;
-    assert_eq!(strong.count(), Some(1), "strong edge (w=0.9) must survive pruning");
+    assert_eq!(
+        strong.count(),
+        Some(1),
+        "strong edge (w=0.9) must survive pruning"
+    );
 
     ctx.cleanup().await;
     Ok(())

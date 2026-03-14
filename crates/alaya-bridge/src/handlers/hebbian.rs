@@ -7,13 +7,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{Json, extract::State, http::StatusCode};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use alaya_types::graph::{CoAccessPair, Neighbor};
 
-use crate::{cypher, handlers::exec_query, AppState};
+use crate::{AppState, cypher, handlers::exec_query};
 
 // ─── Request types ────────────────────────────────────────────────────────────
 
@@ -80,7 +80,11 @@ pub async fn neighbors(
         if content_hash.is_empty() {
             continue;
         }
-        neighbors.push(Neighbor { content_hash, weight, hops });
+        neighbors.push(Neighbor {
+            content_hash,
+            weight,
+            hops,
+        });
     }
 
     Ok(Json(json!({ "neighbors": neighbors })))
@@ -141,10 +145,8 @@ pub async fn spreading(
     sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     sorted.truncate(limit);
 
-    let activations: serde_json::Map<String, Value> = sorted
-        .into_iter()
-        .map(|(k, v)| (k, json!(v)))
-        .collect();
+    let activations: serde_json::Map<String, Value> =
+        sorted.into_iter().map(|(k, v)| (k, json!(v))).collect();
 
     Ok(Json(json!({ "activations": activations })))
 }
@@ -199,7 +201,10 @@ pub async fn strengthen(
     }
 
     if req.pairs.is_empty() {
-        return Ok((StatusCode::ACCEPTED, Json(json!({ "accepted": true, "queued": 0 }))));
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({ "accepted": true, "queued": 0 })),
+        ));
     }
 
     let queued = req.pairs.len();
@@ -222,5 +227,8 @@ pub async fn strengthen(
             })?;
     }
 
-    Ok((StatusCode::ACCEPTED, Json(json!({ "accepted": true, "queued": queued }))))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "accepted": true, "queued": queued })),
+    ))
 }

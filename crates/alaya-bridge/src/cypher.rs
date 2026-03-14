@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use alaya_types::graph::{Direction, SystemRelationType, UserRelationType};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// A fully-constructed Cypher query ready to dispatch.
 /// `(cypher, params, readonly)`
@@ -15,7 +15,10 @@ pub type CypherQuery = (String, HashMap<String, Value>, bool);
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 fn params(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect()
 }
 
 // ─── node operations ─────────────────────────────────────────────────────────
@@ -25,7 +28,11 @@ pub fn ensure_node(hash: &str, ts: f64) -> CypherQuery {
     let q = "MERGE (m:Memory {content_hash: $hash}) \
              ON CREATE SET m.created_at = $ts"
         .to_string();
-    (q, params(&[("hash", json!(hash)), ("ts", json!(ts))]), false)
+    (
+        q,
+        params(&[("hash", json!(hash)), ("ts", json!(ts))]),
+        false,
+    )
 }
 
 /// DETACH DELETE a Memory node by hash.
@@ -97,7 +104,11 @@ pub fn get_typed_edges(
              LIMIT $lim"
         ),
     };
-    (q, params(&[("hash", json!(hash)), ("lim", json!(limit))]), true)
+    (
+        q,
+        params(&[("hash", json!(hash)), ("lim", json!(limit))]),
+        true,
+    )
 }
 
 /// DELETE a single typed edge between two memories.
@@ -107,7 +118,11 @@ pub fn delete_typed_edge(src: &str, dst: &str, rel: UserRelationType) -> CypherQ
         "MATCH (a:Memory {{content_hash: $src}})-[e:{label}]->(b:Memory {{content_hash: $dst}}) \
          DELETE e RETURN count(e)"
     );
-    (q, params(&[("src", json!(src)), ("dst", json!(dst))]), false)
+    (
+        q,
+        params(&[("src", json!(src)), ("dst", json!(dst))]),
+        false,
+    )
 }
 
 // ─── system edge operations ───────────────────────────────────────────────────
@@ -121,7 +136,11 @@ pub fn create_system_edge(src: &str, dst: &str, rel: SystemRelationType, ts: f64
          ON CREATE SET e.created_at = $ts \
          RETURN count(e)"
     );
-    (q, params(&[("src", json!(src)), ("dst", json!(dst)), ("ts", json!(ts))]), false)
+    (
+        q,
+        params(&[("src", json!(src)), ("dst", json!(dst)), ("ts", json!(ts))]),
+        false,
+    )
 }
 
 // ─── contradiction operations ─────────────────────────────────────────────────
@@ -161,7 +180,15 @@ pub fn get_neighbors(hash: &str, max_hops: u8, min_weight: f64, limit: u32) -> C
          ORDER BY path_weight DESC \
          LIMIT $lim"
     );
-    (q, params(&[("hash", json!(hash)), ("min_w", json!(min_weight)), ("lim", json!(limit))]), true)
+    (
+        q,
+        params(&[
+            ("hash", json!(hash)),
+            ("min_w", json!(min_weight)),
+            ("lim", json!(limit)),
+        ]),
+        true,
+    )
 }
 
 /// Spreading activation from a set of seed hashes.
@@ -234,7 +261,11 @@ pub fn decay_all_edges(decay: f64, limit: u32) -> CypherQuery {
     let q = "MATCH ()-[e:HEBBIAN]->() WITH e LIMIT $lim \
              SET e.weight = toFloat(e.weight * $decay) RETURN count(e)"
         .to_string();
-    (q, params(&[("decay", json!(decay)), ("lim", json!(limit))]), false)
+    (
+        q,
+        params(&[("decay", json!(decay)), ("lim", json!(limit))]),
+        false,
+    )
 }
 
 /// Decay HEBBIAN edges that have not been co-accessed since `before_ts`.
@@ -242,7 +273,15 @@ pub fn decay_stale_edges(before_ts: f64, decay: f64, limit: u32) -> CypherQuery 
     let q = "MATCH ()-[e:HEBBIAN]->() WHERE e.last_co_access < $ts WITH e LIMIT $lim \
              SET e.weight = toFloat(e.weight * $decay) RETURN count(e)"
         .to_string();
-    (q, params(&[("ts", json!(before_ts)), ("decay", json!(decay)), ("lim", json!(limit))]), false)
+    (
+        q,
+        params(&[
+            ("ts", json!(before_ts)),
+            ("decay", json!(decay)),
+            ("lim", json!(limit)),
+        ]),
+        false,
+    )
 }
 
 /// DELETE HEBBIAN edges whose weight has dropped below `threshold`.
@@ -250,7 +289,11 @@ pub fn prune_weak_edges(threshold: f64, limit: u32) -> CypherQuery {
     let q = "MATCH ()-[e:HEBBIAN]->() WHERE e.weight < $thresh WITH e LIMIT $lim \
              DELETE e RETURN count(e)"
         .to_string();
-    (q, params(&[("thresh", json!(threshold)), ("lim", json!(limit))]), false)
+    (
+        q,
+        params(&[("thresh", json!(threshold)), ("lim", json!(limit))]),
+        false,
+    )
 }
 
 /// Find Memory nodes with no edges of any tracked type.
@@ -372,18 +415,19 @@ mod tests {
 
     #[test]
     fn create_typed_edge_without_confidence() {
-        let (q, p, ro) =
-            create_typed_edge("a", "b", UserRelationType::Contradicts, 1.0, None);
+        let (q, p, ro) = create_typed_edge("a", "b", UserRelationType::Contradicts, 1.0, None);
         assert!(q.contains("CONTRADICTS"));
-        assert!(!q.contains("e.confidence"), "must omit confidence when None");
+        assert!(
+            !q.contains("e.confidence"),
+            "must omit confidence when None"
+        );
         assert!(!p.contains_key("conf"));
         assert!(!ro);
     }
 
     #[test]
     fn get_typed_edges_outgoing() {
-        let (q, p, ro) =
-            get_typed_edges("h", UserRelationType::Precedes, Direction::Outgoing, 100);
+        let (q, p, ro) = get_typed_edges("h", UserRelationType::Precedes, Direction::Outgoing, 100);
         assert!(q.contains("PRECEDES"));
         assert!(q.contains("LIMIT"));
         assert!(p.contains_key("hash"));
@@ -397,8 +441,7 @@ mod tests {
 
     #[test]
     fn get_typed_edges_incoming() {
-        let (q, p, ro) =
-            get_typed_edges("h", UserRelationType::Precedes, Direction::Incoming, 50);
+        let (q, p, ro) = get_typed_edges("h", UserRelationType::Precedes, Direction::Incoming, 50);
         assert!(ro);
         assert!(p.contains_key("hash"));
         // incoming: hash node on right
@@ -491,8 +534,7 @@ mod tests {
 
     #[test]
     fn strengthen_edge_shape() {
-        let (q, p, ro) =
-            strengthen_edge("s", "d", 0.3, 0.1, 1.0, 1.0, 1_710_000_000.0);
+        let (q, p, ro) = strengthen_edge("s", "d", 0.3, 0.1, 1.0, 1.0, 1_710_000_000.0);
         assert!(q.contains("HEBBIAN"));
         assert!(q.contains("ON CREATE SET"));
         assert!(q.contains("ON MATCH SET"));
@@ -556,7 +598,11 @@ mod tests {
         assert_eq!(qs.len(), 6);
         // all must be readonly
         assert!(qs.iter().all(|(_, _, ro)| *ro));
-        let cypher_joined: String = qs.iter().map(|(q, _, _)| q.as_str()).collect::<Vec<_>>().join(" ");
+        let cypher_joined: String = qs
+            .iter()
+            .map(|(q, _, _)| q.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(cypher_joined.contains("HEBBIAN"));
         assert!(cypher_joined.contains("RELATES_TO"));
         assert!(cypher_joined.contains("PRECEDES"));

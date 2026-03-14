@@ -35,7 +35,11 @@ async fn create_and_get_relates_to_edge() -> anyhow::Result<()> {
 
     // Create a RELATES_TO edge A→B.
     ctx.exec_tuple(cypher::create_typed_edge(
-        HASH_A, HASH_B, UserRelationType::RelatesTo, ts, None,
+        HASH_A,
+        HASH_B,
+        UserRelationType::RelatesTo,
+        ts,
+        None,
     ))
     .await;
 
@@ -69,7 +73,11 @@ async fn create_contradicts_edge_stores_confidence() -> anyhow::Result<()> {
     let confidence = 0.85;
 
     ctx.exec_tuple(cypher::create_typed_edge(
-        HASH_A, HASH_B, UserRelationType::Contradicts, ts, Some(confidence),
+        HASH_A,
+        HASH_B,
+        UserRelationType::Contradicts,
+        ts,
+        Some(confidence),
     ))
     .await;
 
@@ -113,7 +121,11 @@ async fn get_edges_direction_incoming_vs_outgoing() -> anyhow::Result<()> {
 
     // A→B  PRECEDES
     ctx.exec_tuple(cypher::create_typed_edge(
-        HASH_A, HASH_B, UserRelationType::Precedes, ts, None,
+        HASH_A,
+        HASH_B,
+        UserRelationType::Precedes,
+        ts,
+        None,
     ))
     .await;
 
@@ -126,7 +138,10 @@ async fn get_edges_direction_incoming_vs_outgoing() -> anyhow::Result<()> {
             10,
         ))
         .await;
-    assert!(!out_a.result_set.is_empty(), "A must have outgoing PRECEDES edge");
+    assert!(
+        !out_a.result_set.is_empty(),
+        "A must have outgoing PRECEDES edge"
+    );
 
     // Incoming to A: should be empty (nothing points to A yet).
     let in_a = ctx
@@ -137,7 +152,10 @@ async fn get_edges_direction_incoming_vs_outgoing() -> anyhow::Result<()> {
             10,
         ))
         .await;
-    assert!(in_a.result_set.is_empty(), "A must have no incoming PRECEDES edge");
+    assert!(
+        in_a.result_set.is_empty(),
+        "A must have no incoming PRECEDES edge"
+    );
 
     // Incoming to B: should find the A→B edge.
     let in_b = ctx
@@ -148,7 +166,10 @@ async fn get_edges_direction_incoming_vs_outgoing() -> anyhow::Result<()> {
             10,
         ))
         .await;
-    assert!(!in_b.result_set.is_empty(), "B must have incoming PRECEDES edge");
+    assert!(
+        !in_b.result_set.is_empty(),
+        "B must have incoming PRECEDES edge"
+    );
 
     // Both on B: should also find it.
     let both_b = ctx
@@ -159,7 +180,10 @@ async fn get_edges_direction_incoming_vs_outgoing() -> anyhow::Result<()> {
             10,
         ))
         .await;
-    assert!(!both_b.result_set.is_empty(), "Both direction on B must find the edge");
+    assert!(
+        !both_b.result_set.is_empty(),
+        "Both direction on B must find the edge"
+    );
 
     ctx.cleanup().await;
     Ok(())
@@ -177,13 +201,21 @@ async fn delete_typed_edge_removes_it() -> anyhow::Result<()> {
     let ts = 1_710_000_040.0_f64;
 
     ctx.exec_tuple(cypher::create_typed_edge(
-        HASH_A, HASH_B, UserRelationType::RelatesTo, ts, None,
+        HASH_A,
+        HASH_B,
+        UserRelationType::RelatesTo,
+        ts,
+        None,
     ))
     .await;
 
     // Delete it.
-    ctx.exec_tuple(cypher::delete_typed_edge(HASH_A, HASH_B, UserRelationType::RelatesTo))
-        .await;
+    ctx.exec_tuple(cypher::delete_typed_edge(
+        HASH_A,
+        HASH_B,
+        UserRelationType::RelatesTo,
+    ))
+    .await;
 
     // Verify gone.
     let result = ctx
@@ -194,7 +226,10 @@ async fn delete_typed_edge_removes_it() -> anyhow::Result<()> {
             10,
         ))
         .await;
-    assert!(result.result_set.is_empty(), "edge must be gone after delete");
+    assert!(
+        result.result_set.is_empty(),
+        "edge must be gone after delete"
+    );
 
     ctx.cleanup().await;
     Ok(())
@@ -212,7 +247,10 @@ async fn create_supersedes_system_edge() -> anyhow::Result<()> {
     let ts = 1_710_000_050.0_f64;
 
     ctx.exec_tuple(cypher::create_system_edge(
-        HASH_A, HASH_B, SystemRelationType::Supersedes, ts,
+        HASH_A,
+        HASH_B,
+        SystemRelationType::Supersedes,
+        ts,
     ))
     .await;
 
@@ -248,17 +286,28 @@ async fn get_all_contradictions_returns_created_pairs() -> anyhow::Result<()> {
     let ts = 1_710_000_060.0_f64;
 
     ctx.exec_tuple(cypher::create_typed_edge(
-        HASH_A, HASH_B, UserRelationType::Contradicts, ts, Some(0.9),
+        HASH_A,
+        HASH_B,
+        UserRelationType::Contradicts,
+        ts,
+        Some(0.9),
     ))
     .await;
     ctx.exec_tuple(cypher::create_typed_edge(
-        HASH_B, HASH_C, UserRelationType::Contradicts, ts, Some(0.7),
+        HASH_B,
+        HASH_C,
+        UserRelationType::Contradicts,
+        ts,
+        Some(0.7),
     ))
     .await;
 
     let result = ctx.exec_tuple(cypher::get_all_contradictions(50)).await;
 
-    assert!(result.result_set.len() >= 2, "must find both CONTRADICTS pairs");
+    assert!(
+        result.result_set.len() >= 2,
+        "must find both CONTRADICTS pairs"
+    );
 
     ctx.cleanup().await;
     Ok(())

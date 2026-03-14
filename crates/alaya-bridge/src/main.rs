@@ -10,8 +10,7 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let redis_url =
-        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
     let graph_name = std::env::var("GRAPH_NAME").unwrap_or_else(|_| "memory".into());
 
     let client = redis::Client::open(redis_url.as_str()).expect("Invalid REDIS_URL");

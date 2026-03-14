@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use alaya_types::graph::CoAccessPair;
 
-use crate::{cypher, handlers, AppState};
+use crate::{AppState, cypher, handlers};
 
 const QUEUE_KEY: &str = "alaya:hebbian:queue";
 const INITIAL_WEIGHT: f64 = 0.1;
@@ -55,30 +55,27 @@ async fn consumer_loop(state: &AppState) {
             .await;
 
         match result {
-            Ok(Some((_key, raw))) => {
-                match serde_json::from_str::<CoAccessPair>(&raw) {
-                    Ok(pair) => {
-                        let spacing_mod = 0.5 + 0.5 * pair.spacing_quality.clamp(0.0, 1.0);
-                        let (cypher, params, readonly) = cypher::strengthen_edge(
-                            &pair.src,
-                            &pair.dst,
-                            INITIAL_WEIGHT,
-                            STRENGTHEN_RATE,
-                            MAX_WEIGHT,
-                            spacing_mod,
-                            pair.timestamp,
-                        );
-                        if let Err(e) = handlers::exec_query(state, &cypher, params, readonly).await
-                        {
-                            tracing::error!("Hebbian strengthen failed: {e:?}");
-                        }
-                        ops_this_second += 1;
+            Ok(Some((_key, raw))) => match serde_json::from_str::<CoAccessPair>(&raw) {
+                Ok(pair) => {
+                    let spacing_mod = 0.5 + 0.5 * pair.spacing_quality.clamp(0.0, 1.0);
+                    let (cypher, params, readonly) = cypher::strengthen_edge(
+                        &pair.src,
+                        &pair.dst,
+                        INITIAL_WEIGHT,
+                        STRENGTHEN_RATE,
+                        MAX_WEIGHT,
+                        spacing_mod,
+                        pair.timestamp,
+                    );
+                    if let Err(e) = handlers::exec_query(state, &cypher, params, readonly).await {
+                        tracing::error!("Hebbian strengthen failed: {e:?}");
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to deserialize queue item: {e}");
-                    }
+                    ops_this_second += 1;
                 }
-            }
+                Err(e) => {
+                    tracing::error!("Failed to deserialize queue item: {e}");
+                }
+            },
             Ok(None) => {
                 // Timeout, no items — loop back.
             }

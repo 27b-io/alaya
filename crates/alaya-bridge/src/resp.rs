@@ -25,7 +25,8 @@ pub struct FalkorResult {
 impl FalkorResult {
     /// Parse a `redis::Value` returned by `GRAPH.QUERY` into a `FalkorResult`.
     pub fn parse(value: &Value) -> Result<Self, String> {
-        let top = as_array(value).ok_or_else(|| format!("expected top-level array, got {value:?}"))?;
+        let top =
+            as_array(value).ok_or_else(|| format!("expected top-level array, got {value:?}"))?;
 
         match top.len() {
             // ── write-only: just stats ──────────────────────────────────────
@@ -42,13 +43,21 @@ impl FalkorResult {
                 let stats = parse_stats(&top[1])?;
                 if looks_like_headers(&top[0]) {
                     let columns = parse_columns(&top[0])?;
-                    Ok(Self { columns, result_set: vec![], stats })
+                    Ok(Self {
+                        columns,
+                        result_set: vec![],
+                        stats,
+                    })
                 } else {
                     // No headers supplied — treat as anonymous result set.
                     let result_set = parse_result_set(&top[0], 0)?;
                     let col_count = result_set.first().map_or(0, |r| r.len());
                     let columns = (0..col_count).map(|i| format!("col{i}")).collect();
-                    Ok(Self { columns, result_set, stats })
+                    Ok(Self {
+                        columns,
+                        result_set,
+                        stats,
+                    })
                 }
             }
 
@@ -57,7 +66,11 @@ impl FalkorResult {
                 let columns = parse_columns(&top[0])?;
                 let result_set = parse_result_set(&top[1], columns.len())?;
                 let stats = parse_stats(&top[2])?;
-                Ok(Self { columns, result_set, stats })
+                Ok(Self {
+                    columns,
+                    result_set,
+                    stats,
+                })
             }
 
             n => Err(format!("unexpected top-level array length {n}")),
@@ -87,12 +100,16 @@ fn as_array(v: &Value) -> Option<&Vec<Value>> {
 /// Heuristic: element 0 is a headers list when it is an array whose first item
 /// is itself a 2-element array `[int, name_bytes]`.
 fn looks_like_headers(v: &Value) -> bool {
-    let Some(outer) = as_array(v) else { return false };
+    let Some(outer) = as_array(v) else {
+        return false;
+    };
     let Some(first) = outer.first() else {
         // Empty array is ambiguous; treat as headers (empty column list).
         return true;
     };
-    let Some(inner) = as_array(first) else { return false };
+    let Some(inner) = as_array(first) else {
+        return false;
+    };
     if inner.len() != 2 {
         return false;
     }
@@ -104,16 +121,17 @@ fn looks_like_headers(v: &Value) -> bool {
 ///
 /// Each header is `[col_type_int, col_name_bulk_string]`.
 fn parse_columns(v: &Value) -> Result<Vec<String>, String> {
-    let headers = as_array(v)
-        .ok_or_else(|| format!("headers must be an array, got {v:?}"))?;
+    let headers = as_array(v).ok_or_else(|| format!("headers must be an array, got {v:?}"))?;
 
     headers
         .iter()
         .map(|h| {
-            let inner = as_array(h)
-                .ok_or_else(|| format!("each header must be an array, got {h:?}"))?;
+            let inner =
+                as_array(h).ok_or_else(|| format!("each header must be an array, got {h:?}"))?;
             if inner.len() < 2 {
-                return Err(format!("header must have at least 2 elements, got {inner:?}"));
+                return Err(format!(
+                    "header must have at least 2 elements, got {inner:?}"
+                ));
             }
             bulk_string_to_string(&inner[1])
                 .ok_or_else(|| format!("column name must be a string, got {:?}", inner[1]))
@@ -123,8 +141,7 @@ fn parse_columns(v: &Value) -> Result<Vec<String>, String> {
 
 /// Convert the result-set element into rows of `serde_json::Value` cells.
 fn parse_result_set(v: &Value, col_count: usize) -> Result<Vec<Vec<serde_json::Value>>, String> {
-    let rows = as_array(v)
-        .ok_or_else(|| format!("result set must be an array, got {v:?}"))?;
+    let rows = as_array(v).ok_or_else(|| format!("result set must be an array, got {v:?}"))?;
 
     rows.iter()
         .enumerate()
@@ -155,14 +172,14 @@ fn resp_cell_to_json(v: &Value) -> Result<serde_json::Value, String> {
         Value::Boolean(b) => Ok(serde_json::Value::Bool(*b)),
 
         Value::Double(f) => {
-            let n = serde_json::Number::from_f64(*f)
-                .ok_or_else(|| format!("non-finite f64: {f}"))?;
+            let n =
+                serde_json::Number::from_f64(*f).ok_or_else(|| format!("non-finite f64: {f}"))?;
             Ok(serde_json::Value::Number(n))
         }
 
         Value::BulkString(bytes) => {
-            let s = std::str::from_utf8(bytes)
-                .map_err(|e| format!("non-UTF-8 bulk string: {e}"))?;
+            let s =
+                std::str::from_utf8(bytes).map_err(|e| format!("non-UTF-8 bulk string: {e}"))?;
             // Try float first (FalkorDB sends floats as bulk strings).
             if let Ok(f) = s.parse::<f64>()
                 && let Some(n) = serde_json::Number::from_f64(f)
@@ -182,8 +199,7 @@ fn resp_cell_to_json(v: &Value) -> Result<serde_json::Value, String> {
 
 /// Parse a stats element — an array of `"Key: value"` strings — into a map.
 fn parse_stats(v: &Value) -> Result<HashMap<String, String>, String> {
-    let items = as_array(v)
-        .ok_or_else(|| format!("stats must be an array, got {v:?}"))?;
+    let items = as_array(v).ok_or_else(|| format!("stats must be an array, got {v:?}"))?;
 
     let mut map = HashMap::new();
     for item in items {
@@ -230,15 +246,9 @@ mod tests {
     fn full_result_with_data() {
         let response = Value::Array(vec![
             // Headers
-            Value::Array(vec![
-                header(1, "hash"),
-                header(1, "weight"),
-            ]),
+            Value::Array(vec![header(1, "hash"), header(1, "weight")]),
             // Result set
-            Value::Array(vec![Value::Array(vec![
-                bulk("abc"),
-                bulk("0.5"),
-            ])]),
+            Value::Array(vec![Value::Array(vec![bulk("abc"), bulk("0.5")])]),
             // Stats
             Value::Array(vec![
                 stat("Cached execution: 1"),
@@ -349,7 +359,10 @@ mod tests {
         assert_eq!(r.stats["Nodes created"], "0");
         assert_eq!(r.stats["Relationships created"], "5");
         assert_eq!(r.stats["Cached execution"], "1");
-        assert_eq!(r.stats["Query internal execution time"], "1.234 milliseconds");
+        assert_eq!(
+            r.stats["Query internal execution time"],
+            "1.234 milliseconds"
+        );
     }
 
     // ── 7. Integer cell ───────────────────────────────────────────────────────

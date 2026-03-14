@@ -35,8 +35,7 @@ impl TestContext {
         let suffix: u32 = rand_u32();
         let graph_name = format!("test_{}_{}", std::process::id(), suffix);
 
-        let client = redis::Client::open(redis_url.as_str())
-            .expect("Invalid REDIS_URL");
+        let client = redis::Client::open(redis_url.as_str()).expect("Invalid REDIS_URL");
         let conn = redis::aio::ConnectionManager::new(client)
             .await
             .expect("Failed to connect to Redis");
