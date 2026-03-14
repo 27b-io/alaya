@@ -3,9 +3,16 @@ name = "alaya-bridge"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "alaya_bridge"
+path = "src/lib.rs"
+
 [[bin]]
 name = "alaya-bridge"
 path = "src/main.rs"
+
+[dev-dependencies]
+anyhow = "1"
 
 [dependencies]
 alaya-types = { path = "../alaya-types" }

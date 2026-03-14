@@ -1,19 +1,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use alaya_bridge::AppState;
 use tracing_subscriber::EnvFilter;
-
-mod auth;
-pub mod cypher;
-mod handlers;
-mod queue;
-pub mod resp;
-mod routes;
-
-pub struct AppState {
-    pub redis: redis::aio::ConnectionManager,
-    pub graph_name: String,
-}
 
 #[tokio::main]
 async fn main() {
@@ -33,24 +22,15 @@ async fn main() {
     let state = Arc::new(AppState { redis, graph_name });
 
     // Initialize schema (indexes) — best-effort; log errors but don't abort.
-    init_schema(&state).await;
+    alaya_bridge::init_schema(&state).await;
 
     // Start background Hebbian write-queue consumer (LPUSH/BRPOP pattern).
-    queue::spawn_consumer(state.clone());
+    alaya_bridge::queue::spawn_consumer(state.clone());
 
-    let app = routes::router(state);
+    let app = alaya_bridge::routes::router(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     tracing::info!("alaya-bridge listening on {addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
-}
-
-async fn init_schema(state: &AppState) {
-    for (q, params, readonly) in cypher::schema_statements() {
-        if let Err(e) = handlers::exec_query(state, &q, params, readonly).await {
-            tracing::warn!("Schema init failed ({e:?}): {q}");
-        }
-    }
-    tracing::info!("Schema initialization complete");
 }
