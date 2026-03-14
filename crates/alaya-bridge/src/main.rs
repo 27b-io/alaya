@@ -3,6 +3,7 @@ use tracing_subscriber::EnvFilter;
 
 mod auth;
 pub mod cypher;
+pub mod resp;
 mod routes;
 
 #[tokio::main]
