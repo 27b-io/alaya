@@ -4,8 +4,11 @@
 //! Cypher queries are dispatched through `exec_query` which serializes
 //! parameters as a `CYPHER key=value` prefix and uses `--compact` mode.
 
+pub mod consolidation;
+pub mod contradictions;
 pub mod edges;
 pub mod health;
+pub mod hebbian;
 pub mod nodes;
 
 use std::collections::HashMap;
