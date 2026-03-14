@@ -161,9 +161,94 @@ fn parse_result_set(v: &Value, col_count: usize) -> Result<Vec<Vec<serde_json::V
 
 /// Convert a single RESP cell value to a `serde_json::Value`.
 ///
+/// In **compact mode**, each cell is a 2-element array `[type_id, value]`:
+///   1=null, 2=string, 3=integer, 4=boolean, 5=double, 6=array,
+///   7=edge, 8=node, 9=path, 10=map, 11=point
+///
+/// In **non-compact mode**, cells are bare RESP values.
+///
 /// FalkorDB quirk: floats are returned as bulk strings (e.g. `b"3.14"`).  We
 /// try a float parse first; only fall back to string when that fails.
 fn resp_cell_to_json(v: &Value) -> Result<serde_json::Value, String> {
+    // Detect compact-mode typed cell: [type_id, value]
+    if let Some(arr) = as_array(v)
+        && arr.len() == 2
+        && let Value::Int(type_id) = &arr[0]
+    {
+        return compact_cell_to_json(*type_id, &arr[1]);
+    }
+
+    // Non-compact / bare value path
+    bare_value_to_json(v)
+}
+
+/// Parse a compact-mode typed cell `[type_id, inner_value]`.
+fn compact_cell_to_json(type_id: i64, inner: &Value) -> Result<serde_json::Value, String> {
+    match type_id {
+        1 => Ok(serde_json::Value::Null), // VALUE_NULL
+        2 => {
+            // VALUE_STRING — inner is a bulk string, possibly double-quoted
+            let s = bulk_string_to_string(inner)
+                .ok_or_else(|| format!("compact string cell has non-string inner: {inner:?}"))?;
+            Ok(serde_json::Value::String(s))
+        }
+        3 => {
+            // VALUE_INTEGER — inner is Int
+            match inner {
+                Value::Int(i) => Ok(serde_json::json!(*i)),
+                _ => bare_value_to_json(inner),
+            }
+        }
+        4 => {
+            // VALUE_BOOLEAN
+            match inner {
+                Value::Boolean(b) => Ok(serde_json::Value::Bool(*b)),
+                Value::BulkString(bytes) => {
+                    let s = std::str::from_utf8(bytes)
+                        .map_err(|e| format!("non-UTF-8 bool cell: {e}"))?;
+                    Ok(serde_json::Value::Bool(s == "true"))
+                }
+                _ => bare_value_to_json(inner),
+            }
+        }
+        5 => {
+            // VALUE_DOUBLE — inner is BulkString with float text, or Double
+            match inner {
+                Value::Double(f) => {
+                    let n = serde_json::Number::from_f64(*f)
+                        .ok_or_else(|| format!("non-finite f64: {f}"))?;
+                    Ok(serde_json::Value::Number(n))
+                }
+                Value::BulkString(bytes) => {
+                    let s = std::str::from_utf8(bytes)
+                        .map_err(|e| format!("non-UTF-8 float cell: {e}"))?;
+                    let f: f64 = s
+                        .parse()
+                        .map_err(|e| format!("cannot parse '{s}' as f64: {e}"))?;
+                    let n = serde_json::Number::from_f64(f)
+                        .ok_or_else(|| format!("non-finite f64: {f}"))?;
+                    Ok(serde_json::Value::Number(n))
+                }
+                _ => bare_value_to_json(inner),
+            }
+        }
+        6 => {
+            // VALUE_ARRAY — recurse
+            if let Some(arr) = as_array(inner) {
+                let items: Result<Vec<_>, _> = arr.iter().map(resp_cell_to_json).collect();
+                Ok(serde_json::Value::Array(items?))
+            } else {
+                bare_value_to_json(inner)
+            }
+        }
+        // Types 7-11 (edge, node, path, map, point) — not used by our scalar queries.
+        // Fall through to bare parsing for forward compatibility.
+        _ => bare_value_to_json(inner),
+    }
+}
+
+/// Parse a bare (non-compact) RESP value.
+fn bare_value_to_json(v: &Value) -> Result<serde_json::Value, String> {
     match v {
         Value::Nil => Ok(serde_json::Value::Null),
 
@@ -180,6 +265,11 @@ fn resp_cell_to_json(v: &Value) -> Result<serde_json::Value, String> {
         Value::BulkString(bytes) => {
             let s =
                 std::str::from_utf8(bytes).map_err(|e| format!("non-UTF-8 bulk string: {e}"))?;
+            // Strip compact-mode double quotes if present.
+            let s = s
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or(s);
             // Try float first (FalkorDB sends floats as bulk strings).
             if let Ok(f) = s.parse::<f64>()
                 && let Some(n) = serde_json::Number::from_f64(f)
@@ -214,12 +304,22 @@ fn parse_stats(v: &Value) -> Result<HashMap<String, String>, String> {
 }
 
 /// Try to decode a `BulkString` or `SimpleString` as UTF-8.
+///
+/// FalkorDB compact mode wraps all strings in double quotes (`"foo"`).
+/// We strip those unconditionally — non-compact strings never contain
+/// surrounding quotes, so this is safe for both modes.
 fn bulk_string_to_string(v: &Value) -> Option<String> {
-    match v {
-        Value::BulkString(b) => std::str::from_utf8(b).ok().map(str::to_owned),
-        Value::SimpleString(s) => Some(s.clone()),
-        _ => None,
-    }
+    let raw = match v {
+        Value::BulkString(b) => std::str::from_utf8(b).ok()?,
+        Value::SimpleString(s) => s.as_str(),
+        _ => return None,
+    };
+    // Strip surrounding double quotes added by compact mode.
+    let stripped = raw
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(raw);
+    Some(stripped.to_owned())
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────────

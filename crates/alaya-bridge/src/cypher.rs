@@ -168,18 +168,30 @@ pub fn get_contradictions_for_hashes(hashes: &[&str]) -> CypherQuery {
 // ─── Hebbian read operations ──────────────────────────────────────────────────
 
 /// Walk HEBBIAN edges up to `max_hops` (capped at 3) from a source node.
+///
+/// When `max_hops == 1`, uses a simple single-edge match (FalkorDB binds
+/// `e` as an Edge, not a List, for `*1..1` — which breaks `ALL(r IN e ...)`).
 pub fn get_neighbors(hash: &str, max_hops: u8, min_weight: f64, limit: u32) -> CypherQuery {
-    let hops = max_hops.min(3);
-    let q = format!(
-        "MATCH (src:Memory {{content_hash: $hash}})-[e:HEBBIAN*1..{hops}]->(dst:Memory) \
-         WHERE ALL(r IN e WHERE r.weight >= $min_w) \
-         WITH dst, e, length(e) AS hops \
-         RETURN DISTINCT dst.content_hash AS hash, \
-                reduce(w = 1.0, r IN e | w * r.weight) AS path_weight, \
-                hops \
+    let hops = max_hops.clamp(1, 3);
+    let q = if hops == 1 {
+        "MATCH (src:Memory {content_hash: $hash})-[e:HEBBIAN]->(dst:Memory) \
+         WHERE e.weight >= $min_w \
+         RETURN DISTINCT dst.content_hash AS hash, e.weight AS path_weight, 1 AS hops \
          ORDER BY path_weight DESC \
          LIMIT $lim"
-    );
+            .to_string()
+    } else {
+        format!(
+            "MATCH (src:Memory {{content_hash: $hash}})-[e:HEBBIAN*1..{hops}]->(dst:Memory) \
+             WITH dst, relationships(e) AS edges, length(e) AS hops \
+             WHERE ALL(r IN edges WHERE r.weight >= $min_w) \
+             RETURN DISTINCT dst.content_hash AS hash, \
+                    reduce(w = 1.0, r IN edges | w * r.weight) AS path_weight, \
+                    hops \
+             ORDER BY path_weight DESC \
+             LIMIT $lim"
+        )
+    };
     (
         q,
         params(&[
@@ -193,15 +205,22 @@ pub fn get_neighbors(hash: &str, max_hops: u8, min_weight: f64, limit: u32) -> C
 
 /// Spreading activation from a set of seed hashes.
 pub fn spreading_activation(seeds: &[&str], max_hops: u8) -> CypherQuery {
-    let hops = max_hops.min(3);
-    let q = format!(
-        "MATCH (src:Memory)-[e:HEBBIAN*1..{hops}]->(dst:Memory) \
+    let hops = max_hops.clamp(1, 3);
+    let q = if hops == 1 {
+        "MATCH (src:Memory)-[e:HEBBIAN]->(dst:Memory) \
          WHERE src.content_hash IN $seeds AND NOT dst.content_hash IN $seeds \
-         WITH dst.content_hash AS hash, \
-              reduce(w = 1.0, r IN e | w * r.weight) AS path_weight, \
-              length(e) AS hops \
-         RETURN hash, path_weight, hops"
-    );
+         RETURN dst.content_hash AS hash, e.weight AS path_weight, 1 AS hops"
+            .to_string()
+    } else {
+        format!(
+            "MATCH (src:Memory)-[e:HEBBIAN*1..{hops}]->(dst:Memory) \
+             WHERE src.content_hash IN $seeds AND NOT dst.content_hash IN $seeds \
+             WITH dst.content_hash AS hash, \
+                  reduce(w = 1.0, r IN relationships(e) | w * r.weight) AS path_weight, \
+                  length(e) AS hops \
+             RETURN hash, path_weight, hops"
+        )
+    };
     let seed_list: Vec<Value> = seeds.iter().map(|s| json!(s)).collect();
     (q, params(&[("seeds", Value::Array(seed_list))]), true)
 }
