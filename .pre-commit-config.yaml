@@ -1,0 +1,30 @@
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test --workspace
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: wasm-check
+        name: wasm build check
+        entry: bash -c 'cargo build -p alaya-types --target wasm32-unknown-unknown && cargo build -p alaya-backends --target wasm32-unknown-unknown && cargo build -p alaya-core --target wasm32-unknown-unknown'
+        language: system
+        types: [rust]
+        pass_filenames: false
