@@ -1,0 +1,178 @@
+//! Edge handlers — POST /edges/create, POST /edges/get, POST /edges/delete
+
+use std::sync::Arc;
+
+use axum::{
+    extract::State,
+    http::StatusCode,
+    Json,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use alaya_types::{
+    graph::{Direction, Edge, UserRelationType},
+    memory::validate_content_hash,
+};
+
+use crate::{cypher, handlers::exec_query, AppState};
+
+// ─── Request types ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CreateEdgeRequest {
+    pub source: String,
+    pub target: String,
+    pub relation_type: String,
+    pub created_at: Option<f64>,
+    pub confidence: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GetEdgesRequest {
+    pub content_hash: String,
+    pub relation_type: Option<String>,
+    /// "outgoing", "incoming", or "both" (default "both")
+    pub direction: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteEdgeRequest {
+    pub source: String,
+    pub target: String,
+    pub relation_type: String,
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Parse a relation_type string into a `UserRelationType`.
+/// Rejects system relation types (e.g. SUPERSEDES) and unknown values.
+fn parse_user_relation(s: &str) -> Result<UserRelationType, StatusCode> {
+    match s {
+        "RELATES_TO" => Ok(UserRelationType::RelatesTo),
+        "PRECEDES" => Ok(UserRelationType::Precedes),
+        "CONTRADICTS" => Ok(UserRelationType::Contradicts),
+        // Explicitly reject system relations
+        "SUPERSEDES" | "HEBBIAN" => Err(StatusCode::UNPROCESSABLE_ENTITY),
+        _ => Err(StatusCode::UNPROCESSABLE_ENTITY),
+    }
+}
+
+fn parse_direction(s: &str) -> Result<Direction, StatusCode> {
+    match s {
+        "outgoing" => Ok(Direction::Outgoing),
+        "incoming" => Ok(Direction::Incoming),
+        "both" => Ok(Direction::Both),
+        _ => Err(StatusCode::UNPROCESSABLE_ENTITY),
+    }
+}
+
+/// Collect all `UserRelationType` variants.
+fn all_user_relation_types() -> &'static [UserRelationType] {
+    &[
+        UserRelationType::RelatesTo,
+        UserRelationType::Precedes,
+        UserRelationType::Contradicts,
+    ]
+}
+
+// ─── Handlers ─────────────────────────────────────────────────────────────────
+
+/// POST /edges/create
+pub async fn create(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateEdgeRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    if !validate_content_hash(&req.source) || !validate_content_hash(&req.target) {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let rel = parse_user_relation(&req.relation_type)?;
+    let ts = req.created_at.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+    });
+
+    let (cypher, params, readonly) =
+        cypher::create_typed_edge(&req.source, &req.target, rel, ts, req.confidence);
+    let result = exec_query(&state, &cypher, params, readonly).await?;
+
+    // RETURN count(e) — 1 means created (ON CREATE fired), 0 means already existed
+    let count = result.count().unwrap_or(0);
+    Ok(Json(json!({ "created": count > 0 })))
+}
+
+/// POST /edges/get
+pub async fn get(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<GetEdgesRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    if !validate_content_hash(&req.content_hash) {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let direction = req
+        .direction
+        .as_deref()
+        .map(parse_direction)
+        .transpose()?
+        .unwrap_or(Direction::Both);
+
+    let limit = req.limit.unwrap_or(100).clamp(1, 500) as u32;
+
+    // Determine which relation types to query
+    let relations: Vec<UserRelationType> = match req.relation_type.as_deref() {
+        Some(rt) => vec![parse_user_relation(rt)?],
+        None => all_user_relation_types().to_vec(),
+    };
+
+    let mut edges: Vec<Edge> = Vec::new();
+
+    for rel in relations {
+        let (cypher, params, readonly) =
+            cypher::get_typed_edges(&req.content_hash, rel, direction, limit);
+        let result = exec_query(&state, &cypher, params, readonly).await?;
+
+        for row in &result.result_set {
+            // Row: [a.content_hash, b.content_hash, e.created_at]
+            if row.len() < 2 {
+                continue;
+            }
+            let source = row[0].as_str().unwrap_or("").to_string();
+            let target = row[1].as_str().unwrap_or("").to_string();
+            let created_at = row.get(2).and_then(Value::as_f64);
+
+            edges.push(Edge {
+                source,
+                target,
+                relation_type: rel.cypher_label().to_string(),
+                direction,
+                created_at,
+                confidence: None,
+            });
+        }
+    }
+
+    Ok(Json(json!({ "edges": edges })))
+}
+
+/// POST /edges/delete
+pub async fn delete(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DeleteEdgeRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    if !validate_content_hash(&req.source) || !validate_content_hash(&req.target) {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let rel = parse_user_relation(&req.relation_type)?;
+    let (cypher, params, readonly) =
+        cypher::delete_typed_edge(&req.source, &req.target, rel);
+    let result = exec_query(&state, &cypher, params, readonly).await?;
+
+    let count = result.count().unwrap_or(0);
+    Ok(Json(json!({ "deleted": count > 0 })))
+}
