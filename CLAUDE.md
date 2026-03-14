@@ -10,13 +10,14 @@ Rust rewrite of the mcp-memory-service API layer, targeting Cloudflare Workers (
 
 ## Architecture
 
-4-crate workspace (2 implemented, 2 future):
+4-crate workspace (4 implemented, 1 future):
 
 | Crate | Target | Status | Purpose |
 |-------|--------|--------|---------|
-| **alaya-types** | wasm32 + native | Done | Shared types: Memory, Edge, SearchMode, AlayaError |
-| **alaya-bridge** | native only | Done | FalkorDB typed RPC bridge (axum + redis) |
-| **alaya-core** | wasm32 + native | Future | MemoryService orchestration |
+| **alaya-types** | wasm32 + native | Done | Shared types: Memory, Edge, SearchMode, AlayaError, PayloadFilter |
+| **alaya-bridge** | native only | Done | FalkorDB typed RPC bridge (axum + redis), 18 endpoints |
+| **alaya-backends** | wasm32 + native | Done | Trait definitions + HTTP clients (Qdrant, Embedding, Graph) |
+| **alaya-core** | wasm32 + native | Done | MemoryService orchestration (all 9 MCP tools) |
 | **alaya-worker** | wasm32 | Future | CF Worker entry point + MCP transport |
 
 ```
@@ -25,32 +26,51 @@ crates/
 │   ├── lib.rs          # Re-exports
 │   ├── error.rs        # AlayaError (6 variants, JSON-RPC codes, safe_message())
 │   ├── graph.rs        # UserRelationType, SystemRelationType, Edge, Neighbor, etc.
-│   ├── memory.rs       # Memory, ScoredMemory, ScrollResult, MetadataUpdate
-│   └── search.rs       # SearchMode (5 modes), PromptName
-└── alaya-bridge/src/
-    ├── lib.rs           # Library target (re-exports for integration tests)
-    ├── main.rs          # Binary entry — reads REDIS_URL/GRAPH_NAME, starts axum + queue
-    ├── routes.rs        # 17 HTTP endpoints, auth middleware on API routes
-    ├── auth.rs          # Bearer token middleware (GRAPH_API_KEY env)
-    ├── cypher.rs        # Typed Cypher query builders (17 functions, all parameterized)
-    ├── resp.rs          # FalkorDB RESP parser (compact + non-compact modes)
-    ├── queue.rs         # Hebbian write queue (LPUSH/BRPOP, rate-limited 100 ops/sec)
-    └── handlers/
-        ├── mod.rs       # exec_query() + value_to_cypher_literal()
-        ├── nodes.rs     # POST /nodes/ensure, /nodes/delete
-        ├── edges.rs     # POST /edges/create, /edges/get, /edges/delete
-        ├── health.rs    # GET /health (unauth), GET /stats
-        ├── hebbian.rs   # POST /hebbian/{neighbors,spreading,boosts-within,strengthen}
-        ├── contradictions.rs  # POST /contradictions/{all,for}
-        └── consolidation.rs   # POST /consolidation/{decay-all,decay-stale,prune,orphans}
+│   ├── memory.rs       # Memory (15 fields), ScoredMemory, ScrollResult, MetadataUpdate
+│   └── search.rs       # SearchMode (5 modes), PromptName, PayloadFilter
+├── alaya-bridge/src/
+│   ├── lib.rs           # Library target (re-exports for integration tests)
+│   ├── main.rs          # Binary entry — reads REDIS_URL/GRAPH_NAME, starts axum + queue
+│   ├── routes.rs        # 18 HTTP endpoints, auth middleware on API routes
+│   ├── auth.rs          # Bearer token middleware (GRAPH_API_KEY env)
+│   ├── cypher.rs        # Typed Cypher query builders (17 functions, all parameterized)
+│   ├── resp.rs          # FalkorDB RESP parser (compact + non-compact modes)
+│   ├── queue.rs         # Hebbian write queue (LPUSH/BRPOP, rate-limited 100 ops/sec)
+│   └── handlers/
+│       ├── mod.rs       # exec_query() + value_to_cypher_literal()
+│       ├── nodes.rs     # POST /nodes/ensure, /nodes/delete
+│       ├── edges.rs     # POST /edges/create, /edges/get, /edges/delete, /edges/create-system
+│       ├── health.rs    # GET /health (unauth), GET /stats
+│       ├── hebbian.rs   # POST /hebbian/{neighbors,spreading,boosts-within,strengthen}
+│       ├── contradictions.rs  # POST /contradictions/{all,for}
+│       └── consolidation.rs   # POST /consolidation/{decay-all,decay-stale,prune,orphans}
+├── alaya-backends/src/
+│   ├── lib.rs           # Re-exports
+│   ├── traits.rs        # VectorStorage, EmbeddingProvider, GraphService, HebbianService, ConsolidationService
+│   ├── qdrant.rs        # QdrantClient — Qdrant REST API (WASM-compat)
+│   ├── embedding.rs     # EmbeddingClient — OpenAI-compat /v1/embeddings
+│   └── graph.rs         # GraphHttpClient — bridge HTTP wrapper (3 trait impls)
+└── alaya-core/src/
+    ├── lib.rs           # Re-exports
+    ├── service.rs       # MemoryService — all 9 MCP tools orchestrated
+    ├── hashing.rs       # SHA-256 content hashing
+    ├── hybrid_search.rs # RRF, adaptive alpha, keyword extraction, recency decay
+    ├── interference.rs  # Contradiction detection (negation, antonym, temporal)
+    ├── salience.rs      # Salience scoring + boost
+    ├── deduplication.rs # Cosine similarity, UnionFind, duplicate clustering
+    ├── spaced_repetition.rs # Spacing quality + boost
+    ├── provenance.rs    # Trust scoring, provenance building
+    └── encoding_context.rs  # Context capture + similarity
 ```
 
 ## Commands
 
 ```bash
 cargo build --workspace                                    # Build all (native)
-cargo build -p alaya-types --target wasm32-unknown-unknown # WASM check
-cargo test --workspace                                     # Unit tests (52)
+cargo build -p alaya-types --target wasm32-unknown-unknown # WASM check (types)
+cargo build -p alaya-backends --target wasm32-unknown-unknown # WASM check (backends)
+cargo build -p alaya-core --target wasm32-unknown-unknown  # WASM check (core)
+cargo test --workspace                                     # Unit tests (156)
 cargo clippy --workspace -- -D warnings                    # Lint
 cargo fmt --all -- --check                                 # Format
 cargo run -p alaya-bridge                                  # Run bridge
@@ -96,8 +116,8 @@ These were discovered during integration testing and are NOT documented in Falko
 
 Per the design spec, remaining phases:
 
-1. **Backend HTTP clients** — Qdrant vector storage client, embedding service client, graph HTTP client (calls bridge)
-2. **alaya-core** — MemoryService orchestration: store, search, retrieve, delete, supersede, dedup
+1. ~~**Backend HTTP clients**~~ — Done (alaya-backends: QdrantClient, EmbeddingClient, GraphHttpClient)
+2. ~~**alaya-core**~~ — Done (MemoryService: all 9 tools, 7 algorithm modules)
 3. **MCP transport** — JSON-RPC 2.0 over fetch, tool definitions matching Python service
 4. **alaya-worker** — CF Worker entry point, wrangler.toml, KV bindings for config
 5. **Integration testing + deployment** — End-to-end against real backends
