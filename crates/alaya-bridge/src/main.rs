@@ -6,6 +6,7 @@ use tracing_subscriber::EnvFilter;
 mod auth;
 pub mod cypher;
 mod handlers;
+mod queue;
 pub mod resp;
 mod routes;
 
@@ -33,6 +34,9 @@ async fn main() {
 
     // Initialize schema (indexes) — best-effort; log errors but don't abort.
     init_schema(&state).await;
+
+    // Start background Hebbian write-queue consumer (LPUSH/BRPOP pattern).
+    queue::spawn_consumer(state.clone());
 
     let app = routes::router(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
