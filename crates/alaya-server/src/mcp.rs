@@ -3,7 +3,8 @@
 //! Single `/mcp` endpoint handles: initialize, tools/list, tools/call, ping.
 //! Stateless — each request is self-contained, no session management.
 
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
@@ -73,27 +74,34 @@ pub async fn mcp_handler(
     headers: HeaderMap,
     handle: axum::extract::State<ServiceHandle>,
     body: axum::body::Bytes,
-) -> Result<axum::Json<Value>, StatusCode> {
+) -> Response {
     // Validate Content-Type
     let ct = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if !ct.contains("application/json") {
-        return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     }
 
     // Body size check
     if body.len() > MAX_BODY_SIZE {
-        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
+
+    // Check if client wants SSE
+    let wants_sse = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .map(|a| a.contains("text/event-stream"))
+        .unwrap_or(false);
 
     // Parse JSON-RPC request
     let req: JsonRpcRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
             let resp = JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {e}"));
-            return Ok(axum::Json(serde_json::to_value(resp).unwrap()));
+            return make_response(resp, wants_sse);
         }
     };
 
@@ -104,7 +112,7 @@ pub async fn mcp_handler(
             -32600,
             "Invalid Request: jsonrpc must be \"2.0\"",
         );
-        return Ok(axum::Json(serde_json::to_value(resp).unwrap()));
+        return make_response(resp, wants_sse);
     }
 
     let id = req.id.unwrap_or(Value::Null);
@@ -116,7 +124,7 @@ pub async fn mcp_handler(
             "initialized" | "notifications/cancelled"
         )
     {
-        return Err(StatusCode::ACCEPTED);
+        return StatusCode::ACCEPTED.into_response();
     }
 
     let resp = match req.method.as_str() {
@@ -127,7 +135,29 @@ pub async fn mcp_handler(
         _ => JsonRpcResponse::error(id, -32601, format!("Method not found: {}", req.method)),
     };
 
-    Ok(axum::Json(serde_json::to_value(resp).unwrap()))
+    make_response(resp, wants_sse)
+}
+
+/// Format response as SSE or plain JSON depending on client preference.
+fn make_response(resp: JsonRpcResponse, sse: bool) -> Response {
+    let json_str = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
+
+    if sse {
+        let body = format!("event: message\ndata: {json_str}\n\n");
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            body,
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            json_str,
+        )
+            .into_response()
+    }
 }
 
 // ─── Method handlers ────────────────────────────────────────────────────────
@@ -136,9 +166,9 @@ fn handle_initialize(id: Value) -> JsonRpcResponse {
     JsonRpcResponse::success(
         id,
         json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": "2025-03-26",
             "capabilities": {
-                "tools": {}
+                "tools": { "listChanged": false }
             },
             "serverInfo": {
                 "name": "alaya",
@@ -495,7 +525,7 @@ mod tests {
     fn initialize_response() {
         let resp = handle_initialize(json!(1));
         let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!(v["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(v["result"]["protocolVersion"], "2025-03-26");
         assert!(v["result"]["capabilities"]["tools"].is_object());
         assert_eq!(v["result"]["serverInfo"]["name"], "alaya");
     }
