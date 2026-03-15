@@ -35,10 +35,18 @@ pub fn init_tracing() {
         let resource = Resource::builder().with_service_name(service_name).build();
 
         // OTLP HTTP exporter — reads endpoint + headers from env vars automatically
-        let exporter = SpanExporter::builder()
-            .with_http()
-            .build()
-            .expect("failed to create OTLP exporter");
+        let exporter = match SpanExporter::builder().with_http().build() {
+            Ok(e) => e,
+            Err(e) => {
+                // Fall back to stderr-only — don't crash the server over telemetry
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(fmt_layer)
+                    .init();
+                tracing::warn!("OTLP exporter failed ({e}), tracing to stderr only");
+                return;
+            }
+        };
 
         let provider = SdkTracerProvider::builder()
             .with_resource(resource)
