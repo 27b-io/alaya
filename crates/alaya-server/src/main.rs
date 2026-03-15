@@ -10,6 +10,7 @@
 //!   GET  /health       — Health check
 
 mod mcp;
+mod telemetry;
 
 use axum::{
     Json, Router,
@@ -177,12 +178,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "alaya_server=info".into()),
-        )
-        .init();
+    telemetry::init_tracing();
 
     let config = Config::from_env();
 
