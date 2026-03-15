@@ -1,8 +1,15 @@
-//! alaya-server — Native REST API wrapping MemoryService.
+//! alaya-server — Native REST + MCP server wrapping MemoryService.
 //!
 //! Uses a channel-based architecture: axum handlers send requests to a
 //! MemoryService running on a LocalSet (single-threaded, ?Send compatible).
 //! This bridges axum's Send+Sync requirement with the WASM-compat traits.
+//!
+//! Endpoints:
+//!   POST /mcp          — MCP Streamable HTTP (JSON-RPC 2.0)
+//!   POST /store, etc.  — Plain REST API (for Prajna and internal consumers)
+//!   GET  /health       — Health check
+
+mod mcp;
 
 use axum::{
     Json, Router,
@@ -60,7 +67,7 @@ fn env_or(key: &str, default: &str) -> String {
 // ─── Command channel ────────────────────────────────────────────────────────
 
 /// A command sent from axum handlers to the MemoryService worker.
-enum Cmd {
+pub(crate) enum Cmd {
     Health(oneshot::Sender<Value>),
     Store(StoreParams, oneshot::Sender<Value>),
     Search(SearchParams, oneshot::Sender<Value>),
@@ -74,8 +81,8 @@ enum Cmd {
 
 /// Handle for sending commands. Clone + Send + Sync (axum-compatible).
 #[derive(Clone)]
-struct ServiceHandle {
-    tx: mpsc::Sender<Cmd>,
+pub(crate) struct ServiceHandle {
+    pub(crate) tx: mpsc::Sender<Cmd>,
 }
 
 impl ServiceHandle {
@@ -241,6 +248,7 @@ fn main() {
         let handle = ServiceHandle { tx };
 
         let app = Router::new()
+            .route("/mcp", post(mcp::mcp_handler))
             .route("/health", get(health))
             .route("/store", post(store))
             .route("/search", post(search))
