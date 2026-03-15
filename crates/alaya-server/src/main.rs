@@ -178,8 +178,6 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 fn main() {
-    telemetry::init_tracing();
-
     let config = Config::from_env();
 
     // Multi-threaded runtime for axum; LocalSet thread for MemoryService
@@ -189,6 +187,8 @@ fn main() {
         .expect("failed to build runtime");
 
     rt.block_on(async move {
+        telemetry::init_tracing();
+
         let (tx, rx) = mpsc::channel::<Cmd>(256);
 
         // Spawn MemoryService on a dedicated thread with LocalSet
