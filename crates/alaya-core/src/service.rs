@@ -81,6 +81,10 @@ pub struct StoreParams {
     pub metadata: Option<HashMap<String, Value>>,
     pub client_hostname: Option<String>,
     pub summary: Option<String>,
+    /// If set, skip storage when an existing memory has cosine similarity >= threshold.
+    /// Enables Prajna's `store_if_novel()` pattern in a single call.
+    #[serde(default)]
+    pub dedup_threshold: Option<f64>,
 }
 
 /// Relation action parameters.
@@ -159,6 +163,38 @@ impl MemoryService {
         let embedding = embeddings.into_iter().next().ok_or_else(|| {
             AlayaError::Embedding("embedding service returned empty result".into())
         })?;
+
+        // Dedup-on-write: skip storage if a near-duplicate exists
+        if let Some(threshold) = params.dedup_threshold {
+            let dedup_filter = PayloadFilter {
+                exclude_superseded: true,
+                ..Default::default()
+            };
+            let similar = self
+                .vectors
+                .search_by_vector(&embedding, 1, Some(dedup_filter))
+                .await
+                .unwrap_or_default();
+
+            if let Some(top) = similar.first()
+                && top.score >= threshold
+            {
+                let mut result = HashMap::new();
+                result.insert("success".into(), serde_json::json!(true));
+                result.insert("duplicate".into(), serde_json::json!(true));
+                result.insert(
+                    "existing_hash".into(),
+                    serde_json::json!(top.memory.content_hash),
+                );
+                result.insert("similarity".into(), serde_json::json!(top.score));
+                result.insert("content_hash".into(), serde_json::json!(content_hash));
+                result.insert(
+                    "message".into(),
+                    serde_json::json!("Duplicate detected, storage skipped"),
+                );
+                return Ok(result);
+            }
+        }
 
         // Build memory struct
         let memory = Memory {

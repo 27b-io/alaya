@@ -57,6 +57,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "alaya-server"
+version = "0.1.0"
+dependencies = [
+ "alaya-backends",
+ "alaya-core",
+ "alaya-types",
+ "async-trait",
+ "axum",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "alaya-types"
 version = "0.1.0"
 dependencies = [
