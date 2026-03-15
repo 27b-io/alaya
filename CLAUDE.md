@@ -10,15 +10,16 @@ Rust rewrite of the mcp-memory-service API layer, targeting Cloudflare Workers (
 
 ## Architecture
 
-4-crate workspace (4 implemented, 1 future):
+5-crate workspace (5 implemented, 1 future):
 
 | Crate | Target | Status | Purpose |
 |-------|--------|--------|---------|
 | **alaya-types** | wasm32 + native | Done | Shared types: Memory, Edge, SearchMode, AlayaError, PayloadFilter |
 | **alaya-bridge** | native only | Done | FalkorDB typed RPC bridge (axum + redis), 18 endpoints |
 | **alaya-backends** | wasm32 + native | Done | Trait definitions + HTTP clients (Qdrant, Embedding, Graph) |
-| **alaya-core** | wasm32 + native | Done | MemoryService orchestration (all 9 MCP tools) |
-| **alaya-worker** | wasm32 | Future | CF Worker entry point + MCP transport |
+| **alaya-core** | wasm32 + native | Done | MemoryService orchestration (all 9 MCP tools), 5 integration tests |
+| **alaya-server** | native only | Done | REST API wrapping MemoryService (axum, 9 endpoints) |
+| **alaya-worker** | wasm32 | Future | CF Worker entry point + MCP Streamable HTTP transport |
 
 ```
 crates/
@@ -61,6 +62,8 @@ crates/
     ├── spaced_repetition.rs # Spacing quality + boost
     ├── provenance.rs    # Trust scoring, provenance building
     └── encoding_context.rs  # Context capture + similarity
+└── alaya-server/src/
+    └── main.rs          # Native REST server (axum, channel-based, 9 endpoints)
 ```
 
 ## Commands
@@ -118,6 +121,9 @@ Per the design spec, remaining phases:
 
 1. ~~**Backend HTTP clients**~~ — Done (alaya-backends: QdrantClient, EmbeddingClient, GraphHttpClient)
 2. ~~**alaya-core**~~ — Done (MemoryService: all 9 tools, 7 algorithm modules)
-3. **MCP transport** — JSON-RPC 2.0 over fetch, tool definitions matching Python service
-4. **alaya-worker** — CF Worker entry point, wrangler.toml, KV bindings for config
-5. **Integration testing + deployment** — End-to-end against real backends
+3. ~~**Native REST server**~~ — Done (alaya-server: 9 REST endpoints, channel-based axum)
+4. ~~**Integration testing**~~ — Done (5 tests against real Qdrant + TEI on lab k3s)
+5. **MCP transport** — JSON-RPC 2.0 over fetch, tool definitions matching Python service
+6. **alaya-worker** — CF Worker entry point, wrangler.toml, KV bindings for config
+7. **Prajna integration** — Replace writer.rs qdrant-client with Ālaya HTTP calls
+8. **Deployment** — k3s manifests for bridge + server, Cloudflare Worker for edge
