@@ -1,8 +1,10 @@
 # CLAUDE.md
 
-Ālaya — Rust/WASM MCP Memory Worker
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Rust rewrite of the mcp-memory-service API layer, targeting Cloudflare Workers (WASM).
+Ālaya — Rust MCP Memory Service
+
+Rust rewrite of the mcp-memory-service API layer. Deployed on k3s as a native server (not CF Workers — deferred). Shares Qdrant + FalkorDB backends with the Python service during migration.
 
 ## Spec
 
@@ -10,7 +12,7 @@ Rust rewrite of the mcp-memory-service API layer, targeting Cloudflare Workers (
 
 ## Architecture
 
-5-crate workspace (5 implemented, 1 future):
+6-crate workspace (5 implemented, 1 deferred):
 
 | Crate | Target | Status | Purpose |
 |-------|--------|--------|---------|
@@ -18,8 +20,8 @@ Rust rewrite of the mcp-memory-service API layer, targeting Cloudflare Workers (
 | **alaya-bridge** | native only | Done | FalkorDB typed RPC bridge (axum + redis), 18 endpoints |
 | **alaya-backends** | wasm32 + native | Done | Trait definitions + HTTP clients (Qdrant, Embedding, Graph) |
 | **alaya-core** | wasm32 + native | Done | MemoryService orchestration (all 9 MCP tools), 5 integration tests |
-| **alaya-server** | native only | Done | REST API wrapping MemoryService (axum, 9 endpoints) |
-| **alaya-worker** | wasm32 | Future | CF Worker entry point + MCP Streamable HTTP transport |
+| **alaya-server** | native only | Done | REST API + MCP Streamable HTTP (axum, channel-based, 9 endpoints + /mcp) |
+| **alaya-worker** | wasm32 | Deferred | CF Worker entry point (reqwest-wasm unreliable on Workers, native server sufficient) |
 
 ```
 crates/
@@ -51,19 +53,21 @@ crates/
 │   ├── qdrant.rs        # QdrantClient — Qdrant REST API (WASM-compat)
 │   ├── embedding.rs     # EmbeddingClient — OpenAI-compat /v1/embeddings
 │   └── graph.rs         # GraphHttpClient — bridge HTTP wrapper (3 trait impls)
-└── alaya-core/src/
-    ├── lib.rs           # Re-exports
-    ├── service.rs       # MemoryService — all 9 MCP tools orchestrated
-    ├── hashing.rs       # SHA-256 content hashing
-    ├── hybrid_search.rs # RRF, adaptive alpha, keyword extraction, recency decay
-    ├── interference.rs  # Contradiction detection (negation, antonym, temporal)
-    ├── salience.rs      # Salience scoring + boost
-    ├── deduplication.rs # Cosine similarity, UnionFind, duplicate clustering
-    ├── spaced_repetition.rs # Spacing quality + boost
-    ├── provenance.rs    # Trust scoring, provenance building
-    └── encoding_context.rs  # Context capture + similarity
+├── alaya-core/src/
+│   ├── lib.rs           # Re-exports
+│   ├── service.rs       # MemoryService — all 9 MCP tools orchestrated
+│   ├── hashing.rs       # SHA-256 content hashing
+│   ├── hybrid_search.rs # RRF, adaptive alpha, keyword extraction, recency decay
+│   ├── interference.rs  # Contradiction detection (negation, antonym, temporal)
+│   ├── salience.rs      # Salience scoring + boost
+│   ├── deduplication.rs # Cosine similarity, UnionFind, duplicate clustering
+│   ├── spaced_repetition.rs # Spacing quality + boost
+│   ├── provenance.rs    # Trust scoring, provenance building
+│   └── encoding_context.rs  # Context capture + similarity
 └── alaya-server/src/
-    └── main.rs          # Native REST server (axum, channel-based, 9 endpoints)
+    ├── main.rs          # Native REST + MCP server (axum, channel-based)
+    ├── mcp.rs           # MCP Streamable HTTP (JSON-RPC 2.0, SSE, protocol 2025-03-26)
+    └── telemetry.rs     # OTLP tracing to Phoenix (optional, graceful fallback)
 ```
 
 ## Commands
@@ -73,28 +77,71 @@ cargo build --workspace                                    # Build all (native)
 cargo build -p alaya-types --target wasm32-unknown-unknown # WASM check (types)
 cargo build -p alaya-backends --target wasm32-unknown-unknown # WASM check (backends)
 cargo build -p alaya-core --target wasm32-unknown-unknown  # WASM check (core)
-cargo test --workspace                                     # Unit tests (156)
+cargo test --workspace                                     # Unit tests (168)
+cargo test -p alaya-core --test integration                # Skip (needs backends)
 cargo clippy --workspace -- -D warnings                    # Lint
 cargo fmt --all -- --check                                 # Format
-cargo run -p alaya-bridge                                  # Run bridge
+cargo run -p alaya-bridge                                  # Run bridge (needs REDIS_URL)
+cargo run -p alaya-server                                  # Run server (needs QDRANT_URL + EMBEDDING_URL + GRAPH_URL)
 
-# Integration tests (need FalkorDB)
-docker run -d --name falkordb -p 6379:6379 falkordb/falkordb:latest
+# Integration tests (need real backends — lab k3s cluster IPs or port-forwards)
+QDRANT_URL=http://10.43.119.230:6333 \
+EMBEDDING_URL=http://10.43.242.167 \
+  cargo test -p alaya-core --test integration -- --test-threads=1
+
+# Bridge integration tests (need FalkorDB)
 REDIS_URL=redis://localhost:6379 cargo test -p alaya-bridge --test '*' -- --test-threads=1
 ```
 
 ## Quality Gates
 
-Every commit must pass: `cargo fmt`, `cargo clippy -D warnings`, `cargo test`
+Every commit must pass: `cargo fmt`, `cargo clippy -D warnings`, `cargo test`, WASM gate.
+Pre-commit hooks via prek enforce all four + gitleaks + trailing whitespace.
 
-## Environment Variables (Bridge)
+## Deployment (lab k3s)
 
+Both services deployed in `mcp` namespace via `lab/k8s/mcp/alaya.yaml`:
+
+| Pod | Image | Port | Connects to |
+|-----|-------|------|-------------|
+| alaya-bridge | ghcr.io/27b-io/alaya:latest | 8080 (svc: 3000) | FalkorDB (recsys:6379) |
+| alaya-server | ghcr.io/27b-io/alaya:latest | 3001 | Qdrant (mcp:6333), TEI (mcp:80), bridge (mcp:3000) |
+
+CI pushes to ghcr.io on every main push. Network policies restrict egress to named backends + DNS.
+
+## Environment Variables
+
+### Bridge
 ```bash
-REDIS_URL=redis://localhost:6379    # FalkorDB connection
-GRAPH_NAME=memory                   # FalkorDB graph name (default: memory)
-GRAPH_API_KEY=                      # Bearer token (empty = no auth)
-RUST_LOG=alaya_bridge=info          # Logging level
+REDIS_URL=redis://falkordb.recsys.svc:6379
+GRAPH_NAME=memory
+GRAPH_API_KEY=               # empty = no auth
+RUST_LOG=alaya_bridge=info
 ```
+
+### Server
+```bash
+QDRANT_URL=http://qdrant:6333            # required
+QDRANT_COLLECTION=memories_arctic1024    # default
+EMBEDDING_URL=http://tei:80              # required
+EMBEDDING_MODEL=Snowflake/snowflake-arctic-embed-l-v2.0
+EMBEDDING_DIMENSIONS=1024
+GRAPH_URL=http://alaya-bridge:3000       # required
+GRAPH_API_KEY=
+LISTEN_ADDR=0.0.0.0:3001
+RUST_LOG=alaya_server=info
+OTEL_EXPORTER_OTLP_ENDPOINT=http://phoenix-svc.recsys.svc:6006  # optional
+OTEL_SERVICE_NAME=alaya-server
+```
+
+## Key Design Decisions
+
+- **`?Send` traits** — All backend traits use `#[async_trait(?Send)]` for WASM compat. The native server bridges this via a channel-based architecture: axum (multi-threaded, Send+Sync) sends commands over mpsc to MemoryService running on a dedicated LocalSet thread.
+- **UUID from content_hash** — `Uuid::parse_str(&hash[..32])` — takes first 32 hex chars, NOT uuid5. Must match Python `uuid.UUID(hash[:32])` for data compatibility.
+- **Superseded filtering** — Done at application layer, NOT Qdrant filter level. Qdrant's `is_null` on nested payload fields is unreliable without explicit indexes.
+- **Graph operations are non-fatal** — All graph calls (spreading activation, Hebbian, interference) use `unwrap_or_default()`. Service degrades gracefully when FalkorDB is down.
+- **reqwest default-features = false** — Workspace-level and per-crate. Uses `rustls-tls` on native, bare `json` on wasm32. Prevents OpenSSL dependency in containers.
+- **MCP protocol 2025-03-26** — SSE response format (`event: message\ndata: {...}\n\n`) when client sends `Accept: text/event-stream`. Plain JSON otherwise.
 
 ## Conventions
 
@@ -117,13 +164,12 @@ These were discovered during integration testing and are NOT documented in Falko
 
 ## Implementation Roadmap
 
-Per the design spec, remaining phases:
-
 1. ~~**Backend HTTP clients**~~ — Done (alaya-backends: QdrantClient, EmbeddingClient, GraphHttpClient)
 2. ~~**alaya-core**~~ — Done (MemoryService: all 9 tools, 7 algorithm modules)
 3. ~~**Native REST server**~~ — Done (alaya-server: 9 REST endpoints, channel-based axum)
 4. ~~**Integration testing**~~ — Done (5 tests against real Qdrant + TEI on lab k3s)
-5. **MCP transport** — JSON-RPC 2.0 over fetch, tool definitions matching Python service
-6. **alaya-worker** — CF Worker entry point, wrangler.toml, KV bindings for config
-7. **Prajna integration** — Replace writer.rs qdrant-client with Ālaya HTTP calls
-8. **Deployment** — k3s manifests for bridge + server, Cloudflare Worker for edge
+5. ~~**MCP transport**~~ — Done (JSON-RPC 2.0 + SSE, protocol 2025-03-26, 9 tool schemas)
+6. ~~**Deployment**~~ — Done (k3s manifests, CI → ghcr.io, network policies)
+7. **OTLP tracing** — Wired but degraded (reqwest async client issue in container, falls back to stderr)
+8. **Prajna integration** — Replace writer.rs qdrant-client with Ālaya HTTP calls
+9. **cachekit-rs integration** — Embedding cache for edge performance (immutable, content-addressed)
