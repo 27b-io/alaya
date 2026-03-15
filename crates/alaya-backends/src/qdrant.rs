@@ -99,13 +99,9 @@ fn build_filter(filter: &PayloadFilter) -> Value {
         }
     }
 
-    if filter.exclude_superseded {
-        must.push(json!({
-            "is_null": {
-                "key": "metadata.superseded_by"
-            }
-        }));
-    }
+    // Note: exclude_superseded is handled at the application layer (MemoryService)
+    // after retrieval, not at the Qdrant filter level. Qdrant's nested payload
+    // filtering for "field does not exist" is unreliable without explicit indexes.
 
     if let Some(min_trust) = filter.min_trust_score {
         must.push(json!({
@@ -927,14 +923,14 @@ mod tests {
     }
 
     #[test]
-    fn build_filter_superseded() {
+    fn build_filter_superseded_is_noop() {
+        // Superseded filtering happens at application layer, not Qdrant
         let f = PayloadFilter {
             exclude_superseded: true,
             ..Default::default()
         };
         let filter = build_filter(&f);
-        let must = filter["must"].as_array().unwrap();
-        assert!(must.iter().any(|c| c.get("is_null").is_some()));
+        assert_eq!(filter, json!({}));
     }
 
     #[test]

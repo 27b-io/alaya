@@ -50,9 +50,11 @@ dependencies = [
  "async-trait",
  "futures",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
  "tracing",
 ]
 

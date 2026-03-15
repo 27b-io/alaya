@@ -13,3 +13,7 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 regex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
