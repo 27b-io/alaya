@@ -41,17 +41,23 @@ Two implementations, gated by `cfg(target_arch)`:
 | `ReqwestHttpClient` | native | `reqwest::Client` | default |
 | `WorkerHttpClient` | wasm32 | `worker::Fetch` | `workers` |
 
+`WorkerHttpClient` maps all five HTTP methods including `Method::Post` (the cachekit-rs reference only needed GET/PUT/DELETE/HEAD — Ālaya uses POST extensively for Qdrant search, bridge calls, and embeddings).
+
 ### Backend Client Refactor
 
-All three clients (`QdrantClient`, `EmbeddingClient`, `GraphHttpClient`) change from owning a `reqwest::Client` to accepting `Box<dyn HttpClient>`:
+All three clients (`QdrantClient`, `EmbeddingClient`, `GraphHttpClient`) change from owning a `reqwest::Client` to accepting `Arc<dyn HttpClient>`:
 
 ```rust
+use std::sync::Arc;
+
 pub struct QdrantClient {
-    http: Box<dyn HttpClient>,  // was: reqwest::Client
+    http: Arc<dyn HttpClient>,  // was: reqwest::Client
     base_url: String,
     collection: String,
 }
 ```
+
+`Arc<dyn HttpClient>` instead of `Box<dyn HttpClient>` because multiple backend clients share the same HTTP client instance. `Arc::clone()` is cheap; on Workers (single-threaded) the atomic refcount cost is zero.
 
 HTTP call sites change from reqwest convenience methods to explicit serialization:
 
@@ -73,11 +79,12 @@ The logic (filter construction, UUID generation, response parsing) stays identic
 
 Move reusable MCP protocol logic from `alaya-server/src/mcp.rs` into `alaya-core/src/mcp.rs`:
 
-- `tool_schemas() -> Value` — 9 tool JSON schemas
-- `handle_jsonrpc(svc: &MemoryService, body: &[u8], wants_sse: bool) -> Vec<u8>` — full JSON-RPC parse + dispatch + format
-- `dispatch_tool(svc: &MemoryService, name: &str, args: Value) -> Result<Value>` — tool name → MemoryService method
+- `tool_schemas() -> Value` — 9 tool JSON schemas (pure data)
+- `dispatch_tool_direct(svc: &MemoryService, name: &str, args: Value) -> Result<Value>` — direct tool dispatch, calls MemoryService methods synchronously. Used by Worker.
+- `format_jsonrpc_response(id: Value, result: Result<Value>) -> Vec<u8>` — JSON-RPC 2.0 response formatting
+- `parse_jsonrpc_request(body: &[u8]) -> Result<(Value, String, Option<Value>)>` — parse id, method, params
 
-`alaya-server` calls `handle_jsonrpc` via the channel bridge (unchanged behavior). `alaya-worker` calls it directly (single-threaded, no channel needed).
+`alaya-server` keeps its channel-based `dispatch_tool` wrapper that sends `Cmd` over mpsc — it calls `dispatch_tool_direct` inside the `service_worker` loop. `alaya-worker` calls `dispatch_tool_direct` directly (single-threaded, no channel needed).
 
 ### Worker Entry Point
 
@@ -85,6 +92,7 @@ New crate `crates/alaya-worker/`:
 
 ```rust
 use worker::*;
+use std::sync::Arc;
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -92,29 +100,62 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return Response::error("Not Found", 404);
     }
 
-    let http = Box::new(WorkerHttpClient::new());
-    let qdrant = QdrantClient::new(http.clone(), env.var("QDRANT_URL")?, ...);
-    let embeddings = EmbeddingClient::new(http.clone(), env.var("EMBEDDING_URL")?, ...);
-    let graph = GraphHttpClient::new(http.clone(), env.var("GRAPH_URL")?, ...);
-    let svc = MemoryService::new(Box::new(qdrant), Box::new(embeddings), ...);
+    let http: Arc<dyn HttpClient> = Arc::new(WorkerHttpClient::new());
+
+    let qdrant_url = env.var("QDRANT_URL")?.to_string();
+    let collection = env.var("QDRANT_COLLECTION")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| "memories_arctic1024".into());
+    let embedding_url = env.var("EMBEDDING_URL")?.to_string();
+    let graph_url = env.var("GRAPH_URL")?.to_string();
+    let graph_api_key = env.var("GRAPH_API_KEY")
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+
+    let qdrant = QdrantClient::new(http.clone(), qdrant_url, collection, None);
+    let embeddings = EmbeddingClient::new(http.clone(), embedding_url, ...);
+    let graph1 = GraphHttpClient::new(http.clone(), graph_url.clone(), &graph_api_key);
+    let graph2 = GraphHttpClient::new(http.clone(), graph_url.clone(), &graph_api_key);
+    let graph3 = GraphHttpClient::new(http.clone(), graph_url, &graph_api_key);
+
+    let svc = MemoryService::new(
+        Box::new(qdrant),
+        Box::new(embeddings),
+        Box::new(graph1),   // GraphService
+        Box::new(graph2),   // HebbianService
+        Box::new(graph3),   // ConsolidationService
+    );
 
     let body = req.bytes().await?;
-    let wants_sse = req.headers().get("accept")?.contains("text/event-stream");
-    let response_bytes = alaya_core::mcp::handle_jsonrpc(&svc, &body, wants_sse).await;
+    let wants_sse = req.headers().get("Accept")
+        .map(|a| a.contains("text/event-stream"))
+        .unwrap_or(false);
 
+    let (id, method, params) = parse_jsonrpc_request(&body)?;
+    let result = match method.as_str() {
+        "initialize" => Ok(initialize_response()),
+        "tools/list" => Ok(tool_schemas_response()),
+        "tools/call" => dispatch_tool_direct(&svc, params).await,
+        "ping" => Ok(json!({})),
+        _ => Err(method_not_found(&method)),
+    };
+
+    let response_bytes = format_jsonrpc_response(id, result, wants_sse);
     Response::from_bytes(response_bytes)
 }
 ```
 
+MemoryService is constructed per-request. This is cheap — no connection pools, no state, just struct allocation with `Arc` references to the shared HTTP client. The Worker runtime reuses the isolate across requests, but we don't rely on that.
+
 Config from Worker environment bindings (same var names as alaya-server):
 - `QDRANT_URL`, `QDRANT_COLLECTION`, `EMBEDDING_URL`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `GRAPH_URL`, `GRAPH_API_KEY`
 
-### SystemTime Fix
+### Timestamp Utility
 
-`current_timestamp()` in `alaya-core/src/service.rs` uses `std::time::SystemTime::now()`. On Workers, use `js_sys::Date::now()`:
+`std::time::SystemTime::now()` appears in both `alaya-core/src/service.rs` and `alaya-backends/src/qdrant.rs` (in `increment_access_count`). Extract a shared utility into `alaya-types/src/time.rs`:
 
 ```rust
-fn current_timestamp() -> f64 {
+pub fn current_timestamp() -> f64 {
     #[cfg(target_arch = "wasm32")]
     { js_sys::Date::now() / 1000.0 }
 
@@ -126,7 +167,13 @@ fn current_timestamp() -> f64 {
 }
 ```
 
-Add `js-sys` as conditional dependency: `[target.'cfg(target_arch = "wasm32")'.dependencies] js-sys = "0.3"`.
+Add `js-sys` as conditional dependency on `alaya-types`:
+```toml
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+```
+
+Both `alaya-core` and `alaya-backends` import `alaya_types::time::current_timestamp()`.
 
 ### Backend Topology
 
@@ -146,10 +193,10 @@ Tunnel hostnames configured in `wrangler.toml` vars. Backends unchanged.
 
 ### In scope
 - `HttpClient` trait + `ReqwestHttpClient` + `WorkerHttpClient`
-- Refactor 3 backend clients to use `HttpClient`
-- Extract MCP dispatch into `alaya-core/src/mcp.rs`
+- Refactor 3 backend clients to use `Arc<dyn HttpClient>`
+- Extract MCP dispatch into `alaya-core/src/mcp.rs` (direct + channel variants)
 - `alaya-worker` crate with `#[event(fetch)]` entry
-- `js-sys` conditional dep for WASM timestamps
+- `current_timestamp()` utility in `alaya-types` with `js-sys` conditional dep
 - `wrangler.toml` for deployment
 - WASM compile gate in CI
 
@@ -158,7 +205,7 @@ Tunnel hostnames configured in `wrangler.toml` vars. Backends unchanged.
 - Prajna integration
 - OTLP tracing on Worker (no OTel WASM support)
 - Durable Objects / KV state
-- Authentication (tunnel provides network-level security for Topology A)
+- Authentication (tunnel provides network-level security for Topology A; if Worker is exposed on a public route, auth becomes critical — separate spec)
 
 ## Testing
 
@@ -171,20 +218,22 @@ Tunnel hostnames configured in `wrangler.toml` vars. Backends unchanged.
 
 | File | Change |
 |------|--------|
+| `crates/alaya-types/src/time.rs` | **New** — `current_timestamp()` with cfg(wasm32) branch |
+| `crates/alaya-types/src/lib.rs` | Add `pub mod time` |
+| `crates/alaya-types/Cargo.toml` | Add `js-sys` conditional dep |
 | `crates/alaya-backends/src/http.rs` | **New** — HttpClient trait, Method, HttpResponse |
 | `crates/alaya-backends/src/http_reqwest.rs` | **New** — ReqwestHttpClient impl |
-| `crates/alaya-backends/src/http_worker.rs` | **New** — WorkerHttpClient impl (cfg wasm32) |
+| `crates/alaya-backends/src/http_worker.rs` | **New** — WorkerHttpClient impl (cfg wasm32, feature workers) |
 | `crates/alaya-backends/src/lib.rs` | Add `pub mod http` + conditional re-exports |
-| `crates/alaya-backends/src/qdrant.rs` | Replace `reqwest::Client` with `Box<dyn HttpClient>` |
+| `crates/alaya-backends/src/qdrant.rs` | Replace `reqwest::Client` with `Arc<dyn HttpClient>` |
 | `crates/alaya-backends/src/embedding.rs` | Same refactor |
 | `crates/alaya-backends/src/graph.rs` | Same refactor |
-| `crates/alaya-backends/Cargo.toml` | Add `worker` feature flag + conditional deps |
-| `crates/alaya-core/src/mcp.rs` | **New** — extracted MCP dispatch logic |
-| `crates/alaya-core/src/service.rs` | `current_timestamp()` cfg branch |
+| `crates/alaya-backends/Cargo.toml` | Add `workers` feature flag + conditional deps |
+| `crates/alaya-core/src/mcp.rs` | **New** — tool_schemas, dispatch_tool_direct, JSON-RPC helpers |
+| `crates/alaya-core/src/service.rs` | Use `alaya_types::time::current_timestamp()` |
 | `crates/alaya-core/src/lib.rs` | Add `pub mod mcp` |
-| `crates/alaya-core/Cargo.toml` | Add `js-sys` conditional dep |
-| `crates/alaya-server/src/mcp.rs` | Delegate to `alaya_core::mcp` |
-| `crates/alaya-server/src/main.rs` | Update client construction |
+| `crates/alaya-server/src/mcp.rs` | Delegate to `alaya_core::mcp` for schemas + dispatch |
+| `crates/alaya-server/src/main.rs` | Update client construction with Arc<dyn HttpClient> |
 | `crates/alaya-worker/Cargo.toml` | **New** — worker crate |
 | `crates/alaya-worker/src/lib.rs` | **New** — Worker entry point |
 | `Cargo.toml` | Add `worker` to workspace deps |
