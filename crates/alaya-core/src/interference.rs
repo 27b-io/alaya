@@ -219,9 +219,10 @@ fn contains_word(text: &str, word: &str) -> bool {
 }
 
 fn count_negation_words(text: &str) -> usize {
+    let lower = text.to_lowercase();
     NEGATION_WORDS
         .iter()
-        .filter(|&&word| text.contains(word))
+        .filter(|&&word| contains_word(&lower, word))
         .count()
 }
 
@@ -361,5 +362,17 @@ mod tests {
         let existing = "This operation is safe with proper input";
         let result = check_antonym_pairs(new, existing);
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn negation_count_does_not_match_substrings() {
+        let count = count_negation_words("the notation was clear");
+        assert_eq!(count, 0, "should not match 'not' inside 'notation'");
+    }
+
+    #[test]
+    fn negation_count_matches_whole_words() {
+        let count = count_negation_words("this is not valid and cannot work");
+        assert_eq!(count, 2); // "not" and "cannot"
     }
 }
