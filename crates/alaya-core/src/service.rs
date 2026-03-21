@@ -839,32 +839,39 @@ impl MemoryService {
     pub async fn memory_contradictions(&self, limit: usize) -> Result<Value> {
         let pairs = self.graph.get_all_contradictions(limit).await?;
 
-        // Enrich with content previews
+        // Batch fetch all referenced memories (was: N+1 sequential queries)
+        let all_hashes: Vec<&str> = pairs
+            .iter()
+            .flat_map(|p| [p.memory_a_hash.as_str(), p.memory_b_hash.as_str()])
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let memories = self
+            .vectors
+            .get_batch(&all_hashes)
+            .await
+            .unwrap_or_default();
+        let lookup: std::collections::HashMap<&str, &Memory> = memories
+            .iter()
+            .map(|m| (m.content_hash.as_str(), m))
+            .collect();
+
         let mut enriched: Vec<Value> = Vec::new();
         for pair in &pairs {
-            let a = self
-                .vectors
-                .get_by_hash(&pair.memory_a_hash)
-                .await
-                .ok()
-                .flatten();
-            let b = self
-                .vectors
-                .get_by_hash(&pair.memory_b_hash)
-                .await
-                .ok()
-                .flatten();
+            let a = lookup.get(pair.memory_a_hash.as_str());
+            let b = lookup.get(pair.memory_b_hash.as_str());
 
             enriched.push(serde_json::json!({
                 "memory_a_hash": pair.memory_a_hash,
                 "memory_b_hash": pair.memory_b_hash,
                 "confidence": pair.confidence,
-                "memory_a_content": a.as_ref().map(|m| truncate(&m.content, 200)),
-                "memory_b_content": b.as_ref().map(|m| truncate(&m.content, 200)),
-                "memory_a_superseded": a.as_ref().and_then(|m| {
+                "memory_a_content": a.map(|m| truncate(&m.content, 200)),
+                "memory_b_content": b.map(|m| truncate(&m.content, 200)),
+                "memory_a_superseded": a.and_then(|m| {
                     m.metadata.as_ref()?.get("superseded_by")
                 }).is_some(),
-                "memory_b_superseded": b.as_ref().and_then(|m| {
+                "memory_b_superseded": b.and_then(|m| {
                     m.metadata.as_ref()?.get("superseded_by")
                 }).is_some(),
             }));
