@@ -1033,10 +1033,38 @@ fn format_memory_result(memory: &Memory, score: f64) -> Value {
     })
 }
 
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+fn truncate(s: &str, max_chars: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len])
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{truncated}...")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_handles_multibyte_utf8() {
+        let chinese = "你好世界测试内容";
+        let result = truncate(chinese, 4);
+        assert!(result.ends_with("..."));
+        assert_eq!(result, "你好世界...");
+    }
+
+    #[test]
+    fn truncate_handles_emoji() {
+        let emoji = "🎉🎊🎈🎁🎂";
+        let result = truncate(emoji, 3);
+        assert!(result.ends_with("..."));
+        assert_eq!(result, "🎉🎊🎈...");
+    }
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate("hello", 10), "hello");
     }
 }
