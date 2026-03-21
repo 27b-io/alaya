@@ -58,11 +58,17 @@ impl QdrantClient {
 ///
 /// Python takes the first 32 hex chars and formats as UUID-4 style.
 /// Must match exactly for data compatibility.
-fn hash_to_uuid(content_hash: &str) -> String {
+fn hash_to_uuid(content_hash: &str) -> Result<String> {
+    if content_hash.len() < 32 {
+        return Err(AlayaError::Validation(format!(
+            "content_hash too short: {} chars (need 64)",
+            content_hash.len()
+        )));
+    }
     let hex = &content_hash[..32];
     uuid::Uuid::parse_str(hex)
-        .expect("content_hash should contain valid hex")
-        .to_string()
+        .map(|u| u.to_string())
+        .map_err(|e| AlayaError::Validation(format!("invalid content_hash hex: {e}")))
 }
 
 // ─── Filter construction ────────────────────────────────────────────────────
@@ -237,7 +243,7 @@ async fn qdrant_error(resp: reqwest::Response) -> AlayaError {
 #[async_trait(?Send)]
 impl VectorStorage for QdrantClient {
     async fn store(&self, memory: &Memory) -> Result<(bool, String)> {
-        let point_id = hash_to_uuid(&memory.content_hash);
+        let point_id = hash_to_uuid(&memory.content_hash)?;
         let embedding = memory
             .embedding
             .as_ref()
@@ -270,7 +276,7 @@ impl VectorStorage for QdrantClient {
     }
 
     async fn get_by_hash(&self, content_hash: &str) -> Result<Option<Memory>> {
-        let point_id = hash_to_uuid(content_hash);
+        let point_id = hash_to_uuid(content_hash)?;
 
         let body = json!({
             "ids": [point_id],
@@ -311,7 +317,10 @@ impl VectorStorage for QdrantClient {
             return Ok(Vec::new());
         }
 
-        let ids: Vec<String> = hashes.iter().map(|h| hash_to_uuid(h)).collect();
+        let ids: Vec<String> = hashes
+            .iter()
+            .map(|h| hash_to_uuid(h))
+            .collect::<Result<Vec<String>>>()?;
 
         let body = json!({
             "ids": ids,
@@ -348,7 +357,7 @@ impl VectorStorage for QdrantClient {
     }
 
     async fn delete(&self, content_hash: &str) -> Result<bool> {
-        let point_id = hash_to_uuid(content_hash);
+        let point_id = hash_to_uuid(content_hash)?;
 
         let body = json!({
             "points": [point_id]
@@ -373,7 +382,7 @@ impl VectorStorage for QdrantClient {
     }
 
     async fn update_metadata(&self, content_hash: &str, updates: MetadataUpdate) -> Result<()> {
-        let point_id = hash_to_uuid(content_hash);
+        let point_id = hash_to_uuid(content_hash)?;
 
         let mut payload = serde_json::Map::new();
         if let Some(ref sb) = updates.superseded_by {
@@ -763,7 +772,7 @@ impl VectorStorage for QdrantClient {
         let mut timestamps = memory.access_timestamps;
         timestamps.push(now);
 
-        let point_id = hash_to_uuid(content_hash);
+        let point_id = hash_to_uuid(content_hash)?;
         let body = json!({
             "payload": {
                 "access_count": new_count,
@@ -868,7 +877,7 @@ mod tests {
     fn hash_to_uuid_matches_python() {
         // Python: uuid.UUID("a" * 32) = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
         let hash = "a".repeat(64);
-        let uuid = hash_to_uuid(&hash);
+        let uuid = hash_to_uuid(&hash).unwrap();
         assert_eq!(uuid, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
     }
 
@@ -876,8 +885,20 @@ mod tests {
     fn hash_to_uuid_real_hash() {
         // SHA-256 of "test" starts with "9f86d081..."
         let hash = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
-        let uuid = hash_to_uuid(hash);
+        let uuid = hash_to_uuid(hash).unwrap();
         assert_eq!(uuid, "9f86d081-884c-7d65-9a2f-eaa0c55ad015");
+    }
+
+    #[test]
+    fn hash_to_uuid_short_input_returns_error() {
+        let result = hash_to_uuid("abc");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn hash_to_uuid_non_hex_returns_error() {
+        let result = hash_to_uuid(&"zz".repeat(32));
+        assert!(result.is_err());
     }
 
     #[test]
