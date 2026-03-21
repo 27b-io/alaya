@@ -14,6 +14,59 @@ use alaya_core::service::{RelationParams, SearchParams, StoreParams};
 
 use crate::{Cmd, ServiceHandle};
 
+// ─── Typed param structs for MCP dispatch ───────────────────────────────────
+
+#[derive(Deserialize)]
+struct DeleteParams {
+    content_hash: String,
+}
+
+#[derive(Deserialize)]
+struct SupersedeParams {
+    old_id: String,
+    new_id: String,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Deserialize)]
+struct ContradictionsParams {
+    #[serde(default = "default_contradictions_limit")]
+    limit: usize,
+}
+fn default_contradictions_limit() -> usize {
+    20
+}
+
+#[derive(Deserialize)]
+struct FindDuplicatesParams {
+    #[serde(default = "default_find_dup_threshold")]
+    similarity_threshold: f64,
+    #[serde(default = "default_find_dup_limit")]
+    limit: usize,
+    #[serde(default)]
+    strategy: CanonicalStrategy,
+}
+fn default_find_dup_threshold() -> f64 {
+    0.95
+}
+fn default_find_dup_limit() -> usize {
+    100
+}
+
+#[derive(Deserialize)]
+struct MergeDuplicatesParams {
+    canonical_hash: String,
+    duplicate_hashes: Vec<String>,
+    #[serde(default = "default_merge_reason")]
+    reason: String,
+    #[serde(default)]
+    dry_run: bool,
+}
+fn default_merge_reason() -> String {
+    "Merged by deduplication".into()
+}
+
 // ─── JSON-RPC types ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -259,15 +312,15 @@ async fn dispatch_tool(
                 .map_err(|_| (-32000, "Service dropped".to_string()))
         }
         "delete_memory" => {
-            let hash = args
-                .get("content_hash")
-                .and_then(|v| v.as_str())
-                .ok_or((-32602, "Missing content_hash".to_string()))?
-                .to_string();
+            let p: DeleteParams = serde_json::from_value(args)
+                .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::Delete { hash, reply: tx })
+                .send(Cmd::Delete {
+                    hash: p.content_hash,
+                    reply: tx,
+                })
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await
@@ -296,28 +349,15 @@ async fn dispatch_tool(
                 .map_err(|_| (-32000, "Service dropped".to_string()))
         }
         "memory_supersede" => {
-            let old = args
-                .get("old_id")
-                .and_then(|v| v.as_str())
-                .ok_or((-32602, "Missing old_id".to_string()))?
-                .to_string();
-            let new = args
-                .get("new_id")
-                .and_then(|v| v.as_str())
-                .ok_or((-32602, "Missing new_id".to_string()))?
-                .to_string();
-            let reason = args
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let p: SupersedeParams = serde_json::from_value(args)
+                .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
                 .send(Cmd::Supersede {
-                    old_hash: old,
-                    new_hash: new,
-                    reason,
+                    old_hash: p.old_id,
+                    new_hash: p.new_id,
+                    reason: p.reason,
                     reply: tx,
                 })
                 .await
@@ -326,33 +366,30 @@ async fn dispatch_tool(
                 .map_err(|_| (-32000, "Service dropped".to_string()))
         }
         "memory_contradictions" => {
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+            let p: ContradictionsParams = serde_json::from_value(args)
+                .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::Contradictions { limit, reply: tx })
+                .send(Cmd::Contradictions {
+                    limit: p.limit,
+                    reply: tx,
+                })
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await
                 .map_err(|_| (-32000, "Service dropped".to_string()))
         }
         "find_duplicates" => {
-            let threshold = args
-                .get("similarity_threshold")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.95);
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
-            let strategy: CanonicalStrategy = args
-                .get("strategy")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
+            let p: FindDuplicatesParams = serde_json::from_value(args)
+                .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
                 .send(Cmd::FindDuplicates {
-                    threshold,
-                    limit,
-                    strategy,
+                    threshold: p.similarity_threshold,
+                    limit: p.limit,
+                    strategy: p.strategy,
                     reply: tx,
                 })
                 .await
@@ -361,32 +398,16 @@ async fn dispatch_tool(
                 .map_err(|_| (-32000, "Service dropped".to_string()))
         }
         "merge_duplicates" => {
-            let canonical = args
-                .get("canonical_hash")
-                .and_then(|v| v.as_str())
-                .ok_or((-32602, "Missing canonical_hash".to_string()))?
-                .to_string();
-            let dupes: Vec<String> = args
-                .get("duplicate_hashes")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .ok_or((-32602, "Missing duplicate_hashes".to_string()))?;
-            let reason = args
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Merged by deduplication")
-                .to_string();
-            let dry_run = args
-                .get("dry_run")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let p: MergeDuplicatesParams = serde_json::from_value(args)
+                .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
                 .send(Cmd::MergeDuplicates {
-                    canonical,
-                    duplicates: dupes,
-                    reason,
-                    dry_run,
+                    canonical: p.canonical_hash,
+                    duplicates: p.duplicate_hashes,
+                    reason: p.reason,
+                    dry_run: p.dry_run,
                     reply: tx,
                 })
                 .await

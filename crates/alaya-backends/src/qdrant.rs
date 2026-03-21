@@ -75,7 +75,6 @@ fn hash_to_uuid(content_hash: &str) -> Result<String> {
 
 fn build_filter(filter: &PayloadFilter) -> Value {
     let mut must = Vec::new();
-    let must_not: Vec<Value> = Vec::new();
     let mut should = Vec::new();
 
     if let Some(ref mt) = filter.memory_type {
@@ -119,9 +118,6 @@ fn build_filter(filter: &PayloadFilter) -> Value {
     let mut f = json!({});
     if !must.is_empty() {
         f["must"] = json!(must);
-    }
-    if !must_not.is_empty() {
-        f["must_not"] = json!(must_not);
     }
     if !should.is_empty() {
         f["should"] = json!(should);
