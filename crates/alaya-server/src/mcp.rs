@@ -240,7 +240,7 @@ async fn dispatch_tool(
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::Store(params, tx))
+                .send(Cmd::Store { params, reply: tx })
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await
@@ -252,7 +252,7 @@ async fn dispatch_tool(
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::Search(params, tx))
+                .send(Cmd::Search { params, reply: tx })
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await
@@ -267,7 +267,7 @@ async fn dispatch_tool(
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::Delete(hash, tx))
+                .send(Cmd::Delete { hash, reply: tx })
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await
@@ -277,7 +277,7 @@ async fn dispatch_tool(
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::Health(tx))
+                .send(Cmd::Health { reply: tx })
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await
@@ -289,7 +289,7 @@ async fn dispatch_tool(
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::Relation(params, tx))
+                .send(Cmd::Relation { params, reply: tx })
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await
@@ -314,7 +314,12 @@ async fn dispatch_tool(
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::Supersede(old, new, reason, tx))
+                .send(Cmd::Supersede {
+                    old_hash: old,
+                    new_hash: new,
+                    reason,
+                    reply: tx,
+                })
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await
@@ -325,7 +330,7 @@ async fn dispatch_tool(
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::Contradictions(limit, tx))
+                .send(Cmd::Contradictions { limit, reply: tx })
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await
@@ -344,7 +349,12 @@ async fn dispatch_tool(
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::FindDuplicates(threshold, limit, strategy, tx))
+                .send(Cmd::FindDuplicates {
+                    threshold,
+                    limit,
+                    strategy,
+                    reply: tx,
+                })
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await
@@ -372,7 +382,13 @@ async fn dispatch_tool(
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::MergeDuplicates(canonical, dupes, reason, dry_run, tx))
+                .send(Cmd::MergeDuplicates {
+                    canonical,
+                    duplicates: dupes,
+                    reason,
+                    dry_run,
+                    reply: tx,
+                })
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await

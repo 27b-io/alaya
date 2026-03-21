@@ -32,6 +32,7 @@ use alaya_core::service::{MemoryService, RelationParams, SearchParams, StorePara
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct Config {
     qdrant_url: String,
     qdrant_collection: String,
@@ -74,15 +75,48 @@ fn env_or(key: &str, default: &str) -> String {
 
 /// A command sent from axum handlers to the MemoryService worker.
 pub(crate) enum Cmd {
-    Health(oneshot::Sender<Value>),
-    Store(StoreParams, oneshot::Sender<Value>),
-    Search(SearchParams, oneshot::Sender<Value>),
-    Delete(String, oneshot::Sender<Value>),
-    Relation(RelationParams, oneshot::Sender<Value>),
-    Supersede(String, String, String, oneshot::Sender<Value>),
-    Contradictions(usize, oneshot::Sender<Value>),
-    FindDuplicates(f64, usize, CanonicalStrategy, oneshot::Sender<Value>),
-    MergeDuplicates(String, Vec<String>, String, bool, oneshot::Sender<Value>),
+    Health {
+        reply: oneshot::Sender<Value>,
+    },
+    Store {
+        params: StoreParams,
+        reply: oneshot::Sender<Value>,
+    },
+    Search {
+        params: SearchParams,
+        reply: oneshot::Sender<Value>,
+    },
+    Delete {
+        hash: String,
+        reply: oneshot::Sender<Value>,
+    },
+    Relation {
+        params: RelationParams,
+        reply: oneshot::Sender<Value>,
+    },
+    Supersede {
+        old_hash: String,
+        new_hash: String,
+        reason: String,
+        reply: oneshot::Sender<Value>,
+    },
+    Contradictions {
+        limit: usize,
+        reply: oneshot::Sender<Value>,
+    },
+    FindDuplicates {
+        threshold: f64,
+        limit: usize,
+        strategy: CanonicalStrategy,
+        reply: oneshot::Sender<Value>,
+    },
+    MergeDuplicates {
+        canonical: String,
+        duplicates: Vec<String>,
+        reason: String,
+        dry_run: bool,
+        reply: oneshot::Sender<Value>,
+    },
 }
 
 /// Handle for sending commands. Clone + Send + Sync (axum-compatible).
@@ -109,64 +143,80 @@ impl ServiceHandle {
 async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            Cmd::Health(reply) => {
+            Cmd::Health { reply } => {
                 let result = match svc.check_database_health().await {
                     Ok(r) => json!(r),
                     Err(e) => json!({"status": "error", "message": e.safe_message()}),
                 };
                 let _ = reply.send(result);
             }
-            Cmd::Store(params, reply) => {
+            Cmd::Store { params, reply } => {
                 let result = match svc.store_memory(params).await {
                     Ok(r) => json!(r),
                     Err(e) => json!({"success": false, "error": e.safe_message()}),
                 };
                 let _ = reply.send(result);
             }
-            Cmd::Search(params, reply) => {
+            Cmd::Search { params, reply } => {
                 let result = match svc.search(params).await {
                     Ok(r) => r,
                     Err(e) => json!({"error": e.safe_message()}),
                 };
                 let _ = reply.send(result);
             }
-            Cmd::Delete(hash, reply) => {
+            Cmd::Delete { hash, reply } => {
                 let result = match svc.delete_memory(&hash).await {
                     Ok(r) => json!(r),
                     Err(e) => json!({"success": false, "error": e.safe_message()}),
                 };
                 let _ = reply.send(result);
             }
-            Cmd::Relation(params, reply) => {
+            Cmd::Relation { params, reply } => {
                 let result = match svc.relation(params).await {
                     Ok(r) => r,
                     Err(e) => json!({"success": false, "error": e.safe_message()}),
                 };
                 let _ = reply.send(result);
             }
-            Cmd::Supersede(old, new, reason, reply) => {
-                let result = match svc.memory_supersede(&old, &new, &reason).await {
+            Cmd::Supersede {
+                old_hash,
+                new_hash,
+                reason,
+                reply,
+            } => {
+                let result = match svc.memory_supersede(&old_hash, &new_hash, &reason).await {
                     Ok(r) => r,
                     Err(e) => json!({"success": false, "error": e.safe_message()}),
                 };
                 let _ = reply.send(result);
             }
-            Cmd::Contradictions(limit, reply) => {
+            Cmd::Contradictions { limit, reply } => {
                 let result = match svc.memory_contradictions(limit).await {
                     Ok(r) => r,
                     Err(e) => json!({"success": false, "error": e.safe_message()}),
                 };
                 let _ = reply.send(result);
             }
-            Cmd::FindDuplicates(threshold, limit, strategy, reply) => {
+            Cmd::FindDuplicates {
+                threshold,
+                limit,
+                strategy,
+                reply,
+            } => {
                 let result = match svc.find_duplicates(threshold, limit, strategy).await {
                     Ok(r) => r,
                     Err(e) => json!({"success": false, "error": e.safe_message()}),
                 };
                 let _ = reply.send(result);
             }
-            Cmd::MergeDuplicates(canonical, dupes, reason, dry_run, reply) => {
-                let refs: Vec<&str> = dupes.iter().map(|s| s.as_str()).collect();
+            Cmd::MergeDuplicates {
+                canonical,
+                duplicates,
+                reason,
+                dry_run,
+                reply,
+            } => {
+                let refs: Vec<&str> = duplicates.iter().map(|s| s.as_str()).collect();
                 let result = match svc
                     .merge_duplicates(&canonical, &refs, &reason, dry_run)
                     .await
@@ -197,17 +247,7 @@ fn main() {
         let (tx, rx) = mpsc::channel::<Cmd>(256);
 
         // Spawn MemoryService on a dedicated thread with LocalSet
-        let cfg_clone = Config {
-            qdrant_url: config.qdrant_url.clone(),
-            qdrant_collection: config.qdrant_collection.clone(),
-            qdrant_api_key: config.qdrant_api_key.clone(),
-            embedding_url: config.embedding_url.clone(),
-            embedding_model: config.embedding_model.clone(),
-            embedding_dimensions: config.embedding_dimensions,
-            graph_url: config.graph_url.clone(),
-            graph_api_key: config.graph_api_key.clone(),
-            listen_addr: config.listen_addr.clone(),
-        };
+        let cfg_clone = config.clone();
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -275,7 +315,7 @@ fn main() {
 
 async fn health(axum::extract::State(h): axum::extract::State<ServiceHandle>) -> Json<Value> {
     let (tx, rx) = oneshot::channel();
-    h.call(Cmd::Health(tx), rx).await
+    h.call(Cmd::Health { reply: tx }, rx).await
 }
 
 async fn store(
@@ -283,7 +323,7 @@ async fn store(
     Json(params): Json<StoreParams>,
 ) -> Json<Value> {
     let (tx, rx) = oneshot::channel();
-    h.call(Cmd::Store(params, tx), rx).await
+    h.call(Cmd::Store { params, reply: tx }, rx).await
 }
 
 async fn search(
@@ -291,7 +331,7 @@ async fn search(
     Json(params): Json<SearchParams>,
 ) -> Json<Value> {
     let (tx, rx) = oneshot::channel();
-    h.call(Cmd::Search(params, tx), rx).await
+    h.call(Cmd::Search { params, reply: tx }, rx).await
 }
 
 #[derive(Deserialize)]
@@ -304,7 +344,14 @@ async fn delete(
     Json(req): Json<DeleteReq>,
 ) -> Json<Value> {
     let (tx, rx) = oneshot::channel();
-    h.call(Cmd::Delete(req.content_hash, tx), rx).await
+    h.call(
+        Cmd::Delete {
+            hash: req.content_hash,
+            reply: tx,
+        },
+        rx,
+    )
+    .await
 }
 
 async fn relation(
@@ -312,7 +359,7 @@ async fn relation(
     Json(params): Json<RelationParams>,
 ) -> Json<Value> {
     let (tx, rx) = oneshot::channel();
-    h.call(Cmd::Relation(params, tx), rx).await
+    h.call(Cmd::Relation { params, reply: tx }, rx).await
 }
 
 #[derive(Deserialize)]
@@ -329,7 +376,12 @@ async fn supersede(
 ) -> Json<Value> {
     let (tx, rx) = oneshot::channel();
     h.call(
-        Cmd::Supersede(req.old_hash, req.new_hash, req.reason, tx),
+        Cmd::Supersede {
+            old_hash: req.old_hash,
+            new_hash: req.new_hash,
+            reason: req.reason,
+            reply: tx,
+        },
         rx,
     )
     .await
@@ -349,7 +401,14 @@ async fn contradictions(
     Json(req): Json<ContradictionsReq>,
 ) -> Json<Value> {
     let (tx, rx) = oneshot::channel();
-    h.call(Cmd::Contradictions(req.limit, tx), rx).await
+    h.call(
+        Cmd::Contradictions {
+            limit: req.limit,
+            reply: tx,
+        },
+        rx,
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -374,7 +433,12 @@ async fn find_duplicates(
 ) -> Json<Value> {
     let (tx, rx) = oneshot::channel();
     h.call(
-        Cmd::FindDuplicates(req.similarity_threshold, req.limit, req.strategy, tx),
+        Cmd::FindDuplicates {
+            threshold: req.similarity_threshold,
+            limit: req.limit,
+            strategy: req.strategy,
+            reply: tx,
+        },
         rx,
     )
     .await
@@ -396,13 +460,13 @@ async fn merge_duplicates(
 ) -> Json<Value> {
     let (tx, rx) = oneshot::channel();
     h.call(
-        Cmd::MergeDuplicates(
-            req.canonical_hash,
-            req.duplicate_hashes,
-            req.reason,
-            req.dry_run,
-            tx,
-        ),
+        Cmd::MergeDuplicates {
+            canonical: req.canonical_hash,
+            duplicates: req.duplicate_hashes,
+            reason: req.reason,
+            dry_run: req.dry_run,
+            reply: tx,
+        },
         rx,
     )
     .await
