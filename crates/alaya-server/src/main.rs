@@ -146,35 +146,50 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             Cmd::Health { reply } => {
                 let result = match svc.check_database_health().await {
                     Ok(r) => json!(r),
-                    Err(e) => json!({"status": "error", "message": e.safe_message()}),
+                    Err(e) => {
+                        tracing::error!("check_database_health failed: {e:?}");
+                        json!({"status": "error", "message": e.safe_message()})
+                    }
                 };
                 let _ = reply.send(result);
             }
             Cmd::Store { params, reply } => {
                 let result = match svc.store_memory(params).await {
                     Ok(r) => json!(r),
-                    Err(e) => json!({"success": false, "error": e.safe_message()}),
+                    Err(e) => {
+                        tracing::error!("store_memory failed: {e:?}");
+                        json!({"success": false, "error": e.safe_message()})
+                    }
                 };
                 let _ = reply.send(result);
             }
             Cmd::Search { params, reply } => {
                 let result = match svc.search(params).await {
                     Ok(r) => r,
-                    Err(e) => json!({"error": e.safe_message()}),
+                    Err(e) => {
+                        tracing::error!("search failed: {e:?}");
+                        json!({"error": e.safe_message()})
+                    }
                 };
                 let _ = reply.send(result);
             }
             Cmd::Delete { hash, reply } => {
                 let result = match svc.delete_memory(&hash).await {
                     Ok(r) => json!(r),
-                    Err(e) => json!({"success": false, "error": e.safe_message()}),
+                    Err(e) => {
+                        tracing::error!("delete_memory failed: {e:?}");
+                        json!({"success": false, "error": e.safe_message()})
+                    }
                 };
                 let _ = reply.send(result);
             }
             Cmd::Relation { params, reply } => {
                 let result = match svc.relation(params).await {
                     Ok(r) => r,
-                    Err(e) => json!({"success": false, "error": e.safe_message()}),
+                    Err(e) => {
+                        tracing::error!("relation failed: {e:?}");
+                        json!({"success": false, "error": e.safe_message()})
+                    }
                 };
                 let _ = reply.send(result);
             }
@@ -186,14 +201,20 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             } => {
                 let result = match svc.memory_supersede(&old_hash, &new_hash, &reason).await {
                     Ok(r) => r,
-                    Err(e) => json!({"success": false, "error": e.safe_message()}),
+                    Err(e) => {
+                        tracing::error!("memory_supersede failed: {e:?}");
+                        json!({"success": false, "error": e.safe_message()})
+                    }
                 };
                 let _ = reply.send(result);
             }
             Cmd::Contradictions { limit, reply } => {
                 let result = match svc.memory_contradictions(limit).await {
                     Ok(r) => r,
-                    Err(e) => json!({"success": false, "error": e.safe_message()}),
+                    Err(e) => {
+                        tracing::error!("memory_contradictions failed: {e:?}");
+                        json!({"success": false, "error": e.safe_message()})
+                    }
                 };
                 let _ = reply.send(result);
             }
@@ -205,7 +226,10 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             } => {
                 let result = match svc.find_duplicates(threshold, limit, strategy).await {
                     Ok(r) => r,
-                    Err(e) => json!({"success": false, "error": e.safe_message()}),
+                    Err(e) => {
+                        tracing::error!("find_duplicates failed: {e:?}");
+                        json!({"success": false, "error": e.safe_message()})
+                    }
                 };
                 let _ = reply.send(result);
             }
@@ -222,7 +246,10 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                     .await
                 {
                     Ok(r) => r,
-                    Err(e) => json!({"success": false, "error": e.safe_message()}),
+                    Err(e) => {
+                        tracing::error!("merge_duplicates failed: {e:?}");
+                        json!({"success": false, "error": e.safe_message()})
+                    }
                 };
                 let _ = reply.send(result);
             }
