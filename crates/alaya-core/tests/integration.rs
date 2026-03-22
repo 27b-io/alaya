@@ -306,10 +306,10 @@ async fn ensure_test_collection(qdrant_url: &str) {
         .send()
         .await;
 
-    if let Ok(r) = resp {
-        if r.status().is_success() {
-            return; // Already exists
-        }
+    if let Ok(r) = resp
+        && r.status().is_success()
+    {
+        return; // Already exists
     }
 
     // Create collection with Arctic dimensions (1024)

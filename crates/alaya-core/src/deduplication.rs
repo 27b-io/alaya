@@ -407,7 +407,9 @@ mod tests {
 
     // --- build_duplicate_groups ---
 
-    fn test_data() -> (Vec<&'static str>, Vec<Vec<f32>>, Vec<f64>, Vec<u64>) {
+    type TestData = (Vec<&'static str>, Vec<Vec<f32>>, Vec<f64>, Vec<u64>);
+
+    fn test_data() -> TestData {
         let hashes = vec!["h1", "h2", "h3"];
         let embeddings = vec![
             vec![1.0, 0.0, 0.0],

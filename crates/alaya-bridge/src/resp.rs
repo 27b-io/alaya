@@ -422,7 +422,9 @@ mod tests {
         let r = FalkorResult::parse(&response).unwrap();
         // JSON numbers from f64 lose precision; compare as f64
         let v = r.result_set[0][0].as_f64().unwrap();
-        assert!((v - 3.14).abs() < 1e-10);
+        #[allow(clippy::approx_constant)]
+        let expected = 3.14;
+        assert!((v - expected).abs() < 1e-10);
     }
 
     // ── 5. Null values ────────────────────────────────────────────────────────

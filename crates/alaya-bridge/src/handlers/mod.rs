@@ -114,6 +114,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn number_bare() {
         assert_eq!(value_to_cypher_literal(&json!(3.14)), "3.14");
         assert_eq!(value_to_cypher_literal(&json!(42)), "42");
