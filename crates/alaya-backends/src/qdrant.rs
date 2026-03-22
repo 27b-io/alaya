@@ -61,7 +61,7 @@ impl QdrantClient {
 fn hash_to_uuid(content_hash: &str) -> Result<String> {
     if content_hash.len() < 32 {
         return Err(AlayaError::Validation(format!(
-            "content_hash too short: {} chars (need 64)",
+            "content_hash too short: {} chars (need 32)",
             content_hash.len()
         )));
     }

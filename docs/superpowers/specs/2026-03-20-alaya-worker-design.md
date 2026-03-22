@@ -179,7 +179,7 @@ Both `alaya-core` and `alaya-backends` import `alaya_types::time::current_timest
 
 For Topology A (current): Worker → Cloudflare Tunnel → lab k3s backends.
 
-```
+```text
 CF Edge (Worker)
     │
     ├─→ tunnel → qdrant.mcp.svc:6333
