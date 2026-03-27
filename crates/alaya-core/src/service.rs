@@ -334,6 +334,9 @@ impl MemoryService {
     // ─── Tool 2: search ─────────────────────────────────────────────────
 
     pub async fn search(&self, params: SearchParams) -> Result<Value> {
+        if params.page_size == 0 {
+            return Err(AlayaError::Validation("page_size must be > 0".into()));
+        }
         match params.mode {
             SearchMode::Hybrid | SearchMode::Scan => self.search_hybrid(&params).await,
             SearchMode::Similar => self.search_similar(&params).await,
@@ -820,7 +823,7 @@ impl MemoryService {
         let now = current_timestamp();
         if let Err(e) = self
             .graph
-            .create_system_edge(old_hash, new_hash, SystemRelationType::Supersedes, now)
+            .create_system_edge(new_hash, old_hash, SystemRelationType::Supersedes, now)
             .await
         {
             tracing::warn!("failed to create SUPERSEDES edge: {e}");

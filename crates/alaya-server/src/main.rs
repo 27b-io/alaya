@@ -14,6 +14,10 @@ mod telemetry;
 
 use axum::{
     Json, Router,
+    extract::Request,
+    http::{StatusCode, header},
+    middleware::{self, Next},
+    response::Response,
     routing::{get, post},
 };
 use serde::Deserialize;
@@ -43,6 +47,7 @@ struct Config {
     graph_url: String,
     graph_api_key: String,
     listen_addr: String,
+    api_key: String,
 }
 
 impl Config {
@@ -59,6 +64,7 @@ impl Config {
             graph_url: env_required("GRAPH_URL"),
             graph_api_key: env_or("GRAPH_API_KEY", ""),
             listen_addr: env_or("LISTEN_ADDR", "0.0.0.0:3001"),
+            api_key: env_or("ALAYA_API_KEY", ""),
         }
     }
 }
@@ -123,6 +129,7 @@ pub(crate) enum Cmd {
 #[derive(Clone)]
 pub(crate) struct ServiceHandle {
     pub(crate) tx: mpsc::Sender<Cmd>,
+    api_key: String,
 }
 
 impl ServiceHandle {
@@ -257,7 +264,28 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
     }
 }
 
-// ─── Main ───────────────────────────────────────────────────────────────────
+// ─── Auth middleware ────────────────────────────────────────────────────────
+
+async fn require_bearer(
+    axum::extract::State(h): axum::extract::State<ServiceHandle>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if h.api_key.is_empty() {
+        return Ok(next.run(req).await);
+    }
+
+    let token = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    match token {
+        Some(t) if t == h.api_key => Ok(next.run(req).await),
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
 
 fn main() {
     let config = Config::from_env();
@@ -313,11 +341,17 @@ fn main() {
         });
 
         // Axum on the main multi-threaded runtime
-        let handle = ServiceHandle { tx };
+        let handle = ServiceHandle {
+            tx,
+            api_key: config.api_key.clone(),
+        };
 
-        let app = Router::new()
+        if handle.api_key.is_empty() {
+            tracing::warn!("ALAYA_API_KEY not set — all endpoints are unauthenticated");
+        }
+
+        let protected = Router::new()
             .route("/mcp", post(mcp::mcp_handler))
-            .route("/health", get(health))
             .route("/store", post(store))
             .route("/search", post(search))
             .route("/delete", post(delete))
@@ -326,6 +360,14 @@ fn main() {
             .route("/contradictions", post(contradictions))
             .route("/duplicates/find", post(find_duplicates))
             .route("/duplicates/merge", post(merge_duplicates))
+            .layer(middleware::from_fn_with_state(
+                handle.clone(),
+                require_bearer,
+            ));
+
+        let app = Router::new()
+            .route("/health", get(health))
+            .merge(protected)
             .layer(TraceLayer::new_for_http())
             .with_state(handle);
 

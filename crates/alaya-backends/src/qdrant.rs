@@ -382,8 +382,8 @@ impl VectorStorage for QdrantClient {
 
         let mut payload = serde_json::Map::new();
         if let Some(ref sb) = updates.superseded_by {
-            // Merge into metadata.superseded_by
-            payload.insert("metadata".into(), json!({ "superseded_by": sb }));
+            // Dot-path sets nested field without replacing the entire metadata object
+            payload.insert("metadata.superseded_by".into(), json!(sb));
         }
         if let Some(ac) = updates.access_count {
             payload.insert("access_count".into(), json!(ac));
