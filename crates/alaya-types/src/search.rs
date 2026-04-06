@@ -30,7 +30,7 @@ pub enum SearchMode {
 impl SearchMode {
     /// Whether this mode requires embedding generation.
     pub fn needs_embedding(&self) -> bool {
-        matches!(self, Self::Hybrid | Self::Scan | Self::Similar)
+        matches!(self, Self::Hybrid | Self::Similar)
     }
 }
 
@@ -59,6 +59,11 @@ mod tests {
     #[test]
     fn search_mode_hybrid_needs_embedding() {
         assert!(SearchMode::Hybrid.needs_embedding());
+    }
+
+    #[test]
+    fn search_mode_scan_does_not_need_embedding() {
+        assert!(!SearchMode::Scan.needs_embedding());
     }
 
     #[test]

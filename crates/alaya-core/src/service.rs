@@ -545,37 +545,51 @@ impl MemoryService {
     }
 
     async fn search_scan(&self, params: &SearchParams) -> Result<Value> {
-        let fetch_size = params.page * params.page_size;
-        let scroll = self.vectors.get_all(fetch_size, None).await?;
-        let has_more_in_db = scroll.next_offset.is_some();
-        let mut memories = scroll.memories;
+        let target = (params.page.saturating_sub(1)) * params.page_size + params.page_size + 1;
+        let scroll_page: usize = 100;
+        let mut filtered: Vec<Memory> = Vec::new();
+        let mut cursor: Option<String> = None;
 
-        // Filter superseded at application layer
-        if !params.include_superseded {
-            memories.retain(|m| {
-                m.metadata
+        // Scroll until we have enough filtered results or hit EOF
+        loop {
+            let batch_size = scroll_page.min(target.saturating_sub(filtered.len()));
+            let scroll = self.vectors.get_all(batch_size, cursor.as_deref()).await?;
+            let batch_empty = scroll.memories.is_empty();
+
+            for m in scroll.memories {
+                if !params.include_superseded
+                    && m.metadata
+                        .as_ref()
+                        .and_then(|md| md.get("superseded_by"))
+                        .is_some()
+                {
+                    continue;
+                }
+                if params
+                    .memory_type
                     .as_ref()
-                    .and_then(|md| md.get("superseded_by"))
-                    .is_none()
-            });
-        }
+                    .is_some_and(|mt| m.memory_type != *mt)
+                {
+                    continue;
+                }
+                filtered.push(m);
+            }
 
-        // Apply memory_type filter
-        if let Some(ref mt) = params.memory_type {
-            memories.retain(|m| m.memory_type == *mt);
+            cursor = scroll.next_offset;
+            if batch_empty || cursor.is_none() || filtered.len() >= target {
+                break;
+            }
         }
 
         let offset = (params.page.saturating_sub(1)) * params.page_size;
-        let page: Vec<Value> = memories
+        let page: Vec<Value> = filtered
             .iter()
             .skip(offset)
             .take(params.page_size)
             .map(|m| format_memory_result(m, 1.0, params.output))
             .collect();
 
-        // has_more: either we have unfetched data in Qdrant, or there are
-        // more items in our filtered set beyond this page
-        let has_more = has_more_in_db || (offset + params.page_size) < memories.len();
+        let has_more = filtered.len() > offset + params.page_size || cursor.is_some();
 
         Ok(serde_json::json!({
             "page": params.page,
@@ -658,16 +672,15 @@ impl MemoryService {
         let offset = (params.page.saturating_sub(1)) * params.page_size;
         let results = self
             .vectors
-            .get_recent(params.page_size, offset, params.memory_type.as_deref())
+            .get_recent(params.page_size + 1, offset, params.memory_type.as_deref())
             .await?;
 
+        let has_more = results.len() > params.page_size;
         let items: Vec<Value> = results
             .iter()
+            .take(params.page_size)
             .map(|m| format_memory_result(m, 1.0, params.output))
             .collect();
-
-        // has_more: if we got a full page, there are likely more
-        let has_more = items.len() == params.page_size;
 
         Ok(serde_json::json!({
             "page": params.page,
@@ -957,35 +970,36 @@ impl MemoryService {
         let scan_limit: usize = 500;
         let scroll_page: usize = 100;
 
-        // Paginated scroll to collect up to scan_limit memories
+        // Paginated scroll to collect up to scan_limit live (non-superseded) memories
         let mut memories: Vec<Memory> = Vec::new();
         let mut offset: Option<String> = None;
+        let mut raw_scanned: usize = 0;
         while memories.len() < scan_limit {
             let batch_size = scroll_page.min(scan_limit - memories.len());
             let scroll = self.vectors.get_all(batch_size, offset.as_deref()).await?;
             let batch_empty = scroll.memories.is_empty();
-            memories.extend(scroll.memories);
+            raw_scanned += scroll.memories.len();
+            for m in scroll.memories {
+                if m.metadata
+                    .as_ref()
+                    .and_then(|md| md.get("superseded_by"))
+                    .is_some()
+                {
+                    continue;
+                }
+                memories.push(m);
+            }
             offset = scroll.next_offset;
             if batch_empty || offset.is_none() {
                 break;
             }
         }
 
-        // Filter superseded
-        memories.retain(|m| {
-            m.metadata
-                .as_ref()
-                .and_then(|md| md.get("superseded_by"))
-                .is_none()
-        });
-
-        let scanned = memories.len();
-
         if memories.len() < 2 {
             return Ok(serde_json::json!({
                 "success": true,
                 "groups": [],
-                "total_memories_scanned": scanned,
+                "total_memories_scanned": raw_scanned,
                 "total_duplicates_found": 0,
             }));
         }
@@ -1019,7 +1033,7 @@ impl MemoryService {
         Ok(serde_json::json!({
             "success": true,
             "groups": groups,
-            "total_memories_scanned": scanned,
+            "total_memories_scanned": raw_scanned,
             "total_duplicates_found": total_dups,
         }))
     }
