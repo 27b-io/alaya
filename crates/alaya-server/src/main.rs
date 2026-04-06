@@ -493,7 +493,7 @@ fn default_threshold() -> f64 {
     0.95
 }
 fn default_dup_limit() -> usize {
-    100
+    500
 }
 
 async fn find_duplicates(

@@ -31,6 +31,7 @@ use crate::{
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchParams {
+    #[serde(default)]
     pub query: String,
     #[serde(default)]
     pub mode: SearchMode,
@@ -338,7 +339,8 @@ impl MemoryService {
             return Err(AlayaError::Validation("page_size must be > 0".into()));
         }
         match params.mode {
-            SearchMode::Hybrid | SearchMode::Scan => self.search_hybrid(&params).await,
+            SearchMode::Hybrid => self.search_hybrid(&params).await,
+            SearchMode::Scan => self.search_scan(&params).await,
             SearchMode::Similar => self.search_similar(&params).await,
             SearchMode::Tag => self.search_tag(&params).await,
             SearchMode::Recent => self.search_recent(&params).await,
@@ -346,6 +348,11 @@ impl MemoryService {
     }
 
     async fn search_hybrid(&self, params: &SearchParams) -> Result<Value> {
+        if params.query.trim().is_empty() {
+            return Err(AlayaError::Validation(
+                "query is required for hybrid mode".into(),
+            ));
+        }
         let now = current_timestamp();
 
         // Stage 1: Prepare
@@ -523,7 +530,7 @@ impl MemoryService {
             .iter()
             .filter_map(|(hash, score)| {
                 let sm = memory_map.get(hash)?;
-                Some(format_memory_result(&sm.memory, *score))
+                Some(format_memory_result(&sm.memory, *score, params.output))
             })
             .collect();
 
@@ -537,7 +544,68 @@ impl MemoryService {
         }))
     }
 
+    async fn search_scan(&self, params: &SearchParams) -> Result<Value> {
+        let target = (params.page.saturating_sub(1)) * params.page_size + params.page_size + 1;
+        let scroll_page: usize = 100;
+        let mut filtered: Vec<Memory> = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        // Scroll until we have enough filtered results or hit EOF
+        loop {
+            let batch_size = scroll_page.min(target.saturating_sub(filtered.len()));
+            let scroll = self.vectors.get_all(batch_size, cursor.as_deref()).await?;
+            let batch_empty = scroll.memories.is_empty();
+
+            for m in scroll.memories {
+                if !params.include_superseded
+                    && m.metadata
+                        .as_ref()
+                        .and_then(|md| md.get("superseded_by"))
+                        .is_some()
+                {
+                    continue;
+                }
+                if params
+                    .memory_type
+                    .as_ref()
+                    .is_some_and(|mt| m.memory_type != *mt)
+                {
+                    continue;
+                }
+                filtered.push(m);
+            }
+
+            cursor = scroll.next_offset;
+            if batch_empty || cursor.is_none() || filtered.len() >= target {
+                break;
+            }
+        }
+
+        let offset = (params.page.saturating_sub(1)) * params.page_size;
+        let page: Vec<Value> = filtered
+            .iter()
+            .skip(offset)
+            .take(params.page_size)
+            .map(|m| format_memory_result(m, 1.0, params.output))
+            .collect();
+
+        let has_more = filtered.len() > offset + params.page_size || cursor.is_some();
+
+        Ok(serde_json::json!({
+            "page": params.page,
+            "page_size": params.page_size,
+            "has_more": has_more,
+            "count": page.len(),
+            "results": page,
+        }))
+    }
+
     async fn search_similar(&self, params: &SearchParams) -> Result<Value> {
+        if params.query.trim().is_empty() {
+            return Err(AlayaError::Validation(
+                "query is required for similar mode".into(),
+            ));
+        }
         let query_embedding = self
             .embeddings
             .embed_batch(&[params.query.as_str()], PromptName::Query)
@@ -558,12 +626,12 @@ impl MemoryService {
 
         let items: Vec<Value> = results
             .iter()
-            .map(|sm| format_memory_result(&sm.memory, sm.score))
+            .map(|sm| format_memory_result(&sm.memory, sm.score, params.output))
             .collect();
 
         Ok(serde_json::json!({
             "results": items,
-            "total_memories_scanned": results.len(),
+            "total": results.len(),
         }))
     }
 
@@ -585,7 +653,7 @@ impl MemoryService {
             .iter()
             .skip(offset)
             .take(params.page_size)
-            .map(|sm| format_memory_result(&sm.memory, sm.score))
+            .map(|sm| format_memory_result(&sm.memory, sm.score, params.output))
             .collect();
 
         let total_pages = total.div_ceil(params.page_size);
@@ -604,17 +672,20 @@ impl MemoryService {
         let offset = (params.page.saturating_sub(1)) * params.page_size;
         let results = self
             .vectors
-            .get_recent(params.page_size, offset, params.memory_type.as_deref())
+            .get_recent(params.page_size + 1, offset, params.memory_type.as_deref())
             .await?;
 
+        let has_more = results.len() > params.page_size;
         let items: Vec<Value> = results
             .iter()
-            .map(|m| format_memory_result(m, 1.0))
+            .take(params.page_size)
+            .map(|m| format_memory_result(m, 1.0, params.output))
             .collect();
 
         Ok(serde_json::json!({
             "page": params.page,
             "page_size": params.page_size,
+            "has_more": has_more,
             "results": items,
         }))
     }
@@ -895,25 +966,40 @@ impl MemoryService {
         limit: usize,
         strategy: CanonicalStrategy,
     ) -> Result<Value> {
-        let limit = limit.min(100); // Workers limit
+        let group_limit = limit.min(500);
+        let scan_limit: usize = 500;
+        let scroll_page: usize = 100;
 
-        // Scroll memories
-        let scroll = self.vectors.get_all(limit, None).await?;
-        let mut memories = scroll.memories;
-
-        // Filter superseded
-        memories.retain(|m| {
-            m.metadata
-                .as_ref()
-                .and_then(|md| md.get("superseded_by"))
-                .is_none()
-        });
+        // Paginated scroll to collect up to scan_limit live (non-superseded) memories
+        let mut memories: Vec<Memory> = Vec::new();
+        let mut offset: Option<String> = None;
+        let mut raw_scanned: usize = 0;
+        while memories.len() < scan_limit {
+            let batch_size = scroll_page.min(scan_limit - memories.len());
+            let scroll = self.vectors.get_all(batch_size, offset.as_deref()).await?;
+            let batch_empty = scroll.memories.is_empty();
+            raw_scanned += scroll.memories.len();
+            for m in scroll.memories {
+                if m.metadata
+                    .as_ref()
+                    .and_then(|md| md.get("superseded_by"))
+                    .is_some()
+                {
+                    continue;
+                }
+                memories.push(m);
+            }
+            offset = scroll.next_offset;
+            if batch_empty || offset.is_none() {
+                break;
+            }
+        }
 
         if memories.len() < 2 {
             return Ok(serde_json::json!({
                 "success": true,
                 "groups": [],
-                "total_memories_scanned": memories.len(),
+                "total_memories_scanned": raw_scanned,
                 "total_duplicates_found": 0,
             }));
         }
@@ -930,7 +1016,7 @@ impl MemoryService {
         let created_ats: Vec<f64> = memories.iter().map(|m| m.created_at).collect();
         let access_counts: Vec<u64> = memories.iter().map(|m| m.access_count).collect();
 
-        let groups = deduplication::build_duplicate_groups(
+        let mut groups = deduplication::build_duplicate_groups(
             &hashes,
             &embeddings,
             &created_ats,
@@ -939,12 +1025,15 @@ impl MemoryService {
             strategy,
         );
 
+        // Limit output groups
+        groups.truncate(group_limit);
+
         let total_dups: usize = groups.iter().map(|g| g.size - 1).sum();
 
         Ok(serde_json::json!({
             "success": true,
             "groups": groups,
-            "total_memories_scanned": memories.len(),
+            "total_memories_scanned": raw_scanned,
             "total_duplicates_found": total_dups,
         }))
     }
@@ -1028,19 +1117,31 @@ fn parse_user_relation(s: &str) -> Result<UserRelationType> {
     }
 }
 
-fn format_memory_result(memory: &Memory, score: f64) -> Value {
-    serde_json::json!({
-        "content": memory.content,
+fn format_memory_result(memory: &Memory, score: f64, output: OutputMode) -> Value {
+    let mut v = serde_json::json!({
         "content_hash": memory.content_hash,
         "tags": memory.tags,
         "memory_type": memory.memory_type,
         "metadata": memory.metadata,
         "created_at": memory.created_at,
         "updated_at": memory.updated_at,
-        "summary": memory.summary,
         "salience_score": memory.salience_score,
         "score": score,
-    })
+    });
+    let obj = v.as_object_mut().unwrap();
+    match output {
+        OutputMode::Full => {
+            obj.insert("content".into(), serde_json::json!(memory.content));
+        }
+        OutputMode::Summary => {
+            obj.insert("summary".into(), serde_json::json!(memory.summary));
+        }
+        OutputMode::Both => {
+            obj.insert("content".into(), serde_json::json!(memory.content));
+            obj.insert("summary".into(), serde_json::json!(memory.summary));
+        }
+    }
+    v
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
