@@ -374,22 +374,9 @@ pub fn get_graph_stats() -> Vec<CypherQuery> {
 
 // ─── schema ───────────────────────────────────────────────────────────────────
 
-/// DDL statements to ensure required indexes exist.
-pub fn schema_statements() -> Vec<CypherQuery> {
-    let empty: HashMap<String, Value> = HashMap::new();
-    vec![
-        (
-            "CREATE INDEX IF NOT EXISTS FOR (m:Memory) ON (m.content_hash)".to_string(),
-            empty.clone(),
-            false,
-        ),
-        (
-            "CREATE INDEX IF NOT EXISTS FOR (m:Memory) ON (m.created_at)".to_string(),
-            empty,
-            false,
-        ),
-    ]
-}
+// FalkorDB auto-creates range indexes on properties used in MATCH/WHERE filters.
+// No explicit CREATE INDEX needed — removed Neo4j-style statements that FalkorDB
+// rejects ("Invalid input 'I': expected '=', CREATE INDEX ON or CREATE INDEX FOR").
 
 // ─── tests ───────────────────────────────────────────────────────────────────
 
@@ -630,13 +617,4 @@ mod tests {
     }
 
     // schema
-
-    #[test]
-    fn schema_statements_shape() {
-        let stmts = schema_statements();
-        assert_eq!(stmts.len(), 2);
-        assert!(stmts.iter().all(|(_, _, ro)| !ro), "DDL is not readonly");
-        assert!(stmts[0].0.contains("content_hash"));
-        assert!(stmts[1].0.contains("created_at"));
-    }
 }

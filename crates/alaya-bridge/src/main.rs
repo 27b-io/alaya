@@ -20,9 +20,6 @@ async fn main() {
 
     let state = Arc::new(AppState { redis, graph_name });
 
-    // Initialize schema (indexes) — best-effort; log errors but don't abort.
-    alaya_bridge::init_schema(&state).await;
-
     // Start background Hebbian write-queue consumer (LPUSH/BRPOP pattern).
     alaya_bridge::queue::spawn_consumer(state.clone());
 

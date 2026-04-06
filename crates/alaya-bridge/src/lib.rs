@@ -20,13 +20,3 @@ pub struct AppState {
     pub redis: redis::aio::ConnectionManager,
     pub graph_name: String,
 }
-
-/// Initialize FalkorDB schema indexes — best-effort; logs on failure.
-pub async fn init_schema(state: &AppState) {
-    for (q, params, readonly) in cypher::schema_statements() {
-        if let Err(e) = handlers::exec_query(state, &q, params, readonly).await {
-            tracing::warn!("Schema init failed ({e:?}): {q}");
-        }
-    }
-    tracing::info!("Schema initialization complete");
-}
