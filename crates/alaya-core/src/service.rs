@@ -348,6 +348,11 @@ impl MemoryService {
     }
 
     async fn search_hybrid(&self, params: &SearchParams) -> Result<Value> {
+        if params.query.trim().is_empty() {
+            return Err(AlayaError::Validation(
+                "query is required for hybrid mode".into(),
+            ));
+        }
         let now = current_timestamp();
 
         // Stage 1: Prepare
@@ -542,6 +547,7 @@ impl MemoryService {
     async fn search_scan(&self, params: &SearchParams) -> Result<Value> {
         let fetch_size = params.page * params.page_size;
         let scroll = self.vectors.get_all(fetch_size, None).await?;
+        let has_more_in_db = scroll.next_offset.is_some();
         let mut memories = scroll.memories;
 
         // Filter superseded at application layer
@@ -559,7 +565,6 @@ impl MemoryService {
             memories.retain(|m| m.memory_type == *mt);
         }
 
-        let total = memories.len();
         let offset = (params.page.saturating_sub(1)) * params.page_size;
         let page: Vec<Value> = memories
             .iter()
@@ -568,23 +573,25 @@ impl MemoryService {
             .map(|m| format_memory_result(m, 1.0, params.output))
             .collect();
 
-        let total_pages = if params.page_size > 0 {
-            total.div_ceil(params.page_size)
-        } else {
-            0
-        };
+        // has_more: either we have unfetched data in Qdrant, or there are
+        // more items in our filtered set beyond this page
+        let has_more = has_more_in_db || (offset + params.page_size) < memories.len();
 
         Ok(serde_json::json!({
             "page": params.page,
-            "total": total,
             "page_size": params.page_size,
-            "has_more": params.page < total_pages,
-            "total_pages": total_pages,
+            "has_more": has_more,
+            "count": page.len(),
             "results": page,
         }))
     }
 
     async fn search_similar(&self, params: &SearchParams) -> Result<Value> {
+        if params.query.trim().is_empty() {
+            return Err(AlayaError::Validation(
+                "query is required for similar mode".into(),
+            ));
+        }
         let query_embedding = self
             .embeddings
             .embed_batch(&[params.query.as_str()], PromptName::Query)
@@ -1111,7 +1118,6 @@ fn format_memory_result(memory: &Memory, score: f64, output: OutputMode) -> Valu
     match output {
         OutputMode::Full => {
             obj.insert("content".into(), serde_json::json!(memory.content));
-            obj.insert("summary".into(), serde_json::json!(memory.summary));
         }
         OutputMode::Summary => {
             obj.insert("summary".into(), serde_json::json!(memory.summary));
