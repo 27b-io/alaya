@@ -125,6 +125,22 @@ pub(crate) enum Cmd {
     },
 }
 
+impl Cmd {
+    fn op_name(&self) -> &'static str {
+        match self {
+            Cmd::Health { .. } => "health",
+            Cmd::Store { .. } => "store",
+            Cmd::Search { .. } => "search",
+            Cmd::Delete { .. } => "delete",
+            Cmd::Relation { .. } => "relation",
+            Cmd::Supersede { .. } => "supersede",
+            Cmd::Contradictions { .. } => "contradictions",
+            Cmd::FindDuplicates { .. } => "find_duplicates",
+            Cmd::MergeDuplicates { .. } => "merge_duplicates",
+        }
+    }
+}
+
 /// Handle for sending commands. Clone + Send + Sync (axum-compatible).
 #[derive(Clone)]
 pub(crate) struct ServiceHandle {
@@ -149,12 +165,17 @@ impl ServiceHandle {
 /// Runs MemoryService on a LocalSet, processing commands from the channel.
 async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
     while let Some(cmd) = rx.recv().await {
+        let op = cmd.op_name();
+        let start = std::time::Instant::now();
         match cmd {
             Cmd::Health { reply } => {
                 let result = match svc.check_database_health().await {
-                    Ok(r) => json!(r),
+                    Ok(r) => {
+                        log_ok(op, &json!(r), start);
+                        json!(r)
+                    }
                     Err(e) => {
-                        tracing::error!("check_database_health failed: {e:?}");
+                        log_err(op, &e, start);
                         json!({"status": "error", "message": e.safe_message()})
                     }
                 };
@@ -162,39 +183,61 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             }
             Cmd::Store { params, reply } => {
                 let result = match svc.store_memory(params).await {
-                    Ok(r) => json!(r),
+                    Ok(r) => {
+                        log_ok(op, &json!(r), start);
+                        json!(r)
+                    }
                     Err(e) => {
-                        tracing::error!("store_memory failed: {e:?}");
+                        log_err(op, &e, start);
                         json!({"success": false, "error": e.safe_message()})
                     }
                 };
                 let _ = reply.send(result);
             }
             Cmd::Search { params, reply } => {
+                let mode = format!("{:?}", params.mode).to_lowercase();
                 let result = match svc.search(params).await {
-                    Ok(r) => r,
+                    Ok(r) => {
+                        let n = result_count(&r);
+                        tracing::info!(
+                            op,
+                            mode = mode.as_str(),
+                            results = n,
+                            elapsed_ms = ms(start),
+                            "ok"
+                        );
+                        r
+                    }
                     Err(e) => {
-                        tracing::error!("search failed: {e:?}");
+                        log_err(op, &e, start);
                         json!({"error": e.safe_message()})
                     }
                 };
                 let _ = reply.send(result);
             }
             Cmd::Delete { hash, reply } => {
+                let h = &hash[..8.min(hash.len())];
                 let result = match svc.delete_memory(&hash).await {
-                    Ok(r) => json!(r),
+                    Ok(r) => {
+                        tracing::info!(op, hash = h, elapsed_ms = ms(start), "ok");
+                        json!(r)
+                    }
                     Err(e) => {
-                        tracing::error!("delete_memory failed: {e:?}");
+                        log_err(op, &e, start);
                         json!({"success": false, "error": e.safe_message()})
                     }
                 };
                 let _ = reply.send(result);
             }
             Cmd::Relation { params, reply } => {
+                let action = params.action.clone();
                 let result = match svc.relation(params).await {
-                    Ok(r) => r,
+                    Ok(r) => {
+                        tracing::info!(op, action = action.as_str(), elapsed_ms = ms(start), "ok");
+                        r
+                    }
                     Err(e) => {
-                        tracing::error!("relation failed: {e:?}");
+                        log_err(op, &e, start);
                         json!({"success": false, "error": e.safe_message()})
                     }
                 };
@@ -206,10 +249,15 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 reason,
                 reply,
             } => {
+                let old_h = &old_hash[..8.min(old_hash.len())];
+                let new_h = &new_hash[..8.min(new_hash.len())];
                 let result = match svc.memory_supersede(&old_hash, &new_hash, &reason).await {
-                    Ok(r) => r,
+                    Ok(r) => {
+                        tracing::info!(op, old = old_h, new = new_h, elapsed_ms = ms(start), "ok");
+                        r
+                    }
                     Err(e) => {
-                        tracing::error!("memory_supersede failed: {e:?}");
+                        log_err(op, &e, start);
                         json!({"success": false, "error": e.safe_message()})
                     }
                 };
@@ -217,9 +265,12 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             }
             Cmd::Contradictions { limit, reply } => {
                 let result = match svc.memory_contradictions(limit).await {
-                    Ok(r) => r,
+                    Ok(r) => {
+                        log_ok(op, &r, start);
+                        r
+                    }
                     Err(e) => {
-                        tracing::error!("memory_contradictions failed: {e:?}");
+                        log_err(op, &e, start);
                         json!({"success": false, "error": e.safe_message()})
                     }
                 };
@@ -232,9 +283,16 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 reply,
             } => {
                 let result = match svc.find_duplicates(threshold, limit, strategy).await {
-                    Ok(r) => r,
+                    Ok(r) => {
+                        let n = r
+                            .get("total_duplicates_found")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        tracing::info!(op, duplicates = n, elapsed_ms = ms(start), "ok");
+                        r
+                    }
                     Err(e) => {
-                        tracing::error!("find_duplicates failed: {e:?}");
+                        log_err(op, &e, start);
                         json!({"success": false, "error": e.safe_message()})
                     }
                 };
@@ -252,9 +310,12 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                     .merge_duplicates(&canonical, &refs, &reason, dry_run)
                     .await
                 {
-                    Ok(r) => r,
+                    Ok(r) => {
+                        log_ok(op, &r, start);
+                        r
+                    }
                     Err(e) => {
-                        tracing::error!("merge_duplicates failed: {e:?}");
+                        log_err(op, &e, start);
                         json!({"success": false, "error": e.safe_message()})
                     }
                 };
@@ -262,6 +323,31 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             }
         }
     }
+}
+
+fn ms(start: std::time::Instant) -> u64 {
+    start.elapsed().as_millis() as u64
+}
+
+fn result_count(v: &Value) -> u64 {
+    v.get("results")
+        .and_then(|r| r.as_array())
+        .map(|a| a.len() as u64)
+        .unwrap_or(0)
+}
+
+fn log_ok(op: &str, result: &Value, start: std::time::Instant) {
+    let hash = result
+        .get("content_hash")
+        .and_then(|v| v.as_str())
+        .map(|s| &s[..8.min(s.len())])
+        .unwrap_or("-");
+    let n = result_count(result);
+    tracing::info!(op, hash, results = n, elapsed_ms = ms(start), "ok");
+}
+
+fn log_err(op: &str, e: &alaya_types::AlayaError, start: std::time::Instant) {
+    tracing::error!(op, error = %e, elapsed_ms = ms(start), "failed");
 }
 
 // ─── Auth middleware ────────────────────────────────────────────────────────
