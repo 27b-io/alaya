@@ -18,15 +18,18 @@ const BRPOP_TIMEOUT_SECS: f64 = 1.0;
 const MAX_OPS_PER_SEC: u32 = 100;
 
 /// Spawn the Hebbian write-queue consumer as a background tokio task.
-pub fn spawn_consumer(state: Arc<AppState>) {
+///
+/// Takes a **dedicated** `ConnectionManager` — BRPOP is a blocking command
+/// that starves a multiplexed connection, so the consumer must NOT share
+/// the connection used by query handlers.
+pub fn spawn_consumer(state: Arc<AppState>, queue_conn: redis::aio::ConnectionManager) {
     tokio::spawn(async move {
-        consumer_loop(&state).await;
+        consumer_loop(&state, queue_conn).await;
     });
     tracing::info!("Hebbian write-queue consumer started (queue={QUEUE_KEY})");
 }
 
-async fn consumer_loop(state: &AppState) {
-    let mut conn = state.redis.clone();
+async fn consumer_loop(state: &AppState, mut queue_conn: redis::aio::ConnectionManager) {
     let mut ops_this_second: u32 = 0;
     let mut second_start = tokio::time::Instant::now();
 
@@ -51,7 +54,7 @@ async fn consumer_loop(state: &AppState) {
         let result: Result<Option<(String, String)>, redis::RedisError> = redis::cmd("BRPOP")
             .arg(QUEUE_KEY)
             .arg(BRPOP_TIMEOUT_SECS)
-            .query_async(&mut conn)
+            .query_async(&mut queue_conn)
             .await;
 
         match result {

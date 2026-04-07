@@ -328,48 +328,33 @@ pub fn get_orphan_nodes(limit: u32) -> CypherQuery {
     (q, params(&[("lim", json!(limit))]), true)
 }
 
-/// Return multiple queries for a full graph statistics snapshot.
+/// Return a single UNION ALL query that fetches all graph statistics in one
+/// Redis round-trip. Returns rows of `(kind, cnt)`.
 ///
-/// Each tuple is independent; results must be collected by the caller.
-pub fn get_graph_stats() -> Vec<CypherQuery> {
-    let empty: HashMap<String, Value> = HashMap::new();
+/// Previously this was 6 separate queries executed sequentially — each one a
+/// full Redis GRAPH.RO_QUERY round-trip. With BRPOP contention on the old
+/// shared connection, that meant ~6s for stats alone.
+pub fn get_graph_stats_union() -> CypherQuery {
+    let relates = UserRelationType::RelatesTo.cypher_label();
+    let precedes = UserRelationType::Precedes.cypher_label();
+    let contradicts = UserRelationType::Contradicts.cypher_label();
+    let supersedes = SystemRelationType::Supersedes.cypher_label();
 
-    let node_count = (
-        "MATCH (m:Memory) RETURN count(m)".to_string(),
-        empty.clone(),
-        true,
+    let q = format!(
+        "MATCH (m:Memory) RETURN 'nodes' AS kind, count(m) AS cnt \
+         UNION ALL \
+         MATCH ()-[e:HEBBIAN]->() RETURN 'hebbian' AS kind, count(e) AS cnt \
+         UNION ALL \
+         MATCH ()-[e:{relates}]->() RETURN '{relates}' AS kind, count(e) AS cnt \
+         UNION ALL \
+         MATCH ()-[e:{precedes}]->() RETURN '{precedes}' AS kind, count(e) AS cnt \
+         UNION ALL \
+         MATCH ()-[e:{contradicts}]->() RETURN '{contradicts}' AS kind, count(e) AS cnt \
+         UNION ALL \
+         MATCH ()-[e:{supersedes}]->() RETURN '{supersedes}' AS kind, count(e) AS cnt"
     );
-    let hebbian_count = (
-        "MATCH ()-[e:HEBBIAN]->() RETURN count(e)".to_string(),
-        empty.clone(),
-        true,
-    );
 
-    let mut queries = vec![node_count, hebbian_count];
-
-    // one query per user relation type
-    for rel in [
-        UserRelationType::RelatesTo,
-        UserRelationType::Precedes,
-        UserRelationType::Contradicts,
-    ] {
-        let label = rel.cypher_label();
-        queries.push((
-            format!("MATCH ()-[e:{label}]->() RETURN count(e)"),
-            empty.clone(),
-            true,
-        ));
-    }
-
-    // system relation types
-    let label = SystemRelationType::Supersedes.cypher_label();
-    queries.push((
-        format!("MATCH ()-[e:{label}]->() RETURN count(e)"),
-        empty.clone(),
-        true,
-    ));
-
-    queries
+    (q, HashMap::new(), true)
 }
 
 // ─── schema ───────────────────────────────────────────────────────────────────
@@ -598,22 +583,21 @@ mod tests {
     // graph stats
 
     #[test]
-    fn get_graph_stats_returns_multiple_queries() {
-        let qs = get_graph_stats();
-        // node_count + hebbian + 3 user rels + 1 system rel = 6
-        assert_eq!(qs.len(), 6);
-        // all must be readonly
-        assert!(qs.iter().all(|(_, _, ro)| *ro));
-        let cypher_joined: String = qs
-            .iter()
-            .map(|(q, _, _)| q.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(cypher_joined.contains("HEBBIAN"));
-        assert!(cypher_joined.contains("RELATES_TO"));
-        assert!(cypher_joined.contains("PRECEDES"));
-        assert!(cypher_joined.contains("CONTRADICTS"));
-        assert!(cypher_joined.contains("SUPERSEDES"));
+    fn get_graph_stats_union_shape() {
+        let (q, p, ro) = get_graph_stats_union();
+        // Single query, no params, readonly
+        assert!(p.is_empty());
+        assert!(ro);
+        // Contains all edge types in UNION ALL
+        assert!(q.contains("UNION ALL"));
+        assert!(q.contains("HEBBIAN"));
+        assert!(q.contains("RELATES_TO"));
+        assert!(q.contains("PRECEDES"));
+        assert!(q.contains("CONTRADICTS"));
+        assert!(q.contains("SUPERSEDES"));
+        // Returns kind + cnt columns
+        assert!(q.contains("AS kind"));
+        assert!(q.contains("AS cnt"));
     }
 
     // schema

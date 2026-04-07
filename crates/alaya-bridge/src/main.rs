@@ -14,14 +14,19 @@ async fn main() {
     let graph_name = std::env::var("GRAPH_NAME").unwrap_or_else(|_| "memory".into());
 
     let client = redis::Client::open(redis_url.as_str()).expect("Invalid REDIS_URL");
-    let redis = redis::aio::ConnectionManager::new(client)
+    let redis = redis::aio::ConnectionManager::new(client.clone())
         .await
         .expect("Failed to connect to Redis");
 
     let state = Arc::new(AppState { redis, graph_name });
 
-    // Start background Hebbian write-queue consumer (LPUSH/BRPOP pattern).
-    alaya_bridge::queue::spawn_consumer(state.clone());
+    // BRPOP is a blocking command that starves a multiplexed ConnectionManager.
+    // Give the consumer its own dedicated connection so it doesn't block query handlers.
+    let queue_conn = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("Failed to create queue connection");
+
+    alaya_bridge::queue::spawn_consumer(state.clone(), queue_conn);
 
     let app = alaya_bridge::routes::router(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));

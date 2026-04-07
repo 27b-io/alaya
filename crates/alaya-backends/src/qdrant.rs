@@ -37,10 +37,14 @@ impl QdrantClient {
             );
         }
 
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .build()
-            .expect("failed to build reqwest client");
+        let builder = reqwest::Client::builder().default_headers(headers);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let builder = builder
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(30));
+
+        let client = builder.build().expect("failed to build reqwest client");
 
         let tag_collection = format!("{collection}_tags");
         Self {
@@ -49,6 +53,21 @@ impl QdrantClient {
             collection,
             tag_collection,
         }
+    }
+}
+
+// ─── Access timestamp capping ────────────────────────────────────────────────
+
+/// Maximum number of access timestamps to retain per memory.
+/// The spaced_repetition module only needs recent inter-access intervals,
+/// so 100 entries is more than sufficient.
+const MAX_ACCESS_TIMESTAMPS: usize = 100;
+
+/// Trim `timestamps` to keep only the most recent `max` entries.
+fn cap_timestamps(timestamps: &mut Vec<f64>, max: usize) {
+    if timestamps.len() > max {
+        let drain_count = timestamps.len() - max;
+        timestamps.drain(..drain_count);
     }
 }
 
@@ -767,6 +786,7 @@ impl VectorStorage for QdrantClient {
         let new_count = memory.access_count + 1;
         let mut timestamps = memory.access_timestamps;
         timestamps.push(now);
+        cap_timestamps(&mut timestamps, MAX_ACCESS_TIMESTAMPS);
 
         let point_id = hash_to_uuid(content_hash)?;
         let body = json!({
@@ -790,6 +810,74 @@ impl VectorStorage for QdrantClient {
 
         if !resp.status().is_success() {
             return Err(qdrant_error(resp).await);
+        }
+
+        Ok(())
+    }
+
+    async fn increment_access_count_batch(&self, content_hashes: &[&str]) -> Result<()> {
+        if content_hashes.is_empty() {
+            return Ok(());
+        }
+
+        // Single batch GET instead of N individual GETs
+        let memories = self.get_batch(content_hashes).await.unwrap_or_default();
+        if memories.is_empty() {
+            return Ok(());
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        // Fire individual set-payload calls (each point has different values)
+        for memory in &memories {
+            let new_count = memory.access_count + 1;
+            let mut timestamps = memory.access_timestamps.clone();
+            timestamps.push(now);
+            cap_timestamps(&mut timestamps, MAX_ACCESS_TIMESTAMPS);
+
+            let point_id = match hash_to_uuid(&memory.content_hash) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+
+            let body = json!({
+                "payload": {
+                    "access_count": new_count,
+                    "access_timestamps": timestamps,
+                },
+                "points": [point_id],
+            });
+
+            let resp = self
+                .client
+                .post(format!(
+                    "{}/collections/{}/points/payload",
+                    self.base_url, self.collection
+                ))
+                .json(&body)
+                .send()
+                .await;
+
+            // Non-fatal: log and continue on individual failures
+            match resp {
+                Ok(r) if !r.status().is_success() => {
+                    tracing::warn!(
+                        hash = %memory.content_hash,
+                        "batch increment_access_count set-payload failed"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        hash = %memory.content_hash,
+                        error = %e,
+                        "batch increment_access_count set-payload error"
+                    );
+                }
+                _ => {}
+            }
         }
 
         Ok(())
@@ -1028,5 +1116,47 @@ mod tests {
         assert_eq!(payload["access_count"], 5);
         assert!(payload.get("metadata").is_none());
         assert_eq!(payload["summary"], "summary");
+    }
+
+    #[test]
+    fn cap_timestamps_noop_below_limit() {
+        let mut ts: Vec<f64> = (0..50).map(|i| i as f64).collect();
+        cap_timestamps(&mut ts, MAX_ACCESS_TIMESTAMPS);
+        assert_eq!(ts.len(), 50);
+        assert_eq!(ts[0], 0.0);
+    }
+
+    #[test]
+    fn cap_timestamps_noop_at_limit() {
+        let mut ts: Vec<f64> = (0..100).map(|i| i as f64).collect();
+        cap_timestamps(&mut ts, MAX_ACCESS_TIMESTAMPS);
+        assert_eq!(ts.len(), 100);
+        assert_eq!(ts[0], 0.0);
+        assert_eq!(ts[99], 99.0);
+    }
+
+    #[test]
+    fn cap_timestamps_trims_oldest_when_over_limit() {
+        let mut ts: Vec<f64> = (0..150).map(|i| i as f64).collect();
+        cap_timestamps(&mut ts, MAX_ACCESS_TIMESTAMPS);
+        assert_eq!(ts.len(), 100);
+        // Oldest 50 removed, first remaining is 50.0
+        assert_eq!(ts[0], 50.0);
+        assert_eq!(ts[99], 149.0);
+    }
+
+    #[test]
+    fn cap_timestamps_trims_one_over() {
+        let mut ts: Vec<f64> = (0..101).map(|i| i as f64).collect();
+        cap_timestamps(&mut ts, MAX_ACCESS_TIMESTAMPS);
+        assert_eq!(ts.len(), 100);
+        assert_eq!(ts[0], 1.0);
+    }
+
+    #[test]
+    fn cap_timestamps_empty_vec() {
+        let mut ts: Vec<f64> = vec![];
+        cap_timestamps(&mut ts, MAX_ACCESS_TIMESTAMPS);
+        assert!(ts.is_empty());
     }
 }

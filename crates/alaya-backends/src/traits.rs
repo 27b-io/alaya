@@ -53,6 +53,18 @@ pub trait VectorStorage {
     async fn count(&self) -> Result<usize>;
     async fn get_all_tags(&self) -> Result<Vec<String>>;
     async fn increment_access_count(&self, content_hash: &str) -> Result<()>;
+
+    /// Batch increment access counts for multiple memories.
+    ///
+    /// Default: sequential fallback. Implementations may override with
+    /// batch GET + concurrent PUTs to reduce round trips from 2N to 1+N.
+    async fn increment_access_count_batch(&self, content_hashes: &[&str]) -> Result<()> {
+        for hash in content_hashes {
+            let _ = self.increment_access_count(hash).await;
+        }
+        Ok(())
+    }
+
     async fn health(&self) -> Result<HealthStatus>;
 }
 

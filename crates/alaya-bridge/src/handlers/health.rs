@@ -26,26 +26,30 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
 
 /// GET /stats
 ///
-/// Executes graph statistics queries and returns a `GraphStats` snapshot.
+/// Executes a single UNION ALL query for all graph statistics.
+/// Previously used 6 sequential queries (one per edge type), each a full
+/// Redis round-trip. Now does it in one.
 pub async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Value>, StatusCode> {
-    let queries = cypher::get_graph_stats();
-    // Queries: [node_count, hebbian_count, RELATES_TO, PRECEDES, CONTRADICTS, SUPERSEDES]
-    if queries.len() < 6 {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    let (q, params, readonly) = cypher::get_graph_stats_union();
+    let result = exec_query(&state, &q, params, readonly).await?;
+
+    // Parse rows of (kind, cnt) into a lookup
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for row in &result.result_set {
+        if let (Some(kind), Some(cnt)) = (
+            row.first().and_then(|v| v.as_str()),
+            row.get(1).and_then(|v| v.as_i64()),
+        ) {
+            counts.insert(kind, cnt as usize);
+        }
     }
 
-    let mut counts: Vec<i64> = Vec::with_capacity(queries.len());
-    for (q, params, readonly) in queries {
-        let result = exec_query(&state, &q, params, readonly).await?;
-        counts.push(result.count().unwrap_or(0));
-    }
-
-    let node_count = counts[0] as usize;
-    let hebbian_edge_count = counts[1] as usize;
-    let relates_to = counts[2] as usize;
-    let precedes = counts[3] as usize;
-    let contradicts = counts[4] as usize;
-    let supersedes = counts[5] as usize;
+    let node_count = counts.get("nodes").copied().unwrap_or(0);
+    let hebbian_edge_count = counts.get("hebbian").copied().unwrap_or(0);
+    let relates_to = counts.get("RELATES_TO").copied().unwrap_or(0);
+    let precedes = counts.get("PRECEDES").copied().unwrap_or(0);
+    let contradicts = counts.get("CONTRADICTS").copied().unwrap_or(0);
+    let supersedes = counts.get("SUPERSEDES").copied().unwrap_or(0);
 
     let edge_count = hebbian_edge_count + relates_to + precedes + contradicts + supersedes;
 

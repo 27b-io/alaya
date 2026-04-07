@@ -1,6 +1,7 @@
 //! Hybrid search — RRF fusion, adaptive alpha, keyword extraction, recency decay.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 // ─── Stop words ─────────────────────────────────────────────────────────────
 
@@ -17,6 +18,8 @@ const STOP_WORDS: &[&str] = &[
     "this", "that", "these", "those", "am",
 ];
 
+static STOP_SET: LazyLock<HashSet<&str>> = LazyLock::new(|| STOP_WORDS.iter().copied().collect());
+
 /// Tag-only base score (no cosine similarity available).
 const TAG_ONLY_BASE_SCORE: f64 = 0.1;
 
@@ -30,13 +33,11 @@ pub const RRF_K: usize = 60;
 /// Tokenizes on non-alphanumeric, lowercases, removes stop words and short tokens,
 /// and generates hyphenated compounds from adjacent tokens.
 pub fn extract_query_keywords(query: &str, existing_tags: Option<&HashSet<String>>) -> Vec<String> {
-    let stop: HashSet<&str> = STOP_WORDS.iter().copied().collect();
-
     // Tokenize: split on non-alphanumeric
     let tokens: Vec<String> = query
         .split(|c: char| !c.is_alphanumeric())
         .map(|s| s.to_lowercase())
-        .filter(|s| s.len() >= 2 && !stop.contains(s.as_str()))
+        .filter(|s| s.len() >= 2 && !STOP_SET.contains(s.as_str()))
         .collect();
 
     let mut keywords: Vec<String> = tokens.clone();
@@ -203,6 +204,25 @@ mod tests {
     fn extract_keywords_deduplicated() {
         let kw = extract_query_keywords("rust rust rust", None);
         assert_eq!(kw.iter().filter(|k| *k == "rust").count(), 1);
+    }
+
+    #[test]
+    fn extract_keywords_static_stop_set_repeated_calls() {
+        // Verify the static STOP_SET works correctly across multiple invocations.
+        // If the LazyLock is broken, the second call would panic or return wrong results.
+        let kw1 = extract_query_keywords("configure Rust logging", None);
+        let kw2 = extract_query_keywords("deploy Python service", None);
+        let kw3 = extract_query_keywords("configure Rust logging", None);
+
+        // First and third calls are identical input — must produce identical output
+        assert_eq!(kw1, kw3);
+
+        // Second call filters its own stop words correctly
+        assert!(kw2.contains(&"deploy".to_string()));
+        assert!(kw2.contains(&"python".to_string()));
+        assert!(kw2.contains(&"service".to_string()));
+        // "the", "a", etc. must still be filtered on every call
+        assert!(!kw2.iter().any(|k| STOP_WORDS.contains(&k.as_str())));
     }
 
     #[test]

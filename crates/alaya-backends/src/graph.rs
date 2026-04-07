@@ -35,10 +35,14 @@ impl GraphHttpClient {
             headers.insert(AUTHORIZATION, val);
         }
 
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .build()
-            .expect("failed to build reqwest client");
+        let builder = reqwest::Client::builder().default_headers(headers);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let builder = builder
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(30));
+
+        let client = builder.build().expect("failed to build reqwest client");
 
         Self { client, base_url }
     }

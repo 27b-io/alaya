@@ -3,6 +3,7 @@
 //! This is the core business logic layer. Each public method corresponds to
 //! one MCP tool. All backend calls go through trait abstractions.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -99,12 +100,22 @@ pub struct RelationParams {
 
 // ─── MemoryService ──────────────────────────────────────────────────────────
 
+/// TTL for the tag cache in seconds. Tags change infrequently, so 60s is
+/// acceptable — new tags may not appear in hybrid keyword extraction for
+/// up to one minute after being stored.
+const TAG_CACHE_TTL: f64 = 60.0;
+
 pub struct MemoryService {
     pub vectors: Box<dyn VectorStorage>,
     pub embeddings: Box<dyn EmbeddingProvider>,
     pub graph: Box<dyn GraphService>,
     pub hebbian: Box<dyn HebbianService>,
     pub consolidation: Box<dyn ConsolidationService>,
+    /// Cached (timestamp, tags) from `get_all_tags()`. RefCell is fine:
+    /// MemoryService runs single-threaded on a LocalSet (`!Send`).
+    tag_cache: RefCell<Option<(f64, Vec<String>)>>,
+    /// Clock function for timestamps. Defaults to wall clock; injectable for tests.
+    clock: fn() -> f64,
 }
 
 impl MemoryService {
@@ -121,6 +132,29 @@ impl MemoryService {
             graph,
             hebbian,
             consolidation,
+            tag_cache: RefCell::new(None),
+            clock: current_timestamp,
+        }
+    }
+
+    /// Create a `MemoryService` with a custom clock (for testing).
+    #[cfg(test)]
+    pub fn with_clock(
+        vectors: Box<dyn VectorStorage>,
+        embeddings: Box<dyn EmbeddingProvider>,
+        graph: Box<dyn GraphService>,
+        hebbian: Box<dyn HebbianService>,
+        consolidation: Box<dyn ConsolidationService>,
+        clock: fn() -> f64,
+    ) -> Self {
+        Self {
+            vectors,
+            embeddings,
+            graph,
+            hebbian,
+            consolidation,
+            tag_cache: RefCell::new(None),
+            clock,
         }
     }
 
@@ -131,7 +165,7 @@ impl MemoryService {
             return Err(AlayaError::Validation("content cannot be empty".into()));
         }
 
-        let now = current_timestamp();
+        let now = (self.clock)();
         let content_hash = generate_content_hash(&params.content);
         let tags = params.tags.unwrap_or_default();
         let memory_type = params.memory_type.unwrap_or_else(|| "note".into());
@@ -218,6 +252,11 @@ impl MemoryService {
 
         // Store in vector DB
         let (created, _) = self.vectors.store(&memory).await?;
+
+        // Invalidate tag cache — new tags should appear in keyword extraction immediately
+        if !tags.is_empty() {
+            *self.tag_cache.borrow_mut() = None;
+        }
 
         // Create graph node (non-fatal)
         if let Err(e) = self.graph.ensure_node(&content_hash, now).await {
@@ -353,10 +392,25 @@ impl MemoryService {
                 "query is required for hybrid mode".into(),
             ));
         }
-        let now = current_timestamp();
+        let now = (self.clock)();
 
-        // Stage 1: Prepare
-        let all_tags = self.vectors.get_all_tags().await.unwrap_or_default();
+        // Stage 1: Prepare — use cached tags if fresh, otherwise fetch
+        let all_tags = {
+            let cached = self.tag_cache.borrow().clone();
+            if let Some((ts, tags)) = cached {
+                if now - ts < TAG_CACHE_TTL {
+                    tags
+                } else {
+                    let fresh = self.vectors.get_all_tags().await.unwrap_or_default();
+                    *self.tag_cache.borrow_mut() = Some((now, fresh.clone()));
+                    fresh
+                }
+            } else {
+                let fresh = self.vectors.get_all_tags().await.unwrap_or_default();
+                *self.tag_cache.borrow_mut() = Some((now, fresh.clone()));
+                fresh
+            }
+        };
         let tag_set: std::collections::HashSet<String> = all_tags.into_iter().collect();
         let keywords = hybrid_search::extract_query_keywords(&params.query, Some(&tag_set));
         let corpus_size = self.vectors.count().await.unwrap_or(0);
@@ -503,10 +557,11 @@ impl MemoryService {
         // Stage 6: Enrich — fire-and-forget side effects
         let page_hashes: Vec<&str> = page_results.iter().map(|(h, _)| h.as_str()).collect();
 
-        // Increment access counts (non-fatal)
-        for hash in &page_hashes {
-            let _ = self.vectors.increment_access_count(hash).await;
-        }
+        // Increment access counts (non-fatal, single batch GET + N PUTs)
+        let _ = self
+            .vectors
+            .increment_access_count_batch(&page_hashes)
+            .await;
 
         // Hebbian co-access (non-fatal)
         if page_hashes.len() >= 2 {
@@ -777,7 +832,7 @@ impl MemoryService {
                     .ok_or_else(|| AlayaError::Validation("relation_type required".into()))?;
                 let rel = parse_user_relation(rel_str)?;
 
-                let now = current_timestamp();
+                let now = (self.clock)();
                 let created = self
                     .graph
                     .create_typed_edge(
@@ -891,7 +946,7 @@ impl MemoryService {
             .await?;
 
         // Create SUPERSEDES graph edge
-        let now = current_timestamp();
+        let now = (self.clock)();
         if let Err(e) = self
             .graph
             .create_system_edge(new_hash, old_hash, SystemRelationType::Supersedes, now)
@@ -1157,6 +1212,8 @@ fn truncate(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     #[test]
     fn truncate_handles_multibyte_utf8() {
@@ -1177,5 +1234,480 @@ mod tests {
     #[test]
     fn truncate_short_string_unchanged() {
         assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    // ─── Mock backends for tag cache tests ─────────────────────────────
+
+    use alaya_backends::{
+        ConsolidationService, EmbeddingProvider, GraphService, HebbianService, VectorStorage,
+    };
+    use alaya_types::{
+        graph::{
+            CoAccessPair, Contradiction, ContradictionRef, Direction, Edge, EdgeMeta, GraphStats,
+            Neighbor, SystemRelationType, UserRelationType,
+        },
+        memory::{HealthStatus, Memory, MetadataUpdate, ScoredMemory, ScrollResult},
+        search::{PayloadFilter, PromptName},
+    };
+    use async_trait::async_trait;
+
+    /// Mock VectorStorage that counts `get_all_tags` calls.
+    struct MockVectors {
+        get_all_tags_calls: Rc<Cell<usize>>,
+        tags: Vec<String>,
+    }
+
+    impl MockVectors {
+        fn new(tags: Vec<String>, counter: Rc<Cell<usize>>) -> Self {
+            Self {
+                get_all_tags_calls: counter,
+                tags,
+            }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl VectorStorage for MockVectors {
+        async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+            Ok((true, "mock".into()))
+        }
+        async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
+            Ok(None)
+        }
+        async fn get_batch(&self, _h: &[&str]) -> Result<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn delete(&self, _h: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn update_metadata(&self, _h: &str, _u: MetadataUpdate) -> Result<()> {
+            Ok(())
+        }
+        async fn search_by_vector(
+            &self,
+            _e: &[f32],
+            _l: usize,
+            _f: Option<PayloadFilter>,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(vec![])
+        }
+        async fn search_by_tags(
+            &self,
+            _t: &[&str],
+            _m: bool,
+            _l: usize,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(vec![])
+        }
+        async fn search_similar_tags(&self, _e: &[f32], _l: usize) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn get_all(&self, _l: usize, _o: Option<&str>) -> Result<ScrollResult> {
+            Ok(ScrollResult {
+                memories: vec![],
+                next_offset: None,
+            })
+        }
+        async fn get_recent(&self, _l: usize, _o: usize, _t: Option<&str>) -> Result<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn count(&self) -> Result<usize> {
+            Ok(100)
+        }
+        async fn get_all_tags(&self) -> Result<Vec<String>> {
+            self.get_all_tags_calls
+                .set(self.get_all_tags_calls.get() + 1);
+            Ok(self.tags.clone())
+        }
+        async fn increment_access_count(&self, _h: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            Ok(HealthStatus {
+                status: "ok".into(),
+                backend: "mock".into(),
+                details: None,
+            })
+        }
+    }
+
+    /// Mock embedding provider returning a fixed vector.
+    struct MockEmbeddings;
+
+    #[async_trait(?Send)]
+    impl EmbeddingProvider for MockEmbeddings {
+        async fn embed_batch(&self, texts: &[&str], _p: PromptName) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.0; 1024]).collect())
+        }
+        fn dimensions(&self) -> usize {
+            1024
+        }
+        fn model_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    /// No-op graph service.
+    struct MockGraph;
+
+    #[async_trait(?Send)]
+    impl GraphService for MockGraph {
+        async fn ensure_node(&self, _h: &str, _t: f64) -> Result<()> {
+            Ok(())
+        }
+        async fn delete_node(&self, _h: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn create_typed_edge(
+            &self,
+            _s: &str,
+            _d: &str,
+            _r: UserRelationType,
+            _m: EdgeMeta,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+        async fn get_typed_edges(
+            &self,
+            _h: &str,
+            _r: Option<UserRelationType>,
+            _d: Direction,
+            _l: usize,
+        ) -> Result<Vec<Edge>> {
+            Ok(vec![])
+        }
+        async fn delete_typed_edge(
+            &self,
+            _s: &str,
+            _d: &str,
+            _r: UserRelationType,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+        async fn create_system_edge(
+            &self,
+            _s: &str,
+            _d: &str,
+            _r: SystemRelationType,
+            _t: f64,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+        async fn get_all_contradictions(&self, _l: usize) -> Result<Vec<Contradiction>> {
+            Ok(vec![])
+        }
+        async fn get_contradictions_for_hashes(
+            &self,
+            _h: &[&str],
+        ) -> Result<HashMap<String, Vec<ContradictionRef>>> {
+            Ok(HashMap::new())
+        }
+        async fn get_neighbors(
+            &self,
+            _h: &str,
+            _m: u8,
+            _w: f64,
+            _l: usize,
+        ) -> Result<Vec<Neighbor>> {
+            Ok(vec![])
+        }
+        async fn spreading_activation(
+            &self,
+            _s: &[&str],
+            _m: u8,
+            _d: f64,
+            _a: f64,
+            _l: usize,
+        ) -> Result<HashMap<String, f64>> {
+            Ok(HashMap::new())
+        }
+        async fn hebbian_boosts_within(&self, _h: &[&str]) -> Result<HashMap<String, f64>> {
+            Ok(HashMap::new())
+        }
+        async fn get_stats(&self) -> Result<GraphStats> {
+            Ok(GraphStats {
+                graph_name: "mock".into(),
+                node_count: 0,
+                edge_count: 0,
+                hebbian_edge_count: 0,
+                typed_edge_counts: HashMap::new(),
+                status: "ok".into(),
+            })
+        }
+    }
+
+    struct MockHebbian;
+    #[async_trait(?Send)]
+    impl HebbianService for MockHebbian {
+        async fn enqueue_strengthen(&self, _p: &[CoAccessPair]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MockConsolidation;
+    #[async_trait(?Send)]
+    impl ConsolidationService for MockConsolidation {
+        async fn decay_all_edges(&self, _d: f64, _l: usize) -> Result<usize> {
+            Ok(0)
+        }
+        async fn decay_stale_edges(&self, _s: f64, _d: f64, _l: usize) -> Result<usize> {
+            Ok(0)
+        }
+        async fn prune_weak_edges(&self, _t: f64, _l: usize) -> Result<usize> {
+            Ok(0)
+        }
+        async fn get_orphan_nodes(&self, _l: usize) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+    }
+
+    fn build_mock_service(tags: Vec<String>) -> (MemoryService, Rc<Cell<usize>>) {
+        let counter = Rc::new(Cell::new(0));
+        let svc = MemoryService::new(
+            Box::new(MockVectors::new(tags, counter.clone())),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+        );
+        (svc, counter)
+    }
+
+    fn build_mock_service_with_clock(
+        tags: Vec<String>,
+        clock: fn() -> f64,
+    ) -> (MemoryService, Rc<Cell<usize>>) {
+        let counter = Rc::new(Cell::new(0));
+        let svc = MemoryService::with_clock(
+            Box::new(MockVectors::new(tags, counter.clone())),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            clock,
+        );
+        (svc, counter)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tag_cache_avoids_repeat_fetches() {
+        let (svc, counter) = build_mock_service(vec!["rust".into(), "alaya".into()]);
+
+        let params = SearchParams {
+            query: "test query about rust".into(),
+            mode: SearchMode::Hybrid,
+            page: 1,
+            page_size: 10,
+            tags: None,
+            match_all: false,
+            k: 10,
+            min_similarity: None,
+            memory_type: None,
+            encoding_context: None,
+            include_superseded: false,
+            min_trust_score: None,
+            output: OutputMode::Full,
+        };
+
+        // First search — must call get_all_tags
+        let _ = svc.search(params.clone()).await;
+        assert_eq!(counter.get(), 1, "first search should fetch tags");
+
+        // Second search within TTL — must NOT call get_all_tags again
+        let _ = svc.search(params.clone()).await;
+        assert_eq!(
+            counter.get(),
+            1,
+            "second search within TTL should use cached tags"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tag_cache_invalidated_on_store_with_tags() {
+        let (svc, counter) = build_mock_service(vec!["rust".into()]);
+
+        let search_params = SearchParams {
+            query: "test query".into(),
+            mode: SearchMode::Hybrid,
+            page: 1,
+            page_size: 10,
+            tags: None,
+            match_all: false,
+            k: 10,
+            min_similarity: None,
+            memory_type: None,
+            encoding_context: None,
+            include_superseded: false,
+            min_trust_score: None,
+            output: OutputMode::Full,
+        };
+
+        // Populate cache
+        let _ = svc.search(search_params.clone()).await;
+        assert_eq!(counter.get(), 1);
+
+        // Store a memory WITH tags — should invalidate cache
+        let store_params = StoreParams {
+            content: "test content".into(),
+            tags: Some(vec!["new-tag".into()]),
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: None,
+        };
+        let _ = svc.store_memory(store_params).await;
+
+        // Next search should re-fetch tags
+        let _ = svc.search(search_params).await;
+        assert_eq!(
+            counter.get(),
+            2,
+            "search after store-with-tags should re-fetch"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tag_cache_not_invalidated_on_store_without_tags() {
+        let (svc, counter) = build_mock_service(vec!["rust".into()]);
+
+        let search_params = SearchParams {
+            query: "test query".into(),
+            mode: SearchMode::Hybrid,
+            page: 1,
+            page_size: 10,
+            tags: None,
+            match_all: false,
+            k: 10,
+            min_similarity: None,
+            memory_type: None,
+            encoding_context: None,
+            include_superseded: false,
+            min_trust_score: None,
+            output: OutputMode::Full,
+        };
+
+        // Populate cache
+        let _ = svc.search(search_params.clone()).await;
+        assert_eq!(counter.get(), 1);
+
+        // Store a memory WITHOUT tags — should NOT invalidate cache
+        let store_params = StoreParams {
+            content: "tagless content".into(),
+            tags: None,
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: None,
+        };
+        let _ = svc.store_memory(store_params).await;
+
+        // Next search should still use cached tags
+        let _ = svc.search(search_params).await;
+        assert_eq!(
+            counter.get(),
+            1,
+            "store without tags should not invalidate cache"
+        );
+    }
+
+    // ─── TTL expiry tests ─────────────────────────────────────────────────
+
+    thread_local! {
+        static MOCK_TIME: Cell<f64> = const { Cell::new(1_000_000.0) };
+    }
+
+    fn mock_clock() -> f64 {
+        MOCK_TIME.with(|t| t.get())
+    }
+
+    fn advance_clock(seconds: f64) {
+        MOCK_TIME.with(|t| t.set(t.get() + seconds));
+    }
+
+    fn reset_clock() {
+        MOCK_TIME.with(|t| t.set(1_000_000.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tag_cache_expires_after_ttl() {
+        reset_clock();
+        let (svc, counter) =
+            build_mock_service_with_clock(vec!["rust".into(), "alaya".into()], mock_clock);
+
+        let params = SearchParams {
+            query: "test query about rust".into(),
+            mode: SearchMode::Hybrid,
+            page: 1,
+            page_size: 10,
+            tags: None,
+            match_all: false,
+            k: 10,
+            min_similarity: None,
+            memory_type: None,
+            encoding_context: None,
+            include_superseded: false,
+            min_trust_score: None,
+            output: OutputMode::Full,
+        };
+
+        // First search — populates cache
+        let _ = svc.search(params.clone()).await;
+        assert_eq!(counter.get(), 1, "first search fetches tags");
+
+        // 30s later — within TTL, should use cache
+        advance_clock(30.0);
+        let _ = svc.search(params.clone()).await;
+        assert_eq!(counter.get(), 1, "30s later: still cached");
+
+        // 61s total — past TTL, must re-fetch
+        advance_clock(31.0);
+        let _ = svc.search(params.clone()).await;
+        assert_eq!(counter.get(), 2, "61s later: cache expired, re-fetched");
+
+        // Immediately after — fresh cache, should not fetch again
+        let _ = svc.search(params).await;
+        assert_eq!(counter.get(), 2, "immediately after refresh: still cached");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tag_cache_ttl_boundary_exactly_at_expiry() {
+        reset_clock();
+        let (svc, counter) = build_mock_service_with_clock(vec!["test".into()], mock_clock);
+
+        let params = SearchParams {
+            query: "boundary test".into(),
+            mode: SearchMode::Hybrid,
+            page: 1,
+            page_size: 10,
+            tags: None,
+            match_all: false,
+            k: 10,
+            min_similarity: None,
+            memory_type: None,
+            encoding_context: None,
+            include_superseded: false,
+            min_trust_score: None,
+            output: OutputMode::Full,
+        };
+
+        // Populate cache
+        let _ = svc.search(params.clone()).await;
+        assert_eq!(counter.get(), 1);
+
+        // Exactly at TTL boundary (60.0s) — cache expires (< is strict, not <=)
+        advance_clock(60.0);
+        let _ = svc.search(params.clone()).await;
+        assert_eq!(
+            counter.get(),
+            2,
+            "exactly at TTL: expires (strict < comparison)"
+        );
+
+        // Immediately after refresh — should be cached again
+        advance_clock(0.001);
+        let _ = svc.search(params).await;
+        assert_eq!(counter.get(), 2, "just after refresh: still cached");
     }
 }
