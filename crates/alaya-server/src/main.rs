@@ -169,6 +169,7 @@ struct HealthChecker {
     qdrant_url: String,
     collection: String,
     graph_url: String,
+    graph_api_key: String,
 }
 
 impl HealthChecker {
@@ -192,6 +193,7 @@ impl HealthChecker {
             qdrant_url: config.qdrant_url.clone(),
             collection: config.qdrant_collection.clone(),
             graph_url: config.graph_url.clone(),
+            graph_api_key: config.graph_api_key.clone(),
         }
     }
 
@@ -237,6 +239,10 @@ impl HealthChecker {
             .await
             .map_err(|e| e.to_string())?;
 
+        if !resp.status().is_success() {
+            return Err(format!("qdrant returned {}", resp.status()));
+        }
+
         let body: Value = resp.json().await.map_err(|e| e.to_string())?;
         let status = body
             .pointer("/result/status")
@@ -255,12 +261,11 @@ impl HealthChecker {
     }
 
     async fn check_graph(&self) -> Result<Value, String> {
-        let resp = self
-            .client
-            .get(format!("{}/stats", self.graph_url))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut req = self.client.get(format!("{}/stats", self.graph_url));
+        if !self.graph_api_key.is_empty() {
+            req = req.bearer_auth(&self.graph_api_key);
+        }
+        let resp = req.send().await.map_err(|e| e.to_string())?;
 
         if !resp.status().is_success() {
             return Err(format!("bridge returned {}", resp.status()));

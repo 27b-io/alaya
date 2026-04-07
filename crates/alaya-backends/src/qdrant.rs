@@ -821,7 +821,13 @@ impl VectorStorage for QdrantClient {
         }
 
         // Single batch GET instead of N individual GETs
-        let memories = self.get_batch(content_hashes).await.unwrap_or_default();
+        let memories = match self.get_batch(content_hashes).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("batch increment_access_count get_batch failed: {e}");
+                return Ok(());
+            }
+        };
         if memories.is_empty() {
             return Ok(());
         }
