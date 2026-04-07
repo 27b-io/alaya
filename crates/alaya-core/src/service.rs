@@ -600,16 +600,20 @@ impl MemoryService {
     }
 
     async fn search_scan(&self, params: &SearchParams) -> Result<Value> {
+        const MAX_RAW_SCANNED: usize = 5000;
+
         let target = (params.page.saturating_sub(1)) * params.page_size + params.page_size + 1;
         let scroll_page: usize = 100;
         let mut filtered: Vec<Memory> = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut raw_scanned: usize = 0;
 
-        // Scroll until we have enough filtered results or hit EOF
+        // Scroll until we have enough filtered results, hit EOF, or safety cap
         loop {
             let batch_size = scroll_page.min(target.saturating_sub(filtered.len()));
             let scroll = self.vectors.get_all(batch_size, cursor.as_deref()).await?;
             let batch_empty = scroll.memories.is_empty();
+            raw_scanned += scroll.memories.len();
 
             for m in scroll.memories {
                 if !params.include_superseded
@@ -632,6 +636,15 @@ impl MemoryService {
 
             cursor = scroll.next_offset;
             if batch_empty || cursor.is_none() || filtered.len() >= target {
+                break;
+            }
+            if raw_scanned >= MAX_RAW_SCANNED {
+                tracing::warn!(
+                    raw_scanned,
+                    filtered = filtered.len(),
+                    target,
+                    "search_scan hit safety cap"
+                );
                 break;
             }
         }
@@ -917,15 +930,14 @@ impl MemoryService {
             ));
         }
 
-        // Verify both exist
-        let old = self.vectors.get_by_hash(old_hash).await?;
-        if old.is_none() {
+        // Verify both exist (single batch GET instead of 2 sequential calls)
+        let batch = self.vectors.get_batch(&[old_hash, new_hash]).await?;
+        if !batch.iter().any(|m| m.content_hash == old_hash) {
             return Err(AlayaError::Validation(format!(
                 "old memory not found: {old_hash}"
             )));
         }
-        let new = self.vectors.get_by_hash(new_hash).await?;
-        if new.is_none() {
+        if !batch.iter().any(|m| m.content_hash == new_hash) {
             return Err(AlayaError::Validation(format!(
                 "new memory not found: {new_hash}"
             )));

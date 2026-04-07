@@ -210,22 +210,24 @@ pub async fn strengthen(
     let queued = req.pairs.len();
     let mut conn = state.redis.clone();
 
+    // Serialize all pairs first so we fail fast before touching Redis
+    let mut serialized: Vec<String> = Vec::with_capacity(req.pairs.len());
     for pair in &req.pairs {
-        let serialized = serde_json::to_string(pair).map_err(|e| {
+        serialized.push(serde_json::to_string(pair).map_err(|e| {
             tracing::error!("Failed to serialize CoAccessPair: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-        redis::cmd("LPUSH")
-            .arg("alaya:hebbian:queue")
-            .arg(&serialized)
-            .query_async::<()>(&mut conn)
-            .await
-            .map_err(|e| {
-                tracing::error!("Redis LPUSH error: {e}");
-                StatusCode::BAD_GATEWAY
-            })?;
+        })?);
     }
+
+    // Pipeline all LPUSH commands into a single Redis round-trip
+    let mut pipe = redis::pipe();
+    for s in &serialized {
+        pipe.cmd("LPUSH").arg("alaya:hebbian:queue").arg(s);
+    }
+    pipe.query_async::<()>(&mut conn).await.map_err(|e| {
+        tracing::error!("Redis pipeline LPUSH error: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
 
     Ok((
         StatusCode::ACCEPTED,
