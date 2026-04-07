@@ -160,6 +160,136 @@ impl ServiceHandle {
     }
 }
 
+/// Direct health checker — bypasses the service worker channel so health
+/// probes don't queue behind long-running operations (find_duplicates, etc).
+/// Uses its own reqwest::Client (Clone + Send + Sync) on the axum runtime.
+#[derive(Clone)]
+struct HealthChecker {
+    client: reqwest::Client,
+    qdrant_url: String,
+    collection: String,
+    graph_url: String,
+}
+
+impl HealthChecker {
+    fn new(config: &Config) -> Self {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(ref key) = config.qdrant_api_key
+            && let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+        {
+            headers.insert(reqwest::header::AUTHORIZATION, val);
+        }
+
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("failed to build health check client");
+
+        Self {
+            client,
+            qdrant_url: config.qdrant_url.clone(),
+            collection: config.qdrant_collection.clone(),
+            graph_url: config.graph_url.clone(),
+        }
+    }
+
+    async fn check(&self) -> Value {
+        let start = std::time::Instant::now();
+
+        // All three checks run concurrently via tokio::join!
+        let (qdrant_health, graph_health, count) =
+            tokio::join!(self.check_qdrant(), self.check_graph(), self.check_count(),);
+
+        let status = if qdrant_health.is_ok() {
+            "healthy"
+        } else {
+            "degraded"
+        };
+
+        let elapsed = start.elapsed().as_millis();
+        tracing::info!(op = "health", elapsed_ms = elapsed, status, "ok (direct)");
+
+        json!({
+            "status": status,
+            "backend": "qdrant",
+            "vector_health": match qdrant_health {
+                Ok(v) => v,
+                Err(e) => json!({"status": "unhealthy", "error": e}),
+            },
+            "graph_health": match graph_health {
+                Ok(v) => v,
+                Err(e) => json!({"status": "unhealthy", "error": e}),
+            },
+            "total_memories": count.unwrap_or(0),
+        })
+    }
+
+    async fn check_qdrant(&self) -> Result<Value, String> {
+        let resp = self
+            .client
+            .get(format!(
+                "{}/collections/{}",
+                self.qdrant_url, self.collection
+            ))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+        let status = body
+            .pointer("/result/status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown");
+        let points = body
+            .pointer("/result/points_count")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0);
+
+        Ok(json!({
+            "status": status,
+            "backend": "qdrant",
+            "details": { "points_count": points },
+        }))
+    }
+
+    async fn check_graph(&self) -> Result<Value, String> {
+        let resp = self
+            .client
+            .get(format!("{}/stats", self.graph_url))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !resp.status().is_success() {
+            return Err(format!("bridge returned {}", resp.status()));
+        }
+
+        let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+        Ok(body)
+    }
+
+    async fn check_count(&self) -> Result<usize, String> {
+        let resp = self
+            .client
+            .post(format!(
+                "{}/collections/{}/points/count",
+                self.qdrant_url, self.collection
+            ))
+            .json(&json!({}))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+        Ok(body
+            .pointer("/result/count")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0) as usize)
+    }
+}
+
 // ─── Service worker ─────────────────────────────────────────────────────────
 
 /// Runs MemoryService on a LocalSet, processing commands from the channel.
@@ -169,6 +299,8 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
         let start = std::time::Instant::now();
         match cmd {
             Cmd::Health { reply } => {
+                // Used by MCP check_database_health tool (infrequent, user-triggered).
+                // GET /health bypasses this via HealthChecker.
                 let result = match svc.check_database_health().await {
                     Ok(r) => {
                         log_ok(op, &json!(r), start);
@@ -436,6 +568,11 @@ fn main() {
             tracing::warn!("ALAYA_API_KEY not set — all endpoints are unauthenticated");
         }
 
+        // Health checker bypasses the service worker channel entirely —
+        // runs directly on the multi-threaded axum runtime with its own
+        // reqwest::Client. Prevents health probe timeouts during long ops.
+        let checker = HealthChecker::new(&config);
+
         let protected = Router::new()
             .route("/mcp", post(mcp::mcp_handler))
             .route("/store", post(store))
@@ -451,11 +588,13 @@ fn main() {
                 require_bearer,
             ));
 
-        let app = Router::new()
+        let health_route = Router::new()
             .route("/health", get(health))
-            .merge(protected)
-            .layer(TraceLayer::new_for_http())
-            .with_state(handle);
+            .with_state(checker);
+
+        let app = health_route
+            .merge(protected.with_state(handle))
+            .layer(TraceLayer::new_for_http());
 
         let listener = tokio::net::TcpListener::bind(&config.listen_addr)
             .await
@@ -468,9 +607,8 @@ fn main() {
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
-async fn health(axum::extract::State(h): axum::extract::State<ServiceHandle>) -> Json<Value> {
-    let (tx, rx) = oneshot::channel();
-    h.call(Cmd::Health { reply: tx }, rx).await
+async fn health(axum::extract::State(checker): axum::extract::State<HealthChecker>) -> Json<Value> {
+    Json(checker.check().await)
 }
 
 async fn store(
