@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use alaya_types::{
     AlayaError, Result,
     graph::{
-        CoAccessPair, Contradiction, ContradictionRef, Direction, Edge, GraphStats, Neighbor,
-        SystemRelationType, UserRelationType,
+        CoAccessPair, Contradiction, ContradictionRef, Direction, Edge, EdgeMeta, GraphStats,
+        Neighbor, SystemRelationType, UserRelationType,
     },
 };
 
@@ -117,6 +117,11 @@ struct CreateEdgeReq<'a> {
 }
 
 #[derive(Serialize)]
+struct BatchCreateEdgeReq<'a> {
+    edges: Vec<CreateEdgeReq<'a>>,
+}
+
+#[derive(Serialize)]
 struct GetEdgesReq<'a> {
     content_hash: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -199,6 +204,11 @@ struct PruneReq {
 struct CreatedResp {
     #[allow(dead_code)]
     created: bool,
+}
+
+#[derive(Deserialize)]
+struct BatchCreatedResp {
+    created: usize,
 }
 
 #[derive(Deserialize)]
@@ -303,6 +313,37 @@ impl GraphService for GraphHttpClient {
             .map_err(|e| AlayaError::Graph(e.to_string()))?;
 
         let body: CreatedResp = handle_response(resp).await?;
+        Ok(body.created)
+    }
+
+    async fn create_typed_edges_batch(
+        &self,
+        edges: &[(String, String, UserRelationType, EdgeMeta)],
+    ) -> Result<usize> {
+        if edges.is_empty() {
+            return Ok(0);
+        }
+
+        let edge_reqs: Vec<CreateEdgeReq<'_>> = edges
+            .iter()
+            .map(|(src, dst, rel, meta)| CreateEdgeReq {
+                source: src,
+                target: dst,
+                relation_type: rel.cypher_label(),
+                created_at: meta.created_at,
+                confidence: meta.confidence,
+            })
+            .collect();
+
+        let resp = self
+            .client
+            .post(format!("{}/edges/create-batch", self.base_url))
+            .json(&BatchCreateEdgeReq { edges: edge_reqs })
+            .send()
+            .await
+            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+
+        let body: BatchCreatedResp = handle_response(resp).await?;
         Ok(body.created)
     }
 

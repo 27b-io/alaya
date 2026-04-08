@@ -138,6 +138,23 @@ pub trait GraphService {
     ) -> Result<HashMap<String, f64>>;
     async fn hebbian_boosts_within(&self, hashes: &[&str]) -> Result<HashMap<String, f64>>;
 
+    /// Batch-create typed edges in a single round-trip.
+    ///
+    /// Default: sequential fallback via `create_typed_edge`. Implementations
+    /// may override with a single HTTP POST to `/edges/create-batch`.
+    async fn create_typed_edges_batch(
+        &self,
+        edges: &[(String, String, UserRelationType, EdgeMeta)],
+    ) -> Result<usize> {
+        let mut created = 0;
+        for (src, dst, rel, meta) in edges {
+            if self.create_typed_edge(src, dst, *rel, meta.clone()).await? {
+                created += 1;
+            }
+        }
+        Ok(created)
+    }
+
     // Stats
     async fn get_stats(&self) -> Result<GraphStats>;
 }

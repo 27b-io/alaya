@@ -105,6 +105,11 @@ pub struct RelationParams {
 /// up to one minute after being stored.
 const TAG_CACHE_TTL: f64 = 60.0;
 
+/// Maximum number of memories to scan in `find_duplicates`. Embedding large
+/// batches blocks the LocalSet for tens of seconds. 200 memories = ~4 embedding
+/// batches of 64, keeping the total under ~10-20s instead of ~40s at 500.
+const MAX_DEDUP_SCAN: usize = 200;
+
 pub struct MemoryService {
     pub vectors: Box<dyn VectorStorage>,
     pub embeddings: Box<dyn EmbeddingProvider>,
@@ -301,6 +306,8 @@ impl MemoryService {
             .search_by_vector(&embedding, 10, Some(interference_filter))
             .await
         {
+            let mut edges_to_create: Vec<(String, String, UserRelationType, EdgeMeta)> = Vec::new();
+
             for scored in &similar {
                 if scored.memory.content_hash == content_hash {
                     continue;
@@ -317,22 +324,15 @@ impl MemoryService {
                 );
 
                 for signal in &signals {
-                    // Create CONTRADICTS edge
-                    if let Err(e) = self
-                        .graph
-                        .create_typed_edge(
-                            &content_hash,
-                            &signal.existing_hash,
-                            UserRelationType::Contradicts,
-                            EdgeMeta {
-                                created_at: Some(now),
-                                confidence: Some(signal.confidence),
-                            },
-                        )
-                        .await
-                    {
-                        tracing::warn!("failed to create CONTRADICTS edge: {e}");
-                    }
+                    edges_to_create.push((
+                        content_hash.clone(),
+                        signal.existing_hash.clone(),
+                        UserRelationType::Contradicts,
+                        EdgeMeta {
+                            created_at: Some(now),
+                            confidence: Some(signal.confidence),
+                        },
+                    ));
                 }
 
                 contradiction_signals.extend(signals);
@@ -347,21 +347,22 @@ impl MemoryService {
                     continue; // Only create RELATES_TO for moderate similarity
                 }
 
-                if let Err(e) = self
-                    .graph
-                    .create_typed_edge(
-                        &content_hash,
-                        &scored.memory.content_hash,
-                        UserRelationType::RelatesTo,
-                        EdgeMeta {
-                            created_at: Some(now),
-                            confidence: None,
-                        },
-                    )
-                    .await
-                {
-                    tracing::warn!("failed to create RELATES_TO edge: {e}");
-                }
+                edges_to_create.push((
+                    content_hash.clone(),
+                    scored.memory.content_hash.clone(),
+                    UserRelationType::RelatesTo,
+                    EdgeMeta {
+                        created_at: Some(now),
+                        confidence: None,
+                    },
+                ));
+            }
+
+            // Batch-create all interference edges in a single round-trip
+            if !edges_to_create.is_empty()
+                && let Err(e) = self.graph.create_typed_edges_batch(&edges_to_create).await
+            {
+                tracing::warn!("failed to batch-create interference edges: {e}");
             }
         }
 
@@ -1089,7 +1090,14 @@ impl MemoryService {
         strategy: CanonicalStrategy,
     ) -> Result<Value> {
         let group_limit = limit.min(500);
-        let scan_limit: usize = 500;
+        let scan_limit: usize = limit.min(MAX_DEDUP_SCAN);
+        if limit > MAX_DEDUP_SCAN {
+            tracing::warn!(
+                requested = limit,
+                capped_to = MAX_DEDUP_SCAN,
+                "find_duplicates limit capped"
+            );
+        }
         let scroll_page: usize = 100;
 
         // Paginated scroll to collect up to scan_limit live (non-superseded) memories
@@ -1741,6 +1749,214 @@ mod tests {
         assert_eq!(counter.get(), 2, "immediately after refresh: still cached");
     }
 
+    // ─── find_duplicates scan cap tests ──────────────────────────────────
+
+    /// Mock VectorStorage that returns `total` synthetic memories from `get_all`,
+    /// paginated in chunks. Tracks how many memories were actually fetched.
+    struct MockVectorsWithMemories {
+        total: usize,
+        fetched: Rc<Cell<usize>>,
+        /// Shared counter for get_all_tags calls (satisfies MockVectors API).
+        get_all_tags_calls: Rc<Cell<usize>>,
+    }
+
+    impl MockVectorsWithMemories {
+        fn new(total: usize, fetched: Rc<Cell<usize>>) -> Self {
+            Self {
+                total,
+                fetched,
+                get_all_tags_calls: Rc::new(Cell::new(0)),
+            }
+        }
+
+        fn make_memory(i: usize) -> Memory {
+            Memory {
+                content: format!("memory content {i}"),
+                content_hash: format!("{i:064x}"),
+                tags: vec![],
+                memory_type: "note".into(),
+                metadata: None,
+                created_at: 1_000_000.0 + i as f64,
+                updated_at: 1_000_000.0 + i as f64,
+                embedding: None,
+                summary: None,
+                salience_score: 0.5,
+                access_count: 1,
+                access_timestamps: vec![],
+                emotional_valence: None,
+                encoding_context: None,
+                provenance: None,
+            }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl VectorStorage for MockVectorsWithMemories {
+        async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+            Ok((true, "mock".into()))
+        }
+        async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
+            Ok(None)
+        }
+        async fn get_batch(&self, _h: &[&str]) -> Result<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn delete(&self, _h: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn update_metadata(&self, _h: &str, _u: MetadataUpdate) -> Result<()> {
+            Ok(())
+        }
+        async fn search_by_vector(
+            &self,
+            _e: &[f32],
+            _l: usize,
+            _f: Option<PayloadFilter>,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(vec![])
+        }
+        async fn search_by_tags(
+            &self,
+            _t: &[&str],
+            _m: bool,
+            _l: usize,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(vec![])
+        }
+        async fn search_similar_tags(&self, _e: &[f32], _l: usize) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
+            Ok(())
+        }
+        async fn get_all(&self, limit: usize, offset: Option<&str>) -> Result<ScrollResult> {
+            let start = offset.and_then(|o| o.parse::<usize>().ok()).unwrap_or(0);
+            let end = (start + limit).min(self.total);
+            let memories: Vec<Memory> = (start..end).map(Self::make_memory).collect();
+            self.fetched.set(self.fetched.get() + memories.len());
+            let next_offset = if end < self.total {
+                Some(end.to_string())
+            } else {
+                None
+            };
+            Ok(ScrollResult {
+                memories,
+                next_offset,
+            })
+        }
+        async fn get_recent(&self, _l: usize, _o: usize, _t: Option<&str>) -> Result<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn count(&self) -> Result<usize> {
+            Ok(self.total)
+        }
+        async fn get_all_tags(&self) -> Result<Vec<String>> {
+            self.get_all_tags_calls
+                .set(self.get_all_tags_calls.get() + 1);
+            Ok(vec![])
+        }
+        async fn increment_access_count(&self, _h: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            Ok(HealthStatus {
+                status: "ok".into(),
+                backend: "mock".into(),
+                details: None,
+            })
+        }
+    }
+
+    /// Mock embedding provider that tracks how many texts were embedded.
+    struct MockEmbeddingsTracked {
+        embedded_count: Rc<Cell<usize>>,
+    }
+
+    #[async_trait(?Send)]
+    impl EmbeddingProvider for MockEmbeddingsTracked {
+        async fn embed_batch(&self, texts: &[&str], _p: PromptName) -> Result<Vec<Vec<f32>>> {
+            self.embedded_count
+                .set(self.embedded_count.get() + texts.len());
+            // Return distinct vectors so deduplication doesn't merge them all
+            Ok(texts
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let mut v = vec![0.0_f32; 1024];
+                    v[i % 1024] = 1.0;
+                    v
+                })
+                .collect())
+        }
+        fn dimensions(&self) -> usize {
+            1024
+        }
+        fn model_name(&self) -> &str {
+            "mock-tracked"
+        }
+    }
+
+    fn build_dedup_service(
+        total_memories: usize,
+    ) -> (MemoryService, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+        let fetched = Rc::new(Cell::new(0));
+        let embedded = Rc::new(Cell::new(0));
+        let svc = MemoryService::new(
+            Box::new(MockVectorsWithMemories::new(
+                total_memories,
+                fetched.clone(),
+            )),
+            Box::new(MockEmbeddingsTracked {
+                embedded_count: embedded.clone(),
+            }),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+        );
+        (svc, fetched, embedded)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn find_duplicates_caps_scan_at_max_dedup_scan() {
+        // 300 memories available — more than MAX_DEDUP_SCAN (200)
+        let (svc, _fetched, embedded) = build_dedup_service(300);
+
+        let result = svc
+            .find_duplicates(0.95, 500, CanonicalStrategy::KeepNewest)
+            .await
+            .unwrap();
+
+        // The service should have capped scan to MAX_DEDUP_SCAN, not scanned all 300
+        let scanned = result["total_memories_scanned"].as_u64().unwrap() as usize;
+        assert!(
+            scanned <= MAX_DEDUP_SCAN,
+            "scan should be capped at {MAX_DEDUP_SCAN}, but scanned {scanned}"
+        );
+
+        // Embeddings should match the capped count, not the full 300
+        let embed_count = embedded.get();
+        assert!(
+            embed_count <= MAX_DEDUP_SCAN,
+            "should embed at most {MAX_DEDUP_SCAN} memories, but embedded {embed_count}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn find_duplicates_under_cap_scans_all() {
+        // 50 memories — well under the cap
+        let (svc, _fetched, embedded) = build_dedup_service(50);
+
+        let result = svc
+            .find_duplicates(0.95, 500, CanonicalStrategy::KeepNewest)
+            .await
+            .unwrap();
+
+        // Should scan all 50 since that's under the cap
+        let scanned = result["total_memories_scanned"].as_u64().unwrap() as usize;
+        assert_eq!(scanned, 50, "should scan all 50 when under cap");
+        assert_eq!(embedded.get(), 50, "should embed all 50 when under cap");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn tag_cache_ttl_boundary_exactly_at_expiry() {
         reset_clock();
@@ -1779,5 +1995,329 @@ mod tests {
         advance_clock(0.001);
         let _ = svc.search(params).await;
         assert_eq!(counter.get(), 2, "just after refresh: still cached");
+    }
+
+    // ─── Mock backends for batch edge tests ──────────────────────────────
+
+    /// Mock graph that tracks individual vs batch create_typed_edge calls.
+    struct MockGraphBatchTracker {
+        individual_calls: Rc<Cell<usize>>,
+        batch_calls: Rc<Cell<usize>>,
+        batch_edge_count: Rc<Cell<usize>>,
+    }
+
+    impl MockGraphBatchTracker {
+        fn new(
+            individual: Rc<Cell<usize>>,
+            batch: Rc<Cell<usize>>,
+            batch_edges: Rc<Cell<usize>>,
+        ) -> Self {
+            Self {
+                individual_calls: individual,
+                batch_calls: batch,
+                batch_edge_count: batch_edges,
+            }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl GraphService for MockGraphBatchTracker {
+        async fn ensure_node(&self, _h: &str, _t: f64) -> Result<()> {
+            Ok(())
+        }
+        async fn delete_node(&self, _h: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn create_typed_edge(
+            &self,
+            _s: &str,
+            _d: &str,
+            _r: UserRelationType,
+            _m: EdgeMeta,
+        ) -> Result<bool> {
+            self.individual_calls.set(self.individual_calls.get() + 1);
+            Ok(true)
+        }
+        async fn create_typed_edges_batch(
+            &self,
+            edges: &[(String, String, UserRelationType, EdgeMeta)],
+        ) -> Result<usize> {
+            self.batch_calls.set(self.batch_calls.get() + 1);
+            self.batch_edge_count
+                .set(self.batch_edge_count.get() + edges.len());
+            Ok(edges.len())
+        }
+        async fn get_typed_edges(
+            &self,
+            _h: &str,
+            _r: Option<UserRelationType>,
+            _d: Direction,
+            _l: usize,
+        ) -> Result<Vec<Edge>> {
+            Ok(vec![])
+        }
+        async fn delete_typed_edge(
+            &self,
+            _s: &str,
+            _d: &str,
+            _r: UserRelationType,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+        async fn create_system_edge(
+            &self,
+            _s: &str,
+            _d: &str,
+            _r: SystemRelationType,
+            _t: f64,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+        async fn get_all_contradictions(&self, _l: usize) -> Result<Vec<Contradiction>> {
+            Ok(vec![])
+        }
+        async fn get_contradictions_for_hashes(
+            &self,
+            _h: &[&str],
+        ) -> Result<HashMap<String, Vec<ContradictionRef>>> {
+            Ok(HashMap::new())
+        }
+        async fn get_neighbors(
+            &self,
+            _h: &str,
+            _m: u8,
+            _w: f64,
+            _l: usize,
+        ) -> Result<Vec<Neighbor>> {
+            Ok(vec![])
+        }
+        async fn spreading_activation(
+            &self,
+            _s: &[&str],
+            _m: u8,
+            _d: f64,
+            _a: f64,
+            _l: usize,
+        ) -> Result<HashMap<String, f64>> {
+            Ok(HashMap::new())
+        }
+        async fn hebbian_boosts_within(&self, _h: &[&str]) -> Result<HashMap<String, f64>> {
+            Ok(HashMap::new())
+        }
+        async fn get_stats(&self) -> Result<GraphStats> {
+            Ok(GraphStats {
+                graph_name: "mock".into(),
+                node_count: 0,
+                edge_count: 0,
+                hebbian_edge_count: 0,
+                typed_edge_counts: HashMap::new(),
+                status: "ok".into(),
+            })
+        }
+    }
+
+    /// Mock VectorStorage that returns similar memories for interference detection.
+    struct MockVectorsWithSimilar {
+        similar_memories: Vec<ScoredMemory>,
+    }
+
+    #[async_trait(?Send)]
+    impl VectorStorage for MockVectorsWithSimilar {
+        async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+            Ok((true, "mock".into()))
+        }
+        async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
+            Ok(None)
+        }
+        async fn get_batch(&self, _h: &[&str]) -> Result<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn delete(&self, _h: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn update_metadata(&self, _h: &str, _u: MetadataUpdate) -> Result<()> {
+            Ok(())
+        }
+        async fn search_by_vector(
+            &self,
+            _e: &[f32],
+            _l: usize,
+            _f: Option<PayloadFilter>,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(self.similar_memories.clone())
+        }
+        async fn search_by_tags(
+            &self,
+            _t: &[&str],
+            _m: bool,
+            _l: usize,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(vec![])
+        }
+        async fn search_similar_tags(&self, _e: &[f32], _l: usize) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
+            Ok(())
+        }
+        async fn get_all(&self, _l: usize, _o: Option<&str>) -> Result<ScrollResult> {
+            Ok(ScrollResult {
+                memories: vec![],
+                next_offset: None,
+            })
+        }
+        async fn get_recent(&self, _l: usize, _o: usize, _t: Option<&str>) -> Result<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn count(&self) -> Result<usize> {
+            Ok(100)
+        }
+        async fn get_all_tags(&self) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn increment_access_count(&self, _h: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            Ok(HealthStatus {
+                status: "ok".into(),
+                backend: "mock".into(),
+                details: None,
+            })
+        }
+    }
+
+    fn make_contradicting_memory(hash: &str, content: &str, score: f64) -> ScoredMemory {
+        ScoredMemory {
+            memory: Memory {
+                content: content.into(),
+                content_hash: hash.into(),
+                tags: vec![],
+                memory_type: "note".into(),
+                metadata: None,
+                created_at: 1_000_000.0,
+                updated_at: 1_000_000.0,
+                embedding: None,
+                summary: None,
+                salience_score: 0.5,
+                access_count: 0,
+                access_timestamps: vec![],
+                emotional_valence: None,
+                encoding_context: None,
+                provenance: None,
+            },
+            score,
+        }
+    }
+
+    fn build_batch_test_service(
+        similar: Vec<ScoredMemory>,
+    ) -> (
+        MemoryService,
+        Rc<Cell<usize>>,
+        Rc<Cell<usize>>,
+        Rc<Cell<usize>>,
+    ) {
+        let individual = Rc::new(Cell::new(0));
+        let batch = Rc::new(Cell::new(0));
+        let batch_edges = Rc::new(Cell::new(0));
+        let svc = MemoryService::new(
+            Box::new(MockVectorsWithSimilar {
+                similar_memories: similar,
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraphBatchTracker::new(
+                individual.clone(),
+                batch.clone(),
+                batch_edges.clone(),
+            )),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+        );
+        (svc, individual, batch, batch_edges)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_memory_batches_interference_edges() {
+        // Two existing memories with high similarity — trigger CONTRADICTS edges
+        // (negation asymmetry: new content has "not", "failed", "cannot", "won't")
+        let similar = vec![
+            make_contradicting_memory(
+                "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000",
+                "Authentication is required for all API endpoints",
+                0.92,
+            ),
+            make_contradicting_memory(
+                "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000",
+                "The cache should be enabled for performance",
+                0.85,
+            ),
+            // Moderate similarity — should become RELATES_TO
+            make_contradicting_memory(
+                "cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000",
+                "API security configuration notes",
+                0.55,
+            ),
+        ];
+
+        let (svc, individual_calls, batch_calls, batch_edge_count) =
+            build_batch_test_service(similar);
+
+        // Content with negation asymmetry vs the existing memories
+        let params = StoreParams {
+            content: "Authentication is not required, it failed and cannot be used and won't work"
+                .into(),
+            tags: None,
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: None,
+        };
+
+        let result = svc.store_memory(params).await;
+        assert!(result.is_ok(), "store_memory should succeed");
+
+        // Key assertion: edges should be batched, not created individually
+        assert_eq!(
+            individual_calls.get(),
+            0,
+            "should NOT call create_typed_edge individually"
+        );
+        assert_eq!(
+            batch_calls.get(),
+            1,
+            "should call create_typed_edges_batch exactly once"
+        );
+        // At minimum: CONTRADICTS edges for the high-similarity memories + RELATES_TO
+        assert!(
+            batch_edge_count.get() >= 1,
+            "batch should contain at least 1 edge, got {}",
+            batch_edge_count.get()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_memory_no_batch_when_no_interference() {
+        // No similar memories — no edges to create
+        let (svc, individual_calls, _batch_calls, batch_edge_count) =
+            build_batch_test_service(vec![]);
+
+        let params = StoreParams {
+            content: "A completely standalone memory with no similar content".into(),
+            tags: None,
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: None,
+        };
+
+        let result = svc.store_memory(params).await;
+        assert!(result.is_ok());
+
+        // No edges created at all
+        assert_eq!(individual_calls.get(), 0);
+        assert_eq!(batch_edge_count.get(), 0);
     }
 }

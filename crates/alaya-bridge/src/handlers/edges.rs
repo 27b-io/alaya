@@ -1,4 +1,4 @@
-//! Edge handlers — POST /edges/create, POST /edges/get, POST /edges/delete
+//! Edge handlers — POST /edges/create, POST /edges/create-batch, POST /edges/get, POST /edges/delete
 
 use std::sync::Arc;
 
@@ -46,6 +46,11 @@ pub struct CreateSystemEdgeRequest {
     pub target: String,
     pub relation_type: String,
     pub created_at: f64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BatchCreateEdgeRequest {
+    pub edges: Vec<CreateEdgeRequest>,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -117,7 +122,51 @@ pub async fn create(
     Ok(Json(json!({ "created": count > 0 })))
 }
 
-/// POST /edges/get
+/// POST /edges/create-batch
+///
+/// Validate all edges up front, then execute each Cypher query sequentially.
+/// Single HTTP call from the client replaces N individual calls.
+pub async fn create_batch(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BatchCreateEdgeRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    if req.edges.is_empty() {
+        return Ok(Json(json!({ "created": 0 })));
+    }
+
+    // Validate all edges before executing any
+    let mut queries = Vec::with_capacity(req.edges.len());
+    for edge in &req.edges {
+        if !validate_content_hash(&edge.source) || !validate_content_hash(&edge.target) {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let rel = parse_user_relation(&edge.relation_type)?;
+        let ts = edge.created_at.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64()
+        });
+        queries.push(cypher::create_typed_edge(
+            &edge.source,
+            &edge.target,
+            rel,
+            ts,
+            edge.confidence,
+        ));
+    }
+
+    // Execute all queries (each is a Redis round-trip, but within the bridge process)
+    let mut created = 0usize;
+    for (cypher, params, readonly) in queries {
+        let result = exec_query(&state, &cypher, params, readonly).await?;
+        if result.count().unwrap_or(0) > 0 {
+            created += 1;
+        }
+    }
+
+    Ok(Json(json!({ "created": created })))
+}
 pub async fn get(
     State(state): State<Arc<AppState>>,
     Json(req): Json<GetEdgesRequest>,
