@@ -611,9 +611,11 @@ fn main() {
             .route("/health", get(health))
             .with_state(checker);
 
-        let app = health_route
-            .merge(protected.with_state(handle))
-            .layer(TraceLayer::new_for_http());
+        let app = health_route.merge(protected.with_state(handle)).layer(
+            TraceLayer::new_for_http().make_span_with(
+                tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO),
+            ),
+        );
 
         let listener = tokio::net::TcpListener::bind(&config.listen_addr)
             .await
