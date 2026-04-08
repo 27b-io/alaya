@@ -7,7 +7,7 @@
 //! propagate to both the console and the OTLP exporter.
 
 use opentelemetry::trace::TracerProvider;
-use opentelemetry_otlp::SpanExporter;
+use opentelemetry_otlp::{SpanExporter, WithHttpConfig};
 use opentelemetry_sdk::{
     Resource,
     trace::{Sampler, SdkTracerProvider},
@@ -19,8 +19,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
 /// Default log filter — includes tower_http so HTTP request spans reach the
-/// OTLP exporter (tower_http creates spans at DEBUG by default, but we only
-/// need INFO-level to get one span per request).
+/// OTLP exporter, and opentelemetry for internal diagnostics.
 const DEFAULT_FILTER: &str =
     "alaya_server=info,tower_http=info,opentelemetry=debug,opentelemetry_sdk=debug";
 
@@ -45,11 +44,22 @@ pub fn init_tracing() {
 
         let resource = Resource::builder().with_service_name(service_name).build();
 
-        // OTLP HTTP exporter — reads endpoint + headers from env vars automatically
-        let exporter = match SpanExporter::builder().with_http().build() {
+        // The BatchSpanProcessor runs on a dedicated OS thread and calls
+        // futures_executor::block_on() — not a tokio runtime. reqwest's async
+        // client panics without a tokio reactor. Use reqwest::blocking::Client
+        // which works on any thread.
+        let blocking_client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("failed to build blocking reqwest client");
+
+        let exporter = match SpanExporter::builder()
+            .with_http()
+            .with_http_client(blocking_client)
+            .build()
+        {
             Ok(e) => e,
             Err(e) => {
-                // Fall back to stderr-only — don't crash the server over telemetry
                 tracing_subscriber::registry()
                     .with(env_filter)
                     .with(fmt_layer)
