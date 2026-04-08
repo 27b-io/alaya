@@ -40,6 +40,10 @@ pub trait VectorStorage {
     async fn search_similar_tags(&self, tag_embedding: &[f32], limit: usize)
     -> Result<Vec<String>>;
 
+    /// Upsert tag embeddings into the tag collection.
+    /// Each entry is `(tag_name, embedding_vector)`.
+    async fn upsert_tags(&self, tags: &[(&str, Vec<f32>)]) -> Result<()>;
+
     // Scroll / list
     async fn get_all(&self, limit: usize, offset: Option<&str>) -> Result<ScrollResult>;
     async fn get_recent(

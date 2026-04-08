@@ -256,6 +256,33 @@ impl MemoryService {
         // Invalidate tag cache — new tags should appear in keyword extraction immediately
         if !tags.is_empty() {
             *self.tag_cache.borrow_mut() = None;
+
+            // Index new tags into the tag embedding collection (non-fatal).
+            // Uses the same embedding we'd generate for any passage — tags are
+            // short text, but the embedding model handles them fine.
+            let tag_strs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
+            match self
+                .embeddings
+                .embed_batch(&tag_strs, PromptName::Passage)
+                .await
+            {
+                Ok(tag_embeddings) if tag_embeddings.len() == tags.len() => {
+                    let pairs: Vec<(&str, Vec<f32>)> = tag_strs
+                        .iter()
+                        .zip(tag_embeddings)
+                        .map(|(t, e)| (*t, e))
+                        .collect();
+                    if let Err(e) = self.vectors.upsert_tags(&pairs).await {
+                        tracing::warn!("tag index upsert failed (non-fatal): {e}");
+                    }
+                }
+                Ok(_) => {
+                    tracing::warn!("tag embedding batch size mismatch (non-fatal)");
+                }
+                Err(e) => {
+                    tracing::warn!("tag embedding failed (non-fatal): {e}");
+                }
+            }
         }
 
         // Create graph node (non-fatal)
@@ -416,7 +443,7 @@ impl MemoryService {
         let corpus_size = self.vectors.count().await.unwrap_or(0);
         let alpha = hybrid_search::get_adaptive_alpha(corpus_size, keywords.len());
 
-        // Stage 2: Fan-out — embed + vector search + tag search
+        // Stage 2: Fan-out — embed + vector search + tag search + semantic tag search
         let query_embedding = self
             .embeddings
             .embed_batch(&[params.query.as_str()], PromptName::Query)
@@ -442,7 +469,8 @@ impl MemoryService {
             .search_by_vector(&query_embedding, fetch_size, Some(filter))
             .await?;
 
-        let tag_results = if !keywords.is_empty() {
+        // Exact tag search from extracted keywords
+        let mut tag_results = if !keywords.is_empty() {
             let keyword_refs: Vec<&str> = keywords.iter().map(|s| s.as_str()).collect();
             self.vectors
                 .search_by_tags(&keyword_refs, false, fetch_size)
@@ -451,6 +479,33 @@ impl MemoryService {
         } else {
             Vec::new()
         };
+
+        // Semantic tag search — find tags similar to the query embedding (non-fatal)
+        let semantic_tags = self
+            .vectors
+            .search_similar_tags(&query_embedding, 10)
+            .await
+            .unwrap_or_default();
+
+        // Merge semantic tag matches into the tag pool (deduplicated by content_hash)
+        if !semantic_tags.is_empty() {
+            let semantic_refs: Vec<&str> = semantic_tags.iter().map(|s| s.as_str()).collect();
+            if let Ok(semantic_results) = self
+                .vectors
+                .search_by_tags(&semantic_refs, false, fetch_size)
+                .await
+            {
+                let existing: std::collections::HashSet<String> = tag_results
+                    .iter()
+                    .map(|s| s.memory.content_hash.clone())
+                    .collect();
+                for sr in semantic_results {
+                    if !existing.contains(&sr.memory.content_hash) {
+                        tag_results.push(sr);
+                    }
+                }
+            }
+        }
 
         // Stage 3: Fuse (RRF)
         let v_tuples: Vec<(String, f64)> = vector_results
@@ -1313,6 +1368,9 @@ mod tests {
         }
         async fn search_similar_tags(&self, _e: &[f32], _l: usize) -> Result<Vec<String>> {
             Ok(vec![])
+        }
+        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
+            Ok(())
         }
         async fn get_all(&self, _l: usize, _o: Option<&str>) -> Result<ScrollResult> {
             Ok(ScrollResult {

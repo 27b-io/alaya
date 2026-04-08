@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use alaya_types::{
     AlayaError, Result,
@@ -587,6 +588,49 @@ impl VectorStorage for QdrantClient {
                     .map(String::from)
             })
             .collect())
+    }
+
+    async fn upsert_tags(&self, tags: &[(&str, Vec<f32>)]) -> Result<()> {
+        if tags.is_empty() {
+            return Ok(());
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        let points: Vec<Value> = tags
+            .iter()
+            .map(|(tag, embedding)| {
+                let hex = format!("{:x}", Sha256::digest(tag.as_bytes()));
+                let uuid = uuid::Uuid::parse_str(&hex[..32])
+                    .expect("first 32 hex chars are always valid UUID input");
+                json!({
+                    "id": uuid.to_string(),
+                    "vector": embedding,
+                    "payload": { "tag": *tag, "created_at": now }
+                })
+            })
+            .collect();
+
+        let body = json!({ "points": points });
+        let resp = self
+            .client
+            .put(format!(
+                "{}/collections/{}/points?wait=true",
+                self.base_url, self.tag_collection
+            ))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(qdrant_error(resp).await);
+        }
+
+        Ok(())
     }
 
     async fn get_all(&self, limit: usize, offset: Option<&str>) -> Result<ScrollResult> {
