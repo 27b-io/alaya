@@ -264,6 +264,7 @@ struct OrphansResp {
 
 #[async_trait(?Send)]
 impl GraphService for GraphHttpClient {
+    #[tracing::instrument(skip(self))]
     async fn ensure_node(&self, content_hash: &str, created_at: f64) -> Result<()> {
         let resp = self
             .client
@@ -316,6 +317,7 @@ impl GraphService for GraphHttpClient {
         Ok(body.created)
     }
 
+    #[tracing::instrument(skip(self, edges), fields(n = edges.len()))]
     async fn create_typed_edges_batch(
         &self,
         edges: &[(String, String, UserRelationType, EdgeMeta)],
@@ -496,6 +498,7 @@ impl GraphService for GraphHttpClient {
         Ok(body.neighbors)
     }
 
+    #[tracing::instrument(skip(self, seeds), fields(n_seeds = seeds.len(), max_hops))]
     async fn spreading_activation(
         &self,
         seeds: &[&str],
@@ -522,6 +525,7 @@ impl GraphService for GraphHttpClient {
         Ok(body.activations)
     }
 
+    #[tracing::instrument(skip(self, hashes), fields(n = hashes.len()))]
     async fn hebbian_boosts_within(&self, hashes: &[&str]) -> Result<HashMap<String, f64>> {
         let resp = self
             .client
@@ -535,6 +539,7 @@ impl GraphService for GraphHttpClient {
         Ok(body.boosts)
     }
 
+    #[tracing::instrument(skip(self))]
     async fn get_stats(&self) -> Result<GraphStats> {
         let resp = self
             .client

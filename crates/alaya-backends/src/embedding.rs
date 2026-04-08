@@ -54,6 +54,7 @@ impl EmbeddingClient {
 
 #[async_trait(?Send)]
 impl EmbeddingProvider for EmbeddingClient {
+    #[tracing::instrument(skip(self, texts), fields(n = texts.len(), prompt = ?prompt_name))]
     async fn embed_batch(&self, texts: &[&str], prompt_name: PromptName) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());

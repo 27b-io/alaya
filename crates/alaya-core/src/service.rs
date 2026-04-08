@@ -165,6 +165,7 @@ impl MemoryService {
 
     // ─── Tool 1: store_memory ───────────────────────────────────────────
 
+    #[tracing::instrument(skip(self, params), fields(content_len = params.content.len()))]
     pub async fn store_memory(&self, params: StoreParams) -> Result<HashMap<String, Value>> {
         if params.content.is_empty() {
             return Err(AlayaError::Validation("content cannot be empty".into()));
@@ -401,6 +402,7 @@ impl MemoryService {
 
     // ─── Tool 2: search ─────────────────────────────────────────────────
 
+    #[tracing::instrument(skip(self, params), fields(mode = ?params.mode))]
     pub async fn search(&self, params: SearchParams) -> Result<Value> {
         if params.page_size == 0 {
             return Err(AlayaError::Validation("page_size must be > 0".into()));
@@ -414,6 +416,7 @@ impl MemoryService {
         }
     }
 
+    #[tracing::instrument(skip(self, params))]
     async fn search_hybrid(&self, params: &SearchParams) -> Result<Value> {
         if params.query.trim().is_empty() {
             return Err(AlayaError::Validation(
@@ -650,6 +653,7 @@ impl MemoryService {
         }))
     }
 
+    #[tracing::instrument(skip(self, params))]
     async fn search_scan(&self, params: &SearchParams) -> Result<Value> {
         const MAX_RAW_SCANNED: usize = 5000;
 
@@ -719,6 +723,7 @@ impl MemoryService {
         }))
     }
 
+    #[tracing::instrument(skip(self, params))]
     async fn search_similar(&self, params: &SearchParams) -> Result<Value> {
         if params.query.trim().is_empty() {
             return Err(AlayaError::Validation(
@@ -754,6 +759,7 @@ impl MemoryService {
         }))
     }
 
+    #[tracing::instrument(skip(self, params))]
     async fn search_tag(&self, params: &SearchParams) -> Result<Value> {
         let tags = params.tags.as_deref().unwrap_or_default();
         if tags.is_empty() {
@@ -787,6 +793,7 @@ impl MemoryService {
         }))
     }
 
+    #[tracing::instrument(skip(self, params))]
     async fn search_recent(&self, params: &SearchParams) -> Result<Value> {
         let offset = (params.page.saturating_sub(1)) * params.page_size;
         let results = self
@@ -811,6 +818,7 @@ impl MemoryService {
 
     // ─── Tool 3: delete_memory ──────────────────────────────────────────
 
+    #[tracing::instrument(skip(self))]
     pub async fn delete_memory(&self, content_hash: &str) -> Result<HashMap<String, Value>> {
         if !alaya_types::memory::validate_content_hash(content_hash) {
             return Err(AlayaError::Validation("invalid content_hash format".into()));
@@ -838,6 +846,7 @@ impl MemoryService {
 
     // ─── Tool 4: check_database_health ──────────────────────────────────
 
+    #[tracing::instrument(skip(self))]
     pub async fn check_database_health(&self) -> Result<HashMap<String, Value>> {
         let vector_health = self.vectors.health().await?;
 
@@ -879,6 +888,7 @@ impl MemoryService {
 
     // ─── Tool 5: relation ───────────────────────────────────────────────
 
+    #[tracing::instrument(skip(self, params), fields(action = %params.action))]
     pub async fn relation(&self, params: RelationParams) -> Result<Value> {
         if !alaya_types::memory::validate_content_hash(&params.content_hash) {
             return Err(AlayaError::Validation("invalid content_hash".into()));
@@ -969,6 +979,7 @@ impl MemoryService {
 
     // ─── Tool 6: memory_supersede ───────────────────────────────────────
 
+    #[tracing::instrument(skip(self))]
     pub async fn memory_supersede(
         &self,
         old_hash: &str,
@@ -1028,6 +1039,7 @@ impl MemoryService {
 
     // ─── Tool 7: memory_contradictions ──────────────────────────────────
 
+    #[tracing::instrument(skip(self))]
     pub async fn memory_contradictions(&self, limit: usize) -> Result<Value> {
         let pairs = self.graph.get_all_contradictions(limit).await?;
 
@@ -1078,6 +1090,7 @@ impl MemoryService {
 
     // ─── Tool 8: find_duplicates ────────────────────────────────────────
 
+    #[tracing::instrument(skip(self))]
     pub async fn find_duplicates(
         &self,
         similarity_threshold: f64,
@@ -1165,6 +1178,7 @@ impl MemoryService {
 
     // ─── Tool 9: merge_duplicates ───────────────────────────────────────
 
+    #[tracing::instrument(skip(self, duplicate_hashes))]
     pub async fn merge_duplicates(
         &self,
         canonical_hash: &str,

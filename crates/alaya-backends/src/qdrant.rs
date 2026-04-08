@@ -258,6 +258,7 @@ async fn qdrant_error(resp: reqwest::Response) -> AlayaError {
 
 #[async_trait(?Send)]
 impl VectorStorage for QdrantClient {
+    #[tracing::instrument(skip(self, memory), fields(hash = %memory.content_hash))]
     async fn store(&self, memory: &Memory) -> Result<(bool, String)> {
         let point_id = hash_to_uuid(&memory.content_hash)?;
         let embedding = memory
@@ -437,6 +438,7 @@ impl VectorStorage for QdrantClient {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, embedding, filters), fields(limit))]
     async fn search_by_vector(
         &self,
         embedding: &[f32],
@@ -485,6 +487,7 @@ impl VectorStorage for QdrantClient {
             .collect())
     }
 
+    #[tracing::instrument(skip(self), fields(n_tags = tags.len(), match_all, limit))]
     async fn search_by_tags(
         &self,
         tags: &[&str],
@@ -733,6 +736,7 @@ impl VectorStorage for QdrantClient {
             .collect())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn count(&self) -> Result<usize> {
         let body = json!({"exact": true});
 
@@ -759,6 +763,7 @@ impl VectorStorage for QdrantClient {
         Ok(data.result.map(|r| r.count).unwrap_or(0))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn get_all_tags(&self) -> Result<Vec<String>> {
         // Scroll the tag collection to get all tags
         let mut all_tags = Vec::new();
@@ -859,6 +864,7 @@ impl VectorStorage for QdrantClient {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self), fields(n = content_hashes.len()))]
     async fn increment_access_count_batch(&self, content_hashes: &[&str]) -> Result<()> {
         if content_hashes.is_empty() {
             return Ok(());
@@ -933,6 +939,7 @@ impl VectorStorage for QdrantClient {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn health(&self) -> Result<HealthStatus> {
         let resp = self
             .client
