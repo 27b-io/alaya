@@ -880,7 +880,6 @@ dependencies = [
  "prost",
  "reqwest",
  "thiserror",
- "tracing",
 ]
 
 [[package]]
