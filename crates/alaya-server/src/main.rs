@@ -298,7 +298,13 @@ impl HealthChecker {
 // ─── Service worker ─────────────────────────────────────────────────────────
 
 /// Runs MemoryService on a LocalSet, processing commands from the channel.
+///
+/// Wraps the service in `Rc` so long-running operations (find_duplicates,
+/// merge_duplicates) can be spawned as local tasks without blocking the
+/// command loop. Other commands continue processing while they run.
 async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
+    let svc = std::rc::Rc::new(svc);
+
     while let Some(cmd) = rx.recv().await {
         let op = cmd.op_name();
         let start = std::time::Instant::now();
@@ -413,27 +419,32 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 };
                 let _ = reply.send(result);
             }
+
+            // ── Long-running ops: spawned as local tasks to avoid blocking ──
             Cmd::FindDuplicates {
                 threshold,
                 limit,
                 strategy,
                 reply,
             } => {
-                let result = match svc.find_duplicates(threshold, limit, strategy).await {
-                    Ok(r) => {
-                        let n = r
-                            .get("total_duplicates_found")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        tracing::info!(op, duplicates = n, elapsed_ms = ms(start), "ok");
-                        r
-                    }
-                    Err(e) => {
-                        log_err(op, &e, start);
-                        json!({"success": false, "error": e.safe_message()})
-                    }
-                };
-                let _ = reply.send(result);
+                let svc = svc.clone();
+                tokio::task::spawn_local(async move {
+                    let result = match svc.find_duplicates(threshold, limit, strategy).await {
+                        Ok(r) => {
+                            let n = r
+                                .get("total_duplicates_found")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            tracing::info!(op, duplicates = n, elapsed_ms = ms(start), "ok");
+                            r
+                        }
+                        Err(e) => {
+                            log_err(op, &e, start);
+                            json!({"success": false, "error": e.safe_message()})
+                        }
+                    };
+                    let _ = reply.send(result);
+                });
             }
             Cmd::MergeDuplicates {
                 canonical,
@@ -442,21 +453,24 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 dry_run,
                 reply,
             } => {
-                let refs: Vec<&str> = duplicates.iter().map(|s| s.as_str()).collect();
-                let result = match svc
-                    .merge_duplicates(&canonical, &refs, &reason, dry_run)
-                    .await
-                {
-                    Ok(r) => {
-                        log_ok(op, &r, start);
-                        r
-                    }
-                    Err(e) => {
-                        log_err(op, &e, start);
-                        json!({"success": false, "error": e.safe_message()})
-                    }
-                };
-                let _ = reply.send(result);
+                let svc = svc.clone();
+                tokio::task::spawn_local(async move {
+                    let refs: Vec<&str> = duplicates.iter().map(|s| s.as_str()).collect();
+                    let result = match svc
+                        .merge_duplicates(&canonical, &refs, &reason, dry_run)
+                        .await
+                    {
+                        Ok(r) => {
+                            log_ok(op, &r, start);
+                            r
+                        }
+                        Err(e) => {
+                            log_err(op, &e, start);
+                            json!({"success": false, "error": e.safe_message()})
+                        }
+                    };
+                    let _ = reply.send(result);
+                });
             }
         }
     }

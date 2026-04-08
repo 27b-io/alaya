@@ -61,42 +61,46 @@ impl EmbeddingProvider for EmbeddingClient {
 
         let prefixed: Vec<String> = texts.iter().map(|t| prefix_text(prompt_name, t)).collect();
         let url = format!("{}/v1/embeddings", self.base_url);
-        let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
 
-        for chunk in prefixed.chunks(BATCH_SIZE) {
+        // Fire all chunk requests concurrently — on a LocalSet (?Send context)
+        // this interleaves I/O waits instead of blocking sequentially.
+        let chunk_futures = prefixed.chunks(BATCH_SIZE).map(|chunk| {
+            let client = &self.client;
+            let url = &url;
             let body = serde_json::json!({
                 "model": self.model,
                 "input": chunk,
                 "encoding_format": "float",
             });
+            async move {
+                let resp = client
+                    .post(url.as_str())
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| AlayaError::Embedding(e.to_string()))?;
 
-            let resp = self
-                .client
-                .post(&url)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| AlayaError::Embedding(e.to_string()))?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_else(|_| "<unreadable>".into());
+                    return Err(AlayaError::Embedding(format!(
+                        "embedding API returned {status}: {body}"
+                    )));
+                }
 
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_else(|_| "<unreadable>".into());
-                return Err(AlayaError::Embedding(format!(
-                    "embedding API returned {status}: {body}"
-                )));
+                let parsed: EmbeddingResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| AlayaError::Embedding(format!("failed to parse response: {e}")))?;
+
+                let mut items = parsed.data;
+                items.sort_by_key(|d| d.index);
+                Ok(items.into_iter().map(|d| d.embedding).collect::<Vec<_>>())
             }
+        });
 
-            let parsed: EmbeddingResponse = resp
-                .json()
-                .await
-                .map_err(|e| AlayaError::Embedding(format!("failed to parse response: {e}")))?;
-
-            let mut items = parsed.data;
-            items.sort_by_key(|d| d.index);
-            all_embeddings.extend(items.into_iter().map(|d| d.embedding));
-        }
-
-        Ok(all_embeddings)
+        let results = futures::future::try_join_all(chunk_futures).await?;
+        Ok(results.into_iter().flatten().collect())
     }
 
     fn dimensions(&self) -> usize {

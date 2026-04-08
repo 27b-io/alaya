@@ -17,6 +17,7 @@ version = "0.1.0"
 dependencies = [
  "alaya-types",
  "async-trait",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",
