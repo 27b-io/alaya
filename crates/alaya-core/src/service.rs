@@ -422,7 +422,7 @@ impl MemoryService {
         }
         let now = (self.clock)();
 
-        // Stage 1: Prepare — use cached tags if fresh, otherwise fetch
+        // Stage 1: Prepare — tags (cached), embed, and count run concurrently
         let all_tags = {
             let cached = self.tag_cache.borrow().clone();
             if let Some((ts, tags)) = cached {
@@ -441,22 +441,37 @@ impl MemoryService {
         };
         let tag_set: std::collections::HashSet<String> = all_tags.into_iter().collect();
         let keywords = hybrid_search::extract_query_keywords(&params.query, Some(&tag_set));
-        let corpus_size = self.vectors.count().await.unwrap_or(0);
-        let alpha = hybrid_search::get_adaptive_alpha(corpus_size, keywords.len());
-
-        // Stage 2: Fan-out — embed + vector search + tag search + semantic tag search
-        let query_embedding = self
-            .embeddings
-            .embed_batch(&[params.query.as_str()], PromptName::Query)
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| AlayaError::Embedding("empty embedding result".into()))?;
 
         let fetch_size = std::cmp::min(
             std::cmp::max(params.page_size * 3, params.page * params.page_size),
             100,
         );
+
+        // Stage 2: Fan-out — embed, keyword tag search, and count are independent
+        let query_texts = [params.query.as_str()];
+        let embed_fut = self.embeddings.embed_batch(&query_texts, PromptName::Query);
+
+        let tag_search_fut = async {
+            if keywords.is_empty() {
+                return Vec::new();
+            }
+            let keyword_refs: Vec<&str> = keywords.iter().map(|s| s.as_str()).collect();
+            self.vectors
+                .search_by_tags(&keyword_refs, false, fetch_size)
+                .await
+                .unwrap_or_default()
+        };
+
+        let count_fut = self.vectors.count();
+
+        let (embed_result, mut tag_results, corpus_size) =
+            futures::join!(embed_fut, tag_search_fut, count_fut);
+
+        let query_embedding = embed_result?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AlayaError::Embedding("empty embedding result".into()))?;
+        let alpha = hybrid_search::get_adaptive_alpha(corpus_size.unwrap_or(0), keywords.len());
 
         let filter = PayloadFilter {
             memory_type: params.memory_type.clone(),
@@ -465,28 +480,15 @@ impl MemoryService {
             ..Default::default()
         };
 
-        let vector_results = self
+        // Vector search + semantic tag search both need the embedding, but are independent
+        let vector_fut = self
             .vectors
-            .search_by_vector(&query_embedding, fetch_size, Some(filter))
-            .await?;
+            .search_by_vector(&query_embedding, fetch_size, Some(filter));
+        let semantic_fut = self.vectors.search_similar_tags(&query_embedding, 10);
 
-        // Exact tag search from extracted keywords
-        let mut tag_results = if !keywords.is_empty() {
-            let keyword_refs: Vec<&str> = keywords.iter().map(|s| s.as_str()).collect();
-            self.vectors
-                .search_by_tags(&keyword_refs, false, fetch_size)
-                .await
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        // Semantic tag search — find tags similar to the query embedding (non-fatal)
-        let semantic_tags = self
-            .vectors
-            .search_similar_tags(&query_embedding, 10)
-            .await
-            .unwrap_or_default();
+        let (vector_result, semantic_tags) = futures::join!(vector_fut, semantic_fut);
+        let vector_results = vector_result?;
+        let semantic_tags = semantic_tags.unwrap_or_default();
 
         // Merge semantic tag matches into the tag pool (deduplicated by content_hash)
         if !semantic_tags.is_empty() {
@@ -531,27 +533,21 @@ impl MemoryService {
                 .or_insert(sm);
         }
 
-        // Stage 4: Boost
+        // Stage 4: Boost — graph queries run concurrently
         let result_hashes: Vec<&str> = fused.iter().take(20).map(|(h, _, _)| h.as_str()).collect();
 
-        // Graph boosts (non-fatal)
-        let spreading = self
-            .graph
-            .spreading_activation(
-                &result_hashes[..std::cmp::min(5, result_hashes.len())],
-                2,
-                0.5,
-                0.05,
-                50,
-            )
-            .await
-            .unwrap_or_default();
+        let spreading_fut = self.graph.spreading_activation(
+            &result_hashes[..std::cmp::min(5, result_hashes.len())],
+            2,
+            0.5,
+            0.05,
+            50,
+        );
+        let hebbian_fut = self.graph.hebbian_boosts_within(&result_hashes);
 
-        let hebbian_boosts = self
-            .graph
-            .hebbian_boosts_within(&result_hashes)
-            .await
-            .unwrap_or_default();
+        let (spreading, hebbian_boosts) = futures::join!(spreading_fut, hebbian_fut);
+        let spreading = spreading.unwrap_or_default();
+        let hebbian_boosts = hebbian_boosts.unwrap_or_default();
 
         let mut scored_results: Vec<(String, f64)> = fused
             .iter()
@@ -610,28 +606,27 @@ impl MemoryService {
             .take(params.page_size)
             .collect();
 
-        // Stage 6: Enrich — fire-and-forget side effects
+        // Stage 6: Enrich — fire-and-forget side effects run concurrently
         let page_hashes: Vec<&str> = page_results.iter().map(|(h, _)| h.as_str()).collect();
 
-        // Increment access counts (non-fatal, single batch GET + N PUTs)
-        let _ = self
-            .vectors
-            .increment_access_count_batch(&page_hashes)
-            .await;
+        let access_fut = self.vectors.increment_access_count_batch(&page_hashes);
 
-        // Hebbian co-access (non-fatal)
-        if page_hashes.len() >= 2 {
-            let pairs: Vec<CoAccessPair> = page_hashes
-                .windows(2)
-                .map(|w| CoAccessPair {
-                    src: w[0].to_string(),
-                    dst: w[1].to_string(),
-                    spacing_quality: 0.5,
-                    timestamp: now,
-                })
-                .collect();
-            let _ = self.hebbian.enqueue_strengthen(&pairs).await;
-        }
+        let hebbian_enqueue_fut = async {
+            if page_hashes.len() >= 2 {
+                let pairs: Vec<CoAccessPair> = page_hashes
+                    .windows(2)
+                    .map(|w| CoAccessPair {
+                        src: w[0].to_string(),
+                        dst: w[1].to_string(),
+                        spacing_quality: 0.5,
+                        timestamp: now,
+                    })
+                    .collect();
+                let _ = self.hebbian.enqueue_strengthen(&pairs).await;
+            }
+        };
+
+        let _ = futures::join!(access_fut, hebbian_enqueue_fut);
 
         // Stage 7: Format response
         let total_pages = total.div_ceil(params.page_size);
