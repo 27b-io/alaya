@@ -527,7 +527,7 @@ fn main() {
         // Spawn MemoryService on a dedicated thread with LocalSet
         let cfg_clone = config.clone();
 
-        std::thread::spawn(move || {
+        let worker_handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -606,8 +606,34 @@ fn main() {
             .expect("failed to bind");
 
         tracing::info!("alaya-server listening on {}", config.listen_addr);
-        axum::serve(listener, app).await.expect("server error");
+
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .expect("server error");
+
+        // axum returned — all in-flight requests done, router (and its
+        // ServiceHandle/Sender clones) dropped. The worker's rx.recv()
+        // will return None after processing any remaining queued commands.
+        tracing::info!("waiting for service worker to drain…");
+        let _ = worker_handle.join();
+        tracing::info!("service worker drained");
+
+        // Flush OTLP spans
+        telemetry::shutdown_tracing();
+        tracing::info!("shutdown complete");
     });
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to register SIGTERM handler");
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received SIGINT, shutting down…"),
+        _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down…"),
+    }
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────────────

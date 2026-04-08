@@ -11,7 +11,11 @@ use opentelemetry_sdk::{
     Resource,
     trace::{Sampler, SdkTracerProvider},
 };
+use std::sync::OnceLock;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Global tracer provider — stored here so `shutdown_tracing()` can flush it.
+static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
 /// Initialize tracing with optional OTLP export.
 ///
@@ -63,8 +67,8 @@ pub fn init_tracing() {
             .with(otel_layer)
             .init();
 
-        // Keep provider alive for process lifetime
-        std::mem::forget(provider);
+        // Store provider so shutdown can flush buffered spans
+        let _ = TRACER_PROVIDER.set(provider);
 
         tracing::info!("OTLP tracing enabled → {endpoint}");
     } else {
@@ -72,5 +76,15 @@ pub fn init_tracing() {
             .with(env_filter)
             .with(fmt_layer)
             .init();
+    }
+}
+
+/// Flush buffered OTLP spans and shut down the tracer provider.
+/// No-op if OTLP was never configured.
+pub fn shutdown_tracing() {
+    if let Some(provider) = TRACER_PROVIDER.get()
+        && let Err(e) = provider.shutdown()
+    {
+        tracing::warn!("OTLP shutdown error: {e}");
     }
 }

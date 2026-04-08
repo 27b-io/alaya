@@ -33,5 +33,26 @@ async fn main() {
     tracing::info!("alaya-bridge listening on {addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+
+    // axum returned — in-flight requests done. The Hebbian queue consumer
+    // (spawned task) will be cancelled when the tokio runtime drops on
+    // return from main. Hebbian strengthening is idempotent, so a
+    // partially-processed item is safe to lose.
+    tracing::info!("shutdown complete");
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to register SIGTERM handler");
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received SIGINT, shutting down…"),
+        _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down…"),
+    }
 }
