@@ -1,9 +1,10 @@
-//! OpenTelemetry OTLP tracing setup for Phoenix integration.
+//! OpenTelemetry OTLP tracing setup.
 //!
 //! If `OTEL_EXPORTER_OTLP_ENDPOINT` is set, configures OTLP HTTP exporter.
 //! If not set, tracing goes to stderr only.
 //!
-//! Phoenix-specific: set `OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer <jwt>"`
+//! Default filter includes `tower_http=info` so HTTP request spans
+//! propagate to both the console and the OTLP exporter.
 
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_otlp::SpanExporter;
@@ -17,16 +18,21 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// Global tracer provider — stored here so `shutdown_tracing()` can flush it.
 static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
+/// Default log filter — includes tower_http so HTTP request spans reach the
+/// OTLP exporter (tower_http creates spans at DEBUG by default, but we only
+/// need INFO-level to get one span per request).
+const DEFAULT_FILTER: &str = "alaya_server=info,tower_http=info";
+
 /// Initialize tracing with optional OTLP export.
 ///
 /// Uses standard OTel env vars:
-/// - `OTEL_EXPORTER_OTLP_ENDPOINT`: OTLP endpoint (e.g. http://phoenix-svc:6006)
-/// - `OTEL_EXPORTER_OTLP_HEADERS`: Headers (e.g. "authorization=Bearer <jwt>")
+/// - `OTEL_EXPORTER_OTLP_ENDPOINT`: OTLP endpoint
+/// - `OTEL_EXPORTER_OTLP_HEADERS`: Headers (e.g. "Authorization=Bearer <token>")
 /// - `OTEL_SERVICE_NAME`: Service name (default: "alaya-server")
 /// - `RUST_LOG`: Log level filter
 pub fn init_tracing() {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("alaya_server=info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_FILTER));
 
     let fmt_layer = tracing_subscriber::fmt::layer().with_target(true);
 
