@@ -9,6 +9,7 @@
 //!   POST /store, etc.  — Plain REST API (for Prajna and internal consumers)
 //!   GET  /health       — Health check
 
+mod cached_embedding;
 mod mcp;
 mod telemetry;
 
@@ -594,6 +595,10 @@ fn main() {
                     cfg_clone.embedding_dimensions,
                     None,
                 );
+                let cached_embeddings = cached_embedding::CachedEmbedding::new(
+                    Box::new(embeddings),
+                    10_000, // max cached embeddings (~40 MB at 1024 dims)
+                );
                 let graph = std::rc::Rc::new(GraphHttpClient::new(
                     cfg_clone.graph_url,
                     &cfg_clone.graph_api_key,
@@ -601,7 +606,7 @@ fn main() {
 
                 let svc = MemoryService::new(
                     Box::new(qdrant),
-                    Box::new(embeddings),
+                    Box::new(cached_embeddings),
                     Box::new(GraphRef(graph.clone())),
                     Box::new(HebbianRef(graph.clone())),
                     Box::new(ConsolidationRef(graph)),
