@@ -41,8 +41,15 @@ pub fn init_tracing() {
     if let Some(ref endpoint) = otel_endpoint {
         let service_name =
             std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "alaya-server".to_string());
+        let git_sha = option_env!("ALAYA_GIT_SHA").unwrap_or("dev");
 
-        let resource = Resource::builder().with_service_name(service_name).build();
+        let resource = Resource::builder()
+            .with_service_name(service_name)
+            .with_attribute(opentelemetry::KeyValue::new(
+                "service.version",
+                git_sha.to_string(),
+            ))
+            .build();
 
         // The BatchSpanProcessor runs on a dedicated OS thread and calls
         // futures_executor::block_on() — not a tokio runtime. reqwest's async
@@ -87,7 +94,7 @@ pub fn init_tracing() {
         // Store provider so shutdown can flush buffered spans
         let _ = TRACER_PROVIDER.set(provider);
 
-        tracing::info!("OTLP tracing enabled → {endpoint}");
+        tracing::info!("OTLP tracing enabled → {endpoint} (version: {git_sha})");
     } else {
         tracing_subscriber::registry()
             .with(env_filter)

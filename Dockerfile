@@ -1,8 +1,11 @@
 FROM docker.io/library/rust:1.87-bookworm AS builder
 
+ARG GIT_SHA=unknown
+
 WORKDIR /app
 COPY . .
 
+ENV ALAYA_GIT_SHA=${GIT_SHA}
 RUN cargo build --release -p alaya-bridge -p alaya-server
 
 FROM docker.io/library/debian:bookworm-slim
