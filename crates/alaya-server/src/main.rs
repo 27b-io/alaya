@@ -314,19 +314,18 @@ impl HealthChecker {
 /// merge_duplicates) can be spawned as local tasks without blocking the
 /// command loop. Other commands continue processing while they run.
 async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
+    use tracing::Instrument;
+
     let svc = std::rc::Rc::new(svc);
 
     while let Some(cmd) = rx.recv().await {
         let op = cmd.op_name();
         let start = std::time::Instant::now();
-        // Re-enter the caller's span so service methods become children
-        // of the HTTP request span across the mpsc thread boundary.
-        let _guard = cmd.span.enter();
+        let parent_span = cmd.span;
+
         match cmd.inner {
             CmdInner::Health { reply } => {
-                // Used by MCP check_database_health tool (infrequent, user-triggered).
-                // GET /health bypasses this via HealthChecker.
-                let result = match svc.check_database_health().await {
+                let result = match svc.check_database_health().instrument(parent_span).await {
                     Ok(r) => {
                         log_ok(op, &json!(r), start);
                         json!(r)
@@ -339,7 +338,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 let _ = reply.send(result);
             }
             CmdInner::Store { params, reply } => {
-                let result = match svc.store_memory(params).await {
+                let result = match svc.store_memory(params).instrument(parent_span).await {
                     Ok(r) => {
                         log_ok(op, &json!(r), start);
                         json!(r)
@@ -353,7 +352,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             }
             CmdInner::Search { params, reply } => {
                 let mode = format!("{:?}", params.mode).to_lowercase();
-                let result = match svc.search(params).await {
+                let result = match svc.search(params).instrument(parent_span).await {
                     Ok(r) => {
                         let n = result_count(&r);
                         tracing::info!(
@@ -374,7 +373,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             }
             CmdInner::Delete { hash, reply } => {
                 let h = &hash[..8.min(hash.len())];
-                let result = match svc.delete_memory(&hash).await {
+                let result = match svc.delete_memory(&hash).instrument(parent_span).await {
                     Ok(r) => {
                         tracing::info!(op, hash = h, elapsed_ms = ms(start), "ok");
                         json!(r)
@@ -388,7 +387,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             }
             CmdInner::Relation { params, reply } => {
                 let action = params.action.clone();
-                let result = match svc.relation(params).await {
+                let result = match svc.relation(params).instrument(parent_span).await {
                     Ok(r) => {
                         tracing::info!(op, action = action.as_str(), elapsed_ms = ms(start), "ok");
                         r
@@ -408,7 +407,11 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             } => {
                 let old_h = &old_hash[..8.min(old_hash.len())];
                 let new_h = &new_hash[..8.min(new_hash.len())];
-                let result = match svc.memory_supersede(&old_hash, &new_hash, &reason).await {
+                let result = match svc
+                    .memory_supersede(&old_hash, &new_hash, &reason)
+                    .instrument(parent_span)
+                    .await
+                {
                     Ok(r) => {
                         tracing::info!(op, old = old_h, new = new_h, elapsed_ms = ms(start), "ok");
                         r
@@ -421,7 +424,11 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 let _ = reply.send(result);
             }
             CmdInner::Contradictions { limit, reply } => {
-                let result = match svc.memory_contradictions(limit).await {
+                let result = match svc
+                    .memory_contradictions(limit)
+                    .instrument(parent_span)
+                    .await
+                {
                     Ok(r) => {
                         log_ok(op, &r, start);
                         r
@@ -442,23 +449,26 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 reply,
             } => {
                 let svc = svc.clone();
-                tokio::task::spawn_local(async move {
-                    let result = match svc.find_duplicates(threshold, limit, strategy).await {
-                        Ok(r) => {
-                            let n = r
-                                .get("total_duplicates_found")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            tracing::info!(op, duplicates = n, elapsed_ms = ms(start), "ok");
-                            r
-                        }
-                        Err(e) => {
-                            log_err(op, &e, start);
-                            json!({"success": false, "error": e.safe_message()})
-                        }
-                    };
-                    let _ = reply.send(result);
-                });
+                tokio::task::spawn_local(
+                    async move {
+                        let result = match svc.find_duplicates(threshold, limit, strategy).await {
+                            Ok(r) => {
+                                let n = r
+                                    .get("total_duplicates_found")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                tracing::info!(op, duplicates = n, elapsed_ms = ms(start), "ok");
+                                r
+                            }
+                            Err(e) => {
+                                log_err(op, &e, start);
+                                json!({"success": false, "error": e.safe_message()})
+                            }
+                        };
+                        let _ = reply.send(result);
+                    }
+                    .instrument(parent_span),
+                );
             }
             CmdInner::MergeDuplicates {
                 canonical,
@@ -468,23 +478,26 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 reply,
             } => {
                 let svc = svc.clone();
-                tokio::task::spawn_local(async move {
-                    let refs: Vec<&str> = duplicates.iter().map(|s| s.as_str()).collect();
-                    let result = match svc
-                        .merge_duplicates(&canonical, &refs, &reason, dry_run)
-                        .await
-                    {
-                        Ok(r) => {
-                            log_ok(op, &r, start);
-                            r
-                        }
-                        Err(e) => {
-                            log_err(op, &e, start);
-                            json!({"success": false, "error": e.safe_message()})
-                        }
-                    };
-                    let _ = reply.send(result);
-                });
+                tokio::task::spawn_local(
+                    async move {
+                        let refs: Vec<&str> = duplicates.iter().map(|s| s.as_str()).collect();
+                        let result = match svc
+                            .merge_duplicates(&canonical, &refs, &reason, dry_run)
+                            .await
+                        {
+                            Ok(r) => {
+                                log_ok(op, &r, start);
+                                r
+                            }
+                            Err(e) => {
+                                log_err(op, &e, start);
+                                json!({"success": false, "error": e.safe_message()})
+                            }
+                        };
+                        let _ = reply.send(result);
+                    }
+                    .instrument(parent_span),
+                );
             }
         }
     }
