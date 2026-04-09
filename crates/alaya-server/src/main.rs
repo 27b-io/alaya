@@ -321,11 +321,12 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
     while let Some(cmd) = rx.recv().await {
         let op = cmd.op_name();
         let start = std::time::Instant::now();
-        let parent_span = cmd.span;
+        let ps = cmd.span;
 
         match cmd.inner {
             CmdInner::Health { reply } => {
-                let result = match svc.check_database_health().instrument(parent_span).await {
+                let span = tracing::info_span!(parent: &ps, "health");
+                let result = match svc.check_database_health().instrument(span).await {
                     Ok(r) => {
                         log_ok(op, &json!(r), start);
                         json!(r)
@@ -338,7 +339,9 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 let _ = reply.send(result);
             }
             CmdInner::Store { params, reply } => {
-                let result = match svc.store_memory(params).instrument(parent_span).await {
+                let span =
+                    tracing::info_span!(parent: &ps, "store", content_len = params.content.len());
+                let result = match svc.store_memory(params).instrument(span).await {
                     Ok(r) => {
                         log_ok(op, &json!(r), start);
                         json!(r)
@@ -352,9 +355,8 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             }
             CmdInner::Search { params, reply } => {
                 let mode = format!("{:?}", params.mode).to_lowercase();
-                let search_span =
-                    tracing::info_span!(parent: &parent_span, "search_dispatch", %mode);
-                let result = match svc.search(params).instrument(search_span).await {
+                let span = tracing::info_span!(parent: &ps, "search", %mode);
+                let result = match svc.search(params).instrument(span).await {
                     Ok(r) => {
                         let n = result_count(&r);
                         tracing::info!(
@@ -374,8 +376,9 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 let _ = reply.send(result);
             }
             CmdInner::Delete { hash, reply } => {
+                let span = tracing::info_span!(parent: &ps, "delete");
                 let h = &hash[..8.min(hash.len())];
-                let result = match svc.delete_memory(&hash).instrument(parent_span).await {
+                let result = match svc.delete_memory(&hash).instrument(span).await {
                     Ok(r) => {
                         tracing::info!(op, hash = h, elapsed_ms = ms(start), "ok");
                         json!(r)
@@ -389,7 +392,8 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             }
             CmdInner::Relation { params, reply } => {
                 let action = params.action.clone();
-                let result = match svc.relation(params).instrument(parent_span).await {
+                let span = tracing::info_span!(parent: &ps, "relation", %action);
+                let result = match svc.relation(params).instrument(span).await {
                     Ok(r) => {
                         tracing::info!(op, action = action.as_str(), elapsed_ms = ms(start), "ok");
                         r
@@ -407,11 +411,12 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 reason,
                 reply,
             } => {
+                let span = tracing::info_span!(parent: &ps, "supersede");
                 let old_h = &old_hash[..8.min(old_hash.len())];
                 let new_h = &new_hash[..8.min(new_hash.len())];
                 let result = match svc
                     .memory_supersede(&old_hash, &new_hash, &reason)
-                    .instrument(parent_span)
+                    .instrument(span)
                     .await
                 {
                     Ok(r) => {
@@ -426,11 +431,8 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 let _ = reply.send(result);
             }
             CmdInner::Contradictions { limit, reply } => {
-                let result = match svc
-                    .memory_contradictions(limit)
-                    .instrument(parent_span)
-                    .await
-                {
+                let span = tracing::info_span!(parent: &ps, "contradictions");
+                let result = match svc.memory_contradictions(limit).instrument(span).await {
                     Ok(r) => {
                         log_ok(op, &r, start);
                         r
@@ -450,6 +452,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 strategy,
                 reply,
             } => {
+                let span = tracing::info_span!(parent: &ps, "find_duplicates");
                 let svc = svc.clone();
                 tokio::task::spawn_local(
                     async move {
@@ -469,7 +472,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                         };
                         let _ = reply.send(result);
                     }
-                    .instrument(parent_span),
+                    .instrument(span),
                 );
             }
             CmdInner::MergeDuplicates {
@@ -479,6 +482,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 dry_run,
                 reply,
             } => {
+                let span = tracing::info_span!(parent: &ps, "merge_duplicates");
                 let svc = svc.clone();
                 tokio::task::spawn_local(
                     async move {
@@ -498,7 +502,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                         };
                         let _ = reply.send(result);
                     }
-                    .instrument(parent_span),
+                    .instrument(span),
                 );
             }
         }
