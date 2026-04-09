@@ -352,7 +352,9 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             }
             CmdInner::Search { params, reply } => {
                 let mode = format!("{:?}", params.mode).to_lowercase();
-                let result = match svc.search(params).instrument(parent_span).await {
+                let search_span =
+                    tracing::info_span!(parent: &parent_span, "search_dispatch", %mode);
+                let result = match svc.search(params).instrument(search_span).await {
                     Ok(r) => {
                         let n = result_count(&r);
                         tracing::info!(
