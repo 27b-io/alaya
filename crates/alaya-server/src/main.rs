@@ -638,17 +638,16 @@ fn main() {
             .layer(middleware::from_fn_with_state(
                 handle.clone(),
                 require_bearer,
+            ))
+            .layer(TraceLayer::new_for_http().make_span_with(
+                tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO),
             ));
 
         let health_route = Router::new()
             .route("/health", get(health))
             .with_state(checker);
 
-        let app = health_route.merge(protected.with_state(handle)).layer(
-            TraceLayer::new_for_http().make_span_with(
-                tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO),
-            ),
-        );
+        let app = health_route.merge(protected.with_state(handle));
 
         let listener = tokio::net::TcpListener::bind(&config.listen_addr)
             .await
