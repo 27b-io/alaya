@@ -547,6 +547,7 @@ impl VectorStorage for QdrantClient {
             .collect())
     }
 
+    #[tracing::instrument(skip(self, tag_embedding), fields(limit))]
     async fn search_similar_tags(
         &self,
         tag_embedding: &[f32],
