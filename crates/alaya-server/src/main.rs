@@ -223,7 +223,7 @@ impl HealthChecker {
         };
 
         let elapsed = start.elapsed().as_millis();
-        tracing::info!(op = "health", elapsed_ms = elapsed, status, "ok (direct)");
+        tracing::debug!(op = "health", elapsed_ms = elapsed, status, "ok (direct)");
 
         json!({
             "status": status,
