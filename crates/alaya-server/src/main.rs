@@ -226,6 +226,7 @@ impl HealthChecker {
 
         json!({
             "status": status,
+            "version": option_env!("ALAYA_GIT_SHA").unwrap_or("dev"),
             "backend": "qdrant",
             "vector_health": match qdrant_health {
                 Ok(v) => v,
