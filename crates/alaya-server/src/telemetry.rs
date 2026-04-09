@@ -21,7 +21,7 @@ static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 /// Default log filter — includes tower_http so HTTP request spans reach the
 /// OTLP exporter, and opentelemetry for internal diagnostics.
 const DEFAULT_FILTER: &str =
-    "alaya_server=info,tower_http=info,opentelemetry=debug,opentelemetry_sdk=debug";
+    "alaya_server=info,alaya_core=info,alaya_backends=info,tower_http=info";
 
 /// Initialize tracing with optional OTLP export.
 ///
