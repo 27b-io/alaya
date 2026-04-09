@@ -12,7 +12,14 @@ use tokio::sync::oneshot;
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{RelationParams, SearchParams, StoreParams};
 
-use crate::{Cmd, ServiceHandle};
+use crate::{Cmd, CmdInner, ServiceHandle};
+
+fn cmd(inner: CmdInner) -> Cmd {
+    Cmd {
+        inner,
+        span: tracing::Span::current(),
+    }
+}
 
 // ─── Typed param structs for MCP dispatch ───────────────────────────────────
 
@@ -293,7 +300,7 @@ async fn dispatch_tool(
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::Store { params, reply: tx })
+                .send(cmd(CmdInner::Store { params, reply: tx }))
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await
@@ -305,7 +312,7 @@ async fn dispatch_tool(
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::Search { params, reply: tx })
+                .send(cmd(CmdInner::Search { params, reply: tx }))
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await
@@ -317,10 +324,10 @@ async fn dispatch_tool(
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::Delete {
+                .send(cmd(CmdInner::Delete {
                     hash: p.content_hash,
                     reply: tx,
-                })
+                }))
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await
@@ -330,7 +337,7 @@ async fn dispatch_tool(
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::Health { reply: tx })
+                .send(cmd(CmdInner::Health { reply: tx }))
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await
@@ -342,7 +349,7 @@ async fn dispatch_tool(
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::Relation { params, reply: tx })
+                .send(cmd(CmdInner::Relation { params, reply: tx }))
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await
@@ -354,12 +361,12 @@ async fn dispatch_tool(
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::Supersede {
+                .send(cmd(CmdInner::Supersede {
                     old_hash: p.old_id,
                     new_hash: p.new_id,
                     reason: p.reason,
                     reply: tx,
-                })
+                }))
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await
@@ -371,10 +378,10 @@ async fn dispatch_tool(
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::Contradictions {
+                .send(cmd(CmdInner::Contradictions {
                     limit: p.limit,
                     reply: tx,
-                })
+                }))
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await
@@ -386,12 +393,12 @@ async fn dispatch_tool(
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::FindDuplicates {
+                .send(cmd(CmdInner::FindDuplicates {
                     threshold: p.similarity_threshold,
                     limit: p.limit,
                     strategy: p.strategy,
                     reply: tx,
-                })
+                }))
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await
@@ -403,13 +410,13 @@ async fn dispatch_tool(
             let (tx, rx) = oneshot::channel();
             handle
                 .tx
-                .send(Cmd::MergeDuplicates {
+                .send(cmd(CmdInner::MergeDuplicates {
                     canonical: p.canonical_hash,
                     duplicates: p.duplicate_hashes,
                     reason: p.reason,
                     dry_run: p.dry_run,
                     reply: tx,
-                })
+                }))
                 .await
                 .map_err(|_| (-32000, "Service unavailable".to_string()))?;
             rx.await

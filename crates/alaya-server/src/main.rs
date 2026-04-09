@@ -80,7 +80,14 @@ fn env_or(key: &str, default: &str) -> String {
 // ─── Command channel ────────────────────────────────────────────────────────
 
 /// A command sent from axum handlers to the MemoryService worker.
-pub(crate) enum Cmd {
+/// Carries the caller's tracing span so service methods become children
+/// of the HTTP request span across the mpsc thread boundary.
+pub(crate) struct Cmd {
+    inner: CmdInner,
+    span: tracing::Span,
+}
+
+pub(crate) enum CmdInner {
     Health {
         reply: oneshot::Sender<Value>,
     },
@@ -127,16 +134,16 @@ pub(crate) enum Cmd {
 
 impl Cmd {
     fn op_name(&self) -> &'static str {
-        match self {
-            Cmd::Health { .. } => "health",
-            Cmd::Store { .. } => "store",
-            Cmd::Search { .. } => "search",
-            Cmd::Delete { .. } => "delete",
-            Cmd::Relation { .. } => "relation",
-            Cmd::Supersede { .. } => "supersede",
-            Cmd::Contradictions { .. } => "contradictions",
-            Cmd::FindDuplicates { .. } => "find_duplicates",
-            Cmd::MergeDuplicates { .. } => "merge_duplicates",
+        match &self.inner {
+            CmdInner::Health { .. } => "health",
+            CmdInner::Store { .. } => "store",
+            CmdInner::Search { .. } => "search",
+            CmdInner::Delete { .. } => "delete",
+            CmdInner::Relation { .. } => "relation",
+            CmdInner::Supersede { .. } => "supersede",
+            CmdInner::Contradictions { .. } => "contradictions",
+            CmdInner::FindDuplicates { .. } => "find_duplicates",
+            CmdInner::MergeDuplicates { .. } => "merge_duplicates",
         }
     }
 }
@@ -149,7 +156,11 @@ pub(crate) struct ServiceHandle {
 }
 
 impl ServiceHandle {
-    async fn call(&self, cmd: Cmd, rx: oneshot::Receiver<Value>) -> Json<Value> {
+    async fn call(&self, inner: CmdInner, rx: oneshot::Receiver<Value>) -> Json<Value> {
+        let cmd = Cmd {
+            inner,
+            span: tracing::Span::current(),
+        };
         if self.tx.send(cmd).await.is_err() {
             return Json(json!({"error": "service unavailable"}));
         }
@@ -308,8 +319,11 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
     while let Some(cmd) = rx.recv().await {
         let op = cmd.op_name();
         let start = std::time::Instant::now();
-        match cmd {
-            Cmd::Health { reply } => {
+        // Re-enter the caller's span so service methods become children
+        // of the HTTP request span across the mpsc thread boundary.
+        let _guard = cmd.span.enter();
+        match cmd.inner {
+            CmdInner::Health { reply } => {
                 // Used by MCP check_database_health tool (infrequent, user-triggered).
                 // GET /health bypasses this via HealthChecker.
                 let result = match svc.check_database_health().await {
@@ -324,7 +338,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 };
                 let _ = reply.send(result);
             }
-            Cmd::Store { params, reply } => {
+            CmdInner::Store { params, reply } => {
                 let result = match svc.store_memory(params).await {
                     Ok(r) => {
                         log_ok(op, &json!(r), start);
@@ -337,7 +351,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 };
                 let _ = reply.send(result);
             }
-            Cmd::Search { params, reply } => {
+            CmdInner::Search { params, reply } => {
                 let mode = format!("{:?}", params.mode).to_lowercase();
                 let result = match svc.search(params).await {
                     Ok(r) => {
@@ -358,7 +372,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 };
                 let _ = reply.send(result);
             }
-            Cmd::Delete { hash, reply } => {
+            CmdInner::Delete { hash, reply } => {
                 let h = &hash[..8.min(hash.len())];
                 let result = match svc.delete_memory(&hash).await {
                     Ok(r) => {
@@ -372,7 +386,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 };
                 let _ = reply.send(result);
             }
-            Cmd::Relation { params, reply } => {
+            CmdInner::Relation { params, reply } => {
                 let action = params.action.clone();
                 let result = match svc.relation(params).await {
                     Ok(r) => {
@@ -386,7 +400,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 };
                 let _ = reply.send(result);
             }
-            Cmd::Supersede {
+            CmdInner::Supersede {
                 old_hash,
                 new_hash,
                 reason,
@@ -406,7 +420,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 };
                 let _ = reply.send(result);
             }
-            Cmd::Contradictions { limit, reply } => {
+            CmdInner::Contradictions { limit, reply } => {
                 let result = match svc.memory_contradictions(limit).await {
                     Ok(r) => {
                         log_ok(op, &r, start);
@@ -421,7 +435,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             }
 
             // ── Long-running ops: spawned as local tasks to avoid blocking ──
-            Cmd::FindDuplicates {
+            CmdInner::FindDuplicates {
                 threshold,
                 limit,
                 strategy,
@@ -446,7 +460,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                     let _ = reply.send(result);
                 });
             }
-            Cmd::MergeDuplicates {
+            CmdInner::MergeDuplicates {
                 canonical,
                 duplicates,
                 reason,
@@ -663,7 +677,7 @@ async fn store(
     Json(params): Json<StoreParams>,
 ) -> Json<Value> {
     let (tx, rx) = oneshot::channel();
-    h.call(Cmd::Store { params, reply: tx }, rx).await
+    h.call(CmdInner::Store { params, reply: tx }, rx).await
 }
 
 async fn search(
@@ -671,7 +685,7 @@ async fn search(
     Json(params): Json<SearchParams>,
 ) -> Json<Value> {
     let (tx, rx) = oneshot::channel();
-    h.call(Cmd::Search { params, reply: tx }, rx).await
+    h.call(CmdInner::Search { params, reply: tx }, rx).await
 }
 
 #[derive(Deserialize)]
@@ -685,7 +699,7 @@ async fn delete(
 ) -> Json<Value> {
     let (tx, rx) = oneshot::channel();
     h.call(
-        Cmd::Delete {
+        CmdInner::Delete {
             hash: req.content_hash,
             reply: tx,
         },
@@ -699,7 +713,7 @@ async fn relation(
     Json(params): Json<RelationParams>,
 ) -> Json<Value> {
     let (tx, rx) = oneshot::channel();
-    h.call(Cmd::Relation { params, reply: tx }, rx).await
+    h.call(CmdInner::Relation { params, reply: tx }, rx).await
 }
 
 #[derive(Deserialize)]
@@ -716,7 +730,7 @@ async fn supersede(
 ) -> Json<Value> {
     let (tx, rx) = oneshot::channel();
     h.call(
-        Cmd::Supersede {
+        CmdInner::Supersede {
             old_hash: req.old_hash,
             new_hash: req.new_hash,
             reason: req.reason,
@@ -742,7 +756,7 @@ async fn contradictions(
 ) -> Json<Value> {
     let (tx, rx) = oneshot::channel();
     h.call(
-        Cmd::Contradictions {
+        CmdInner::Contradictions {
             limit: req.limit,
             reply: tx,
         },
@@ -773,7 +787,7 @@ async fn find_duplicates(
 ) -> Json<Value> {
     let (tx, rx) = oneshot::channel();
     h.call(
-        Cmd::FindDuplicates {
+        CmdInner::FindDuplicates {
             threshold: req.similarity_threshold,
             limit: req.limit,
             strategy: req.strategy,
@@ -800,7 +814,7 @@ async fn merge_duplicates(
 ) -> Json<Value> {
     let (tx, rx) = oneshot::channel();
     h.call(
-        Cmd::MergeDuplicates {
+        CmdInner::MergeDuplicates {
             canonical: req.canonical_hash,
             duplicates: req.duplicate_hashes,
             reason: req.reason,
