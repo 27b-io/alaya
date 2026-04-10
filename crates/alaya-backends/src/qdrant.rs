@@ -12,7 +12,9 @@ use sha2::{Digest, Sha256};
 
 use alaya_types::{
     AlayaError, Result,
-    memory::{HealthStatus, Memory, MetadataUpdate, ScoredMemory, ScrollResult},
+    memory::{
+        HealthStatus, Memory, MetadataUpdate, PatchMemoryRequest, ScoredMemory, ScrollResult,
+    },
     search::PayloadFilter,
 };
 
@@ -436,6 +438,78 @@ impl VectorStorage for QdrantClient {
         }
 
         Ok(())
+    }
+
+    #[tracing::instrument(skip(self, patch), fields(hash = %content_hash))]
+    async fn patch_memory(&self, content_hash: &str, patch: &PatchMemoryRequest) -> Result<Memory> {
+        if patch.is_empty() {
+            return Err(AlayaError::Validation("patch is empty".into()));
+        }
+
+        let point_id = hash_to_uuid(content_hash)?;
+
+        // Verify the memory exists before any writes. Also needed for metadata merge.
+        let existing = self
+            .get_by_hash(content_hash)
+            .await?
+            .ok_or_else(|| AlayaError::NotFound(format!("memory {content_hash} not found")))?;
+
+        // Build set_payload with only the provided fields
+        let mut payload = serde_json::Map::new();
+
+        if let Some(ref tags) = patch.tags {
+            payload.insert("tags".into(), json!(tags));
+        }
+        if let Some(ref summary) = patch.summary {
+            payload.insert("summary".into(), json!(summary));
+        }
+        if let Some(ref memory_type) = patch.memory_type {
+            payload.insert("memory_type".into(), json!(memory_type));
+        }
+
+        // Metadata merge: apply incoming keys, delete null keys
+        if let Some(ref incoming) = patch.metadata {
+            let mut merged = existing.metadata.clone().unwrap_or_default();
+            for (k, v) in incoming {
+                if v.is_null() {
+                    merged.remove(k);
+                } else {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+            payload.insert("metadata".into(), json!(merged));
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        payload.insert("updated_at".into(), json!(now));
+
+        let body = json!({
+            "payload": payload,
+            "points": [point_id],
+        });
+
+        let resp = self
+            .client
+            .post(format!(
+                "{}/collections/{}/points/payload?wait=true",
+                self.base_url, self.collection
+            ))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(qdrant_error(resp).await);
+        }
+
+        // Return the updated memory
+        self.get_by_hash(content_hash)
+            .await?
+            .ok_or_else(|| AlayaError::NotFound(format!("memory {content_hash} not found")))
     }
 
     #[tracing::instrument(skip(self, embedding, filters), fields(limit))]

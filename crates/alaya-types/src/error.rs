@@ -19,6 +19,9 @@ pub enum AlayaError {
     #[error("validation error: {0}")]
     Validation(String),
 
+    #[error("not found: {0}")]
+    NotFound(String),
+
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 }
@@ -32,6 +35,7 @@ impl AlayaError {
             Self::Graph(_) => -32002,
             Self::Config(_) => -32003,
             Self::Validation(_) => -32602,
+            Self::NotFound(_) => -32004,
             Self::Serialization(_) => -32600,
         }
     }
@@ -45,6 +49,7 @@ impl AlayaError {
             Self::Graph(_) => "Graph operation failed",
             Self::Config(_) => "Service configuration error",
             Self::Validation(_) => "Invalid request parameters",
+            Self::NotFound(_) => "Resource not found",
             Self::Serialization(_) => "Invalid request format",
         }
     }

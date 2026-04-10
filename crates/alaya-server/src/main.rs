@@ -19,7 +19,7 @@ use axum::{
     http::{StatusCode, header},
     middleware::{self, Next},
     response::Response,
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -34,6 +34,7 @@ use alaya_backends::{
 };
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{MemoryService, RelationParams, SearchParams, StoreParams};
+use alaya_types::memory::PatchMemoryRequest;
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -131,6 +132,11 @@ pub(crate) enum CmdInner {
         dry_run: bool,
         reply: oneshot::Sender<Value>,
     },
+    Patch {
+        hash: String,
+        patch: PatchMemoryRequest,
+        reply: oneshot::Sender<Value>,
+    },
 }
 
 impl Cmd {
@@ -145,6 +151,7 @@ impl Cmd {
             CmdInner::Contradictions { .. } => "contradictions",
             CmdInner::FindDuplicates { .. } => "find_duplicates",
             CmdInner::MergeDuplicates { .. } => "merge_duplicates",
+            CmdInner::Patch { .. } => "patch",
         }
     }
 }
@@ -446,6 +453,28 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 };
                 let _ = reply.send(result);
             }
+            CmdInner::Patch { hash, patch, reply } => {
+                let span = tracing::info_span!(parent: &ps, "patch");
+                let h = &hash[..8.min(hash.len())];
+                let result = match svc.patch_memory(&hash, &patch).instrument(span).await {
+                    Ok(mem) => {
+                        tracing::info!(op, hash = h, elapsed_ms = ms(start), "ok");
+                        json!(mem)
+                    }
+                    Err(e) => {
+                        log_err(op, &e, start);
+                        json!({
+                            "error": e.safe_message(),
+                            "error_kind": match &e {
+                                alaya_types::AlayaError::NotFound(_) => "not_found",
+                                alaya_types::AlayaError::Validation(_) => "validation",
+                                _ => "internal",
+                            }
+                        })
+                    }
+                };
+                let _ = reply.send(result);
+            }
 
             // ── Long-running ops: spawned as local tasks to avoid blocking ──
             CmdInner::FindDuplicates {
@@ -641,6 +670,7 @@ fn main() {
             .route("/contradictions", post(contradictions))
             .route("/duplicates/find", post(find_duplicates))
             .route("/duplicates/merge", post(merge_duplicates))
+            .route("/memories/{content_hash}", patch(patch_memory))
             .layer(middleware::from_fn_with_state(
                 handle.clone(),
                 require_bearer,
@@ -848,4 +878,58 @@ async fn merge_duplicates(
         rx,
     )
     .await
+}
+
+async fn patch_memory(
+    axum::extract::State(h): axum::extract::State<ServiceHandle>,
+    axum::extract::Path(content_hash): axum::extract::Path<String>,
+    Json(patch): Json<PatchMemoryRequest>,
+) -> (StatusCode, Json<Value>) {
+    if patch.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "at least one field must be provided"})),
+        );
+    }
+
+    if !alaya_types::memory::validate_content_hash(&content_hash) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid content_hash format"})),
+        );
+    }
+
+    if let Err(msg) = patch.validate() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg})));
+    }
+
+    let (tx, rx) = oneshot::channel();
+    let cmd = Cmd {
+        inner: CmdInner::Patch {
+            hash: content_hash,
+            patch,
+            reply: tx,
+        },
+        span: tracing::Span::current(),
+    };
+
+    if h.tx.send(cmd).await.is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "service unavailable"})),
+        );
+    }
+
+    match rx.await {
+        Ok(v) => match v.get("error_kind").and_then(|k| k.as_str()) {
+            Some("not_found") => (StatusCode::NOT_FOUND, Json(v)),
+            Some("validation") => (StatusCode::BAD_REQUEST, Json(v)),
+            Some(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(v)),
+            None => (StatusCode::OK, Json(v)),
+        },
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "service dropped response"})),
+        ),
+    }
 }

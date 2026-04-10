@@ -16,7 +16,7 @@ use alaya_backends::{
 use alaya_types::{
     AlayaError, Result,
     graph::{CoAccessPair, Direction, EdgeMeta, SystemRelationType, UserRelationType},
-    memory::{Memory, MetadataUpdate, ScoredMemory},
+    memory::{Memory, MetadataUpdate, PatchMemoryRequest, ScoredMemory},
     search::{PayloadFilter, PromptName, SearchMode},
 };
 
@@ -882,6 +882,32 @@ impl MemoryService {
         Ok(result)
     }
 
+    // ─── patch_memory (REST only, not an MCP tool) ─────────────────────
+
+    /// Patch mutable fields on an existing memory.
+    ///
+    /// Delegates to VectorStorage and invalidates tag cache when tags change.
+    /// Returns the full updated Memory on success.
+    #[tracing::instrument(skip(self, patch))]
+    pub async fn patch_memory(
+        &self,
+        content_hash: &str,
+        patch: &PatchMemoryRequest,
+    ) -> Result<Memory> {
+        if !alaya_types::memory::validate_content_hash(content_hash) {
+            return Err(AlayaError::Validation("invalid content_hash format".into()));
+        }
+
+        let mem = self.vectors.patch_memory(content_hash, patch).await?;
+
+        // Invalidate tag cache so hybrid search picks up new tags immediately
+        if patch.tags.is_some() {
+            *self.tag_cache.borrow_mut() = None;
+        }
+
+        Ok(mem)
+    }
+
     // ─── Tool 4: check_database_health ──────────────────────────────────
 
     #[tracing::instrument(skip(self))]
@@ -1364,11 +1390,14 @@ mod tests {
         ConsolidationService, EmbeddingProvider, GraphService, HebbianService, VectorStorage,
     };
     use alaya_types::{
+        AlayaError,
         graph::{
             CoAccessPair, Contradiction, ContradictionRef, Direction, Edge, EdgeMeta, GraphStats,
             Neighbor, SystemRelationType, UserRelationType,
         },
-        memory::{HealthStatus, Memory, MetadataUpdate, ScoredMemory, ScrollResult},
+        memory::{
+            HealthStatus, Memory, MetadataUpdate, PatchMemoryRequest, ScoredMemory, ScrollResult,
+        },
         search::{PayloadFilter, PromptName},
     };
     use async_trait::async_trait;
@@ -1388,6 +1417,26 @@ mod tests {
         }
     }
 
+    fn dummy_memory() -> Memory {
+        Memory {
+            content: "mock".into(),
+            content_hash: "a".repeat(64),
+            tags: vec![],
+            memory_type: "note".into(),
+            metadata: None,
+            created_at: 0.0,
+            updated_at: 0.0,
+            embedding: None,
+            summary: None,
+            salience_score: 0.0,
+            access_count: 0,
+            access_timestamps: vec![],
+            emotional_valence: None,
+            encoding_context: None,
+            provenance: None,
+        }
+    }
+
     #[async_trait(?Send)]
     impl VectorStorage for MockVectors {
         async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
@@ -1404,6 +1453,9 @@ mod tests {
         }
         async fn update_metadata(&self, _h: &str, _u: MetadataUpdate) -> Result<()> {
             Ok(())
+        }
+        async fn patch_memory(&self, _h: &str, _p: &PatchMemoryRequest) -> Result<Memory> {
+            Ok(dummy_memory())
         }
         async fn search_by_vector(
             &self,
@@ -1854,6 +1906,9 @@ mod tests {
         async fn update_metadata(&self, _h: &str, _u: MetadataUpdate) -> Result<()> {
             Ok(())
         }
+        async fn patch_memory(&self, _h: &str, _p: &PatchMemoryRequest) -> Result<Memory> {
+            Err(AlayaError::NotFound("mock".into()))
+        }
         async fn search_by_vector(
             &self,
             _e: &[f32],
@@ -2185,6 +2240,9 @@ mod tests {
         async fn update_metadata(&self, _h: &str, _u: MetadataUpdate) -> Result<()> {
             Ok(())
         }
+        async fn patch_memory(&self, _h: &str, _p: &PatchMemoryRequest) -> Result<Memory> {
+            Err(AlayaError::NotFound("mock".into()))
+        }
         async fn search_by_vector(
             &self,
             _e: &[f32],
@@ -2366,5 +2424,85 @@ mod tests {
         // No edges created at all
         assert_eq!(individual_calls.get(), 0);
         assert_eq!(batch_edge_count.get(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn patch_memory_invalidates_tag_cache_when_tags_present() {
+        let (svc, counter) = build_mock_service(vec!["rust".into()]);
+
+        let search_params = SearchParams {
+            query: "test query".into(),
+            mode: SearchMode::Hybrid,
+            page: 1,
+            page_size: 10,
+            tags: None,
+            match_all: false,
+            k: 10,
+            min_similarity: None,
+            memory_type: None,
+            encoding_context: None,
+            include_superseded: false,
+            min_trust_score: None,
+            output: OutputMode::Full,
+        };
+
+        // Populate cache
+        let _ = svc.search(search_params.clone()).await;
+        assert_eq!(counter.get(), 1);
+
+        // Patch with tags — should invalidate cache
+        let patch = PatchMemoryRequest {
+            tags: Some(vec!["new-tag".into()]),
+            ..Default::default()
+        };
+        let _ = svc.patch_memory(&"a".repeat(64), &patch).await;
+
+        // Next search should re-fetch tags
+        let _ = svc.search(search_params).await;
+        assert_eq!(
+            counter.get(),
+            2,
+            "search after patch-with-tags should re-fetch"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn patch_memory_does_not_invalidate_tag_cache_without_tags() {
+        let (svc, counter) = build_mock_service(vec!["rust".into()]);
+
+        let search_params = SearchParams {
+            query: "test query".into(),
+            mode: SearchMode::Hybrid,
+            page: 1,
+            page_size: 10,
+            tags: None,
+            match_all: false,
+            k: 10,
+            min_similarity: None,
+            memory_type: None,
+            encoding_context: None,
+            include_superseded: false,
+            min_trust_score: None,
+            output: OutputMode::Full,
+        };
+
+        // Populate cache
+        let _ = svc.search(search_params.clone()).await;
+        assert_eq!(counter.get(), 1);
+
+        // Patch without tags — should NOT invalidate cache
+        let patch = PatchMemoryRequest {
+            summary: Some("updated".into()),
+            ..Default::default()
+        };
+        let _ = svc.patch_memory(&"a".repeat(64), &patch).await;
+
+        // Next search should use cached tags
+        let _ = svc.search(search_params).await;
+        assert_eq!(
+            counter.get(),
+            1,
+            "search after patch-without-tags should use cache"
+        );
     }
 }

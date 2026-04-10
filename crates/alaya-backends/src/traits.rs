@@ -8,7 +8,9 @@ use alaya_types::{
         CoAccessPair, Contradiction, ContradictionRef, Direction, Edge, EdgeMeta, GraphStats,
         Neighbor, SystemRelationType, UserRelationType,
     },
-    memory::{HealthStatus, Memory, MetadataUpdate, ScoredMemory, ScrollResult},
+    memory::{
+        HealthStatus, Memory, MetadataUpdate, PatchMemoryRequest, ScoredMemory, ScrollResult,
+    },
     search::{PayloadFilter, PromptName},
 };
 
@@ -23,6 +25,13 @@ pub trait VectorStorage {
     async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>>;
     async fn delete(&self, content_hash: &str) -> Result<bool>;
     async fn update_metadata(&self, content_hash: &str, updates: MetadataUpdate) -> Result<()>;
+
+    /// Patch mutable fields on an existing memory.
+    ///
+    /// Updates only the provided fields, sets `updated_at`, and returns the
+    /// full updated memory. Metadata merge: incoming keys are merged into
+    /// existing metadata; keys with JSON `null` values are deleted.
+    async fn patch_memory(&self, content_hash: &str, patch: &PatchMemoryRequest) -> Result<Memory>;
 
     // Vector search
     async fn search_by_vector(
