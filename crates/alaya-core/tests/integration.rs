@@ -46,6 +46,7 @@ fn build_service(qdrant_url: &str, embedding_url: &str) -> MemoryService {
         Box::new(GraphRef(graph.clone())),
         Box::new(HebbianRef(graph.clone())),
         Box::new(ConsolidationRef(graph)),
+        None,
     )
 }
 

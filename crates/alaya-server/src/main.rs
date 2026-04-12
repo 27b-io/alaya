@@ -31,6 +31,7 @@ use alaya_backends::{
     graph::GraphHttpClient,
     graph_ref::{ConsolidationRef, GraphRef, HebbianRef},
     qdrant::QdrantClient,
+    summary::SummaryClient,
 };
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{MemoryService, RelationParams, SearchParams, StoreParams};
@@ -50,6 +51,9 @@ struct Config {
     graph_api_key: String,
     listen_addr: String,
     api_key: String,
+    summary_url: Option<String>,
+    summary_api_key: Option<String>,
+    summary_model: String,
 }
 
 impl Config {
@@ -67,6 +71,11 @@ impl Config {
             graph_api_key: env_or("GRAPH_API_KEY", ""),
             listen_addr: env_or("LISTEN_ADDR", "0.0.0.0:3001"),
             api_key: env_or("ALAYA_API_KEY", ""),
+            summary_url: std::env::var("SUMMARY_URL").ok().filter(|s| !s.is_empty()),
+            summary_api_key: std::env::var("SUMMARY_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            summary_model: env_or("SUMMARY_MODEL", "claude-haiku-4-5-20251001"),
         }
     }
 }
@@ -137,6 +146,10 @@ pub(crate) enum CmdInner {
         patch: PatchMemoryRequest,
         reply: oneshot::Sender<Value>,
     },
+    BackfillSummaries {
+        limit: usize,
+        reply: oneshot::Sender<Value>,
+    },
 }
 
 impl Cmd {
@@ -152,6 +165,7 @@ impl Cmd {
             CmdInner::FindDuplicates { .. } => "find_duplicates",
             CmdInner::MergeDuplicates { .. } => "merge_duplicates",
             CmdInner::Patch { .. } => "patch",
+            CmdInner::BackfillSummaries { .. } => "backfill_summaries",
         }
     }
 }
@@ -337,7 +351,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 let span = tracing::info_span!(parent: &ps, "health");
                 let result = match svc.check_database_health().instrument(span).await {
                     Ok(r) => {
-                        log_ok(op, &json!(r), start);
+                        tracing::debug!(op, elapsed_ms = ms(start), "ok");
                         json!(r)
                     }
                     Err(e) => {
@@ -348,11 +362,58 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 let _ = reply.send(result);
             }
             CmdInner::Store { params, reply } => {
-                let span =
-                    tracing::info_span!(parent: &ps, "store", content_len = params.content.len());
+                let content_len = params.content.len();
+                let mem_type = params.memory_type.as_deref().unwrap_or("note").to_string();
+                let tag_count = params.tags.as_ref().map(|t| t.len()).unwrap_or(0);
+                let has_dedup = params.dedup_threshold.is_some();
+                let client = params.client_hostname.clone().unwrap_or_default();
+
+                // Capture for fire-and-forget summary generation
+                let needs_summary = params.summary.is_none() && svc.summary.is_some();
+                let content_for_summary = if needs_summary {
+                    Some(params.content.clone())
+                } else {
+                    None
+                };
+
+                let span = tracing::info_span!(parent: &ps, "store",
+                    content_len, %mem_type);
                 let result = match svc.store_memory(params).instrument(span).await {
                     Ok(r) => {
-                        log_ok(op, &json!(r), start);
+                        let hash = r
+                            .get("content_hash")
+                            .and_then(|v| v.as_str())
+                            .map(|s| &s[..8.min(s.len())])
+                            .unwrap_or("-");
+                        let skipped = r
+                            .get("duplicate")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        tracing::info!(
+                            op,
+                            hash,
+                            mem_type = mem_type.as_str(),
+                            content_len,
+                            tag_count,
+                            has_dedup,
+                            skipped,
+                            client = client.as_str(),
+                            elapsed_ms = ms(start),
+                            "ok"
+                        );
+
+                        // Fire-and-forget: generate summary in background
+                        if let Some(content) = content_for_summary
+                            && !skipped
+                            && let Some(full_hash) = r.get("content_hash").and_then(|v| v.as_str())
+                        {
+                            let hash_owned = full_hash.to_string();
+                            let svc = svc.clone();
+                            tokio::task::spawn_local(async move {
+                                enrich_summary(&svc, &hash_owned, &content).await;
+                            });
+                        }
+
                         json!(r)
                     }
                     Err(e) => {
@@ -364,14 +425,26 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             }
             CmdInner::Search { params, reply } => {
                 let mode = format!("{:?}", params.mode).to_lowercase();
+                let query_preview = truncate(&params.query, 80);
+                let page = params.page;
+                let page_size = params.page_size;
+                let tag_count = params.tags.as_ref().map(|t| t.len()).unwrap_or(0);
+                let mem_type = params.memory_type.clone().unwrap_or_default();
                 let span = tracing::info_span!(parent: &ps, "search", %mode);
                 let result = match svc.search(params).instrument(span).await {
                     Ok(r) => {
                         let n = result_count(&r);
+                        let has_more = r.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
                         tracing::info!(
                             op,
                             mode = mode.as_str(),
+                            query = query_preview.as_str(),
                             results = n,
+                            has_more,
+                            page,
+                            page_size,
+                            tag_count,
+                            mem_type = mem_type.as_str(),
                             elapsed_ms = ms(start),
                             "ok"
                         );
@@ -386,10 +459,10 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             }
             CmdInner::Delete { hash, reply } => {
                 let span = tracing::info_span!(parent: &ps, "delete");
-                let h = &hash[..8.min(hash.len())];
+                let h = truncate_hash(&hash);
                 let result = match svc.delete_memory(&hash).instrument(span).await {
                     Ok(r) => {
-                        tracing::info!(op, hash = h, elapsed_ms = ms(start), "ok");
+                        tracing::info!(op, hash = h.as_str(), elapsed_ms = ms(start), "ok");
                         json!(r)
                     }
                     Err(e) => {
@@ -401,10 +474,25 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             }
             CmdInner::Relation { params, reply } => {
                 let action = params.action.clone();
+                let hash = truncate_hash(&params.content_hash);
+                let target = params
+                    .target_hash
+                    .as_deref()
+                    .map(truncate_hash)
+                    .unwrap_or_default();
+                let rel_type = params.relation_type.clone().unwrap_or_default();
                 let span = tracing::info_span!(parent: &ps, "relation", %action);
                 let result = match svc.relation(params).instrument(span).await {
                     Ok(r) => {
-                        tracing::info!(op, action = action.as_str(), elapsed_ms = ms(start), "ok");
+                        tracing::info!(
+                            op,
+                            action = action.as_str(),
+                            hash = hash.as_str(),
+                            target = target.as_str(),
+                            rel_type = rel_type.as_str(),
+                            elapsed_ms = ms(start),
+                            "ok"
+                        );
                         r
                     }
                     Err(e) => {
@@ -421,15 +509,23 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 reply,
             } => {
                 let span = tracing::info_span!(parent: &ps, "supersede");
-                let old_h = &old_hash[..8.min(old_hash.len())];
-                let new_h = &new_hash[..8.min(new_hash.len())];
+                let old_h = truncate_hash(&old_hash);
+                let new_h = truncate_hash(&new_hash);
+                let reason_preview = truncate(&reason, 60);
                 let result = match svc
                     .memory_supersede(&old_hash, &new_hash, &reason)
                     .instrument(span)
                     .await
                 {
                     Ok(r) => {
-                        tracing::info!(op, old = old_h, new = new_h, elapsed_ms = ms(start), "ok");
+                        tracing::info!(
+                            op,
+                            old = old_h.as_str(),
+                            new = new_h.as_str(),
+                            reason = reason_preview.as_str(),
+                            elapsed_ms = ms(start),
+                            "ok"
+                        );
                         r
                     }
                     Err(e) => {
@@ -443,7 +539,12 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 let span = tracing::info_span!(parent: &ps, "contradictions");
                 let result = match svc.memory_contradictions(limit).instrument(span).await {
                     Ok(r) => {
-                        log_ok(op, &r, start);
+                        let pairs = r
+                            .get("contradictions")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0);
+                        tracing::info!(op, limit, pairs, elapsed_ms = ms(start), "ok");
                         r
                     }
                     Err(e) => {
@@ -455,10 +556,17 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             }
             CmdInner::Patch { hash, patch, reply } => {
                 let span = tracing::info_span!(parent: &ps, "patch");
-                let h = &hash[..8.min(hash.len())];
+                let h = truncate_hash(&hash);
+                let fields = patch.changed_fields();
                 let result = match svc.patch_memory(&hash, &patch).instrument(span).await {
                     Ok(mem) => {
-                        tracing::info!(op, hash = h, elapsed_ms = ms(start), "ok");
+                        tracing::info!(
+                            op,
+                            hash = h.as_str(),
+                            fields = fields.as_str(),
+                            elapsed_ms = ms(start),
+                            "ok"
+                        );
                         json!(mem)
                     }
                     Err(e) => {
@@ -483,6 +591,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 strategy,
                 reply,
             } => {
+                let strat_name = format!("{strategy:?}").to_lowercase();
                 let span = tracing::info_span!(parent: &ps, "find_duplicates");
                 let svc = svc.clone();
                 tokio::task::spawn_local(
@@ -493,7 +602,23 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                                     .get("total_duplicates_found")
                                     .and_then(|v| v.as_u64())
                                     .unwrap_or(0);
-                                tracing::info!(op, duplicates = n, elapsed_ms = ms(start), "ok");
+                                let groups = r
+                                    .get("duplicate_groups")
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| a.len())
+                                    .unwrap_or(0);
+                                let scanned =
+                                    r.get("raw_scanned").and_then(|v| v.as_u64()).unwrap_or(0);
+                                tracing::info!(
+                                    op,
+                                    duplicates = n,
+                                    groups,
+                                    scanned,
+                                    threshold,
+                                    strategy = strat_name.as_str(),
+                                    elapsed_ms = ms(start),
+                                    "ok"
+                                );
                                 r
                             }
                             Err(e) => {
@@ -515,6 +640,8 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             } => {
                 let span = tracing::info_span!(parent: &ps, "merge_duplicates");
                 let svc = svc.clone();
+                let dup_count = duplicates.len();
+                let canonical_h = truncate_hash(&canonical);
                 tokio::task::spawn_local(
                     async move {
                         let refs: Vec<&str> = duplicates.iter().map(|s| s.as_str()).collect();
@@ -523,7 +650,14 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                             .await
                         {
                             Ok(r) => {
-                                log_ok(op, &r, start);
+                                tracing::info!(
+                                    op,
+                                    canonical = canonical_h.as_str(),
+                                    dup_count,
+                                    dry_run,
+                                    elapsed_ms = ms(start),
+                                    "ok"
+                                );
                                 r
                             }
                             Err(e) => {
@@ -536,6 +670,81 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                     .instrument(span),
                 );
             }
+            CmdInner::BackfillSummaries { limit, reply } => {
+                let span = tracing::info_span!(parent: &ps, "backfill_summaries");
+                let svc = svc.clone();
+                tokio::task::spawn_local(
+                    async move {
+                        if svc.summary.is_none() {
+                            let _ = reply.send(json!({"error": "summary provider not configured"}));
+                            return;
+                        }
+
+                        // Scroll memories, collect those without summaries
+                        let mut offset: Option<String> = None;
+                        let mut targets: Vec<(String, String)> = Vec::new();
+
+                        loop {
+                            match svc.vectors.get_all(100, offset.as_deref()).await {
+                                Ok(scroll) => {
+                                    for mem in &scroll.memories {
+                                        if mem.summary.is_none() && targets.len() < limit {
+                                            targets.push((
+                                                mem.content_hash.clone(),
+                                                mem.content.clone(),
+                                            ));
+                                        }
+                                    }
+                                    if scroll.next_offset.is_none() || targets.len() >= limit {
+                                        break;
+                                    }
+                                    offset = scroll.next_offset;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("backfill scroll failed: {e}");
+                                    break;
+                                }
+                            }
+                        }
+
+                        let queued = targets.len();
+                        tracing::info!(queued, "backfill: generating summaries");
+                        let _ = reply.send(json!({"queued": queued}));
+
+                        // Generate summaries sequentially (avoid API rate limits)
+                        for (hash, content) in &targets {
+                            enrich_summary(&svc, hash, content).await;
+                        }
+                        tracing::info!(queued, "backfill summaries complete");
+                    }
+                    .instrument(span),
+                );
+            }
+        }
+    }
+}
+
+/// Fire-and-forget summary generation helper.
+/// Called from spawn_local — logs errors, never panics.
+async fn enrich_summary(svc: &MemoryService, hash: &str, content: &str) {
+    let Some(ref summarizer) = svc.summary else {
+        return;
+    };
+    let h = &hash[..8.min(hash.len())];
+    match summarizer.summarize(content).await {
+        Ok(summary) => {
+            let patch = PatchMemoryRequest {
+                summary: Some(summary),
+                ..Default::default()
+            };
+            if let Err(e) = svc.patch_memory(hash, &patch).await {
+                tracing::warn!(hash = h, "summary patch failed (non-fatal): {e}");
+            } else {
+                tracing::debug!(hash = h, "auto-summary applied");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(hash = h, "summary generation failed (non-fatal): {e}");
         }
     }
 }
@@ -551,14 +760,17 @@ fn result_count(v: &Value) -> u64 {
         .unwrap_or(0)
 }
 
-fn log_ok(op: &str, result: &Value, start: std::time::Instant) {
-    let hash = result
-        .get("content_hash")
-        .and_then(|v| v.as_str())
-        .map(|s| &s[..8.min(s.len())])
-        .unwrap_or("-");
-    let n = result_count(result);
-    tracing::info!(op, hash, results = n, elapsed_ms = ms(start), "ok");
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let boundary = s.floor_char_boundary(max);
+        format!("{}…", &s[..boundary])
+    }
+}
+
+fn truncate_hash(s: &str) -> String {
+    s[..8.min(s.len())].to_string()
 }
 
 fn log_err(op: &str, e: &alaya_types::AlayaError, start: std::time::Instant) {
@@ -633,12 +845,41 @@ fn main() {
                     &cfg_clone.graph_api_key,
                 ));
 
+                let summary: Option<Box<dyn alaya_backends::SummaryProvider>> = match (
+                    &cfg_clone.summary_url,
+                    &cfg_clone.summary_api_key,
+                ) {
+                    (Some(url), Some(key)) => {
+                        tracing::info!(
+                            url = url.as_str(),
+                            model = cfg_clone.summary_model.as_str(),
+                            "summary provider enabled"
+                        );
+                        Some(Box::new(SummaryClient::new(
+                            url.clone(),
+                            cfg_clone.summary_model.clone(),
+                            key.clone(),
+                        )))
+                    }
+                    (Some(_), None) => {
+                        tracing::warn!(
+                            "SUMMARY_URL set but SUMMARY_API_KEY missing — auto-summary disabled"
+                        );
+                        None
+                    }
+                    _ => {
+                        tracing::info!("SUMMARY_URL not set — auto-summary disabled");
+                        None
+                    }
+                };
+
                 let svc = MemoryService::new(
                     Box::new(qdrant),
                     Box::new(cached_embeddings),
                     Box::new(GraphRef(graph.clone())),
                     Box::new(HebbianRef(graph.clone())),
                     Box::new(ConsolidationRef(graph)),
+                    summary,
                 );
 
                 service_worker(rx, svc).await;
@@ -671,6 +912,7 @@ fn main() {
             .route("/duplicates/find", post(find_duplicates))
             .route("/duplicates/merge", post(merge_duplicates))
             .route("/memories/{content_hash}", patch(patch_memory))
+            .route("/backfill/summaries", post(backfill_summaries))
             .layer(middleware::from_fn_with_state(
                 handle.clone(),
                 require_bearer,
@@ -932,4 +1174,28 @@ async fn patch_memory(
             Json(json!({"error": "service dropped response"})),
         ),
     }
+}
+
+#[derive(Deserialize)]
+struct BackfillParams {
+    #[serde(default = "default_backfill_limit")]
+    limit: usize,
+}
+fn default_backfill_limit() -> usize {
+    100
+}
+
+async fn backfill_summaries(
+    axum::extract::State(h): axum::extract::State<ServiceHandle>,
+    Json(params): Json<BackfillParams>,
+) -> Json<Value> {
+    let (tx, rx) = oneshot::channel();
+    h.call(
+        CmdInner::BackfillSummaries {
+            limit: params.limit,
+            reply: tx,
+        },
+        rx,
+    )
+    .await
 }

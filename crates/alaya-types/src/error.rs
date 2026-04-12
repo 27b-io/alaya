@@ -22,6 +22,9 @@ pub enum AlayaError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    #[error("summary generation error: {0}")]
+    Summary(String),
+
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 }
@@ -36,6 +39,7 @@ impl AlayaError {
             Self::Config(_) => -32003,
             Self::Validation(_) => -32602,
             Self::NotFound(_) => -32004,
+            Self::Summary(_) => -32005,
             Self::Serialization(_) => -32600,
         }
     }
@@ -50,6 +54,7 @@ impl AlayaError {
             Self::Config(_) => "Service configuration error",
             Self::Validation(_) => "Invalid request parameters",
             Self::NotFound(_) => "Resource not found",
+            Self::Summary(_) => "Summary generation failed",
             Self::Serialization(_) => "Invalid request format",
         }
     }

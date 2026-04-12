@@ -187,3 +187,12 @@ pub trait ConsolidationService {
     async fn prune_weak_edges(&self, threshold: f64, limit: usize) -> Result<usize>;
     async fn get_orphan_nodes(&self, limit: usize) -> Result<Vec<String>>;
 }
+
+/// Summary generation backend (e.g. Anthropic Messages API).
+///
+/// Optional — when absent, summaries are only set from client-provided values.
+#[async_trait(?Send)]
+pub trait SummaryProvider {
+    /// Generate a one-line summary (~50 tokens) for the given content.
+    async fn summarize(&self, content: &str) -> Result<String>;
+}

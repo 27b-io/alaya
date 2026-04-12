@@ -108,6 +108,24 @@ impl PatchMemoryRequest {
             && self.memory_type.is_none()
     }
 
+    /// Returns a comma-separated list of fields being patched (for logging).
+    pub fn changed_fields(&self) -> String {
+        let mut fields = Vec::new();
+        if self.tags.is_some() {
+            fields.push("tags");
+        }
+        if self.metadata.is_some() {
+            fields.push("metadata");
+        }
+        if self.summary.is_some() {
+            fields.push("summary");
+        }
+        if self.memory_type.is_some() {
+            fields.push("memory_type");
+        }
+        fields.join(",")
+    }
+
     /// Validate field sizes and values. Returns Err with a description on failure.
     pub fn validate(&self) -> std::result::Result<(), String> {
         if let Some(ref tags) = self.tags {

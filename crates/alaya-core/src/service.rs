@@ -11,7 +11,8 @@ use serde_json::Value;
 use tracing;
 
 use alaya_backends::{
-    ConsolidationService, EmbeddingProvider, GraphService, HebbianService, VectorStorage,
+    ConsolidationService, EmbeddingProvider, GraphService, HebbianService, SummaryProvider,
+    VectorStorage,
 };
 use alaya_types::{
     AlayaError, Result,
@@ -116,6 +117,9 @@ pub struct MemoryService {
     pub graph: Box<dyn GraphService>,
     pub hebbian: Box<dyn HebbianService>,
     pub consolidation: Box<dyn ConsolidationService>,
+    /// Optional summary generator. When set, summaries are auto-generated
+    /// fire-and-forget after store when the caller omits one.
+    pub summary: Option<Box<dyn SummaryProvider>>,
     /// Cached (timestamp, tags) from `get_all_tags()`. RefCell is fine:
     /// MemoryService runs single-threaded on a LocalSet (`!Send`).
     tag_cache: RefCell<Option<(f64, Vec<String>)>>,
@@ -130,6 +134,7 @@ impl MemoryService {
         graph: Box<dyn GraphService>,
         hebbian: Box<dyn HebbianService>,
         consolidation: Box<dyn ConsolidationService>,
+        summary: Option<Box<dyn SummaryProvider>>,
     ) -> Self {
         Self {
             vectors,
@@ -137,6 +142,7 @@ impl MemoryService {
             graph,
             hebbian,
             consolidation,
+            summary,
             tag_cache: RefCell::new(None),
             clock: current_timestamp,
         }
@@ -158,6 +164,7 @@ impl MemoryService {
             graph,
             hebbian,
             consolidation,
+            summary: None,
             tag_cache: RefCell::new(None),
             clock,
         }
@@ -373,6 +380,8 @@ impl MemoryService {
         let mut result = HashMap::new();
         result.insert("success".into(), serde_json::json!(true));
         result.insert("content_hash".into(), serde_json::json!(content_hash));
+        result.insert("memory_type".into(), serde_json::json!(memory.memory_type));
+        result.insert("created".into(), serde_json::json!(created));
         result.insert(
             "message".into(),
             serde_json::json!(if created {
@@ -381,6 +390,9 @@ impl MemoryService {
                 "Memory updated"
             }),
         );
+        if !tags.is_empty() {
+            result.insert("tags".into(), serde_json::json!(tags));
+        }
 
         if !contradiction_signals.is_empty() {
             let interference_data: Vec<Value> = contradiction_signals
@@ -410,13 +422,19 @@ impl MemoryService {
         if params.page_size == 0 {
             return Err(AlayaError::Validation("page_size must be > 0".into()));
         }
-        match params.mode {
-            SearchMode::Hybrid => self.search_hybrid(&params).await,
-            SearchMode::Scan => self.search_scan(&params).await,
-            SearchMode::Similar => self.search_similar(&params).await,
-            SearchMode::Tag => self.search_tag(&params).await,
-            SearchMode::Recent => self.search_recent(&params).await,
+        let mode_str = format!("{:?}", params.mode).to_lowercase();
+        let mut result = match params.mode {
+            SearchMode::Hybrid => self.search_hybrid(&params).await?,
+            SearchMode::Scan => self.search_scan(&params).await?,
+            SearchMode::Similar => self.search_similar(&params).await?,
+            SearchMode::Tag => self.search_tag(&params).await?,
+            SearchMode::Recent => self.search_recent(&params).await?,
+        };
+        // Inject mode into every search response for caller context
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("mode".into(), serde_json::json!(mode_str));
         }
+        Ok(result)
     }
 
     #[tracing::instrument(skip(self, params))]
@@ -1646,6 +1664,7 @@ mod tests {
             Box::new(MockGraph),
             Box::new(MockHebbian),
             Box::new(MockConsolidation),
+            None,
         );
         (svc, counter)
     }
@@ -2014,6 +2033,7 @@ mod tests {
             Box::new(MockGraph),
             Box::new(MockHebbian),
             Box::new(MockConsolidation),
+            None,
         );
         (svc, fetched, embedded)
     }
@@ -2338,6 +2358,7 @@ mod tests {
             )),
             Box::new(MockHebbian),
             Box::new(MockConsolidation),
+            None,
         );
         (svc, individual, batch, batch_edges)
     }
