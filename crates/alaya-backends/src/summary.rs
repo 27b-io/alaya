@@ -36,6 +36,7 @@ impl SummaryClient {
 
         #[cfg(not(target_arch = "wasm32"))]
         let builder = builder
+            .http1_only()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30));
 
