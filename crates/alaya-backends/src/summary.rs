@@ -19,12 +19,14 @@ pub struct SummaryClient {
 }
 
 impl SummaryClient {
-    pub fn new(base_url: String, model: String, api_key: String) -> Self {
+    pub fn new(base_url: String, model: String, api_key: Option<String>) -> Self {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            "x-api-key",
-            reqwest::header::HeaderValue::from_str(&api_key).expect("invalid API key characters"),
-        );
+        if let Some(key) = api_key {
+            headers.insert(
+                "x-api-key",
+                reqwest::header::HeaderValue::from_str(&key).expect("invalid API key characters"),
+            );
+        }
         headers.insert(
             "anthropic-version",
             reqwest::header::HeaderValue::from_static("2023-06-01"),

@@ -845,33 +845,23 @@ fn main() {
                     &cfg_clone.graph_api_key,
                 ));
 
-                let summary: Option<Box<dyn alaya_backends::SummaryProvider>> = match (
-                    &cfg_clone.summary_url,
-                    &cfg_clone.summary_api_key,
-                ) {
-                    (Some(url), Some(key)) => {
+                let summary: Option<Box<dyn alaya_backends::SummaryProvider>> =
+                    if let Some(url) = &cfg_clone.summary_url {
                         tracing::info!(
                             url = url.as_str(),
                             model = cfg_clone.summary_model.as_str(),
+                            has_api_key = cfg_clone.summary_api_key.is_some(),
                             "summary provider enabled"
                         );
                         Some(Box::new(SummaryClient::new(
                             url.clone(),
                             cfg_clone.summary_model.clone(),
-                            key.clone(),
+                            cfg_clone.summary_api_key.clone(),
                         )))
-                    }
-                    (Some(_), None) => {
-                        tracing::warn!(
-                            "SUMMARY_URL set but SUMMARY_API_KEY missing — auto-summary disabled"
-                        );
-                        None
-                    }
-                    _ => {
+                    } else {
                         tracing::info!("SUMMARY_URL not set — auto-summary disabled");
                         None
-                    }
-                };
+                    };
 
                 let svc = MemoryService::new(
                     Box::new(qdrant),
