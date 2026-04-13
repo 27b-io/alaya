@@ -16,6 +16,8 @@ fn deserialize_tags<'de, D>(deserializer: D) -> std::result::Result<Option<Vec<S
 where
     D: serde::Deserializer<'de>,
 {
+    use std::collections::HashSet;
+
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum StringOrVec {
@@ -23,25 +25,20 @@ where
         Str(String),
     }
 
+    fn dedup(iter: impl Iterator<Item = String>) -> Option<Vec<String>> {
+        let mut seen = HashSet::new();
+        let v: Vec<String> = iter
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty() && seen.insert(s.clone()))
+            .collect();
+        if v.is_empty() { None } else { Some(v) }
+    }
+
     let opt: Option<StringOrVec> = Option::deserialize(deserializer)?;
     Ok(match opt {
         None => None,
-        Some(StringOrVec::Vec(v)) => {
-            let v: Vec<String> = v
-                .into_iter()
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if v.is_empty() { None } else { Some(v) }
-        }
-        Some(StringOrVec::Str(s)) => {
-            let v: Vec<String> = s
-                .split(',')
-                .map(|t| t.trim().to_owned())
-                .filter(|t| !t.is_empty())
-                .collect();
-            if v.is_empty() { None } else { Some(v) }
-        }
+        Some(StringOrVec::Vec(v)) => dedup(v.into_iter()),
+        Some(StringOrVec::Str(s)) => dedup(s.split(',').map(String::from)),
     })
 }
 use tracing;
@@ -2614,5 +2611,19 @@ mod tests {
         let json = r#"{"tags":"lab,infra"}"#;
         let p: SearchParams = serde_json::from_str(json).unwrap();
         assert_eq!(p.tags, Some(vec!["lab".into(), "infra".into()]));
+    }
+
+    #[test]
+    fn tags_deduped_from_array() {
+        let json = r#"{"content":"x","tags":["a","b","a"]}"#;
+        let p: StoreParams = serde_json::from_str(json).unwrap();
+        assert_eq!(p.tags, Some(vec!["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn tags_deduped_from_csv() {
+        let json = r#"{"content":"x","tags":"x, y, x"}"#;
+        let p: StoreParams = serde_json::from_str(json).unwrap();
+        assert_eq!(p.tags, Some(vec!["x".into(), "y".into()]));
     }
 }
