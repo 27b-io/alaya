@@ -69,7 +69,7 @@ def load_progress() -> set[str]:
         data = json.loads(PROGRESS_FILE.read_text())
         return set(data.get("completed", []))
     except (json.JSONDecodeError, ValueError):
-        print(f"  warning: corrupt progress file, starting fresh", flush=True)
+        print("  warning: corrupt progress file, starting fresh", flush=True)
         return set()
 
 
@@ -210,6 +210,8 @@ async def patch_summary(
         json={"summary": summary},
         timeout=10.0,
     )
+    if resp.status_code >= 500 or resp.status_code == 429:
+        resp.raise_for_status()
     return resp.status_code == 200
 
 
@@ -217,7 +219,6 @@ async def patch_summary(
 
 
 async def process_memory(
-    sem: asyncio.Semaphore,
     client: httpx.AsyncClient,
     memory: dict,
     completed: set[str],
@@ -226,39 +227,53 @@ async def process_memory(
     content_hash = memory["content_hash"]
     h = content_hash[:8]
 
-    async with sem:
-        await asyncio.sleep(THROTTLE_DELAY)
+    await asyncio.sleep(THROTTLE_DELAY)
 
-        try:
-            summary = await generate_summary(client, memory["content"])
-            if summary:
-                ok = await patch_summary(client, content_hash, summary)
-                if ok:
-                    completed.add(content_hash)
-                    stats["success"] += 1
-                else:
-                    print(f"    [{h}] patch failed", flush=True)
-                    stats["errors"] += 1
+    try:
+        summary = await generate_summary(client, memory["content"])
+        if summary:
+            ok = await patch_summary(client, content_hash, summary)
+            if ok:
+                completed.add(content_hash)
+                stats["success"] += 1
             else:
-                print(f"    [{h}] empty summary", flush=True)
+                print(f"    [{h}] patch failed", flush=True)
                 stats["errors"] += 1
-        except Exception as e:
-            print(f"    [{h}] failed after retries: {e}", flush=True)
+        else:
+            print(f"    [{h}] empty summary", flush=True)
             stats["errors"] += 1
+    except Exception as e:
+        print(f"    [{h}] failed after retries: {e}", flush=True)
+        stats["errors"] += 1
 
-        stats["processed"] += 1
-        n = stats["processed"]
-        if n % 100 == 0 or n == stats["total"]:
-            elapsed = time.time() - stats["start"]
-            rate = n / max(elapsed, 1)
-            eta = (stats["total"] - n) / max(rate, 0.01)
-            print(
-                f"  [{n}/{stats['total']}] "
-                f"ok={stats['success']} err={stats['errors']} "
-                f"rate={rate:.1f}/s eta={eta / 60:.0f}m",
-                flush=True,
-            )
-            save_progress(completed, stats["total"], stats["errors"])
+    stats["processed"] += 1
+    n = stats["processed"]
+    if n % 100 == 0 or n == stats["total"]:
+        elapsed = time.time() - stats["start"]
+        rate = n / max(elapsed, 1)
+        eta = (stats["total"] - n) / max(rate, 0.01)
+        print(
+            f"  [{n}/{stats['total']}] "
+            f"ok={stats['success']} err={stats['errors']} "
+            f"rate={rate:.1f}/s eta={eta / 60:.0f}m",
+            flush=True,
+        )
+        save_progress(completed, stats["total"], stats["errors"])
+
+
+async def worker(
+    queue: asyncio.Queue,
+    client: httpx.AsyncClient,
+    completed: set[str],
+    stats: dict,
+):
+    """Pull memories from queue and process until sentinel."""
+    while True:
+        memory = await queue.get()
+        if memory is None:
+            break
+        await process_memory(client, memory, completed, stats)
+        queue.task_done()
 
 
 # ─── Main ───────────────────────────────────────────────────────────────────
@@ -298,15 +313,27 @@ async def main():
             "total": len(to_process),
             "start": time.time(),
         }
-        sem = asyncio.Semaphore(CONCURRENCY)
 
-        tasks = [
-            process_memory(sem, client, m, completed, stats) for m in to_process
+        # Queue-based worker pool — constant memory regardless of batch size
+        queue: asyncio.Queue = asyncio.Queue()
+        for m in to_process:
+            queue.put_nowait(m)
+
+        workers = [
+            asyncio.create_task(worker(queue, client, completed, stats))
+            for _ in range(CONCURRENCY)
         ]
-        await asyncio.gather(*tasks)
+
+        # Wait for all items to be processed
+        await queue.join()
+
+        # Send sentinel to stop workers
+        for _ in workers:
+            queue.put_nowait(None)
+        await asyncio.gather(*workers)
 
         elapsed = time.time() - stats["start"]
-        save_progress(completed, len(memories), stats["errors"])
+        save_progress(completed, stats["total"], stats["errors"])
 
         print()
         print(f"Done in {elapsed / 60:.1f}m")
