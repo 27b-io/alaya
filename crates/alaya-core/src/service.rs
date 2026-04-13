@@ -8,6 +8,42 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+// ─── Tag deserialization ───────────────────────────────────────────────────────
+
+/// Accept `["a","b"]`, `"a, b"`, or `null` — always yields `Option<Vec<String>>`.
+fn deserialize_tags<'de, D>(deserializer: D) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        Vec(Vec<String>),
+        Str(String),
+    }
+
+    let opt: Option<StringOrVec> = Option::deserialize(deserializer)?;
+    Ok(match opt {
+        None => None,
+        Some(StringOrVec::Vec(v)) => {
+            let v: Vec<String> = v
+                .into_iter()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if v.is_empty() { None } else { Some(v) }
+        }
+        Some(StringOrVec::Str(s)) => {
+            let v: Vec<String> = s
+                .split(',')
+                .map(|t| t.trim().to_owned())
+                .filter(|t| !t.is_empty())
+                .collect();
+            if v.is_empty() { None } else { Some(v) }
+        }
+    })
+}
 use tracing;
 
 use alaya_backends::{
@@ -41,6 +77,7 @@ pub struct SearchParams {
     pub page: usize,
     #[serde(default = "default_page_size")]
     pub page_size: usize,
+    #[serde(default, deserialize_with = "deserialize_tags")]
     pub tags: Option<Vec<String>>,
     #[serde(default)]
     pub match_all: bool,
@@ -79,6 +116,7 @@ pub enum OutputMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreParams {
     pub content: String,
+    #[serde(default, deserialize_with = "deserialize_tags")]
     pub tags: Option<Vec<String>>,
     pub memory_type: Option<String>,
     pub metadata: Option<HashMap<String, Value>>,
@@ -2525,5 +2563,56 @@ mod tests {
             1,
             "search after patch-without-tags should use cache"
         );
+    }
+
+    // ─── Tag deserialization ───────────────────────────────────────────
+
+    #[test]
+    fn tags_from_json_array() {
+        let json = r#"{"content":"x","tags":["a","b"]}"#;
+        let p: StoreParams = serde_json::from_str(json).unwrap();
+        assert_eq!(p.tags, Some(vec!["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn tags_from_csv_string() {
+        let json = r#"{"content":"x","tags":"a, b, c"}"#;
+        let p: StoreParams = serde_json::from_str(json).unwrap();
+        assert_eq!(p.tags, Some(vec!["a".into(), "b".into(), "c".into()]));
+    }
+
+    #[test]
+    fn tags_from_null() {
+        let json = r#"{"content":"x","tags":null}"#;
+        let p: StoreParams = serde_json::from_str(json).unwrap();
+        assert_eq!(p.tags, None);
+    }
+
+    #[test]
+    fn tags_omitted() {
+        let json = r#"{"content":"x"}"#;
+        let p: StoreParams = serde_json::from_str(json).unwrap();
+        assert_eq!(p.tags, None);
+    }
+
+    #[test]
+    fn tags_empty_string_becomes_none() {
+        let json = r#"{"content":"x","tags":""}"#;
+        let p: StoreParams = serde_json::from_str(json).unwrap();
+        assert_eq!(p.tags, None);
+    }
+
+    #[test]
+    fn tags_whitespace_trimmed() {
+        let json = r#"{"content":"x","tags":"  alpha , beta  "}"#;
+        let p: StoreParams = serde_json::from_str(json).unwrap();
+        assert_eq!(p.tags, Some(vec!["alpha".into(), "beta".into()]));
+    }
+
+    #[test]
+    fn search_tags_from_csv_string() {
+        let json = r#"{"tags":"lab,infra"}"#;
+        let p: SearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(p.tags, Some(vec!["lab".into(), "infra".into()]));
     }
 }
