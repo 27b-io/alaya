@@ -8,16 +8,18 @@ alaya-server. Resumable via a progress file.
 Usage:
     pip install httpx tenacity
 
-    # Run from the lab host (direct access to ClusterIPs):
+    # Full backfill (summary + embedding):
     python3 scripts/backfill_summaries.py
+
+    # Embeddings only (skip Haiku, use existing summaries):
+    python3 scripts/backfill_summaries.py --embeddings-only
 
     # Override endpoints:
     ALAYA_URL=http://10.43.61.94:3001 \
-    QDRANT_URL=http://10.43.119.230:6333 \
-    SUMMARY_URL=http://192.168.0.10:8082 \
     python3 scripts/backfill_summaries.py
 """
 
+import argparse
 import asyncio
 import json
 import os
@@ -125,6 +127,7 @@ async def scroll_all_qdrant(client: httpx.AsyncClient) -> list[dict]:
                 memories.append({
                     "content": content,
                     "content_hash": content_hash,
+                    "summary": payload.get("summary"),
                 })
 
         next_offset = data.get("result", {}).get("next_page_offset")
@@ -259,6 +262,7 @@ async def process_memory(
     memory: dict,
     completed: set[str],
     stats: dict,
+    embeddings_only: bool = False,
 ):
     content_hash = memory["content_hash"]
     h = content_hash[:8]
@@ -266,18 +270,28 @@ async def process_memory(
     await asyncio.sleep(THROTTLE_DELAY)
 
     try:
-        summary = await generate_summary(client, memory["content"])
-        if summary:
-            embedding = await generate_embedding(client, summary)
-            ok = await patch_summary(client, content_hash, summary, embedding)
-            if ok:
-                completed.add(content_hash)
-                stats["success"] += 1
-            else:
-                print(f"    [{h}] patch failed", flush=True)
+        if embeddings_only:
+            summary = memory.get("summary")
+            if not summary:
+                print(f"    [{h}] no existing summary, skipping", flush=True)
                 stats["errors"] += 1
+                stats["processed"] += 1
+                return
         else:
-            print(f"    [{h}] empty summary", flush=True)
+            summary = await generate_summary(client, memory["content"])
+            if not summary:
+                print(f"    [{h}] empty summary", flush=True)
+                stats["errors"] += 1
+                stats["processed"] += 1
+                return
+
+        embedding = await generate_embedding(client, summary)
+        ok = await patch_summary(client, content_hash, summary, embedding)
+        if ok:
+            completed.add(content_hash)
+            stats["success"] += 1
+        else:
+            print(f"    [{h}] patch failed", flush=True)
             stats["errors"] += 1
     except Exception as e:
         print(f"    [{h}] failed after retries: {e}", flush=True)
@@ -303,13 +317,14 @@ async def worker(
     client: httpx.AsyncClient,
     completed: set[str],
     stats: dict,
+    embeddings_only: bool = False,
 ):
     """Pull memories from queue and process until sentinel."""
     while True:
         memory = await queue.get()
         if memory is None:
             break
-        await process_memory(client, memory, completed, stats)
+        await process_memory(client, memory, completed, stats, embeddings_only)
         queue.task_done()
 
 
@@ -317,11 +332,22 @@ async def worker(
 
 
 async def main():
-    print("Backfill summaries (full regeneration)")
+    parser = argparse.ArgumentParser(description="Backfill memory summaries via Haiku")
+    parser.add_argument(
+        "--embeddings-only",
+        action="store_true",
+        help="Skip Haiku — only generate embeddings for existing summaries",
+    )
+    args = parser.parse_args()
+
+    mode = "embeddings only" if args.embeddings_only else "full (summary + embedding)"
+    print(f"Backfill summaries ({mode})")
     print(f"  qdrant:      {QDRANT_URL}/{QDRANT_COLLECTION}")
     print(f"  alaya:       {ALAYA_URL}")
-    print(f"  summary:     {SUMMARY_URL}")
-    print(f"  model:       {SUMMARY_MODEL}")
+    if not args.embeddings_only:
+        print(f"  summary:     {SUMMARY_URL}")
+        print(f"  model:       {SUMMARY_MODEL}")
+    print(f"  embedding:   {EMBEDDING_URL}")
     print(f"  concurrency: {CONCURRENCY}")
     print(f"  throttle:    {THROTTLE_DELAY}s")
     print()
@@ -357,7 +383,7 @@ async def main():
             queue.put_nowait(m)
 
         workers = [
-            asyncio.create_task(worker(queue, client, completed, stats))
+            asyncio.create_task(worker(queue, client, completed, stats, args.embeddings_only))
             for _ in range(CONCURRENCY)
         ]
 
