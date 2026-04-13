@@ -208,6 +208,14 @@ fn point_to_memory(point: &Value) -> Option<Memory> {
         provenance: payload
             .get("provenance")
             .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        summary_embedding: payload
+            .get("summary_embedding")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_f64().map(|f| f as f32))
+                    .collect()
+            }),
     })
 }
 
@@ -245,6 +253,9 @@ fn memory_to_payload(memory: &Memory) -> Value {
     }
     if let Some(ref p) = memory.provenance {
         payload["provenance"] = json!(p);
+    }
+    if let Some(ref se) = memory.summary_embedding {
+        payload["summary_embedding"] = json!(se);
     }
 
     payload
@@ -465,6 +476,9 @@ impl VectorStorage for QdrantClient {
         }
         if let Some(ref memory_type) = patch.memory_type {
             payload.insert("memory_type".into(), json!(memory_type));
+        }
+        if let Some(ref se) = patch.summary_embedding {
+            payload.insert("summary_embedding".into(), json!(se));
         }
 
         // Metadata merge: apply incoming keys, delete null keys
@@ -1241,6 +1255,7 @@ mod tests {
             emotional_valence: None,
             encoding_context: None,
             provenance: None,
+            summary_embedding: None,
         };
         let payload = memory_to_payload(&mem);
         assert_eq!(payload["content"], "test content");

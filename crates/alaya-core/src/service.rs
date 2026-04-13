@@ -299,6 +299,7 @@ impl MemoryService {
             emotional_valence: None,
             encoding_context: Some(enc_ctx),
             provenance: Some(prov),
+            summary_embedding: None,
         };
 
         // Store in vector DB
@@ -661,6 +662,15 @@ impl MemoryService {
                         let ctx_sim =
                             encoding_context::compute_context_similarity(stored_ctx, query_ctx);
                         score = encoding_context::apply_context_boost(score, ctx_sim, 0.1);
+                    }
+
+                    // Summary embedding boost — rewards memories whose distilled
+                    // meaning aligns with the query, independent of content noise.
+                    if let Some(ref summary_emb) = sm.memory.summary_embedding {
+                        let sim = hybrid_search::cosine_similarity(&query_embedding, summary_emb);
+                        if sim > 0.0 {
+                            score *= 1.0 + 0.1 * sim as f64;
+                        }
                     }
 
                     // Recency decay
@@ -1187,8 +1197,12 @@ impl MemoryService {
                 "memory_a_hash": pair.memory_a_hash,
                 "memory_b_hash": pair.memory_b_hash,
                 "confidence": pair.confidence,
-                "memory_a_content": a.map(|m| truncate(&m.content, 200)),
-                "memory_b_content": b.map(|m| truncate(&m.content, 200)),
+                "memory_a_content": a.map(|m| {
+                    m.summary.clone().unwrap_or_else(|| truncate(&m.content, 200))
+                }),
+                "memory_b_content": b.map(|m| {
+                    m.summary.clone().unwrap_or_else(|| truncate(&m.content, 200))
+                }),
                 "memory_a_superseded": a.and_then(|m| {
                     m.metadata.as_ref()?.get("superseded_by")
                 }).is_some(),
@@ -1388,9 +1402,17 @@ fn format_memory_result(memory: &Memory, score: f64, output: OutputMode) -> Valu
     match output {
         OutputMode::Full => {
             obj.insert("content".into(), serde_json::json!(memory.content));
+            if memory.summary.is_some() {
+                obj.insert("summary".into(), serde_json::json!(memory.summary));
+            }
         }
         OutputMode::Summary => {
-            obj.insert("summary".into(), serde_json::json!(memory.summary));
+            // Fallback to truncated content when summary is not yet available
+            let summary_val = match &memory.summary {
+                Some(s) => serde_json::json!(s),
+                None => serde_json::json!(truncate(&memory.content, 200)),
+            };
+            obj.insert("summary".into(), summary_val);
         }
         OutputMode::Both => {
             obj.insert("content".into(), serde_json::json!(memory.content));
@@ -1487,6 +1509,7 @@ mod tests {
             emotional_valence: None,
             encoding_context: None,
             provenance: None,
+            summary_embedding: None,
         }
     }
 
@@ -1939,6 +1962,7 @@ mod tests {
                 emotional_valence: None,
                 encoding_context: None,
                 provenance: None,
+                summary_embedding: None,
             }
         }
     }
@@ -2365,6 +2389,7 @@ mod tests {
                 emotional_valence: None,
                 encoding_context: None,
                 provenance: None,
+                summary_embedding: None,
             },
             score,
         }
