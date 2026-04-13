@@ -36,9 +36,11 @@ from tenacity import (
 
 ALAYA_URL = os.environ.get("ALAYA_URL", "http://10.43.61.94:3001")
 SUMMARY_URL = os.environ.get("SUMMARY_URL", "http://192.168.0.10:8082")
+EMBEDDING_URL = os.environ.get("EMBEDDING_URL", "http://10.43.242.167")
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://10.43.119.230:6333")
 QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "memories_arctic1024")
 SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "claude-haiku-4-5-20251001")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-l-v2.0")
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "5"))
 THROTTLE_DELAY = float(os.environ.get("THROTTLE_DELAY", "0.2"))
 PROGRESS_FILE = Path(os.environ.get("PROGRESS_FILE", "backfill_summaries_progress.json"))
@@ -197,17 +199,51 @@ async def generate_summary(client: httpx.AsyncClient, content: str) -> str | Non
 
 @retry(
     retry=retry_if_exception_type(RETRYABLE),
+    wait=wait_exponential(multiplier=1, min=2, max=15),
+    stop=stop_after_attempt(3),
+    reraise=True,
+)
+async def generate_embedding(client: httpx.AsyncClient, text: str) -> list[float] | None:
+    """Generate embedding via TEI (OpenAI-compatible endpoint)."""
+    resp = await client.post(
+        f"{EMBEDDING_URL}/v1/embeddings",
+        json={
+            "model": EMBEDDING_MODEL,
+            "input": [f"search_document: {text}"],
+            "encoding_format": "float",
+        },
+        timeout=30.0,
+    )
+    if resp.status_code >= 500 or resp.status_code == 429:
+        resp.raise_for_status()
+    if not resp.is_success:
+        return None
+    data = resp.json()
+    items = data.get("data", [])
+    if items:
+        return items[0].get("embedding")
+    return None
+
+
+@retry(
+    retry=retry_if_exception_type(RETRYABLE),
     wait=wait_exponential(multiplier=0.5, min=1, max=10),
     stop=stop_after_attempt(3),
     reraise=True,
 )
 async def patch_summary(
-    client: httpx.AsyncClient, content_hash: str, summary: str
+    client: httpx.AsyncClient,
+    content_hash: str,
+    summary: str,
+    summary_embedding: list[float] | None = None,
 ) -> bool:
-    """PATCH the summary back to alaya-server."""
+    """PATCH the summary + embedding back to alaya-server."""
+    payload: dict = {"summary": summary}
+    if summary_embedding is not None:
+        payload["summary_embedding"] = summary_embedding
     resp = await client.patch(
         f"{ALAYA_URL}/memories/{content_hash}",
-        json={"summary": summary},
+        json=payload,
         timeout=10.0,
     )
     if resp.status_code >= 500 or resp.status_code == 429:
@@ -232,7 +268,8 @@ async def process_memory(
     try:
         summary = await generate_summary(client, memory["content"])
         if summary:
-            ok = await patch_summary(client, content_hash, summary)
+            embedding = await generate_embedding(client, summary)
+            ok = await patch_summary(client, content_hash, summary, embedding)
             if ok:
                 completed.add(content_hash)
                 stats["success"] += 1
