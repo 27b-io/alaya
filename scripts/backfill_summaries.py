@@ -42,6 +42,8 @@ EMBEDDING_URL = os.environ.get("EMBEDDING_URL", "http://10.43.242.167")
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://10.43.119.230:6333")
 QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "memories_arctic1024")
 SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "claude-haiku-4-5-20251001")
+SUMMARY_MODEL_COMPLEX = os.environ.get("SUMMARY_MODEL_COMPLEX", "claude-sonnet-4-6")
+COMPLEXITY_THRESHOLD = int(os.environ.get("COMPLEXITY_THRESHOLD", "1500"))  # chars
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-l-v2.0")
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "5"))
 THROTTLE_DELAY = float(os.environ.get("THROTTLE_DELAY", "0.2"))
@@ -167,13 +169,14 @@ async def _scroll_request(client: httpx.AsyncClient, body: dict) -> httpx.Respon
     reraise=True,
 )
 async def generate_summary(client: httpx.AsyncClient, content: str) -> str | None:
-    """Call anthropic-lb to generate a summary."""
+    """Call anthropic-lb to generate a summary. Promotes to Sonnet for complex content."""
     truncated = content[:MAX_CONTENT_CHARS]
+    model = SUMMARY_MODEL_COMPLEX if len(content) > COMPLEXITY_THRESHOLD else SUMMARY_MODEL
 
     resp = await client.post(
         f"{SUMMARY_URL}/v1/messages",
         json={
-            "model": SUMMARY_MODEL,
+            "model": model,
             "max_tokens": 100,
             "system": SYSTEM_PROMPT,
             "messages": [{"role": "user", "content": truncated}],
@@ -346,7 +349,8 @@ async def main():
     print(f"  alaya:       {ALAYA_URL}")
     if not args.embeddings_only:
         print(f"  summary:     {SUMMARY_URL}")
-        print(f"  model:       {SUMMARY_MODEL}")
+        print(f"  model:       {SUMMARY_MODEL} (< {COMPLEXITY_THRESHOLD} chars)")
+        print(f"  model:       {SUMMARY_MODEL_COMPLEX} (>= {COMPLEXITY_THRESHOLD} chars)")
     print(f"  embedding:   {EMBEDDING_URL}")
     print(f"  concurrency: {CONCURRENCY}")
     print(f"  throttle:    {THROTTLE_DELAY}s")
