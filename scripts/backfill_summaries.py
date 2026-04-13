@@ -155,6 +155,10 @@ async def _scroll_request(client: httpx.AsyncClient, body: dict) -> httpx.Respon
         json=body,
         timeout=30.0,
     )
+    # 4xx = client error, fail fast (don't retry bad requests)
+    if 400 <= resp.status_code < 500:
+        raise RuntimeError(f"Qdrant scroll {resp.status_code}: {resp.text[:200]}")
+    # 5xx = server error, raise for tenacity retry
     resp.raise_for_status()
     return resp
 
@@ -289,6 +293,11 @@ async def process_memory(
                 return
 
         embedding = await generate_embedding(client, summary)
+        if embedding is None:
+            print(f"    [{h}] embedding failed, skipping", flush=True)
+            stats["errors"] += 1
+            stats["processed"] += 1
+            return
         ok = await patch_summary(client, content_hash, summary, embedding)
         if ok:
             completed.add(content_hash)
