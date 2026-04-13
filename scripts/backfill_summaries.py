@@ -8,14 +8,13 @@ alaya-server. Resumable via a progress file.
 Usage:
     pip install httpx tenacity
 
-    # Port-forward:
-    kubectl -n mcp port-forward svc/alaya-server 3099:3001 &
-    kubectl -n mcp port-forward svc/anthropic-lb 8082:8082 &
-    kubectl -n mcp port-forward svc/qdrant 6333:6333 &
+    # Run from the lab host (direct access to ClusterIPs):
+    python3 scripts/backfill_summaries.py
 
-    ALAYA_URL=http://localhost:3099 \
-    SUMMARY_URL=http://localhost:8082 \
-    QDRANT_URL=http://localhost:6333 \
+    # Override endpoints:
+    ALAYA_URL=http://10.43.61.94:3001 \
+    QDRANT_URL=http://10.43.119.230:6333 \
+    SUMMARY_URL=http://192.168.0.10:8082 \
     python3 scripts/backfill_summaries.py
 """
 
@@ -35,9 +34,9 @@ from tenacity import (
 
 # ─── Config ─────────────────────────────────────────────────────────────────
 
-ALAYA_URL = os.environ.get("ALAYA_URL", "http://localhost:3099")
-SUMMARY_URL = os.environ.get("SUMMARY_URL", "http://localhost:8082")
-QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
+ALAYA_URL = os.environ.get("ALAYA_URL", "http://10.43.61.94:3001")
+SUMMARY_URL = os.environ.get("SUMMARY_URL", "http://192.168.0.10:8082")
+QDRANT_URL = os.environ.get("QDRANT_URL", "http://10.43.119.230:6333")
 QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "memories_arctic1024")
 SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "claude-haiku-4-5-20251001")
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "5"))
@@ -50,18 +49,34 @@ SYSTEM_PROMPT = (
 )
 MAX_CONTENT_CHARS = 4000
 
+# Retryable exception types (network errors + mid-response resets)
+RETRYABLE = (
+    httpx.HTTPStatusError,
+    httpx.ConnectError,
+    httpx.ReadTimeout,
+    httpx.RemoteProtocolError,
+    httpx.WriteTimeout,
+    httpx.PoolTimeout,
+)
+
 # ─── Progress tracking ──────────────────────────────────────────────────────
 
 
 def load_progress() -> set[str]:
-    if PROGRESS_FILE.exists():
+    if not PROGRESS_FILE.exists():
+        return set()
+    try:
         data = json.loads(PROGRESS_FILE.read_text())
         return set(data.get("completed", []))
-    return set()
+    except (json.JSONDecodeError, ValueError):
+        print(f"  warning: corrupt progress file, starting fresh", flush=True)
+        return set()
 
 
 def save_progress(completed: set[str], total: int, errors: int):
-    PROGRESS_FILE.write_text(
+    """Atomic write: tmp file then rename."""
+    tmp = PROGRESS_FILE.with_suffix(".tmp")
+    tmp.write_text(
         json.dumps(
             {
                 "completed": sorted(completed),
@@ -73,9 +88,10 @@ def save_progress(completed: set[str], total: int, errors: int):
             indent=2,
         )
     )
+    tmp.rename(PROGRESS_FILE)
 
 
-# ─── Qdrant scroll (cursor-based, no re-scan) ──────────────────────────────
+# ─── Qdrant scroll (cursor-based, with retry) ──────────────────────────────
 
 
 async def scroll_all_qdrant(client: httpx.AsyncClient) -> list[dict]:
@@ -92,12 +108,7 @@ async def scroll_all_qdrant(client: httpx.AsyncClient) -> list[dict]:
         if offset is not None:
             body["offset"] = offset
 
-        resp = await client.post(
-            f"{QDRANT_URL}/collections/{QDRANT_COLLECTION}/points/scroll",
-            json=body,
-            timeout=30.0,
-        )
-        resp.raise_for_status()
+        resp = await _scroll_request(client, body)
         data = resp.json()
 
         points = data.get("result", {}).get("points", [])
@@ -112,7 +123,6 @@ async def scroll_all_qdrant(client: httpx.AsyncClient) -> list[dict]:
                 memories.append({
                     "content": content,
                     "content_hash": content_hash,
-                    "summary": payload.get("summary"),
                 })
 
         next_offset = data.get("result", {}).get("next_page_offset")
@@ -126,11 +136,27 @@ async def scroll_all_qdrant(client: httpx.AsyncClient) -> list[dict]:
     return memories
 
 
+@retry(
+    retry=retry_if_exception_type(RETRYABLE),
+    wait=wait_exponential(multiplier=1, min=2, max=15),
+    stop=stop_after_attempt(5),
+    reraise=True,
+)
+async def _scroll_request(client: httpx.AsyncClient, body: dict) -> httpx.Response:
+    resp = await client.post(
+        f"{QDRANT_URL}/collections/{QDRANT_COLLECTION}/points/scroll",
+        json=body,
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+    return resp
+
+
 # ─── API calls with retries ────────────────────────────────────────────────
 
 
 @retry(
-    retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.ConnectError, httpx.ReadTimeout)),
+    retry=retry_if_exception_type(RETRYABLE),
     wait=wait_exponential(multiplier=1, min=2, max=30),
     stop=stop_after_attempt(5),
     reraise=True,
@@ -154,7 +180,8 @@ async def generate_summary(client: httpx.AsyncClient, content: str) -> str | Non
         timeout=30.0,
     )
 
-    if resp.status_code in (429, 529):
+    # Retry all 5xx + 429
+    if resp.status_code >= 500 or resp.status_code == 429:
         resp.raise_for_status()
 
     if not resp.is_success:
@@ -169,7 +196,7 @@ async def generate_summary(client: httpx.AsyncClient, content: str) -> str | Non
 
 
 @retry(
-    retry=retry_if_exception_type((httpx.ConnectError, httpx.ReadTimeout)),
+    retry=retry_if_exception_type(RETRYABLE),
     wait=wait_exponential(multiplier=0.5, min=1, max=10),
     stop=stop_after_attempt(3),
     reraise=True,
@@ -186,7 +213,7 @@ async def patch_summary(
     return resp.status_code == 200
 
 
-# ─── Worker with throttling ────────────────────────────────────────────────
+# ─── Worker ─────────────────────────────────────────────────────────────────
 
 
 async def process_memory(
@@ -239,12 +266,12 @@ async def process_memory(
 
 async def main():
     print("Backfill summaries (full regeneration)")
-    print(f"  qdrant:     {QDRANT_URL}/{QDRANT_COLLECTION}")
-    print(f"  alaya:      {ALAYA_URL}")
-    print(f"  summary:    {SUMMARY_URL}")
-    print(f"  model:      {SUMMARY_MODEL}")
+    print(f"  qdrant:      {QDRANT_URL}/{QDRANT_COLLECTION}")
+    print(f"  alaya:       {ALAYA_URL}")
+    print(f"  summary:     {SUMMARY_URL}")
+    print(f"  model:       {SUMMARY_MODEL}")
     print(f"  concurrency: {CONCURRENCY}")
-    print(f"  throttle:   {THROTTLE_DELAY}s")
+    print(f"  throttle:    {THROTTLE_DELAY}s")
     print()
 
     completed = load_progress()
