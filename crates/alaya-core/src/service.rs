@@ -146,6 +146,35 @@ const TAG_CACHE_TTL: f64 = 60.0;
 /// batches of 64, keeping the total under ~10-20s instead of ~40s at 500.
 const MAX_DEDUP_SCAN: usize = 200;
 
+// ─── Search ranking weights ────────────────────────────────────────────────
+//
+// Multiplicative boosts applied to each result after RRF fusion.
+// Each weight controls the maximum influence of that signal:
+//   score *= 1.0 + WEIGHT * signal_value
+// where signal_value is in [0.0, 1.0].
+
+/// Salience: emotional weight + access frequency + explicit importance.
+const BOOST_SALIENCE: f64 = 0.15;
+
+/// Spaced repetition: rewards memories accessed at healthy intervals.
+const BOOST_SPACING: f64 = 0.10;
+
+/// Encoding context: similarity between storage context and query context.
+const BOOST_CONTEXT: f64 = 0.10;
+
+/// Summary embedding: cosine similarity between query and distilled summary.
+/// Higher than content-level signals because summaries are query-shaped.
+const BOOST_SUMMARY: f64 = 0.15;
+
+/// Recency decay lambda: exponential half-life ~70 days.
+const RECENCY_DECAY_LAMBDA: f64 = 0.01;
+
+/// Graph spreading activation: multi-hop associative relevance.
+const BOOST_GRAPH_ACTIVATION: f64 = 0.10;
+
+/// Hebbian co-access: memories frequently retrieved together.
+const BOOST_HEBBIAN: f64 = 0.10;
+
 pub struct MemoryService {
     pub vectors: Box<dyn VectorStorage>,
     pub embeddings: Box<dyn EmbeddingProvider>,
@@ -648,12 +677,16 @@ impl MemoryService {
 
                 // Salience boost
                 if let Some(sm) = memory_map.get(hash) {
-                    score = salience::apply_salience_boost(score, sm.memory.salience_score, 0.15);
+                    score = salience::apply_salience_boost(
+                        score,
+                        sm.memory.salience_score,
+                        BOOST_SALIENCE,
+                    );
 
                     // Spacing boost
                     let sq =
                         spaced_repetition::compute_spacing_quality(&sm.memory.access_timestamps);
-                    score = spaced_repetition::apply_spacing_boost(score, sq, 0.1);
+                    score = spaced_repetition::apply_spacing_boost(score, sq, BOOST_SPACING);
 
                     // Encoding context boost
                     if let (Some(stored_ctx), Some(query_ctx)) =
@@ -661,7 +694,8 @@ impl MemoryService {
                     {
                         let ctx_sim =
                             encoding_context::compute_context_similarity(stored_ctx, query_ctx);
-                        score = encoding_context::apply_context_boost(score, ctx_sim, 0.1);
+                        score =
+                            encoding_context::apply_context_boost(score, ctx_sim, BOOST_CONTEXT);
                     }
 
                     // Summary embedding boost — rewards memories whose distilled
@@ -669,21 +703,25 @@ impl MemoryService {
                     if let Some(ref summary_emb) = sm.memory.summary_embedding {
                         let sim = hybrid_search::cosine_similarity(&query_embedding, summary_emb);
                         if sim > 0.0 {
-                            score *= 1.0 + 0.1 * sim as f64;
+                            score *= 1.0 + BOOST_SUMMARY * sim as f64;
                         }
                     }
 
                     // Recency decay
-                    score =
-                        hybrid_search::apply_recency_decay(score, sm.memory.created_at, now, 0.01);
+                    score = hybrid_search::apply_recency_decay(
+                        score,
+                        sm.memory.created_at,
+                        now,
+                        RECENCY_DECAY_LAMBDA,
+                    );
                 }
 
                 // Graph boosts
                 if let Some(&activation) = spreading.get(hash) {
-                    score *= 1.0 + 0.1 * activation;
+                    score *= 1.0 + BOOST_GRAPH_ACTIVATION * activation;
                 }
                 if let Some(&boost) = hebbian_boosts.get(hash) {
-                    score *= 1.0 + 0.1 * boost;
+                    score *= 1.0 + BOOST_HEBBIAN * boost;
                 }
 
                 // Cap at 1.0
