@@ -28,6 +28,10 @@ pub struct Memory {
     pub encoding_context: Option<HashMap<String, serde_json::Value>>,
     #[serde(default)]
     pub provenance: Option<HashMap<String, serde_json::Value>>,
+    /// Pre-computed embedding of the summary text, used for search boost.
+    /// Stored in Qdrant payload, never exposed in API responses.
+    #[serde(default, skip_serializing)]
+    pub summary_embedding: Option<Vec<f32>>,
 }
 
 /// A memory with a similarity/relevance score from search.
@@ -82,6 +86,9 @@ pub struct PatchMemoryRequest {
     /// Full replacement of memory_type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_type: Option<String>,
+    /// Pre-computed embedding of the summary text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_embedding: Option<Vec<f32>>,
 }
 
 /// Valid memory types matching the MCP tool schema.
@@ -106,6 +113,7 @@ impl PatchMemoryRequest {
             && self.metadata.is_none()
             && self.summary.is_none()
             && self.memory_type.is_none()
+            && self.summary_embedding.is_none()
     }
 
     /// Returns a comma-separated list of fields being patched (for logging).
@@ -122,6 +130,9 @@ impl PatchMemoryRequest {
         }
         if self.memory_type.is_some() {
             fields.push("memory_type");
+        }
+        if self.summary_embedding.is_some() {
+            fields.push("summary_embedding");
         }
         fields.join(",")
     }
@@ -274,6 +285,7 @@ mod tests {
             memory_type: Some("decision".into()),
             summary: Some("short".into()),
             metadata: None,
+            summary_embedding: None,
         };
         assert!(p.validate().is_ok());
     }
