@@ -155,10 +155,10 @@ async def _scroll_request(client: httpx.AsyncClient, body: dict) -> httpx.Respon
         json=body,
         timeout=30.0,
     )
-    # 4xx = client error, fail fast (don't retry bad requests)
-    if 400 <= resp.status_code < 500:
+    # 429 = rate limited, retry via tenacity
+    # Other 4xx = client error, fail fast
+    if 400 <= resp.status_code < 500 and resp.status_code != 429:
         raise RuntimeError(f"Qdrant scroll {resp.status_code}: {resp.text[:200]}")
-    # 5xx = server error, raise for tenacity retry
     resp.raise_for_status()
     return resp
 
@@ -321,7 +321,7 @@ async def process_memory(
             f"rate={rate:.1f}/s eta={eta / 60:.0f}m",
             flush=True,
         )
-        save_progress(completed, stats["total"], stats["errors"])
+        save_progress(completed, stats["total_memories"], stats["errors"])
 
 
 async def worker(
@@ -350,6 +350,11 @@ async def main():
         action="store_true",
         help="Skip Haiku — only generate embeddings for existing summaries",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Ignore progress file — re-summarise and re-embed everything",
+    )
     args = parser.parse_args()
 
     mode = "embeddings only" if args.embeddings_only else "full (summary + embedding)"
@@ -365,8 +370,10 @@ async def main():
     print(f"  throttle:    {THROTTLE_DELAY}s")
     print()
 
-    completed = load_progress()
-    if completed:
+    completed = set() if args.force else load_progress()
+    if args.force:
+        print("Force mode — ignoring progress file")
+    elif completed:
         print(f"Resuming — {len(completed)} already done")
 
     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -387,6 +394,7 @@ async def main():
             "success": 0,
             "errors": 0,
             "total": len(to_process),
+            "total_memories": len(memories),
             "start": time.time(),
         }
 
@@ -409,7 +417,7 @@ async def main():
         await asyncio.gather(*workers)
 
         elapsed = time.time() - stats["start"]
-        save_progress(completed, stats["total"], stats["errors"])
+        save_progress(completed, stats["total_memories"], stats["errors"])
 
         print()
         print(f"Done in {elapsed / 60:.1f}m")
