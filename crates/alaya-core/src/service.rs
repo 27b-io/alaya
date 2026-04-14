@@ -621,7 +621,7 @@ impl MemoryService {
         }
 
         // Stage 3: Fuse (RRF) — pure computation
-        let fused = {
+        let mut fused = {
             let _span = tracing::info_span!(
                 "rrf_fuse",
                 vectors = vector_results.len(),
@@ -670,6 +670,82 @@ impl MemoryService {
             (s.unwrap_or_default(), h.unwrap_or_default())
         };
 
+        // Stage 4b: Graph injection — activated neighbors that are NOT already
+        // in the fused results get fetched from Qdrant and spliced into the
+        // candidate pool. This lets Hebbian-connected memories surface even
+        // when their cosine similarity to the query is low.
+        let injected_neighbors: Vec<ScoredMemory> = if !spreading.is_empty() {
+            let _span = tracing::info_span!("graph_inject").entered();
+            let fused_hashes: std::collections::HashSet<&str> =
+                fused.iter().map(|(h, _, _)| h.as_str()).collect();
+
+            // Top-10 activated neighbors not already in results
+            let mut inject_candidates: Vec<(&str, f64)> = spreading
+                .iter()
+                .filter(|(h, _)| !fused_hashes.contains(h.as_str()))
+                .map(|(h, s)| (h.as_str(), *s))
+                .collect();
+            inject_candidates
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            inject_candidates.truncate(10);
+
+            if inject_candidates.is_empty() {
+                Vec::new()
+            } else {
+                let neighbor_hashes: Vec<&str> =
+                    inject_candidates.iter().map(|(h, _)| *h).collect();
+                let activation_map: HashMap<&str, f64> = inject_candidates.into_iter().collect();
+
+                // Use the minimum existing display score as a floor so
+                // injected memories don't get filtered by min_similarity.
+                let min_existing = fused
+                    .iter()
+                    .map(|(_, _, s)| *s)
+                    .fold(f64::INFINITY, f64::min)
+                    .max(0.1);
+
+                match self.vectors.get_batch(&neighbor_hashes).await {
+                    Ok(memories) => {
+                        let mut result = Vec::with_capacity(memories.len());
+                        for mem in memories {
+                            let activation = activation_map
+                                .get(mem.content_hash.as_str())
+                                .copied()
+                                .unwrap_or(0.0);
+                            let display_score = min_existing.max(activation);
+                            result.push(ScoredMemory {
+                                memory: mem,
+                                score: display_score,
+                            });
+                        }
+                        tracing::debug!(
+                            injected = result.len(),
+                            "graph injection: added neighbors from spreading activation"
+                        );
+                        result
+                    }
+                    Err(e) => {
+                        tracing::warn!("graph injection fetch failed (non-fatal): {e}");
+                        Vec::new()
+                    }
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Extend memory_map and fused with injected neighbors
+        for sm in &injected_neighbors {
+            memory_map
+                .entry(sm.memory.content_hash.clone())
+                .or_insert(sm);
+            fused.push((
+                sm.memory.content_hash.clone(),
+                0.0, // no RRF rank
+                sm.score,
+            ));
+        }
+
         let mut scored_results: Vec<(String, f64)> = fused
             .iter()
             .map(|(hash, _rrf, display_score)| {
@@ -716,7 +792,9 @@ impl MemoryService {
                     );
                 }
 
-                // Graph boosts
+                // Graph boosts — spreading activation now correctly applies to
+                // both injected neighbors AND fused results at positions 6+
+                // (which may be HEBBIAN neighbors of the top-5 seeds).
                 if let Some(&activation) = spreading.get(hash) {
                     score *= 1.0 + BOOST_GRAPH_ACTIVATION * activation;
                 }
@@ -2688,5 +2766,276 @@ mod tests {
         let json = r#"{"content":"x","tags":"x, y, x"}"#;
         let p: StoreParams = serde_json::from_str(json).unwrap();
         assert_eq!(p.tags, Some(vec!["x".into(), "y".into()]));
+    }
+
+    // ─── Spreading activation injection tests ────────────────────────────
+
+    /// Mock VectorStorage that returns pre-configured vector search results
+    /// and can serve specific memories from get_batch (for graph injection).
+    struct MockVectorsWithInjection {
+        search_results: Vec<ScoredMemory>,
+        injectable_memories: HashMap<String, Memory>,
+    }
+
+    #[async_trait(?Send)]
+    impl VectorStorage for MockVectorsWithInjection {
+        async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+            Ok((true, "mock".into()))
+        }
+        async fn get_by_hash(&self, h: &str) -> Result<Option<Memory>> {
+            Ok(self.injectable_memories.get(h).cloned())
+        }
+        async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>> {
+            Ok(hashes
+                .iter()
+                .filter_map(|h| self.injectable_memories.get(*h).cloned())
+                .collect())
+        }
+        async fn delete(&self, _h: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn update_metadata(&self, _h: &str, _u: MetadataUpdate) -> Result<()> {
+            Ok(())
+        }
+        async fn patch_memory(&self, _h: &str, _p: &PatchMemoryRequest) -> Result<Memory> {
+            Ok(dummy_memory())
+        }
+        async fn search_by_vector(
+            &self,
+            _e: &[f32],
+            _l: usize,
+            _f: Option<PayloadFilter>,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(self.search_results.clone())
+        }
+        async fn search_by_tags(
+            &self,
+            _t: &[&str],
+            _m: bool,
+            _l: usize,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(vec![])
+        }
+        async fn search_similar_tags(&self, _e: &[f32], _l: usize) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
+            Ok(())
+        }
+        async fn get_all(&self, _l: usize, _o: Option<&str>) -> Result<ScrollResult> {
+            Ok(ScrollResult {
+                memories: vec![],
+                next_offset: None,
+            })
+        }
+        async fn get_recent(&self, _l: usize, _o: usize, _t: Option<&str>) -> Result<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn count(&self) -> Result<usize> {
+            Ok(100)
+        }
+        async fn get_all_tags(&self) -> Result<Vec<String>> {
+            Ok(vec!["stability".into()])
+        }
+        async fn increment_access_count(&self, _h: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            Ok(HealthStatus {
+                status: "ok".into(),
+                backend: "mock".into(),
+                details: None,
+            })
+        }
+    }
+
+    /// Mock graph that returns pre-configured spreading activation results.
+    struct MockGraphWithActivation {
+        activation: HashMap<String, f64>,
+    }
+
+    #[async_trait(?Send)]
+    impl GraphService for MockGraphWithActivation {
+        async fn ensure_node(&self, _h: &str, _t: f64) -> Result<()> {
+            Ok(())
+        }
+        async fn delete_node(&self, _h: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn create_typed_edge(
+            &self,
+            _s: &str,
+            _d: &str,
+            _r: UserRelationType,
+            _m: EdgeMeta,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+        async fn get_typed_edges(
+            &self,
+            _h: &str,
+            _r: Option<UserRelationType>,
+            _d: Direction,
+            _l: usize,
+        ) -> Result<Vec<Edge>> {
+            Ok(vec![])
+        }
+        async fn delete_typed_edge(
+            &self,
+            _s: &str,
+            _d: &str,
+            _r: UserRelationType,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+        async fn create_system_edge(
+            &self,
+            _s: &str,
+            _d: &str,
+            _r: SystemRelationType,
+            _t: f64,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+        async fn get_all_contradictions(&self, _l: usize) -> Result<Vec<Contradiction>> {
+            Ok(vec![])
+        }
+        async fn get_contradictions_for_hashes(
+            &self,
+            _h: &[&str],
+        ) -> Result<HashMap<String, Vec<ContradictionRef>>> {
+            Ok(HashMap::new())
+        }
+        async fn get_neighbors(
+            &self,
+            _h: &str,
+            _m: u8,
+            _w: f64,
+            _l: usize,
+        ) -> Result<Vec<Neighbor>> {
+            Ok(vec![])
+        }
+        async fn spreading_activation(
+            &self,
+            _s: &[&str],
+            _m: u8,
+            _d: f64,
+            _a: f64,
+            _l: usize,
+        ) -> Result<HashMap<String, f64>> {
+            Ok(self.activation.clone())
+        }
+        async fn hebbian_boosts_within(&self, _h: &[&str]) -> Result<HashMap<String, f64>> {
+            Ok(HashMap::new())
+        }
+        async fn get_stats(&self) -> Result<GraphStats> {
+            Ok(GraphStats {
+                graph_name: "mock".into(),
+                node_count: 0,
+                edge_count: 0,
+                hebbian_edge_count: 0,
+                typed_edge_counts: HashMap::new(),
+                status: "ok".into(),
+            })
+        }
+    }
+
+    fn make_scored_memory(hash: &str, content: &str, score: f64) -> ScoredMemory {
+        ScoredMemory {
+            memory: Memory {
+                content: content.into(),
+                content_hash: hash.into(),
+                tags: vec!["stability".into()],
+                memory_type: "decision".into(),
+                metadata: None,
+                created_at: 1_000_000.0,
+                updated_at: 1_000_000.0,
+                embedding: None,
+                summary: None,
+                salience_score: 0.3,
+                access_count: 5,
+                access_timestamps: vec![],
+                emotional_valence: None,
+                encoding_context: None,
+                provenance: None,
+                summary_embedding: None,
+            },
+            score,
+        }
+    }
+
+    /// Spreading activation returns neighbor hashes that should be injected
+    /// into search results. This test verifies that graph-activated neighbors
+    /// appear in the final results even though they weren't in the initial
+    /// vector search.
+    ///
+    /// Bug: spreading_activation() returns {neighbor_hash: activation} but
+    /// the scoring loop looks up seed hashes (which are excluded). The
+    /// neighbor is never injected into the result set.
+    #[tokio::test(flavor = "current_thread")]
+    async fn spreading_activation_injects_neighbor_into_results() {
+        let seed_hash = "a".repeat(64);
+        let neighbor_hash = "b".repeat(64);
+
+        // Seed memory returned by vector search
+        let seed = make_scored_memory(&seed_hash, "VictoriaMetrics OOM incident", 0.6);
+
+        // Neighbor memory exists in Qdrant but was not returned by vector search
+        let neighbor = make_scored_memory(&neighbor_hash, "dm-cache writeback fix", 0.0);
+
+        let mut injectable = HashMap::new();
+        injectable.insert(neighbor_hash.clone(), neighbor.memory.clone());
+
+        // Spreading activation returns the neighbor with high activation
+        let mut activation = HashMap::new();
+        activation.insert(neighbor_hash.clone(), 0.8);
+
+        let svc = MemoryService::new(
+            Box::new(MockVectorsWithInjection {
+                search_results: vec![seed],
+                injectable_memories: injectable,
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraphWithActivation { activation }),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        );
+
+        let params = SearchParams {
+            query: "stability enhancements lab".into(),
+            mode: SearchMode::Hybrid,
+            page: 1,
+            page_size: 10,
+            tags: None,
+            match_all: false,
+            k: 10,
+            min_similarity: None,
+            memory_type: None,
+            encoding_context: None,
+            include_superseded: false,
+            min_trust_score: None,
+            output: OutputMode::Full,
+        };
+
+        let result = svc.search(params).await.expect("search should succeed");
+        let results = result["results"]
+            .as_array()
+            .expect("results should be array");
+
+        // The neighbor should appear in results because spreading activation
+        // identified it as strongly connected to the seed.
+        let result_hashes: Vec<&str> = results
+            .iter()
+            .filter_map(|r| r["content_hash"].as_str())
+            .collect();
+
+        assert!(
+            result_hashes.contains(&neighbor_hash.as_str()),
+            "Graph-activated neighbor should be injected into search results.\n\
+             Expected neighbor hash {} to be in results, but got: {:?}",
+            &neighbor_hash,
+            result_hashes,
+        );
     }
 }
