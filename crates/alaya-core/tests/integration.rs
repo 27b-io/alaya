@@ -76,6 +76,7 @@ async fn store_and_retrieve() {
         })
         .await
         .expect("store_memory should succeed");
+    let (result, _enrichment) = result;
 
     assert_eq!(result["success"], true);
     let hash = result["content_hash"].as_str().unwrap();
@@ -129,7 +130,7 @@ async fn search_hybrid() {
             })
             .await
             .expect("store should succeed");
-        stored_hashes.push(r["content_hash"].as_str().unwrap().to_string());
+        stored_hashes.push(r.0["content_hash"].as_str().unwrap().to_string());
     }
 
     // Search for Rust-related content
@@ -193,7 +194,7 @@ async fn dedup_threshold_skips_duplicate() {
         .await
         .expect("first store should succeed");
 
-    let hash1 = r1["content_hash"].as_str().unwrap().to_string();
+    let hash1 = r1.0["content_hash"].as_str().unwrap().to_string();
 
     // Store near-duplicate with dedup threshold
     let r2 = svc
@@ -211,15 +212,15 @@ async fn dedup_threshold_skips_duplicate() {
 
     // Should be flagged as duplicate
     assert_eq!(
-        r2.get("duplicate").and_then(|v| v.as_bool()),
+        r2.0.get("duplicate").and_then(|v| v.as_bool()),
         Some(true),
         "near-duplicate should be detected: {:?}",
-        r2
+        r2.0
     );
 
     // Clean up
     let _ = svc.delete_memory(&hash1).await;
-    if let Some(hash2) = r2.get("content_hash").and_then(|v| v.as_str()) {
+    if let Some(hash2) = r2.0.get("content_hash").and_then(|v| v.as_str()) {
         let _ = svc.delete_memory(hash2).await;
     }
 }
@@ -246,7 +247,7 @@ async fn search_by_tag() {
         .await
         .expect("store should succeed");
 
-    let hash = r["content_hash"].as_str().unwrap().to_string();
+    let hash = r.0["content_hash"].as_str().unwrap().to_string();
 
     let result = svc
         .search(SearchParams {

@@ -393,7 +393,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 let span = tracing::info_span!(parent: &ps, "store",
                     content_len, %mem_type);
                 let result = match svc.store_memory(params).instrument(span).await {
-                    Ok(r) => {
+                    Ok((r, enrichment)) => {
                         let hash = r
                             .get("content_hash")
                             .and_then(|v| v.as_str())
@@ -416,7 +416,15 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                             "ok"
                         );
 
-                        // Fire-and-forget: generate summary in background
+                        // Fire-and-forget: enrichment (tags, graph, interference)
+                        if let Some(e) = enrichment {
+                            let svc = svc.clone();
+                            tokio::task::spawn_local(async move {
+                                svc.enrich_stored_memory(e).await;
+                            });
+                        }
+
+                        // Fire-and-forget: summary generation
                         if let Some(content) = content_for_summary
                             && !skipped
                             && let Some(full_hash) = r.get("content_hash").and_then(|v| v.as_str())
@@ -445,6 +453,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 let tag_count = params.tags.as_ref().map(|t| t.len()).unwrap_or(0);
                 let mem_type = params.memory_type.clone().unwrap_or_default();
                 let span = tracing::info_span!(parent: &ps, "search", %mode);
+                let is_hybrid = mode == "hybrid";
                 let result = match svc.search(params).instrument(span).await {
                     Ok(r) => {
                         let n = result_count(&r);
@@ -462,6 +471,31 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                             elapsed_ms = ms(start),
                             "ok"
                         );
+
+                        // Fire-and-forget: enrich search results (access counts + Hebbian)
+                        if is_hybrid
+                            && let Some(results) = r.get("results").and_then(|v| v.as_array())
+                        {
+                            let hashes: Vec<String> = results
+                                .iter()
+                                .filter_map(|v| {
+                                    v.get("content_hash")
+                                        .and_then(|h| h.as_str())
+                                        .map(|s| s.to_string())
+                                })
+                                .collect();
+                            if !hashes.is_empty() {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs_f64();
+                                let svc = svc.clone();
+                                tokio::task::spawn_local(async move {
+                                    svc.enrich_search_results(&hashes, now).await;
+                                });
+                            }
+                        }
+
                         r
                     }
                     Err(e) => {

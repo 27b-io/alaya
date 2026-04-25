@@ -137,6 +137,16 @@ pub struct StoreParams {
     pub dedup_threshold: Option<f64>,
 }
 
+/// Enrichment payload returned by `store_memory` for fire-and-forget
+/// background work (tag embedding, graph node, interference detection).
+pub struct StoreEnrichment {
+    pub tags: Vec<String>,
+    pub content_hash: String,
+    pub content: String,
+    pub embedding: Vec<f32>,
+    pub now: f64,
+}
+
 /// Relation action parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelationParams {
@@ -249,7 +259,10 @@ impl MemoryService {
     // ─── Tool 1: store_memory ───────────────────────────────────────────
 
     #[tracing::instrument(skip(self, params), fields(content_len = params.content.len()))]
-    pub async fn store_memory(&self, params: StoreParams) -> Result<HashMap<String, Value>> {
+    pub async fn store_memory(
+        &self,
+        params: StoreParams,
+    ) -> Result<(HashMap<String, Value>, Option<StoreEnrichment>)> {
         if params.content.is_empty() {
             return Err(AlayaError::Validation("content cannot be empty".into()));
         }
@@ -278,6 +291,24 @@ impl MemoryService {
 
         // Capture encoding context
         let enc_ctx = encoding_context::capture_encoding_context(&tags, None, now);
+
+        // Fast-path: if dedup is requested and exact hash already exists, skip
+        // the ~180ms embedding entirely.
+        if params.dedup_threshold.is_some()
+            && self.vectors.get_by_hash(&content_hash).await?.is_some()
+        {
+            let mut result = HashMap::new();
+            result.insert("success".into(), serde_json::json!(true));
+            result.insert("duplicate".into(), serde_json::json!(true));
+            result.insert("existing_hash".into(), serde_json::json!(content_hash));
+            result.insert("similarity".into(), serde_json::json!(1.0));
+            result.insert("content_hash".into(), serde_json::json!(content_hash));
+            result.insert(
+                "message".into(),
+                serde_json::json!("Exact duplicate detected, storage skipped"),
+            );
+            return Ok((result, None));
+        }
 
         // Generate embedding
         let embedding = {
@@ -319,7 +350,7 @@ impl MemoryService {
                     "message".into(),
                     serde_json::json!("Duplicate detected, storage skipped"),
                 );
-                return Ok(result);
+                return Ok((result, None));
             }
         }
 
@@ -346,114 +377,12 @@ impl MemoryService {
         // Store in vector DB
         let (created, _) = self.vectors.store(&memory).await?;
 
-        // Invalidate tag cache — new tags should appear in keyword extraction immediately
+        // Invalidate tag cache immediately so keyword extraction picks up new tags
         if !tags.is_empty() {
             *self.tag_cache.borrow_mut() = None;
-
-            // Index new tags into the tag embedding collection (non-fatal).
-            // Uses the same embedding we'd generate for any passage — tags are
-            // short text, but the embedding model handles them fine.
-            let tag_strs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
-            match self
-                .embeddings
-                .embed_batch(&tag_strs, PromptName::Passage)
-                .await
-            {
-                Ok(tag_embeddings) if tag_embeddings.len() == tags.len() => {
-                    let pairs: Vec<(&str, Vec<f32>)> = tag_strs
-                        .iter()
-                        .zip(tag_embeddings)
-                        .map(|(t, e)| (*t, e))
-                        .collect();
-                    if let Err(e) = self.vectors.upsert_tags(&pairs).await {
-                        tracing::warn!("tag index upsert failed (non-fatal): {e}");
-                    }
-                }
-                Ok(_) => {
-                    tracing::warn!("tag embedding batch size mismatch (non-fatal)");
-                }
-                Err(e) => {
-                    tracing::warn!("tag embedding failed (non-fatal): {e}");
-                }
-            }
         }
 
-        // Create graph node (non-fatal)
-        if let Err(e) = self.graph.ensure_node(&content_hash, now).await {
-            tracing::warn!("graph ensure_node failed (non-fatal): {e}");
-        }
-
-        // Interference detection: search for similar content
-        let mut contradiction_signals = Vec::new();
-        let interference_filter = PayloadFilter {
-            exclude_superseded: true,
-            ..Default::default()
-        };
-        if let Ok(similar) = self
-            .vectors
-            .search_by_vector(&embedding, 10, Some(interference_filter))
-            .await
-        {
-            let mut edges_to_create: Vec<(String, String, UserRelationType, EdgeMeta)> = Vec::new();
-
-            for scored in &similar {
-                if scored.memory.content_hash == content_hash {
-                    continue;
-                }
-                if scored.score < 0.7 {
-                    continue;
-                }
-
-                let signals = interference::detect_contradiction_signals(
-                    &params.content,
-                    &scored.memory.content,
-                    &scored.memory.content_hash,
-                    scored.score,
-                );
-
-                for signal in &signals {
-                    edges_to_create.push((
-                        content_hash.clone(),
-                        signal.existing_hash.clone(),
-                        UserRelationType::Contradicts,
-                        EdgeMeta {
-                            created_at: Some(now),
-                            confidence: Some(signal.confidence),
-                        },
-                    ));
-                }
-
-                contradiction_signals.extend(signals);
-            }
-
-            // Cross-reference detection (lower threshold)
-            for scored in &similar {
-                if scored.memory.content_hash == content_hash {
-                    continue;
-                }
-                if scored.score < 0.4 || scored.score >= 0.7 {
-                    continue; // Only create RELATES_TO for moderate similarity
-                }
-
-                edges_to_create.push((
-                    content_hash.clone(),
-                    scored.memory.content_hash.clone(),
-                    UserRelationType::RelatesTo,
-                    EdgeMeta {
-                        created_at: Some(now),
-                        confidence: None,
-                    },
-                ));
-            }
-
-            // Batch-create all interference edges in a single round-trip
-            if !edges_to_create.is_empty()
-                && let Err(e) = self.graph.create_typed_edges_batch(&edges_to_create).await
-            {
-                tracing::warn!("failed to batch-create interference edges: {e}");
-            }
-        }
-
+        // Build result — return to caller without waiting for enrichment
         let mut result = HashMap::new();
         result.insert("success".into(), serde_json::json!(true));
         result.insert("content_hash".into(), serde_json::json!(content_hash));
@@ -468,28 +397,129 @@ impl MemoryService {
             }),
         );
         if !tags.is_empty() {
-            result.insert("tags".into(), serde_json::json!(tags));
+            result.insert("tags".into(), serde_json::json!(tags.clone()));
         }
 
-        if !contradiction_signals.is_empty() {
-            let interference_data: Vec<Value> = contradiction_signals
-                .iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "existing_hash": s.existing_hash,
-                        "signal_type": format!("{:?}", s.signal_type),
-                        "confidence": s.confidence,
-                        "detail": s.detail,
+        // Package enrichment work for fire-and-forget execution by the caller
+        let enrichment = StoreEnrichment {
+            tags,
+            content_hash,
+            content: params.content,
+            embedding,
+            now,
+        };
+
+        Ok((result, Some(enrichment)))
+    }
+
+    /// Background enrichment after store: tag embedding/upsert, graph node
+    /// creation, and interference detection. All operations are non-fatal.
+    pub async fn enrich_stored_memory(&self, e: StoreEnrichment) {
+        // Tag embedding + upsert
+        if !e.tags.is_empty() {
+            let tag_strs: Vec<&str> = e.tags.iter().map(|s| s.as_str()).collect();
+            match self
+                .embeddings
+                .embed_batch(&tag_strs, PromptName::Passage)
+                .await
+            {
+                Ok(tag_embeddings) if tag_embeddings.len() == e.tags.len() => {
+                    let pairs: Vec<(&str, Vec<f32>)> = tag_strs
+                        .iter()
+                        .zip(tag_embeddings)
+                        .map(|(t, emb)| (*t, emb))
+                        .collect();
+                    if let Err(err) = self.vectors.upsert_tags(&pairs).await {
+                        tracing::warn!("tag index upsert failed (non-fatal): {err}");
+                    }
+                }
+                Ok(_) => tracing::warn!("tag embedding batch size mismatch (non-fatal)"),
+                Err(err) => tracing::warn!("tag embedding failed (non-fatal): {err}"),
+            }
+        }
+
+        // Graph node
+        if let Err(err) = self.graph.ensure_node(&e.content_hash, e.now).await {
+            tracing::warn!("graph ensure_node failed (non-fatal): {err}");
+        }
+
+        // Interference detection + edge creation
+        let interference_filter = PayloadFilter {
+            exclude_superseded: true,
+            ..Default::default()
+        };
+        if let Ok(similar) = self
+            .vectors
+            .search_by_vector(&e.embedding, 10, Some(interference_filter))
+            .await
+        {
+            let mut edges: Vec<(String, String, UserRelationType, EdgeMeta)> = Vec::new();
+
+            for scored in &similar {
+                if scored.memory.content_hash == e.content_hash {
+                    continue;
+                }
+                if scored.score >= 0.7 {
+                    let signals = interference::detect_contradiction_signals(
+                        &e.content,
+                        &scored.memory.content,
+                        &scored.memory.content_hash,
+                        scored.score,
+                    );
+                    for signal in &signals {
+                        edges.push((
+                            e.content_hash.clone(),
+                            signal.existing_hash.clone(),
+                            UserRelationType::Contradicts,
+                            EdgeMeta {
+                                created_at: Some(e.now),
+                                confidence: Some(signal.confidence),
+                            },
+                        ));
+                    }
+                } else if scored.score >= 0.4 {
+                    edges.push((
+                        e.content_hash.clone(),
+                        scored.memory.content_hash.clone(),
+                        UserRelationType::RelatesTo,
+                        EdgeMeta {
+                            created_at: Some(e.now),
+                            confidence: None,
+                        },
+                    ));
+                }
+            }
+
+            if !edges.is_empty()
+                && let Err(err) = self.graph.create_typed_edges_batch(&edges).await
+            {
+                tracing::warn!("failed to batch-create interference edges: {err}");
+            }
+        }
+    }
+
+    /// Background enrichment after search: increment access counts and
+    /// enqueue Hebbian co-access strengthening. All operations are non-fatal.
+    pub async fn enrich_search_results(&self, hashes: &[String], now: f64) {
+        let refs: Vec<&str> = hashes.iter().map(|s| s.as_str()).collect();
+        let access_fut = self.vectors.increment_access_count_batch(&refs);
+
+        let hebbian_fut = async {
+            if hashes.len() >= 2 {
+                let pairs: Vec<CoAccessPair> = hashes
+                    .windows(2)
+                    .map(|w| CoAccessPair {
+                        src: w[0].clone(),
+                        dst: w[1].clone(),
+                        spacing_quality: 0.5,
+                        timestamp: now,
                     })
-                })
-                .collect();
-            result.insert(
-                "interference".into(),
-                serde_json::json!({ "contradictions": interference_data }),
-            );
-        }
+                    .collect();
+                let _ = self.hebbian.enqueue_strengthen(&pairs).await;
+            }
+        };
 
-        Ok(result)
+        let _ = futures::join!(access_fut, hebbian_fut);
     }
 
     // ─── Tool 2: search ─────────────────────────────────────────────────
@@ -835,32 +865,7 @@ impl MemoryService {
             .take(params.page_size)
             .collect();
 
-        // Stage 6: Enrich — side-effect writes run concurrently
-        let page_hashes: Vec<&str> = page_results.iter().map(|(h, _)| h.as_str()).collect();
-
-        {
-            let _span = tracing::info_span!("enrich", results = page_hashes.len()).entered();
-            let access_fut = self.vectors.increment_access_count_batch(&page_hashes);
-
-            let hebbian_enqueue_fut = async {
-                if page_hashes.len() >= 2 {
-                    let pairs: Vec<CoAccessPair> = page_hashes
-                        .windows(2)
-                        .map(|w| CoAccessPair {
-                            src: w[0].to_string(),
-                            dst: w[1].to_string(),
-                            spacing_quality: 0.5,
-                            timestamp: now,
-                        })
-                        .collect();
-                    let _ = self.hebbian.enqueue_strengthen(&pairs).await;
-                }
-            };
-
-            let _ = futures::join!(access_fut, hebbian_enqueue_fut);
-        }
-
-        // Stage 7: Format response
+        // Stage 6: Format response (enrichment deferred to caller via fire-and-forget)
         let total_pages = total.div_ceil(params.page_size);
         let has_more = params.page < total_pages;
 
@@ -2673,6 +2678,12 @@ mod tests {
 
         let result = svc.store_memory(params).await;
         assert!(result.is_ok(), "store_memory should succeed");
+        let (_, enrichment) = result.unwrap();
+
+        // Run enrichment (fire-and-forget in production, inline in tests)
+        if let Some(e) = enrichment {
+            svc.enrich_stored_memory(e).await;
+        }
 
         // Key assertion: edges should be batched, not created individually
         assert_eq!(
@@ -2711,6 +2722,10 @@ mod tests {
 
         let result = svc.store_memory(params).await;
         assert!(result.is_ok());
+        let (_, enrichment) = result.unwrap();
+        if let Some(e) = enrichment {
+            svc.enrich_stored_memory(e).await;
+        }
 
         // No edges created at all
         assert_eq!(individual_calls.get(), 0);
