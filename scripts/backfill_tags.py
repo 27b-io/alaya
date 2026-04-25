@@ -108,6 +108,12 @@ async def scroll_all(client: httpx.AsyncClient) -> list[dict]:
     return memories
 
 
+_AUTH_HEADERS: dict[str, str] = {}
+_token = os.environ.get("ALAYA_API_KEY", "")
+if _token:
+    _AUTH_HEADERS["Authorization"] = f"Bearer {_token}"
+
+
 async def patch_tags(
     client: httpx.AsyncClient, content_hash: str, tags: list[str]
 ) -> bool:
@@ -115,6 +121,7 @@ async def patch_tags(
     resp = await client.patch(
         f"{ALAYA_URL}/memories/{content_hash}",
         json={"tags": tags},
+        headers=_AUTH_HEADERS,
     )
     return resp.status_code == 200
 
