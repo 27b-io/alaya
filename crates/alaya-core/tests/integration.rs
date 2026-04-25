@@ -148,6 +148,7 @@ async fn search_hybrid() {
             include_superseded: false,
             min_trust_score: None,
             output: Default::default(),
+            cursor: None,
         })
         .await
         .expect("search should succeed");
@@ -262,6 +263,7 @@ async fn search_by_tag() {
             include_superseded: false,
             min_trust_score: None,
             output: Default::default(),
+            cursor: None,
         })
         .await
         .expect("tag search should succeed");

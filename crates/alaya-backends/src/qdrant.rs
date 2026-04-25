@@ -774,21 +774,22 @@ impl VectorStorage for QdrantClient {
     async fn get_recent(
         &self,
         limit: usize,
-        offset: usize,
+        start_from: Option<f64>,
         memory_type: Option<&str>,
     ) -> Result<Vec<Memory>> {
-        // Scroll API is the only endpoint that respects order_by on
-        // Qdrant 1.16.x. The Query API silently ignores it.
-        // Over-fetch limit+offset then skip — acceptable because
-        // search_recent caps depth via page_size+1 lookahead.
+        let mut order_by = json!({
+            "key": "created_at",
+            "direction": "desc"
+        });
+        if let Some(ts) = start_from {
+            order_by["start_from"] = json!(ts);
+        }
+
         let mut body = json!({
-            "limit": limit + offset,
+            "limit": limit,
             "with_payload": true,
             "with_vector": false,
-            "order_by": {
-                "key": "created_at",
-                "direction": "desc"
-            },
+            "order_by": order_by,
         });
 
         if let Some(mt) = memory_type {
@@ -822,11 +823,7 @@ impl VectorStorage for QdrantClient {
 
         let points = data.result.map(|r| r.points).unwrap_or_default();
 
-        Ok(points
-            .iter()
-            .skip(offset)
-            .filter_map(point_to_memory)
-            .collect())
+        Ok(points.iter().filter_map(point_to_memory).collect())
     }
 
     #[tracing::instrument(skip(self))]

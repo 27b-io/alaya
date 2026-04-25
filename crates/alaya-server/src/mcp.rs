@@ -429,7 +429,8 @@ fn tool_schemas() -> Value {
                     "memory_type": { "anyOf": [{"type": "string"}, {"type": "null"}] },
                     "encoding_context": { "anyOf": [{"type": "object"}, {"type": "null"}] },
                     "include_superseded": { "type": "boolean", "default": false },
-                    "min_trust_score": { "anyOf": [{"type": "number"}, {"type": "null"}] }
+                    "min_trust_score": { "anyOf": [{"type": "number"}, {"type": "null"}] },
+                    "cursor": { "anyOf": [{"type": "number"}, {"type": "null"}], "description": "Cursor for recent mode pagination. Pass next_cursor from previous response." }
                 }
             }
         },
