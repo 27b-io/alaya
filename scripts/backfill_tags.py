@@ -28,9 +28,18 @@ import os
 
 import httpx
 
-ALAYA_URL = os.environ.get("ALAYA_URL", "http://10.43.61.94:3001")
-QDRANT_URL = os.environ.get("QDRANT_URL", "http://10.43.119.230:6333")
+ALAYA_URL = os.environ.get("ALAYA_URL", "")
+QDRANT_URL = os.environ.get("QDRANT_URL", "")
 COLLECTION = os.environ.get("QDRANT_COLLECTION", "memories_arctic1024")
+
+if not ALAYA_URL or not QDRANT_URL:
+    print(
+        "Error: ALAYA_URL and QDRANT_URL must be set.\n\n"
+        "  ALAYA_URL=http://<alaya-server>:3001 \\\n"
+        "  QDRANT_URL=http://<qdrant>:6333 \\\n"
+        "    python3 scripts/backfill_tags.py [--apply]\n"
+    )
+    raise SystemExit(1)
 PAGE_SIZE = 100
 
 
@@ -51,7 +60,15 @@ def reconstruct_tags(mangled: list[str]) -> list[str] | None:
     try:
         parsed = json.loads(joined)
         if isinstance(parsed, list) and all(isinstance(t, str) for t in parsed):
-            return [t.strip() for t in parsed if t.strip()]
+            # Order-preserving dedup matching service's deserialize_tags
+            seen: set[str] = set()
+            result = []
+            for t in parsed:
+                t = t.strip()
+                if t and t not in seen:
+                    seen.add(t)
+                    result.append(t)
+            return result or None
     except json.JSONDecodeError:
         pass
     return None

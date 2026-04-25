@@ -39,13 +39,14 @@ where
         None => None,
         Some(StringOrVec::Vec(v)) => dedup(v.into_iter()),
         Some(StringOrVec::Str(s)) => {
+            let t = s.trim();
             // Handle stringified JSON arrays: "[\"a\",\"b\"]" → vec!["a","b"]
-            if s.starts_with('[')
-                && let Ok(v) = serde_json::from_str::<Vec<String>>(&s)
+            if t.starts_with('[')
+                && let Ok(v) = serde_json::from_str::<Vec<String>>(t)
             {
                 return Ok(dedup(v.into_iter()));
             }
-            dedup(s.split(',').map(String::from))
+            dedup(t.split(',').map(String::from))
         }
     })
 }
@@ -986,22 +987,53 @@ impl MemoryService {
 
     #[tracing::instrument(skip(self, params))]
     async fn search_tag(&self, params: &SearchParams) -> Result<Value> {
+        const MAX_TAG_FETCH: usize = 5000;
+
         let tags = params.tags.as_deref().unwrap_or_default();
         if tags.is_empty() {
             return Err(AlayaError::Validation("tags required for tag mode".into()));
         }
 
         let offset = (params.page.saturating_sub(1)) * params.page_size;
-        let fetch_size = offset + params.page_size + 1; // +1 to detect has_more
-
+        let target = offset + params.page_size + 1; // +1 to detect has_more
         let tag_refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
-        let results = self
-            .vectors
-            .search_by_tags(&tag_refs, params.match_all, fetch_size)
-            .await?;
 
-        let has_more = results.len() > offset + params.page_size;
-        let page: Vec<Value> = results
+        // Over-fetch and filter superseded at application layer (Qdrant's
+        // is_null on nested payload fields is unreliable without explicit
+        // indexes). Double fetch_size until we have enough filtered results
+        // or the backend is exhausted.
+        let mut fetch_size = target * 2;
+        let mut filtered: Vec<ScoredMemory>;
+        let mut exhausted;
+        loop {
+            let results = self
+                .vectors
+                .search_by_tags(&tag_refs, params.match_all, fetch_size)
+                .await?;
+            exhausted = results.len() < fetch_size;
+
+            filtered = results
+                .into_iter()
+                .filter(|sm| {
+                    params.include_superseded
+                        || sm
+                            .memory
+                            .metadata
+                            .as_ref()
+                            .and_then(|md| md.get("superseded_by"))
+                            .is_none()
+                })
+                .collect();
+
+            if filtered.len() >= target || exhausted || fetch_size >= MAX_TAG_FETCH {
+                break;
+            }
+            fetch_size = (fetch_size * 2).min(MAX_TAG_FETCH);
+        }
+
+        let has_more =
+            filtered.len() > offset + params.page_size || (!exhausted && filtered.len() < target);
+        let page: Vec<Value> = filtered
             .iter()
             .skip(offset)
             .take(params.page_size)
@@ -2763,6 +2795,13 @@ mod tests {
             p.tags,
             Some(vec!["lab".into(), "hooks".into(), "ntfy".into()])
         );
+    }
+
+    #[test]
+    fn tags_stringified_array_with_leading_whitespace() {
+        let json = r#"{"content":"x","tags":"  [\"a\",\"b\"]  "}"#;
+        let p: StoreParams = serde_json::from_str(json).unwrap();
+        assert_eq!(p.tags, Some(vec!["a".into(), "b".into()]));
     }
 
     #[test]
