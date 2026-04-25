@@ -777,11 +777,12 @@ impl VectorStorage for QdrantClient {
         offset: usize,
         memory_type: Option<&str>,
     ) -> Result<Vec<Memory>> {
-        // Use Query API for native numeric offset (avoids fetching and
-        // discarding `offset` records that the scroll API requires).
+        // Scroll API is the only endpoint that respects order_by on
+        // Qdrant 1.16.x. The Query API silently ignores it.
+        // Over-fetch limit+offset then skip — acceptable because
+        // search_recent caps depth via page_size+1 lookahead.
         let mut body = json!({
-            "limit": limit,
-            "offset": offset,
+            "limit": limit + offset,
             "with_payload": true,
             "with_vector": false,
             "order_by": {
@@ -802,7 +803,7 @@ impl VectorStorage for QdrantClient {
         let resp = self
             .client
             .post(format!(
-                "{}/collections/{}/points/query",
+                "{}/collections/{}/points/scroll",
                 self.base_url, self.collection
             ))
             .json(&body)
@@ -814,14 +815,18 @@ impl VectorStorage for QdrantClient {
             return Err(qdrant_error(resp).await);
         }
 
-        let data: QdrantResponse<QueryResponse> = resp
+        let data: QdrantResponse<ScrollResponse> = resp
             .json()
             .await
             .map_err(|e| AlayaError::Storage(e.to_string()))?;
 
         let points = data.result.map(|r| r.points).unwrap_or_default();
 
-        Ok(points.iter().filter_map(point_to_memory).collect())
+        Ok(points
+            .iter()
+            .skip(offset)
+            .filter_map(point_to_memory)
+            .collect())
     }
 
     #[tracing::instrument(skip(self))]
@@ -1089,13 +1094,6 @@ struct ScrollResponse {
     #[serde(default)]
     points: Vec<Value>,
     next_page_offset: Option<Value>,
-}
-
-/// Response from POST /collections/{name}/points/query
-#[derive(Deserialize, Default)]
-struct QueryResponse {
-    #[serde(default)]
-    points: Vec<Value>,
 }
 
 #[derive(Deserialize)]

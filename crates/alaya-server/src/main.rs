@@ -91,6 +91,8 @@ fn env_or(key: &str, default: &str) -> String {
 
 // ─── Command channel ────────────────────────────────────────────────────────
 
+const CMD_CHANNEL_CAP: usize = 256;
+
 /// A command sent from axum handlers to the MemoryService worker.
 /// Carries the caller's tracing span so service methods become children
 /// of the HTTP request span across the mpsc thread boundary.
@@ -183,7 +185,7 @@ impl ServiceHandle {
     fn try_dispatch(&self, cmd: Cmd) -> Result<(), (i32, String)> {
         self.tx.try_send(cmd).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => {
-                tracing::warn!("command channel full (capacity 256)");
+                tracing::warn!(capacity = CMD_CHANNEL_CAP, "command channel full");
                 (-32000, "Service overloaded, try again later".to_string())
             }
             mpsc::error::TrySendError::Closed(_) => (-32000, "Service unavailable".to_string()),
@@ -843,7 +845,7 @@ fn main() {
     rt.block_on(async move {
         telemetry::init_tracing();
 
-        let (tx, rx) = mpsc::channel::<Cmd>(256);
+        let (tx, rx) = mpsc::channel::<Cmd>(CMD_CHANNEL_CAP);
 
         // Spawn MemoryService on a dedicated thread with LocalSet
         let cfg_clone = config.clone();
