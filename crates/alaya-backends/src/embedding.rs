@@ -8,8 +8,8 @@ use alaya_types::{AlayaError, Result, search::PromptName};
 
 use crate::EmbeddingProvider;
 
-/// Maximum texts per API call (OpenAI-compatible limit).
-const BATCH_SIZE: usize = 64;
+/// Maximum texts per embedding API call. TEI default max-client-batch-size is 32.
+const BATCH_SIZE: usize = 32;
 
 pub struct EmbeddingClient {
     client: Client,
@@ -155,10 +155,9 @@ mod tests {
         let texts: Vec<String> = (0..150).map(|i| format!("text_{i}")).collect();
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         let chunks: Vec<&[&str]> = refs.chunks(BATCH_SIZE).collect();
-        assert_eq!(chunks.len(), 3); // 64 + 64 + 22
-        assert_eq!(chunks[0].len(), 64);
-        assert_eq!(chunks[1].len(), 64);
-        assert_eq!(chunks[2].len(), 22);
+        assert_eq!(chunks.len(), 5); // 32 + 32 + 32 + 32 + 22
+        assert_eq!(chunks[0].len(), 32);
+        assert_eq!(chunks[4].len(), 22);
     }
 
     #[test]

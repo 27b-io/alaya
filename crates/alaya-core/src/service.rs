@@ -38,7 +38,15 @@ where
     Ok(match opt {
         None => None,
         Some(StringOrVec::Vec(v)) => dedup(v.into_iter()),
-        Some(StringOrVec::Str(s)) => dedup(s.split(',').map(String::from)),
+        Some(StringOrVec::Str(s)) => {
+            // Handle stringified JSON arrays: "[\"a\",\"b\"]" → vec!["a","b"]
+            if s.starts_with('[')
+                && let Ok(v) = serde_json::from_str::<Vec<String>>(&s)
+            {
+                return Ok(dedup(v.into_iter()));
+            }
+            dedup(s.split(',').map(String::from))
+        }
     })
 }
 use tracing;
@@ -983,14 +991,16 @@ impl MemoryService {
             return Err(AlayaError::Validation("tags required for tag mode".into()));
         }
 
+        let offset = (params.page.saturating_sub(1)) * params.page_size;
+        let fetch_size = offset + params.page_size + 1; // +1 to detect has_more
+
         let tag_refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
         let results = self
             .vectors
-            .search_by_tags(&tag_refs, params.match_all, params.page_size * params.page)
+            .search_by_tags(&tag_refs, params.match_all, fetch_size)
             .await?;
 
-        let offset = (params.page.saturating_sub(1)) * params.page_size;
-        let total = results.len();
+        let has_more = results.len() > offset + params.page_size;
         let page: Vec<Value> = results
             .iter()
             .skip(offset)
@@ -998,14 +1008,11 @@ impl MemoryService {
             .map(|sm| format_memory_result(&sm.memory, sm.score, params.output))
             .collect();
 
-        let total_pages = total.div_ceil(params.page_size);
-
         Ok(serde_json::json!({
             "page": params.page,
-            "total": total,
             "page_size": params.page_size,
-            "has_more": params.page < total_pages,
-            "total_pages": total_pages,
+            "count": page.len(),
+            "has_more": has_more,
             "results": page,
         }))
     }
@@ -2738,6 +2745,24 @@ mod tests {
         let json = r#"{"content":"x","tags":""}"#;
         let p: StoreParams = serde_json::from_str(json).unwrap();
         assert_eq!(p.tags, None);
+    }
+
+    #[test]
+    fn tags_from_stringified_json_array() {
+        // Bug #17: Claude Code sometimes sends tags as a stringified JSON array
+        let json = r#"{"content":"x","tags":"[\"a\",\"b\",\"c\"]"}"#;
+        let p: StoreParams = serde_json::from_str(json).unwrap();
+        assert_eq!(p.tags, Some(vec!["a".into(), "b".into(), "c".into()]));
+    }
+
+    #[test]
+    fn tags_stringified_array_with_spaces() {
+        let json = r#"{"content":"x","tags":"[\"lab\", \"hooks\", \"ntfy\"]"}"#;
+        let p: StoreParams = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            p.tags,
+            Some(vec!["lab".into(), "hooks".into(), "ntfy".into()])
+        );
     }
 
     #[test]
