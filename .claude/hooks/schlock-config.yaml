@@ -1,0 +1,21 @@
+_metadata:
+  generated_at: '2026-04-06T02:40:00.671207+00:00'
+  wizard_version: 0.1.0
+  last_modified_by: setup-wizard
+risk_tolerance:
+  preset: permissive
+  levels:
+    SAFE: allow
+    LOW: allow
+    MEDIUM: allow
+    HIGH: allow
+    BLOCKED: deny
+commit_filter:
+  enabled: true
+  rules:
+    advertising:
+      enabled: true
+shellcheck:
+  enabled: true
+  severity: info
+  security_only: true

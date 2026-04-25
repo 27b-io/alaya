@@ -777,8 +777,11 @@ impl VectorStorage for QdrantClient {
         offset: usize,
         memory_type: Option<&str>,
     ) -> Result<Vec<Memory>> {
+        // Use Query API for native numeric offset (avoids fetching and
+        // discarding `offset` records that the scroll API requires).
         let mut body = json!({
-            "limit": limit + offset,
+            "limit": limit,
+            "offset": offset,
             "with_payload": true,
             "with_vector": false,
             "order_by": {
@@ -799,7 +802,7 @@ impl VectorStorage for QdrantClient {
         let resp = self
             .client
             .post(format!(
-                "{}/collections/{}/points/scroll",
+                "{}/collections/{}/points/query",
                 self.base_url, self.collection
             ))
             .json(&body)
@@ -811,18 +814,14 @@ impl VectorStorage for QdrantClient {
             return Err(qdrant_error(resp).await);
         }
 
-        let data: QdrantResponse<ScrollResponse> = resp
+        let data: QdrantResponse<QueryResponse> = resp
             .json()
             .await
             .map_err(|e| AlayaError::Storage(e.to_string()))?;
 
         let points = data.result.map(|r| r.points).unwrap_or_default();
 
-        Ok(points
-            .iter()
-            .skip(offset)
-            .filter_map(point_to_memory)
-            .collect())
+        Ok(points.iter().filter_map(point_to_memory).collect())
     }
 
     #[tracing::instrument(skip(self))]
@@ -1090,6 +1089,13 @@ struct ScrollResponse {
     #[serde(default)]
     points: Vec<Value>,
     next_page_offset: Option<Value>,
+}
+
+/// Response from POST /collections/{name}/points/query
+#[derive(Deserialize, Default)]
+struct QueryResponse {
+    #[serde(default)]
+    points: Vec<Value>,
 }
 
 #[derive(Deserialize)]

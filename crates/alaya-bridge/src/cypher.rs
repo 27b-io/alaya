@@ -111,6 +111,43 @@ pub fn get_typed_edges(
     )
 }
 
+/// MATCH edges of all user relation types in a single round-trip.
+pub fn get_all_typed_edges(
+    hash: &str,
+    types: &[UserRelationType],
+    direction: Direction,
+    limit: u32,
+) -> CypherQuery {
+    let clauses: Vec<String> = types
+        .iter()
+        .map(|rel| {
+            let label = rel.cypher_label();
+            let pattern = match direction {
+                Direction::Outgoing => {
+                    format!("(a:Memory {{content_hash: $hash}})-[e:{label}]->(b:Memory)")
+                }
+                Direction::Incoming => {
+                    format!("(a:Memory)-[e:{label}]->(b:Memory {{content_hash: $hash}})")
+                }
+                Direction::Both => {
+                    format!("(a:Memory {{content_hash: $hash}})-[e:{label}]-(b:Memory)")
+                }
+            };
+            format!(
+                "MATCH {pattern} \
+                 RETURN a.content_hash, b.content_hash, e.created_at, '{label}' AS rel_type \
+                 LIMIT $lim"
+            )
+        })
+        .collect();
+    let q = clauses.join(" UNION ALL ");
+    (
+        q,
+        params(&[("hash", json!(hash)), ("lim", json!(limit))]),
+        true,
+    )
+}
+
 /// DELETE a single typed edge between two memories.
 pub fn delete_typed_edge(src: &str, dst: &str, rel: UserRelationType) -> CypherQuery {
     let label = rel.cypher_label();

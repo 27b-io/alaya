@@ -298,11 +298,7 @@ async fn dispatch_tool(
             let params: StoreParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle
-                .tx
-                .send(cmd(CmdInner::Store { params, reply: tx }))
-                .await
-                .map_err(|_| (-32000, "Service unavailable".to_string()))?;
+            handle.try_dispatch(cmd(CmdInner::Store { params, reply: tx }))?;
             rx.await
                 .map_err(|_| (-32000, "Service dropped".to_string()))
         }
@@ -310,11 +306,7 @@ async fn dispatch_tool(
             let params: SearchParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle
-                .tx
-                .send(cmd(CmdInner::Search { params, reply: tx }))
-                .await
-                .map_err(|_| (-32000, "Service unavailable".to_string()))?;
+            handle.try_dispatch(cmd(CmdInner::Search { params, reply: tx }))?;
             rx.await
                 .map_err(|_| (-32000, "Service dropped".to_string()))
         }
@@ -322,24 +314,16 @@ async fn dispatch_tool(
             let p: DeleteParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle
-                .tx
-                .send(cmd(CmdInner::Delete {
-                    hash: p.content_hash,
-                    reply: tx,
-                }))
-                .await
-                .map_err(|_| (-32000, "Service unavailable".to_string()))?;
+            handle.try_dispatch(cmd(CmdInner::Delete {
+                hash: p.content_hash,
+                reply: tx,
+            }))?;
             rx.await
                 .map_err(|_| (-32000, "Service dropped".to_string()))
         }
         "check_database_health" => {
             let (tx, rx) = oneshot::channel();
-            handle
-                .tx
-                .send(cmd(CmdInner::Health { reply: tx }))
-                .await
-                .map_err(|_| (-32000, "Service unavailable".to_string()))?;
+            handle.try_dispatch(cmd(CmdInner::Health { reply: tx }))?;
             rx.await
                 .map_err(|_| (-32000, "Service dropped".to_string()))
         }
@@ -347,11 +331,7 @@ async fn dispatch_tool(
             let params: RelationParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle
-                .tx
-                .send(cmd(CmdInner::Relation { params, reply: tx }))
-                .await
-                .map_err(|_| (-32000, "Service unavailable".to_string()))?;
+            handle.try_dispatch(cmd(CmdInner::Relation { params, reply: tx }))?;
             rx.await
                 .map_err(|_| (-32000, "Service dropped".to_string()))
         }
@@ -359,16 +339,12 @@ async fn dispatch_tool(
             let p: SupersedeParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle
-                .tx
-                .send(cmd(CmdInner::Supersede {
-                    old_hash: p.old_id,
-                    new_hash: p.new_id,
-                    reason: p.reason,
-                    reply: tx,
-                }))
-                .await
-                .map_err(|_| (-32000, "Service unavailable".to_string()))?;
+            handle.try_dispatch(cmd(CmdInner::Supersede {
+                old_hash: p.old_id,
+                new_hash: p.new_id,
+                reason: p.reason,
+                reply: tx,
+            }))?;
             rx.await
                 .map_err(|_| (-32000, "Service dropped".to_string()))
         }
@@ -376,14 +352,10 @@ async fn dispatch_tool(
             let p: ContradictionsParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle
-                .tx
-                .send(cmd(CmdInner::Contradictions {
-                    limit: p.limit,
-                    reply: tx,
-                }))
-                .await
-                .map_err(|_| (-32000, "Service unavailable".to_string()))?;
+            handle.try_dispatch(cmd(CmdInner::Contradictions {
+                limit: p.limit,
+                reply: tx,
+            }))?;
             rx.await
                 .map_err(|_| (-32000, "Service dropped".to_string()))
         }
@@ -391,16 +363,12 @@ async fn dispatch_tool(
             let p: FindDuplicatesParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle
-                .tx
-                .send(cmd(CmdInner::FindDuplicates {
-                    threshold: p.similarity_threshold,
-                    limit: p.limit,
-                    strategy: p.strategy,
-                    reply: tx,
-                }))
-                .await
-                .map_err(|_| (-32000, "Service unavailable".to_string()))?;
+            handle.try_dispatch(cmd(CmdInner::FindDuplicates {
+                threshold: p.similarity_threshold,
+                limit: p.limit,
+                strategy: p.strategy,
+                reply: tx,
+            }))?;
             rx.await
                 .map_err(|_| (-32000, "Service dropped".to_string()))
         }
@@ -408,17 +376,13 @@ async fn dispatch_tool(
             let p: MergeDuplicatesParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle
-                .tx
-                .send(cmd(CmdInner::MergeDuplicates {
-                    canonical: p.canonical_hash,
-                    duplicates: p.duplicate_hashes,
-                    reason: p.reason,
-                    dry_run: p.dry_run,
-                    reply: tx,
-                }))
-                .await
-                .map_err(|_| (-32000, "Service unavailable".to_string()))?;
+            handle.try_dispatch(cmd(CmdInner::MergeDuplicates {
+                canonical: p.canonical_hash,
+                duplicates: p.duplicate_hashes,
+                reason: p.reason,
+                dry_run: p.dry_run,
+                reply: tx,
+            }))?;
             rx.await
                 .map_err(|_| (-32000, "Service dropped".to_string()))
         }

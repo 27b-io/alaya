@@ -179,13 +179,24 @@ pub(crate) struct ServiceHandle {
 }
 
 impl ServiceHandle {
+    /// Non-blocking send. Returns error tuple suitable for both REST and MCP paths.
+    fn try_dispatch(&self, cmd: Cmd) -> Result<(), (i32, String)> {
+        self.tx.try_send(cmd).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => {
+                tracing::warn!("command channel full (capacity 256)");
+                (-32000, "Service overloaded, try again later".to_string())
+            }
+            mpsc::error::TrySendError::Closed(_) => (-32000, "Service unavailable".to_string()),
+        })
+    }
+
     async fn call(&self, inner: CmdInner, rx: oneshot::Receiver<Value>) -> Json<Value> {
         let cmd = Cmd {
             inner,
             span: tracing::Span::current(),
         };
-        if self.tx.send(cmd).await.is_err() {
-            return Json(json!({"error": "service unavailable"}));
+        if let Err((_code, msg)) = self.try_dispatch(cmd) {
+            return Json(json!({"error": msg}));
         }
         match rx.await {
             Ok(v) => Json(v),

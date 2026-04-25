@@ -1268,23 +1268,45 @@ impl MemoryService {
         new_hash: &str,
         reason: &str,
     ) -> Result<Value> {
+        self.supersede_inner(old_hash, new_hash, reason, true).await
+    }
+
+    /// Core supersede logic. When `verify_new` is false, skips the existence
+    /// check on new_hash (used by merge_duplicates which pre-validates the
+    /// canonical hash once before the loop).
+    async fn supersede_inner(
+        &self,
+        old_hash: &str,
+        new_hash: &str,
+        reason: &str,
+        verify_new: bool,
+    ) -> Result<Value> {
         if old_hash == new_hash {
             return Err(AlayaError::Validation(
                 "old_hash and new_hash must differ".into(),
             ));
         }
 
-        // Verify both exist (single batch GET instead of 2 sequential calls)
-        let batch = self.vectors.get_batch(&[old_hash, new_hash]).await?;
-        if !batch.iter().any(|m| m.content_hash == old_hash) {
-            return Err(AlayaError::Validation(format!(
-                "old memory not found: {old_hash}"
-            )));
-        }
-        if !batch.iter().any(|m| m.content_hash == new_hash) {
-            return Err(AlayaError::Validation(format!(
-                "new memory not found: {new_hash}"
-            )));
+        if verify_new {
+            // Verify both exist (single batch GET)
+            let batch = self.vectors.get_batch(&[old_hash, new_hash]).await?;
+            if !batch.iter().any(|m| m.content_hash == old_hash) {
+                return Err(AlayaError::Validation(format!(
+                    "old memory not found: {old_hash}"
+                )));
+            }
+            if !batch.iter().any(|m| m.content_hash == new_hash) {
+                return Err(AlayaError::Validation(format!(
+                    "new memory not found: {new_hash}"
+                )));
+            }
+        } else {
+            // Only verify old_hash exists (canonical already validated)
+            if self.vectors.get_by_hash(old_hash).await?.is_none() {
+                return Err(AlayaError::Validation(format!(
+                    "old memory not found: {old_hash}"
+                )));
+            }
         }
 
         // Update metadata on old memory
@@ -1498,7 +1520,7 @@ impl MemoryService {
 
         for &dup_hash in duplicate_hashes {
             match self
-                .memory_supersede(dup_hash, canonical_hash, reason)
+                .supersede_inner(dup_hash, canonical_hash, reason, false)
                 .await
             {
                 Ok(_) => superseded.push(dup_hash.to_string()),
