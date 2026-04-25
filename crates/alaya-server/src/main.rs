@@ -485,10 +485,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                                 })
                                 .collect();
                             if !hashes.is_empty() {
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs_f64();
+                                let now = svc.now();
                                 let svc = svc.clone();
                                 tokio::task::spawn_local(async move {
                                     svc.enrich_search_results(&hashes, now).await;
@@ -1212,11 +1209,8 @@ async fn patch_memory(
         span: tracing::Span::current(),
     };
 
-    if h.tx.send(cmd).await.is_err() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "service unavailable"})),
-        );
+    if let Err((_code, msg)) = h.try_dispatch(cmd) {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": msg})));
     }
 
     match rx.await {

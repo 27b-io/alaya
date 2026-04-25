@@ -256,6 +256,11 @@ impl MemoryService {
         }
     }
 
+    /// Current timestamp via the injected clock (wall clock in prod, mock in tests).
+    pub fn now(&self) -> f64 {
+        (self.clock)()
+    }
+
     // ─── Tool 1: store_memory ───────────────────────────────────────────
 
     #[tracing::instrument(skip(self, params), fields(content_len = params.content.len()))]
@@ -448,52 +453,55 @@ impl MemoryService {
             exclude_superseded: true,
             ..Default::default()
         };
-        if let Ok(similar) = self
+        match self
             .vectors
             .search_by_vector(&e.embedding, 10, Some(interference_filter))
             .await
         {
-            let mut edges: Vec<(String, String, UserRelationType, EdgeMeta)> = Vec::new();
+            Err(err) => tracing::warn!("interference search failed (non-fatal): {err}"),
+            Ok(similar) => {
+                let mut edges: Vec<(String, String, UserRelationType, EdgeMeta)> = Vec::new();
 
-            for scored in &similar {
-                if scored.memory.content_hash == e.content_hash {
-                    continue;
-                }
-                if scored.score >= 0.7 {
-                    let signals = interference::detect_contradiction_signals(
-                        &e.content,
-                        &scored.memory.content,
-                        &scored.memory.content_hash,
-                        scored.score,
-                    );
-                    for signal in &signals {
+                for scored in &similar {
+                    if scored.memory.content_hash == e.content_hash {
+                        continue;
+                    }
+                    if scored.score >= 0.7 {
+                        let signals = interference::detect_contradiction_signals(
+                            &e.content,
+                            &scored.memory.content,
+                            &scored.memory.content_hash,
+                            scored.score,
+                        );
+                        for signal in &signals {
+                            edges.push((
+                                e.content_hash.clone(),
+                                signal.existing_hash.clone(),
+                                UserRelationType::Contradicts,
+                                EdgeMeta {
+                                    created_at: Some(e.now),
+                                    confidence: Some(signal.confidence),
+                                },
+                            ));
+                        }
+                    } else if scored.score >= 0.4 {
                         edges.push((
                             e.content_hash.clone(),
-                            signal.existing_hash.clone(),
-                            UserRelationType::Contradicts,
+                            scored.memory.content_hash.clone(),
+                            UserRelationType::RelatesTo,
                             EdgeMeta {
                                 created_at: Some(e.now),
-                                confidence: Some(signal.confidence),
+                                confidence: None,
                             },
                         ));
                     }
-                } else if scored.score >= 0.4 {
-                    edges.push((
-                        e.content_hash.clone(),
-                        scored.memory.content_hash.clone(),
-                        UserRelationType::RelatesTo,
-                        EdgeMeta {
-                            created_at: Some(e.now),
-                            confidence: None,
-                        },
-                    ));
                 }
-            }
 
-            if !edges.is_empty()
-                && let Err(err) = self.graph.create_typed_edges_batch(&edges).await
-            {
-                tracing::warn!("failed to batch-create interference edges: {err}");
+                if !edges.is_empty()
+                    && let Err(err) = self.graph.create_typed_edges_batch(&edges).await
+                {
+                    tracing::warn!("failed to batch-create interference edges: {err}");
+                }
             }
         }
     }
