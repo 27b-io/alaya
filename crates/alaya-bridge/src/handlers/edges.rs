@@ -184,36 +184,49 @@ pub async fn get(
 
     let limit = req.limit.unwrap_or(100).clamp(1, 500) as u32;
 
-    // Determine which relation types to query
-    let relations: Vec<UserRelationType> = match req.relation_type.as_deref() {
-        Some(rt) => vec![parse_user_relation(rt)?],
-        None => all_user_relation_types().to_vec(),
+    let row_to_edge = |row: &[Value], rel_type: &str| -> Option<Edge> {
+        if row.len() < 3 {
+            return None;
+        }
+        Some(Edge {
+            source: row[0].as_str().unwrap_or("").to_string(),
+            target: row[1].as_str().unwrap_or("").to_string(),
+            relation_type: rel_type.to_string(),
+            direction,
+            created_at: row.get(2).and_then(Value::as_f64),
+            confidence: None,
+        })
     };
 
     let mut edges: Vec<Edge> = Vec::new();
 
-    for rel in relations {
-        let (cypher, params, readonly) =
-            cypher::get_typed_edges(&req.content_hash, rel, direction, limit);
-        let result = exec_query(&state, &cypher, params, readonly).await?;
-
-        for row in &result.result_set {
-            // Row: [a.content_hash, b.content_hash, e.created_at]
-            if row.len() < 2 {
-                continue;
+    match req.relation_type.as_deref() {
+        Some(rt) => {
+            let rel = parse_user_relation(rt)?;
+            let (cypher, params, readonly) =
+                cypher::get_typed_edges(&req.content_hash, rel, direction, limit);
+            let result = exec_query(&state, &cypher, params, readonly).await?;
+            let label = rel.cypher_label();
+            edges.extend(
+                result
+                    .result_set
+                    .iter()
+                    .filter_map(|r| row_to_edge(r, label)),
+            );
+        }
+        None => {
+            // Single UNION ALL query instead of 3 round-trips.
+            // Returns rel_type as column 4 (compile-time enum label, not user input).
+            let types = all_user_relation_types();
+            let (cypher, params, readonly) =
+                cypher::get_all_typed_edges(&req.content_hash, types, direction, limit);
+            let result = exec_query(&state, &cypher, params, readonly).await?;
+            for row in &result.result_set {
+                let rel_type = row.get(3).and_then(Value::as_str).unwrap_or("");
+                if let Some(e) = row_to_edge(row, rel_type) {
+                    edges.push(e);
+                }
             }
-            let source = row[0].as_str().unwrap_or("").to_string();
-            let target = row[1].as_str().unwrap_or("").to_string();
-            let created_at = row.get(2).and_then(Value::as_f64);
-
-            edges.push(Edge {
-                source,
-                target,
-                relation_type: rel.cypher_label().to_string(),
-                direction,
-                created_at,
-                confidence: None,
-            });
         }
     }
 

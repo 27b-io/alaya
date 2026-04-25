@@ -55,10 +55,13 @@ pub trait VectorStorage {
 
     // Scroll / list
     async fn get_all(&self, limit: usize, offset: Option<&str>) -> Result<ScrollResult>;
+    /// Fetch memories ordered by `created_at` descending.
+    /// `start_from` is a cursor: when `Some(ts)`, only memories with
+    /// `created_at < ts` are returned (exclusive, for cursor pagination).
     async fn get_recent(
         &self,
         limit: usize,
-        offset: usize,
+        start_from: Option<f64>,
         memory_type: Option<&str>,
     ) -> Result<Vec<Memory>>;
 

@@ -97,6 +97,9 @@ pub struct SearchParams {
     pub min_trust_score: Option<f64>,
     #[serde(default)]
     pub output: OutputMode,
+    /// Cursor for recent mode: `created_at` timestamp of the last result
+    /// from the previous page. Memories with `created_at < cursor` are returned.
+    pub cursor: Option<f64>,
 }
 
 fn default_page() -> usize {
@@ -1051,25 +1054,35 @@ impl MemoryService {
 
     #[tracing::instrument(skip(self, params))]
     async fn search_recent(&self, params: &SearchParams) -> Result<Value> {
-        let offset = (params.page.saturating_sub(1)) * params.page_size;
         let results = self
             .vectors
-            .get_recent(params.page_size + 1, offset, params.memory_type.as_deref())
+            .get_recent(
+                params.page_size + 1,
+                params.cursor,
+                params.memory_type.as_deref(),
+            )
             .await?;
 
         let has_more = results.len() > params.page_size;
-        let items: Vec<Value> = results
+        let page_results: Vec<&Memory> = results.iter().take(params.page_size).collect();
+
+        // Cursor for next page: created_at of the last result on this page
+        let next_cursor = page_results.last().map(|m| m.created_at);
+
+        let items: Vec<Value> = page_results
             .iter()
-            .take(params.page_size)
             .map(|m| format_memory_result(m, 1.0, params.output))
             .collect();
 
-        Ok(serde_json::json!({
-            "page": params.page,
+        let mut resp = serde_json::json!({
             "page_size": params.page_size,
             "has_more": has_more,
             "results": items,
-        }))
+        });
+        if let Some(c) = next_cursor {
+            resp["next_cursor"] = serde_json::json!(c);
+        }
+        Ok(resp)
     }
 
     // ─── Tool 3: delete_memory ──────────────────────────────────────────
@@ -1268,23 +1281,45 @@ impl MemoryService {
         new_hash: &str,
         reason: &str,
     ) -> Result<Value> {
+        self.supersede_inner(old_hash, new_hash, reason, true).await
+    }
+
+    /// Core supersede logic. When `verify_new` is false, skips the existence
+    /// check on new_hash (used by merge_duplicates which pre-validates the
+    /// canonical hash once before the loop).
+    async fn supersede_inner(
+        &self,
+        old_hash: &str,
+        new_hash: &str,
+        reason: &str,
+        verify_new: bool,
+    ) -> Result<Value> {
         if old_hash == new_hash {
             return Err(AlayaError::Validation(
                 "old_hash and new_hash must differ".into(),
             ));
         }
 
-        // Verify both exist (single batch GET instead of 2 sequential calls)
-        let batch = self.vectors.get_batch(&[old_hash, new_hash]).await?;
-        if !batch.iter().any(|m| m.content_hash == old_hash) {
-            return Err(AlayaError::Validation(format!(
-                "old memory not found: {old_hash}"
-            )));
-        }
-        if !batch.iter().any(|m| m.content_hash == new_hash) {
-            return Err(AlayaError::Validation(format!(
-                "new memory not found: {new_hash}"
-            )));
+        if verify_new {
+            // Verify both exist (single batch GET)
+            let batch = self.vectors.get_batch(&[old_hash, new_hash]).await?;
+            if !batch.iter().any(|m| m.content_hash == old_hash) {
+                return Err(AlayaError::Validation(format!(
+                    "old memory not found: {old_hash}"
+                )));
+            }
+            if !batch.iter().any(|m| m.content_hash == new_hash) {
+                return Err(AlayaError::Validation(format!(
+                    "new memory not found: {new_hash}"
+                )));
+            }
+        } else {
+            // Only verify old_hash exists (canonical already validated)
+            if self.vectors.get_by_hash(old_hash).await?.is_none() {
+                return Err(AlayaError::Validation(format!(
+                    "old memory not found: {old_hash}"
+                )));
+            }
         }
 
         // Update metadata on old memory
@@ -1498,7 +1533,7 @@ impl MemoryService {
 
         for &dup_hash in duplicate_hashes {
             match self
-                .memory_supersede(dup_hash, canonical_hash, reason)
+                .supersede_inner(dup_hash, canonical_hash, reason, false)
                 .await
             {
                 Ok(_) => superseded.push(dup_hash.to_string()),
@@ -1716,7 +1751,12 @@ mod tests {
                 next_offset: None,
             })
         }
-        async fn get_recent(&self, _l: usize, _o: usize, _t: Option<&str>) -> Result<Vec<Memory>> {
+        async fn get_recent(
+            &self,
+            _l: usize,
+            _s: Option<f64>,
+            _t: Option<&str>,
+        ) -> Result<Vec<Memory>> {
             Ok(vec![])
         }
         async fn count(&self) -> Result<usize> {
@@ -1916,6 +1956,7 @@ mod tests {
             include_superseded: false,
             min_trust_score: None,
             output: OutputMode::Full,
+            cursor: None,
         };
 
         // First search — must call get_all_tags
@@ -1949,6 +1990,7 @@ mod tests {
             include_superseded: false,
             min_trust_score: None,
             output: OutputMode::Full,
+            cursor: None,
         };
 
         // Populate cache
@@ -1994,6 +2036,7 @@ mod tests {
             include_superseded: false,
             min_trust_score: None,
             output: OutputMode::Full,
+            cursor: None,
         };
 
         // Populate cache
@@ -2059,6 +2102,7 @@ mod tests {
             include_superseded: false,
             min_trust_score: None,
             output: OutputMode::Full,
+            cursor: None,
         };
 
         // First search — populates cache
@@ -2179,7 +2223,12 @@ mod tests {
                 next_offset,
             })
         }
-        async fn get_recent(&self, _l: usize, _o: usize, _t: Option<&str>) -> Result<Vec<Memory>> {
+        async fn get_recent(
+            &self,
+            _l: usize,
+            _s: Option<f64>,
+            _t: Option<&str>,
+        ) -> Result<Vec<Memory>> {
             Ok(vec![])
         }
         async fn count(&self) -> Result<usize> {
@@ -2312,6 +2361,7 @@ mod tests {
             include_superseded: false,
             min_trust_score: None,
             output: OutputMode::Full,
+            cursor: None,
         };
 
         // Populate cache
@@ -2505,7 +2555,12 @@ mod tests {
                 next_offset: None,
             })
         }
-        async fn get_recent(&self, _l: usize, _o: usize, _t: Option<&str>) -> Result<Vec<Memory>> {
+        async fn get_recent(
+            &self,
+            _l: usize,
+            _s: Option<f64>,
+            _t: Option<&str>,
+        ) -> Result<Vec<Memory>> {
             Ok(vec![])
         }
         async fn count(&self) -> Result<usize> {
@@ -2680,6 +2735,7 @@ mod tests {
             include_superseded: false,
             min_trust_score: None,
             output: OutputMode::Full,
+            cursor: None,
         };
 
         // Populate cache
@@ -2720,6 +2776,7 @@ mod tests {
             include_superseded: false,
             min_trust_score: None,
             output: OutputMode::Full,
+            cursor: None,
         };
 
         // Populate cache
@@ -2892,7 +2949,12 @@ mod tests {
                 next_offset: None,
             })
         }
-        async fn get_recent(&self, _l: usize, _o: usize, _t: Option<&str>) -> Result<Vec<Memory>> {
+        async fn get_recent(
+            &self,
+            _l: usize,
+            _s: Option<f64>,
+            _t: Option<&str>,
+        ) -> Result<Vec<Memory>> {
             Ok(vec![])
         }
         async fn count(&self) -> Result<usize> {
@@ -3080,6 +3142,7 @@ mod tests {
             include_superseded: false,
             min_trust_score: None,
             output: OutputMode::Full,
+            cursor: None,
         };
 
         let result = svc.search(params).await.expect("search should succeed");
