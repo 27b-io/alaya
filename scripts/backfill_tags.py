@@ -116,14 +116,19 @@ if _token:
 
 async def patch_tags(
     client: httpx.AsyncClient, content_hash: str, tags: list[str]
-) -> bool:
-    """PATCH memory tags via alaya-server."""
-    resp = await client.patch(
-        f"{ALAYA_URL}/memories/{content_hash}",
-        json={"tags": tags},
-        headers=_AUTH_HEADERS,
-    )
-    return resp.status_code == 200
+) -> tuple[bool, str]:
+    """PATCH memory tags via alaya-server. Returns (success, detail)."""
+    try:
+        resp = await client.patch(
+            f"{ALAYA_URL}/memories/{content_hash}",
+            json={"tags": tags},
+            headers=_AUTH_HEADERS,
+        )
+        if resp.status_code == 200:
+            return True, ""
+        return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+    except httpx.HTTPError as e:
+        return False, str(e)
 
 
 async def main(apply: bool) -> None:
@@ -170,13 +175,13 @@ async def main(apply: bool) -> None:
         ok = 0
         fail = 0
         for item in affected:
-            success = await patch_tags(client, item["content_hash"], item["fixed"])
+            success, detail = await patch_tags(client, item["content_hash"], item["fixed"])
             if success:
                 ok += 1
                 print(f"  OK  {item['content_hash'][:8]}")
             else:
                 fail += 1
-                print(f"  FAIL {item['content_hash'][:8]}")
+                print(f"  FAIL {item['content_hash'][:8]}  {detail}")
 
         print(f"\nDone: {ok} fixed, {fail} failed.")
 
