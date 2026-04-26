@@ -89,6 +89,26 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+async fn init_l2_cache(
+    url: &str,
+    model: &str,
+    dims: usize,
+) -> std::result::Result<cachekit::CacheKit, Box<dyn std::error::Error>> {
+    let redis = cachekit::backend::redis::RedisBackend::builder()
+        .url(url)
+        .build()?;
+    let handle = redis.connect().await?;
+    handle.await??;
+    // Namespace includes model+dims so cache auto-invalidates on config change
+    let ns = format!("alaya:embed:{model}:{dims}");
+    Ok(cachekit::CacheKit::builder()
+        .backend(std::sync::Arc::new(redis))
+        .namespace(ns)
+        .default_ttl(std::time::Duration::from_secs(86400 * 30))
+        .no_l1()
+        .build()?)
+}
+
 // ─── Command channel ────────────────────────────────────────────────────────
 
 const CMD_CHANNEL_CAP: usize = 256;
@@ -863,15 +883,34 @@ fn main() {
                     cfg_clone.qdrant_collection,
                     cfg_clone.qdrant_api_key,
                 );
+                let embed_model = cfg_clone.embedding_model;
+                let embed_dims = cfg_clone.embedding_dimensions;
                 let embeddings = EmbeddingClient::new(
                     cfg_clone.embedding_url,
-                    cfg_clone.embedding_model,
-                    cfg_clone.embedding_dimensions,
+                    embed_model.clone(),
+                    embed_dims,
                     None,
                 );
+                // L2 embedding cache: Redis via cachekit-rs (optional)
+                let l2_cache = if let Ok(url) = std::env::var("REDIS_CACHE_URL") {
+                    match init_l2_cache(&url, &embed_model, embed_dims).await {
+                        Ok(ck) => {
+                            tracing::info!("L2 embedding cache enabled (Redis)");
+                            Some(ck)
+                        }
+                        Err(e) => {
+                            tracing::warn!("L2 cache init failed, running L1-only: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    tracing::info!("REDIS_CACHE_URL not set — L1-only embedding cache");
+                    None
+                };
                 let cached_embeddings = cached_embedding::CachedEmbedding::new(
                     Box::new(embeddings),
-                    10_000, // max cached embeddings (~40 MB at 1024 dims)
+                    10_000, // L1 max cached embeddings (~40 MB at 1024 dims)
+                    l2_cache,
                 );
                 let graph = std::rc::Rc::new(GraphHttpClient::new(
                     cfg_clone.graph_url,
