@@ -102,7 +102,7 @@ async fn init_l2_cache(
     // Namespace includes model+dims so cache auto-invalidates on config change
     let ns = format!("alaya:embed:{model}:{dims}");
     Ok(cachekit::CacheKit::builder()
-        .backend(std::sync::Arc::new(redis))
+        .backend(std::rc::Rc::new(redis))
         .namespace(ns)
         .default_ttl(std::time::Duration::from_secs(86400 * 30))
         .no_l1()
