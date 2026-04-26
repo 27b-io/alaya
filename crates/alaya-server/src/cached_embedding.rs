@@ -63,30 +63,48 @@ impl CachedEmbedding {
         (self.hits_l1.get(), self.hits_l2.get(), self.misses.get())
     }
 
-    /// Try L2 get, backfill L1 on hit.
-    async fn l2_get(&self, key_bytes: [u8; 32], key_hex: &str) -> Option<Vec<f32>> {
-        let l2 = self.l2.as_ref()?;
-        match l2.get::<Vec<f32>>(key_hex).await {
-            Ok(Some(embedding)) => {
-                // Backfill L1
-                self.l1.borrow_mut().insert(key_bytes, embedding.clone());
-                self.hits_l2.set(self.hits_l2.get() + 1);
-                Some(embedding)
-            }
-            Ok(None) => None,
-            Err(e) => {
-                tracing::debug!("L2 cache get failed (non-fatal): {e}");
-                None
-            }
-        }
+    /// Concurrent L2 reads for a batch of keys. Returns results in same order.
+    /// Handles backfill into L1 and hit counting after all reads complete.
+    async fn l2_get_batch(&self, keys: &[([u8; 32], &str)]) -> Vec<Option<Vec<f32>>> {
+        let l2 = match self.l2.as_ref() {
+            Some(l2) => l2,
+            None => return vec![None; keys.len()],
+        };
+
+        // Fan out all Redis reads concurrently (single thread, interleaved I/O)
+        let futs: Vec<_> = keys.iter().map(|(_, kh)| l2.get::<Vec<f32>>(kh)).collect();
+        let raw_results = futures::future::join_all(futs).await;
+
+        // Process results: backfill L1, count hits
+        raw_results
+            .into_iter()
+            .zip(keys)
+            .map(|(result, (kb, _))| match result {
+                Ok(Some(embedding)) => {
+                    self.l1.borrow_mut().insert(*kb, embedding.clone());
+                    self.hits_l2.set(self.hits_l2.get() + 1);
+                    Some(embedding)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::debug!("L2 cache get failed (non-fatal): {e}");
+                    None
+                }
+            })
+            .collect()
     }
 
-    /// Write to L2 (fire-and-forget, errors logged).
-    async fn l2_set(&self, key_hex: &str, embedding: &Vec<f32>) {
-        if let Some(l2) = self.l2.as_ref()
-            && let Err(e) = l2.set(key_hex, embedding).await
-        {
-            tracing::debug!("L2 cache set failed (non-fatal): {e}");
+    /// Batch L2 writes — concurrent, errors logged.
+    async fn l2_set_batch(&self, entries: &[(&str, &Vec<f32>)]) {
+        let l2 = match self.l2.as_ref() {
+            Some(l2) => l2,
+            None => return,
+        };
+        let futs: Vec<_> = entries.iter().map(|(k, v)| l2.set(k, *v)).collect();
+        for result in futures::future::join_all(futs).await {
+            if let Err(e) = result {
+                tracing::debug!("L2 cache set failed (non-fatal): {e}");
+            }
         }
     }
 }
@@ -111,12 +129,17 @@ impl EmbeddingProvider for CachedEmbedding {
             }
         }
 
-        // L2 check for L1 misses
-        if self.l2.is_some() {
+        // L2 check — fan out all misses concurrently
+        if self.l2.is_some() && !miss_indices.is_empty() {
+            let l2_keys: Vec<([u8; 32], &str)> = miss_indices
+                .iter()
+                .map(|&i| (keys[i].0, keys[i].1.as_str()))
+                .collect();
+            let l2_results = self.l2_get_batch(&l2_keys).await;
+
             let mut still_missing = Vec::new();
-            for &idx in &miss_indices {
-                let (kb, ref kh) = keys[idx];
-                if let Some(embedding) = self.l2_get(kb, kh).await {
+            for (&idx, l2_result) in miss_indices.iter().zip(l2_results) {
+                if let Some(embedding) = l2_result {
                     results[idx] = Some(embedding);
                 } else {
                     still_missing.push(idx);
@@ -135,12 +158,26 @@ impl EmbeddingProvider for CachedEmbedding {
         let miss_texts: Vec<&str> = miss_indices.iter().map(|&i| texts[i]).collect();
         let fresh = self.inner.embed_batch(&miss_texts, prompt_name).await?;
 
-        // Populate both tiers
+        // Populate L1 + results, collect keys for L2 batch write
+        let mut l2_write_keys: Vec<usize> = Vec::new();
         for (&idx, embedding) in miss_indices.iter().zip(fresh) {
-            let (kb, ref kh) = keys[idx];
+            let (kb, _) = keys[idx];
             self.l1.borrow_mut().insert(kb, embedding.clone());
-            self.l2_set(kh, &embedding).await;
+            l2_write_keys.push(idx);
             results[idx] = Some(embedding);
+        }
+
+        // Batch L2 writes concurrently (non-blocking: results already assigned)
+        if self.l2.is_some() {
+            let entries: Vec<(&str, &Vec<f32>)> = l2_write_keys
+                .iter()
+                .filter_map(|&idx| {
+                    let kh = keys[idx].1.as_str();
+                    let emb = results[idx].as_ref()?;
+                    Some((kh, emb))
+                })
+                .collect();
+            self.l2_set_batch(&entries).await;
         }
 
         Ok(results.into_iter().map(|o| o.unwrap()).collect())

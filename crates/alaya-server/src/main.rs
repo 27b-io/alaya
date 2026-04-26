@@ -91,15 +91,19 @@ fn env_or(key: &str, default: &str) -> String {
 
 async fn init_l2_cache(
     url: &str,
+    model: &str,
+    dims: usize,
 ) -> std::result::Result<cachekit::CacheKit, Box<dyn std::error::Error>> {
     let redis = cachekit::backend::redis::RedisBackend::builder()
         .url(url)
         .build()?;
     let handle = redis.connect().await?;
     handle.await??;
+    // Namespace includes model+dims so cache auto-invalidates on config change
+    let ns = format!("alaya:embed:{model}:{dims}");
     Ok(cachekit::CacheKit::builder()
         .backend(std::sync::Arc::new(redis))
-        .namespace("alaya:embed")
+        .namespace(ns)
         .default_ttl(std::time::Duration::from_secs(86400 * 30))
         .no_l1()
         .build()?)
@@ -879,15 +883,17 @@ fn main() {
                     cfg_clone.qdrant_collection,
                     cfg_clone.qdrant_api_key,
                 );
+                let embed_model = cfg_clone.embedding_model;
+                let embed_dims = cfg_clone.embedding_dimensions;
                 let embeddings = EmbeddingClient::new(
                     cfg_clone.embedding_url,
-                    cfg_clone.embedding_model,
-                    cfg_clone.embedding_dimensions,
+                    embed_model.clone(),
+                    embed_dims,
                     None,
                 );
                 // L2 embedding cache: Redis via cachekit-rs (optional)
                 let l2_cache = if let Ok(url) = std::env::var("REDIS_CACHE_URL") {
-                    match init_l2_cache(&url).await {
+                    match init_l2_cache(&url, &embed_model, embed_dims).await {
                         Ok(ck) => {
                             tracing::info!("L2 embedding cache enabled (Redis)");
                             Some(ck)
