@@ -22,6 +22,7 @@ tracing-subscriber = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 mini-moka = { workspace = true }
+cachekit-rs = { workspace = true }
 
 # OpenTelemetry (optional — enabled when OTEL_ENDPOINT is set)
 opentelemetry = "0.29"

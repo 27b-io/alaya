@@ -89,6 +89,22 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+async fn init_l2_cache(
+    url: &str,
+) -> std::result::Result<cachekit::CacheKit, Box<dyn std::error::Error>> {
+    let redis = cachekit::backend::redis::RedisBackend::builder()
+        .url(url)
+        .build()?;
+    let handle = redis.connect().await?;
+    handle.await??;
+    Ok(cachekit::CacheKit::builder()
+        .backend(std::sync::Arc::new(redis))
+        .namespace("alaya:embed")
+        .default_ttl(std::time::Duration::from_secs(86400 * 30))
+        .no_l1()
+        .build()?)
+}
+
 // ─── Command channel ────────────────────────────────────────────────────────
 
 const CMD_CHANNEL_CAP: usize = 256;
@@ -869,9 +885,26 @@ fn main() {
                     cfg_clone.embedding_dimensions,
                     None,
                 );
+                // L2 embedding cache: Redis via cachekit-rs (optional)
+                let l2_cache = if let Ok(url) = std::env::var("REDIS_CACHE_URL") {
+                    match init_l2_cache(&url).await {
+                        Ok(ck) => {
+                            tracing::info!("L2 embedding cache enabled (Redis)");
+                            Some(ck)
+                        }
+                        Err(e) => {
+                            tracing::warn!("L2 cache init failed, running L1-only: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    tracing::info!("REDIS_CACHE_URL not set — L1-only embedding cache");
+                    None
+                };
                 let cached_embeddings = cached_embedding::CachedEmbedding::new(
                     Box::new(embeddings),
-                    10_000, // max cached embeddings (~40 MB at 1024 dims)
+                    10_000, // L1 max cached embeddings (~40 MB at 1024 dims)
+                    l2_cache,
                 );
                 let graph = std::rc::Rc::new(GraphHttpClient::new(
                     cfg_clone.graph_url,
