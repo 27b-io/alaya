@@ -89,6 +89,9 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+const L2_MAX_ATTEMPTS: u32 = 5;
+const L2_BASE_RETRY_MS: u64 = 500;
+
 async fn init_l2_cache(
     url: &str,
     model: &str,
@@ -97,17 +100,39 @@ async fn init_l2_cache(
     let redis = cachekit::backend::redis::RedisBackend::builder()
         .url(url)
         .build()?;
-    // Start connection attempt but don't block — fred reconnects automatically.
-    // If Redis is down, the circuit breaker in CachedEmbedding handles it.
-    let handle = redis.connect().await?;
-    drop(handle);
-    let ns = format!("alaya:embed:{model}:{dims}");
-    Ok(cachekit::CacheKit::builder()
-        .backend(std::rc::Rc::new(redis))
-        .namespace(ns)
-        .default_ttl(std::time::Duration::from_secs(86400 * 30))
-        .no_l1()
-        .build()?)
+    // Retry connection with backoff — at pod startup the CNI/kube-proxy may
+    // not have finished installing network rules yet, causing ECONNREFUSED.
+    let mut last_err = None;
+    for attempt in 0..L2_MAX_ATTEMPTS {
+        match redis.connect().await {
+            Ok(handle) => {
+                drop(handle);
+                if attempt > 0 {
+                    tracing::info!(attempt, "L2 cache connected after retry");
+                }
+                let ns = format!("alaya:embed:{model}:{dims}");
+                return Ok(cachekit::CacheKit::builder()
+                    .backend(std::rc::Rc::new(redis))
+                    .namespace(ns)
+                    .default_ttl(std::time::Duration::from_secs(86400 * 30))
+                    .no_l1()
+                    .build()?);
+            }
+            Err(e) => {
+                tracing::debug!(attempt, error = %e, "L2 cache connect attempt failed");
+                last_err = Some(e);
+                if attempt + 1 < L2_MAX_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        L2_BASE_RETRY_MS * (1 << attempt),
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+    Err(last_err
+        .ok_or_else(|| "L2 cache init: no connection attempts made".to_string())?
+        .into())
 }
 
 // ─── Command channel ────────────────────────────────────────────────────────
