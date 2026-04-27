@@ -97,12 +97,13 @@ async fn init_l2_cache(
     let redis = cachekit::backend::redis::RedisBackend::builder()
         .url(url)
         .build()?;
+    // Start connection attempt but don't block — fred reconnects automatically.
+    // If Redis is down, the circuit breaker in CachedEmbedding handles it.
     let handle = redis.connect().await?;
-    handle.await??;
-    // Namespace includes model+dims so cache auto-invalidates on config change
+    drop(handle);
     let ns = format!("alaya:embed:{model}:{dims}");
     Ok(cachekit::CacheKit::builder()
-        .backend(std::sync::Arc::new(redis))
+        .backend(std::rc::Rc::new(redis))
         .namespace(ns)
         .default_ttl(std::time::Duration::from_secs(86400 * 30))
         .no_l1()

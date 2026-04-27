@@ -5,6 +5,9 @@
 //!
 //! Embeddings are immutable and content-addressed — same text always produces
 //! the same vector. Cache keys are SHA-256(prompt_name + ":" + text).
+//!
+//! L2 has a circuit breaker: after 3 consecutive failures, L2 is bypassed
+//! for 30 seconds before retrying. Prevents hammering a dead Redis.
 
 use std::cell::{Cell, RefCell};
 
@@ -15,6 +18,18 @@ use sha2::{Digest, Sha256};
 use alaya_backends::traits::EmbeddingProvider;
 use alaya_types::Result;
 use alaya_types::search::PromptName;
+
+/// Consecutive L2 failures before the circuit opens.
+const BREAKER_THRESHOLD: u32 = 3;
+/// Seconds to wait before retrying L2 after circuit opens.
+const BREAKER_COOLDOWN_SECS: f64 = 30.0;
+
+fn now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
 
 /// Cache key: SHA-256 of (prompt_name, text). Returns (raw bytes for L1, hex string for L2).
 fn cache_key(prompt: PromptName, text: &str) -> ([u8; 32], String) {
@@ -40,6 +55,10 @@ pub struct CachedEmbedding {
     hits_l1: Cell<u64>,
     hits_l2: Cell<u64>,
     misses: Cell<u64>,
+    /// Circuit breaker: consecutive L2 failure count.
+    l2_failures: Cell<u32>,
+    /// Timestamp when circuit opened (0.0 = closed).
+    l2_open_since: Cell<f64>,
 }
 
 impl CachedEmbedding {
@@ -55,6 +74,8 @@ impl CachedEmbedding {
             hits_l1: Cell::new(0),
             hits_l2: Cell::new(0),
             misses: Cell::new(0),
+            l2_failures: Cell::new(0),
+            l2_open_since: Cell::new(0.0),
         }
     }
 
@@ -63,48 +84,114 @@ impl CachedEmbedding {
         (self.hits_l1.get(), self.hits_l2.get(), self.misses.get())
     }
 
-    /// Concurrent L2 reads for a batch of keys. Returns results in same order.
-    /// Handles backfill into L1 and hit counting after all reads complete.
+    /// Check if L2 circuit breaker allows a request.
+    fn l2_available(&self) -> bool {
+        if self.l2.is_none() {
+            return false;
+        }
+        let open_since = self.l2_open_since.get();
+        if open_since == 0.0 {
+            return true; // closed
+        }
+        // Half-open: try again after cooldown
+        if now_secs() - open_since >= BREAKER_COOLDOWN_SECS {
+            return true;
+        }
+        false // open
+    }
+
+    /// Record L2 success — reset breaker.
+    fn l2_success(&self) {
+        if self.l2_failures.get() > 0 {
+            self.l2_failures.set(0);
+            if self.l2_open_since.get() != 0.0 {
+                tracing::info!("L2 cache circuit breaker closed (recovered)");
+                self.l2_open_since.set(0.0);
+            }
+        }
+    }
+
+    /// Record L2 failure — trip breaker after threshold, refresh on half-open failure.
+    fn l2_failure(&self) {
+        let n = self.l2_failures.get() + 1;
+        self.l2_failures.set(n);
+        if self.l2_open_since.get() != 0.0 {
+            // Half-open probe failed — re-enter open state with fresh cooldown
+            self.l2_open_since.set(now_secs());
+            return;
+        }
+        if n >= BREAKER_THRESHOLD {
+            tracing::warn!(
+                failures = n,
+                cooldown_secs = BREAKER_COOLDOWN_SECS,
+                "L2 cache circuit breaker OPEN — bypassing Redis"
+            );
+            self.l2_open_since.set(now_secs());
+        }
+    }
+
+    /// Concurrent L2 reads for a batch of keys.
     async fn l2_get_batch(&self, keys: &[([u8; 32], &str)]) -> Vec<Option<Vec<f32>>> {
         let l2 = match self.l2.as_ref() {
             Some(l2) => l2,
             None => return vec![None; keys.len()],
         };
 
-        // Fan out all Redis reads concurrently (single thread, interleaved I/O)
         let futs: Vec<_> = keys.iter().map(|(_, kh)| l2.get::<Vec<f32>>(kh)).collect();
         let raw_results = futures::future::join_all(futs).await;
 
-        // Process results: backfill L1, count hits
-        raw_results
+        let mut any_success = false;
+        let mut any_failure = false;
+
+        let results: Vec<Option<Vec<f32>>> = raw_results
             .into_iter()
             .zip(keys)
             .map(|(result, (kb, _))| match result {
                 Ok(Some(embedding)) => {
                     self.l1.borrow_mut().insert(*kb, embedding.clone());
                     self.hits_l2.set(self.hits_l2.get() + 1);
+                    any_success = true;
                     Some(embedding)
                 }
-                Ok(None) => None,
+                Ok(None) => {
+                    any_success = true;
+                    None
+                }
                 Err(e) => {
                     tracing::debug!("L2 cache get failed (non-fatal): {e}");
+                    any_failure = true;
                     None
                 }
             })
-            .collect()
+            .collect();
+
+        if any_success {
+            self.l2_success();
+        } else if any_failure {
+            self.l2_failure();
+        }
+
+        results
     }
 
-    /// Batch L2 writes — concurrent, errors logged.
+    /// Batch L2 writes — concurrent, errors tracked by circuit breaker.
     async fn l2_set_batch(&self, entries: &[(&str, &Vec<f32>)]) {
         let l2 = match self.l2.as_ref() {
             Some(l2) => l2,
             None => return,
         };
         let futs: Vec<_> = entries.iter().map(|(k, v)| l2.set(k, *v)).collect();
+        let mut any_failure = false;
         for result in futures::future::join_all(futs).await {
             if let Err(e) = result {
                 tracing::debug!("L2 cache set failed (non-fatal): {e}");
+                any_failure = true;
             }
+        }
+        if any_failure {
+            self.l2_failure();
+        } else {
+            self.l2_success();
         }
     }
 }
@@ -112,7 +199,6 @@ impl CachedEmbedding {
 #[async_trait(?Send)]
 impl EmbeddingProvider for CachedEmbedding {
     async fn embed_batch(&self, texts: &[&str], prompt_name: PromptName) -> Result<Vec<Vec<f32>>> {
-        // Compute all keys upfront
         let keys: Vec<([u8; 32], String)> =
             texts.iter().map(|t| cache_key(prompt_name, t)).collect();
 
@@ -129,8 +215,8 @@ impl EmbeddingProvider for CachedEmbedding {
             }
         }
 
-        // L2 check — fan out all misses concurrently
-        if self.l2.is_some() && !miss_indices.is_empty() {
+        // L2 check — fan out concurrently (if circuit breaker allows)
+        if self.l2_available() && !miss_indices.is_empty() {
             let l2_keys: Vec<([u8; 32], &str)> = miss_indices
                 .iter()
                 .map(|&i| (keys[i].0, keys[i].1.as_str()))
@@ -167,8 +253,8 @@ impl EmbeddingProvider for CachedEmbedding {
             results[idx] = Some(embedding);
         }
 
-        // Batch L2 writes concurrently (non-blocking: results already assigned)
-        if self.l2.is_some() {
+        // Batch L2 writes concurrently (if circuit breaker allows)
+        if self.l2_available() {
             let entries: Vec<(&str, &Vec<f32>)> = l2_write_keys
                 .iter()
                 .filter_map(|&idx| {
