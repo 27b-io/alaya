@@ -111,11 +111,16 @@ impl CachedEmbedding {
         }
     }
 
-    /// Record L2 failure — trip breaker after threshold.
+    /// Record L2 failure — trip breaker after threshold, refresh on half-open failure.
     fn l2_failure(&self) {
         let n = self.l2_failures.get() + 1;
         self.l2_failures.set(n);
-        if n >= BREAKER_THRESHOLD && self.l2_open_since.get() == 0.0 {
+        if self.l2_open_since.get() != 0.0 {
+            // Half-open probe failed — re-enter open state with fresh cooldown
+            self.l2_open_since.set(now_secs());
+            return;
+        }
+        if n >= BREAKER_THRESHOLD {
             tracing::warn!(
                 failures = n,
                 cooldown_secs = BREAKER_COOLDOWN_SECS,
