@@ -202,19 +202,35 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def extract_keywords(text: str) -> list[str]:
+def extract_keywords(text: str, existing_tags: set[str] | None = None) -> list[str]:
+    """Extract keywords mirroring Alaya's Rust hybrid_search::extract_query_keywords.
+
+    - Split on non-alphanumeric (not just alpha — keeps digits like Rust)
+    - Generate hyphenated compounds from adjacent pairs
+    - Filter to existing_tags if provided (matches Rust's optional tag filter)
+    """
     tokens = [
         t.lower()
-        for t in re.findall(r"[a-zA-Z]{2,}", text)
-        if t.lower() not in STOP_WORDS and len(t) >= 2
+        for t in re.split(r"[^a-zA-Z0-9]+", text)
+        if len(t) >= 2 and t.lower() not in STOP_WORDS
     ]
+
+    keywords = list(tokens)
+    # Adjacent hyphenated compounds (same as Rust windows(2))
+    for a, b in zip(tokens, tokens[1:]):
+        keywords.append(f"{a}-{b}")
+
+    # Filter to existing tags if provided
+    if existing_tags is not None:
+        keywords = [k for k in keywords if k in existing_tags]
+
     # Deduplicate preserving order
     seen = set()
     unique = []
-    for t in tokens:
-        if t not in seen:
-            seen.add(t)
-            unique.append(t)
+    for k in keywords:
+        if k not in seen:
+            seen.add(k)
+            unique.append(k)
     return unique
 
 
@@ -469,7 +485,9 @@ def score_question(cached_q: dict, params: dict) -> dict:
     vector_ranks = {int(idx): rank + 1 for rank, idx in enumerate(vector_order)}
 
     # ── Tag ranking ──────────────────────────────────────────────────
-    query_keywords = set(extract_keywords(cached_q["question"]))
+    # Build tag set (mirrors Rust's get_all_tags → filter to existing)
+    all_tags = {tag for tags in tags_per_doc for tag in tags}
+    query_keywords = set(extract_keywords(cached_q["question"], existing_tags=all_tags))
     tag_scores = []
     for doc_idx, tags in enumerate(tags_per_doc):
         overlap = len(query_keywords & set(tags))
@@ -645,6 +663,10 @@ def optimize(args):
     evaluator = make_evaluator(cache)
 
     # Score baseline first
+    if not dev_examples or not val_examples:
+        print("\n  ERROR: empty dev or val set after split. Check --dev-size and data.")
+        sys.exit(1)
+
     print("\n  Baseline (current Alaya params):")
     baseline_scores = []
     for ex in dev_examples:
@@ -741,7 +763,7 @@ def optimize(args):
         val_scores.append(s)
         val_per_type[asi["question_type"]].append(s)
 
-    opt_val = sum(val_scores) / len(val_scores)
+    opt_val = sum(val_scores) / len(val_scores) if val_scores else 0.0
     print(f"  Baseline Val NDCG@10:  {baseline_val:.4f}")
     print(f"  Optimized Val NDCG@10: {opt_val:.4f}  ({opt_val - baseline_val:+.4f})")
     print("\n  Per-type (val):")

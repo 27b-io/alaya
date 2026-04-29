@@ -162,6 +162,9 @@ class AlayaClient:
         body = r.json()
         if body.get("duplicate"):
             raise DuplicateMemory(body.get("content_hash", ""))
+        if body.get("success") is False or "error" in body:
+            msg = body.get("error", body.get("message", "unknown store failure"))
+            raise RuntimeError(f"Alaya store failed: {msg}")
         return body
 
     def search(self, query: str, mode: str = "hybrid", k: int = 10) -> dict:
@@ -510,8 +513,8 @@ def run_question(
             stored += 1
         except DuplicateMemory:
             pass  # Same content already stored — expected for duplicate sessions
-        except httpx.HTTPStatusError as e:
-            print(f"    Store error for {sess_id}: {e}", file=sys.stderr)
+        except (httpx.HTTPStatusError, RuntimeError) as e:
+            return {"error": f"store failure for {sess_id}: {e}"}
 
     if stored == 0:
         return {"error": "no sessions stored"}
