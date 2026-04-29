@@ -187,6 +187,13 @@ const BOOST_GRAPH_ACTIVATION: f64 = 0.10;
 /// Hebbian co-access: memories frequently retrieved together.
 const BOOST_HEBBIAN: f64 = 0.10;
 
+/// RRF blend weight: how much the fused rank signal contributes to the
+/// final score vs raw cosine similarity.  0.0 = pure cosine (pre-fix
+/// behavior), 1.0 = pure RRF rank.  GEPA-optimized on LongMemEval:
+/// 0.4 ties with 0.9/1.0 at R@5=0.938; 0.4 chosen to preserve cosine
+/// signal for production (where boosts amplify it).
+const RRF_BLEND_WEIGHT: f64 = 0.4;
+
 pub struct MemoryService {
     pub vectors: Box<dyn VectorStorage>,
     pub embeddings: Box<dyn EmbeddingProvider>,
@@ -758,10 +765,21 @@ impl MemoryService {
             ));
         }
 
+        // Normalize RRF scores to [0, 1] for blending with display_score (cosine).
+        // Max RRF score is 1/(k+1) for rank 1; scale so rank-1 maps to ~1.0.
+        let max_rrf = fused
+            .iter()
+            .map(|(_, rrf, _)| *rrf)
+            .fold(0.0_f64, f64::max)
+            .max(1e-9);
+
         let mut scored_results: Vec<(String, f64)> = fused
             .iter()
-            .map(|(hash, _rrf, display_score)| {
-                let mut score = *display_score;
+            .map(|(hash, rrf_combined, display_score)| {
+                // Blend normalized RRF rank signal with cosine similarity
+                let rrf_norm = rrf_combined / max_rrf;
+                let mut score =
+                    RRF_BLEND_WEIGHT * rrf_norm + (1.0 - RRF_BLEND_WEIGHT) * display_score;
 
                 // Salience boost
                 if let Some(sm) = memory_map.get(hash) {
@@ -814,8 +832,8 @@ impl MemoryService {
                     score *= 1.0 + BOOST_HEBBIAN * boost;
                 }
 
-                // Cap at 1.0
-                (hash.clone(), score.min(1.0))
+                // Cap — keeps scores bounded after multiplicative boosts
+                (hash.clone(), score.min(1.5))
             })
             .collect();
 
