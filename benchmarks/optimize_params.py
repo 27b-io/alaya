@@ -50,7 +50,7 @@ EMBED_CACHE_FILE = EMBED_CACHE_DIR / "lme_embeddings.npz"
 
 SEED_PARAMS = {
     "rrf_k": 20,
-    "rrf_blend_weight": 0.5,
+    "rrf_blend_weight": 0.4,
     "alpha_small": 0.72,
     "alpha_medium": 0.7,
     "alpha_large": 0.8,
@@ -365,11 +365,11 @@ def score_question(cached_q: dict, params: dict) -> dict:
         tag_scores.append((doc_idx, overlap))
     tag_scores.sort(key=lambda x: -x[1])
     tag_ranks = {idx: rank + 1 for rank, (idx, score) in enumerate(tag_scores) if score > 0}
-    matching_tag_count = sum(1 for _, s in tag_scores if s > 0)
 
     # ── RRF fusion ───────────────────────────────────────────────────
     rrf_k = int(params["rrf_k"])
-    alpha = get_adaptive_alpha(n_docs, matching_tag_count, params)
+    # Rust passes n_keywords (matched query keyword count), not document count
+    alpha = get_adaptive_alpha(n_docs, len(query_keywords), params)
 
     all_indices = set(range(n_docs))
     fused = []
@@ -525,15 +525,15 @@ def optimize(args):
     for ex in dev_examples:
         s, _ = evaluator(json.dumps(SEED_PARAMS), ex)
         baseline_scores.append(s)
-    baseline_r5 = sum(baseline_scores) / len(baseline_scores)
-    print(f"    Dev R@5:  {baseline_r5:.4f}")
+    baseline_dev = sum(baseline_scores) / len(baseline_scores)
+    print(f"    Dev NDCG@10:  {baseline_dev:.4f}")
 
     baseline_val_scores = []
     for ex in val_examples:
         s, _ = evaluator(json.dumps(SEED_PARAMS), ex)
         baseline_val_scores.append(s)
-    baseline_val_r5 = sum(baseline_val_scores) / len(baseline_val_scores)
-    print(f"    Val R@5:  {baseline_val_r5:.4f}")
+    baseline_val = sum(baseline_val_scores) / len(baseline_val_scores)
+    print(f"    Val NDCG@10:  {baseline_val:.4f}")
 
     # LiteLLM gateway config
     litellm_api_base = args.api_base
@@ -616,24 +616,24 @@ def optimize(args):
         val_scores.append(s)
         val_per_type[asi["question_type"]].append(s)
 
-    opt_val_r5 = sum(val_scores) / len(val_scores)
-    print(f"  Baseline Val R@5:  {baseline_val_r5:.4f}")
-    print(f"  Optimized Val R@5: {opt_val_r5:.4f}  ({opt_val_r5 - baseline_val_r5:+.4f})")
+    opt_val = sum(val_scores) / len(val_scores)
+    print(f"  Baseline Val NDCG@10:  {baseline_val:.4f}")
+    print(f"  Optimized Val NDCG@10: {opt_val:.4f}  ({opt_val - baseline_val:+.4f})")
     print(f"\n  Per-type (val):")
     for qtype in sorted(val_per_type.keys()):
         scores = val_per_type[qtype]
         avg = sum(scores) / len(scores)
-        print(f"    {qtype:30} R@5={avg:.3f}  ({len(scores)}q)")
+        print(f"    {qtype:30} NDCG@10={avg:.3f}  ({len(scores)}q)")
 
     # Save results
     out_path = args.out or "benchmarks/optimized_params.json"
     output = {
         "seed_params": SEED_PARAMS,
         "optimized_params": best_params,
-        "baseline_dev_r5": baseline_r5,
-        "baseline_val_r5": baseline_val_r5,
-        "optimized_val_r5": opt_val_r5,
-        "improvement": opt_val_r5 - baseline_val_r5,
+        "baseline_dev_ndcg10": baseline_dev,
+        "baseline_val_ndcg10": baseline_val,
+        "optimized_val_ndcg10": opt_val,
+        "improvement": opt_val - baseline_val,
         "val_per_type": {k: sum(v) / len(v) for k, v in val_per_type.items()},
     }
     with open(out_path, "w") as f:

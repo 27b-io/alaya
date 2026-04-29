@@ -112,21 +112,17 @@ class QdrantAdmin:
     def reset_collections(self):
         """Delete and recreate both collections for a clean slate."""
         for coll in (COLLECTION, TAG_COLLECTION):
-            # Delete (ignore errors — may not exist)
-            try:
-                self.client.delete(f"{self.base}/collections/{coll}")
-            except Exception:
-                pass
-            # Create (ignore "already exists")
-            try:
-                self.client.put(
-                    f"{self.base}/collections/{coll}",
-                    json={
-                        "vectors": {"size": EMBEDDING_DIM, "distance": "Cosine"},
-                    },
-                )
-            except Exception:
-                pass
+            resp = self.client.delete(f"{self.base}/collections/{coll}")
+            if resp.status_code not in (200, 404):
+                resp.raise_for_status()
+            resp = self.client.put(
+                f"{self.base}/collections/{coll}",
+                json={
+                    "vectors": {"size": EMBEDDING_DIM, "distance": "Cosine"},
+                },
+            )
+            if resp.status_code not in (200, 409):
+                resp.raise_for_status()
 
     def close(self):
         self.client.close()
@@ -272,7 +268,7 @@ def run_question(
     qdrant.reset_collections()
 
     # 2. Store each session through Alaya
-    hash_to_session_id: dict[str, str] = {}
+    hash_to_session_ids: dict[str, list[str]] = {}
     stored = 0
 
     for session, sess_id, date in zip(sessions, session_ids, dates):
@@ -282,7 +278,7 @@ def run_question(
 
         tags = extract_tags(doc)
         chash = content_hash(doc)
-        hash_to_session_id[chash] = sess_id
+        hash_to_session_ids.setdefault(chash, []).append(sess_id)
 
         try:
             alaya.store(
@@ -313,9 +309,9 @@ def run_question(
     for r in results:
         mem = r.get("memory", r)
         chash = mem.get("content_hash", "")
-        sid = hash_to_session_id.get(chash)
-        if sid and sid not in ranked_session_ids:
-            ranked_session_ids.append(sid)
+        for sid in hash_to_session_ids.get(chash, []):
+            if sid not in ranked_session_ids:
+                ranked_session_ids.append(sid)
 
     # 5. Score
     metrics = {

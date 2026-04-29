@@ -14,7 +14,7 @@ services:
     tmpfs: ["/tmp/qdrant_bench"]
 
   falkordb:
-    image: docker.io/falkordb/falkordb:latest
+    image: docker.io/falkordb/falkordb:v4.18.2
     ports: ["16379:6379"]
 
   bridge:
