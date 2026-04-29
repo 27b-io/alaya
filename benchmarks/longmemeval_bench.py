@@ -65,7 +65,9 @@ def dcg(relevances: list[float], k: int) -> float:
 
 def ndcg_at_k(ranked_ids: list[str], correct_ids: set[str], k: int) -> float:
     relevances = [1.0 if rid in correct_ids else 0.0 for rid in ranked_ids[:k]]
-    ideal = sorted(relevances, reverse=True)
+    # IDCG from ground truth: min(k, num_relevant) ones at the top
+    n_relevant = min(k, len(correct_ids))
+    ideal = [1.0] * n_relevant + [0.0] * (k - n_relevant)
     idcg = dcg(ideal, k)
     if idcg == 0:
         return 0.0
@@ -131,6 +133,10 @@ class QdrantAdmin:
 # ── Alaya client ─────────────────────────────────────────────────────────────
 
 
+class DuplicateMemory(Exception):
+    """Raised when Alaya reports a dedup hit (HTTP 200, duplicate=true)."""
+
+
 class AlayaClient:
     """Talks to Alaya's REST API."""
 
@@ -154,7 +160,10 @@ class AlayaClient:
             },
         )
         r.raise_for_status()
-        return r.json()
+        body = r.json()
+        if body.get("duplicate"):
+            raise DuplicateMemory(body.get("content_hash", ""))
+        return body
 
     def search(self, query: str, mode: str = "hybrid", k: int = 10) -> dict:
         r = self.client.post(
@@ -168,7 +177,10 @@ class AlayaClient:
             },
         )
         r.raise_for_status()
-        return r.json()
+        body = r.json()
+        if "error" in body:
+            raise RuntimeError(f"Alaya search error: {body['error']}")
+        return body
 
     def close(self):
         self.client.close()
@@ -287,12 +299,10 @@ def run_question(
                 metadata={"session_id": sess_id, "session_date": date},
             )
             stored += 1
+        except DuplicateMemory:
+            pass  # Same content already stored — expected for duplicate sessions
         except httpx.HTTPStatusError as e:
-            # Duplicate content hash — same doc text across sessions
-            if e.response.status_code == 409:
-                pass
-            else:
-                print(f"    Store error for {sess_id}: {e}", file=sys.stderr)
+            print(f"    Store error for {sess_id}: {e}", file=sys.stderr)
 
     if stored == 0:
         return {"error": "no sessions stored"}

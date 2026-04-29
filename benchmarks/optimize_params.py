@@ -406,11 +406,11 @@ def score_question(cached_q: dict, params: dict) -> dict:
     r5 = float(any(aid in top5 for aid in answer_ids))
     r10 = float(any(aid in top10 for aid in answer_ids))
 
-    # NDCG@10
+    # NDCG@10 — IDCG from ground truth, not from retrieved subset
     relevances = [1.0 if sid in answer_ids else 0.0 for sid in ranked_sids[:10]]
-    ideal = sorted(relevances, reverse=True)
     dcg_val = sum(r / math.log2(i + 2) for i, r in enumerate(relevances))
-    idcg_val = sum(r / math.log2(i + 2) for i, r in enumerate(ideal))
+    n_relevant = min(10, len(answer_ids))
+    idcg_val = sum(1.0 / math.log2(i + 2) for i in range(n_relevant))
     ndcg10 = dcg_val / idcg_val if idcg_val > 0 else 0.0
 
     # Find where the correct answer actually ranked
@@ -429,7 +429,7 @@ def score_question(cached_q: dict, params: dict) -> dict:
         "correct_rank": correct_rank,
         "n_docs": n_docs,
         "alpha_used": alpha,
-        "matching_tags": matching_tag_count,
+        "matching_tags": len(query_keywords),
     }
 
     if r5 == 0.0 and correct_rank is not None:
