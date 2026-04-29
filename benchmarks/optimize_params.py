@@ -69,19 +69,118 @@ SEED_PARAMS = {
 # ── Stop words (from Alaya hybrid_search.rs) ─────────────────────────────────
 
 STOP_WORDS = {
-    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "shall", "can", "need", "dare", "ought",
-    "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
-    "as", "into", "through", "during", "before", "after", "above", "below",
-    "between", "out", "off", "over", "under", "again", "further", "then",
-    "once", "here", "there", "when", "where", "why", "how", "all", "each",
-    "every", "both", "few", "more", "most", "other", "some", "such", "no",
-    "not", "only", "own", "same", "so", "than", "too", "very", "just",
-    "because", "but", "and", "or", "if", "while", "about", "up", "it",
-    "its", "me", "my", "we", "our", "you", "your", "he", "him", "his",
-    "she", "her", "they", "them", "their", "what", "which", "who", "this",
-    "that", "these", "those", "am",
+    "a",
+    "an",
+    "the",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "do",
+    "does",
+    "did",
+    "will",
+    "would",
+    "could",
+    "should",
+    "may",
+    "might",
+    "shall",
+    "can",
+    "need",
+    "dare",
+    "ought",
+    "used",
+    "to",
+    "of",
+    "in",
+    "for",
+    "on",
+    "with",
+    "at",
+    "by",
+    "from",
+    "as",
+    "into",
+    "through",
+    "during",
+    "before",
+    "after",
+    "above",
+    "below",
+    "between",
+    "out",
+    "off",
+    "over",
+    "under",
+    "again",
+    "further",
+    "then",
+    "once",
+    "here",
+    "there",
+    "when",
+    "where",
+    "why",
+    "how",
+    "all",
+    "each",
+    "every",
+    "both",
+    "few",
+    "more",
+    "most",
+    "other",
+    "some",
+    "such",
+    "no",
+    "not",
+    "only",
+    "own",
+    "same",
+    "so",
+    "than",
+    "too",
+    "very",
+    "just",
+    "because",
+    "but",
+    "and",
+    "or",
+    "if",
+    "while",
+    "about",
+    "up",
+    "it",
+    "its",
+    "me",
+    "my",
+    "we",
+    "our",
+    "you",
+    "your",
+    "he",
+    "him",
+    "his",
+    "she",
+    "her",
+    "they",
+    "them",
+    "their",
+    "what",
+    "which",
+    "who",
+    "this",
+    "that",
+    "these",
+    "those",
+    "am",
 }
 
 # ── Data helpers ─────────────────────────────────────────────────────────────
@@ -104,8 +203,11 @@ def content_hash(text: str) -> str:
 
 
 def extract_keywords(text: str) -> list[str]:
-    tokens = [t.lower() for t in re.findall(r"[a-zA-Z]{2,}", text)
-              if t.lower() not in STOP_WORDS and len(t) >= 2]
+    tokens = [
+        t.lower()
+        for t in re.findall(r"[a-zA-Z]{2,}", text)
+        if t.lower() not in STOP_WORDS and len(t) >= 2
+    ]
     # Deduplicate preserving order
     seen = set()
     unique = []
@@ -130,6 +232,7 @@ def extract_tags(text: str, max_tags: int = 30) -> list[str]:
 def stratified_split(data: list[dict], dev_n: int = 50, seed: int = 42):
     """Split into dev (stratified) and val (rest)."""
     import random
+
     rng = random.Random(seed)
 
     by_type: dict[str, list[dict]] = defaultdict(list)
@@ -154,13 +257,15 @@ def stratified_split(data: list[dict], dev_n: int = 50, seed: int = 42):
 # ── TEI embedding ────────────────────────────────────────────────────────────
 
 
-def embed_batch(client: httpx.Client, texts: list[str], prefix: str) -> list[np.ndarray]:
+def embed_batch(
+    client: httpx.Client, texts: list[str], prefix: str
+) -> list[np.ndarray]:
     """Embed texts via TEI. prefix is 'search_query' or 'search_document'."""
     all_embeddings = []
     prefixed = [f"{prefix}: {t}" for t in texts]
 
     for i in range(0, len(prefixed), BATCH_SIZE):
-        batch = prefixed[i:i + BATCH_SIZE]
+        batch = prefixed[i : i + BATCH_SIZE]
         resp = client.post(
             f"{EMBEDDING_URL}/v1/embeddings",
             json={"model": EMBEDDING_MODEL, "input": batch, "encoding_format": "float"},
@@ -194,6 +299,7 @@ def precompute(args):
 
     # Resumable: load existing cache if present
     import pickle
+
     if EMBED_CACHE_FILE.exists():
         with open(EMBED_CACHE_FILE, "rb") as f:
             cache = pickle.load(f)
@@ -242,7 +348,7 @@ def precompute(args):
                 success = True
                 break
             except (httpx.ConnectError, httpx.ReadTimeout, httpx.ReadError) as e:
-                wait = 10 * (2 ** attempt)  # 10, 20, 40, 80, 160s
+                wait = 10 * (2**attempt)  # 10, 20, 40, 80, 160s
                 print(f"\n  TEI failed (attempt {attempt + 1}/5): {e}")
                 print(f"  Retrying in {wait}s...")
                 time.sleep(wait)
@@ -277,7 +383,9 @@ def precompute(args):
             rate = embedded_this_run / elapsed if elapsed > 0 else 0
             remaining = len(data) - total_done
             eta = remaining / rate if rate > 0 else 0
-            print(f"  [{total_done:4}/{len(data)}]  {rate:.2f} q/s  ETA {eta / 60:.0f}m")
+            print(
+                f"  [{total_done:4}/{len(data)}]  {rate:.2f} q/s  ETA {eta / 60:.0f}m"
+            )
 
     client.close()
 
@@ -294,6 +402,7 @@ def precompute(args):
 
 def load_cache() -> dict:
     import pickle
+
     with open(EMBED_CACHE_FILE, "rb") as f:
         return pickle.load(f)
 
@@ -320,7 +429,9 @@ def cosine_sim_batch(query: np.ndarray, docs: np.ndarray) -> np.ndarray:
     return dot / denom
 
 
-def get_adaptive_alpha(corpus_size: int, matching_tag_count: int, params: dict) -> float:
+def get_adaptive_alpha(
+    corpus_size: int, matching_tag_count: int, params: dict
+) -> float:
     if corpus_size < 500:
         base = params["alpha_small"]
     elif corpus_size < 5000:
@@ -364,7 +475,9 @@ def score_question(cached_q: dict, params: dict) -> dict:
         overlap = len(query_keywords & set(tags))
         tag_scores.append((doc_idx, overlap))
     tag_scores.sort(key=lambda x: -x[1])
-    tag_ranks = {idx: rank + 1 for rank, (idx, score) in enumerate(tag_scores) if score > 0}
+    tag_ranks = {
+        idx: rank + 1 for rank, (idx, score) in enumerate(tag_scores) if score > 0
+    }
 
     # ── RRF fusion ───────────────────────────────────────────────────
     rrf_k = int(params["rrf_k"])
@@ -374,10 +487,22 @@ def score_question(cached_q: dict, params: dict) -> dict:
     all_indices = set(range(n_docs))
     fused = []
     for idx in all_indices:
-        v_rrf = rrf_score(vector_ranks.get(idx, n_docs + 1), rrf_k) if idx in vector_ranks else 0.0
-        t_rrf = rrf_score(tag_ranks.get(idx, n_docs + 1), rrf_k) if idx in tag_ranks else 0.0
+        v_rrf = (
+            rrf_score(vector_ranks.get(idx, n_docs + 1), rrf_k)
+            if idx in vector_ranks
+            else 0.0
+        )
+        t_rrf = (
+            rrf_score(tag_ranks.get(idx, n_docs + 1), rrf_k)
+            if idx in tag_ranks
+            else 0.0
+        )
         combined = alpha * v_rrf + (1.0 - alpha) * t_rrf
-        display = float(cosines[idx]) if idx in vector_ranks else params["tag_only_base_score"]
+        display = (
+            float(cosines[idx])
+            if idx in vector_ranks
+            else params["tag_only_base_score"]
+        )
         fused.append((idx, combined, display))
 
     fused.sort(key=lambda x: -x[1])
@@ -679,7 +804,9 @@ def validate(args):
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="GEPA optimizer for Alaya search params")
+    parser = argparse.ArgumentParser(
+        description="GEPA optimizer for Alaya search params"
+    )
     sub = parser.add_subparsers(dest="command")
 
     # Precompute
@@ -690,12 +817,18 @@ if __name__ == "__main__":
     p_opt = sub.add_parser("optimize", help="Run GEPA optimization")
     p_opt.add_argument("--data", default=LME_CACHE)
     p_opt.add_argument("--dev-size", type=int, default=50)
-    p_opt.add_argument("--max-evals", type=int, default=50000, help="Max metric calls (budget)")
-    p_opt.add_argument("--max-proposals", type=int, default=20, help="Max LLM iterations")
+    p_opt.add_argument(
+        "--max-evals", type=int, default=50000, help="Max metric calls (budget)"
+    )
+    p_opt.add_argument(
+        "--max-proposals", type=int, default=20, help="Max LLM iterations"
+    )
     p_opt.add_argument("--minibatch", type=int, default=10)
     p_opt.add_argument("--model", default="openai/gpt-5.4")
     p_opt.add_argument("--api-base", default="https://gateway.ai.insighttimer-api.net")
-    p_opt.add_argument("--api-key", default=None, help="API key (or set OPENAI_API_KEY)")
+    p_opt.add_argument(
+        "--api-key", default=None, help="API key (or set OPENAI_API_KEY)"
+    )
     p_opt.add_argument("--out", default=None)
 
     # Validate
