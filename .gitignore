@@ -4,3 +4,6 @@
 .DS_Store
 build/
 *_progress.json
+benchmarks/cache/
+benchmarks/results_*
+benchmarks/__pycache__/
