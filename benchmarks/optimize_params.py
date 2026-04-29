@@ -139,7 +139,7 @@ def stratified_split(data: list[dict], dev_n: int = 50, seed: int = 42):
     total = len(data)
     dev_ids = set()
     dev = []
-    for qtype, entries in sorted(by_type.items()):
+    for _, entries in sorted(by_type.items()):
         k = max(1, round(len(entries) * dev_n / total))
         sample = rng.sample(entries, min(k, len(entries)))
         dev.extend(sample)
@@ -221,7 +221,7 @@ def precompute(args):
         valid_session_ids = []
         valid_dates = []
         doc_tags = []
-        for session, sid, date in zip(sessions, session_ids, dates):
+        for session, sid, date in zip(sessions, session_ids, dates, strict=True):
             doc = build_session_doc(session)
             if not doc.strip():
                 continue
@@ -520,7 +520,7 @@ def optimize(args):
     evaluator = make_evaluator(cache)
 
     # Score baseline first
-    print(f"\n  Baseline (current Alaya params):")
+    print("\n  Baseline (current Alaya params):")
     baseline_scores = []
     for ex in dev_examples:
         s, _ = evaluator(json.dumps(SEED_PARAMS), ex)
@@ -560,7 +560,7 @@ def optimize(args):
         ),
     )
 
-    print(f"\n  Starting GEPA optimization...")
+    print("\n  Starting GEPA optimization...")
     print(f"    Max evals:  {args.max_evals}")
     print(f"    Minibatch:  {args.minibatch}")
     print(f"    Model:      {reflection_lm}")
@@ -600,7 +600,7 @@ def optimize(args):
     best_params_str = result.best_candidate
     try:
         best_params = json.loads(best_params_str)
-    except Exception:
+    except (json.JSONDecodeError, TypeError, ValueError):
         best_params = SEED_PARAMS
         print("  WARNING: Could not parse best candidate, using seed params")
 
@@ -619,7 +619,7 @@ def optimize(args):
     opt_val = sum(val_scores) / len(val_scores)
     print(f"  Baseline Val NDCG@10:  {baseline_val:.4f}")
     print(f"  Optimized Val NDCG@10: {opt_val:.4f}  ({opt_val - baseline_val:+.4f})")
-    print(f"\n  Per-type (val):")
+    print("\n  Per-type (val):")
     for qtype in sorted(val_per_type.keys()):
         scores = val_per_type[qtype]
         avg = sum(scores) / len(scores)
@@ -658,21 +658,21 @@ def validate(args):
 
     all_scores = []
     per_type = defaultdict(list)
-    for qid, cached_q in cache.items():
+    for cached_q in cache.values():
         diag = score_question(cached_q, params)
         all_scores.append(diag["recall_5"])
         per_type[diag["question_type"]].append(diag)
 
     r5 = sum(all_scores) / len(all_scores)
     print(f"\n  Full 500 R@5: {r5:.4f}")
-    print(f"\n  Per-type:")
+    print("\n  Per-type:")
     for qtype in sorted(per_type.keys()):
         items = per_type[qtype]
         avg = sum(d["recall_5"] for d in items) / len(items)
         r10 = sum(d["recall_10"] for d in items) / len(items)
         print(f"    {qtype:30} R@5={avg:.3f}  R@10={r10:.3f}  ({len(items)}q)")
 
-    print(f"\n  MemPalace reference: R@5=0.966 (raw), R@5=0.984 (hybrid v4)")
+    print("\n  MemPalace reference: R@5=0.966 (raw), R@5=0.984 (hybrid v4)")
     print(f"{'=' * 60}")
 
 

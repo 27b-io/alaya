@@ -213,11 +213,11 @@ STOP_WORDS = {
     "send", "expect", "build", "stay", "fall", "cut", "reach", "kill",
     "remain", "suggest", "raise", "pass", "sell", "require", "report",
     "decide", "pull", "really", "much", "actually", "pretty", "something",
-    "anything", "everything", "thing", "things", "got", "going", "been",
-    "being", "well", "still", "even", "back", "after", "long", "right",
-    "good", "new", "first", "last", "great", "little", "many", "own", "old",
+    "anything", "everything", "thing", "things", "got", "going",
+    "well", "still", "even", "back", "long", "right",
+    "good", "new", "first", "last", "great", "little", "many", "old",
     "big", "high", "different", "small", "large", "next", "early", "young",
-    "important", "few", "public", "bad", "sure", "able", "feel",
+    "important", "public", "bad", "sure", "able", "feel",
 }
 
 
@@ -250,7 +250,7 @@ def stratified_sample(data: list[dict], n: int) -> list[dict]:
 
     total = len(data)
     sampled = []
-    for qtype, entries in sorted(by_type.items()):
+    for _, entries in sorted(by_type.items()):
         k = max(1, round(len(entries) * n / total))
         sampled.extend(random.sample(entries, min(k, len(entries))))
 
@@ -283,7 +283,7 @@ def run_question(
     hash_to_session_ids: dict[str, list[str]] = {}
     stored = 0
 
-    for session, sess_id, date in zip(sessions, session_ids, dates):
+    for session, sess_id, date in zip(sessions, session_ids, dates, strict=True):
         doc = build_session_doc(session)
         if not doc.strip():
             continue
