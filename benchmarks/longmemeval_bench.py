@@ -610,14 +610,17 @@ def run_benchmark(args):
 
         # Progress
         if (i + 1) % 5 == 0 or i == len(data) - 1:
-            avg_r5 = sum(m["recall_5"] for m in all_metrics) / len(all_metrics)
-            avg_r10 = sum(m.get("recall_10", 0) for m in all_metrics) / len(all_metrics)
             elapsed = time.monotonic() - t0
             rate = (i + 1) / elapsed
             eta = (len(data) - i - 1) / rate if rate > 0 else 0
+            recall_parts = "  ".join(
+                f"R@{k}={sum(m[f'recall_{k}'] for m in all_metrics) / len(all_metrics):.3f}"
+                for k in top_ks
+                if f"recall_{k}" in all_metrics[0]
+            )
             print(
                 f"  [{i + 1:4}/{len(data)}]"
-                f"  R@5={avg_r5:.3f}  R@10={avg_r10:.3f}"
+                f"  {recall_parts}"
                 f"  {qt_elapsed:.1f}s/q  ETA {eta:.0f}s"
             )
 

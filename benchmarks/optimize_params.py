@@ -26,6 +26,7 @@ import sys
 import time
 import urllib.request
 from collections import defaultdict
+from itertools import pairwise
 from pathlib import Path
 
 import httpx
@@ -217,7 +218,7 @@ def extract_keywords(text: str, existing_tags: set[str] | None = None) -> list[s
 
     keywords = list(tokens)
     # Adjacent hyphenated compounds (same as Rust windows(2))
-    for a, b in zip(tokens, tokens[1:]):
+    for a, b in pairwise(tokens):
         keywords.append(f"{a}-{b}")
 
     # Filter to existing tags if provided
@@ -371,7 +372,10 @@ def precompute(args):
         if not success:
             print(f"  TEI failed after 5 retries at question {i + 1}.")
             print(f"  Saving {len(cache)} cached questions. Re-run to resume.")
-            break
+            # Save partial cache before exiting
+            with open(EMBED_CACHE_FILE, "wb") as f:
+                pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+            sys.exit(1)
 
         doc_emb_matrix = np.stack(doc_embeddings)
 
@@ -608,7 +612,10 @@ def make_evaluator(cache: dict):
         if qid not in cache:
             return 0.0, {"error": f"question {qid} not in cache"}
 
-        result = score_question(cache[qid], params)
+        try:
+            result = score_question(cache[qid], params)
+        except (KeyError, TypeError, ValueError, ZeroDivisionError) as e:
+            return 0.0, {"error": "invalid candidate", "detail": str(e)}
 
         # Primary metric: NDCG@10 (continuous, gives gradient signal)
         # R@5 is binary (0/1) which makes GEPA unable to distinguish
@@ -794,10 +801,13 @@ def optimize(args):
 
 def validate(args):
     print("=" * 60)
-    print("  Phase 3: Validate optimized params on full 500")
+    print("  Phase 3: Validate optimized params")
     print("=" * 60)
 
     cache = load_cache()
+    n_cached = len(cache)
+    if n_cached < 500:
+        print(f"  WARNING: cache has {n_cached}/500 questions (incomplete)")
     with open(args.params) as f:
         result = json.load(f)
     params = result["optimized_params"]
@@ -810,8 +820,8 @@ def validate(args):
         all_scores.append(diag["recall_5"])
         per_type[diag["question_type"]].append(diag)
 
-    r5 = sum(all_scores) / len(all_scores)
-    print(f"\n  Full 500 R@5: {r5:.4f}")
+    r5 = sum(all_scores) / len(all_scores) if all_scores else 0.0
+    print(f"\n  {n_cached}q R@5: {r5:.4f}")
     print("\n  Per-type:")
     for qtype in sorted(per_type.keys()):
         items = per_type[qtype]
