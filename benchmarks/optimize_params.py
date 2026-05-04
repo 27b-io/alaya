@@ -418,7 +418,9 @@ def score_question(cached_q: dict, params: dict) -> dict:
     max_rrf = max((r for _, r, _ in fused), default=1e-9)
     if max_rrf < 1e-9:
         max_rrf = 1e-9
-    blend_w = params.get("rrf_blend_weight", 0.5)
+    if "rrf_blend_weight" not in params:
+        raise KeyError("candidate missing required key: rrf_blend_weight")
+    blend_w = float(params["rrf_blend_weight"])
 
     scored = []
     for idx, rrf_combined, display in fused:
@@ -543,6 +545,15 @@ def optimize(args):
     print(f"  Loaded {len(cache)} cached questions")
 
     data = download_data(args.data)
+
+    # Verify cache covers the dataset
+    data_ids = {e["question_id"] for e in data}
+    missing = data_ids - cache.keys()
+    if missing:
+        print(f"  ERROR: cache missing {len(missing)} questions. Run precompute first.")
+        print(f"  Examples: {sorted(missing)[:5]}")
+        sys.exit(1)
+
     dev, val = stratified_split(data, dev_n=args.dev_size)
     print(f"  Dev set:  {len(dev)} questions")
     print(f"  Val set:  {len(val)} questions")
