@@ -367,10 +367,13 @@ def score_question(cached_q: dict, params: dict) -> dict:
     if n_docs == 0:
         return {"recall_5": 0.0, "recall_10": 0.0, "error": "no docs"}
 
-    # ── Vector ranking ───────────────────────────────────────────────
+    # ── Vector ranking (truncated to fetch_size like Rust/Qdrant) ────
+    fetch_size = min(int(params.get("fetch_size", 50)), n_docs)
     cosines = cosine_sim_batch(query_emb, doc_embs)
     vector_order = np.argsort(-cosines)  # descending
-    vector_ranks = {int(idx): rank + 1 for rank, idx in enumerate(vector_order)}
+    vector_ranks = {
+        int(idx): rank + 1 for rank, idx in enumerate(vector_order[:fetch_size])
+    }
 
     # ── Tag ranking ──────────────────────────────────────────────────
     # Build tag set (mirrors Rust's get_all_tags → filter to existing)
@@ -421,6 +424,8 @@ def score_question(cached_q: dict, params: dict) -> dict:
     if "rrf_blend_weight" not in params:
         raise KeyError("candidate missing required key: rrf_blend_weight")
     blend_w = float(params["rrf_blend_weight"])
+    if not math.isfinite(blend_w) or not (0.0 <= blend_w <= 1.0):
+        raise ValueError(f"rrf_blend_weight={blend_w} out of range [0.0, 1.0]")
 
     scored = []
     for idx, rrf_combined, display in fused:
@@ -700,9 +705,13 @@ def validate(args):
     print("=" * 60)
 
     cache = load_cache()
+    data = download_data(args.data)
+    data_ids = {e["question_id"] for e in data}
+    missing = data_ids - cache.keys()
+    if missing:
+        print(f"  ERROR: cache missing {len(missing)} questions. Run precompute first.")
+        sys.exit(1)
     n_cached = len(cache)
-    if n_cached < 500:
-        print(f"  WARNING: cache has {n_cached}/500 questions (incomplete)")
     with open(args.params) as f:
         result = json.load(f)
     params = result["optimized_params"]
@@ -767,8 +776,9 @@ if __name__ == "__main__":
     p_opt.add_argument("--out", default=None)
 
     # Validate
-    p_val = sub.add_parser("validate", help="Validate params on full 500")
+    p_val = sub.add_parser("validate", help="Validate params on full dataset")
     p_val.add_argument("--params", required=True, help="Path to optimized_params.json")
+    p_val.add_argument("--data", default=LME_CACHE)
 
     args = parser.parse_args()
     if args.command == "precompute":
