@@ -10,3 +10,6 @@ benchmarks/__pycache__/
 
 # Internal planning docs (specs/plans) — not committed to this repo
 docs/superpowers/
+
+# Local dev — docker compose env overrides
+.env
