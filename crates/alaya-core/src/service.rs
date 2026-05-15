@@ -190,6 +190,9 @@ const BOOST_HEBBIAN: f64 = 0.10;
 /// Trust: provenance-based quality signal (mcp=0.9, api=0.8, cli=0.7, unknown=0.5).
 const BOOST_TRUST: f64 = 0.15;
 
+/// Score cap — keeps scores bounded after multiplicative boosts.
+const SCORE_CAP: f64 = 1.5;
+
 /// RRF blend weight: how much the fused rank signal contributes to the
 /// final score vs raw cosine similarity.  0.0 = pure cosine (pre-fix
 /// behavior), 1.0 = pure RRF rank.  GEPA-optimized on LongMemEval:
@@ -794,8 +797,15 @@ impl MemoryService {
                         .and_then(|m| m.get("importance"))
                         .and_then(|v| v.as_f64())
                         .unwrap_or(0.0);
+                    let emotional = sm
+                        .memory
+                        .emotional_valence
+                        .as_ref()
+                        .and_then(|ev| ev.get("sentiment"))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
                     let live_salience =
-                        salience::compute_salience(0.0, sm.memory.access_count, importance);
+                        salience::compute_salience(emotional, sm.memory.access_count, importance);
                     score = salience::apply_salience_boost(score, live_salience, BOOST_SALIENCE);
 
                     // Trust boost — provenance-based quality signal
@@ -850,8 +860,7 @@ impl MemoryService {
                     score *= 1.0 + BOOST_HEBBIAN * boost;
                 }
 
-                // Cap — keeps scores bounded after multiplicative boosts
-                (hash.clone(), score.min(1.5))
+                (hash.clone(), score.min(SCORE_CAP))
             })
             .collect();
 

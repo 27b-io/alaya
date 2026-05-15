@@ -202,14 +202,10 @@ def precompute(args):
     EMBED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     # Resumable: load existing cache if present
-    if EMBED_CACHE_ARRAYS.exists() and EMBED_CACHE_META.exists():
+    try:
         cache = load_cache()
         print(f"  Resuming from {len(cache)} cached questions")
-    elif (EMBED_CACHE_DIR / "lme_embeddings.npz").exists():
-        # Legacy pickle file — migrate it
-        cache = load_cache()
-        print(f"  Resuming from {len(cache)} cached questions (migrated from pickle)")
-    else:
+    except FileNotFoundError:
         cache = {}
 
     t0 = time.monotonic()
@@ -336,18 +332,26 @@ def load_cache() -> dict:
             cache[qid] = entry
         return cache
 
-    # Legacy pickle migration
-    legacy = EMBED_CACHE_DIR / "lme_embeddings.npz"
-    if legacy.exists():
-        import pickle
+    if EMBED_CACHE_ARRAYS.exists() and not EMBED_CACHE_META.exists():
+        # Could be partial new-format write or legacy pickle named .npz.
+        # Peek at magic bytes: real npz starts with PK (zip), pickle doesn't.
+        with open(EMBED_CACHE_ARRAYS, "rb") as f:
+            magic = f.read(2)
+        if magic == b"PK":
+            # Real npz without json sidecar — partial write, discard
+            print("  Removing partial cache checkpoint (missing metadata sidecar)")
+            EMBED_CACHE_ARRAYS.unlink()
+        else:
+            # Legacy pickle disguised as .npz — migrate
+            import pickle
 
-        with open(legacy, "rb") as f:
-            cache = pickle.load(f)
-        print(f"  Migrating legacy pickle cache ({len(cache)} questions)...")
-        save_cache(cache)
-        legacy.rename(_LEGACY_CACHE)
-        print(f"  Migrated to {EMBED_CACHE_ARRAYS} + {EMBED_CACHE_META}")
-        return cache
+            with open(EMBED_CACHE_ARRAYS, "rb") as f:
+                cache = pickle.load(f)
+            print(f"  Migrating legacy pickle cache ({len(cache)} questions)...")
+            EMBED_CACHE_ARRAYS.rename(_LEGACY_CACHE)
+            save_cache(cache)
+            print(f"  Migrated to {EMBED_CACHE_ARRAYS} + {EMBED_CACHE_META}")
+            return cache
 
     raise FileNotFoundError(
         f"No cache found at {EMBED_CACHE_ARRAYS}. Run precompute first."
@@ -436,9 +440,9 @@ def score_question(cached_q: dict, params: dict) -> dict:
     # Rust passes n_keywords (matched query keyword count), not document count
     alpha = get_adaptive_alpha(n_docs, len(query_keywords), params)
 
-    all_indices = set(range(n_docs))
+    candidates = vector_ranks.keys() | tag_ranks.keys()
     fused = []
-    for idx in all_indices:
+    for idx in candidates:
         v_rrf = (
             rrf_score(vector_ranks.get(idx, n_docs + 1), rrf_k)
             if idx in vector_ranks
@@ -514,16 +518,17 @@ def score_question(cached_q: dict, params: dict) -> dict:
     }
 
     if r5 == 0.0 and correct_rank is not None:
-        # Detailed miss diagnostics
+        # Detailed miss diagnostics — use blended rank-1, not vector rank-1
         correct_idx = next(i for i, sid in enumerate(session_ids) if sid in answer_ids)
+        rank1_idx = int(scored[0][0])
         diag["miss"] = {
             "question": cached_q["question"][:120],
             "correct_cosine": float(cosines[correct_idx]),
-            "rank1_cosine": float(cosines[vector_order[0]]),
+            "rank1_cosine": float(cosines[rank1_idx]),
             "correct_vector_rank": vector_ranks.get(correct_idx),
             "correct_tag_rank": tag_ranks.get(correct_idx),
             "correct_tags": tags_per_doc[correct_idx],
-            "rank1_tags": tags_per_doc[int(vector_order[0])],
+            "rank1_tags": tags_per_doc[rank1_idx],
         }
 
     return diag
@@ -750,10 +755,16 @@ def validate(args):
     cache = load_cache()
     data = download_data(args.data)
     data_ids = {e["question_id"] for e in data}
-    missing = data_ids - cache.keys()
+    cache_ids = set(cache.keys())
+    missing = data_ids - cache_ids
     if missing:
         print(f"  ERROR: cache missing {len(missing)} questions. Run precompute first.")
         sys.exit(1)
+    extra = cache_ids - data_ids
+    if extra:
+        print(f"  Pruning {len(extra)} stale cache entries not in dataset")
+        for eid in extra:
+            del cache[eid]
     n_cached = len(cache)
     with open(args.params) as f:
         result = json.load(f)
