@@ -137,6 +137,14 @@ impl JsonRpcResponse {
 
 const MAX_BODY_SIZE: usize = 1_048_576; // 1MB
 
+fn is_accepted_notification(id: &Value, method: &str) -> bool {
+    id.is_null()
+        && matches!(
+            method,
+            "initialized" | "notifications/initialized" | "notifications/cancelled"
+        )
+}
+
 pub async fn mcp_handler(
     headers: HeaderMap,
     handle: axum::extract::State<ServiceHandle>,
@@ -185,12 +193,7 @@ pub async fn mcp_handler(
     let id = req.id.unwrap_or(Value::Null);
 
     // Notifications (no id) → 202 Accepted
-    if id.is_null()
-        && matches!(
-            req.method.as_str(),
-            "initialized" | "notifications/initialized" | "notifications/cancelled"
-        )
-    {
+    if is_accepted_notification(&id, req.method.as_str()) {
         return StatusCode::ACCEPTED.into_response();
     }
 
@@ -715,6 +718,24 @@ mod tests {
             .await
             .unwrap();
         assert!(body.is_empty());
+    }
+
+    #[test]
+    fn accepted_notifications_include_spec_initialized_method() {
+        assert!(is_accepted_notification(&Value::Null, "initialized"));
+        assert!(is_accepted_notification(
+            &Value::Null,
+            "notifications/initialized"
+        ));
+        assert!(is_accepted_notification(
+            &Value::Null,
+            "notifications/cancelled"
+        ));
+        assert!(!is_accepted_notification(
+            &json!(1),
+            "notifications/initialized"
+        ));
+        assert!(!is_accepted_notification(&Value::Null, "tools/list"));
     }
 
     #[test]
