@@ -187,6 +187,9 @@ const BOOST_GRAPH_ACTIVATION: f64 = 0.10;
 /// Hebbian co-access: memories frequently retrieved together.
 const BOOST_HEBBIAN: f64 = 0.10;
 
+/// Trust: provenance-based quality signal (mcp=0.9, api=0.8, cli=0.7, unknown=0.5).
+const BOOST_TRUST: f64 = 0.15;
+
 /// RRF blend weight: how much the fused rank signal contributes to the
 /// final score vs raw cosine similarity.  0.0 = pure cosine (pre-fix
 /// behavior), 1.0 = pure RRF rank.  GEPA-optimized on LongMemEval:
@@ -781,13 +784,28 @@ impl MemoryService {
                 let mut score =
                     RRF_BLEND_WEIGHT * rrf_norm + (1.0 - RRF_BLEND_WEIGHT) * display_score;
 
-                // Salience boost
+                // Salience boost — recompute from live access_count (stored
+                // salience_score was baked at write time with access_count=0)
                 if let Some(sm) = memory_map.get(hash) {
-                    score = salience::apply_salience_boost(
-                        score,
-                        sm.memory.salience_score,
-                        BOOST_SALIENCE,
-                    );
+                    let importance = sm
+                        .memory
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("importance"))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let live_salience =
+                        salience::compute_salience(0.0, sm.memory.access_count, importance);
+                    score = salience::apply_salience_boost(score, live_salience, BOOST_SALIENCE);
+
+                    // Trust boost — provenance-based quality signal
+                    let trust = sm
+                        .memory
+                        .provenance
+                        .as_ref()
+                        .map(provenance::resolve_trust_score)
+                        .unwrap_or(provenance::DEFAULT_TRUST_SCORE);
+                    score *= 1.0 + BOOST_TRUST * trust;
 
                     // Spacing boost
                     let sq =
@@ -1636,6 +1654,8 @@ fn format_memory_result(memory: &Memory, score: f64, output: OutputMode) -> Valu
         "updated_at": memory.updated_at,
         "salience_score": memory.salience_score,
         "score": score,
+        "provenance": memory.provenance,
+        "access_count": memory.access_count,
     });
     let obj = v.as_object_mut().unwrap();
     match output {
