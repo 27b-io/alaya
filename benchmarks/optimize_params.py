@@ -46,7 +46,10 @@ BATCH_SIZE = 6  # TEI on CPU limits to max_batch_requests=8
 LME_URL = "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json"
 LME_CACHE = "/tmp/longmemeval_s_cleaned.json"
 EMBED_CACHE_DIR = Path("benchmarks/cache")
-EMBED_CACHE_FILE = EMBED_CACHE_DIR / "lme_embeddings.npz"
+EMBED_CACHE_ARRAYS = EMBED_CACHE_DIR / "lme_embeddings.npz"
+EMBED_CACHE_META = EMBED_CACHE_DIR / "lme_embeddings_meta.json"
+# Legacy pickle cache (auto-migrated on first load)
+_LEGACY_CACHE = EMBED_CACHE_DIR / "lme_embeddings.pkl"
 
 # ── Seed parameters (current Alaya defaults) ─────────────────────────────────
 
@@ -199,12 +202,13 @@ def precompute(args):
     EMBED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     # Resumable: load existing cache if present
-    import pickle
-
-    if EMBED_CACHE_FILE.exists():
-        with open(EMBED_CACHE_FILE, "rb") as f:
-            cache = pickle.load(f)
+    if EMBED_CACHE_ARRAYS.exists() and EMBED_CACHE_META.exists():
+        cache = load_cache()
         print(f"  Resuming from {len(cache)} cached questions")
+    elif (EMBED_CACHE_DIR / "lme_embeddings.npz").exists():
+        # Legacy pickle file — migrate it
+        cache = load_cache()
+        print(f"  Resuming from {len(cache)} cached questions (migrated from pickle)")
     else:
         cache = {}
 
@@ -256,9 +260,7 @@ def precompute(args):
         if not success:
             print(f"  TEI failed after 5 retries at question {i + 1}.")
             print(f"  Saving {len(cache)} cached questions. Re-run to resume.")
-            # Save partial cache before exiting
-            with open(EMBED_CACHE_FILE, "wb") as f:
-                pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+            save_cache(cache)
             sys.exit(1)
 
         doc_emb_matrix = np.stack(doc_embeddings)
@@ -278,8 +280,7 @@ def precompute(args):
 
         # Save checkpoint every 50 questions
         if embedded_this_run % 50 == 0:
-            with open(EMBED_CACHE_FILE, "wb") as f:
-                pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+            save_cache(cache)
 
         total_done = len(cache)
         if total_done % 25 == 0 or i == len(data) - 1:
@@ -294,21 +295,63 @@ def precompute(args):
     client.close()
 
     # Final save
-    with open(EMBED_CACHE_FILE, "wb") as f:
-        pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+    save_cache(cache)
 
     elapsed = time.monotonic() - t0
-    size_mb = EMBED_CACHE_FILE.stat().st_size / 1024 / 1024
-    print(f"\n  Cached {len(cache)} questions to {EMBED_CACHE_FILE} ({size_mb:.1f} MB)")
+    size_mb = EMBED_CACHE_ARRAYS.stat().st_size / 1024 / 1024
+    print(
+        f"\n  Cached {len(cache)} questions to {EMBED_CACHE_ARRAYS} ({size_mb:.1f} MB)"
+    )
     print(f"  Embedded this run: {embedded_this_run}")
     print(f"  Time: {elapsed:.0f}s")
 
 
-def load_cache() -> dict:
-    import pickle
+def save_cache(cache: dict) -> None:
+    """Save cache as JSON metadata + npz arrays (no pickle)."""
+    arrays = {}
+    meta = {}
+    for qid, entry in cache.items():
+        meta[qid] = {
+            k: v
+            for k, v in entry.items()
+            if k not in ("doc_embeddings", "query_embedding")
+        }
+        arrays[f"{qid}__doc"] = entry["doc_embeddings"]
+        arrays[f"{qid}__query"] = entry["query_embedding"]
+    np.savez_compressed(EMBED_CACHE_ARRAYS, **arrays)
+    with open(EMBED_CACHE_META, "w") as f:
+        json.dump(meta, f, separators=(",", ":"))
 
-    with open(EMBED_CACHE_FILE, "rb") as f:
-        return pickle.load(f)
+
+def load_cache() -> dict:
+    """Load cache from npz + JSON. Auto-migrates legacy pickle on first load."""
+    if EMBED_CACHE_ARRAYS.exists() and EMBED_CACHE_META.exists():
+        arrays = np.load(EMBED_CACHE_ARRAYS, allow_pickle=False)
+        with open(EMBED_CACHE_META) as f:
+            meta = json.load(f)
+        cache = {}
+        for qid, entry in meta.items():
+            entry["doc_embeddings"] = arrays[f"{qid}__doc"]
+            entry["query_embedding"] = arrays[f"{qid}__query"]
+            cache[qid] = entry
+        return cache
+
+    # Legacy pickle migration
+    legacy = EMBED_CACHE_DIR / "lme_embeddings.npz"
+    if legacy.exists():
+        import pickle
+
+        with open(legacy, "rb") as f:
+            cache = pickle.load(f)
+        print(f"  Migrating legacy pickle cache ({len(cache)} questions)...")
+        save_cache(cache)
+        legacy.rename(_LEGACY_CACHE)
+        print(f"  Migrated to {EMBED_CACHE_ARRAYS} + {EMBED_CACHE_META}")
+        return cache
+
+    raise FileNotFoundError(
+        f"No cache found at {EMBED_CACHE_ARRAYS}. Run precompute first."
+    )
 
 
 # ── Scoring pipeline (pure Python, configurable params) ──────────────────────
