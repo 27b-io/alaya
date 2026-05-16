@@ -83,7 +83,9 @@ fn cap_timestamps(timestamps: &mut Vec<f64>, max: usize) {
 fn hash_to_uuid(content_hash: &str) -> Result<String> {
     if content_hash.len() < 32 {
         return Err(AlayaError::Validation(format!(
-            "content_hash too short: {} chars (need 32)",
+            "content_hash too short: {} chars (need 64-char SHA-256 hex). \
+             Pass the full content_hash from search/store_memory results, \
+             not a truncated display or log prefix.",
             content_hash.len()
         )));
     }
@@ -1124,6 +1126,25 @@ mod tests {
     fn hash_to_uuid_short_input_returns_error() {
         let result = hash_to_uuid("abc");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn hash_to_uuid_short_input_error_message_guides_caller() {
+        // Truncated 8-char prefix from log display — the most common bad input
+        let err = hash_to_uuid("ffa51984").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("8 chars"),
+            "should report actual length: {msg}"
+        );
+        assert!(
+            msg.contains("64"),
+            "should reference full hash length: {msg}"
+        );
+        assert!(
+            msg.contains("search") || msg.contains("store_memory"),
+            "should point to source of full hash: {msg}"
+        );
     }
 
     #[test]

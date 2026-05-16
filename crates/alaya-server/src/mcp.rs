@@ -440,7 +440,12 @@ fn tool_schemas() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "content_hash": { "type": "string", "description": "Unique identifier returned from store_memory or search results" }
+                    "content_hash": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "description": "Full 64-char SHA-256 hex content_hash returned by store_memory or search results. Do not pass truncated display/log prefixes."
+                    }
                 },
                 "required": ["content_hash"]
             }
@@ -457,8 +462,19 @@ fn tool_schemas() -> Value {
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["create", "get", "delete"] },
-                    "content_hash": { "type": "string", "description": "Content hash of the primary/source memory" },
-                    "target_hash": { "anyOf": [{"type": "string"}, {"type": "null"}], "description": "Required for create/delete" },
+                    "content_hash": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "description": "Full 64-char SHA-256 hex content_hash of the primary/source memory. Do not pass truncated display/log prefixes."
+                    },
+                    "target_hash": {
+                        "anyOf": [
+                            { "type": "string", "minLength": 64, "maxLength": 64 },
+                            { "type": "null" }
+                        ],
+                        "description": "Full 64-char SHA-256 hex content_hash of the target memory. Required for create/delete."
+                    },
                     "relation_type": { "anyOf": [{"type": "string"}, {"type": "null"}], "enum": ["RELATES_TO", "PRECEDES", "CONTRADICTS"], "description": "Required for create/delete" }
                 },
                 "required": ["action", "content_hash"]
@@ -470,8 +486,18 @@ fn tool_schemas() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "old_id": { "type": "string", "description": "Content hash of the memory being superseded" },
-                    "new_id": { "type": "string", "description": "Content hash of the newer memory" },
+                    "old_id": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "description": "Full 64-char SHA-256 hex content_hash of the memory being superseded. Do not pass truncated display/log prefixes."
+                    },
+                    "new_id": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "description": "Full 64-char SHA-256 hex content_hash of the newer memory. Do not pass truncated display/log prefixes."
+                    },
                     "reason": { "type": "string", "default": "" }
                 },
                 "required": ["old_id", "new_id"]
@@ -635,5 +661,46 @@ mod tests {
             .unwrap();
         let required = store["inputSchema"]["required"].as_array().unwrap();
         assert!(required.contains(&json!("content")));
+    }
+
+    #[test]
+    fn hash_fields_enforce_full_sha256_length() {
+        // Regression guard: clients have repeatedly sent truncated 7/8/11-char
+        // hashes from log displays. minLength/maxLength on the schema is the
+        // first line of defense before requests hit the server-side validator.
+        let schemas = tool_schemas();
+        let by_name = |name: &str| -> Value {
+            schemas
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("tool {name} missing"))
+                .clone()
+        };
+
+        for (tool, field) in [
+            ("delete_memory", "content_hash"),
+            ("relation", "content_hash"),
+            ("memory_supersede", "old_id"),
+            ("memory_supersede", "new_id"),
+        ] {
+            let schema = by_name(tool);
+            let prop = &schema["inputSchema"]["properties"][field];
+            assert_eq!(
+                prop["minLength"], 64,
+                "{tool}.{field} must enforce minLength: 64"
+            );
+            assert_eq!(
+                prop["maxLength"], 64,
+                "{tool}.{field} must enforce maxLength: 64"
+            );
+        }
+
+        // target_hash is nullable so the constraint lives inside anyOf[0]
+        let relation = by_name("relation");
+        let target = &relation["inputSchema"]["properties"]["target_hash"]["anyOf"][0];
+        assert_eq!(target["minLength"], 64, "target_hash must enforce length");
+        assert_eq!(target["maxLength"], 64, "target_hash must enforce length");
     }
 }

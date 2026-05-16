@@ -589,7 +589,16 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                         r
                     }
                     Err(e) => {
-                        log_err(op, &e, start);
+                        tracing::error!(
+                            op,
+                            error = %e,
+                            old = old_h.as_str(),
+                            new = new_h.as_str(),
+                            old_len = old_hash.len(),
+                            new_len = new_hash.len(),
+                            elapsed_ms = ms(start),
+                            "failed"
+                        );
                         json!({"success": false, "error": e.safe_message()})
                     }
                 };
