@@ -181,7 +181,7 @@ pub async fn mcp_handler(
     if id.is_null()
         && matches!(
             req.method.as_str(),
-            "initialized" | "notifications/cancelled"
+            "initialized" | "notifications/initialized" | "notifications/cancelled"
         )
     {
         return StatusCode::ACCEPTED.into_response();
@@ -522,6 +522,24 @@ fn tool_schemas() -> Value {
 mod tests {
     use super::*;
 
+    fn test_handle() -> ServiceHandle {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        ServiceHandle {
+            tx,
+            api_key: String::new(),
+        }
+    }
+
+    fn mcp_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(
+            header::ACCEPT,
+            "application/json, text/event-stream".parse().unwrap(),
+        );
+        headers
+    }
+
     #[test]
     fn parse_jsonrpc_request() {
         let raw = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
@@ -581,6 +599,29 @@ mod tests {
         let raw = r#"{"jsonrpc":"1.0","id":1,"method":"test"}"#;
         let req: JsonRpcRequest = serde_json::from_str(raw).unwrap();
         assert_ne!(req.jsonrpc, "2.0");
+    }
+
+    #[tokio::test]
+    async fn notifications_initialized_returns_empty_accepted() {
+        let response = mcp_handler(
+            mcp_headers(),
+            axum::extract::State(test_handle()),
+            axum::body::Bytes::from(
+                serde_json::to_vec(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {}
+                }))
+                .unwrap(),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
     }
 
     #[test]
