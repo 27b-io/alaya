@@ -1552,6 +1552,37 @@ impl MemoryService {
             "dry_run": false,
         }))
     }
+
+    // ─── Tool 10: get_memory ────────────────────────────────────────────
+
+    /// Exact retrieval by `content_hash`. Unlike `search`, this is a
+    /// deterministic single-item lookup with explicit not-found semantics:
+    /// a missing memory returns `found: false`, never an empty result set
+    /// that masquerades as low recall.
+    ///
+    /// Superseded memories are always returned — the caller asked for a
+    /// specific hash, typically to inspect before a supersede/delete, so
+    /// hiding it would defeat the purpose. `metadata.superseded_by` signals
+    /// superseded status. Pure read: no access-count mutation.
+    #[tracing::instrument(skip(self))]
+    pub async fn get_memory(&self, content_hash: &str, output: OutputMode) -> Result<Value> {
+        if !alaya_types::memory::validate_content_hash(content_hash) {
+            return Err(AlayaError::Validation(
+                "invalid content_hash: expected 64-char lowercase SHA-256 hex".into(),
+            ));
+        }
+
+        match self.vectors.get_by_hash(content_hash).await? {
+            Some(memory) => Ok(serde_json::json!({
+                "found": true,
+                "memory": format_memory_result(&memory, 1.0, output),
+            })),
+            None => Ok(serde_json::json!({
+                "found": false,
+                "content_hash": content_hash,
+            })),
+        }
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -3164,5 +3195,118 @@ mod tests {
             &neighbor_hash,
             result_hashes,
         );
+    }
+
+    // ─── get_memory (Tool 10) tests ──────────────────────────────────────
+
+    /// Build a MemoryService whose vector store serves `mem` (if any) via
+    /// get_by_hash. Other backends are inert mocks.
+    fn service_with_memory(mem: Option<Memory>) -> MemoryService {
+        let mut injectable = HashMap::new();
+        if let Some(m) = mem {
+            injectable.insert(m.content_hash.clone(), m);
+        }
+        MemoryService::new(
+            Box::new(MockVectorsWithInjection {
+                search_results: vec![],
+                injectable_memories: injectable,
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraphWithActivation {
+                activation: HashMap::new(),
+            }),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_memory_found_returns_envelope() {
+        let hash = "a".repeat(64);
+        let mem = make_scored_memory(&hash, "lab incident postmortem", 0.0).memory;
+        let svc = service_with_memory(Some(mem));
+
+        let v = svc
+            .get_memory(&hash, OutputMode::Full)
+            .await
+            .expect("get_memory should succeed");
+
+        assert_eq!(v["found"], true);
+        assert_eq!(v["memory"]["content_hash"], hash);
+        assert_eq!(v["memory"]["content"], "lab incident postmortem");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_memory_missing_returns_found_false() {
+        let svc = service_with_memory(None);
+
+        let v = svc
+            .get_memory(&"b".repeat(64), OutputMode::Full)
+            .await
+            .expect("missing hash is not an error");
+
+        assert_eq!(v["found"], false);
+        assert!(v.get("memory").is_none(), "no memory body on a miss");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_memory_invalid_hash_is_validation_error() {
+        let svc = service_with_memory(None);
+
+        // Truncated 8-char prefix — the exact failure class this PR targets
+        let err = svc
+            .get_memory("ffa51984", OutputMode::Full)
+            .await
+            .expect_err("short hash must be rejected");
+        assert!(matches!(err, AlayaError::Validation(_)));
+
+        // Uppercase hex is also rejected by validate_content_hash
+        assert!(
+            svc.get_memory(&"A".repeat(64), OutputMode::Full)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_memory_summary_mode_omits_content() {
+        let hash = "c".repeat(64);
+        let mem = make_scored_memory(&hash, "full body text", 0.0).memory;
+        let svc = service_with_memory(Some(mem));
+
+        let v = svc
+            .get_memory(&hash, OutputMode::Summary)
+            .await
+            .expect("get_memory should succeed");
+
+        assert_eq!(v["found"], true);
+        assert!(
+            v["memory"].get("content").is_none(),
+            "summary mode must not include raw content"
+        );
+        assert!(v["memory"].get("summary").is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_memory_returns_superseded_memory_with_marker() {
+        let hash = "d".repeat(64);
+        let mut mem = make_scored_memory(&hash, "outdated decision", 0.0).memory;
+        let mut md = HashMap::new();
+        md.insert(
+            "superseded_by".to_string(),
+            serde_json::json!("e".repeat(64)),
+        );
+        mem.metadata = Some(md);
+        let svc = service_with_memory(Some(mem));
+
+        let v = svc
+            .get_memory(&hash, OutputMode::Full)
+            .await
+            .expect("get_memory should succeed");
+
+        // Exact lookup returns superseded memories — caller asked for this hash.
+        assert_eq!(v["found"], true);
+        assert_eq!(v["memory"]["metadata"]["superseded_by"], "e".repeat(64));
     }
 }

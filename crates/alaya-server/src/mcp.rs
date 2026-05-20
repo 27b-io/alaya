@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use alaya_core::deduplication::CanonicalStrategy;
-use alaya_core::service::{RelationParams, SearchParams, StoreParams};
+use alaya_core::service::{OutputMode, RelationParams, SearchParams, StoreParams};
 
 use crate::{Cmd, CmdInner, ServiceHandle};
 
@@ -26,6 +26,13 @@ fn cmd(inner: CmdInner) -> Cmd {
 #[derive(Deserialize)]
 struct DeleteParams {
     content_hash: String,
+}
+
+#[derive(Deserialize)]
+struct GetMemoryParams {
+    content_hash: String,
+    #[serde(default)]
+    output: OutputMode,
 }
 
 #[derive(Deserialize)]
@@ -321,6 +328,18 @@ async fn dispatch_tool(
             rx.await
                 .map_err(|_| (-32000, "Service dropped".to_string()))
         }
+        "get_memory" => {
+            let p: GetMemoryParams = serde_json::from_value(args)
+                .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
+            let (tx, rx) = oneshot::channel();
+            handle.try_dispatch(cmd(CmdInner::GetMemory {
+                hash: p.content_hash,
+                output: p.output,
+                reply: tx,
+            }))?;
+            rx.await
+                .map_err(|_| (-32000, "Service dropped".to_string()))
+        }
         "check_database_health" => {
             let (tx, rx) = oneshot::channel();
             handle.try_dispatch(cmd(CmdInner::Health { reply: tx }))?;
@@ -432,6 +451,23 @@ fn tool_schemas() -> Value {
                     "min_trust_score": { "anyOf": [{"type": "number"}, {"type": "null"}] },
                     "cursor": { "anyOf": [{"type": "number"}, {"type": "null"}], "description": "Cursor for recent mode pagination. Pass next_cursor from previous response." }
                 }
+            }
+        },
+        {
+            "name": "get_memory",
+            "description": "Retrieve a single memory by its exact content_hash. Returns {\"found\": true, \"memory\": {...}} or {\"found\": false}. Use this to inspect a memory before supersede/delete/relation when you already hold its hash — e.g. from search results or a memory_contradictions report. Superseded memories are returned; check metadata.superseded_by.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content_hash": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "description": "Full 64-char SHA-256 hex content_hash returned by store_memory or search results. Do not pass truncated display/log prefixes."
+                    },
+                    "output": { "type": "string", "enum": ["full", "summary", "both"], "default": "full" }
+                },
+                "required": ["content_hash"]
             }
         },
         {
@@ -584,11 +620,11 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_9_tools() {
+    fn tools_list_returns_10_tools() {
         let resp = handle_tools_list(json!(2));
         let v = serde_json::to_value(&resp).unwrap();
         let tools = v["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
     }
 
     #[test]
@@ -602,6 +638,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"store_memory"));
         assert!(names.contains(&"search"));
+        assert!(names.contains(&"get_memory"));
         assert!(names.contains(&"delete_memory"));
         assert!(names.contains(&"check_database_health"));
         assert!(names.contains(&"relation"));
@@ -681,6 +718,7 @@ mod tests {
 
         for (tool, field) in [
             ("delete_memory", "content_hash"),
+            ("get_memory", "content_hash"),
             ("relation", "content_hash"),
             ("memory_supersede", "old_id"),
             ("memory_supersede", "new_id"),
