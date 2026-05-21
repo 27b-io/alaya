@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use alaya_core::deduplication::CanonicalStrategy;
-use alaya_core::service::{RelationParams, SearchParams, StoreParams};
+use alaya_core::service::{OutputMode, RelationParams, SearchParams, StoreParams};
 
 use crate::{Cmd, CmdInner, ServiceHandle};
 
@@ -26,6 +26,13 @@ fn cmd(inner: CmdInner) -> Cmd {
 #[derive(Deserialize)]
 struct DeleteParams {
     content_hash: String,
+}
+
+#[derive(Deserialize)]
+struct GetMemoryParams {
+    content_hash: String,
+    #[serde(default)]
+    output: OutputMode,
 }
 
 #[derive(Deserialize)]
@@ -222,6 +229,16 @@ fn make_response(resp: JsonRpcResponse, sse: bool) -> Response {
 
 // ─── Method handlers ────────────────────────────────────────────────────────
 
+/// Model-facing usage hint returned in the `initialize` result. The MCP spec
+/// defines `instructions` as a hint to improve the LLM's understanding of the
+/// server. This is the single DRY home for the cross-tool hash convention —
+/// without it the rule is only stated per-input-field and never as a whole.
+const SERVER_INSTRUCTIONS: &str = "Ālaya is a persistent semantic memory service (vector search + knowledge graph).
+
+Memory identifiers: every memory is keyed by `content_hash`, a full 64-character SHA-256 hex string. `store_memory` and `search` return this hash on every result — pass it back verbatim to `get_memory`, `memory_supersede`, `delete_memory`, `relation`, and `merge_duplicates`. Never truncate or abbreviate it; the 8-character prefixes shown in log lines and display output are not valid identifiers and will be rejected.
+
+Inspect before mutating: use `get_memory` to read a memory by hash before `memory_supersede` or `delete_memory`.";
+
 fn handle_initialize(id: Value) -> JsonRpcResponse {
     JsonRpcResponse::success(
         id,
@@ -233,7 +250,8 @@ fn handle_initialize(id: Value) -> JsonRpcResponse {
             "serverInfo": {
                 "name": "alaya",
                 "version": env!("CARGO_PKG_VERSION")
-            }
+            },
+            "instructions": SERVER_INSTRUCTIONS
         }),
     )
 }
@@ -321,6 +339,18 @@ async fn dispatch_tool(
             rx.await
                 .map_err(|_| (-32000, "Service dropped".to_string()))
         }
+        "get_memory" => {
+            let p: GetMemoryParams = serde_json::from_value(args)
+                .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
+            let (tx, rx) = oneshot::channel();
+            handle.try_dispatch(cmd(CmdInner::GetMemory {
+                hash: p.content_hash,
+                output: p.output,
+                reply: tx,
+            }))?;
+            rx.await
+                .map_err(|_| (-32000, "Service dropped".to_string()))
+        }
         "check_database_health" => {
             let (tx, rx) = oneshot::channel();
             handle.try_dispatch(cmd(CmdInner::Health { reply: tx }))?;
@@ -396,7 +426,7 @@ fn tool_schemas() -> Value {
     json!([
         {
             "name": "store_memory",
-            "description": "Store a new memory for future semantic retrieval. Content is vectorized for similarity search. Salience scoring and contradiction detection are computed automatically.",
+            "description": "Store a new memory for future semantic retrieval. Content is vectorized for similarity search. Salience scoring and contradiction detection are computed automatically. Returns the new memory's full 64-char content_hash — the identifier used by get_memory, memory_supersede, delete_memory, and relation.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -413,7 +443,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "search",
-            "description": "Search and retrieve memories. Consolidates all retrieval modes into one tool.",
+            "description": "Search and retrieve memories. Consolidates all retrieval modes into one tool. Each result includes a full 64-char content_hash — pass it to get_memory for an exact re-fetch, or to memory_supersede/delete_memory/relation.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -435,12 +465,36 @@ fn tool_schemas() -> Value {
             }
         },
         {
+            "name": "get_memory",
+            "description": "Retrieve a single memory by its exact content_hash. Returns {\"found\": true, \"memory\": {...}} or {\"found\": false}. Use this to inspect a memory before supersede/delete/relation when you already hold its hash — e.g. from search results or a memory_contradictions report. Superseded memories are returned; check metadata.superseded_by.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content_hash": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "Full 64-char SHA-256 hex content_hash returned by store_memory or search results. Do not pass truncated display/log prefixes."
+                    },
+                    "output": { "type": "string", "enum": ["full", "summary", "both"], "default": "full" }
+                },
+                "required": ["content_hash"]
+            }
+        },
+        {
             "name": "delete_memory",
             "description": "Permanently delete a specific memory by its unique identifier.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "content_hash": { "type": "string", "description": "Unique identifier returned from store_memory or search results" }
+                    "content_hash": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "Full 64-char SHA-256 hex content_hash returned by store_memory or search results. Do not pass truncated display/log prefixes."
+                    }
                 },
                 "required": ["content_hash"]
             }
@@ -457,8 +511,20 @@ fn tool_schemas() -> Value {
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["create", "get", "delete"] },
-                    "content_hash": { "type": "string", "description": "Content hash of the primary/source memory" },
-                    "target_hash": { "anyOf": [{"type": "string"}, {"type": "null"}], "description": "Required for create/delete" },
+                    "content_hash": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "Full 64-char SHA-256 hex content_hash of the primary/source memory. Do not pass truncated display/log prefixes."
+                    },
+                    "target_hash": {
+                        "anyOf": [
+                            { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$" },
+                            { "type": "null" }
+                        ],
+                        "description": "Full 64-char SHA-256 hex content_hash of the target memory. Required for create/delete."
+                    },
                     "relation_type": { "anyOf": [{"type": "string"}, {"type": "null"}], "enum": ["RELATES_TO", "PRECEDES", "CONTRADICTS"], "description": "Required for create/delete" }
                 },
                 "required": ["action", "content_hash"]
@@ -470,8 +536,20 @@ fn tool_schemas() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "old_id": { "type": "string", "description": "Content hash of the memory being superseded" },
-                    "new_id": { "type": "string", "description": "Content hash of the newer memory" },
+                    "old_id": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "Full 64-char SHA-256 hex content_hash of the memory being superseded. Do not pass truncated display/log prefixes."
+                    },
+                    "new_id": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "Full 64-char SHA-256 hex content_hash of the newer memory. Do not pass truncated display/log prefixes."
+                    },
                     "reason": { "type": "string", "default": "" }
                 },
                 "required": ["old_id", "new_id"]
@@ -555,14 +633,28 @@ mod tests {
         assert_eq!(v["result"]["protocolVersion"], "2025-03-26");
         assert!(v["result"]["capabilities"]["tools"].is_object());
         assert_eq!(v["result"]["serverInfo"]["name"], "alaya");
+
+        // instructions must carry the cross-tool hash convention
+        let instructions = v["result"]["instructions"]
+            .as_str()
+            .expect("initialize result must include instructions");
+        assert!(instructions.contains("content_hash"));
+        assert!(
+            instructions.contains("64"),
+            "instructions must state the full hash length"
+        );
+        assert!(
+            instructions.contains("get_memory"),
+            "instructions must mention the retrieval tool"
+        );
     }
 
     #[test]
-    fn tools_list_returns_9_tools() {
+    fn tools_list_returns_10_tools() {
         let resp = handle_tools_list(json!(2));
         let v = serde_json::to_value(&resp).unwrap();
         let tools = v["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
     }
 
     #[test]
@@ -576,6 +668,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"store_memory"));
         assert!(names.contains(&"search"));
+        assert!(names.contains(&"get_memory"));
         assert!(names.contains(&"delete_memory"));
         assert!(names.contains(&"check_database_health"));
         assert!(names.contains(&"relation"));
@@ -635,5 +728,54 @@ mod tests {
             .unwrap();
         let required = store["inputSchema"]["required"].as_array().unwrap();
         assert!(required.contains(&json!("content")));
+    }
+
+    #[test]
+    fn hash_fields_enforce_full_sha256_length() {
+        // Regression guard: clients have repeatedly sent truncated 7/8/11-char
+        // hashes from log displays. minLength/maxLength + a lowercase-hex
+        // pattern on the schema are the first line of defense before requests
+        // hit the server-side validator (validate_content_hash).
+        const HEX64: &str = "^[0-9a-f]{64}$";
+        let schemas = tool_schemas();
+        let by_name = |name: &str| -> Value {
+            schemas
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("tool {name} missing"))
+                .clone()
+        };
+
+        for (tool, field) in [
+            ("delete_memory", "content_hash"),
+            ("get_memory", "content_hash"),
+            ("relation", "content_hash"),
+            ("memory_supersede", "old_id"),
+            ("memory_supersede", "new_id"),
+        ] {
+            let schema = by_name(tool);
+            let prop = &schema["inputSchema"]["properties"][field];
+            assert_eq!(
+                prop["minLength"], 64,
+                "{tool}.{field} must enforce minLength: 64"
+            );
+            assert_eq!(
+                prop["maxLength"], 64,
+                "{tool}.{field} must enforce maxLength: 64"
+            );
+            assert_eq!(
+                prop["pattern"], HEX64,
+                "{tool}.{field} must enforce lowercase-hex pattern"
+            );
+        }
+
+        // target_hash is nullable so the constraint lives inside anyOf[0]
+        let relation = by_name("relation");
+        let target = &relation["inputSchema"]["properties"]["target_hash"]["anyOf"][0];
+        assert_eq!(target["minLength"], 64, "target_hash must enforce length");
+        assert_eq!(target["pattern"], HEX64, "target_hash must enforce pattern");
+        assert_eq!(target["maxLength"], 64, "target_hash must enforce length");
     }
 }

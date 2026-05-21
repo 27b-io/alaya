@@ -19,7 +19,7 @@ Rust rewrite of the mcp-memory-service API layer. Deployed on k3s as a native se
 | **alaya-types** | wasm32 + native | Done | Shared types: Memory, Edge, SearchMode, AlayaError, PayloadFilter |
 | **alaya-bridge** | native only | Done | FalkorDB typed RPC bridge (axum + redis), 18 endpoints |
 | **alaya-backends** | wasm32 + native | Done | Trait definitions + HTTP clients (Qdrant, Embedding, Graph) |
-| **alaya-core** | wasm32 + native | Done | MemoryService orchestration (all 9 MCP tools), 5 integration tests |
+| **alaya-core** | wasm32 + native | Done | MemoryService orchestration (all 10 MCP tools), 5 integration tests |
 | **alaya-server** | native only | Done | REST API + MCP Streamable HTTP (axum, channel-based, 9 endpoints + /mcp) |
 | **alaya-worker** | wasm32 | Deferred | CF Worker entry point (reqwest-wasm unreliable on Workers, native server sufficient) |
 
@@ -55,7 +55,7 @@ crates/
 │   └── graph.rs         # GraphHttpClient — bridge HTTP wrapper (3 trait impls)
 ├── alaya-core/src/
 │   ├── lib.rs           # Re-exports
-│   ├── service.rs       # MemoryService — all 9 MCP tools orchestrated
+│   ├── service.rs       # MemoryService — all 10 MCP tools orchestrated
 │   ├── hashing.rs       # SHA-256 content hashing
 │   ├── hybrid_search.rs # RRF, adaptive alpha, keyword extraction, recency decay
 │   ├── interference.rs  # Contradiction detection (negation, antonym, temporal)
@@ -166,10 +166,10 @@ These were discovered during integration testing and are NOT documented in Falko
 ## Implementation Roadmap
 
 1. ~~**Backend HTTP clients**~~ — Done (alaya-backends: QdrantClient, EmbeddingClient, GraphHttpClient)
-2. ~~**alaya-core**~~ — Done (MemoryService: all 9 tools, 7 algorithm modules)
+2. ~~**alaya-core**~~ — Done (MemoryService: all 10 tools, 7 algorithm modules)
 3. ~~**Native REST server**~~ — Done (alaya-server: 9 REST endpoints, channel-based axum)
 4. ~~**Integration testing**~~ — Done (5 tests against real Qdrant + TEI on lab k3s)
-5. ~~**MCP transport**~~ — Done (JSON-RPC 2.0 + SSE, protocol 2025-03-26, 9 tool schemas)
+5. ~~**MCP transport**~~ — Done (JSON-RPC 2.0 + SSE, protocol 2025-03-26, 10 tool schemas)
 6. ~~**Deployment**~~ — Done (k3s manifests, CI → ghcr.io, network policies)
 7. **OTLP tracing** — Wired but degraded (reqwest async client issue in container, falls back to stderr)
 8. **Prajna integration** — Replace writer.rs qdrant-client with Ālaya HTTP calls

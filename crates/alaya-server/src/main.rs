@@ -19,7 +19,7 @@ use axum::{
     http::{StatusCode, header},
     middleware::{self, Next},
     response::Response,
-    routing::{get, patch, post},
+    routing::{get, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -34,7 +34,7 @@ use alaya_backends::{
     summary::SummaryClient,
 };
 use alaya_core::deduplication::CanonicalStrategy;
-use alaya_core::service::{MemoryService, RelationParams, SearchParams, StoreParams};
+use alaya_core::service::{MemoryService, OutputMode, RelationParams, SearchParams, StoreParams};
 use alaya_types::memory::PatchMemoryRequest;
 use alaya_types::search::PromptName;
 
@@ -163,6 +163,11 @@ pub(crate) enum CmdInner {
         hash: String,
         reply: oneshot::Sender<Value>,
     },
+    GetMemory {
+        hash: String,
+        output: OutputMode,
+        reply: oneshot::Sender<Value>,
+    },
     Relation {
         params: RelationParams,
         reply: oneshot::Sender<Value>,
@@ -208,6 +213,7 @@ impl Cmd {
             CmdInner::Store { .. } => "store",
             CmdInner::Search { .. } => "search",
             CmdInner::Delete { .. } => "delete",
+            CmdInner::GetMemory { .. } => "get_memory",
             CmdInner::Relation { .. } => "relation",
             CmdInner::Supersede { .. } => "supersede",
             CmdInner::Contradictions { .. } => "contradictions",
@@ -532,6 +538,26 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 };
                 let _ = reply.send(result);
             }
+            CmdInner::GetMemory {
+                hash,
+                output,
+                reply,
+            } => {
+                let span = tracing::info_span!(parent: &ps, "get_memory");
+                let h = truncate_hash(&hash);
+                let result = match svc.get_memory(&hash, output).instrument(span).await {
+                    Ok(r) => {
+                        let found = r.get("found").and_then(|f| f.as_bool()).unwrap_or(false);
+                        tracing::info!(op, hash = h.as_str(), found, elapsed_ms = ms(start), "ok");
+                        r
+                    }
+                    Err(e) => {
+                        log_err(op, &e, start);
+                        json!({"error": e.safe_message()})
+                    }
+                };
+                let _ = reply.send(result);
+            }
             CmdInner::Relation { params, reply } => {
                 let action = params.action.clone();
                 let hash = truncate_hash(&params.content_hash);
@@ -589,7 +615,16 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                         r
                     }
                     Err(e) => {
-                        log_err(op, &e, start);
+                        tracing::error!(
+                            op,
+                            error = %e,
+                            old = old_h.as_str(),
+                            new = new_h.as_str(),
+                            old_len = old_hash.len(),
+                            new_len = new_hash.len(),
+                            elapsed_ms = ms(start),
+                            "failed"
+                        );
                         json!({"success": false, "error": e.safe_message()})
                     }
                 };
@@ -999,7 +1034,10 @@ fn main() {
             .route("/contradictions", post(contradictions))
             .route("/duplicates/find", post(find_duplicates))
             .route("/duplicates/merge", post(merge_duplicates))
-            .route("/memories/{content_hash}", patch(patch_memory))
+            .route(
+                "/memories/{content_hash}",
+                get(get_memory).patch(patch_memory),
+            )
             .route("/backfill/summaries", post(backfill_summaries))
             .layer(middleware::from_fn_with_state(
                 handle.clone(),
@@ -1262,6 +1300,59 @@ async fn patch_memory(
             Json(json!({"error": "service dropped response"})),
         ),
     }
+}
+
+#[derive(Deserialize)]
+struct GetMemoryQuery {
+    #[serde(default)]
+    output: OutputMode,
+}
+
+async fn get_memory(
+    axum::extract::State(h): axum::extract::State<ServiceHandle>,
+    axum::extract::Path(content_hash): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<GetMemoryQuery>,
+) -> (StatusCode, Json<Value>) {
+    if !alaya_types::memory::validate_content_hash(&content_hash) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid content_hash format"})),
+        );
+    }
+
+    let (tx, rx) = oneshot::channel();
+    let cmd = Cmd {
+        inner: CmdInner::GetMemory {
+            hash: content_hash,
+            output: q.output,
+            reply: tx,
+        },
+        span: tracing::Span::current(),
+    };
+
+    // Non-blocking dispatch — a full command channel fast-fails instead of
+    // stalling the HTTP request behind the worker backlog.
+    if let Err((_code, msg)) = h.try_dispatch(cmd) {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": msg})));
+    }
+
+    let v = match rx.await {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "service dropped response"})),
+            );
+        }
+    };
+
+    if v.get("error").is_some() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(v));
+    }
+    if v.get("found").and_then(|f| f.as_bool()).unwrap_or(false) {
+        return (StatusCode::OK, Json(v));
+    }
+    (StatusCode::NOT_FOUND, Json(v))
 }
 
 #[derive(Deserialize)]
