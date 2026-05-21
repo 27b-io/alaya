@@ -177,6 +177,12 @@ def embed_batch(
         resp.raise_for_status()
         data = resp.json()["data"]
         data.sort(key=lambda x: x["index"])
+        if len(data) != len(batch) or [d["index"] for d in data] != list(
+            range(len(batch))
+        ):
+            raise ValueError(
+                f"TEI returned {len(data)} embeddings for batch of {len(batch)}"
+            )
         for d in data:
             all_embeddings.append(np.array(d["embedding"], dtype=np.float32))
         # Delay between batches — TEI on CPU with ONNX is fragile under load
@@ -322,14 +328,20 @@ def save_cache(cache: dict) -> None:
 def load_cache() -> dict:
     """Load cache from npz + JSON. Auto-migrates legacy pickle on first load."""
     if EMBED_CACHE_ARRAYS.exists() and EMBED_CACHE_META.exists():
-        arrays = np.load(EMBED_CACHE_ARRAYS, allow_pickle=False)
-        with open(EMBED_CACHE_META) as f:
-            meta = json.load(f)
-        cache = {}
-        for qid, entry in meta.items():
-            entry["doc_embeddings"] = arrays[f"{qid}__doc"]
-            entry["query_embedding"] = arrays[f"{qid}__query"]
-            cache[qid] = entry
+        try:
+            arrays = np.load(EMBED_CACHE_ARRAYS, allow_pickle=False)
+            with open(EMBED_CACHE_META) as f:
+                meta = json.load(f)
+            cache = {}
+            for qid, entry in meta.items():
+                entry["doc_embeddings"] = arrays[f"{qid}__doc"]
+                entry["query_embedding"] = arrays[f"{qid}__query"]
+                cache[qid] = entry
+        except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            raise RuntimeError(
+                "Corrupt cache checkpoint — delete lme_embeddings.npz and "
+                "lme_embeddings_meta.json, then rerun precompute."
+            ) from exc
         return cache
 
     if EMBED_CACHE_ARRAYS.exists() and not EMBED_CACHE_META.exists():

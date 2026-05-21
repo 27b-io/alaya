@@ -913,7 +913,15 @@ impl MemoryService {
             .iter()
             .filter_map(|(hash, score)| {
                 let sm = memory_map.get(hash)?;
-                Some(format_memory_result(&sm.memory, *score, params.output))
+                let mut item = format_memory_result(&sm.memory, *score, params.output);
+                // Reflect the post-increment access_count (batch already wrote N+1)
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert(
+                        "access_count".into(),
+                        serde_json::json!(sm.memory.access_count.saturating_add(1)),
+                    );
+                }
+                Some(item)
             })
             .collect();
 
