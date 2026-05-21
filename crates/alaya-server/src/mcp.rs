@@ -474,6 +474,7 @@ fn tool_schemas() -> Value {
                         "type": "string",
                         "minLength": 64,
                         "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$",
                         "description": "Full 64-char SHA-256 hex content_hash returned by store_memory or search results. Do not pass truncated display/log prefixes."
                     },
                     "output": { "type": "string", "enum": ["full", "summary", "both"], "default": "full" }
@@ -491,6 +492,7 @@ fn tool_schemas() -> Value {
                         "type": "string",
                         "minLength": 64,
                         "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$",
                         "description": "Full 64-char SHA-256 hex content_hash returned by store_memory or search results. Do not pass truncated display/log prefixes."
                     }
                 },
@@ -513,11 +515,12 @@ fn tool_schemas() -> Value {
                         "type": "string",
                         "minLength": 64,
                         "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$",
                         "description": "Full 64-char SHA-256 hex content_hash of the primary/source memory. Do not pass truncated display/log prefixes."
                     },
                     "target_hash": {
                         "anyOf": [
-                            { "type": "string", "minLength": 64, "maxLength": 64 },
+                            { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$" },
                             { "type": "null" }
                         ],
                         "description": "Full 64-char SHA-256 hex content_hash of the target memory. Required for create/delete."
@@ -537,12 +540,14 @@ fn tool_schemas() -> Value {
                         "type": "string",
                         "minLength": 64,
                         "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$",
                         "description": "Full 64-char SHA-256 hex content_hash of the memory being superseded. Do not pass truncated display/log prefixes."
                     },
                     "new_id": {
                         "type": "string",
                         "minLength": 64,
                         "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$",
                         "description": "Full 64-char SHA-256 hex content_hash of the newer memory. Do not pass truncated display/log prefixes."
                     },
                     "reason": { "type": "string", "default": "" }
@@ -728,8 +733,10 @@ mod tests {
     #[test]
     fn hash_fields_enforce_full_sha256_length() {
         // Regression guard: clients have repeatedly sent truncated 7/8/11-char
-        // hashes from log displays. minLength/maxLength on the schema is the
-        // first line of defense before requests hit the server-side validator.
+        // hashes from log displays. minLength/maxLength + a lowercase-hex
+        // pattern on the schema are the first line of defense before requests
+        // hit the server-side validator (validate_content_hash).
+        const HEX64: &str = "^[0-9a-f]{64}$";
         let schemas = tool_schemas();
         let by_name = |name: &str| -> Value {
             schemas
@@ -758,12 +765,17 @@ mod tests {
                 prop["maxLength"], 64,
                 "{tool}.{field} must enforce maxLength: 64"
             );
+            assert_eq!(
+                prop["pattern"], HEX64,
+                "{tool}.{field} must enforce lowercase-hex pattern"
+            );
         }
 
         // target_hash is nullable so the constraint lives inside anyOf[0]
         let relation = by_name("relation");
         let target = &relation["inputSchema"]["properties"]["target_hash"]["anyOf"][0];
         assert_eq!(target["minLength"], 64, "target_hash must enforce length");
+        assert_eq!(target["pattern"], HEX64, "target_hash must enforce pattern");
         assert_eq!(target["maxLength"], 64, "target_hash must enforce length");
     }
 }
