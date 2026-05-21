@@ -1330,28 +1330,29 @@ async fn get_memory(
         span: tracing::Span::current(),
     };
 
-    if h.tx.send(cmd).await.is_err() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "service unavailable"})),
-        );
+    // Non-blocking dispatch — a full command channel fast-fails instead of
+    // stalling the HTTP request behind the worker backlog.
+    if let Err((_code, msg)) = h.try_dispatch(cmd) {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": msg})));
     }
 
-    match rx.await {
-        Ok(v) => {
-            if v.get("error").is_some() {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(v))
-            } else if v.get("found").and_then(|f| f.as_bool()).unwrap_or(false) {
-                (StatusCode::OK, Json(v))
-            } else {
-                (StatusCode::NOT_FOUND, Json(v))
-            }
+    let v = match rx.await {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "service dropped response"})),
+            );
         }
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "service dropped response"})),
-        ),
+    };
+
+    if v.get("error").is_some() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(v));
     }
+    if v.get("found").and_then(|f| f.as_bool()).unwrap_or(false) {
+        return (StatusCode::OK, Json(v));
+    }
+    (StatusCode::NOT_FOUND, Json(v))
 }
 
 #[derive(Deserialize)]
