@@ -81,9 +81,9 @@ fn cap_timestamps(timestamps: &mut Vec<f64>, max: usize) {
 /// Python takes the first 32 hex chars and formats as UUID-4 style.
 /// Must match exactly for data compatibility.
 fn hash_to_uuid(content_hash: &str) -> Result<String> {
-    if content_hash.len() < 32 {
+    if content_hash.len() != 64 {
         return Err(AlayaError::Validation(format!(
-            "content_hash too short: {} chars (need 64-char SHA-256 hex). \
+            "content_hash must be 64-char SHA-256 hex, got {} chars. \
              Pass the full content_hash from search/store_memory results, \
              not a truncated display or log prefix.",
             content_hash.len()
