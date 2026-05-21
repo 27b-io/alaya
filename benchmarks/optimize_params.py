@@ -530,8 +530,8 @@ def score_question(cached_q: dict, params: dict) -> dict:
     }
 
     if r5 == 0.0 and correct_rank is not None:
-        # Detailed miss diagnostics — use blended rank-1, not vector rank-1
-        correct_idx = next(i for i, sid in enumerate(session_ids) if sid in answer_ids)
+        # Detailed miss diagnostics — derive from the session that set correct_rank
+        correct_idx = int(scored[correct_rank - 1][0])
         rank1_idx = int(scored[0][0])
         diag["miss"] = {
             "question": cached_q["question"][:120],
