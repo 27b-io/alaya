@@ -229,6 +229,16 @@ fn make_response(resp: JsonRpcResponse, sse: bool) -> Response {
 
 // ─── Method handlers ────────────────────────────────────────────────────────
 
+/// Model-facing usage hint returned in the `initialize` result. The MCP spec
+/// defines `instructions` as a hint to improve the LLM's understanding of the
+/// server. This is the single DRY home for the cross-tool hash convention —
+/// without it the rule is only stated per-input-field and never as a whole.
+const SERVER_INSTRUCTIONS: &str = "Ālaya is a persistent semantic memory service (vector search + knowledge graph).
+
+Memory identifiers: every memory is keyed by `content_hash`, a full 64-character SHA-256 hex string. `store_memory` and `search` return this hash on every result — pass it back verbatim to `get_memory`, `memory_supersede`, `delete_memory`, `relation`, and `merge_duplicates`. Never truncate or abbreviate it; the 8-character prefixes shown in log lines and display output are not valid identifiers and will be rejected.
+
+Inspect before mutating: use `get_memory` to read a memory by hash before `memory_supersede` or `delete_memory`.";
+
 fn handle_initialize(id: Value) -> JsonRpcResponse {
     JsonRpcResponse::success(
         id,
@@ -240,7 +250,8 @@ fn handle_initialize(id: Value) -> JsonRpcResponse {
             "serverInfo": {
                 "name": "alaya",
                 "version": env!("CARGO_PKG_VERSION")
-            }
+            },
+            "instructions": SERVER_INSTRUCTIONS
         }),
     )
 }
@@ -415,7 +426,7 @@ fn tool_schemas() -> Value {
     json!([
         {
             "name": "store_memory",
-            "description": "Store a new memory for future semantic retrieval. Content is vectorized for similarity search. Salience scoring and contradiction detection are computed automatically.",
+            "description": "Store a new memory for future semantic retrieval. Content is vectorized for similarity search. Salience scoring and contradiction detection are computed automatically. Returns the new memory's full 64-char content_hash — the identifier used by get_memory, memory_supersede, delete_memory, and relation.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -432,7 +443,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "search",
-            "description": "Search and retrieve memories. Consolidates all retrieval modes into one tool.",
+            "description": "Search and retrieve memories. Consolidates all retrieval modes into one tool. Each result includes a full 64-char content_hash — pass it to get_memory for an exact re-fetch, or to memory_supersede/delete_memory/relation.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -617,6 +628,20 @@ mod tests {
         assert_eq!(v["result"]["protocolVersion"], "2025-03-26");
         assert!(v["result"]["capabilities"]["tools"].is_object());
         assert_eq!(v["result"]["serverInfo"]["name"], "alaya");
+
+        // instructions must carry the cross-tool hash convention
+        let instructions = v["result"]["instructions"]
+            .as_str()
+            .expect("initialize result must include instructions");
+        assert!(instructions.contains("content_hash"));
+        assert!(
+            instructions.contains("64"),
+            "instructions must state the full hash length"
+        );
+        assert!(
+            instructions.contains("get_memory"),
+            "instructions must mention the retrieval tool"
+        );
     }
 
     #[test]
