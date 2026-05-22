@@ -372,11 +372,14 @@ def run_benchmark(args):
             elapsed = time.monotonic() - t0
             rate = (i + 1) / elapsed
             eta = (len(data) - i - 1) / rate if rate > 0 else 0
-            recall_parts = "  ".join(
-                f"R@{k}={sum(m[f'recall_{k}'] for m in all_metrics) / len(all_metrics):.3f}"
-                for k in top_ks
-                if f"recall_{k}" in all_metrics[0]
-            )
+            if all_metrics:
+                recall_parts = "  ".join(
+                    f"R@{k}={sum(m[f'recall_{k}'] for m in all_metrics) / len(all_metrics):.3f}"
+                    for k in top_ks
+                    if f"recall_{k}" in all_metrics[0]
+                )
+            else:
+                recall_parts = "no results yet"
             print(
                 f"  [{i + 1:4}/{len(data)}]"
                 f"  {recall_parts}"
