@@ -21,10 +21,12 @@ const STOP_WORDS: &[&str] = &[
 static STOP_SET: LazyLock<HashSet<&str>> = LazyLock::new(|| STOP_WORDS.iter().copied().collect());
 
 /// Tag-only base score (no cosine similarity available).
-const TAG_ONLY_BASE_SCORE: f64 = 0.1;
+/// GEPA-optimized: lowered from 0.1 to reduce tag-only match influence.
+const TAG_ONLY_BASE_SCORE: f64 = 0.02;
 
-/// Default RRF constant.
-pub const RRF_K: usize = 60;
+/// RRF smoothing constant. Lower = sharper rank differentiation.
+/// GEPA-optimized: lowered from 60 to 20 for better top-k separation.
+pub const RRF_K: usize = 20;
 
 // ─── Keyword extraction ─────────────────────────────────────────────────────
 
@@ -67,17 +69,19 @@ pub fn extract_query_keywords(query: &str, existing_tags: Option<&HashSet<String
 /// - Higher alpha = more weight on semantic
 /// - Lower alpha = more weight on tags
 pub fn get_adaptive_alpha(corpus_size: usize, matching_tag_count: usize) -> f64 {
+    // GEPA-optimized: raised small-corpus alpha from 0.5 to 0.72
+    // (more weight on vector similarity vs tags for typical memory corpora)
     let base_alpha = if corpus_size < 500 {
-        0.5
+        0.72
     } else if corpus_size < 5000 {
         0.7
     } else {
         0.8
     };
 
-    // If many tags match, boost tag weight
-    if matching_tag_count >= 3 {
-        (1.0_f64 - 1.5 * (1.0 - base_alpha)).clamp(0.0, 1.0)
+    // GEPA-optimized: threshold 3→5, factor 1.5→1.2 (less aggressive tag boost)
+    if matching_tag_count >= 5 {
+        (1.0_f64 - 1.2 * (1.0 - base_alpha)).clamp(0.0, 1.0)
     } else {
         base_alpha
     }
@@ -244,7 +248,7 @@ mod tests {
 
     #[test]
     fn adaptive_alpha_small_corpus() {
-        assert_eq!(get_adaptive_alpha(100, 0), 0.5);
+        assert_eq!(get_adaptive_alpha(100, 0), 0.72);
     }
 
     #[test]
@@ -260,14 +264,20 @@ mod tests {
     #[test]
     fn adaptive_alpha_tag_boost() {
         let alpha = get_adaptive_alpha(100, 5);
-        // base=0.5, boosted: 1.0 - 1.5*(1.0-0.5) = 0.25
-        assert!((alpha - 0.25).abs() < 1e-10);
+        // base=0.72, boosted: 1.0 - 1.2*(1.0-0.72) = 0.664
+        assert!((alpha - 0.664).abs() < 1e-10);
+    }
+
+    #[test]
+    fn adaptive_alpha_below_threshold_no_boost() {
+        // 4 tags < threshold 5 → no boost
+        assert_eq!(get_adaptive_alpha(100, 4), 0.72);
     }
 
     #[test]
     fn rrf_score_values() {
-        assert!((rrf_score(1, 60) - 1.0 / 61.0).abs() < 1e-10);
-        assert!((rrf_score(10, 60) - 1.0 / 70.0).abs() < 1e-10);
+        assert!((rrf_score(1, 20) - 1.0 / 21.0).abs() < 1e-10);
+        assert!((rrf_score(10, 20) - 1.0 / 30.0).abs() < 1e-10);
     }
 
     #[test]

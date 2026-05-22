@@ -187,6 +187,19 @@ const BOOST_GRAPH_ACTIVATION: f64 = 0.10;
 /// Hebbian co-access: memories frequently retrieved together.
 const BOOST_HEBBIAN: f64 = 0.10;
 
+/// Trust: provenance-based quality signal (mcp=0.9, api=0.8, cli=0.7, unknown=0.5).
+const BOOST_TRUST: f64 = 0.15;
+
+/// Score cap — keeps scores bounded after multiplicative boosts.
+const SCORE_CAP: f64 = 1.5;
+
+/// RRF blend weight: how much the fused rank signal contributes to the
+/// final score vs raw cosine similarity.  0.0 = pure cosine (pre-fix
+/// behavior), 1.0 = pure RRF rank.  GEPA-optimized on LongMemEval:
+/// 0.4 ties with 0.9/1.0 at R@5=0.938; 0.4 chosen to preserve cosine
+/// signal for production (where boosts amplify it).
+const RRF_BLEND_WEIGHT: f64 = 0.4;
+
 pub struct MemoryService {
     pub vectors: Box<dyn VectorStorage>,
     pub embeddings: Box<dyn EmbeddingProvider>,
@@ -758,18 +771,51 @@ impl MemoryService {
             ));
         }
 
+        // Normalize RRF scores to [0, 1] for blending with display_score (cosine).
+        // Max RRF score is 1/(k+1) for rank 1; scale so rank-1 maps to ~1.0.
+        let max_rrf = fused
+            .iter()
+            .map(|(_, rrf, _)| *rrf)
+            .fold(0.0_f64, f64::max)
+            .max(1e-9);
+
         let mut scored_results: Vec<(String, f64)> = fused
             .iter()
-            .map(|(hash, _rrf, display_score)| {
-                let mut score = *display_score;
+            .map(|(hash, rrf_combined, display_score)| {
+                // Blend normalized RRF rank signal with cosine similarity
+                let rrf_norm = rrf_combined / max_rrf;
+                let mut score =
+                    RRF_BLEND_WEIGHT * rrf_norm + (1.0 - RRF_BLEND_WEIGHT) * display_score;
 
-                // Salience boost
+                // Salience boost — recompute from live access_count (stored
+                // salience_score was baked at write time with access_count=0)
                 if let Some(sm) = memory_map.get(hash) {
-                    score = salience::apply_salience_boost(
-                        score,
-                        sm.memory.salience_score,
-                        BOOST_SALIENCE,
-                    );
+                    let importance = sm
+                        .memory
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("importance"))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let emotional = sm
+                        .memory
+                        .emotional_valence
+                        .as_ref()
+                        .and_then(|ev| ev.get("sentiment"))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let live_salience =
+                        salience::compute_salience(emotional, sm.memory.access_count, importance);
+                    score = salience::apply_salience_boost(score, live_salience, BOOST_SALIENCE);
+
+                    // Trust boost — provenance-based quality signal
+                    let trust = sm
+                        .memory
+                        .provenance
+                        .as_ref()
+                        .map(provenance::resolve_trust_score)
+                        .unwrap_or(provenance::DEFAULT_TRUST_SCORE);
+                    score *= 1.0 + BOOST_TRUST * trust;
 
                     // Spacing boost
                     let sq =
@@ -814,8 +860,7 @@ impl MemoryService {
                     score *= 1.0 + BOOST_HEBBIAN * boost;
                 }
 
-                // Cap at 1.0
-                (hash.clone(), score.min(1.0))
+                (hash.clone(), score.min(SCORE_CAP))
             })
             .collect();
 
@@ -868,7 +913,15 @@ impl MemoryService {
             .iter()
             .filter_map(|(hash, score)| {
                 let sm = memory_map.get(hash)?;
-                Some(format_memory_result(&sm.memory, *score, params.output))
+                let mut item = format_memory_result(&sm.memory, *score, params.output);
+                // Reflect the post-increment access_count (batch already wrote N+1)
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert(
+                        "access_count".into(),
+                        serde_json::json!(sm.memory.access_count.saturating_add(1)),
+                    );
+                }
+                Some(item)
             })
             .collect();
 
@@ -1618,6 +1671,8 @@ fn format_memory_result(memory: &Memory, score: f64, output: OutputMode) -> Valu
         "updated_at": memory.updated_at,
         "salience_score": memory.salience_score,
         "score": score,
+        "provenance": memory.provenance,
+        "access_count": memory.access_count,
     });
     let obj = v.as_object_mut().unwrap();
     match output {

@@ -1,0 +1,48 @@
+{
+  "seed_params": {
+    "rrf_k": 20,
+    "rrf_blend_weight": 0.5,
+    "alpha_small": 0.72,
+    "alpha_medium": 0.7,
+    "alpha_large": 0.8,
+    "alpha_tag_threshold": 5,
+    "alpha_tag_factor": 1.2,
+    "boost_salience": 0.15,
+    "boost_spacing": 0.1,
+    "boost_summary": 0.15,
+    "boost_graph": 0.1,
+    "boost_hebbian": 0.1,
+    "recency_decay_lambda": 0.01,
+    "tag_only_base_score": 0.02,
+    "score_cap": 1.5
+  },
+  "optimized_params": {
+    "rrf_k": 20,
+    "rrf_blend_weight": 0.5,
+    "alpha_small": 0.72,
+    "alpha_medium": 0.7,
+    "alpha_large": 0.8,
+    "alpha_tag_threshold": 5,
+    "alpha_tag_factor": 1.2,
+    "boost_salience": 0.15,
+    "boost_spacing": 0.1,
+    "boost_summary": 0.15,
+    "boost_graph": 0.1,
+    "boost_hebbian": 0.1,
+    "recency_decay_lambda": 0.01,
+    "tag_only_base_score": 0.02,
+    "score_cap": 1.5
+  },
+  "baseline_dev_r5": 0.8242926351167046,
+  "baseline_val_r5": 0.878898232866004,
+  "optimized_val_r5": 0.878898232866004,
+  "improvement": 0.0,
+  "val_per_type": {
+    "single-session-user": 0.8235356068120621,
+    "multi-session": 0.8885971595841667,
+    "single-session-preference": 0.8877475032737137,
+    "temporal-reasoning": 0.8268239989556666,
+    "knowledge-update": 0.9426610724369416,
+    "single-session-assistant": 0.9563092975357145
+  }
+}
