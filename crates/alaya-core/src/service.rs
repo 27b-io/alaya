@@ -788,68 +788,66 @@ impl MemoryService {
         // replaces the RRF+cosine blend in the scoring loop for those entries.
         // Validated on LongMemEval (2026-05-23): R@5 0.936 → 0.990 with
         // BAAI/bge-reranker-v2-m3 and top_n=20.
-        let rerank_score_map: HashMap<String, f64> = if let Some(reranker) = self.reranker.as_ref()
-        {
+        let rerank_score_map: HashMap<String, f64> = 'rerank: {
+            let Some(reranker) = self.reranker.as_ref() else {
+                break 'rerank HashMap::new();
+            };
             let _span = tracing::info_span!("rerank", top_n = reranker.top_n()).entered();
             let top_n = reranker.top_n().min(fused.len());
             if top_n == 0 {
-                HashMap::new()
-            } else {
-                let candidate_contents: Vec<&str> = fused
-                    .iter()
-                    .take(top_n)
-                    .map(|(hash, _, _)| {
-                        memory_map
-                            .get(hash)
-                            .map(|sm| sm.memory.content.as_str())
-                            .unwrap_or("")
-                    })
-                    .collect();
-
-                match reranker.rerank(&params.query, &candidate_contents).await {
-                    Ok(scores) if scores.len() == top_n => {
-                        // Reorder the top-N slice of fused by rerank score desc.
-                        // We zip (hash, score) pairs so we can sort and rebuild.
-                        let mut top_with_scores: Vec<((String, f64, f64), f64)> = fused
-                            .drain(..top_n)
-                            .zip(scores.iter().copied())
-                            .map(|(entry, s)| (entry, s as f64))
-                            .collect();
-                        top_with_scores.sort_by(|a, b| {
-                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        let map: HashMap<String, f64> = top_with_scores
-                            .iter()
-                            .map(|(entry, s)| (entry.0.clone(), *s))
-                            .collect();
-                        // Splice reordered top-N back to the front of fused.
-                        let reordered: Vec<(String, f64, f64)> =
-                            top_with_scores.into_iter().map(|(e, _)| e).collect();
-                        let mut new_fused = reordered;
-                        new_fused.append(&mut fused);
-                        fused = new_fused;
-                        tracing::debug!(
-                            reranked = map.len(),
-                            "cross-encoder rerank reordered top-N candidates"
-                        );
-                        map
-                    }
-                    Ok(scores) => {
-                        tracing::warn!(
-                            got = scores.len(),
-                            expected = top_n,
-                            "rerank score count mismatch; skipping rerank"
-                        );
-                        HashMap::new()
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "rerank failed (non-fatal); using RRF order");
-                        HashMap::new()
-                    }
-                }
+                break 'rerank HashMap::new();
             }
-        } else {
-            HashMap::new()
+
+            let candidate_contents: Vec<&str> = fused
+                .iter()
+                .take(top_n)
+                .map(|(hash, _, _)| {
+                    memory_map
+                        .get(hash)
+                        .map(|sm| sm.memory.content.as_str())
+                        .unwrap_or("")
+                })
+                .collect();
+
+            let scores = match reranker.rerank(&params.query, &candidate_contents).await {
+                Ok(s) if s.len() == top_n => s,
+                Ok(s) => {
+                    tracing::warn!(
+                        got = s.len(),
+                        expected = top_n,
+                        "rerank score count mismatch; skipping rerank"
+                    );
+                    break 'rerank HashMap::new();
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "rerank failed (non-fatal); using RRF order");
+                    break 'rerank HashMap::new();
+                }
+            };
+
+            // Reorder the top-N slice of fused by rerank score desc, then
+            // splice it back to the front of `fused`.
+            let mut top_with_scores: Vec<((String, f64, f64), f64)> = fused
+                .drain(..top_n)
+                .zip(scores.iter().copied())
+                .map(|(entry, s)| (entry, s as f64))
+                .collect();
+            top_with_scores
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let map: HashMap<String, f64> = top_with_scores
+                .iter()
+                .map(|(entry, s)| (entry.0.clone(), *s))
+                .collect();
+            let reordered: Vec<(String, f64, f64)> =
+                top_with_scores.into_iter().map(|(e, _)| e).collect();
+            let mut new_fused = reordered;
+            new_fused.append(&mut fused);
+            fused = new_fused;
+            tracing::debug!(
+                reranked = map.len(),
+                "cross-encoder rerank reordered top-N candidates"
+            );
+            map
         };
 
         // Normalize RRF scores to [0, 1] for blending with display_score (cosine).

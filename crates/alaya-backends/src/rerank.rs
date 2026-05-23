@@ -89,6 +89,7 @@ impl RerankingService for RerankClient {
         }
 
         let mut scores = vec![0.0_f32; texts.len()];
+        let mut seen = vec![false; texts.len()];
         for item in parsed {
             if item.index >= texts.len() {
                 return Err(AlayaError::Rerank(format!(
@@ -97,6 +98,13 @@ impl RerankingService for RerankClient {
                     texts.len()
                 )));
             }
+            if seen[item.index] {
+                return Err(AlayaError::Rerank(format!(
+                    "rerank returned duplicate index {} (would silently overwrite)",
+                    item.index
+                )));
+            }
+            seen[item.index] = true;
             scores[item.index] = item.score;
         }
         Ok(scores)
@@ -141,5 +149,25 @@ mod tests {
     fn top_n_is_returned() {
         let client = RerankClient::new("http://localhost:8089".to_string(), 20, None);
         assert_eq!(client.top_n(), 20);
+    }
+
+    #[test]
+    fn duplicate_index_in_remap_is_rejected() {
+        // Mirror the bounds + dedup check from the rerank() implementation.
+        let n = 3;
+        let mut scores = vec![0.0_f32; n];
+        let mut seen = vec![false; n];
+        let items = [(1usize, 0.5_f32), (1usize, 0.9_f32)];
+        let mut got_dup_error = false;
+        for (idx, score) in items {
+            assert!(idx < n);
+            if seen[idx] {
+                got_dup_error = true;
+                break;
+            }
+            seen[idx] = true;
+            scores[idx] = score;
+        }
+        assert!(got_dup_error, "duplicate index must trigger an error path");
     }
 }

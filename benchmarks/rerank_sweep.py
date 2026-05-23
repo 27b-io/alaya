@@ -151,6 +151,9 @@ def main() -> None:
     print(f"  cached questions: {len(cached)}")
     print(f"  LME questions:    {len(lme)}")
 
+    if not cached or not lme:
+        raise ValueError("no questions to evaluate (cache or LME data empty)")
+
     # Build per-question session_id → document mapping
     sid_to_doc: dict[str, dict[str, str]] = {}
     for qid, e in lme.items():
@@ -186,6 +189,11 @@ def main() -> None:
     print(
         f"  baseline computed in {time.monotonic() - t0:.1f}s for {len(baseline_rankings)}q"
     )
+
+    if not baseline_rankings:
+        raise ValueError(
+            "no overlapping questions to evaluate — cache and LME data have no shared IDs"
+        )
 
     # Baseline metrics
     print("\nBaseline (current Alaya scoring):")
