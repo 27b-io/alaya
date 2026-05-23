@@ -199,3 +199,20 @@ pub trait SummaryProvider {
     /// Generate a one-line summary (~50 tokens) for the given content.
     async fn summarize(&self, content: &str) -> Result<String>;
 }
+
+/// Cross-encoder reranking backend (TEI `/rerank` endpoint).
+///
+/// Optional — when absent, hybrid search returns RRF-fused results without
+/// a second-stage rerank. When present, top-N candidates from RRF are
+/// re-scored as (query, document) pairs by a cross-encoder model
+/// (e.g. BAAI/bge-reranker-v2-m3) and reordered by that score.
+#[async_trait(?Send)]
+pub trait RerankingService {
+    /// Score each (query, text) pair; returns one score per input text,
+    /// in the same order as `texts`. Higher = more relevant.
+    /// Scores are sigmoid-normalized to roughly [0, 1] when supported.
+    async fn rerank(&self, query: &str, texts: &[&str]) -> Result<Vec<f32>>;
+
+    /// Number of candidates to rerank per query.
+    fn top_n(&self) -> usize;
+}

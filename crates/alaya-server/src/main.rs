@@ -31,6 +31,7 @@ use alaya_backends::{
     graph::GraphHttpClient,
     graph_ref::{ConsolidationRef, GraphRef, HebbianRef},
     qdrant::QdrantClient,
+    rerank::RerankClient,
     summary::SummaryClient,
 };
 use alaya_core::deduplication::CanonicalStrategy;
@@ -55,6 +56,9 @@ struct Config {
     summary_url: Option<String>,
     summary_api_key: Option<String>,
     summary_model: String,
+    rerank_url: Option<String>,
+    rerank_api_key: Option<String>,
+    rerank_top_n: usize,
 }
 
 impl Config {
@@ -77,6 +81,13 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty()),
             summary_model: env_or("SUMMARY_MODEL", "claude-haiku-4-5-20251001"),
+            rerank_url: std::env::var("RERANK_URL").ok().filter(|s| !s.is_empty()),
+            rerank_api_key: std::env::var("RERANK_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            rerank_top_n: env_or("RERANK_TOP_N", "20")
+                .parse()
+                .expect("RERANK_TOP_N must be a number"),
         }
     }
 }
@@ -996,7 +1007,7 @@ fn main() {
                         None
                     };
 
-                let svc = MemoryService::new(
+                let mut svc = MemoryService::new(
                     Box::new(qdrant),
                     Box::new(cached_embeddings),
                     Box::new(GraphRef(graph.clone())),
@@ -1004,6 +1015,22 @@ fn main() {
                     Box::new(ConsolidationRef(graph)),
                     summary,
                 );
+
+                if let Some(url) = &cfg_clone.rerank_url {
+                    tracing::info!(
+                        url = url.as_str(),
+                        top_n = cfg_clone.rerank_top_n,
+                        has_api_key = cfg_clone.rerank_api_key.is_some(),
+                        "cross-encoder reranker enabled"
+                    );
+                    svc = svc.with_reranker(Box::new(RerankClient::new(
+                        url.clone(),
+                        cfg_clone.rerank_top_n,
+                        cfg_clone.rerank_api_key.clone(),
+                    )));
+                } else {
+                    tracing::info!("RERANK_URL not set — cross-encoder rerank disabled");
+                }
 
                 service_worker(rx, svc).await;
             });
