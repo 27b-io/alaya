@@ -950,7 +950,18 @@ impl MemoryService {
             })
             .collect();
 
-        scored_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Reranked entries always dominate the tail. Cross-encoder scores live
+        // in roughly [0, 1] and can be smaller than blended (RRF+cosine) scores
+        // for non-reranked tail entries, so a plain score-desc sort would let
+        // tail entries leapfrog reranked top-N. Compound key (is_reranked, score)
+        // guarantees the rerank order is preserved as the prefix of results.
+        scored_results.sort_by(|a, b| {
+            let a_rer = rerank_score_map.contains_key(&a.0);
+            let b_rer = rerank_score_map.contains_key(&b.0);
+            b_rer
+                .cmp(&a_rer)
+                .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+        });
 
         // Stage 5: Filter
         if let Some(min_sim) = params.min_similarity {
@@ -3606,6 +3617,67 @@ mod tests {
             result_hashes.first(),
             Some(&hash_a.as_str()),
             "RRF order (cosine-driven) preserved when rerank fails"
+        );
+    }
+
+    /// Regression: a strong tail entry (high cosine, large RRF) must NOT
+    /// outrank a weak-but-positive rerank entry. The Python validation slices
+    /// top-N and reorders within it, with tail strictly below; the Rust
+    /// implementation must preserve that invariant even when rerank scores are
+    /// small in absolute terms (BGE sigmoid outputs are often in [0, 0.05]
+    /// for unrelated pairs and [0.5, 0.95] for matches).
+    #[tokio::test(flavor = "current_thread")]
+    async fn reranked_entries_dominate_high_score_tail() {
+        // top_n=2 — the third memory acts as a high-scoring tail entry.
+        let hash_a = "a".repeat(64); // reranked, weak rerank score
+        let hash_b = "b".repeat(64); // reranked, strong rerank score
+        let hash_c = "c".repeat(64); // NOT reranked, very high cosine
+
+        let results = vec![
+            make_scored_memory(&hash_a, "doc-aaaa first by cosine", 0.6),
+            make_scored_memory(&hash_b, "doc-bbbb second by cosine", 0.55),
+            make_scored_memory(&hash_c, "doc-cccc third — strong tail (high cosine)", 0.95),
+        ];
+
+        let mut scores = HashMap::new();
+        // Even though doc-cccc would beat reranked entries in raw cosine,
+        // the rerank should still come first.
+        scores.insert("doc-aaaa".to_string(), 0.05_f32);
+        scores.insert("doc-bbbb".to_string(), 0.20_f32);
+        // doc-cccc is NOT in the reranker's input — top_n=2 means only the
+        // first two RRF entries are reranked.
+
+        let svc = build_rerank_test_service(
+            results,
+            Some(Box::new(MockReranker {
+                top_n: 2,
+                scores_by_doc_prefix: scores,
+            })),
+        );
+
+        let r = svc
+            .search(search_params("test query"))
+            .await
+            .expect("search succeeds");
+        let result_hashes: Vec<&str> = r["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x["content_hash"].as_str())
+            .collect();
+
+        // Both reranked entries (bbbb stronger, aaaa weaker) must appear
+        // before doc-cccc, even though doc-cccc has a much higher cosine.
+        let pos_b = result_hashes.iter().position(|h| *h == hash_b.as_str());
+        let pos_a = result_hashes.iter().position(|h| *h == hash_a.as_str());
+        let pos_c = result_hashes.iter().position(|h| *h == hash_c.as_str());
+
+        assert_eq!(pos_b, Some(0), "strong rerank entry must be first");
+        assert_eq!(pos_a, Some(1), "weak rerank entry must still beat tail");
+        assert_eq!(
+            pos_c,
+            Some(2),
+            "high-cosine tail must follow reranked top-N"
         );
     }
 
