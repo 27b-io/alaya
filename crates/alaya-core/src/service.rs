@@ -53,8 +53,8 @@ where
 use tracing;
 
 use alaya_backends::{
-    ConsolidationService, EmbeddingProvider, GraphService, HebbianService, SummaryProvider,
-    VectorStorage,
+    ConsolidationService, EmbeddingProvider, GraphService, HebbianService, RerankingService,
+    SummaryProvider, VectorStorage,
 };
 use alaya_types::{
     AlayaError, Result,
@@ -209,6 +209,9 @@ pub struct MemoryService {
     /// Optional summary generator. When set, summaries are auto-generated
     /// fire-and-forget after store when the caller omits one.
     pub summary: Option<Box<dyn SummaryProvider>>,
+    /// Optional cross-encoder reranker. When set, hybrid search re-scores
+    /// the top-N RRF candidates as (query, doc) pairs and reorders them.
+    pub reranker: Option<Box<dyn RerankingService>>,
     /// Cached (timestamp, tags) from `get_all_tags()`. RefCell is fine:
     /// MemoryService runs single-threaded on a LocalSet (`!Send`).
     tag_cache: RefCell<Option<(f64, Vec<String>)>>,
@@ -232,9 +235,17 @@ impl MemoryService {
             hebbian,
             consolidation,
             summary,
+            reranker: None,
             tag_cache: RefCell::new(None),
             clock: current_timestamp,
         }
+    }
+
+    /// Builder: attach a cross-encoder reranker. When set, `search_hybrid`
+    /// re-scores the top-N RRF candidates and reorders them.
+    pub fn with_reranker(mut self, reranker: Box<dyn RerankingService>) -> Self {
+        self.reranker = Some(reranker);
+        self
     }
 
     /// Create a `MemoryService` with a custom clock (for testing).
@@ -254,6 +265,7 @@ impl MemoryService {
             hebbian,
             consolidation,
             summary: None,
+            reranker: None,
             tag_cache: RefCell::new(None),
             clock,
         }
@@ -771,6 +783,73 @@ impl MemoryService {
             ));
         }
 
+        // Stage 4c: Cross-encoder rerank — re-score top-N candidates as
+        // (query, doc) pairs and reorder. When successful, the rerank score
+        // replaces the RRF+cosine blend in the scoring loop for those entries.
+        // Validated on LongMemEval (2026-05-23): R@5 0.936 → 0.990 with
+        // BAAI/bge-reranker-v2-m3 and top_n=20.
+        let rerank_score_map: HashMap<String, f64> = 'rerank: {
+            let Some(reranker) = self.reranker.as_ref() else {
+                break 'rerank HashMap::new();
+            };
+            let _span = tracing::info_span!("rerank", top_n = reranker.top_n()).entered();
+            let top_n = reranker.top_n().min(fused.len());
+            if top_n == 0 {
+                break 'rerank HashMap::new();
+            }
+
+            let candidate_contents: Vec<&str> = fused
+                .iter()
+                .take(top_n)
+                .map(|(hash, _, _)| {
+                    memory_map
+                        .get(hash)
+                        .map(|sm| sm.memory.content.as_str())
+                        .unwrap_or("")
+                })
+                .collect();
+
+            let scores = match reranker.rerank(&params.query, &candidate_contents).await {
+                Ok(s) if s.len() == top_n => s,
+                Ok(s) => {
+                    tracing::warn!(
+                        got = s.len(),
+                        expected = top_n,
+                        "rerank score count mismatch; skipping rerank"
+                    );
+                    break 'rerank HashMap::new();
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "rerank failed (non-fatal); using RRF order");
+                    break 'rerank HashMap::new();
+                }
+            };
+
+            // Reorder the top-N slice of fused by rerank score desc, then
+            // splice it back to the front of `fused`.
+            let mut top_with_scores: Vec<((String, f64, f64), f64)> = fused
+                .drain(..top_n)
+                .zip(scores.iter().copied())
+                .map(|(entry, s)| (entry, s as f64))
+                .collect();
+            top_with_scores
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let map: HashMap<String, f64> = top_with_scores
+                .iter()
+                .map(|(entry, s)| (entry.0.clone(), *s))
+                .collect();
+            let reordered: Vec<(String, f64, f64)> =
+                top_with_scores.into_iter().map(|(e, _)| e).collect();
+            let mut new_fused = reordered;
+            new_fused.append(&mut fused);
+            fused = new_fused;
+            tracing::debug!(
+                reranked = map.len(),
+                "cross-encoder rerank reordered top-N candidates"
+            );
+            map
+        };
+
         // Normalize RRF scores to [0, 1] for blending with display_score (cosine).
         // Max RRF score is 1/(k+1) for rank 1; scale so rank-1 maps to ~1.0.
         let max_rrf = fused
@@ -782,10 +861,15 @@ impl MemoryService {
         let mut scored_results: Vec<(String, f64)> = fused
             .iter()
             .map(|(hash, rrf_combined, display_score)| {
-                // Blend normalized RRF rank signal with cosine similarity
-                let rrf_norm = rrf_combined / max_rrf;
-                let mut score =
-                    RRF_BLEND_WEIGHT * rrf_norm + (1.0 - RRF_BLEND_WEIGHT) * display_score;
+                // When the entry was reranked, the cross-encoder score replaces
+                // the RRF+cosine blend entirely — it's a much stronger relevance
+                // signal. Otherwise fall back to blended RRF + cosine.
+                let mut score = if let Some(&rerank) = rerank_score_map.get(hash) {
+                    rerank
+                } else {
+                    let rrf_norm = rrf_combined / max_rrf;
+                    RRF_BLEND_WEIGHT * rrf_norm + (1.0 - RRF_BLEND_WEIGHT) * display_score
+                };
 
                 // Salience boost — recompute from live access_count (stored
                 // salience_score was baked at write time with access_count=0)
@@ -864,7 +948,18 @@ impl MemoryService {
             })
             .collect();
 
-        scored_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Reranked entries always dominate the tail. Cross-encoder scores live
+        // in roughly [0, 1] and can be smaller than blended (RRF+cosine) scores
+        // for non-reranked tail entries, so a plain score-desc sort would let
+        // tail entries leapfrog reranked top-N. Compound key (is_reranked, score)
+        // guarantees the rerank order is preserved as the prefix of results.
+        scored_results.sort_by(|a, b| {
+            let a_rer = rerank_score_map.contains_key(&a.0);
+            let b_rer = rerank_score_map.contains_key(&b.0);
+            b_rer
+                .cmp(&a_rer)
+                .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+        });
 
         // Stage 5: Filter
         if let Some(min_sim) = params.min_similarity {
@@ -3363,5 +3458,250 @@ mod tests {
         // Exact lookup returns superseded memories — caller asked for this hash.
         assert_eq!(v["found"], true);
         assert_eq!(v["memory"]["metadata"]["superseded_by"], "e".repeat(64));
+    }
+
+    // ─── Cross-encoder rerank tests ──────────────────────────────────────
+
+    /// Mock reranker that returns a configured score per (query, doc) pair,
+    /// keyed by the first 8 chars of the doc content. Unknown docs get 0.0.
+    struct MockReranker {
+        top_n: usize,
+        scores_by_doc_prefix: HashMap<String, f32>,
+    }
+
+    #[async_trait(?Send)]
+    impl alaya_backends::RerankingService for MockReranker {
+        async fn rerank(&self, _query: &str, texts: &[&str]) -> Result<Vec<f32>> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let key: String = t.chars().take(8).collect();
+                    self.scores_by_doc_prefix.get(&key).copied().unwrap_or(0.0)
+                })
+                .collect())
+        }
+        fn top_n(&self) -> usize {
+            self.top_n
+        }
+    }
+
+    /// Reranker that always returns Err — exercises graceful-degradation path.
+    struct FailingReranker;
+
+    #[async_trait(?Send)]
+    impl alaya_backends::RerankingService for FailingReranker {
+        async fn rerank(&self, _query: &str, _texts: &[&str]) -> Result<Vec<f32>> {
+            Err(AlayaError::Rerank("simulated upstream failure".into()))
+        }
+        fn top_n(&self) -> usize {
+            10
+        }
+    }
+
+    fn build_rerank_test_service(
+        search_results: Vec<ScoredMemory>,
+        reranker: Option<Box<dyn alaya_backends::RerankingService>>,
+    ) -> MemoryService {
+        let mut svc = MemoryService::new(
+            Box::new(MockVectorsWithInjection {
+                search_results,
+                injectable_memories: HashMap::new(),
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraphWithActivation {
+                activation: HashMap::new(),
+            }),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        );
+        if let Some(r) = reranker {
+            svc = svc.with_reranker(r);
+        }
+        svc
+    }
+
+    fn search_params(query: &str) -> SearchParams {
+        SearchParams {
+            query: query.into(),
+            mode: SearchMode::Hybrid,
+            page: 1,
+            page_size: 10,
+            tags: None,
+            match_all: false,
+            k: 10,
+            min_similarity: None,
+            memory_type: None,
+            encoding_context: None,
+            include_superseded: false,
+            min_trust_score: None,
+            output: OutputMode::Full,
+            cursor: None,
+        }
+    }
+
+    /// When a reranker is attached, top-N candidates are reordered by rerank
+    /// score, overriding the original RRF order driven by vector cosine.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rerank_reorders_top_n_by_cross_encoder_score() {
+        // Three memories. Vector cosine order = [doc-aaaa (0.9), doc-bbbb (0.7), doc-cccc (0.5)].
+        // Reranker disagrees: doc-cccc is the most relevant.
+        let hash_a = "a".repeat(64);
+        let hash_b = "b".repeat(64);
+        let hash_c = "c".repeat(64);
+
+        let results = vec![
+            make_scored_memory(&hash_a, "doc-aaaa first by cosine", 0.9),
+            make_scored_memory(&hash_b, "doc-bbbb second by cosine", 0.7),
+            make_scored_memory(&hash_c, "doc-cccc third by cosine but best by rerank", 0.5),
+        ];
+
+        let mut scores = HashMap::new();
+        scores.insert("doc-aaaa".to_string(), 0.2_f32);
+        scores.insert("doc-bbbb".to_string(), 0.5_f32);
+        scores.insert("doc-cccc".to_string(), 0.95_f32);
+
+        let svc = build_rerank_test_service(
+            results,
+            Some(Box::new(MockReranker {
+                top_n: 20,
+                scores_by_doc_prefix: scores,
+            })),
+        );
+
+        let r = svc
+            .search(search_params("which doc is most relevant"))
+            .await
+            .expect("search succeeds");
+        let result_hashes: Vec<&str> = r["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x["content_hash"].as_str())
+            .collect();
+
+        assert_eq!(
+            result_hashes,
+            vec![hash_c.as_str(), hash_b.as_str(), hash_a.as_str()],
+            "rerank should put the cross-encoder's best candidate (cccc) at position 1"
+        );
+    }
+
+    /// When the reranker call fails, search still returns results in the
+    /// pre-rerank (RRF/cosine) order — graceful degradation.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rerank_failure_falls_back_to_rrf_order() {
+        let hash_a = "a".repeat(64);
+        let hash_b = "b".repeat(64);
+        let results = vec![
+            make_scored_memory(&hash_a, "doc-aaaa cosine wins", 0.9),
+            make_scored_memory(&hash_b, "doc-bbbb cosine second", 0.5),
+        ];
+
+        let svc = build_rerank_test_service(results, Some(Box::new(FailingReranker)));
+
+        let r = svc
+            .search(search_params("test query"))
+            .await
+            .expect("search should still succeed when rerank errors");
+        let result_hashes: Vec<&str> = r["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x["content_hash"].as_str())
+            .collect();
+
+        assert_eq!(
+            result_hashes.first(),
+            Some(&hash_a.as_str()),
+            "RRF order (cosine-driven) preserved when rerank fails"
+        );
+    }
+
+    /// Regression: a strong tail entry (high cosine, large RRF) must NOT
+    /// outrank a weak-but-positive rerank entry. The Python validation slices
+    /// top-N and reorders within it, with tail strictly below; the Rust
+    /// implementation must preserve that invariant even when rerank scores are
+    /// small in absolute terms (BGE sigmoid outputs are often in [0, 0.05]
+    /// for unrelated pairs and [0.5, 0.95] for matches).
+    #[tokio::test(flavor = "current_thread")]
+    async fn reranked_entries_dominate_high_score_tail() {
+        // top_n=2 — the third memory acts as a high-scoring tail entry.
+        let hash_a = "a".repeat(64); // reranked, weak rerank score
+        let hash_b = "b".repeat(64); // reranked, strong rerank score
+        let hash_c = "c".repeat(64); // NOT reranked, very high cosine
+
+        let results = vec![
+            make_scored_memory(&hash_a, "doc-aaaa first by cosine", 0.6),
+            make_scored_memory(&hash_b, "doc-bbbb second by cosine", 0.55),
+            make_scored_memory(&hash_c, "doc-cccc third — strong tail (high cosine)", 0.95),
+        ];
+
+        let mut scores = HashMap::new();
+        // Even though doc-cccc would beat reranked entries in raw cosine,
+        // the rerank should still come first.
+        scores.insert("doc-aaaa".to_string(), 0.05_f32);
+        scores.insert("doc-bbbb".to_string(), 0.20_f32);
+        // doc-cccc is NOT in the reranker's input — top_n=2 means only the
+        // first two RRF entries are reranked.
+
+        let svc = build_rerank_test_service(
+            results,
+            Some(Box::new(MockReranker {
+                top_n: 2,
+                scores_by_doc_prefix: scores,
+            })),
+        );
+
+        let r = svc
+            .search(search_params("test query"))
+            .await
+            .expect("search succeeds");
+        let result_hashes: Vec<&str> = r["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x["content_hash"].as_str())
+            .collect();
+
+        // Both reranked entries (bbbb stronger, aaaa weaker) must appear
+        // before doc-cccc, even though doc-cccc has a much higher cosine.
+        let pos_b = result_hashes.iter().position(|h| *h == hash_b.as_str());
+        let pos_a = result_hashes.iter().position(|h| *h == hash_a.as_str());
+        let pos_c = result_hashes.iter().position(|h| *h == hash_c.as_str());
+
+        assert_eq!(pos_b, Some(0), "strong rerank entry must be first");
+        assert_eq!(pos_a, Some(1), "weak rerank entry must still beat tail");
+        assert_eq!(
+            pos_c,
+            Some(2),
+            "high-cosine tail must follow reranked top-N"
+        );
+    }
+
+    /// Without a reranker, search behavior is unchanged — RRF/cosine wins.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_reranker_preserves_rrf_order() {
+        let hash_a = "a".repeat(64);
+        let hash_b = "b".repeat(64);
+        let results = vec![
+            make_scored_memory(&hash_a, "doc-aaaa cosine wins", 0.9),
+            make_scored_memory(&hash_b, "doc-bbbb cosine second", 0.5),
+        ];
+
+        let svc = build_rerank_test_service(results, None);
+
+        let r = svc
+            .search(search_params("test query"))
+            .await
+            .expect("search succeeds");
+        let result_hashes: Vec<&str> = r["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x["content_hash"].as_str())
+            .collect();
+
+        assert_eq!(result_hashes.first(), Some(&hash_a.as_str()));
     }
 }

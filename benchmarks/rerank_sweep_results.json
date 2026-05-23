@@ -1,0 +1,56 @@
+{
+  "model": "BAAI/bge-reranker-v2-m3",
+  "baseline": {
+    "recall_5": 0.936,
+    "recall_10": 0.978,
+    "per_type": {
+      "single-session-user": 0.8857142857142857,
+      "multi-session": 0.924812030075188,
+      "single-session-preference": 0.9333333333333333,
+      "temporal-reasoning": 0.9323308270676691,
+      "knowledge-update": 0.9871794871794872,
+      "single-session-assistant": 0.9642857142857143
+    }
+  },
+  "sweep": {
+    "10": {
+      "recall_5": 0.976,
+      "recall_10": 0.978,
+      "per_type": {
+        "single-session-user": 0.9428571428571428,
+        "multi-session": 0.9849624060150376,
+        "single-session-preference": 0.9666666666666667,
+        "temporal-reasoning": 0.9699248120300752,
+        "knowledge-update": 1.0,
+        "single-session-assistant": 0.9821428571428571
+      },
+      "elapsed_s": 1544.5697443159297
+    },
+    "20": {
+      "recall_5": 0.99,
+      "recall_10": 0.994,
+      "per_type": {
+        "single-session-user": 0.9714285714285714,
+        "multi-session": 1.0,
+        "single-session-preference": 0.9666666666666667,
+        "temporal-reasoning": 0.9849624060150376,
+        "knowledge-update": 1.0,
+        "single-session-assistant": 1.0
+      },
+      "elapsed_s": 3188.1068942709826
+    },
+    "30": {
+      "recall_5": 0.99,
+      "recall_10": 0.996,
+      "per_type": {
+        "single-session-user": 0.9714285714285714,
+        "multi-session": 1.0,
+        "single-session-preference": 0.9666666666666667,
+        "temporal-reasoning": 0.9849624060150376,
+        "knowledge-update": 1.0,
+        "single-session-assistant": 1.0
+      },
+      "elapsed_s": 4714.921415417921
+    }
+  }
+}

@@ -142,7 +142,7 @@ class AlayaClient:
 
     def __init__(self, base_url: str):
         self.base = base_url.rstrip("/")
-        self.client = httpx.Client(timeout=60)
+        self.client = httpx.Client(timeout=300)
 
     def health(self) -> dict:
         r = self.client.get(f"{self.base}/health")

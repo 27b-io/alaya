@@ -133,6 +133,9 @@ LISTEN_ADDR=0.0.0.0:3001
 RUST_LOG=alaya_server=info
 OTEL_EXPORTER_OTLP_ENDPOINT=http://phoenix-svc.recsys.svc:6006  # optional
 OTEL_SERVICE_NAME=alaya-server
+RERANK_URL=                              # optional — empty disables cross-encoder rerank
+RERANK_API_KEY=                          # optional
+RERANK_TOP_N=20                          # how many RRF candidates to rerank
 ```
 
 ## Key Design Decisions
@@ -143,6 +146,7 @@ OTEL_SERVICE_NAME=alaya-server
 - **Graph operations are non-fatal** — All graph calls (spreading activation, Hebbian, interference) use `unwrap_or_default()`. Service degrades gracefully when FalkorDB is down.
 - **reqwest default-features = false** — Workspace-level and per-crate. Uses `rustls-tls` on native, bare `json` on wasm32. Prevents OpenSSL dependency in containers.
 - **MCP protocol 2025-03-26** — SSE response format (`event: message\ndata: {...}\n\n`) when client sends `Accept: text/event-stream`. Plain JSON otherwise.
+- **Cross-encoder rerank** — Optional second-stage reranker (TEI `/rerank` endpoint, default model `BAAI/bge-reranker-v2-m3`). When `RERANK_URL` is set, `search_hybrid` re-scores the top-N RRF candidates as (query, doc) pairs and reorders them; the rerank score replaces the RRF+cosine blend for those entries. Validated on LongMemEval (2026-05-23, cached embeddings + Python re-impl, 500q): R@5 0.936 → 0.990 with top_n=20. Graceful degradation: rerank failures log and fall back to RRF order, never break the search.
 
 ## Conventions
 
