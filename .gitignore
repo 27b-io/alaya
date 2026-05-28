@@ -7,3 +7,6 @@ build/
 benchmarks/cache/
 benchmarks/results_*
 benchmarks/__pycache__/
+
+# Internal planning docs (specs/plans) — not committed to this repo
+docs/superpowers/
