@@ -387,35 +387,39 @@ impl MemoryService {
         // Store in vector DB
         let (created, _) = self.vectors.store(&memory).await?;
 
-        // Invalidate tag cache — new tags should appear in keyword extraction immediately.
-        // Suppressed under read_only: the tag-embedding collection is shared owner state.
-        if !read_only && !tags.is_empty() {
+        // The memory itself was stored unconditionally above, so its tags are
+        // now in Qdrant. Always invalidate the in-process tag cache so the
+        // next keyword extraction reflects them — cache is local-process
+        // ranking metadata, not shared owner state.
+        if !tags.is_empty() {
             *self.tag_cache.borrow_mut() = None;
 
-            // Index new tags into the tag embedding collection (non-fatal).
-            // Uses the same embedding we'd generate for any passage — tags are
-            // short text, but the embedding model handles them fine.
-            let tag_strs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
-            match self
-                .embeddings
-                .embed_batch(&tag_strs, PromptName::Passage)
-                .await
-            {
-                Ok(tag_embeddings) if tag_embeddings.len() == tags.len() => {
-                    let pairs: Vec<(&str, Vec<f32>)> = tag_strs
-                        .iter()
-                        .zip(tag_embeddings)
-                        .map(|(t, e)| (*t, e))
-                        .collect();
-                    if let Err(e) = self.vectors.upsert_tags(&pairs).await {
-                        tracing::warn!("tag index upsert failed (non-fatal): {e}");
+            // Tag-embedding collection upsert IS shared owner state — gated
+            // by read_only so a browser-issued store can't seed the keyword
+            // index with attacker-chosen embeddings.
+            if !read_only {
+                let tag_strs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
+                match self
+                    .embeddings
+                    .embed_batch(&tag_strs, PromptName::Passage)
+                    .await
+                {
+                    Ok(tag_embeddings) if tag_embeddings.len() == tags.len() => {
+                        let pairs: Vec<(&str, Vec<f32>)> = tag_strs
+                            .iter()
+                            .zip(tag_embeddings)
+                            .map(|(t, e)| (*t, e))
+                            .collect();
+                        if let Err(e) = self.vectors.upsert_tags(&pairs).await {
+                            tracing::warn!("tag index upsert failed (non-fatal): {e}");
+                        }
                     }
-                }
-                Ok(_) => {
-                    tracing::warn!("tag embedding batch size mismatch (non-fatal)");
-                }
-                Err(e) => {
-                    tracing::warn!("tag embedding failed (non-fatal): {e}");
+                    Ok(_) => {
+                        tracing::warn!("tag embedding batch size mismatch (non-fatal)");
+                    }
+                    Err(e) => {
+                        tracing::warn!("tag embedding failed (non-fatal): {e}");
+                    }
                 }
             }
         }

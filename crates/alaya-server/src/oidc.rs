@@ -228,18 +228,22 @@ impl OidcVerifier {
             return Err(OidcError::Invalid("iss mismatch"));
         }
         // Cap the lifetime regardless of issuer (no revocation, so this bounds
-        // the compromise window). RFC 7519 §4.1.6 makes `iat` OPTIONAL: when
-        // present, cap on the issued lifetime (`exp - iat`); when absent, cap
-        // on the remaining lifetime (`exp - now`).
+        // the compromise window). RFC 7519 §4.1.6 makes `iat` OPTIONAL.
+        // Compute `now` once and use it on both branches; if `iat` is present
+        // and *in the future*, reject — otherwise `exp.saturating_sub(iat)`
+        // would underflow to 0 and silently bypass the cap.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let cap_exceeded = match data.claims.iat {
-            Some(iat) => data.claims.exp.saturating_sub(iat) > MAX_TOKEN_AGE_SECS,
-            None => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                data.claims.exp.saturating_sub(now) > MAX_TOKEN_AGE_SECS
+            Some(iat) => {
+                if iat > now.saturating_add(CLOCK_SKEW_LEEWAY_SECS) {
+                    return Err(OidcError::Invalid("iat in the future"));
+                }
+                data.claims.exp.saturating_sub(iat) > MAX_TOKEN_AGE_SECS
             }
+            None => data.claims.exp.saturating_sub(now) > MAX_TOKEN_AGE_SECS,
         };
         if cap_exceeded {
             return Err(OidcError::Invalid("token lifetime exceeds cap"));
@@ -337,15 +341,27 @@ impl OidcVerifier {
             return Err(OidcError::Invalid("discovery issuer mismatch"));
         }
 
-        // jwks_uri must be HTTPS and same-origin (RFC 6454: scheme + host + port)
-        // as the issuer. Default ports (443/80) are normalized into the tuple,
-        // so `https://idp` ≡ `https://idp:443` but `https://idp:8443` does not
-        // match — closing the same-host different-port forgery vector.
+        // jwks_uri must be same-origin (RFC 6454: scheme + host + port) as the
+        // issuer. Default ports (443/80) are normalized so `https://idp` ≡
+        // `https://idp:443` but `https://idp:8443` does not — closing the
+        // same-host different-port forgery vector.
+        //
+        // Scheme: production deployments require https. When the issuer itself
+        // is loopback (real loopback IP or `localhost`), http jwks_uri is
+        // accepted so local-dev flows work — same exception OidcVerifier::new
+        // makes for the issuer scheme.
         let jwks_origin = origin_of(&disc.jwks_uri).ok_or(OidcError::Invalid("jwks_uri form"))?;
         let issuer_origin =
             origin_of(&self.inner.issuer).ok_or(OidcError::Invalid("issuer form"))?;
-        if jwks_origin.0 != "https" || jwks_origin != issuer_origin {
-            return Err(OidcError::Invalid("jwks_uri not same-origin https"));
+        let issuer_is_loopback = issuer_origin.1 == "localhost"
+            || issuer_origin
+                .1
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
+        let scheme_ok = jwks_origin.0 == "https" || (issuer_is_loopback && jwks_origin.0 == "http");
+        if !scheme_ok || jwks_origin != issuer_origin {
+            return Err(OidcError::Invalid("jwks_uri not same-origin"));
         }
 
         *self.inner.jwks_uri.write().await = Some(disc.jwks_uri.clone());
