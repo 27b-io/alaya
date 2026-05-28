@@ -9,18 +9,23 @@
 //!   POST /store, etc.  — Plain REST API (for Prajna and internal consumers)
 //!   GET  /health       — Health check
 
+mod auth;
 mod cached_embedding;
 mod mcp;
+mod oidc;
 mod telemetry;
+mod wellknown;
 
 use axum::{
     Json, Router,
-    extract::Request,
-    http::{StatusCode, header},
-    middleware::{self, Next},
-    response::Response,
+    extract::DefaultBodyLimit,
+    http::{Method, StatusCode, header},
+    middleware,
     routing::{get, post},
 };
+use tower_http::cors::CorsLayer;
+
+use auth::{AuthPrincipal, AuthState, WritePolicy};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -53,6 +58,9 @@ struct Config {
     graph_api_key: String,
     listen_addr: String,
     api_key: String,
+    oidc_issuer: Option<String>,
+    public_base_url: String,
+    allow_unauthenticated: bool,
     summary_url: Option<String>,
     summary_api_key: Option<String>,
     summary_model: String,
@@ -76,6 +84,13 @@ impl Config {
             graph_api_key: env_or("GRAPH_API_KEY", ""),
             listen_addr: env_or("LISTEN_ADDR", "0.0.0.0:3001"),
             api_key: env_or("ALAYA_API_KEY", ""),
+            oidc_issuer: std::env::var("OIDC_ISSUER").ok().filter(|s| !s.is_empty()),
+            public_base_url: normalize_public_base_url(&env_or(
+                "PUBLIC_BASE_URL",
+                "https://alaya.27b.io",
+            )),
+            allow_unauthenticated: env_or("DANGEROUSLY_ALLOW_UNAUTHENTICATED", "")
+                .eq_ignore_ascii_case("true"),
             summary_url: std::env::var("SUMMARY_URL").ok().filter(|s| !s.is_empty()),
             summary_api_key: std::env::var("SUMMARY_API_KEY")
                 .ok()
@@ -98,6 +113,69 @@ fn env_required(key: &str) -> String {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Normalize the single origin source-of-truth: strip a trailing slash and
+/// require https (loopback may use http for dev). Aborts on a malformed value
+/// since `aud`/`resource` derive from it.
+fn normalize_public_base_url(raw: &str) -> String {
+    let trimmed = raw.strip_suffix('/').unwrap_or(raw).to_string();
+    let is_loopback = host_of(&trimmed)
+        .as_deref()
+        .map(host_is_loopback)
+        .unwrap_or(false);
+    if !trimmed.starts_with("https://") && !is_loopback {
+        panic!("PUBLIC_BASE_URL must be https:// (except loopback): {raw}");
+    }
+    trimmed
+}
+
+/// True iff `host` is a real loopback target. Parses the host as an IP so
+/// `127.0.0.1.evil.com` cannot masquerade as a 127.* literal — a string
+/// `starts_with("127.")` check would let it through.
+fn host_is_loopback(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+/// Host (authority without port) of an absolute URL, lowercased.
+/// Handles IPv6 bracketed literals (`[::1]:8443` → `::1`).
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split("://").nth(1)?;
+    let authority = rest.split('/').next()?;
+    let host = if let Some(inner) = authority.strip_prefix('[') {
+        // IPv6 literal: take everything up to the closing bracket.
+        let end = inner.find(']')?;
+        &inner[..end]
+    } else {
+        authority.split(':').next()?
+    };
+    Some(host.to_ascii_lowercase())
+}
+
+/// True for hosts that are not publicly routable: loopback, RFC1918, or
+/// cluster-internal (`.svc`, `.internal`). Used to forbid the dev-only open
+/// mode on a public origin. Real IP-literal parsing prevents confusable
+/// hostnames like `127.0.0.1.evil.com` from masquerading as loopback.
+fn is_private_host(url: &str) -> bool {
+    let Some(h) = host_of(url) else {
+        return false;
+    };
+    // DNS-only special names — these can't be IP literals.
+    if h == "localhost" || h.ends_with(".svc") || h.ends_with(".internal") {
+        return true;
+    }
+    // Anything else must parse as an actual IP literal to qualify as private.
+    match h.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private(),
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        Err(_) => false,
+    }
 }
 
 const L2_MAX_ATTEMPTS: u32 = 5;
@@ -164,10 +242,12 @@ pub(crate) enum CmdInner {
     },
     Store {
         params: StoreParams,
+        read_only: bool,
         reply: oneshot::Sender<Value>,
     },
     Search {
         params: SearchParams,
+        read_only: bool,
         reply: oneshot::Sender<Value>,
     },
     Delete {
@@ -240,7 +320,6 @@ impl Cmd {
 #[derive(Clone)]
 pub(crate) struct ServiceHandle {
     pub(crate) tx: mpsc::Sender<Cmd>,
-    api_key: String,
 }
 
 impl ServiceHandle {
@@ -438,15 +517,22 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 };
                 let _ = reply.send(result);
             }
-            CmdInner::Store { params, reply } => {
+            CmdInner::Store {
+                params,
+                read_only,
+                reply,
+            } => {
                 let content_len = params.content.len();
                 let mem_type = params.memory_type.as_deref().unwrap_or("note").to_string();
                 let tag_count = params.tags.as_ref().map(|t| t.len()).unwrap_or(0);
                 let has_dedup = params.dedup_threshold.is_some();
                 let client = params.client_hostname.clone().unwrap_or_default();
 
-                // Capture for fire-and-forget summary generation
-                let needs_summary = params.summary.is_none() && svc.summary.is_some();
+                // Capture for fire-and-forget summary generation. Suppressed
+                // under read_only — the summary path patches the stored record
+                // (the gated patch_memory op), so a browser-issued store must
+                // not trigger it.
+                let needs_summary = !read_only && params.summary.is_none() && svc.summary.is_some();
                 let content_for_summary = if needs_summary {
                     Some(params.content.clone())
                 } else {
@@ -454,8 +540,12 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 };
 
                 let span = tracing::info_span!(parent: &ps, "store",
-                    content_len, %mem_type);
-                let result = match svc.store_memory(params).instrument(span).await {
+                    content_len, %mem_type, read_only);
+                let result = match svc
+                    .store_memory_with(params, read_only)
+                    .instrument(span)
+                    .await
+                {
                     Ok(r) => {
                         let hash = r
                             .get("content_hash")
@@ -500,15 +590,19 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 };
                 let _ = reply.send(result);
             }
-            CmdInner::Search { params, reply } => {
+            CmdInner::Search {
+                params,
+                read_only,
+                reply,
+            } => {
                 let mode = format!("{:?}", params.mode).to_lowercase();
                 let query_preview = truncate(&params.query, 80);
                 let page = params.page;
                 let page_size = params.page_size;
                 let tag_count = params.tags.as_ref().map(|t| t.len()).unwrap_or(0);
                 let mem_type = params.memory_type.clone().unwrap_or_default();
-                let span = tracing::info_span!(parent: &ps, "search", %mode);
-                let result = match svc.search(params).instrument(span).await {
+                let span = tracing::info_span!(parent: &ps, "search", %mode, read_only);
+                let result = match svc.search_with(params, read_only).instrument(span).await {
                     Ok(r) => {
                         let n = result_count(&r);
                         let has_more = r.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -902,27 +996,66 @@ fn log_err(op: &str, e: &alaya_types::AlayaError, start: std::time::Instant) {
     tracing::error!(op, error = %e, elapsed_ms = ms(start), "failed");
 }
 
-// ─── Auth middleware ────────────────────────────────────────────────────────
+// ─── Auth ───────────────────────────────────────────────────────────────────
+// Dual-mode auth (static bearer + provider-agnostic OIDC) lives in `auth.rs`;
+// the JWT verifier in `oidc.rs`. The middleware is `auth::require_auth`.
 
-async fn require_bearer(
-    axum::extract::State(h): axum::extract::State<ServiceHandle>,
-    req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    if h.api_key.is_empty() {
-        return Ok(next.run(req).await);
+/// Build `AuthState` from config and enforce fail-closed startup invariants.
+fn build_auth_state(config: &Config) -> AuthState {
+    let api_key = if config.api_key.is_empty() {
+        None
+    } else {
+        Some(config.api_key.clone())
+    };
+
+    let oidc = config.oidc_issuer.as_ref().map(|issuer| {
+        let audience = format!("{}/mcp", config.public_base_url);
+        tracing::info!(
+            issuer = issuer.as_str(),
+            audience = audience.as_str(),
+            "OIDC enabled"
+        );
+        oidc::OidcVerifier::new(issuer.clone(), audience)
+    });
+
+    // Fail-closed: refuse to start with no auth unless the dev flag is set.
+    if api_key.is_none() && oidc.is_none() {
+        if !config.allow_unauthenticated {
+            panic!(
+                "no auth configured: set ALAYA_API_KEY or OIDC_ISSUER, or \
+                 DANGEROUSLY_ALLOW_UNAUTHENTICATED=true for dev"
+            );
+        }
+        // The dev-only open mode must never run on a public origin.
+        if !is_private_host(&config.public_base_url) {
+            panic!(
+                "DANGEROUSLY_ALLOW_UNAUTHENTICATED refused on public origin {}",
+                config.public_base_url
+            );
+        }
+        tracing::warn!("DANGEROUSLY_ALLOW_UNAUTHENTICATED — all endpoints are UNAUTHENTICATED");
+    } else if config.allow_unauthenticated {
+        tracing::warn!("DANGEROUSLY_ALLOW_UNAUTHENTICATED ignored — auth is configured");
     }
 
-    let token = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-
-    match token {
-        Some(t) if t == h.api_key => Ok(next.run(req).await),
-        _ => Err(StatusCode::UNAUTHORIZED),
+    AuthState {
+        api_key,
+        allow_unauthenticated: config.allow_unauthenticated,
+        oidc,
+        public_base_url: config.public_base_url.clone(),
     }
+}
+
+/// CORS for the claude.ai browser connector: exact origin, no credentials.
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(
+            "https://claude.ai"
+                .parse::<axum::http::HeaderValue>()
+                .expect("valid origin"),
+        )
+        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
 }
 
 fn main() {
@@ -1037,20 +1170,20 @@ fn main() {
         });
 
         // Axum on the main multi-threaded runtime
-        let handle = ServiceHandle {
-            tx,
-            api_key: config.api_key.clone(),
-        };
+        let handle = ServiceHandle { tx };
 
-        if handle.api_key.is_empty() {
-            tracing::warn!("ALAYA_API_KEY not set — all endpoints are unauthenticated");
-        }
+        // Dual-mode auth state + fail-closed startup invariants.
+        let auth_state = build_auth_state(&config);
 
         // Health checker bypasses the service worker channel entirely —
         // runs directly on the multi-threaded axum runtime with its own
         // reqwest::Client. Prevents health probe timeouts during long ops.
         let checker = HealthChecker::new(&config);
 
+        const MAX_BODY: usize = 1_048_576; // 1 MB — covers the /mcp Bytes extractor
+
+        // Protected routes: handlers keep `ServiceHandle` state; `require_auth`
+        // is layered with its own `AuthState` (axum allows differing types).
         let protected = Router::new()
             .route("/mcp", post(mcp::mcp_handler))
             .route("/store", post(store))
@@ -1067,18 +1200,37 @@ fn main() {
             )
             .route("/backfill/summaries", post(backfill_summaries))
             .layer(middleware::from_fn_with_state(
-                handle.clone(),
-                require_bearer,
+                auth_state.clone(),
+                auth::require_auth,
             ))
+            .layer(DefaultBodyLimit::max(MAX_BODY))
             .layer(TraceLayer::new_for_http().make_span_with(
                 tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO),
-            ));
+            ))
+            .with_state(handle);
+
+        // Unauthenticated protected-resource metadata (404 when OIDC disabled).
+        let wellknown = Router::new()
+            .route(
+                "/.well-known/oauth-protected-resource",
+                get(wellknown::protected_resource_metadata),
+            )
+            .route(
+                "/.well-known/oauth-protected-resource/mcp",
+                get(wellknown::protected_resource_metadata),
+            )
+            .with_state(auth_state);
 
         let health_route = Router::new()
             .route("/health", get(health))
             .with_state(checker);
 
-        let app = health_route.merge(protected.with_state(handle));
+        // CORS is outermost so browser preflight (OPTIONS, no auth header) is
+        // answered before `require_auth`.
+        let app = health_route
+            .merge(wellknown)
+            .merge(protected)
+            .layer(cors_layer());
 
         let listener = tokio::net::TcpListener::bind(&config.listen_addr)
             .await
@@ -1123,18 +1275,38 @@ async fn health(axum::extract::State(checker): axum::extract::State<HealthChecke
 
 async fn store(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
+    axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(params): Json<StoreParams>,
 ) -> Json<Value> {
+    let read_only = WritePolicy::for_principal(principal) == WritePolicy::ReadOnly;
     let (tx, rx) = oneshot::channel();
-    h.call(CmdInner::Store { params, reply: tx }, rx).await
+    h.call(
+        CmdInner::Store {
+            params,
+            read_only,
+            reply: tx,
+        },
+        rx,
+    )
+    .await
 }
 
 async fn search(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
+    axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(params): Json<SearchParams>,
 ) -> Json<Value> {
+    let read_only = WritePolicy::for_principal(principal) == WritePolicy::ReadOnly;
     let (tx, rx) = oneshot::channel();
-    h.call(CmdInner::Search { params, reply: tx }, rx).await
+    h.call(
+        CmdInner::Search {
+            params,
+            read_only,
+            reply: tx,
+        },
+        rx,
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -1404,4 +1576,45 @@ async fn backfill_summaries(
         rx,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_of_strips_port_and_unwraps_ipv6_brackets() {
+        assert_eq!(host_of("https://id.27b.io"), Some("id.27b.io".into()));
+        assert_eq!(host_of("https://id.27b.io:8443"), Some("id.27b.io".into()));
+        assert_eq!(host_of("http://[::1]:3001/foo"), Some("::1".into()));
+        assert_eq!(host_of("http://localhost:8080"), Some("localhost".into()));
+        assert_eq!(host_of("not-a-url"), None);
+    }
+
+    #[test]
+    fn is_private_host_rejects_dns_confusables() {
+        // Real private — loopback / RFC1918 / cluster-internal.
+        assert!(is_private_host("http://localhost:8080"));
+        assert!(is_private_host("http://127.0.0.1"));
+        assert!(is_private_host("http://[::1]:3001"));
+        assert!(is_private_host("http://10.0.0.5"));
+        assert!(is_private_host("http://192.168.1.1"));
+        assert!(is_private_host("http://172.20.0.1"));
+        assert!(is_private_host("http://alaya-server.mcp.svc"));
+        assert!(is_private_host("http://kube-api.internal"));
+
+        // DNS-name look-alikes must NOT count — the bug fix is this:
+        assert!(!is_private_host("http://127.0.0.1.evil.com"));
+        assert!(!is_private_host("http://192.168.1.1.attacker.net"));
+        assert!(!is_private_host("http://localhost.evil.com"));
+        assert!(!is_private_host("http://172.16.0.1.attacker.org"));
+
+        // 172.x outside 16-31 isn't private.
+        assert!(!is_private_host("http://172.15.0.1"));
+        assert!(!is_private_host("http://172.32.0.1"));
+
+        // Public origins.
+        assert!(!is_private_host("https://alaya.27b.io"));
+        assert!(!is_private_host("https://example.com"));
+    }
 }

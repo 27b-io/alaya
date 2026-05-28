@@ -274,7 +274,23 @@ impl MemoryService {
     // ─── Tool 1: store_memory ───────────────────────────────────────────
 
     #[tracing::instrument(skip(self, params), fields(content_len = params.content.len()))]
+    /// Default-policy wrapper — full side effects. Use [`store_memory_with`] to
+    /// request read-only behaviour (no shared-state writes) from authorized
+    /// call sites; existing callers (tests, internal) keep the original
+    /// semantics by going through this entry point.
     pub async fn store_memory(&self, params: StoreParams) -> Result<HashMap<String, Value>> {
+        self.store_memory_with(params, false).await
+    }
+
+    /// Store a memory. When `read_only` is true, the side-effect writes that
+    /// touch shared owner state — tag-index upsert and interference graph-edge
+    /// creation — are skipped (vector + own node only). The caller's
+    /// fire-and-forget summary patch must also be suppressed (see worker).
+    pub async fn store_memory_with(
+        &self,
+        params: StoreParams,
+        read_only: bool,
+    ) -> Result<HashMap<String, Value>> {
         if params.content.is_empty() {
             return Err(AlayaError::Validation("content cannot be empty".into()));
         }
@@ -371,8 +387,9 @@ impl MemoryService {
         // Store in vector DB
         let (created, _) = self.vectors.store(&memory).await?;
 
-        // Invalidate tag cache — new tags should appear in keyword extraction immediately
-        if !tags.is_empty() {
+        // Invalidate tag cache — new tags should appear in keyword extraction immediately.
+        // Suppressed under read_only: the tag-embedding collection is shared owner state.
+        if !read_only && !tags.is_empty() {
             *self.tag_cache.borrow_mut() = None;
 
             // Index new tags into the tag embedding collection (non-fatal).
@@ -403,21 +420,27 @@ impl MemoryService {
             }
         }
 
-        // Create graph node (non-fatal)
-        if let Err(e) = self.graph.ensure_node(&content_hash, now).await {
+        // Create graph node (non-fatal). Suppressed under read_only — even
+        // an "own" node is a write to the shared owner graph and would let
+        // downstream graph ops (consolidation, neighbor traversal) see a
+        // browser-injected node.
+        if !read_only && let Err(e) = self.graph.ensure_node(&content_hash, now).await {
             tracing::warn!("graph ensure_node failed (non-fatal): {e}");
         }
 
-        // Interference detection: search for similar content
+        // Interference detection: search for similar content + create graph edges.
+        // Suppressed under read_only: edges write to the shared owner graph
+        // (would be a side-channel to the gated `relation` tool).
         let mut contradiction_signals = Vec::new();
         let interference_filter = PayloadFilter {
             exclude_superseded: true,
             ..Default::default()
         };
-        if let Ok(similar) = self
-            .vectors
-            .search_by_vector(&embedding, 10, Some(interference_filter))
-            .await
+        if !read_only
+            && let Ok(similar) = self
+                .vectors
+                .search_by_vector(&embedding, 10, Some(interference_filter))
+                .await
         {
             let mut edges_to_create: Vec<(String, String, UserRelationType, EdgeMeta)> = Vec::new();
 
@@ -519,14 +542,23 @@ impl MemoryService {
 
     // ─── Tool 2: search ─────────────────────────────────────────────────
 
+    /// Default-policy wrapper — runs Hybrid with full side effects.
     #[tracing::instrument(skip(self, params), fields(mode = ?params.mode))]
     pub async fn search(&self, params: SearchParams) -> Result<Value> {
+        self.search_with(params, false).await
+    }
+
+    /// Search. When `read_only` is true, Hybrid skips its side-effect writes
+    /// (access-count increment, Hebbian co-access enqueue) and returns the
+    /// un-incremented `access_count`. Non-Hybrid modes are pure reads already.
+    #[tracing::instrument(skip(self, params), fields(mode = ?params.mode, read_only))]
+    pub async fn search_with(&self, params: SearchParams, read_only: bool) -> Result<Value> {
         if params.page_size == 0 {
             return Err(AlayaError::Validation("page_size must be > 0".into()));
         }
         let mode_str = format!("{:?}", params.mode).to_lowercase();
         let mut result = match params.mode {
-            SearchMode::Hybrid => self.search_hybrid(&params).await?,
+            SearchMode::Hybrid => self.search_hybrid(&params, read_only).await?,
             SearchMode::Scan => self.search_scan(&params).await?,
             SearchMode::Similar => self.search_similar(&params).await?,
             SearchMode::Tag => self.search_tag(&params).await?,
@@ -540,7 +572,7 @@ impl MemoryService {
     }
 
     #[tracing::instrument(skip(self, params))]
-    async fn search_hybrid(&self, params: &SearchParams) -> Result<Value> {
+    async fn search_hybrid(&self, params: &SearchParams, read_only: bool) -> Result<Value> {
         if params.query.trim().is_empty() {
             return Err(AlayaError::Validation(
                 "query is required for hybrid mode".into(),
@@ -975,10 +1007,12 @@ impl MemoryService {
             .take(params.page_size)
             .collect();
 
-        // Stage 6: Enrich — side-effect writes run concurrently
+        // Stage 6: Enrich — side-effect writes run concurrently.
+        // Suppressed under read_only: access_count + Hebbian touch shared
+        // owner ranking state. Skipping leaves rankings unchanged.
         let page_hashes: Vec<&str> = page_results.iter().map(|(h, _)| h.as_str()).collect();
 
-        {
+        if !read_only {
             let _span = tracing::info_span!("enrich", results = page_hashes.len()).entered();
             let access_fut = self.vectors.increment_access_count_batch(&page_hashes);
 
@@ -1010,11 +1044,15 @@ impl MemoryService {
                 let sm = memory_map.get(hash)?;
                 let mut item = format_memory_result(&sm.memory, *score, params.output);
                 // Reflect the post-increment access_count (batch already wrote N+1)
+                // — except under read_only, where the batch was skipped and the
+                // stored value is what's still on disk.
                 if let Some(obj) = item.as_object_mut() {
-                    obj.insert(
-                        "access_count".into(),
-                        serde_json::json!(sm.memory.access_count.saturating_add(1)),
-                    );
+                    let reported = if read_only {
+                        sm.memory.access_count
+                    } else {
+                        sm.memory.access_count.saturating_add(1)
+                    };
+                    obj.insert("access_count".into(), serde_json::json!(reported));
                 }
                 Some(item)
             })
@@ -2786,6 +2824,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn build_batch_test_service(
         similar: Vec<ScoredMemory>,
     ) -> (

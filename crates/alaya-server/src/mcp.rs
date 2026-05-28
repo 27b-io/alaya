@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{OutputMode, RelationParams, SearchParams, StoreParams};
 
+use crate::auth::{AuthPrincipal, oidc_allows};
 use crate::{Cmd, CmdInner, ServiceHandle};
 
 fn cmd(inner: CmdInner) -> Cmd {
@@ -147,6 +148,7 @@ fn is_accepted_notification(id: &Value, method: &str) -> bool {
 
 pub async fn mcp_handler(
     headers: HeaderMap,
+    axum::Extension(principal): axum::Extension<AuthPrincipal>,
     handle: axum::extract::State<ServiceHandle>,
     body: axum::body::Bytes,
 ) -> Response {
@@ -197,10 +199,25 @@ pub async fn mcp_handler(
         return StatusCode::ACCEPTED.into_response();
     }
 
+    // Default-deny authorization: an Oidc principal may only call allowlisted
+    // tools. Enforced here, axum-side, before any channel dispatch.
+    if req.method == "tools/call" && principal == AuthPrincipal::Oidc {
+        let tool = req
+            .params
+            .as_ref()
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+        if !oidc_allows(tool) {
+            let resp = JsonRpcResponse::error(id, -32001, "forbidden for this principal");
+            return make_response(resp, wants_sse);
+        }
+    }
+
     let resp = match req.method.as_str() {
         "initialize" => handle_initialize(id),
         "tools/list" => handle_tools_list(id),
-        "tools/call" => handle_tools_call(id, req.params, &handle).await,
+        "tools/call" => handle_tools_call(id, req.params, &handle, principal).await,
         "ping" => JsonRpcResponse::success(id, json!({})),
         _ => JsonRpcResponse::error(id, -32601, format!("Method not found: {}", req.method)),
     };
@@ -267,6 +284,7 @@ async fn handle_tools_call(
     id: Value,
     params: Option<Value>,
     handle: &ServiceHandle,
+    principal: AuthPrincipal,
 ) -> JsonRpcResponse {
     let params = match params {
         Some(p) => p,
@@ -287,7 +305,7 @@ async fn handle_tools_call(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    let result = dispatch_tool(&tool_name, arguments, handle).await;
+    let result = dispatch_tool(&tool_name, arguments, handle, principal).await;
 
     match result {
         Ok(value) => {
@@ -313,13 +331,19 @@ async fn dispatch_tool(
     name: &str,
     args: Value,
     handle: &ServiceHandle,
+    principal: AuthPrincipal,
 ) -> Result<Value, (i32, String)> {
+    let read_only = matches!(principal, AuthPrincipal::Oidc);
     match name {
         "store_memory" => {
             let params: StoreParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle.try_dispatch(cmd(CmdInner::Store { params, reply: tx }))?;
+            handle.try_dispatch(cmd(CmdInner::Store {
+                params,
+                read_only,
+                reply: tx,
+            }))?;
             rx.await
                 .map_err(|_| (-32000, "Service dropped".to_string()))
         }
@@ -327,7 +351,11 @@ async fn dispatch_tool(
             let params: SearchParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle.try_dispatch(cmd(CmdInner::Search { params, reply: tx }))?;
+            handle.try_dispatch(cmd(CmdInner::Search {
+                params,
+                read_only,
+                reply: tx,
+            }))?;
             rx.await
                 .map_err(|_| (-32000, "Service dropped".to_string()))
         }
@@ -605,10 +633,7 @@ mod tests {
 
     fn test_handle() -> ServiceHandle {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        ServiceHandle {
-            tx,
-            api_key: String::new(),
-        }
+        ServiceHandle { tx }
     }
 
     fn mcp_headers() -> HeaderMap {
@@ -701,6 +726,7 @@ mod tests {
     async fn notifications_initialized_returns_empty_accepted() {
         let response = mcp_handler(
             mcp_headers(),
+            axum::Extension(AuthPrincipal::Static),
             axum::extract::State(test_handle()),
             axum::body::Bytes::from(
                 serde_json::to_vec(&json!({
