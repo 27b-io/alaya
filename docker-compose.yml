@@ -44,7 +44,9 @@ services:
       retries: 5
 
   tei:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-${TEI_ARCH:-arm64}-latest
+    # Defaults to ARM64 (Mac dev). For x86 hosts: TEI_TAG=cpu-1.9.3
+    # No pinned ARM64 tags exist — only `cpu-arm64-latest`.
+    image: ghcr.io/huggingface/text-embeddings-inference:${TEI_TAG:-cpu-arm64-latest}
     command: --model-id ${TEI_MODEL:-Snowflake/snowflake-arctic-embed-l-v2.0} --port 80
     ports:
       - "${TEI_PORT:-8888}:80"
@@ -106,8 +108,11 @@ services:
       # SUMMARY_API_KEY: ${SUMMARY_API_KEY:-}
       # SUMMARY_MODEL: ${SUMMARY_MODEL:-claude-haiku-4-5-20251001}
     depends_on:
+      # Bridge is a soft dependency — graph operations are non-fatal at
+      # runtime (see CLAUDE.md). Wait for it to start but not be healthy
+      # so a FalkorDB outage doesn't block the core memory API.
       alaya-bridge:
-        condition: service_healthy
+        condition: service_started
       qdrant:
         condition: service_healthy
       tei:

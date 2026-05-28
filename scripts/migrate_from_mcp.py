@@ -39,6 +39,11 @@ CONCURRENCY = int(os.environ.get("CONCURRENCY", "5"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "50"))
 DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
 
+if CONCURRENCY <= 0:
+    sys.exit(f"CONCURRENCY must be > 0, got {CONCURRENCY}")
+if BATCH_SIZE <= 0:
+    sys.exit(f"BATCH_SIZE must be > 0, got {BATCH_SIZE}")
+
 METADATA_POINT_PREFIX = "00000000-0000-0000-0000-"
 
 
@@ -124,13 +129,15 @@ async def run() -> None:
             if memory_type:
                 entry["memory_type"] = memory_type
 
-            # Preserve metadata, emotional_valence, provenance
+            # Preserve metadata, emotional_valence, provenance.
+            # Use `is not None` so legitimate falsy values (e.g. epoch 0,
+            # neutral 0.0 valence) survive the copy.
             metadata = dict(payload.get("metadata") or {})
-            if payload.get("emotional_valence"):
+            if payload.get("emotional_valence") is not None:
                 metadata["emotional_valence"] = payload["emotional_valence"]
-            if payload.get("created_at"):
+            if payload.get("created_at") is not None:
                 metadata["original_created_at"] = payload["created_at"]
-            if payload.get("updated_at"):
+            if payload.get("updated_at") is not None:
                 metadata["original_updated_at"] = payload["updated_at"]
             if metadata:
                 entry["metadata"] = metadata
