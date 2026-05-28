@@ -104,6 +104,10 @@ Copy `.env.example` to `.env`. All settings have sensible defaults for local dev
 | `SUMMARY_URL` | — | Anthropic Messages API URL (optional) |
 | `SUMMARY_API_KEY` | — | Required if `SUMMARY_URL` is set |
 | `SUMMARY_MODEL` | `claude-haiku-4-5-20251001` | Summary model |
+| `RERANK_URL` | — | TEI `/rerank` endpoint (empty = rerank disabled) |
+| `RERANK_API_KEY` | — | Optional bearer token for `RERANK_URL` |
+| `RERANK_TOP_N` | `20` | How many top RRF candidates to rerank |
+| `OIDC_ISSUER` | — | OAuth Resource Server issuer URL (empty = no OAuth) |
 
 ## Development
 
@@ -153,6 +157,20 @@ Installed via `.pre-commit-config.yaml` — enforces fmt, clippy, tests, WASM ga
 | `tei` | `ghcr.io/huggingface/text-embeddings-inference:cpu-latest` | 8888 | Embedding inference (CPU) |
 | `alaya-bridge` | Built from `Dockerfile` | 8080 | FalkorDB RPC bridge |
 | `alaya-server` | Built from `Dockerfile` | 3001 | REST + MCP server |
+| `tei-rerank` | `ghcr.io/huggingface/text-embeddings-inference:cpu-arm64-latest` | 8889 | Cross-encoder reranker (opt-in via `--profile rerank`) |
+
+### Cross-encoder reranker
+
+The reranker re-scores the top-N RRF candidates from `search_hybrid` and reorders them — boosts recall@5 ~0.94 → ~0.99 on LongMemEval. It's opt-in because the second TEI container adds ~1GB to the first-run download.
+
+```bash
+docker compose --profile rerank up -d
+# then in .env, uncomment:
+#   RERANK_URL=http://tei-rerank:80
+docker compose up -d alaya-server   # re-create with new env
+```
+
+The server gracefully degrades to RRF order if `RERANK_URL` is unset or unreachable.
 
 For GPU-accelerated embeddings, swap the TEI image:
 

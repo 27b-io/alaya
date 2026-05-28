@@ -61,6 +61,29 @@ services:
       retries: 30
       start_period: 120s
 
+  # Cross-encoder reranker — opt-in via `--profile rerank`.
+  # Doubles first-run download (~1GB extra) so it stays out of the default
+  # stack. Server's rerank pipeline degrades gracefully if RERANK_URL is
+  # unset or unreachable (see CLAUDE.md → Cross-encoder rerank).
+  #
+  #   docker compose --profile rerank up -d
+  tei-rerank:
+    profiles: ["rerank"]
+    image: ghcr.io/huggingface/text-embeddings-inference:${TEI_TAG:-cpu-arm64-latest}
+    command: --model-id ${RERANK_MODEL:-BAAI/bge-reranker-v2-m3} --port 80
+    ports:
+      - "${TEI_RERANK_PORT:-8889}:80"
+    volumes:
+      - tei_rerank_cache:/data
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+
   # ── Alaya services ───────────────────────────────────────────────
 
   alaya-bridge:
@@ -103,10 +126,18 @@ services:
       LISTEN_ADDR: 0.0.0.0:3001
       REDIS_CACHE_URL: redis://falkordb:6379
       RUST_LOG: ${RUST_LOG_SERVER:-alaya_server=info}
+      # Cross-encoder rerank — empty unless `--profile rerank` is active.
+      # When set, server re-scores top-N RRF candidates via TEI /rerank.
+      RERANK_URL: ${RERANK_URL:-}
+      RERANK_API_KEY: ${RERANK_API_KEY:-}
+      RERANK_TOP_N: ${RERANK_TOP_N:-20}
       # Uncomment for auto-summary (requires Anthropic API key):
       # SUMMARY_URL: https://api.anthropic.com/v1/messages
       # SUMMARY_API_KEY: ${SUMMARY_API_KEY:-}
       # SUMMARY_MODEL: ${SUMMARY_MODEL:-claude-haiku-4-5-20251001}
+      # OAuth Resource Server (delegated auth via OIDC) — empty disables.
+      # See README.md → OAuth section.
+      # OIDC_ISSUER: ${OIDC_ISSUER:-}
     depends_on:
       # Bridge is a soft dependency — graph operations are non-fatal at
       # runtime (see CLAUDE.md). Wait for it to start but not be healthy
@@ -127,3 +158,4 @@ volumes:
   falkordb_data:
   qdrant_data:
   tei_cache:
+  tei_rerank_cache:
