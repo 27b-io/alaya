@@ -1,0 +1,161 @@
+# Alaya local dev stack.
+#
+# First run pulls ~2GB (TEI model + Qdrant + FalkorDB + Rust build).
+# Subsequent runs use cached layers and named volumes.
+#
+#   docker compose up --build -d
+#   docker compose logs -f          # watch startup (TEI is slowest)
+#   docker compose ps               # verify all healthy
+#   docker compose down              # stop, keep data
+#   docker compose down -v           # stop + wipe volumes
+#
+# Bootstrap (first run only — create Qdrant collection):
+#   curl -X PUT "http://localhost:${QDRANT_PORT:-6333}/collections/${QDRANT_COLLECTION:-memories_arctic1024}" \
+#     -H 'Content-Type: application/json' \
+#     -d "{\"vectors\":{\"size\":${EMBEDDING_DIMENSIONS:-1024},\"distance\":\"Cosine\"}}"
+
+services:
+
+  # ── External backends ────────────────────────────────────────────
+
+  falkordb:
+    image: falkordb/falkordb:v4.18.6
+    ports:
+      - "${FALKORDB_PORT:-6379}:6379"
+    volumes:
+      - falkordb_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:v1.18.0
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/localhost/6333'"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  tei:
+    # Defaults to ARM64 (Mac dev). For x86 hosts: TEI_TAG=cpu-1.9.3
+    # No pinned ARM64 tags exist — only `cpu-arm64-latest`.
+    image: ghcr.io/huggingface/text-embeddings-inference:${TEI_TAG:-cpu-arm64-latest}
+    command: --model-id ${TEI_MODEL:-Snowflake/snowflake-arctic-embed-l-v2.0} --port 80
+    ports:
+      - "${TEI_PORT:-8888}:80"
+    volumes:
+      - tei_cache:/data
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+
+  # Cross-encoder reranker — opt-in via `--profile rerank`.
+  # Doubles first-run download (~1GB extra) so it stays out of the default
+  # stack. Server's rerank pipeline degrades gracefully if RERANK_URL is
+  # unset or unreachable (see CLAUDE.md → Cross-encoder rerank).
+  #
+  #   docker compose --profile rerank up -d
+  tei-rerank:
+    profiles: ["rerank"]
+    image: ghcr.io/huggingface/text-embeddings-inference:${TEI_TAG:-cpu-arm64-latest}
+    command: --model-id ${RERANK_MODEL:-BAAI/bge-reranker-v2-m3} --port 80
+    ports:
+      - "${TEI_RERANK_PORT:-8889}:80"
+    volumes:
+      - tei_rerank_cache:/data
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+
+  # ── Alaya services ───────────────────────────────────────────────
+
+  alaya-bridge:
+    image: alaya:${GIT_SHA:-dev}
+    build:
+      context: .
+      args:
+        GIT_SHA: ${GIT_SHA:-dev}
+    entrypoint: ["/usr/local/bin/alaya-bridge"]
+    ports:
+      - "${BRIDGE_PORT:-8080}:8080"
+    environment:
+      REDIS_URL: redis://falkordb:6379
+      GRAPH_NAME: ${GRAPH_NAME:-memory_graph}
+      GRAPH_API_KEY: ${GRAPH_API_KEY:-}
+      RUST_LOG: ${RUST_LOG_BRIDGE:-alaya_bridge=info}
+    depends_on:
+      falkordb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  alaya-server:
+    image: alaya:${GIT_SHA:-dev}
+    entrypoint: ["/usr/local/bin/alaya-server"]
+    ports:
+      - "${SERVER_PORT:-3001}:3001"
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-memories_arctic1024}
+      EMBEDDING_URL: http://tei:80
+      EMBEDDING_MODEL: ${TEI_MODEL:-Snowflake/snowflake-arctic-embed-l-v2.0}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
+      GRAPH_URL: http://alaya-bridge:8080
+      GRAPH_API_KEY: ${GRAPH_API_KEY:-}
+      ALAYA_API_KEY: ${ALAYA_API_KEY:-}
+      LISTEN_ADDR: 0.0.0.0:3001
+      REDIS_CACHE_URL: redis://falkordb:6379
+      RUST_LOG: ${RUST_LOG_SERVER:-alaya_server=info}
+      # Cross-encoder rerank — empty unless `--profile rerank` is active.
+      # When set, server re-scores top-N RRF candidates via TEI /rerank.
+      RERANK_URL: ${RERANK_URL:-}
+      RERANK_API_KEY: ${RERANK_API_KEY:-}
+      RERANK_TOP_N: ${RERANK_TOP_N:-20}
+      # Uncomment for auto-summary (requires Anthropic API key):
+      # SUMMARY_URL: https://api.anthropic.com/v1/messages
+      # SUMMARY_API_KEY: ${SUMMARY_API_KEY:-}
+      # SUMMARY_MODEL: ${SUMMARY_MODEL:-claude-haiku-4-5-20251001}
+      # OAuth Resource Server (delegated auth via OIDC) — empty disables.
+      # See README.md → OAuth section.
+      # OIDC_ISSUER: ${OIDC_ISSUER:-}
+    depends_on:
+      # Bridge is a soft dependency — graph operations are non-fatal at
+      # runtime (see CLAUDE.md). Wait for it to start but not be healthy
+      # so a FalkorDB outage doesn't block the core memory API.
+      alaya-bridge:
+        condition: service_started
+      qdrant:
+        condition: service_healthy
+      tei:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3001/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  falkordb_data:
+  qdrant_data:
+  tei_cache:
+  tei_rerank_cache:
