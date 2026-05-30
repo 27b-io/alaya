@@ -45,7 +45,7 @@ pub async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Value>, St
     }
 
     let node_count = counts.get("nodes").copied().unwrap_or(0);
-    let hebbian_edge_count = counts.get("hebbian").copied().unwrap_or(0);
+    let hebbian_edge_count = counts.get("HEBBIAN").copied().unwrap_or(0);
     let relates_to = counts.get("RELATES_TO").copied().unwrap_or(0);
     let precedes = counts.get("PRECEDES").copied().unwrap_or(0);
     let contradicts = counts.get("CONTRADICTS").copied().unwrap_or(0);
