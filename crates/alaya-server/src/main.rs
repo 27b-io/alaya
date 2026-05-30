@@ -451,7 +451,10 @@ impl HealthChecker {
     }
 
     async fn check_graph(&self) -> Result<Value, String> {
-        let mut req = self.client.get(format!("{}/stats", self.graph_url));
+        // Probes bridge /health (a single Redis PING) — never /stats.
+        // /stats runs 6 full-graph aggregate scans and scales with graph
+        // size; readiness probes only need reachability, not workload.
+        let mut req = self.client.get(format!("{}/health", self.graph_url));
         if !self.graph_api_key.is_empty() {
             req = req.bearer_auth(&self.graph_api_key);
         }

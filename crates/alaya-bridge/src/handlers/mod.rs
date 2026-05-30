@@ -54,7 +54,16 @@ pub async fn exec_query(
 
     let mut conn = state.redis.clone();
     let raw: redis::Value = cmd.query_async(&mut conn).await.map_err(|e| {
-        tracing::error!("Redis error: {e}");
+        // Log enough context to identify which query timed out without
+        // dumping params (may include user content).
+        let cypher_preview: String = cypher.chars().take(120).collect();
+        tracing::error!(
+            cmd = cmd_name,
+            graph = state.graph_name.as_str(),
+            cypher = %cypher_preview,
+            error = %e,
+            "FalkorDB query failed"
+        );
         StatusCode::BAD_GATEWAY
     })?;
 
