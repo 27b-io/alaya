@@ -11,7 +11,7 @@ docker compose up --build -d
 
 First run pulls images and downloads the embedding model (~2 GB total). TEI takes 1-2 minutes to warm up — the server waits for it automatically.
 
-```
+```text
 http://localhost:3001/health   # server
 http://localhost:3001/mcp      # MCP endpoint
 http://localhost:8080/health   # bridge
@@ -19,7 +19,7 @@ http://localhost:8080/health   # bridge
 
 ## Architecture
 
-```
+```text
 ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
 │   Qdrant    │   │  FalkorDB   │   │     TEI     │
 │  (vectors)  │   │   (graph)   │   │ (embeddings)│
@@ -154,7 +154,7 @@ Installed via `.pre-commit-config.yaml` — enforces fmt, clippy, tests, WASM ga
 |---------|-------|-----------|---------|
 | `falkordb` | `falkordb/falkordb` | 6379 | Graph database (Redis + FalkorDB module) |
 | `qdrant` | `qdrant/qdrant` | 6333, 6334 | Vector database |
-| `tei` | `ghcr.io/huggingface/text-embeddings-inference:cpu-latest` | 8888 | Embedding inference (CPU) |
+| `tei` | `ghcr.io/huggingface/text-embeddings-inference:${TEI_TAG:-cpu-arm64-latest}` | 8888 | Embedding inference (CPU) |
 | `alaya-bridge` | Built from `Dockerfile` | 8080 | FalkorDB RPC bridge |
 | `alaya-server` | Built from `Dockerfile` | 3001 | REST + MCP server |
 | `tei-rerank` | `ghcr.io/huggingface/text-embeddings-inference:cpu-arm64-latest` | 8889 | Cross-encoder reranker (opt-in via `--profile rerank`) |

@@ -10,9 +10,9 @@
 #   docker compose down -v           # stop + wipe volumes
 #
 # Bootstrap (first run only — create Qdrant collection):
-#   curl -X PUT http://localhost:${QDRANT_PORT:-6333}/collections/memories_arctic1024 \
+#   curl -X PUT "http://localhost:${QDRANT_PORT:-6333}/collections/${QDRANT_COLLECTION:-memories_arctic1024}" \
 #     -H 'Content-Type: application/json' \
-#     -d '{"vectors":{"size":1024,"distance":"Cosine"}}'
+#     -d "{\"vectors\":{\"size\":${EMBEDDING_DIMENSIONS:-1024},\"distance\":\"Cosine\"}}"
 
 services:
 

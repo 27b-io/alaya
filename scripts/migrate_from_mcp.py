@@ -148,7 +148,9 @@ async def run() -> None:
             break
 
     stats.scrolled = len(memories)
-    print(f"  Found {stats.scrolled} memories ({stats.skipped_no_content} skipped — no content)")
+    print(
+        f"  Found {stats.scrolled} memories ({stats.skipped_no_content} skipped — no content)"
+    )
 
     if DRY_RUN:
         for m in memories[:5]:
@@ -188,7 +190,7 @@ async def run() -> None:
     total_elapsed = time.monotonic() - t0
 
     # ── Phase 3: Verify ─────────────────────────────────────────────
-    print(f"\nPhase 3: Verifying...")
+    print("\nPhase 3: Verifying...")
     try:
         r = httpx.get(f"{ALAYA_URL}/health", headers=headers, timeout=10)
         health = r.json()
