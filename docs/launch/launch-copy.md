@@ -42,8 +42,7 @@ context — all ≤60, all number-free, all outcome-first):
 > vector store with a nicer name. They'd happily store two facts that flatly
 > contradict each other — "auth is required on every endpoint" and "we dropped
 > auth on the public ones" — and then hand back whichever one cosine similarity
-> liked that day. The agent doesn't get *memory*; it gets a pile of
-> embeddings and a coin flip.
+> ranked highest that day, with no notion of which fact superseded which.
 >
 > Ālaya is a single-binary memory service (Rust) that does the three things I
 > actually needed: it **finds the right memory even when the words don't match**
@@ -55,7 +54,7 @@ context — all ≤60, all number-free, all outcome-first):
 > endpoint, and the whole default stack is five containers you bring up with one
 > `docker compose up`.
 >
-> On the retrieval question everyone actually asks — *does it find the thing?* —
+> On retrieval quality:
 > Cross-encoder reranking lifts hit-rate@5 from 0.916 to 0.986 on the live server — +7.0 points, paired McNemar p≈5.5e-10 (36 questions fixed, 1 regressed).
 >
 > The benchmark is fully reproducible: same harness, dataset, commit and date,
@@ -64,8 +63,8 @@ context — all ≤60, all number-free, all outcome-first):
 > my word for it.
 >
 > It's MIT-licensed and self-hostable — no account, no SaaS, runs on your own
-> box. Happy to answer anything about the architecture, the metric (I label it
-> honestly — see below), or where it breaks.
+> box. Happy to answer questions about the architecture, the metric, or the
+> benchmark method.
 
 > Honesty footnote for the comment (keep adjacent, do not inline a number):
 > the headline is **0.986** hit-rate@5 on LongMemEval. That metric is *hit-rate@5* —
@@ -97,8 +96,8 @@ context — all ≤60, all number-free, all outcome-first):
 > that says "migrated to pnpm". Second, and worse, it has **no concept of facts
 > disagreeing**: store "auth is required everywhere", later store "we no longer
 > require auth on public endpoints", and both sit in the index forever. The
-> retriever returns whichever one wins the similarity lottery. That's not memory;
-> that's a bag of embeddings.
+> retriever returns whichever one ranks highest; nothing represents that the two
+> conflict.
 >
 > **What I built.** Ālaya is a memory service written in Rust that treats those
 > two problems as first-class:
@@ -130,10 +129,9 @@ context — all ≤60, all number-free, all outcome-first):
 > `/search` endpoints. I report *hit-rate@5* — the fraction of questions where at
 > least one correct session lands in the top 5 — and I deliberately call it
 > hit-rate, not recall@5: it's a binary any-correct-in-top-k measure, the lenient
-> one, and I'd rather own that than dress it up. The full method — dataset
+> one. The full method — dataset
 > provenance, the per-question reset protocol, the exact commit and date, and a
-> one-command reproduction — is in `benchmarks/README.md`. Reproduce it and tell
-> me if I'm wrong.
+> one-command reproduction — is in `benchmarks/README.md`.
 >
 > **Try it.** MIT-licensed, self-hostable, no account:
 >
@@ -163,9 +161,8 @@ context — all ≤60, all number-free, all outcome-first):
 >
 > Repo: https://github.com/27b-io/alaya · Benchmark + reproduction: `benchmarks/README.md`
 >
-> Happy to get into the weeds on the architecture, the `?Send`-trait WASM story,
-> the FalkorDB wire-format gotchas, or anywhere the metric is too generous.
-> Tear it apart.
+> Happy to get into the architecture, the `?Send`-trait WASM design, or the
+> FalkorDB wire-format details.
 
 ---
 

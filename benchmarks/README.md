@@ -56,8 +56,8 @@ the number of relevant items found by the *total* number of relevant items; this
 function returns `1.0` the moment a *single* correct id appears in the top *k*,
 regardless of how many relevant items exist. The Python function is named
 `recall_at_k` for historical reasons, but its body is hit-rate — so we label it
-honestly everywhere it is reported. (The misleading name is a known wart; the
-semantics, not the identifier, are what we publish.)
+honestly everywhere it is reported. (The function name is historical; the
+semantics, not the identifier, are what we report.)
 
 We also report **NDCG@k** ([`longmemeval_bench.py:66`](longmemeval_bench.py#L66)),
 which rewards ranking the correct session higher within the top *k*.

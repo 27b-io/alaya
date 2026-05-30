@@ -2,20 +2,11 @@
 
 Long-term memory for LLM agents — store what matters, retrieve it months later by meaning, and never trip over your own contradictions.
 
-<!-- HOOK CANDIDATES — pick one at join time, delete the rest:
-  A (problem/outcome, current): "Long-term memory for LLM agents — store what matters, retrieve it months later by meaning, and never trip over your own contradictions."
-  B (capability-as-outcome): "A memory service that remembers *for* your agent: semantic recall, automatic contradiction resolution, and a relationship graph — over one HTTP/MCP endpoint."
-  C (positioning/peer-framed): "Open-source semantic memory for agents — the recall quality of a tuned RAG stack, the operational footprint of a single container, speaking both MCP and REST."
-  D (terse/credible): "Rust memory service for LLM agents. Vector recall + knowledge graph + contradiction handling, behind MCP and REST."
--->
-
 A single Rust service over Qdrant (vectors) and FalkorDB (knowledge graph). It speaks both plain REST and [MCP](https://modelcontextprotocol.io) (Streamable HTTP, protocol 2025-03-26), so the same store answers your agents and your scripts.
 
 ## Why this exists
 
 Vector search alone gives an agent a fuzzy lookup table. It returns whatever is closest in embedding space — including stale facts, near-duplicates, and statements that flatly contradict each other — with no notion of which memory superseded which, or how the memories relate. Ālaya is built to be the memory layer you can actually trust over months of writes: it retrieves by meaning, notices when two memories disagree, lets you resolve the conflict while keeping an audit trail, and reasons over the relationships between memories instead of treating each one as an island.
-
-Each capability below is stated as the outcome you get, with the mechanism in parentheses.
 
 - **It finds the right memory even when your words don't match** — hybrid retrieval fuses semantic vectors with keyword signal (Reciprocal Rank Fusion), so "why did we switch package managers" finds the note that says "migrated to pnpm." *(hybrid RRF retrieval)*
 - **It catches when your memories disagree** — conflicting facts are flagged automatically on write; you resolve them with one call and the old answer stays auditable instead of silently vanishing. *(contradiction detection — negation, antonym, temporal cues — plus supersede)*
