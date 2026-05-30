@@ -13,7 +13,7 @@ services:
     image: docker.io/qdrant/qdrant:v1.14.1
     environment:
       QDRANT__STORAGE__STORAGE_PATH: /tmp/qdrant_bench
-    ports: ["6333:6333"]
+    ports: ["16333:6333"]  # host 16333 -> container 6333: off default 6333 so the harness's data-safety guard can fail closed
     tmpfs: ["/tmp/qdrant_bench"]
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:6333/healthz || exit 1"]
@@ -65,12 +65,25 @@ services:
       EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
       GRAPH_URL: http://bridge:8080
       LISTEN_ADDR: 0.0.0.0:3001
-      RUST_LOG: alaya_server=info
+      # alaya_core=info surfaces the per-search "cross-encoder rerank reordered"
+      # line (Signal 2) so the A/B can PROVE rerank fired, not just assume it.
+      RUST_LOG: alaya_server=info,alaya_core=info
+      # Rerank ON by default (points at tei-rerank). For the rerank-OFF arm:
+      #   RERANK_URL= docker compose up -d alaya
+      RERANK_URL: ${RERANK_URL-http://tei-rerank:80}
+      RERANK_TOP_N: "20"
+      # Server is fail-closed (panics with no auth). This is an ephemeral,
+      # localhost-only bench, so opt into the dev-open mode AND give it a
+      # private origin (the open mode is refused on a public PUBLIC_BASE_URL).
+      DANGEROUSLY_ALLOW_UNAUTHENTICATED: "true"
+      PUBLIC_BASE_URL: http://localhost:3001
     ports: ["3001:3001"]
     depends_on:
       qdrant:
         condition: service_healthy
       bridge:
+        condition: service_healthy
+      tei-rerank:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:3001/health || exit 1"]
@@ -78,3 +91,23 @@ services:
       timeout: 3s
       retries: 5
       start_period: 10s
+
+  # Cross-encoder reranker for the rerank A/B. ~1GB model download on first run.
+  # Defaults to the x86 CPU tag — this bench runs on the x86 lab box (Ryzen/GTX).
+  # Mac/arm dev: TEI_TAG=cpu-arm64-latest. GPU: swap to a cuda image + nvidia runtime.
+  tei-rerank:
+    image: ghcr.io/huggingface/text-embeddings-inference:${TEI_TAG:-cpu-1.9.3}
+    command: --model-id ${RERANK_MODEL:-BAAI/bge-reranker-v2-m3} --port 80
+    volumes:
+      - tei_rerank_cache:/data
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:80/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+
+volumes:
+  tei_rerank_cache:  # model cache only — bench DATA stays ephemeral (tmpfs)
