@@ -199,7 +199,9 @@ Mark `old_id` as superseded by `new_id`. The old memory stays in storage (so the
 | `new_id` | string | ✓ | |
 | `reason` | string | | `""` |
 
-**Note:** the field names are `old_id` / `new_id` here (MCP) but `old_hash` / `new_hash` on the REST endpoint. Both take a `content_hash` value.
+> **Field-name divergence.** `supersede` takes `old_hash`/`new_hash` on REST (`POST /supersede`) and `old_id`/`new_id` in MCP (`memory_supersede`). The **values are identical** — full 64-char content hashes; only the field names differ. (`relation` and `delete` use `content_hash`/`target_hash` on *both* protocols — no divergence.)
+
+See [REST: `POST /supersede`](rest-api.md#post-supersede) for the REST equivalent.
 
 **Example:**
 

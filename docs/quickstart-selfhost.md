@@ -17,7 +17,9 @@ cp .env.example .env
 docker compose up -d
 ```
 
-That starts five containers:
+That starts five containers (six with `--profile rerank`):
+
+> **Auth is fail-closed.** The server won't boot without auth, so the dev Compose opts into open mode on `localhost` (`DANGEROUSLY_ALLOW_UNAUTHENTICATED=true`, automatically refused on any non-private origin). Set `ALAYA_API_KEY` in `.env` before exposing it — that enables `Authorization: Bearer` auth and disables the dev-open flag.
 
 | Service | Purpose | Default host port |
 |---|---|---|
@@ -39,6 +41,8 @@ curl -X PUT http://localhost:6333/collections/memories_arctic1024 \
   -d '{"vectors":{"size":1024,"distance":"Cosine"}}'
 ```
 
+> Qdrant has no auth in the default compose; this assumes localhost — don't expose :6333.
+
 (The collection name comes from `QDRANT_COLLECTION` — `memories_arctic1024` is the default for the Snowflake Arctic embed model.)
 
 ## Verify
@@ -57,13 +61,17 @@ Then exercise the API end-to-end:
 
 ```bash
 # Store
-curl -X POST http://localhost:3001/store \
+# Authorization header only when a key is set — omit on a localhost no-auth dev box.
+curl -fsS -H "Authorization: Bearer ${ALAYA_API_KEY}" \
+  -X POST http://localhost:3001/store \
   -H 'Content-Type: application/json' \
   -d '{"content":"hello memory","tags":["demo"]}'
 # → {"content_hash":"e3b0c4...","stored":true,...}
 
 # Search
-curl -X POST http://localhost:3001/search \
+# Authorization header only when a key is set — omit on a localhost no-auth dev box.
+curl -fsS -H "Authorization: Bearer ${ALAYA_API_KEY}" \
+  -X POST http://localhost:3001/search \
   -H 'Content-Type: application/json' \
   -d '{"query":"memory","mode":"hybrid"}'
 # → [{"content":"hello memory","similarity":0.78,...}]
@@ -99,7 +107,7 @@ Every knob lives in `.env`. The interesting ones:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `ALAYA_API_KEY` | empty (no auth) | Bearer token clients must send. **Set this for any non-local deployment.** |
+| `ALAYA_API_KEY` | empty | Bearer token clients must send. Empty is fail-closed: the server won't boot unless the dev Compose sets `DANGEROUSLY_ALLOW_UNAUTHENTICATED=true` (localhost only). **Set this for any non-local deployment.** |
 | `GRAPH_API_KEY` | empty | Bridge bearer token. Set if exposing the bridge port. |
 | `QDRANT_COLLECTION` | `memories_arctic1024` | Must match the bootstrap collection name. |
 | `TEI_MODEL` | `Snowflake/snowflake-arctic-embed-l-v2.0` | Embedding model. Change this and you'll need a new collection with the matching dimensionality. |

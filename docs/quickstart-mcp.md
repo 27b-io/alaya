@@ -5,7 +5,7 @@ Point a Model Context Protocol client (Claude Code, Claude Desktop, etc.) at a r
 ## You need
 
 - A running Ālaya server reachable at some URL (e.g. `http://localhost:3001` for local docker compose, or `https://alaya.example.com` for a hosted deployment).
-- The `ALAYA_API_KEY` for that server, if it has one set. Empty means no auth — fine for local dev, not fine for anything internet-facing.
+- The `ALAYA_API_KEY` for that server. Auth is fail-closed: the dev Compose opts into open mode on `localhost` (`DANGEROUSLY_ALLOW_UNAUTHENTICATED=true`, refused on any non-private origin), so a local dev box needs no key. Set `ALAYA_API_KEY` before exposing the server — that enables `Authorization: Bearer` auth and disables the dev-open flag.
 - An MCP client. The examples below are for Claude Code and Claude Desktop.
 
 ## Claude Code
@@ -49,6 +49,8 @@ Claude Desktop reads `claude_desktop_config.json` (location depends on your OS �
   }
 }
 ```
+
+Omit the `Authorization` header when `ALAYA_API_KEY` is empty (a localhost dev box in open mode).
 
 Restart Claude Desktop. The Ālaya tools show up under the connections panel.
 

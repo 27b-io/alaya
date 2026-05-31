@@ -12,7 +12,7 @@ Set `ALAYA_API_KEY` on the server to require authentication. Clients then send:
 Authorization: Bearer <your-api-key>
 ```
 
-Empty `ALAYA_API_KEY` means **no auth** — fine for local dev, not fine for anything internet-facing. The server logs a warning on startup when running unauthenticated.
+Auth is **fail-closed**: with no `ALAYA_API_KEY` (and no `OIDC_ISSUER`) the server refuses to boot — unless `DANGEROUSLY_ALLOW_UNAUTHENTICATED=true` is set, which the dev Compose does for `localhost` only (it is refused on any non-private `PUBLIC_BASE_URL`). Set `ALAYA_API_KEY` before exposing the server; that enables bearer auth and disables the dev-open flag.
 
 If the server has `OIDC_ISSUER` set, clients use an OAuth access token instead of a fixed key. See [MCP quickstart → OAuth](./quickstart-mcp.md#oauth-optional) — the same flow applies to REST clients.
 
@@ -194,7 +194,9 @@ Content-Type: application/json
 
 ## `POST /supersede`
 
-⚠️ **Field-name divergence:** REST uses `old_hash` / `new_hash`. The equivalent MCP tool (`memory_supersede`) uses `old_id` / `new_id`. The values are the same content hashes.
+> **Field-name divergence.** `supersede` takes `old_hash`/`new_hash` on REST (`POST /supersede`) and `old_id`/`new_id` in MCP (`memory_supersede`). The **values are identical** — full 64-char content hashes; only the field names differ. (`relation` and `delete` use `content_hash`/`target_hash` on *both* protocols — no divergence.)
+
+See also [MCP: `memory_supersede`](./mcp-tools.md#memory_supersede).
 
 ```http
 POST /supersede
