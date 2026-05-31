@@ -1,0 +1,70 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# 27b.io house standard (see org .github/.coderabbit.yaml) + alaya-specific
+# path instructions for the bridge/Cypher and benchmark-harness conventions.
+language: "en-AU"
+early_access: false
+
+reviews:
+  profile: "assertive"
+  request_changes_workflow: true
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+
+  auto_review:
+    enabled: true
+    drafts: false
+    ignore_usernames: []  # review bot/agent PRs too (claude, stev3-bot, CI)
+
+  path_instructions:
+    - path: "**/*.rs"
+      instructions: |
+        Rust code. Check for unsafe blocks, unwrap abuse, missing error propagation,
+        and clippy-level issues. Prefer Result over panic.
+    - path: "crates/alaya-bridge/**/*.rs"
+      instructions: |
+        FalkorDB bridge. Cypher MUST be parameterized — flag any string
+        interpolation of external input into a query. Relation types must use the
+        compile-time enums with cypher_label(); hop depths are u8 clamped to 1..3.
+        Errors must be sanitized via safe_message() before external exposure.
+    - path: "**/*.py"
+      instructions: |
+        Python code. Enforce ruff compatibility, type hints on public APIs,
+        guard clauses over nesting. No bare except clauses.
+    - path: "benchmarks/**/*.py"
+      instructions: |
+        Benchmark harness. It DELETEs Qdrant collections per question — any change
+        must preserve the fail-closed data-safety guard (assert_bench_safe: refuse
+        unless --qdrant-url is the isolated bench port and collections are bench_*).
+        Sampling for A/B and headline numbers must be deterministic --stratified,
+        never --limit. The metric is hit-rate@k (any-correct-in-top-k), not recall.
+    - path: ".github/workflows/**"
+      instructions: |
+        GitHub Actions workflows. All actions MUST be pinned to full 40-char SHA
+        with a version comment (e.g., @abc123 # v6). Never use tag refs.
+    - path: "**/Dockerfile*"
+      instructions: |
+        Dockerfiles. Check for missing cleanup (rm -rf /var/lib/apt/lists/*),
+        unnecessary layers, running as root, and unpinned base images.
+    - path: "**/k8s/**"
+      instructions: |
+        Kubernetes manifests. Verify resource limits, security contexts,
+        non-root execution, and no privileged containers unless justified.
+
+  tools:
+    shellcheck:
+      enabled: true
+    actionlint:
+      enabled: true
+    gitleaks:
+      enabled: true
+    ruff:
+      enabled: true
+    yamllint:
+      enabled: true
+    hadolint:
+      enabled: true
+
+chat:
+  auto_reply: true
