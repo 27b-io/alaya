@@ -59,6 +59,10 @@ services:
       EMBEDDING_URL: ${EMBEDDING_URL:?Set EMBEDDING_URL to a reachable TEI endpoint}
       EMBEDDING_MODEL: Snowflake/snowflake-arctic-embed-l-v2.0
       EMBEDDING_DIMENSIONS: "1024"
+      # Texts per embed request. Default 32 = TEI's default cap. Set
+      # EMBEDDING_BATCH_SIZE=256 when EMBEDDING_URL points at a TEI with
+      # max-client-batch-size=256 (e.g. the fnord-wsl GPU box). Clamped to 256.
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
       GRAPH_URL: http://bridge:8080
       LISTEN_ADDR: 0.0.0.0:3001
       RUST_LOG: alaya_server=info
