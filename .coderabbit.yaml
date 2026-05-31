@@ -42,7 +42,8 @@ reviews:
     - path: ".github/workflows/**"
       instructions: |
         GitHub Actions workflows. All actions MUST be pinned to full 40-char SHA
-        with a version comment (e.g., @abc123 # v6). Never use tag refs.
+        with a version comment (e.g., @0123456789abcdef0123456789abcdef01234567 # v6).
+        Never use tag refs.
     - path: "**/Dockerfile*"
       instructions: |
         Dockerfiles. Check for missing cleanup (rm -rf /var/lib/apt/lists/*),
