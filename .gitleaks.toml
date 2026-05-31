@@ -1,0 +1,16 @@
+# Keep gitleaks' full default ruleset; allowlist only the OIDC test fixtures.
+#
+# crates/alaya-server/src/testkit.rs embeds a fixed RSA-2048 / EC-P256 keypair
+# used solely to mint JWTs in the auth test suite. The keys are generated for
+# tests, are never used by any deployment, and grant access to nothing — but
+# they trip the default private-key rule. Allowlist that one file by path.
+title = "alaya"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test-only OIDC keypairs in alaya-server (no production use)"
+paths = [
+  '''crates/alaya-server/src/testkit\.rs''',
+]

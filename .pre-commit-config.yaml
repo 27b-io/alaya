@@ -9,11 +9,15 @@ repos:
         args: ['--maxkb=1000']
       - id: check-merge-conflict
       - id: detect-private-key
+        # testkit.rs holds intentional test-only OIDC keypairs (see .gitleaks.toml).
+        exclude: ^crates/alaya-server/src/testkit\.rs$
 
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.30.1
     hooks:
       - id: gitleaks
+        # Allowlisted via .gitleaks.toml; exclude here too for staged-scan mode.
+        exclude: ^crates/alaya-server/src/testkit\.rs$
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.4
