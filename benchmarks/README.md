@@ -40,8 +40,8 @@ We report **hit-rate@k**.
 > **hit-rate@k** — the fraction of questions for which at least one
 > ground-truth answer session appears in the top *k* retrieved results.
 
-It is implemented at
-[`longmemeval_bench.py:79`](longmemeval_bench.py#L79) as:
+It is implemented as `recall_at_k` in
+[`longmemeval_bench.py`](longmemeval_bench.py):
 
 ```python
 def recall_at_k(ranked_ids, correct_ids, k):
@@ -59,7 +59,7 @@ regardless of how many relevant items exist. The Python function is named
 honestly everywhere it is reported. (The function name is historical; the
 semantics, not the identifier, are what we report.)
 
-We also report **NDCG@k** ([`longmemeval_bench.py:66`](longmemeval_bench.py#L66)),
+We also report **NDCG@k** (`ndcg_at_k` in [`longmemeval_bench.py`](longmemeval_bench.py)),
 which rewards ranking the correct session higher within the top *k*.
 
 ---
@@ -103,7 +103,7 @@ What this means for honest reading of the numbers:
 - Each item carries a haystack of prior chat sessions plus a question whose
   ground-truth answer lives in one or more of those sessions.
 - The harness downloads it once and caches it to `/tmp/longmemeval_s_cleaned.json`
-  ([`longmemeval_bench.py:53`](longmemeval_bench.py#L53)); subsequent runs read
+  (`LME_CACHE` in [`longmemeval_bench.py`](longmemeval_bench.py)); subsequent runs read
   the cache.
 
 ---

@@ -21,7 +21,7 @@ Vector search alone gives an agent a fuzzy lookup table. It returns whatever is 
 
 Measured on **LongMemEval** (`longmemeval_s_cleaned`, 500 multi-session QA items), using the standard LongMemEval **reset-per-question** protocol — each question is scored against only its own haystack in an otherwise-empty index.
 
-We report **hit-rate@5**: the fraction of questions where at least one ground-truth session lands in the top 5 results. This is the *any-correct-in-top-k* metric (a binary per-question hit, averaged across questions) — we label it hit-rate, **not** classical recall, because that is exactly what the harness computes (`benchmarks/longmemeval_bench.py:79`, `float(any(cid in top_k ...))`).
+We report **hit-rate@5**: the fraction of questions where at least one ground-truth session lands in the top 5 results. This is the *any-correct-in-top-k* metric (a binary per-question hit, averaged across questions) — we label it hit-rate, **not** classical recall, because that is what the harness computes (`recall_at_k` in `benchmarks/longmemeval_bench.py`: `float(any(cid in top_k ...))`).
 
 | Configuration              | hit-rate@5 | hit-rate@10 |
 |----------------------------|------------|-------------|

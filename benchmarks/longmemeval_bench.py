@@ -441,45 +441,43 @@ def run_benchmark(args):
     t0 = time.monotonic()
     errors = 0
     # Append + flush per question: a crash at hour 5 keeps every completed row.
-    out_f = open(out_path, "a")
+    with open(out_path, "a") as out_f:
+        for i, entry in enumerate(data):
+            if entry["question_id"] in done_ids:
+                continue
+            qt0 = time.monotonic()
+            metrics = run_question(entry, alaya, qdrant, args.mode, top_ks)
 
-    for i, entry in enumerate(data):
-        if entry["question_id"] in done_ids:
-            continue
-        qt0 = time.monotonic()
-        metrics = run_question(entry, alaya, qdrant, args.mode, top_ks)
+            if "error" in metrics:
+                errors += 1
+                continue
 
-        if "error" in metrics:
-            errors += 1
-            continue
+            all_metrics.append(metrics)
+            per_type[metrics["question_type"]].append(metrics)
+            out_f.write(json.dumps(metrics) + "\n")
+            out_f.flush()
+            qt_elapsed = time.monotonic() - qt0
 
-        all_metrics.append(metrics)
-        per_type[metrics["question_type"]].append(metrics)
-        out_f.write(json.dumps(metrics) + "\n")
-        out_f.flush()
-        qt_elapsed = time.monotonic() - qt0
-
-        # Progress
-        if (i + 1) % 5 == 0 or i == len(data) - 1:
-            elapsed = time.monotonic() - t0
-            rate = (i + 1) / elapsed
-            eta = (len(data) - i - 1) / rate if rate > 0 else 0
-            if all_metrics:
-                recall_parts = "  ".join(
-                    f"R@{k}={sum(m[f'recall_{k}'] for m in all_metrics) / len(all_metrics):.3f}"
-                    for k in top_ks
-                    if f"recall_{k}" in all_metrics[0]
+            # Progress
+            if (i + 1) % 5 == 0 or i == len(data) - 1:
+                elapsed = time.monotonic() - t0
+                rate = (i + 1) / elapsed
+                eta = (len(data) - i - 1) / rate if rate > 0 else 0
+                if all_metrics:
+                    recall_parts = "  ".join(
+                        f"R@{k}={sum(m[f'recall_{k}'] for m in all_metrics) / len(all_metrics):.3f}"
+                        for k in top_ks
+                        if f"recall_{k}" in all_metrics[0]
+                    )
+                else:
+                    recall_parts = "no results yet"
+                print(
+                    f"  [{i + 1:4}/{len(data)}]"
+                    f"  {recall_parts}"
+                    f"  {qt_elapsed:.1f}s/q  ETA {eta:.0f}s"
                 )
-            else:
-                recall_parts = "no results yet"
-            print(
-                f"  [{i + 1:4}/{len(data)}]"
-                f"  {recall_parts}"
-                f"  {qt_elapsed:.1f}s/q  ETA {eta:.0f}s"
-            )
 
     elapsed = time.monotonic() - t0
-    out_f.close()
     alaya.close()
     qdrant.close()
 
