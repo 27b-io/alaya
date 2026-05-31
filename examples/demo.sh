@@ -60,7 +60,7 @@ fi
 # -f makes any non-2xx fatal under `set -e`, so a 401 (wrong/missing key) or an
 # empty graph fails LOUDLY at the offending step instead of silently.
 api() {
-  curl -fsS "${AUTH[@]}" -H 'Content-Type: application/json' \
+  curl -fsS --connect-timeout 5 --max-time 30 "${AUTH[@]}" -H 'Content-Type: application/json' \
        -X POST "${ALAYA_URL}${1}" -d "${2}"
 }
 

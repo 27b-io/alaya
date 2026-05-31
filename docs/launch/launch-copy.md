@@ -65,7 +65,7 @@ context — all ≤60, all number-free, all outcome-first):
 > It's MIT-licensed and self-hostable — no account, no SaaS, runs on your own
 > box. Happy to answer questions about the architecture, the metric, or the
 > benchmark method.
-
+>
 > Honesty footnote for the comment (keep adjacent, do not inline a number):
 > the headline is **0.986** hit-rate@5 on LongMemEval. That metric is *hit-rate@5* —
 > "did at least one correct session land in the top 5", averaged over questions —

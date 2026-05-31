@@ -425,7 +425,13 @@ def run_benchmark(args):
                 line = line.strip()
                 if not line:
                     continue
-                m = json.loads(line)
+                try:
+                    m = json.loads(line)
+                except json.JSONDecodeError:
+                    # A crash mid-write can leave a truncated final line; skip it
+                    # rather than aborting the whole resume.
+                    print(f"  Resume:    skipping malformed line in {out_path}")
+                    continue
                 all_metrics.append(m)
                 per_type[m["question_type"]].append(m)
                 done_ids.add(m["question_id"])
@@ -590,8 +596,9 @@ if __name__ == "__main__":
         "--rerank-note",
         default="",
         help="Provenance string recorded verbatim in the summary "
-        "(e.g. 'on:bge-reranker-v2-m3:top_n=20' or 'off'). Verify rerank ACTUALLY "
-        "fired via server logs: 'cross-encoder reranker enabled'.",
+        "(e.g. 'on:bge-reranker-v2-m3:top_n=20' or 'off'). The startup log "
+        "'cross-encoder reranker enabled' only proves rerank is CONFIGURED; to prove "
+        "it EXECUTED, watch the reranker TEI's te_predict_count climb (see README).",
     )
     args = parser.parse_args()
 

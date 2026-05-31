@@ -179,7 +179,7 @@ uv run longmemeval_bench.py --stratified 24 \
 
 # VERIFY rerank actually EXECUTED: the reranker TEI's request counter must climb
 # during the run (rerank success is silent in alaya's logs; only failures warn).
-curl -s http://<your-rerank-tei-host>/metrics | grep '^te_predict_count'
+docker compose exec tei-rerank curl -s http://localhost:80/metrics | grep '^te_predict_count'
 docker compose logs alaya | grep -c "rerank failed"   # must be 0
 ```
 
@@ -240,9 +240,9 @@ docker compose down -v
 
 ## Results
 
-Every numeric cell below is a placeholder pending the verified live-server run.
-A figure ships here **only** after it is measured against the shipped server with
-rerank state verified in the logs.
+The numbers below are from a verified live-server run — measured against the
+shipped server with rerank state confirmed in the logs (provenance follows the
+table). A figure ships here **only** after that verification.
 
 | Configuration | Questions | hit-rate@5 | hit-rate@10 | NDCG@5 |
 |---|---|---|---|---|
