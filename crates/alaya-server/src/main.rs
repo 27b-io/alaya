@@ -54,6 +54,7 @@ struct Config {
     embedding_url: String,
     embedding_model: String,
     embedding_dimensions: usize,
+    embedding_batch_size: usize,
     graph_url: String,
     graph_api_key: String,
     listen_addr: String,
@@ -80,6 +81,12 @@ impl Config {
             embedding_dimensions: env_or("EMBEDDING_DIMENSIONS", "1024")
                 .parse()
                 .expect("EMBEDDING_DIMENSIONS must be a number"),
+            // Texts per /v1/embeddings request. Default 32 matches TEI's own
+            // default max-client-batch-size; raise to match a TEI configured
+            // higher (e.g. 256 on the fnord-wsl GPU box). Clamped to [1, 256].
+            embedding_batch_size: env_or("EMBEDDING_BATCH_SIZE", "32")
+                .parse()
+                .expect("EMBEDDING_BATCH_SIZE must be a number"),
             graph_url: env_required("GRAPH_URL"),
             graph_api_key: env_or("GRAPH_API_KEY", ""),
             listen_addr: env_or("LISTEN_ADDR", "0.0.0.0:3001"),
@@ -1097,6 +1104,7 @@ fn main() {
                     cfg_clone.embedding_url,
                     embed_model.clone(),
                     embed_dims,
+                    cfg_clone.embedding_batch_size,
                     None,
                 );
                 // L2 embedding cache: Redis via cachekit-rs (optional)

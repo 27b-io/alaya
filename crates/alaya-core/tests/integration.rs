@@ -33,6 +33,7 @@ fn build_service(qdrant_url: &str, embedding_url: &str) -> MemoryService {
         embedding_url.into(),
         "Snowflake/snowflake-arctic-embed-l-v2.0".into(),
         1024,
+        32,
         None,
     );
 

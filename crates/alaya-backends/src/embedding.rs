@@ -8,14 +8,19 @@ use alaya_types::{AlayaError, Result, search::PromptName};
 
 use crate::EmbeddingProvider;
 
-/// Maximum texts per embedding API call. TEI default max-client-batch-size is 32.
-const BATCH_SIZE: usize = 32;
+/// TEI hard-rejects client batches larger than this with HTTP 422 (no silent
+/// truncation), so the configured batch size is clamped to it. Batch size does
+/// not change output numerics — only how many texts ride in a single request.
+const MAX_TEI_BATCH_SIZE: usize = 256;
 
 pub struct EmbeddingClient {
     client: Client,
     base_url: String,
     model: String,
     dimensions: usize,
+    /// Texts per `/v1/embeddings` request. Must not exceed the target TEI's
+    /// `max_client_batch_size`. Clamped to `[1, MAX_TEI_BATCH_SIZE]` in `new`.
+    batch_size: usize,
 }
 
 impl EmbeddingClient {
@@ -23,8 +28,19 @@ impl EmbeddingClient {
         base_url: String,
         model: String,
         dimensions: usize,
+        batch_size: usize,
         api_key: Option<String>,
     ) -> Self {
+        // chunks(0) panics, and >256 makes TEI return 422 — clamp to safe range.
+        let clamped = batch_size.clamp(1, MAX_TEI_BATCH_SIZE);
+        if clamped != batch_size {
+            tracing::warn!(
+                requested = batch_size,
+                used = clamped,
+                "embedding batch size out of range, clamped to [1, {MAX_TEI_BATCH_SIZE}]"
+            );
+        }
+
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(key) = api_key {
             headers.insert(
@@ -48,6 +64,7 @@ impl EmbeddingClient {
             base_url,
             model,
             dimensions,
+            batch_size: clamped,
         }
     }
 }
@@ -65,7 +82,7 @@ impl EmbeddingProvider for EmbeddingClient {
 
         // Fire all chunk requests concurrently — on a LocalSet (?Send context)
         // this interleaves I/O waits instead of blocking sequentially.
-        let chunk_futures = prefixed.chunks(BATCH_SIZE).map(|chunk| {
+        let chunk_futures = prefixed.chunks(self.batch_size).map(|chunk| {
             let client = &self.client;
             let url = &url;
             let body = serde_json::json!({
@@ -151,13 +168,26 @@ mod tests {
 
     #[test]
     fn batch_splitting_logic() {
-        // Verify chunks(BATCH_SIZE) produces correct batch counts
+        // Default batch size of 32 produces the expected chunk counts.
         let texts: Vec<String> = (0..150).map(|i| format!("text_{i}")).collect();
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-        let chunks: Vec<&[&str]> = refs.chunks(BATCH_SIZE).collect();
+        let chunks: Vec<&[&str]> = refs.chunks(32).collect();
         assert_eq!(chunks.len(), 5); // 32 + 32 + 32 + 32 + 22
         assert_eq!(chunks[0].len(), 32);
         assert_eq!(chunks[4].len(), 22);
+    }
+
+    #[test]
+    fn batch_size_is_clamped() {
+        // 0 would panic chunks(); must floor to 1.
+        let zero = EmbeddingClient::new("http://x".into(), "m".into(), 1024, 0, None);
+        assert_eq!(zero.batch_size, 1);
+        // Above TEI's hard ceiling must clamp to 256 (else HTTP 422).
+        let huge = EmbeddingClient::new("http://x".into(), "m".into(), 1024, 9999, None);
+        assert_eq!(huge.batch_size, MAX_TEI_BATCH_SIZE);
+        // In-range values pass through untouched.
+        let ok = EmbeddingClient::new("http://x".into(), "m".into(), 1024, 64, None);
+        assert_eq!(ok.batch_size, 64);
     }
 
     #[test]
