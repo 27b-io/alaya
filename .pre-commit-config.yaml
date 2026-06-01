@@ -9,15 +9,18 @@ repos:
         args: ['--maxkb=1000']
       - id: check-merge-conflict
       - id: detect-private-key
-        # testkit.rs holds intentional test-only OIDC keypairs (see .gitleaks.toml).
+        # testkit.rs holds two intentional test-only OIDC keypairs. This hook has
+        # no content allowlist, so the file is excluded here — but gitleaks (below)
+        # still scans it and flags any NON-allowlisted secret via .gitleaks.toml.
         exclude: ^crates/alaya-server/src/testkit\.rs$
 
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.30.1
     hooks:
+      # No file exclude: gitleaks scans testkit.rs and allowlists ONLY the two
+      # known test keypairs by regex (.gitleaks.toml), so a new secret added to
+      # that file is still caught.
       - id: gitleaks
-        # Allowlisted via .gitleaks.toml; exclude here too for staged-scan mode.
-        exclude: ^crates/alaya-server/src/testkit\.rs$
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.4

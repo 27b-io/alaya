@@ -29,16 +29,10 @@ pub async fn protected_resource_metadata(State(auth): State<AuthState>) -> Respo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::AuthState;
     use axum::body::to_bytes;
 
-    fn auth(oidc_on: bool) -> AuthState {
-        AuthState {
-            api_key: Some("k".to_string()),
-            allow_unauthenticated: false,
-            oidc: oidc_on.then(crate::oidc::OidcVerifier::test_with_rsa_key),
-            public_base_url: "https://rs.test".to_string(),
-        }
+    fn auth(oidc_on: bool) -> crate::auth::AuthState {
+        crate::testkit::auth_state(Some("k"), oidc_on)
     }
 
     #[tokio::test]

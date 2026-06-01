@@ -96,8 +96,24 @@ pub(crate) fn mint(alg: Algorithm, kid: Option<&str>, claims: &TestClaims) -> St
         Algorithm::ES256 => {
             EncodingKey::from_ec_pem(EC_PRIV_PEM.as_bytes()).expect("ec test key parses")
         }
-        Algorithm::HS256 => EncodingKey::from_secret(b"test-only-symmetric-secret"),
+        // Models the RS256->HS256 confusion attack: the attacker signs HS256
+        // using the (public, known) RSA modulus as the HMAC secret, betting the
+        // server reuses key material across algs. The verifier must reject this
+        // at the alg allowlist regardless of the secret.
+        Algorithm::HS256 => EncodingKey::from_secret(RSA_N.as_bytes()),
         other => panic!("unsupported test alg: {other:?}"),
     };
     encode(&header, claims, &key).expect("mint token")
+}
+
+/// Shared `AuthState` builder for the auth/wellknown tests. `oidc_on` attaches
+/// a verifier pre-loaded with the RSA test key (validates `testkit`-minted RS256
+/// tokens with no network).
+pub(crate) fn auth_state(api_key: Option<&str>, oidc_on: bool) -> crate::auth::AuthState {
+    crate::auth::AuthState {
+        api_key: api_key.map(str::to_string),
+        allow_unauthenticated: false,
+        oidc: oidc_on.then(crate::oidc::OidcVerifier::test_with_rsa_key),
+        public_base_url: "https://rs.test".to_string(),
+    }
 }

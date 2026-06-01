@@ -495,23 +495,31 @@ mod tests {
         OidcVerifier::test_with_ec_key()
     }
 
+    /// Which discovery defect the mock IdP serves, to exercise each rejection
+    /// branch independently.
+    enum IdpFault {
+        /// Correct discovery + JWKS (happy path).
+        None,
+        /// discovery `issuer` != configured issuer (OIDC Core §4.3).
+        Issuer,
+        /// `jwks_uri` on a different origin than the issuer (key substitution).
+        JwksOrigin,
+    }
+
     /// Spawn a loopback OIDC provider serving discovery + JWKS for the RSA test
-    /// key. Returns the base URL (a loopback issuer, so http is accepted). When
-    /// `bad_issuer` is set, the discovery document advertises a mismatched
-    /// issuer to exercise that rejection.
-    async fn spawn_idp(bad_issuer: bool) -> String {
+    /// key. Returns the base URL (a loopback issuer, so http is accepted).
+    async fn spawn_idp(fault: IdpFault) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let disc_issuer = if bad_issuer {
-            "https://attacker.test".to_string()
-        } else {
-            base.clone()
+        let issuer = match fault {
+            IdpFault::Issuer => "https://attacker.test".to_string(),
+            _ => base.clone(),
         };
-        let discovery = serde_json::json!({
-            "issuer": disc_issuer,
-            "jwks_uri": format!("{base}/jwks"),
-        })
-        .to_string();
+        let jwks_uri = match fault {
+            IdpFault::JwksOrigin => "https://attacker.test/jwks".to_string(),
+            _ => format!("{base}/jwks"),
+        };
+        let discovery = serde_json::json!({ "issuer": issuer, "jwks_uri": jwks_uri }).to_string();
         let jwks = serde_json::json!({
             "keys": [{
                 "kty": "RSA", "kid": testkit::KID_RSA,
@@ -528,18 +536,19 @@ mod tests {
                 "/jwks",
                 axum::routing::get(move || std::future::ready(jwks.clone())),
             );
+        // The listener is already bound, so the OS accept-backlog absorbs the
+        // verifier's connect even before axum's accept loop runs — no sleep.
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        // Let the accept loop start before the verifier connects.
-        tokio::time::sleep(Duration::from_millis(100)).await;
         base
     }
 
-    fn assert_invalid(err: OidcError, needle: &str) {
+    /// Assert the verifier rejected with EXACTLY this reason. Exact-match (not
+    /// substring) so a test can't pass on a different-but-also-failing branch
+    /// — e.g. "iss" is a substring of "missing kid", and "kid" of both
+    /// "missing kid" and "unknown kid (cooldown)".
+    fn assert_invalid(err: OidcError, expected: &str) {
         let OidcError::Invalid(m) = err;
-        assert!(
-            m.contains(needle),
-            "expected error containing {needle:?}, got {m:?}"
-        );
+        assert_eq!(m, expected, "wrong rejection reason");
     }
 
     #[tokio::test]
@@ -566,15 +575,18 @@ mod tests {
 
     #[tokio::test]
     async fn hs256_symmetric_alg_is_rejected() {
-        // A token signed with HS256 must be refused by the alg allowlist before
-        // any key lookup — the classic alg-confusion downgrade.
+        // The HS256 token is signed with the RSA public modulus as the HMAC
+        // secret (the RS256->HS256 confusion an attacker mounts with the known
+        // public key — see testkit::mint). Must be refused at the pre-key-lookup
+        // allowlist with EXACTLY "alg not allowed" — NOT fall through to
+        // build_decoding_key's "alg/key mismatch" (which would also contain "alg").
         let v = rsa_verifier();
         let t = mint(
             Algorithm::HS256,
             Some(testkit::KID_RSA),
             &TestClaims::valid(),
         );
-        assert_invalid(v.validate(&t).await.unwrap_err(), "alg");
+        assert_invalid(v.validate(&t).await.unwrap_err(), "alg not allowed");
     }
 
     #[tokio::test]
@@ -583,7 +595,7 @@ mod tests {
         let mut c = TestClaims::valid();
         c.aud = "https://attacker.test/mcp".into();
         let t = mint(Algorithm::RS256, Some(testkit::KID_RSA), &c);
-        assert_invalid(v.validate(&t).await.unwrap_err(), "aud");
+        assert_invalid(v.validate(&t).await.unwrap_err(), "aud mismatch");
     }
 
     #[tokio::test]
@@ -592,7 +604,7 @@ mod tests {
         let mut c = TestClaims::valid();
         c.iss = "https://attacker.test".into();
         let t = mint(Algorithm::RS256, Some(testkit::KID_RSA), &c);
-        assert_invalid(v.validate(&t).await.unwrap_err(), "iss");
+        assert_invalid(v.validate(&t).await.unwrap_err(), "iss mismatch");
     }
 
     #[tokio::test]
@@ -600,8 +612,9 @@ mod tests {
         let v = rsa_verifier();
         let mut c = TestClaims::valid();
         let n = testkit::now();
-        c.iat = Some(n - 600);
-        c.exp = n - 300; // well past the clock-skew leeway
+        // exp is past `now` by more than the clock-skew leeway → expired.
+        c.iat = Some(n - CLOCK_SKEW_LEEWAY_SECS - 600);
+        c.exp = n - CLOCK_SKEW_LEEWAY_SECS - 240;
         let t = mint(Algorithm::RS256, Some(testkit::KID_RSA), &c);
         assert_invalid(v.validate(&t).await.unwrap_err(), "expired");
     }
@@ -614,7 +627,10 @@ mod tests {
         c.iat = Some(n);
         c.exp = n + MAX_TOKEN_AGE_SECS + 1000; // exceeds the hard cap
         let t = mint(Algorithm::RS256, Some(testkit::KID_RSA), &c);
-        assert_invalid(v.validate(&t).await.unwrap_err(), "cap");
+        assert_invalid(
+            v.validate(&t).await.unwrap_err(),
+            "token lifetime exceeds cap",
+        );
     }
 
     #[tokio::test]
@@ -622,17 +638,17 @@ mod tests {
         let v = rsa_verifier();
         let mut c = TestClaims::valid();
         let n = testkit::now();
-        c.iat = Some(n + 600); // beyond leeway
-        c.exp = n + 700;
+        c.iat = Some(n + CLOCK_SKEW_LEEWAY_SECS + 240); // beyond leeway
+        c.exp = n + CLOCK_SKEW_LEEWAY_SECS + 340;
         let t = mint(Algorithm::RS256, Some(testkit::KID_RSA), &c);
-        assert_invalid(v.validate(&t).await.unwrap_err(), "iat");
+        assert_invalid(v.validate(&t).await.unwrap_err(), "iat in the future");
     }
 
     #[tokio::test]
     async fn missing_kid_is_rejected() {
         let v = rsa_verifier();
         let t = mint(Algorithm::RS256, None, &TestClaims::valid());
-        assert_invalid(v.validate(&t).await.unwrap_err(), "kid");
+        assert_invalid(v.validate(&t).await.unwrap_err(), "missing kid");
     }
 
     #[tokio::test]
@@ -641,7 +657,7 @@ mod tests {
         // Cooldown active → an unknown kid fails fast without any outbound fetch.
         *v.inner.fetch_gate.lock().await = Instant::now();
         let t = mint(Algorithm::RS256, Some("no-such-kid"), &TestClaims::valid());
-        assert_invalid(v.validate(&t).await.unwrap_err(), "kid");
+        assert_invalid(v.validate(&t).await.unwrap_err(), "unknown kid (cooldown)");
     }
 
     #[tokio::test]
@@ -672,7 +688,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_discovery_and_jwks_fetch_validates_token() {
-        let base = spawn_idp(false).await;
+        let base = spawn_idp(IdpFault::None).await;
         let v = OidcVerifier::new(base.clone(), testkit::AUDIENCE.to_string());
         let mut c = TestClaims::valid();
         c.iss = base; // token issuer must equal the configured (loopback) issuer
@@ -685,7 +701,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_discovery_issuer_mismatch_is_rejected() {
-        let base = spawn_idp(true).await; // discovery advertises a different issuer
+        let base = spawn_idp(IdpFault::Issuer).await; // discovery advertises a different issuer
         let v = OidcVerifier::new(base.clone(), testkit::AUDIENCE.to_string());
         let mut c = TestClaims::valid();
         c.iss = base;
@@ -693,6 +709,64 @@ mod tests {
         assert_invalid(
             v.validate(&t).await.unwrap_err(),
             "discovery issuer mismatch",
+        );
+    }
+
+    #[tokio::test]
+    async fn live_cross_origin_jwks_uri_is_rejected() {
+        // discovery `issuer` matches, but `jwks_uri` points at another origin —
+        // the key-substitution vector the same-origin check at jwks_uri() blocks.
+        let base = spawn_idp(IdpFault::JwksOrigin).await;
+        let v = OidcVerifier::new(base.clone(), testkit::AUDIENCE.to_string());
+        let mut c = TestClaims::valid();
+        c.iss = base;
+        let t = mint(Algorithm::RS256, Some(testkit::KID_RSA), &c);
+        assert_invalid(
+            v.validate(&t).await.unwrap_err(),
+            "jwks_uri not same-origin",
+        );
+    }
+
+    // ── alg/key-type confusion: a header alg that doesn't match the resolved
+    //    JWK's key type must be refused at build_decoding_key (RS256 and ES256
+    //    are both allowlisted, so the header-stage gate does NOT catch this). ──
+
+    #[tokio::test]
+    async fn rs256_header_against_ec_key_is_rejected() {
+        // kid resolves to the EC JWK, but the header claims RS256.
+        let v = ec_verifier();
+        let t = mint(
+            Algorithm::RS256,
+            Some(testkit::KID_EC),
+            &TestClaims::valid(),
+        );
+        assert_invalid(v.validate(&t).await.unwrap_err(), "alg/key mismatch");
+    }
+
+    #[tokio::test]
+    async fn es256_header_against_rsa_key_is_rejected() {
+        let v = rsa_verifier();
+        let t = mint(
+            Algorithm::ES256,
+            Some(testkit::KID_RSA),
+            &TestClaims::valid(),
+        );
+        assert_invalid(v.validate(&t).await.unwrap_err(), "alg/key mismatch");
+    }
+
+    #[tokio::test]
+    async fn iat_absent_over_cap_is_rejected() {
+        // RFC 7519 makes `iat` optional. With no `iat`, the max-age cap is
+        // measured against `now` (the branch guarding the saturating-sub
+        // underflow). This is the only test that drives the `iat == None` path.
+        let v = rsa_verifier();
+        let mut c = TestClaims::valid();
+        c.iat = None;
+        c.exp = testkit::now() + MAX_TOKEN_AGE_SECS + 1000;
+        let t = mint(Algorithm::RS256, Some(testkit::KID_RSA), &c);
+        assert_invalid(
+            v.validate(&t).await.unwrap_err(),
+            "token lifetime exceeds cap",
         );
     }
 }

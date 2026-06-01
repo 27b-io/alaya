@@ -293,14 +293,7 @@ mod tests {
 
     // ── authentication path (the dual-mode dispatch + 401 challenge) ─────────
 
-    fn state(api_key: Option<&str>, oidc_on: bool) -> AuthState {
-        AuthState {
-            api_key: api_key.map(str::to_string),
-            allow_unauthenticated: false,
-            oidc: oidc_on.then(crate::oidc::OidcVerifier::test_with_rsa_key),
-            public_base_url: "https://rs.test".to_string(),
-        }
-    }
+    use crate::testkit::auth_state as state;
 
     #[tokio::test]
     async fn authenticate_static_key() {
