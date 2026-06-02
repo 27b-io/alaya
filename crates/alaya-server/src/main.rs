@@ -14,6 +14,8 @@ mod cached_embedding;
 mod mcp;
 mod oidc;
 mod telemetry;
+#[cfg(test)]
+mod testkit;
 mod wellknown;
 
 use axum::{

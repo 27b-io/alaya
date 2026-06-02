@@ -290,4 +290,79 @@ mod tests {
         assert!(!constant_time_eq(b"secret", b"secretx"));
         assert!(!constant_time_eq(b"", b"x"));
     }
+
+    // ── authentication path (the dual-mode dispatch + 401 challenge) ─────────
+
+    use crate::testkit::auth_state as state;
+
+    #[tokio::test]
+    async fn authenticate_static_key() {
+        let auth = state(Some("s3cret"), false);
+        assert_eq!(
+            authenticate(&auth, "s3cret").await,
+            Some(AuthPrincipal::Static)
+        );
+        assert_eq!(authenticate(&auth, "wrong").await, None);
+    }
+
+    #[tokio::test]
+    async fn authenticate_valid_oidc_and_refuses_hs256_and_garbage() {
+        let auth = state(None, true);
+        let good = crate::testkit::mint(
+            jsonwebtoken::Algorithm::RS256,
+            Some(crate::testkit::KID_RSA),
+            &crate::testkit::TestClaims::valid(),
+        );
+        assert_eq!(authenticate(&auth, &good).await, Some(AuthPrincipal::Oidc));
+
+        // HS256 (alg-confusion downgrade) and a non-JWT must both be refused.
+        let hs = crate::testkit::mint(
+            jsonwebtoken::Algorithm::HS256,
+            Some(crate::testkit::KID_RSA),
+            &crate::testkit::TestClaims::valid(),
+        );
+        assert_eq!(authenticate(&auth, &hs).await, None);
+        assert_eq!(authenticate(&auth, "not.a.jwt").await, None);
+    }
+
+    #[test]
+    fn challenge_advertises_resource_metadata_when_oidc_on() {
+        let resp = challenge_401(&state(Some("k"), true));
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let www = resp
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            www.contains("https://rs.test/.well-known/oauth-protected-resource"),
+            "{www}"
+        );
+    }
+
+    #[test]
+    fn challenge_is_bare_bearer_when_oidc_off() {
+        let resp = challenge_401(&state(Some("k"), false));
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+            "Bearer"
+        );
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        let req = axum::http::Request::builder()
+            .header(header::AUTHORIZATION, "bearer  tok123")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(bearer(&req), Some("tok123"));
+
+        let not_bearer = axum::http::Request::builder()
+            .header(header::AUTHORIZATION, "Basic abc")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(bearer(&not_bearer), None);
+    }
 }

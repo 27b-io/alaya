@@ -1,0 +1,25 @@
+# Keep gitleaks' full default ruleset; allowlist ONLY the two committed test
+# keypairs — pinned by a unique slice of each key, NOT by file path.
+#
+# crates/alaya-server/src/testkit.rs embeds a fixed RSA-2048 / EC-P256 keypair
+# used solely to mint JWTs in the auth test suite. The keys are generated for
+# tests, are never used by any deployment, and grant access to nothing — but
+# they trip the default private-key rule.
+#
+# A file-path allowlist would also silence any OTHER secret later added to that
+# file. Instead we match a distinctive prefix of each test key, so a different
+# key/token/credential added to testkit.rs is still flagged.
+title = "alaya"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "The two committed test-only OIDC keypairs (no production use)"
+regexTarget = "match"
+# Match into the key payload (modulus / EC scalar), not just the PKCS#8 ASN.1
+# header, so these patterns can't suppress a DIFFERENT real RSA/EC key.
+regexes = [
+  '''MIIEuwIBADANBgkqhkiG9w0BAQEFAASCBKUwggShAgEAAoIBAQCPPv5JKnalJQKt''', # test RSA-2048 private key
+  '''MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgYQR4QrEzqrzkofjM''', # test EC P-256 private key
+]
