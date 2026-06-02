@@ -66,10 +66,12 @@ pub(crate) struct TestClaims {
 }
 
 pub(crate) fn now() -> u64 {
+    // unwrap_or(0) instead of unwrap(): duration_since only errors if the clock
+    // is before UNIX_EPOCH — impossible in practice, but avoid the panic.
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl TestClaims {

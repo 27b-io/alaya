@@ -496,7 +496,9 @@ mod tests {
     }
 
     /// Which discovery defect the mock IdP serves, to exercise each rejection
-    /// branch independently.
+    /// branch independently. (Fieldless; `Copy` so `spawn_idp` can match it
+    /// twice without a move.)
+    #[derive(Clone, Copy)]
     enum IdpFault {
         /// Correct discovery + JWKS (happy path).
         None,

@@ -17,7 +17,9 @@ useDefault = true
 [allowlist]
 description = "The two committed test-only OIDC keypairs (no production use)"
 regexTarget = "match"
+# Match into the key payload (modulus / EC scalar), not just the PKCS#8 ASN.1
+# header, so these patterns can't suppress a DIFFERENT real RSA/EC key.
 regexes = [
-  '''MIIEuwIBADANBgkqhkiG9w0BAQEFAASCBKUwggSh''', # test RSA-2048 private key
-  '''MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0w''', # test EC P-256 private key
+  '''MIIEuwIBADANBgkqhkiG9w0BAQEFAASCBKUwggShAgEAAoIBAQCPPv5JKnalJQKt''', # test RSA-2048 private key
+  '''MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgYQR4QrEzqrzkofjM''', # test EC P-256 private key
 ]
