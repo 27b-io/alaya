@@ -20,6 +20,7 @@ services:
 
   falkordb:
     image: falkordb/falkordb:v4.18.6
+    restart: unless-stopped
     ports:
       - "${FALKORDB_PORT:-6379}:6379"
     volumes:
@@ -32,6 +33,7 @@ services:
 
   qdrant:
     image: qdrant/qdrant:v1.18.0
+    restart: unless-stopped
     ports:
       - "${QDRANT_PORT:-6333}:6333"
       - "${QDRANT_GRPC_PORT:-6334}:6334"
@@ -47,6 +49,7 @@ services:
     # Defaults to ARM64 (Mac dev). For x86 hosts: TEI_TAG=cpu-1.9.3
     # No pinned ARM64 tags exist — only `cpu-arm64-latest`.
     image: ghcr.io/huggingface/text-embeddings-inference:${TEI_TAG:-cpu-arm64-latest}
+    restart: unless-stopped
     command: --model-id ${TEI_MODEL:-Snowflake/snowflake-arctic-embed-l-v2.0} --port 80
     ports:
       - "${TEI_PORT:-8888}:80"
@@ -70,6 +73,7 @@ services:
   tei-rerank:
     profiles: ["rerank"]
     image: ghcr.io/huggingface/text-embeddings-inference:${TEI_TAG:-cpu-arm64-latest}
+    restart: unless-stopped
     command: --model-id ${RERANK_MODEL:-BAAI/bge-reranker-v2-m3} --port 80
     ports:
       - "${TEI_RERANK_PORT:-8889}:80"
@@ -88,6 +92,7 @@ services:
 
   alaya-bridge:
     image: alaya:${GIT_SHA:-dev}
+    restart: unless-stopped
     build:
       context: .
       args:
@@ -111,6 +116,7 @@ services:
 
   alaya-server:
     image: alaya:${GIT_SHA:-dev}
+    restart: unless-stopped
     entrypoint: ["/usr/local/bin/alaya-server"]
     ports:
       - "${SERVER_PORT:-3001}:3001"
