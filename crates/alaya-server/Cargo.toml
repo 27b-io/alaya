@@ -26,7 +26,9 @@ cachekit-rs = { workspace = true }
 futures = { workspace = true }
 
 # Auth (native-only — must never reach WASM-targeted crates)
-jsonwebtoken = "9"
+# v10 made the crypto backend pluggable; pick pure-Rust to keep C toolchains
+# (aws-lc-sys/cmake) out of the container build, matching the rustls-tls stance.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 subtle = "2"
 
 # OpenTelemetry (optional — enabled when OTEL_ENDPOINT is set)
