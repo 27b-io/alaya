@@ -5,6 +5,11 @@ ARG GIT_SHA=unknown
 WORKDIR /app
 COPY . .
 
+# cmake is required to build aws-lc-sys (jsonwebtoken's aws_lc_rs crypto
+# backend). Builder stage only — the final image copies just the binaries.
+RUN apt-get update && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV ALAYA_GIT_SHA=${GIT_SHA}
 RUN cargo build --release -p alaya-bridge -p alaya-server
 
