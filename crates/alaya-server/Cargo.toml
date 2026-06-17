@@ -26,7 +26,7 @@ cachekit-rs = { workspace = true }
 futures = { workspace = true }
 
 # Auth (native-only — must never reach WASM-targeted crates)
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 subtle = "2"
 
 # OpenTelemetry (optional — enabled when OTEL_ENDPOINT is set)
