@@ -1,0 +1,20 @@
+# Build artifacts — rebuilt inside the image
+target/
+
+# VCS / CI / local tooling — not needed by the build
+.git/
+.github/
+.gitignore
+.dockerignore
+
+# Docs and examples — not part of the binaries
+*.md
+docs/
+examples/
+benchmarks/
+
+# Editor / OS cruft
+.idea/
+.vscode/
+*.swp
+.DS_Store

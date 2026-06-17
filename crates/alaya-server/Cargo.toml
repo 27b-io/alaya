@@ -26,9 +26,10 @@ cachekit-rs = { workspace = true }
 futures = { workspace = true }
 
 # Auth (native-only — must never reach WASM-targeted crates)
-# v10 made the crypto backend pluggable; pick pure-Rust to keep C toolchains
-# (aws-lc-sys/cmake) out of the container build, matching the rustls-tls stance.
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+# v10 made the crypto backend pluggable. aws_lc_rs (BoringSSL-derived, C)
+# instead of rust_crypto: keeps the vulnerable pure-Rust `rsa` crate
+# (RUSTSEC-2023-0071) out of the tree. Requires cmake in the build image.
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 subtle = "2"
 
 # OpenTelemetry (optional — enabled when OTEL_ENDPOINT is set)
