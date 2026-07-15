@@ -85,7 +85,7 @@ def main() -> int:
         if not args.write:
             for p in affected[:10]:
                 print(
-                    f"  would fix {p['payload'].get('content_hash', '?')[:12]} → {str(p['payload'][FLAT_KEY])[:12]}"
+                    f"  would fix {str(p['payload'].get('content_hash') or '?')[:12]} → {str(p['payload'][FLAT_KEY])[:12]}"
                 )
             print("dry run — re-run with --write to apply")
             return 0
