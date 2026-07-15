@@ -101,8 +101,8 @@ def main() -> int:
             json.dump(affected, f)
         print(f"backed up {len(affected)} full payloads → {backup}")
 
-        migrated = 0
-        gain = 0  # counted from the FRESH payload: the scan snapshot can go stale
+        # expected nested value per migrated point id — verified individually below
+        expected: dict[int | str, str] = {}
         for p in affected:
             # re-fetch immediately before the overwrite: the full-payload PUT (needed to
             # remove the dotted key) would otherwise clobber any field a live writer
@@ -110,29 +110,30 @@ def main() -> int:
             fresh = fetch_payload(c, p["id"])
             if fresh is None or not fresh.get(FLAT_KEY):
                 continue  # vanished or already fixed since the scan
-            if not (fresh.get("metadata") or {}).get("superseded_by"):
-                gain += 1
+            fixed = corrected_payload(fresh)
             r = c.put(
                 f"/collections/{COLLECTION}/points/payload?wait=true",
-                json={"payload": corrected_payload(fresh), "points": [p["id"]]},
+                json={"payload": fixed, "points": [p["id"]]},
             )
             r.raise_for_status()
-            migrated += 1
-        print(f"migrated {migrated} points")
+            expected[p["id"]] = fixed["metadata"]["superseded_by"]
+        print(f"migrated {len(expected)} points")
 
-        # verify: flat must reach zero; nested grows only by points that gained a
-        # nested value in the write loop (both-key points keep their nested value)
-        points2 = scroll_all(c)
-        flat2 = sum(1 for p in points2 if p["payload"].get(FLAT_KEY))
-        nested2 = sum(
-            1
-            for p in points2
-            if (p["payload"].get("metadata") or {}).get("superseded_by")
-        )
-        print(
-            f"verify: flat={flat2} nested={nested2} (expected flat=0 nested={nested + gain})"
-        )
-        return 0 if flat2 == 0 and nested2 == nested + gain else 1
+        # verify per point (aggregate counts race with concurrent supersedes): every
+        # migrated id must have its flat key gone and the exact nested value written;
+        # plus one full sweep asserting no flat key survives anywhere
+        bad = 0
+        for pid, want in expected.items():
+            now = fetch_payload(c, pid) or {}
+            if (
+                now.get(FLAT_KEY)
+                or (now.get("metadata") or {}).get("superseded_by") != want
+            ):
+                print(f"  VERIFY FAILED for point {pid}")
+                bad += 1
+        flat2 = sum(1 for p in scroll_all(c) if p["payload"].get(FLAT_KEY))
+        print(f"verify: per-point failures={bad}, flat keys remaining={flat2}")
+        return 0 if bad == 0 and flat2 == 0 else 1
 
 
 if __name__ == "__main__":
