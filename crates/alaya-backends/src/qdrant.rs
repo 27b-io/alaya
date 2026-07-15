@@ -57,6 +57,24 @@ impl QdrantClient {
             tag_collection,
         }
     }
+
+    /// POST a set-payload request body to the memories collection.
+    async fn set_payload(&self, body: Value) -> Result<()> {
+        let resp = self
+            .client
+            .post(format!(
+                "{}/collections/{}/points/payload?wait=true",
+                self.base_url, self.collection
+            ))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(qdrant_error(resp).await);
+        }
+        Ok(())
+    }
 }
 
 // ─── Access timestamp capping ────────────────────────────────────────────────
@@ -227,22 +245,22 @@ fn point_to_scored(point: &Value) -> Option<ScoredMemory> {
     Some(ScoredMemory { memory, score })
 }
 
-/// Build the set-payload map for a metadata update. `superseded_by` merges into the
-/// nested `metadata` object (written back wholesale — qdrant set-payload cannot merge
-/// into nested objects, and dotted map keys create flat literal fields, issue #54);
-/// `access_count` and `extra` stay top-level, matching where they are stored and read.
-fn build_metadata_payload(
-    current_metadata: Option<HashMap<String, Value>>,
-    updates: &MetadataUpdate,
-) -> serde_json::Map<String, Value> {
+/// Set-payload body for the NESTED part of a metadata update. The `key` param scopes
+/// the payload map under `metadata`: qdrant creates the object when absent and merges
+/// with existing sibling keys (verified empirically) — atomic, no read-modify-write.
+/// Never use dotted map keys for this: they create flat literal fields (issue #54).
+fn nested_supersede_body(point_id: &str, superseded_by: &str) -> Value {
+    json!({
+        "payload": { "superseded_by": superseded_by },
+        "key": "metadata",
+        "points": [point_id],
+    })
+}
+
+/// Top-level fields of a metadata update (`access_count`, `extra`) — these live at the
+/// payload root, matching where they are stored and read. Never contains `superseded_by`.
+fn top_level_payload(updates: &MetadataUpdate) -> serde_json::Map<String, Value> {
     let mut payload = serde_json::Map::new();
-    if let Some(ref sb) = updates.superseded_by {
-        let mut meta: serde_json::Map<String, Value> = current_metadata
-            .map(|m| m.into_iter().collect())
-            .unwrap_or_default();
-        meta.insert("superseded_by".into(), json!(sb));
-        payload.insert("metadata".into(), Value::Object(meta));
-    }
     if let Some(ac) = updates.access_count {
         payload.insert("access_count".into(), json!(ac));
     }
@@ -443,44 +461,23 @@ impl VectorStorage for QdrantClient {
     async fn update_metadata(&self, content_hash: &str, updates: MetadataUpdate) -> Result<()> {
         let point_id = hash_to_uuid(content_hash)?;
 
-        // superseded_by lives INSIDE the nested metadata object. Qdrant's set-payload
-        // treats map keys literally: a dotted "metadata.superseded_by" key creates a
-        // flat top-level field that no filter, reader, or delete_payload can address
-        // (issue #54 — 86 supersessions were lost this way). Since set-payload cannot
-        // merge into a nested object, read-modify-write the whole metadata object.
-        let current_metadata = if updates.superseded_by.is_some() {
-            self.get_by_hash(content_hash)
-                .await?
-                .and_then(|m| m.metadata)
-        } else {
-            None
-        };
-        let payload = build_metadata_payload(current_metadata, &updates);
+        // superseded_by lives INSIDE the nested metadata object (issue #54: dotted map
+        // keys create flat literal fields). The `key`-scoped set-payload writes it
+        // atomically, preserving sibling metadata keys without a read-modify-write.
+        if let Some(ref sb) = updates.superseded_by {
+            self.set_payload(nested_supersede_body(&point_id, sb))
+                .await?;
+        }
+
+        let payload = top_level_payload(&updates);
         if payload.is_empty() {
             return Ok(());
         }
-
-        let body = json!({
+        self.set_payload(json!({
             "payload": payload,
             "points": [point_id],
-        });
-
-        let resp = self
-            .client
-            .post(format!(
-                "{}/collections/{}/points/payload?wait=true",
-                self.base_url, self.collection
-            ))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(qdrant_error(resp).await);
-        }
-
-        Ok(())
+        }))
+        .await
     }
 
     #[tracing::instrument(skip(self, patch), fields(hash = %content_hash))]
@@ -1360,42 +1357,37 @@ mod tests {
     }
 
     #[test]
-    fn metadata_payload_nests_superseded_by() {
-        let updates = MetadataUpdate {
-            superseded_by: Some("b".repeat(64)),
-            ..Default::default()
-        };
-        let p = build_metadata_payload(None, &updates);
-        // the regression: a flat literal "metadata.superseded_by" key is unreadable
-        assert!(p.get("metadata.superseded_by").is_none());
-        assert_eq!(p["metadata"]["superseded_by"], json!("b".repeat(64)));
+    fn nested_supersede_body_uses_key_param_not_dotted_keys() {
+        let body = nested_supersede_body("some-uuid", &"b".repeat(64));
+        // the regression: a flat literal "metadata.superseded_by" map key is unreadable
+        assert!(body["payload"].get("metadata.superseded_by").is_none());
+        assert_eq!(body["key"], json!("metadata"));
+        assert_eq!(body["payload"]["superseded_by"], json!("b".repeat(64)));
+        assert_eq!(body["points"], json!(["some-uuid"]));
     }
 
     #[test]
-    fn metadata_payload_preserves_existing_metadata_keys() {
-        let mut current = HashMap::new();
-        current.insert("importance".to_string(), json!(0.7));
+    fn top_level_payload_never_contains_supersession() {
+        let mut extra = HashMap::new();
+        extra.insert("supersession_reason".to_string(), json!("corrected"));
+        let updates = MetadataUpdate {
+            superseded_by: Some("x".to_string()),
+            access_count: Some(42),
+            extra: Some(extra),
+        };
+        let p = top_level_payload(&updates);
+        assert_eq!(p["access_count"], json!(42));
+        assert_eq!(p["supersession_reason"], json!("corrected"));
+        assert!(p.get("superseded_by").is_none());
+        assert!(p.get("metadata").is_none());
+    }
+
+    #[test]
+    fn top_level_payload_empty_when_only_supersession_set() {
         let updates = MetadataUpdate {
             superseded_by: Some("x".to_string()),
             ..Default::default()
         };
-        let p = build_metadata_payload(Some(current), &updates);
-        assert_eq!(p["metadata"]["importance"], json!(0.7));
-        assert_eq!(p["metadata"]["superseded_by"], json!("x"));
-    }
-
-    #[test]
-    fn metadata_payload_keeps_access_count_and_extra_top_level() {
-        let mut extra = HashMap::new();
-        extra.insert("supersession_reason".to_string(), json!("corrected"));
-        let updates = MetadataUpdate {
-            superseded_by: None,
-            access_count: Some(42),
-            extra: Some(extra),
-        };
-        let p = build_metadata_payload(None, &updates);
-        assert_eq!(p["access_count"], json!(42));
-        assert_eq!(p["supersession_reason"], json!("corrected"));
-        assert!(p.get("metadata").is_none()); // no metadata write when superseded_by absent
+        assert!(top_level_payload(&updates).is_empty());
     }
 }

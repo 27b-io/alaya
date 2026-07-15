@@ -51,9 +51,21 @@ def scroll_all(c: httpx.Client) -> list[dict[str, Any]]:
 def corrected_payload(payload: dict[str, Any]) -> dict[str, Any]:
     fixed = {k: v for k, v in payload.items() if k != FLAT_KEY}
     meta = dict(fixed.get("metadata") or {})
-    meta["superseded_by"] = payload[FLAT_KEY]
+    # an existing nested value wins; the flat key is only the fallback — never
+    # clobber already-correct data (no such overlap existed in the 2026-07-15 run)
+    meta.setdefault("superseded_by", payload[FLAT_KEY])
     fixed["metadata"] = meta
     return fixed
+
+
+def fetch_payload(c: httpx.Client, point_id: Any) -> dict[str, Any] | None:
+    r = c.post(
+        f"/collections/{COLLECTION}/points",
+        json={"ids": [point_id], "with_payload": True},
+    )
+    r.raise_for_status()
+    points = r.json()["result"]
+    return points[0]["payload"] if points else None
 
 
 def main() -> int:
@@ -89,14 +101,21 @@ def main() -> int:
             json.dump(affected, f)
         print(f"backed up {len(affected)} full payloads → {backup}")
 
+        migrated = 0
         for p in affected:
-            fixed = corrected_payload(p["payload"])
+            # re-fetch immediately before the overwrite: the full-payload PUT (needed to
+            # remove the dotted key) would otherwise clobber any field a live writer
+            # touched (e.g. access_count) between the scan and this write
+            fresh = fetch_payload(c, p["id"])
+            if fresh is None or not fresh.get(FLAT_KEY):
+                continue  # vanished or already fixed since the scan
             r = c.put(
                 f"/collections/{COLLECTION}/points/payload?wait=true",
-                json={"payload": fixed, "points": [p["id"]]},
+                json={"payload": corrected_payload(fresh), "points": [p["id"]]},
             )
             r.raise_for_status()
-        print(f"migrated {len(affected)} points")
+            migrated += 1
+        print(f"migrated {migrated} points")
 
         # verify: re-scan, flat must be zero and nested must have grown by exactly len(affected)
         points2 = scroll_all(c)
