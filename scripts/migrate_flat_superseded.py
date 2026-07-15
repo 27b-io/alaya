@@ -58,7 +58,7 @@ def corrected_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return fixed
 
 
-def fetch_payload(c: httpx.Client, point_id: Any) -> dict[str, Any] | None:
+def fetch_payload(c: httpx.Client, point_id: int | str) -> dict[str, Any] | None:
     r = c.post(
         f"/collections/{COLLECTION}/points",
         json={"ids": [point_id], "with_payload": True},
@@ -117,7 +117,13 @@ def main() -> int:
             migrated += 1
         print(f"migrated {migrated} points")
 
-        # verify: re-scan, flat must be zero and nested must have grown by exactly len(affected)
+        # verify: flat must reach zero; nested grows only by points that were NOT
+        # already nested (preservation keeps both-key points at their nested value)
+        gain = sum(
+            1
+            for p in affected
+            if not (p["payload"].get("metadata") or {}).get("superseded_by")
+        )
         points2 = scroll_all(c)
         flat2 = sum(1 for p in points2 if p["payload"].get(FLAT_KEY))
         nested2 = sum(
@@ -126,9 +132,9 @@ def main() -> int:
             if (p["payload"].get("metadata") or {}).get("superseded_by")
         )
         print(
-            f"verify: flat={flat2} nested={nested2} (expected flat=0 nested={nested + len(affected)})"
+            f"verify: flat={flat2} nested={nested2} (expected flat=0 nested={nested + gain})"
         )
-        return 0 if flat2 == 0 and nested2 == nested + len(affected) else 1
+        return 0 if flat2 == 0 and nested2 == nested + gain else 1
 
 
 if __name__ == "__main__":

@@ -461,6 +461,18 @@ impl VectorStorage for QdrantClient {
     async fn update_metadata(&self, content_hash: &str, updates: MetadataUpdate) -> Result<()> {
         let point_id = hash_to_uuid(content_hash)?;
 
+        // Auxiliary top-level fields (supersession_reason, access_count) go FIRST: if
+        // this write fails, nothing is marked superseded yet and a retry is clean.
+        // The nested supersession marker below is the commit point.
+        let payload = top_level_payload(&updates);
+        if !payload.is_empty() {
+            self.set_payload(json!({
+                "payload": payload,
+                "points": [point_id],
+            }))
+            .await?;
+        }
+
         // superseded_by lives INSIDE the nested metadata object (issue #54: dotted map
         // keys create flat literal fields). The `key`-scoped set-payload writes it
         // atomically, preserving sibling metadata keys without a read-modify-write.
@@ -468,16 +480,7 @@ impl VectorStorage for QdrantClient {
             self.set_payload(nested_supersede_body(&point_id, sb))
                 .await?;
         }
-
-        let payload = top_level_payload(&updates);
-        if payload.is_empty() {
-            return Ok(());
-        }
-        self.set_payload(json!({
-            "payload": payload,
-            "points": [point_id],
-        }))
-        .await
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, patch), fields(hash = %content_hash))]
