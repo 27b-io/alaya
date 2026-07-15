@@ -102,6 +102,7 @@ def main() -> int:
         print(f"backed up {len(affected)} full payloads → {backup}")
 
         migrated = 0
+        gain = 0  # counted from the FRESH payload: the scan snapshot can go stale
         for p in affected:
             # re-fetch immediately before the overwrite: the full-payload PUT (needed to
             # remove the dotted key) would otherwise clobber any field a live writer
@@ -109,6 +110,8 @@ def main() -> int:
             fresh = fetch_payload(c, p["id"])
             if fresh is None or not fresh.get(FLAT_KEY):
                 continue  # vanished or already fixed since the scan
+            if not (fresh.get("metadata") or {}).get("superseded_by"):
+                gain += 1
             r = c.put(
                 f"/collections/{COLLECTION}/points/payload?wait=true",
                 json={"payload": corrected_payload(fresh), "points": [p["id"]]},
@@ -117,13 +120,8 @@ def main() -> int:
             migrated += 1
         print(f"migrated {migrated} points")
 
-        # verify: flat must reach zero; nested grows only by points that were NOT
-        # already nested (preservation keeps both-key points at their nested value)
-        gain = sum(
-            1
-            for p in affected
-            if not (p["payload"].get("metadata") or {}).get("superseded_by")
-        )
+        # verify: flat must reach zero; nested grows only by points that gained a
+        # nested value in the write loop (both-key points keep their nested value)
         points2 = scroll_all(c)
         flat2 = sum(1 for p in points2 if p["payload"].get(FLAT_KEY))
         nested2 = sum(
