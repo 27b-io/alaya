@@ -9,10 +9,9 @@
 #   docker compose down              # stop, keep data
 #   docker compose down -v           # stop + wipe volumes
 #
-# Bootstrap (first run only — create Qdrant collection):
-#   curl -X PUT "http://localhost:${QDRANT_PORT:-6333}/collections/${QDRANT_COLLECTION:-memories_arctic1024}" \
-#     -H 'Content-Type: application/json' \
-#     -d "{\"vectors\":{\"size\":${EMBEDDING_DIMENSIONS:-1024},\"distance\":\"Cosine\"}}"
+# The Qdrant collection is created automatically by alaya-server at startup
+# (#31) — a fresh volume, even after `docker compose down -v`, accepts writes
+# with no manual bootstrap step.
 
 services:
 

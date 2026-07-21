@@ -75,6 +75,69 @@ impl QdrantClient {
         }
         Ok(())
     }
+
+    /// Ensure the memory collections exist, creating any that are absent with
+    /// the configured vector size and Cosine distance. Idempotent — an existing
+    /// collection is left untouched (never recreated, so no data is dropped).
+    /// Run once at startup so a fresh Qdrant volume accepts writes with no
+    /// manual `curl -X PUT` bootstrap (#31).
+    ///
+    /// The main collection is required: an error propagates so the caller can
+    /// retry (Qdrant may not be ready yet at boot). The `{collection}_tags`
+    /// sidecar is best-effort — tag upserts and semantic-tag search are already
+    /// non-fatal in the service layer, so its absence must not block startup.
+    pub async fn ensure_collection(&self, dimensions: usize) -> Result<()> {
+        self.ensure_one(&self.collection, dimensions).await?;
+        if let Err(e) = self.ensure_one(&self.tag_collection, dimensions).await {
+            tracing::warn!(
+                collection = %self.tag_collection,
+                error = %e,
+                "tag collection ensure failed (non-fatal)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Create `collection` with `dimensions`-wide Cosine vectors if it does not
+    /// already exist; a present collection is a no-op.
+    async fn ensure_one(&self, collection: &str, dimensions: usize) -> Result<()> {
+        // Existence probe. Any non-success — a 404, or a transient error mapped
+        // to `false` — falls through to create. A spurious create against an
+        // existing collection just errors and is retried by the caller, so this
+        // never risks a destructive recreate.
+        let exists = self
+            .client
+            .get(format!("{}/collections/{}", self.base_url, collection))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+
+        if exists {
+            tracing::debug!(collection = %collection, "Qdrant collection present");
+            return Ok(());
+        }
+
+        let body = json!({ "vectors": { "size": dimensions, "distance": "Cosine" } });
+        let resp = self
+            .client
+            .put(format!("{}/collections/{}", self.base_url, collection))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(qdrant_error(resp).await);
+        }
+
+        tracing::info!(
+            collection = %collection,
+            dimensions,
+            "created Qdrant collection (distance=Cosine)"
+        );
+        Ok(())
+    }
 }
 
 // ─── Access timestamp capping ────────────────────────────────────────────────
