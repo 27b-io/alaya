@@ -249,11 +249,11 @@ fn point_to_scored(point: &Value) -> Option<ScoredMemory> {
 /// the payload map under `metadata`: qdrant creates the object when absent and merges
 /// with existing sibling keys (verified empirically) — atomic, no read-modify-write.
 /// Never use dotted map keys for this: they create flat literal fields (issue #54).
-fn nested_supersede_body(point_id: &str, superseded_by: &str) -> Value {
+fn nested_supersede_body(point_ids: &[String], superseded_by: &str) -> Value {
     json!({
         "payload": { "superseded_by": superseded_by },
         "key": "metadata",
-        "points": [point_id],
+        "points": point_ids,
     })
 }
 
@@ -459,7 +459,22 @@ impl VectorStorage for QdrantClient {
     }
 
     async fn update_metadata(&self, content_hash: &str, updates: MetadataUpdate) -> Result<()> {
-        let point_id = hash_to_uuid(content_hash)?;
+        self.update_metadata_batch(&[content_hash], updates).await
+    }
+
+    async fn update_metadata_batch(
+        &self,
+        content_hashes: &[&str],
+        updates: MetadataUpdate,
+    ) -> Result<()> {
+        if content_hashes.is_empty() {
+            return Ok(());
+        }
+
+        let point_ids: Vec<String> = content_hashes
+            .iter()
+            .map(|h| hash_to_uuid(h))
+            .collect::<Result<Vec<String>>>()?;
 
         // Auxiliary top-level fields (supersession_reason, access_count) go FIRST: if
         // this write fails, nothing is marked superseded yet and a retry is clean.
@@ -468,7 +483,7 @@ impl VectorStorage for QdrantClient {
         if !payload.is_empty() {
             self.set_payload(json!({
                 "payload": payload,
-                "points": [point_id],
+                "points": &point_ids,
             }))
             .await?;
         }
@@ -477,7 +492,7 @@ impl VectorStorage for QdrantClient {
         // keys create flat literal fields). The `key`-scoped set-payload writes it
         // atomically, preserving sibling metadata keys without a read-modify-write.
         if let Some(ref sb) = updates.superseded_by {
-            self.set_payload(nested_supersede_body(&point_id, sb))
+            self.set_payload(nested_supersede_body(&point_ids, sb))
                 .await?;
         }
         Ok(())
@@ -1361,12 +1376,24 @@ mod tests {
 
     #[test]
     fn nested_supersede_body_uses_key_param_not_dotted_keys() {
-        let body = nested_supersede_body("some-uuid", &"b".repeat(64));
+        let body = nested_supersede_body(&["some-uuid".to_string()], &"b".repeat(64));
         // the regression: a flat literal "metadata.superseded_by" map key is unreadable
         assert!(body["payload"].get("metadata.superseded_by").is_none());
         assert_eq!(body["key"], json!("metadata"));
         assert_eq!(body["payload"]["superseded_by"], json!("b".repeat(64)));
         assert_eq!(body["points"], json!(["some-uuid"]));
+    }
+
+    #[test]
+    fn nested_supersede_body_carries_all_points_in_one_call() {
+        let ids = vec![
+            "uuid-1".to_string(),
+            "uuid-2".to_string(),
+            "uuid-3".to_string(),
+        ];
+        let body = nested_supersede_body(&ids, &"b".repeat(64));
+        assert_eq!(body["points"], json!(["uuid-1", "uuid-2", "uuid-3"]));
+        assert_eq!(body["key"], json!("metadata"));
     }
 
     #[test]
