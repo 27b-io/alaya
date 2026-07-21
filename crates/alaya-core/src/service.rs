@@ -1170,10 +1170,7 @@ impl MemoryService {
             ..Default::default()
         };
 
-        // Over-fetch and filter superseded at the application layer (the
-        // PayloadFilter route is a no-op — see is_superseded). Double the
-        // fetch until we have k live results or the backend is exhausted.
-        let mut fetch_size = if params.include_superseded {
+        let initial_fetch = if params.include_superseded {
             params.k
         } else {
             params
@@ -1182,24 +1179,17 @@ impl MemoryService {
                 .min(MAX_SIMILAR_FETCH)
                 .max(params.k)
         };
-        let mut results: Vec<ScoredMemory>;
-        loop {
-            let raw = self
-                .vectors
-                .search_by_vector(&query_embedding, fetch_size, Some(filter.clone()))
-                .await?;
-            let exhausted = raw.len() < fetch_size;
-
-            results = raw
-                .into_iter()
-                .filter(|sm| params.include_superseded || !is_superseded(&sm.memory))
-                .collect();
-
-            if results.len() >= params.k || exhausted || fetch_size >= MAX_SIMILAR_FETCH {
-                break;
-            }
-            fetch_size = (fetch_size * 2).min(MAX_SIMILAR_FETCH);
-        }
+        let (mut results, _) = fetch_live_with_retry(
+            initial_fetch,
+            params.k,
+            MAX_SIMILAR_FETCH,
+            params.include_superseded,
+            |n| {
+                self.vectors
+                    .search_by_vector(&query_embedding, n, Some(filter.clone()))
+            },
+        )
+        .await?;
         results.truncate(params.k);
 
         let items: Vec<Value> = results
@@ -1226,30 +1216,14 @@ impl MemoryService {
         let target = offset + params.page_size + 1; // +1 to detect has_more
         let tag_refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
 
-        // Over-fetch and filter superseded at application layer (Qdrant's
-        // is_null on nested payload fields is unreliable without explicit
-        // indexes). Double fetch_size until we have enough filtered results
-        // or the backend is exhausted.
-        let mut fetch_size = target * 2;
-        let mut filtered: Vec<ScoredMemory>;
-        let mut exhausted;
-        loop {
-            let results = self
-                .vectors
-                .search_by_tags(&tag_refs, params.match_all, fetch_size)
-                .await?;
-            exhausted = results.len() < fetch_size;
-
-            filtered = results
-                .into_iter()
-                .filter(|sm| params.include_superseded || !is_superseded(&sm.memory))
-                .collect();
-
-            if filtered.len() >= target || exhausted || fetch_size >= MAX_TAG_FETCH {
-                break;
-            }
-            fetch_size = (fetch_size * 2).min(MAX_TAG_FETCH);
-        }
+        let (filtered, exhausted) = fetch_live_with_retry(
+            target * 2,
+            target,
+            MAX_TAG_FETCH,
+            params.include_superseded,
+            |n| self.vectors.search_by_tags(&tag_refs, params.match_all, n),
+        )
+        .await?;
 
         let has_more =
             filtered.len() > offset + params.page_size || (!exhausted && filtered.len() < target);
@@ -1868,6 +1842,39 @@ fn is_superseded(m: &Memory) -> bool {
         .as_ref()
         .and_then(|md| md.get("superseded_by"))
         .is_some()
+}
+
+/// Over-fetch and filter superseded at the application layer (the
+/// PayloadFilter route is a no-op — see is_superseded). Calls `fetch` with a
+/// growing fetch size, doubling until `target` live results are collected,
+/// the backend is exhausted, or `max_fetch` is reached. Returns the filtered
+/// results and whether the backend was exhausted. Each caller supplies its
+/// own initial size, target, and cap — the loop shape is the shared part.
+async fn fetch_live_with_retry<F, Fut>(
+    mut fetch_size: usize,
+    target: usize,
+    max_fetch: usize,
+    include_superseded: bool,
+    mut fetch: F,
+) -> Result<(Vec<ScoredMemory>, bool)>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<ScoredMemory>>>,
+{
+    loop {
+        let raw = fetch(fetch_size).await?;
+        let exhausted = raw.len() < fetch_size;
+
+        let filtered: Vec<ScoredMemory> = raw
+            .into_iter()
+            .filter(|sm| include_superseded || !is_superseded(&sm.memory))
+            .collect();
+
+        if filtered.len() >= target || exhausted || fetch_size >= max_fetch {
+            return Ok((filtered, exhausted));
+        }
+        fetch_size = (fetch_size * 2).min(max_fetch);
+    }
 }
 
 fn format_memory_result(memory: &Memory, score: f64, output: OutputMode) -> Value {
