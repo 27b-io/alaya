@@ -334,17 +334,17 @@ impl MemoryService {
 
         // Dedup-on-write: skip storage if a near-duplicate exists
         if let Some(threshold) = params.dedup_threshold {
-            let dedup_filter = PayloadFilter {
-                exclude_superseded: true,
-                ..Default::default()
-            };
+            // Over-fetch a few and skip superseded at the app layer (see
+            // is_superseded): a superseded nearest-neighbor must neither
+            // falsely reject new content as a duplicate of a dead memory nor
+            // mask a live duplicate ranked just behind it.
             let similar = self
                 .vectors
-                .search_by_vector(&embedding, 1, Some(dedup_filter))
+                .search_by_vector(&embedding, 5, None)
                 .await
                 .unwrap_or_default();
 
-            if let Some(top) = similar.first()
+            if let Some(top) = similar.iter().find(|sm| !is_superseded(&sm.memory))
                 && top.score >= threshold
             {
                 let mut result = HashMap::new();
@@ -436,20 +436,17 @@ impl MemoryService {
         // Suppressed under read_only: edges write to the shared owner graph
         // (would be a side-channel to the gated `relation` tool).
         let mut contradiction_signals = Vec::new();
-        let interference_filter = PayloadFilter {
-            exclude_superseded: true,
-            ..Default::default()
-        };
-        if !read_only
-            && let Ok(similar) = self
-                .vectors
-                .search_by_vector(&embedding, 10, Some(interference_filter))
-                .await
+        if !read_only && let Ok(similar) = self.vectors.search_by_vector(&embedding, 10, None).await
         {
             let mut edges_to_create: Vec<(String, String, UserRelationType, EdgeMeta)> = Vec::new();
 
             for scored in &similar {
                 if scored.memory.content_hash == content_hash {
+                    continue;
+                }
+                // Never relate/contradict against a superseded memory (see
+                // is_superseded — the Qdrant-side filter is a no-op).
+                if is_superseded(&scored.memory) {
                     continue;
                 }
                 if scored.score < 0.7 {
@@ -1165,6 +1162,14 @@ impl MemoryService {
 
         const MAX_SIMILAR_FETCH: usize = 5000;
 
+        // memory_type (exact match) and min_trust_score (range) are reliable
+        // Qdrant-side filters; only superseded filtering must stay app-side.
+        let filter = PayloadFilter {
+            memory_type: params.memory_type.clone(),
+            min_trust_score: params.min_trust_score,
+            ..Default::default()
+        };
+
         // Over-fetch and filter superseded at the application layer (the
         // PayloadFilter route is a no-op — see is_superseded). Double the
         // fetch until we have k live results or the backend is exhausted.
@@ -1181,7 +1186,7 @@ impl MemoryService {
         loop {
             let raw = self
                 .vectors
-                .search_by_vector(&query_embedding, fetch_size, None)
+                .search_by_vector(&query_embedding, fetch_size, Some(filter.clone()))
                 .await?;
             let exhausted = raw.len() < fetch_size;
 
@@ -3006,6 +3011,118 @@ mod tests {
         // No edges created at all
         assert_eq!(individual_calls.get(), 0);
         assert_eq!(batch_edge_count.get(), 0);
+    }
+
+    fn superseded_scored(hash: &str, content: &str, score: f64) -> ScoredMemory {
+        let mut sm = make_contradicting_memory(hash, content, score);
+        let mut md = HashMap::new();
+        md.insert(
+            "superseded_by".to_string(),
+            serde_json::json!("f".repeat(64)),
+        );
+        sm.memory.metadata = Some(md);
+        sm
+    }
+
+    /// Superseded memories must not create interference (CONTRADICTS) edges.
+    #[tokio::test(flavor = "current_thread")]
+    async fn interference_skips_superseded_memories() {
+        let similar = vec![superseded_scored(
+            "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000",
+            "Authentication is required for all API endpoints",
+            0.92,
+        )];
+
+        let (svc, individual_calls, _batch_calls, batch_edge_count) =
+            build_batch_test_service(similar);
+
+        let params = StoreParams {
+            content: "Authentication is not required, it failed and cannot be used".into(),
+            tags: None,
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: None,
+        };
+
+        svc.store_memory(params).await.expect("store succeeds");
+
+        assert_eq!(individual_calls.get(), 0);
+        assert_eq!(
+            batch_edge_count.get(),
+            0,
+            "no edges may be created against a superseded memory"
+        );
+    }
+
+    /// A superseded near-duplicate must not block storing new content.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dedup_ignores_superseded_near_duplicate() {
+        let similar = vec![
+            superseded_scored(
+                "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000",
+                "near-identical but superseded",
+                0.99,
+            ),
+            make_contradicting_memory(
+                "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000",
+                "vaguely related live memory",
+                0.5,
+            ),
+        ];
+
+        let (svc, _, _, _) = build_batch_test_service(similar);
+
+        let params = StoreParams {
+            content: "brand new content".into(),
+            tags: None,
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: Some(0.95),
+        };
+
+        let result = svc.store_memory(params).await.expect("store succeeds");
+        assert!(
+            !result.contains_key("duplicate"),
+            "superseded neighbor at 0.99 must not trigger dedup rejection: {result:?}"
+        );
+    }
+
+    /// A live duplicate ranked behind a superseded neighbor is still detected.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dedup_detects_live_duplicate_behind_superseded() {
+        let live_hash = "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000";
+        let similar = vec![
+            superseded_scored(
+                "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000",
+                "near-identical but superseded",
+                0.99,
+            ),
+            make_contradicting_memory(live_hash, "near-identical and live", 0.97),
+        ];
+
+        let (svc, _, _, _) = build_batch_test_service(similar);
+
+        let params = StoreParams {
+            content: "brand new content".into(),
+            tags: None,
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: Some(0.95),
+        };
+
+        let result = svc.store_memory(params).await.expect("store succeeds");
+        assert_eq!(result.get("duplicate"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            result.get("existing_hash"),
+            Some(&serde_json::json!(live_hash)),
+            "duplicate must be reported against the LIVE memory, not the superseded one"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
