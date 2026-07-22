@@ -334,17 +334,17 @@ impl MemoryService {
 
         // Dedup-on-write: skip storage if a near-duplicate exists
         if let Some(threshold) = params.dedup_threshold {
-            let dedup_filter = PayloadFilter {
-                exclude_superseded: true,
-                ..Default::default()
-            };
+            // Over-fetch a few and skip superseded at the app layer (see
+            // is_superseded): a superseded nearest-neighbor must neither
+            // falsely reject new content as a duplicate of a dead memory nor
+            // mask a live duplicate ranked just behind it.
             let similar = self
                 .vectors
-                .search_by_vector(&embedding, 1, Some(dedup_filter))
+                .search_by_vector(&embedding, 5, None)
                 .await
                 .unwrap_or_default();
 
-            if let Some(top) = similar.first()
+            if let Some(top) = similar.iter().find(|sm| !is_superseded(&sm.memory))
                 && top.score >= threshold
             {
                 let mut result = HashMap::new();
@@ -436,20 +436,17 @@ impl MemoryService {
         // Suppressed under read_only: edges write to the shared owner graph
         // (would be a side-channel to the gated `relation` tool).
         let mut contradiction_signals = Vec::new();
-        let interference_filter = PayloadFilter {
-            exclude_superseded: true,
-            ..Default::default()
-        };
-        if !read_only
-            && let Ok(similar) = self
-                .vectors
-                .search_by_vector(&embedding, 10, Some(interference_filter))
-                .await
+        if !read_only && let Ok(similar) = self.vectors.search_by_vector(&embedding, 10, None).await
         {
             let mut edges_to_create: Vec<(String, String, UserRelationType, EdgeMeta)> = Vec::new();
 
             for scored in &similar {
                 if scored.memory.content_hash == content_hash {
+                    continue;
+                }
+                // Never relate/contradict against a superseded memory (see
+                // is_superseded — the Qdrant-side filter is a no-op).
+                if is_superseded(&scored.memory) {
                     continue;
                 }
                 if scored.score < 0.7 {
@@ -646,7 +643,6 @@ impl MemoryService {
 
         let filter = PayloadFilter {
             memory_type: params.memory_type.clone(),
-            exclude_superseded: !params.include_superseded,
             min_trust_score: params.min_trust_score,
             ..Default::default()
         };
@@ -654,7 +650,7 @@ impl MemoryService {
         // Stage 2: Vector search + semantic tag pipeline run concurrently.
         // search_similar_tags→search_by_tags chains inside one branch so the
         // 44-64ms semantic search overlaps with search_by_vector.
-        let (vector_results, semantic_tag_results) = {
+        let (mut vector_results, semantic_tag_results) = {
             let _span = tracing::info_span!("vector_search").entered();
             let vector_fut =
                 self.vectors
@@ -691,6 +687,15 @@ impl MemoryService {
                     tag_results.push(sr);
                 }
             }
+        }
+
+        // Drop superseded memories from every candidate pool before fusion —
+        // neither search_by_vector nor search_by_tags filters them (see
+        // is_superseded), and superseded entries must not consume RRF ranks,
+        // rerank slots, or spreading-activation seeds.
+        if !params.include_superseded {
+            vector_results.retain(|sm| !is_superseded(&sm.memory));
+            tag_results.retain(|sm| !is_superseded(&sm.memory));
         }
 
         // Stage 3: Fuse (RRF) — pure computation
@@ -781,6 +786,9 @@ impl MemoryService {
                     Ok(memories) => {
                         let mut result = Vec::with_capacity(memories.len());
                         for mem in memories {
+                            if !params.include_superseded && is_superseded(&mem) {
+                                continue;
+                            }
                             let activation = activation_map
                                 .get(mem.content_hash.as_str())
                                 .copied()
@@ -1090,12 +1098,7 @@ impl MemoryService {
             raw_scanned += scroll.memories.len();
 
             for m in scroll.memories {
-                if !params.include_superseded
-                    && m.metadata
-                        .as_ref()
-                        .and_then(|md| md.get("superseded_by"))
-                        .is_some()
-                {
+                if !params.include_superseded && is_superseded(&m) {
                     continue;
                 }
                 if params
@@ -1157,15 +1160,37 @@ impl MemoryService {
             .next()
             .ok_or_else(|| AlayaError::Embedding("empty embedding result".into()))?;
 
+        const MAX_SIMILAR_FETCH: usize = 5000;
+
+        // memory_type (exact match) and min_trust_score (range) are reliable
+        // Qdrant-side filters; only superseded filtering must stay app-side.
         let filter = PayloadFilter {
-            exclude_superseded: !params.include_superseded,
+            memory_type: params.memory_type.clone(),
+            min_trust_score: params.min_trust_score,
             ..Default::default()
         };
 
-        let results = self
-            .vectors
-            .search_by_vector(&query_embedding, params.k, Some(filter))
-            .await?;
+        let initial_fetch = if params.include_superseded {
+            params.k
+        } else {
+            params
+                .k
+                .saturating_mul(2)
+                .min(MAX_SIMILAR_FETCH)
+                .max(params.k)
+        };
+        let (mut results, _) = fetch_live_with_retry(
+            initial_fetch,
+            params.k,
+            MAX_SIMILAR_FETCH,
+            params.include_superseded,
+            |n| {
+                self.vectors
+                    .search_by_vector(&query_embedding, n, Some(filter.clone()))
+            },
+        )
+        .await?;
+        results.truncate(params.k);
 
         let items: Vec<Value> = results
             .iter()
@@ -1191,38 +1216,14 @@ impl MemoryService {
         let target = offset + params.page_size + 1; // +1 to detect has_more
         let tag_refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
 
-        // Over-fetch and filter superseded at application layer (Qdrant's
-        // is_null on nested payload fields is unreliable without explicit
-        // indexes). Double fetch_size until we have enough filtered results
-        // or the backend is exhausted.
-        let mut fetch_size = target * 2;
-        let mut filtered: Vec<ScoredMemory>;
-        let mut exhausted;
-        loop {
-            let results = self
-                .vectors
-                .search_by_tags(&tag_refs, params.match_all, fetch_size)
-                .await?;
-            exhausted = results.len() < fetch_size;
-
-            filtered = results
-                .into_iter()
-                .filter(|sm| {
-                    params.include_superseded
-                        || sm
-                            .memory
-                            .metadata
-                            .as_ref()
-                            .and_then(|md| md.get("superseded_by"))
-                            .is_none()
-                })
-                .collect();
-
-            if filtered.len() >= target || exhausted || fetch_size >= MAX_TAG_FETCH {
-                break;
-            }
-            fetch_size = (fetch_size * 2).min(MAX_TAG_FETCH);
-        }
+        let (filtered, exhausted) = fetch_live_with_retry(
+            target * 2,
+            target,
+            MAX_TAG_FETCH,
+            params.include_superseded,
+            |n| self.vectors.search_by_tags(&tag_refs, params.match_all, n),
+        )
+        .await?;
 
         let has_more =
             filtered.len() > offset + params.page_size || (!exhausted && filtered.len() < target);
@@ -1244,14 +1245,50 @@ impl MemoryService {
 
     #[tracing::instrument(skip(self, params))]
     async fn search_recent(&self, params: &SearchParams) -> Result<Value> {
-        let results = self
-            .vectors
-            .get_recent(
-                params.page_size + 1,
-                params.cursor,
-                params.memory_type.as_deref(),
-            )
-            .await?;
+        const MAX_RECENT_SCANNED: usize = 5000;
+
+        let target = params.page_size + 1; // +1 detects has_more
+        // Over-fetch and filter superseded at the application layer, advancing
+        // the created_at cursor until the page fills (same strategy as scan/tag;
+        // see is_superseded for why Qdrant can't filter this server-side).
+        let batch_size = if params.include_superseded {
+            target
+        } else {
+            target.saturating_mul(2).min(MAX_RECENT_SCANNED)
+        };
+
+        let mut results: Vec<Memory> = Vec::new();
+        let mut scan_cursor = params.cursor;
+        let mut raw_scanned: usize = 0;
+        loop {
+            let batch = self
+                .vectors
+                .get_recent(batch_size, scan_cursor, params.memory_type.as_deref())
+                .await?;
+            let exhausted = batch.len() < batch_size;
+            raw_scanned += batch.len();
+
+            for m in batch {
+                scan_cursor = Some(m.created_at);
+                if !params.include_superseded && is_superseded(&m) {
+                    continue;
+                }
+                results.push(m);
+            }
+
+            if results.len() >= target || exhausted {
+                break;
+            }
+            if raw_scanned >= MAX_RECENT_SCANNED {
+                tracing::warn!(
+                    raw_scanned,
+                    filtered = results.len(),
+                    target,
+                    "search_recent hit safety cap"
+                );
+                break;
+            }
+        }
 
         let has_more = results.len() > params.page_size;
         let page_results: Vec<&Memory> = results.iter().take(params.page_size).collect();
@@ -1629,11 +1666,7 @@ impl MemoryService {
             let batch_empty = scroll.memories.is_empty();
             raw_scanned += scroll.memories.len();
             for m in scroll.memories {
-                if m.metadata
-                    .as_ref()
-                    .and_then(|md| md.get("superseded_by"))
-                    .is_some()
-                {
+                if is_superseded(&m) {
                     continue;
                 }
                 memories.push(m);
@@ -1795,6 +1828,52 @@ fn parse_user_relation(s: &str) -> Result<UserRelationType> {
         _ => Err(AlayaError::Validation(format!(
             "unknown relation type: {s}"
         ))),
+    }
+}
+
+/// True when the memory has been superseded (`metadata.superseded_by` set).
+///
+/// Superseded filtering MUST happen here at the application layer: the
+/// `PayloadFilter.exclude_superseded` flag is a documented no-op in the
+/// Qdrant backend because `is_null` on nested payload fields is unreliable
+/// without an explicit payload index (issue #30, repo CLAUDE.md).
+fn is_superseded(m: &Memory) -> bool {
+    m.metadata
+        .as_ref()
+        .and_then(|md| md.get("superseded_by"))
+        .is_some()
+}
+
+/// Over-fetch and filter superseded at the application layer (the
+/// PayloadFilter route is a no-op — see is_superseded). Calls `fetch` with a
+/// growing fetch size, doubling until `target` live results are collected,
+/// the backend is exhausted, or `max_fetch` is reached. Returns the filtered
+/// results and whether the backend was exhausted. Each caller supplies its
+/// own initial size, target, and cap — the loop shape is the shared part.
+async fn fetch_live_with_retry<F, Fut>(
+    mut fetch_size: usize,
+    target: usize,
+    max_fetch: usize,
+    include_superseded: bool,
+    mut fetch: F,
+) -> Result<(Vec<ScoredMemory>, bool)>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<ScoredMemory>>>,
+{
+    loop {
+        let raw = fetch(fetch_size).await?;
+        let exhausted = raw.len() < fetch_size;
+
+        let filtered: Vec<ScoredMemory> = raw
+            .into_iter()
+            .filter(|sm| include_superseded || !is_superseded(&sm.memory))
+            .collect();
+
+        if filtered.len() >= target || exhausted || fetch_size >= max_fetch {
+            return Ok((filtered, exhausted));
+        }
+        fetch_size = (fetch_size * 2).min(max_fetch);
     }
 }
 
@@ -2941,6 +3020,118 @@ mod tests {
         assert_eq!(batch_edge_count.get(), 0);
     }
 
+    fn superseded_scored(hash: &str, content: &str, score: f64) -> ScoredMemory {
+        let mut sm = make_contradicting_memory(hash, content, score);
+        let mut md = HashMap::new();
+        md.insert(
+            "superseded_by".to_string(),
+            serde_json::json!("f".repeat(64)),
+        );
+        sm.memory.metadata = Some(md);
+        sm
+    }
+
+    /// Superseded memories must not create interference (CONTRADICTS) edges.
+    #[tokio::test(flavor = "current_thread")]
+    async fn interference_skips_superseded_memories() {
+        let similar = vec![superseded_scored(
+            "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000",
+            "Authentication is required for all API endpoints",
+            0.92,
+        )];
+
+        let (svc, individual_calls, _batch_calls, batch_edge_count) =
+            build_batch_test_service(similar);
+
+        let params = StoreParams {
+            content: "Authentication is not required, it failed and cannot be used".into(),
+            tags: None,
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: None,
+        };
+
+        svc.store_memory(params).await.expect("store succeeds");
+
+        assert_eq!(individual_calls.get(), 0);
+        assert_eq!(
+            batch_edge_count.get(),
+            0,
+            "no edges may be created against a superseded memory"
+        );
+    }
+
+    /// A superseded near-duplicate must not block storing new content.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dedup_ignores_superseded_near_duplicate() {
+        let similar = vec![
+            superseded_scored(
+                "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000",
+                "near-identical but superseded",
+                0.99,
+            ),
+            make_contradicting_memory(
+                "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000",
+                "vaguely related live memory",
+                0.5,
+            ),
+        ];
+
+        let (svc, _, _, _) = build_batch_test_service(similar);
+
+        let params = StoreParams {
+            content: "brand new content".into(),
+            tags: None,
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: Some(0.95),
+        };
+
+        let result = svc.store_memory(params).await.expect("store succeeds");
+        assert!(
+            !result.contains_key("duplicate"),
+            "superseded neighbor at 0.99 must not trigger dedup rejection: {result:?}"
+        );
+    }
+
+    /// A live duplicate ranked behind a superseded neighbor is still detected.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dedup_detects_live_duplicate_behind_superseded() {
+        let live_hash = "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000";
+        let similar = vec![
+            superseded_scored(
+                "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000",
+                "near-identical but superseded",
+                0.99,
+            ),
+            make_contradicting_memory(live_hash, "near-identical and live", 0.97),
+        ];
+
+        let (svc, _, _, _) = build_batch_test_service(similar);
+
+        let params = StoreParams {
+            content: "brand new content".into(),
+            tags: None,
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: Some(0.95),
+        };
+
+        let result = svc.store_memory(params).await.expect("store succeeds");
+        assert_eq!(result.get("duplicate"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            result.get("existing_hash"),
+            Some(&serde_json::json!(live_hash)),
+            "duplicate must be reported against the LIVE memory, not the superseded one"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn patch_memory_invalidates_tag_cache_when_tags_present() {
         let (svc, counter) = build_mock_service(vec!["rust".into()]);
@@ -3746,5 +3937,221 @@ mod tests {
             .collect();
 
         assert_eq!(result_hashes.first(), Some(&hash_a.as_str()));
+    }
+
+    // ─── Superseded filtering across search modes (issue #30) ───────────
+    //
+    // Regression for the evidence case: after superseding 5 duplicate
+    // memories, all 5 still appeared in recent/similar (and hybrid/tag
+    // shared the same defect — the Qdrant PayloadFilter route is a no-op).
+
+    /// Mock VectorStorage over a fixed corpus. Returns the corpus from every
+    /// search entry point with NO superseded filtering — mirroring the real
+    /// Qdrant backend, where that responsibility lives at the app layer.
+    struct MockVectorsCorpus {
+        memories: Vec<Memory>,
+    }
+
+    impl MockVectorsCorpus {
+        fn scored(&self, limit: usize) -> Vec<ScoredMemory> {
+            self.memories
+                .iter()
+                .take(limit)
+                .enumerate()
+                .map(|(i, m)| ScoredMemory {
+                    memory: m.clone(),
+                    score: 0.9 - i as f64 * 0.01,
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl VectorStorage for MockVectorsCorpus {
+        async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+            Ok((true, "mock".into()))
+        }
+        async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
+            Ok(None)
+        }
+        async fn get_batch(&self, _h: &[&str]) -> Result<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn delete(&self, _h: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn update_metadata(&self, _h: &str, _u: MetadataUpdate) -> Result<()> {
+            Ok(())
+        }
+        async fn patch_memory(&self, _h: &str, _p: &PatchMemoryRequest) -> Result<Memory> {
+            Ok(dummy_memory())
+        }
+        async fn search_by_vector(
+            &self,
+            _e: &[f32],
+            limit: usize,
+            _f: Option<PayloadFilter>,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(self.scored(limit))
+        }
+        async fn search_by_tags(
+            &self,
+            _t: &[&str],
+            _m: bool,
+            limit: usize,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(self.scored(limit))
+        }
+        async fn search_similar_tags(&self, _e: &[f32], _l: usize) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
+            Ok(())
+        }
+        async fn get_all(&self, limit: usize, offset: Option<&str>) -> Result<ScrollResult> {
+            let start: usize = offset.and_then(|o| o.parse().ok()).unwrap_or(0);
+            let end = (start + limit).min(self.memories.len());
+            Ok(ScrollResult {
+                memories: self.memories[start..end].to_vec(),
+                next_offset: (end < self.memories.len()).then(|| end.to_string()),
+            })
+        }
+        async fn get_recent(
+            &self,
+            limit: usize,
+            start_from: Option<f64>,
+            _t: Option<&str>,
+        ) -> Result<Vec<Memory>> {
+            let mut sorted = self.memories.clone();
+            sorted.sort_by(|a, b| b.created_at.partial_cmp(&a.created_at).unwrap());
+            Ok(sorted
+                .into_iter()
+                .filter(|m| start_from.is_none_or(|ts| m.created_at < ts))
+                .take(limit)
+                .collect())
+        }
+        async fn count(&self) -> Result<usize> {
+            Ok(self.memories.len())
+        }
+        async fn get_all_tags(&self) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn increment_access_count(&self, _h: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            Ok(HealthStatus {
+                status: "ok".into(),
+                backend: "mock".into(),
+                details: None,
+            })
+        }
+    }
+
+    /// 10 memories: even indices live, odd indices superseded (5 of each).
+    fn superseded_corpus() -> Vec<Memory> {
+        (0..10)
+            .map(|i| {
+                let metadata = (i % 2 == 1).then(|| {
+                    let mut md = HashMap::new();
+                    md.insert(
+                        "superseded_by".to_string(),
+                        serde_json::json!("f".repeat(64)),
+                    );
+                    md
+                });
+                Memory {
+                    content: format!("watchdog sidecar memory {i}"),
+                    content_hash: format!("{i:064x}"),
+                    tags: vec!["watchdog".into()],
+                    memory_type: "note".into(),
+                    metadata,
+                    created_at: 1_000_000.0 + i as f64,
+                    updated_at: 1_000_000.0 + i as f64,
+                    embedding: None,
+                    summary: None,
+                    salience_score: 0.5,
+                    access_count: 1,
+                    access_timestamps: vec![],
+                    emotional_valence: None,
+                    encoding_context: None,
+                    provenance: None,
+                    summary_embedding: None,
+                }
+            })
+            .collect()
+    }
+
+    async fn corpus_search_hashes(
+        mode: SearchMode,
+        include_superseded: bool,
+    ) -> std::collections::HashSet<String> {
+        let svc = MemoryService::new(
+            Box::new(MockVectorsCorpus {
+                memories: superseded_corpus(),
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        );
+        let params = SearchParams {
+            query: "watchdog sidecar".into(),
+            mode,
+            page: 1,
+            page_size: 10,
+            tags: Some(vec!["watchdog".into()]),
+            match_all: false,
+            k: 10,
+            min_similarity: None,
+            memory_type: None,
+            encoding_context: None,
+            include_superseded,
+            min_trust_score: None,
+            output: OutputMode::Full,
+            cursor: None,
+        };
+        svc.search(params).await.expect("search succeeds")["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .filter_map(|x| x["content_hash"].as_str().map(String::from))
+            .collect()
+    }
+
+    const ALL_MODES: [SearchMode; 5] = [
+        SearchMode::Recent,
+        SearchMode::Similar,
+        SearchMode::Hybrid,
+        SearchMode::Tag,
+        SearchMode::Scan,
+    ];
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn superseded_memories_hidden_in_every_search_mode() {
+        let live: std::collections::HashSet<String> =
+            (0..10).step_by(2).map(|i| format!("{i:064x}")).collect();
+
+        for mode in ALL_MODES {
+            let hashes = corpus_search_hashes(mode, false).await;
+            assert_eq!(
+                hashes, live,
+                "{mode:?}: expected exactly the 5 live memories, superseded must not leak"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn include_superseded_returns_them_in_every_search_mode() {
+        let all: std::collections::HashSet<String> = (0..10).map(|i| format!("{i:064x}")).collect();
+
+        for mode in ALL_MODES {
+            let hashes = corpus_search_hashes(mode, true).await;
+            assert_eq!(
+                hashes, all,
+                "{mode:?}: include_superseded=true must return all 10 memories"
+            );
+        }
     }
 }
