@@ -101,23 +101,26 @@ impl QdrantClient {
     /// Create `collection` with `dimensions`-wide Cosine vectors if it does not
     /// already exist; a present collection is a no-op.
     async fn ensure_one(&self, collection: &str, dimensions: usize) -> Result<()> {
-        // Existence probe. Any non-success — a 404, or a transient error mapped
-        // to `false` — falls through to create. A spurious create against an
-        // existing collection just errors and is retried by the caller, so this
-        // never risks a destructive recreate.
-        let exists = self
+        // Existence probe: a 2xx means present (no-op), a 404 means absent
+        // (create). Any other status or a transport error is a real fault —
+        // propagate it so the startup retry backs off on the true cause rather
+        // than misreading it as "missing" and firing a doomed create.
+        let resp = self
             .client
             .get(format!("{}/collections/{}", self.base_url, collection))
             .send()
             .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
+            .map_err(|e| AlayaError::Storage(e.to_string()))?;
 
-        if exists {
+        if resp.status().is_success() {
             tracing::debug!(collection = %collection, "Qdrant collection present");
             return Ok(());
         }
+        if resp.status() != reqwest::StatusCode::NOT_FOUND {
+            return Err(qdrant_error(resp).await);
+        }
 
+        // Absent (404) → create with the configured vector size and Cosine distance.
         let body = json!({ "vectors": { "size": dimensions, "distance": "Cosine" } });
         let resp = self
             .client

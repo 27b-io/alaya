@@ -91,3 +91,29 @@ async fn main_collection_create_error_propagates() {
         "a failed main-collection create must propagate so the caller retries"
     );
 }
+
+#[tokio::test]
+async fn non_404_probe_error_propagates_without_creating() {
+    let server = MockServer::start().await;
+    // The probe returns a server error (e.g. Qdrant still warming up), not a 404.
+    Mock::given(method("GET"))
+        .and(path("/collections/memories"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    // A create here would mean we misread a transient fault as "collection absent".
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let result = QdrantClient::new(server.uri(), "memories".into(), None)
+        .ensure_collection(1024)
+        .await;
+    assert!(
+        result.is_err(),
+        "a non-404 probe response must propagate, not fall through to create"
+    );
+    // Drop verifies zero PUTs were sent.
+}
