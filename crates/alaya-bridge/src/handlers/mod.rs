@@ -98,10 +98,12 @@ pub async fn exec_query(
 ///
 /// FalkorDB creates a graph lazily on the first write; until then any read
 /// answers with `-ERR Invalid graph operation on empty key`. redis-rs parses
-/// the `ERR` prefix into a `ResponseError` carrying the message, so a substring
-/// match on the distinctive "empty key" is stable across versions. (LAB-373)
+/// the `ERR` prefix into a `ResponseError` carrying the message, so gate on
+/// that kind first — a non-response error (e.g. an I/O failure) whose message
+/// happens to contain "empty key" must never be swallowed as an empty graph —
+/// then substring-match the distinctive "empty key". (LAB-373)
 fn is_empty_graph_error(err: &redis::RedisError) -> bool {
-    err.to_string().contains("empty key")
+    err.kind() == redis::ErrorKind::ResponseError && err.to_string().contains("empty key")
 }
 
 // ─── Cypher literal serialization ────────────────────────────────────────────
@@ -201,6 +203,19 @@ mod tests {
         assert!(!is_empty_graph_error(&syntax));
 
         let io = redis::RedisError::from((redis::ErrorKind::IoError, "connection reset by peer"));
+        assert!(!is_empty_graph_error(&io));
+    }
+
+    #[test]
+    fn non_response_error_mentioning_empty_key_not_swallowed() {
+        // Only a server ResponseError may be treated as an empty graph. A
+        // non-response error whose message happens to contain "empty key"
+        // (e.g. an I/O failure surfaced mid-read) must still propagate.
+        let io = redis::RedisError::from((
+            redis::ErrorKind::IoError,
+            "io error",
+            "stream closed while reading empty key".to_string(),
+        ));
         assert!(!is_empty_graph_error(&io));
     }
 }
