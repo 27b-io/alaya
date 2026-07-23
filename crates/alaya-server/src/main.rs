@@ -233,6 +233,38 @@ async fn init_l2_cache(
         .into())
 }
 
+/// Ensure the Qdrant collection exists before the server serves writes, so a
+/// fresh deployment needs no manual bootstrap (#31). Retries with backoff: on a
+/// cluster cold-start the server pod can come up before Qdrant is ready (same
+/// rationale as `init_l2_cache`). Never fatal — after exhausting retries it logs
+/// and continues rather than crash-looping the server; the first write would
+/// then 404 until Qdrant is reachable, exactly as it did before this fix.
+async fn ensure_qdrant_collection(qdrant: &QdrantClient, dimensions: usize) {
+    for attempt in 0..L2_MAX_ATTEMPTS {
+        match qdrant.ensure_collection(dimensions).await {
+            Ok(()) => return,
+            Err(e) if attempt + 1 == L2_MAX_ATTEMPTS => {
+                tracing::error!(
+                    error = %e,
+                    "could not ensure Qdrant collection after {L2_MAX_ATTEMPTS} attempts — \
+                     writes will 404 until Qdrant is reachable and the collection exists"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    error = %e,
+                    "ensure Qdrant collection failed, retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    L2_BASE_RETRY_MS * (1 << attempt),
+                ))
+                .await;
+            }
+        }
+    }
+}
+
 // ─── Command channel ────────────────────────────────────────────────────────
 
 const CMD_CHANNEL_CAP: usize = 256;
@@ -1100,6 +1132,9 @@ fn main() {
                     cfg_clone.qdrant_collection,
                     cfg_clone.qdrant_api_key,
                 );
+                // Fresh-deploy bootstrap: create the memory collection if it is
+                // absent so the first write doesn't 404 (#31).
+                ensure_qdrant_collection(&qdrant, cfg_clone.embedding_dimensions).await;
                 let embed_model = cfg_clone.embedding_model;
                 let embed_dims = cfg_clone.embedding_dimensions;
                 let embeddings = EmbeddingClient::new(
