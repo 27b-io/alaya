@@ -31,19 +31,11 @@ That starts five containers (six with `--profile rerank`):
 
 First boot takes a few minutes — TEI has to download the ~600 MB embedding model and Ālaya has to build the Rust binaries. Watch progress with `docker compose logs -f`.
 
-## Bootstrap the vector collection
+## The vector collection is created automatically
 
-One-time step on a fresh Qdrant volume — create the collection that holds memory vectors:
-
-```bash
-curl -X PUT http://localhost:6333/collections/memories_arctic1024 \
-  -H 'Content-Type: application/json' \
-  -d '{"vectors":{"size":1024,"distance":"Cosine"}}'
-```
+`alaya-server` ensures its Qdrant collection exists at startup, so a fresh Qdrant volume — even after `docker compose down -v` — accepts writes with no manual step. The collection name comes from `QDRANT_COLLECTION` (`memories_arctic1024` by default, for the Snowflake Arctic embed model) and is created with `EMBEDDING_DIMENSIONS`-wide Cosine vectors.
 
 > Qdrant has no auth in the default compose; this assumes localhost — don't expose :6333.
-
-(The collection name comes from `QDRANT_COLLECTION` — `memories_arctic1024` is the default for the Snowflake Arctic embed model.)
 
 ## Verify
 
@@ -109,7 +101,7 @@ Every knob lives in `.env`. The interesting ones:
 |---|---|---|
 | `ALAYA_API_KEY` | empty | Bearer token clients must send. Empty is fail-closed: the server won't boot unless the dev Compose sets `DANGEROUSLY_ALLOW_UNAUTHENTICATED=true` (localhost only). **Set this for any non-local deployment.** |
 | `GRAPH_API_KEY` | empty | Bridge bearer token. Set if exposing the bridge port. |
-| `QDRANT_COLLECTION` | `memories_arctic1024` | Must match the bootstrap collection name. |
+| `QDRANT_COLLECTION` | `memories_arctic1024` | Name of the collection the server auto-creates at startup. |
 | `TEI_MODEL` | `Snowflake/snowflake-arctic-embed-l-v2.0` | Embedding model. Change this and you'll need a new collection with the matching dimensionality. |
 | `EMBEDDING_DIMENSIONS` | `1024` | Must match `TEI_MODEL`'s output. |
 | `REDIS_CACHE_URL` | `redis://falkordb:6379` | L2 embedding cache. Reuses falkordb's Redis layer by default. |
