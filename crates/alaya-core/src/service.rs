@@ -1508,53 +1508,52 @@ impl MemoryService {
         new_hash: &str,
         reason: &str,
     ) -> Result<Value> {
-        self.supersede_inner(old_hash, new_hash, reason, true).await
-    }
-
-    /// Core supersede logic. When `verify_new` is false, skips the existence
-    /// check on new_hash (used by merge_duplicates which pre-validates the
-    /// canonical hash once before the loop).
-    async fn supersede_inner(
-        &self,
-        old_hash: &str,
-        new_hash: &str,
-        reason: &str,
-        verify_new: bool,
-    ) -> Result<Value> {
         if old_hash == new_hash {
             return Err(AlayaError::Validation(
                 "old_hash and new_hash must differ".into(),
             ));
         }
 
-        if verify_new {
-            // Verify both exist (single batch GET)
-            let batch = self.vectors.get_batch(&[old_hash, new_hash]).await?;
-            if !batch.iter().any(|m| m.content_hash == old_hash) {
-                return Err(AlayaError::Validation(format!(
-                    "old memory not found: {old_hash}"
-                )));
-            }
-            if !batch.iter().any(|m| m.content_hash == new_hash) {
-                return Err(AlayaError::Validation(format!(
-                    "new memory not found: {new_hash}"
-                )));
-            }
-        } else {
-            // Only verify old_hash exists (canonical already validated)
-            if self.vectors.get_by_hash(old_hash).await?.is_none() {
-                return Err(AlayaError::Validation(format!(
-                    "old memory not found: {old_hash}"
-                )));
-            }
+        // Verify both exist (single batch GET)
+        let batch = self.vectors.get_batch(&[old_hash, new_hash]).await?;
+        if !batch.iter().any(|m| m.content_hash == old_hash) {
+            return Err(AlayaError::Validation(format!(
+                "old memory not found: {old_hash}"
+            )));
+        }
+        if !batch.iter().any(|m| m.content_hash == new_hash) {
+            return Err(AlayaError::Validation(format!(
+                "new memory not found: {new_hash}"
+            )));
         }
 
-        // Update metadata on old memory
+        self.mark_superseded(&[old_hash], new_hash, reason).await?;
+
+        Ok(serde_json::json!({
+            "success": true,
+            "superseded": old_hash,
+            "superseded_by": new_hash,
+            "reason": reason,
+        }))
+    }
+
+    /// Mark every memory in `old_hashes` as superseded by `new_hash`.
+    ///
+    /// One batched metadata update writes the audit trail (`superseded_by` +
+    /// `supersession_reason`) for all memories, then one batched edge write
+    /// creates the SUPERSEDES edges. Edge failures only warn — graph
+    /// operations are non-fatal by design.
+    async fn mark_superseded(
+        &self,
+        old_hashes: &[&str],
+        new_hash: &str,
+        reason: &str,
+    ) -> Result<()> {
         let mut extra = HashMap::new();
         extra.insert("supersession_reason".into(), serde_json::json!(reason));
         self.vectors
-            .update_metadata(
-                old_hash,
+            .update_metadata_batch(
+                old_hashes,
                 MetadataUpdate {
                     superseded_by: Some(new_hash.to_string()),
                     extra: Some(extra),
@@ -1563,22 +1562,23 @@ impl MemoryService {
             )
             .await?;
 
-        // Create SUPERSEDES graph edge
         let now = (self.clock)();
-        if let Err(e) = self
-            .graph
-            .create_system_edge(new_hash, old_hash, SystemRelationType::Supersedes, now)
-            .await
-        {
-            tracing::warn!("failed to create SUPERSEDES edge: {e}");
+        let edges: Vec<(String, String, SystemRelationType, f64)> = old_hashes
+            .iter()
+            .map(|old| {
+                (
+                    new_hash.to_string(),
+                    (*old).to_string(),
+                    SystemRelationType::Supersedes,
+                    now,
+                )
+            })
+            .collect();
+        if let Err(e) = self.graph.create_system_edges_batch(&edges).await {
+            tracing::warn!("failed to create SUPERSEDES edge(s): {e}");
         }
 
-        Ok(serde_json::json!({
-            "success": true,
-            "superseded": old_hash,
-            "superseded_by": new_hash,
-            "reason": reason,
-        }))
+        Ok(())
     }
 
     // ─── Tool 7: memory_contradictions ──────────────────────────────────
@@ -1751,19 +1751,74 @@ impl MemoryService {
             }));
         }
 
-        let mut superseded = Vec::new();
-        let mut errors = Vec::new();
-
+        // Per-item validation first: a malformed or self-referential hash gets
+        // its own error entry and must not poison the batch existence check
+        // (get_batch rejects the whole call on any invalid hash).
+        let mut errors: Vec<Value> = Vec::new();
+        let mut candidates: Vec<&str> = Vec::new();
         for &dup_hash in duplicate_hashes {
+            if dup_hash == canonical_hash {
+                errors.push(serde_json::json!({
+                    "hash": dup_hash,
+                    "error": AlayaError::Validation(
+                        "old_hash and new_hash must differ".into()
+                    )
+                    .safe_message(),
+                }));
+            } else if !alaya_types::memory::validate_content_hash(dup_hash) {
+                errors.push(serde_json::json!({
+                    "hash": dup_hash,
+                    "error": AlayaError::Validation("invalid content_hash".into())
+                        .safe_message(),
+                }));
+            } else {
+                candidates.push(dup_hash);
+            }
+        }
+
+        // One batch GET replaces N per-duplicate existence checks.
+        let mut to_supersede: Vec<&str> = Vec::new();
+        if !candidates.is_empty() {
+            let existing: std::collections::HashSet<String> = self
+                .vectors
+                .get_batch(&candidates)
+                .await?
+                .into_iter()
+                .map(|m| m.content_hash)
+                .collect();
+            for &dup_hash in &candidates {
+                if existing.contains(dup_hash) {
+                    to_supersede.push(dup_hash);
+                } else {
+                    errors.push(serde_json::json!({
+                        "hash": dup_hash,
+                        "error": AlayaError::Validation(format!(
+                            "old memory not found: {dup_hash}"
+                        ))
+                        .safe_message(),
+                    }));
+                }
+            }
+        }
+
+        // One batched metadata update + one batched edge write for the whole
+        // set — same audit trail per memory as a per-duplicate supersede.
+        let mut superseded: Vec<String> = Vec::new();
+        if !to_supersede.is_empty() {
             match self
-                .supersede_inner(dup_hash, canonical_hash, reason, false)
+                .mark_superseded(&to_supersede, canonical_hash, reason)
                 .await
             {
-                Ok(_) => superseded.push(dup_hash.to_string()),
-                Err(e) => errors.push(serde_json::json!({
-                    "hash": dup_hash,
-                    "error": e.safe_message(),
-                })),
+                Ok(()) => superseded.extend(to_supersede.iter().map(|s| s.to_string())),
+                Err(e) => {
+                    let msg = e.safe_message();
+                    for &dup_hash in &to_supersede {
+                        errors.push(serde_json::json!({
+                            "hash": dup_hash,
+                            "error": msg,
+                        }));
+                    }
+                }
             }
         }
 
@@ -3576,7 +3631,7 @@ mod tests {
             result_hashes.contains(&neighbor_hash.as_str()),
             "Graph-activated neighbor should be injected into search results.\n\
              Expected neighbor hash {} to be in results, but got: {:?}",
-            &neighbor_hash,
+            neighbor_hash,
             result_hashes,
         );
     }
@@ -3937,6 +3992,423 @@ mod tests {
             .collect();
 
         assert_eq!(result_hashes.first(), Some(&hash_a.as_str()));
+    }
+
+    // ─── Mock backends for merge_duplicates batch tests ──────────────────
+
+    /// Shared recording state: seeded memories in, backend calls out.
+    #[derive(Default)]
+    struct MergeRecorder {
+        memories: RefCell<HashMap<String, Memory>>,
+        /// Each update_metadata_batch call: (hashes, update).
+        updates: RefCell<Vec<(Vec<String>, MetadataUpdate)>>,
+        /// Each system edge from create_system_edges_batch: (src, dst).
+        system_edges: RefCell<Vec<(String, String)>>,
+        get_by_hash_calls: Cell<usize>,
+        get_batch_calls: Cell<usize>,
+        update_batch_calls: Cell<usize>,
+        single_update_calls: Cell<usize>,
+        single_edge_calls: Cell<usize>,
+        edge_batch_calls: Cell<usize>,
+        fail_update: Cell<bool>,
+    }
+
+    impl MergeRecorder {
+        fn seed(&self, hashes: &[&str]) {
+            let mut mems = self.memories.borrow_mut();
+            for h in hashes {
+                let mut m = dummy_memory();
+                m.content_hash = (*h).to_string();
+                mems.insert((*h).to_string(), m);
+            }
+        }
+    }
+
+    struct MergeVectors(Rc<MergeRecorder>);
+
+    #[async_trait(?Send)]
+    impl VectorStorage for MergeVectors {
+        async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+            Ok((true, "mock".into()))
+        }
+        async fn get_by_hash(&self, h: &str) -> Result<Option<Memory>> {
+            self.0
+                .get_by_hash_calls
+                .set(self.0.get_by_hash_calls.get() + 1);
+            Ok(self.0.memories.borrow().get(h).cloned())
+        }
+        async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>> {
+            self.0.get_batch_calls.set(self.0.get_batch_calls.get() + 1);
+            let mems = self.0.memories.borrow();
+            Ok(hashes
+                .iter()
+                .filter_map(|h| mems.get(*h).cloned())
+                .collect())
+        }
+        async fn delete(&self, _h: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn update_metadata(&self, _h: &str, _u: MetadataUpdate) -> Result<()> {
+            self.0
+                .single_update_calls
+                .set(self.0.single_update_calls.get() + 1);
+            Ok(())
+        }
+        async fn update_metadata_batch(
+            &self,
+            hashes: &[&str],
+            updates: MetadataUpdate,
+        ) -> Result<()> {
+            self.0
+                .update_batch_calls
+                .set(self.0.update_batch_calls.get() + 1);
+            if self.0.fail_update.get() {
+                return Err(AlayaError::Storage("mock update failure".into()));
+            }
+            self.0
+                .updates
+                .borrow_mut()
+                .push((hashes.iter().map(|h| h.to_string()).collect(), updates));
+            Ok(())
+        }
+        async fn patch_memory(&self, _h: &str, _p: &PatchMemoryRequest) -> Result<Memory> {
+            Err(AlayaError::NotFound("mock".into()))
+        }
+        async fn search_by_vector(
+            &self,
+            _e: &[f32],
+            _l: usize,
+            _f: Option<PayloadFilter>,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(vec![])
+        }
+        async fn search_by_tags(
+            &self,
+            _t: &[&str],
+            _m: bool,
+            _l: usize,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(vec![])
+        }
+        async fn search_similar_tags(&self, _e: &[f32], _l: usize) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
+            Ok(())
+        }
+        async fn get_all(&self, _l: usize, _o: Option<&str>) -> Result<ScrollResult> {
+            Ok(ScrollResult {
+                memories: vec![],
+                next_offset: None,
+            })
+        }
+        async fn get_recent(
+            &self,
+            _l: usize,
+            _s: Option<f64>,
+            _t: Option<&str>,
+        ) -> Result<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn count(&self) -> Result<usize> {
+            Ok(0)
+        }
+        async fn get_all_tags(&self) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn increment_access_count(&self, _h: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            Ok(HealthStatus {
+                status: "ok".into(),
+                backend: "mock".into(),
+                details: None,
+            })
+        }
+    }
+
+    struct MergeGraph(Rc<MergeRecorder>);
+
+    #[async_trait(?Send)]
+    impl GraphService for MergeGraph {
+        async fn ensure_node(&self, _h: &str, _t: f64) -> Result<()> {
+            Ok(())
+        }
+        async fn delete_node(&self, _h: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn create_typed_edge(
+            &self,
+            _s: &str,
+            _d: &str,
+            _r: UserRelationType,
+            _m: EdgeMeta,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+        async fn get_typed_edges(
+            &self,
+            _h: &str,
+            _r: Option<UserRelationType>,
+            _d: Direction,
+            _l: usize,
+        ) -> Result<Vec<Edge>> {
+            Ok(vec![])
+        }
+        async fn delete_typed_edge(
+            &self,
+            _s: &str,
+            _d: &str,
+            _r: UserRelationType,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+        async fn create_system_edge(
+            &self,
+            _s: &str,
+            _d: &str,
+            _r: SystemRelationType,
+            _t: f64,
+        ) -> Result<bool> {
+            self.0
+                .single_edge_calls
+                .set(self.0.single_edge_calls.get() + 1);
+            Ok(true)
+        }
+        async fn create_system_edges_batch(
+            &self,
+            edges: &[(String, String, SystemRelationType, f64)],
+        ) -> Result<usize> {
+            self.0
+                .edge_batch_calls
+                .set(self.0.edge_batch_calls.get() + 1);
+            let mut recorded = self.0.system_edges.borrow_mut();
+            for (src, dst, rel, _ts) in edges {
+                assert_eq!(*rel, SystemRelationType::Supersedes);
+                recorded.push((src.clone(), dst.clone()));
+            }
+            Ok(edges.len())
+        }
+        async fn get_all_contradictions(&self, _l: usize) -> Result<Vec<Contradiction>> {
+            Ok(vec![])
+        }
+        async fn get_contradictions_for_hashes(
+            &self,
+            _h: &[&str],
+        ) -> Result<HashMap<String, Vec<ContradictionRef>>> {
+            Ok(HashMap::new())
+        }
+        async fn get_neighbors(
+            &self,
+            _h: &str,
+            _m: u8,
+            _w: f64,
+            _l: usize,
+        ) -> Result<Vec<Neighbor>> {
+            Ok(vec![])
+        }
+        async fn spreading_activation(
+            &self,
+            _s: &[&str],
+            _m: u8,
+            _d: f64,
+            _a: f64,
+            _l: usize,
+        ) -> Result<HashMap<String, f64>> {
+            Ok(HashMap::new())
+        }
+        async fn hebbian_boosts_within(&self, _h: &[&str]) -> Result<HashMap<String, f64>> {
+            Ok(HashMap::new())
+        }
+        async fn get_stats(&self) -> Result<GraphStats> {
+            Ok(GraphStats {
+                graph_name: "mock".into(),
+                node_count: 0,
+                edge_count: 0,
+                hebbian_edge_count: 0,
+                typed_edge_counts: HashMap::new(),
+                status: "ok".into(),
+            })
+        }
+    }
+
+    fn build_merge_service() -> (MemoryService, Rc<MergeRecorder>) {
+        let rec = Rc::new(MergeRecorder::default());
+        let svc = MemoryService::new(
+            Box::new(MergeVectors(rec.clone())),
+            Box::new(MockEmbeddings),
+            Box::new(MergeGraph(rec.clone())),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        );
+        (svc, rec)
+    }
+
+    /// Result parity + batching (alaya#6): merging N duplicates must produce
+    /// the exact per-memory audit trail the per-duplicate implementation
+    /// produced — superseded_by = canonical, supersession_reason = reason,
+    /// SUPERSEDES edge canonical→duplicate — while issuing a constant number
+    /// of backend calls instead of 4 per duplicate.
+    #[tokio::test(flavor = "current_thread")]
+    async fn merge_duplicates_batches_backend_calls_with_result_parity() {
+        let canonical = "c".repeat(64);
+        let d1 = "1".repeat(64);
+        let d2 = "2".repeat(64);
+        let d3 = "3".repeat(64);
+
+        let (svc, rec) = build_merge_service();
+        rec.seed(&[&canonical, &d1, &d2, &d3]);
+
+        let result = svc
+            .merge_duplicates(&canonical, &[&d1, &d2, &d3], "dedup test", false)
+            .await
+            .expect("merge succeeds");
+
+        // Result JSON parity with the per-duplicate implementation
+        assert_eq!(result["success"], serde_json::json!(true));
+        assert_eq!(result["canonical_hash"], serde_json::json!(canonical));
+        assert_eq!(result["superseded"], serde_json::json!([d1, d2, d3]));
+        assert_eq!(result["errors"], serde_json::json!([]));
+
+        // Call counts: 1 canonical check + 1 batch GET + 1 batch update +
+        // 1 batch edge write. No per-duplicate fallbacks.
+        assert_eq!(rec.get_by_hash_calls.get(), 1, "canonical checked once");
+        assert_eq!(rec.get_batch_calls.get(), 1, "one batch existence check");
+        assert_eq!(rec.update_batch_calls.get(), 1, "one batch metadata update");
+        assert_eq!(rec.single_update_calls.get(), 0, "no per-item updates");
+        assert_eq!(rec.edge_batch_calls.get(), 1, "one batch edge write");
+        assert_eq!(rec.single_edge_calls.get(), 0, "no per-item edge writes");
+
+        // Audit trail parity: same fields a single supersede writes
+        let updates = rec.updates.borrow();
+        let (hashes, update) = &updates[0];
+        assert_eq!(hashes, &[d1.clone(), d2.clone(), d3.clone()]);
+        assert_eq!(update.superseded_by.as_deref(), Some(canonical.as_str()));
+        let extra = update.extra.as_ref().expect("supersession_reason present");
+        assert_eq!(
+            extra["supersession_reason"],
+            serde_json::json!("dedup test")
+        );
+
+        // SUPERSEDES edges: canonical → each duplicate
+        let edges = rec.system_edges.borrow();
+        assert_eq!(
+            *edges,
+            vec![
+                (canonical.clone(), d1.clone()),
+                (canonical.clone(), d2.clone()),
+                (canonical.clone(), d3.clone()),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn merge_duplicates_reports_per_item_errors() {
+        let canonical = "c".repeat(64);
+        let d1 = "1".repeat(64);
+        let missing = "e".repeat(64);
+
+        let (svc, rec) = build_merge_service();
+        rec.seed(&[&canonical, &d1]);
+
+        let result = svc
+            .merge_duplicates(
+                &canonical,
+                &[&d1, &missing, &canonical, "not-a-hash"],
+                "dedup",
+                false,
+            )
+            .await
+            .expect("merge returns per-item errors, not a top-level failure");
+
+        assert_eq!(result["success"], serde_json::json!(false));
+        assert_eq!(result["superseded"], serde_json::json!([d1]));
+
+        let errors = result["errors"].as_array().expect("errors array");
+        let error_hashes: Vec<&str> = errors.iter().filter_map(|e| e["hash"].as_str()).collect();
+        assert!(
+            error_hashes.contains(&missing.as_str()),
+            "missing dup errored"
+        );
+        assert!(
+            error_hashes.contains(&canonical.as_str()),
+            "self-referential dup errored"
+        );
+        assert!(
+            error_hashes.contains(&"not-a-hash"),
+            "malformed hash errored"
+        );
+
+        // The valid duplicate still got the full audit trail
+        assert_eq!(rec.updates.borrow()[0].0, vec![d1.clone()]);
+        assert_eq!(*rec.system_edges.borrow(), vec![(canonical, d1)]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn merge_duplicates_update_failure_marks_all_pending_as_errors() {
+        let canonical = "c".repeat(64);
+        let d1 = "1".repeat(64);
+        let d2 = "2".repeat(64);
+
+        let (svc, rec) = build_merge_service();
+        rec.seed(&[&canonical, &d1, &d2]);
+        rec.fail_update.set(true);
+
+        let result = svc
+            .merge_duplicates(&canonical, &[&d1, &d2], "dedup", false)
+            .await
+            .expect("backend failure becomes per-item errors");
+
+        assert_eq!(result["success"], serde_json::json!(false));
+        assert_eq!(result["superseded"], serde_json::json!([] as [&str; 0]));
+        assert_eq!(result["errors"].as_array().unwrap().len(), 2);
+        // No edges when the metadata commit failed
+        assert!(rec.system_edges.borrow().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn merge_duplicates_dry_run_writes_nothing() {
+        let canonical = "c".repeat(64);
+        let d1 = "1".repeat(64);
+
+        let (svc, rec) = build_merge_service();
+        rec.seed(&[&canonical, &d1]);
+
+        let result = svc
+            .merge_duplicates(&canonical, &[&d1], "dedup", true)
+            .await
+            .expect("dry run succeeds");
+
+        assert_eq!(result["dry_run"], serde_json::json!(true));
+        assert_eq!(rec.update_batch_calls.get(), 0);
+        assert_eq!(rec.edge_batch_calls.get(), 0);
+        assert_eq!(rec.get_batch_calls.get(), 0, "dry run skips batch GET");
+    }
+
+    /// memory_supersede routes through the same batched write path.
+    #[tokio::test(flavor = "current_thread")]
+    async fn memory_supersede_writes_audit_trail_via_batch_path() {
+        let old = "0".repeat(64);
+        let new = "f".repeat(64);
+
+        let (svc, rec) = build_merge_service();
+        rec.seed(&[&old, &new]);
+
+        let result = svc
+            .memory_supersede(&old, &new, "corrected")
+            .await
+            .expect("supersede succeeds");
+
+        assert_eq!(result["success"], serde_json::json!(true));
+        assert_eq!(result["superseded"], serde_json::json!(old));
+        assert_eq!(result["superseded_by"], serde_json::json!(new));
+
+        let updates = rec.updates.borrow();
+        assert_eq!(updates[0].0, vec![old.clone()]);
+        assert_eq!(updates[0].1.superseded_by.as_deref(), Some(new.as_str()));
+        assert_eq!(*rec.system_edges.borrow(), vec![(new, old)]);
     }
 
     // ─── Superseded filtering across search modes (issue #30) ───────────

@@ -114,3 +114,53 @@ async fn supersession_only_update_sends_single_scoped_write() {
     assert_eq!(only["key"], json!("metadata"));
     assert_eq!(only["payload"]["superseded_by"], json!("b".repeat(64)));
 }
+
+/// Batch supersede (alaya#6): N memories, same update → exactly 2 HTTP calls
+/// total (not 2N), each carrying all point ids, with the same aux-first /
+/// marker-last commit ordering as the single-point path.
+#[tokio::test]
+async fn batch_update_sends_two_writes_total_for_many_points() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(PAYLOAD_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ok"})))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let h1 = "1".repeat(64);
+    let h2 = "2".repeat(64);
+    let h3 = "3".repeat(64);
+    client_for(&server)
+        .update_metadata_batch(&[&h1, &h2, &h3], supersede_with_aux())
+        .await
+        .expect("both batch writes succeed");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "3 points must not cost 6 calls");
+
+    let first = body_of(&requests[0]);
+    assert!(first.get("key").is_none(), "aux write is unscoped");
+    assert_eq!(first["points"].as_array().unwrap().len(), 3);
+
+    let second = body_of(&requests[1]);
+    assert_eq!(second["key"], json!("metadata"));
+    assert_eq!(second["payload"]["superseded_by"], json!("b".repeat(64)));
+    assert_eq!(second["points"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn batch_update_empty_hashes_sends_nothing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(PAYLOAD_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ok"})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    client_for(&server)
+        .update_metadata_batch(&[], supersede_with_aux())
+        .await
+        .expect("empty batch is a no-op");
+}

@@ -122,6 +122,11 @@ struct BatchCreateEdgeReq<'a> {
 }
 
 #[derive(Serialize)]
+struct BatchCreateSystemEdgeReq<'a> {
+    edges: Vec<CreateSystemEdgeReq<'a>>,
+}
+
+#[derive(Serialize)]
 struct GetEdgesReq<'a> {
     content_hash: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -417,6 +422,37 @@ impl GraphService for GraphHttpClient {
             .map_err(|e| AlayaError::Graph(e.to_string()))?;
 
         let body: CreatedResp = handle_response(resp).await?;
+        Ok(body.created)
+    }
+
+    #[tracing::instrument(skip(self, edges), fields(n = edges.len()))]
+    async fn create_system_edges_batch(
+        &self,
+        edges: &[(String, String, SystemRelationType, f64)],
+    ) -> Result<usize> {
+        if edges.is_empty() {
+            return Ok(0);
+        }
+
+        let edge_reqs: Vec<CreateSystemEdgeReq<'_>> = edges
+            .iter()
+            .map(|(src, dst, rel, created_at)| CreateSystemEdgeReq {
+                source: src,
+                target: dst,
+                relation_type: rel.cypher_label(),
+                created_at: *created_at,
+            })
+            .collect();
+
+        let resp = self
+            .client
+            .post(format!("{}/edges/create-system-batch", self.base_url))
+            .json(&BatchCreateSystemEdgeReq { edges: edge_reqs })
+            .send()
+            .await
+            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+
+        let body: BatchCreatedResp = handle_response(resp).await?;
         Ok(body.created)
     }
 

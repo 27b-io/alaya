@@ -26,6 +26,23 @@ pub trait VectorStorage {
     async fn delete(&self, content_hash: &str) -> Result<bool>;
     async fn update_metadata(&self, content_hash: &str, updates: MetadataUpdate) -> Result<()>;
 
+    /// Apply the SAME metadata update to many memories.
+    ///
+    /// Default: sequential fallback via `update_metadata`. Implementations
+    /// may override with batched writes (e.g. one Qdrant set-payload call
+    /// covering all points) while preserving `update_metadata`'s
+    /// aux-fields-first / supersession-marker-last commit ordering.
+    async fn update_metadata_batch(
+        &self,
+        content_hashes: &[&str],
+        updates: MetadataUpdate,
+    ) -> Result<()> {
+        for hash in content_hashes {
+            self.update_metadata(hash, updates.clone()).await?;
+        }
+        Ok(())
+    }
+
     /// Patch mutable fields on an existing memory.
     ///
     /// Updates only the provided fields, sets `updated_at`, and returns the
@@ -124,6 +141,23 @@ pub trait GraphService {
         rel: SystemRelationType,
         created_at: f64,
     ) -> Result<bool>;
+
+    /// Batch-create system edges in a single round-trip.
+    ///
+    /// Default: sequential fallback via `create_system_edge`. Implementations
+    /// may override with a single HTTP POST to `/edges/create-system-batch`.
+    async fn create_system_edges_batch(
+        &self,
+        edges: &[(String, String, SystemRelationType, f64)],
+    ) -> Result<usize> {
+        let mut created = 0;
+        for (src, dst, rel, created_at) in edges {
+            if self.create_system_edge(src, dst, *rel, *created_at).await? {
+                created += 1;
+            }
+        }
+        Ok(created)
+    }
 
     // Contradiction queries
     async fn get_all_contradictions(&self, limit: usize) -> Result<Vec<Contradiction>>;

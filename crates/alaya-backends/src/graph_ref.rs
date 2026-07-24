@@ -68,6 +68,26 @@ macro_rules! impl_graph_service {
             ) -> alaya_types::Result<bool> {
                 self.0.create_system_edge(s, d, r, t).await
             }
+            // Batch methods MUST be delegated explicitly: a missing delegation
+            // silently falls back to the trait's sequential default, losing the
+            // single-round-trip bridge endpoint.
+            async fn create_typed_edges_batch(
+                &self,
+                e: &[(
+                    String,
+                    String,
+                    alaya_types::graph::UserRelationType,
+                    alaya_types::graph::EdgeMeta,
+                )],
+            ) -> alaya_types::Result<usize> {
+                self.0.create_typed_edges_batch(e).await
+            }
+            async fn create_system_edges_batch(
+                &self,
+                e: &[(String, String, alaya_types::graph::SystemRelationType, f64)],
+            ) -> alaya_types::Result<usize> {
+                self.0.create_system_edges_batch(e).await
+            }
             async fn get_all_contradictions(
                 &self,
                 l: usize,
