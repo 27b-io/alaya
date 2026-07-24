@@ -200,10 +200,14 @@ async fn init_l2_cache(
         .build()?;
     // Retry connection with backoff — at pod startup the CNI/kube-proxy may
     // not have finished installing network rules yet, causing ECONNREFUSED.
-    let mut last_err = None;
+    // Each attempt is deadline-bounded: cachekit 0.3 sets no fred connect
+    // timeout, and a blackholed target here would otherwise hang the worker
+    // thread before its command loop ever starts (#63).
+    let mut last_err: Option<String> = None;
     for attempt in 0..L2_MAX_ATTEMPTS {
-        match redis.connect().await {
-            Ok(handle) => {
+        let connected = tokio::time::timeout(std::time::Duration::from_secs(10), redis.connect());
+        let err_msg = match connected.await {
+            Ok(Ok(handle)) => {
                 drop(handle);
                 if attempt > 0 {
                     tracing::info!(attempt, "L2 cache connected after retry");
@@ -216,20 +220,20 @@ async fn init_l2_cache(
                     .no_l1()
                     .build()?);
             }
-            Err(e) => {
-                tracing::debug!(attempt, error = %e, "L2 cache connect attempt failed");
-                last_err = Some(e);
-                if attempt + 1 < L2_MAX_ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        L2_BASE_RETRY_MS * (1 << attempt),
-                    ))
-                    .await;
-                }
-            }
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => "connect timed out after 10s".to_string(),
+        };
+        tracing::debug!(attempt, error = %err_msg, "L2 cache connect attempt failed");
+        last_err = Some(err_msg);
+        if attempt + 1 < L2_MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                L2_BASE_RETRY_MS * (1 << attempt),
+            ))
+            .await;
         }
     }
     Err(last_err
-        .ok_or_else(|| "L2 cache init: no connection attempts made".to_string())?
+        .unwrap_or_else(|| "L2 cache init: no connection attempts made".to_string())
         .into())
 }
 
@@ -269,6 +273,34 @@ async fn ensure_qdrant_collection(qdrant: &QdrantClient, dimensions: usize) {
 
 const CMD_CHANNEL_CAP: usize = 256;
 
+// Wedge protection (#63): the worker serializes all ops through one channel,
+// so a single await that never resolves used to freeze the whole service —
+// invisibly, because /health bypasses the worker. Three layers fix that:
+// per-command deadlines (worker drops a stuck handler and keeps draining),
+// bounded reply awaits (callers get an error instead of an infinite hang),
+// and a progress watchdog (a worker stuck in a way timeouts can't preempt —
+// e.g. blocked in sync code — turns /health unhealthy so k8s restarts the pod).
+
+/// Per-command budget for inline ops in the worker. Generous — legit ops
+/// finish in seconds; only a stuck backend await ever gets here.
+const CMD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+/// Budget for spawned long-running scans (find/merge duplicates, backfill).
+const LONG_CMD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+/// Caller-side slack over the worker's own deadline (queue wait + scheduling).
+const REPLY_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+/// Worker is considered stalled when no command has completed for this long.
+/// Must exceed CMD_DEADLINE — a legit inline op may hold the loop that long.
+const WORKER_STALL_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(180);
+/// Pinger period — keeps worker progress fresh when the service is idle.
+const PING_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// A command sent from axum handlers to the MemoryService worker.
 /// Carries the caller's tracing span so service methods become children
 /// of the HTTP request span across the mpsc thread boundary.
@@ -278,6 +310,11 @@ pub(crate) struct Cmd {
 }
 
 pub(crate) enum CmdInner {
+    /// No-op round-trip proving the worker loop is draining. Sent by the
+    /// internal pinger (and tests) — not exposed over REST or MCP.
+    Ping {
+        reply: oneshot::Sender<Value>,
+    },
     Health {
         reply: oneshot::Sender<Value>,
     },
@@ -338,9 +375,23 @@ pub(crate) enum CmdInner {
     },
 }
 
+impl CmdInner {
+    /// Worker-side execution budget for this command. Callers add
+    /// REPLY_MARGIN on top when bounding their reply await.
+    fn deadline(&self) -> std::time::Duration {
+        match self {
+            CmdInner::FindDuplicates { .. }
+            | CmdInner::MergeDuplicates { .. }
+            | CmdInner::BackfillSummaries { .. } => LONG_CMD_DEADLINE,
+            _ => CMD_DEADLINE,
+        }
+    }
+}
+
 impl Cmd {
     fn op_name(&self) -> &'static str {
         match &self.inner {
+            CmdInner::Ping { .. } => "ping",
             CmdInner::Health { .. } => "health",
             CmdInner::Store { .. } => "store",
             CmdInner::Search { .. } => "search",
@@ -375,17 +426,47 @@ impl ServiceHandle {
         })
     }
 
-    async fn call(&self, inner: CmdInner, rx: oneshot::Receiver<Value>) -> Json<Value> {
-        let cmd = Cmd {
+    /// Dispatch a command and await its reply with a deadline. The bound is
+    /// the command's worker budget plus queue-wait margin — callers can never
+    /// hang unboundedly even if the worker itself is wedged (#63). Error tuple
+    /// carries a JSON-RPC code so the MCP path can use it directly.
+    pub(crate) async fn call_rpc(
+        &self,
+        inner: CmdInner,
+        rx: oneshot::Receiver<Value>,
+    ) -> Result<Value, (i32, String)> {
+        let op = Cmd {
             inner,
             span: tracing::Span::current(),
         };
-        if let Err((_code, msg)) = self.try_dispatch(cmd) {
-            return Json(json!({"error": msg}));
+        let op_name = op.op_name();
+        let reply_deadline = op.inner.deadline() + REPLY_MARGIN;
+        self.try_dispatch(op)?;
+        match tokio::time::timeout(reply_deadline, rx).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(_)) => Err((-32000, "service dropped response".to_string())),
+            Err(_) => {
+                tracing::error!(
+                    op = op_name,
+                    deadline_s = reply_deadline.as_secs(),
+                    "no reply from service worker within deadline — worker may be wedged"
+                );
+                Err((
+                    -32000,
+                    format!(
+                        "service did not respond within {}s; the operation may still \
+                         complete in the background",
+                        reply_deadline.as_secs()
+                    ),
+                ))
+            }
         }
-        match rx.await {
+    }
+
+    async fn call(&self, inner: CmdInner, rx: oneshot::Receiver<Value>) -> Json<Value> {
+        match self.call_rpc(inner, rx).await {
             Ok(v) => Json(v),
-            Err(_) => Json(json!({"error": "service dropped response"})),
+            Err((_code, msg)) => Json(json!({"error": msg})),
         }
     }
 }
@@ -393,6 +474,13 @@ impl ServiceHandle {
 /// Direct health checker — bypasses the service worker channel so health
 /// probes don't queue behind long-running operations (find_duplicates, etc).
 /// Uses its own reqwest::Client (Clone + Send + Sync) on the axum runtime.
+///
+/// Bypassing the worker made a wedged worker invisible to k8s (#63), so the
+/// checker also watches `worker_progress` — the epoch-seconds of the last
+/// command the worker completed (pings keep it fresh when idle). Stale
+/// progress means the loop stopped draining: status goes `unhealthy` and
+/// /health returns 503 so a liveness probe restarts the pod. Backend outages
+/// stay `degraded` (200) — restarting this pod doesn't fix Qdrant.
 #[derive(Clone)]
 struct HealthChecker {
     client: reqwest::Client,
@@ -400,10 +488,12 @@ struct HealthChecker {
     collection: String,
     graph_url: String,
     graph_api_key: String,
+    worker_progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stall_threshold: std::time::Duration,
 }
 
 impl HealthChecker {
-    fn new(config: &Config) -> Self {
+    fn new(config: &Config, worker_progress: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(ref key) = config.qdrant_api_key
             && let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
@@ -424,6 +514,8 @@ impl HealthChecker {
             collection: config.qdrant_collection.clone(),
             graph_url: config.graph_url.clone(),
             graph_api_key: config.graph_api_key.clone(),
+            worker_progress,
+            stall_threshold: WORKER_STALL_THRESHOLD,
         }
     }
 
@@ -434,19 +526,39 @@ impl HealthChecker {
         let (qdrant_health, graph_health, count) =
             tokio::join!(self.check_qdrant(), self.check_graph(), self.check_count(),);
 
-        let status = if qdrant_health.is_ok() {
+        let progress_age = epoch_secs().saturating_sub(
+            self.worker_progress
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let worker_stalled = progress_age > self.stall_threshold.as_secs();
+
+        let status = if worker_stalled {
+            "unhealthy"
+        } else if qdrant_health.is_ok() {
             "healthy"
         } else {
             "degraded"
         };
 
         let elapsed = start.elapsed().as_millis();
-        tracing::debug!(op = "health", elapsed_ms = elapsed, status, "ok (direct)");
+        if worker_stalled {
+            tracing::error!(
+                progress_age_s = progress_age,
+                threshold_s = self.stall_threshold.as_secs(),
+                "service worker stalled — reporting unhealthy so the pod gets restarted"
+            );
+        } else {
+            tracing::debug!(op = "health", elapsed_ms = elapsed, status, "ok (direct)");
+        }
 
         json!({
             "status": status,
             "version": option_env!("ALAYA_GIT_SHA").unwrap_or("dev"),
             "backend": "qdrant",
+            "worker": {
+                "stalled": worker_stalled,
+                "last_progress_age_s": progress_age,
+            },
             "vector_health": match qdrant_health {
                 Ok(v) => v,
                 Err(e) => json!({"status": "unhealthy", "error": e}),
@@ -531,12 +643,55 @@ impl HealthChecker {
 
 // ─── Service worker ─────────────────────────────────────────────────────────
 
+/// Deadlines the worker applies per command. A struct only so tests can
+/// shrink them — production always uses `Default` (the consts above).
+struct WorkerLimits {
+    cmd: std::time::Duration,
+    long: std::time::Duration,
+}
+
+impl Default for WorkerLimits {
+    fn default() -> Self {
+        Self {
+            cmd: CMD_DEADLINE,
+            long: LONG_CMD_DEADLINE,
+        }
+    }
+}
+
+/// Reply for a command whose handler blew its deadline. The worker drops the
+/// in-flight future (cancelling its awaits) and keeps draining the queue —
+/// one stuck backend await must never wedge the service (#63).
+fn deadline_exceeded(op: &str, deadline: std::time::Duration, start: std::time::Instant) -> Value {
+    tracing::error!(
+        op,
+        deadline_s = deadline.as_secs(),
+        elapsed_ms = ms(start),
+        "command deadline exceeded — dropping handler, worker continues"
+    );
+    json!({
+        "success": false,
+        "error": format!("{op} timed out after {}s", deadline.as_secs()),
+        "error_kind": "timeout",
+    })
+}
+
 /// Runs MemoryService on a LocalSet, processing commands from the channel.
 ///
 /// Wraps the service in `Rc` so long-running operations (find_duplicates,
 /// merge_duplicates) can be spawned as local tasks without blocking the
 /// command loop. Other commands continue processing while they run.
-async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
+///
+/// Every handler await is bounded by `limits` (#63), and `progress` is
+/// stamped after each command so the health watchdog can tell a draining
+/// worker from a wedged one.
+async fn service_worker(
+    mut rx: mpsc::Receiver<Cmd>,
+    svc: MemoryService,
+    progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    limits: WorkerLimits,
+) {
+    use tokio::time::timeout;
     use tracing::Instrument;
 
     let svc = std::rc::Rc::new(svc);
@@ -547,18 +702,23 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
         let ps = cmd.span;
 
         match cmd.inner {
+            CmdInner::Ping { reply } => {
+                let _ = reply.send(json!({"ok": true}));
+            }
             CmdInner::Health { reply } => {
                 let span = tracing::info_span!(parent: &ps, "health");
-                let result = match svc.check_database_health().instrument(span).await {
-                    Ok(r) => {
-                        tracing::debug!(op, elapsed_ms = ms(start), "ok");
-                        json!(r)
-                    }
-                    Err(e) => {
-                        log_err(op, &e, start);
-                        json!({"status": "error", "message": e.safe_message()})
-                    }
-                };
+                let result =
+                    match timeout(limits.cmd, svc.check_database_health().instrument(span)).await {
+                        Ok(Ok(r)) => {
+                            tracing::debug!(op, elapsed_ms = ms(start), "ok");
+                            json!(r)
+                        }
+                        Ok(Err(e)) => {
+                            log_err(op, &e, start);
+                            json!({"status": "error", "message": e.safe_message()})
+                        }
+                        Err(_) => deadline_exceeded(op, limits.cmd, start),
+                    };
                 let _ = reply.send(result);
             }
             CmdInner::Store {
@@ -585,12 +745,13 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
 
                 let span = tracing::info_span!(parent: &ps, "store",
                     content_len, %mem_type, read_only);
-                let result = match svc
-                    .store_memory_with(params, read_only)
-                    .instrument(span)
-                    .await
+                let result = match timeout(
+                    limits.cmd,
+                    svc.store_memory_with(params, read_only).instrument(span),
+                )
+                .await
                 {
-                    Ok(r) => {
+                    Ok(Ok(r)) => {
                         let hash = r
                             .get("content_hash")
                             .and_then(|v| v.as_str())
@@ -627,10 +788,11 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
 
                         json!(r)
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         log_err(op, &e, start);
                         json!({"success": false, "error": e.safe_message()})
                     }
+                    Err(_) => deadline_exceeded(op, limits.cmd, start),
                 };
                 let _ = reply.send(result);
             }
@@ -646,8 +808,13 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 let tag_count = params.tags.as_ref().map(|t| t.len()).unwrap_or(0);
                 let mem_type = params.memory_type.clone().unwrap_or_default();
                 let span = tracing::info_span!(parent: &ps, "search", %mode, read_only);
-                let result = match svc.search_with(params, read_only).instrument(span).await {
-                    Ok(r) => {
+                let result = match timeout(
+                    limits.cmd,
+                    svc.search_with(params, read_only).instrument(span),
+                )
+                .await
+                {
+                    Ok(Ok(r)) => {
                         let n = result_count(&r);
                         let has_more = r.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
                         tracing::info!(
@@ -665,26 +832,29 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                         );
                         r
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         log_err(op, &e, start);
                         json!({"error": e.safe_message()})
                     }
+                    Err(_) => deadline_exceeded(op, limits.cmd, start),
                 };
                 let _ = reply.send(result);
             }
             CmdInner::Delete { hash, reply } => {
                 let span = tracing::info_span!(parent: &ps, "delete");
                 let h = truncate_hash(&hash);
-                let result = match svc.delete_memory(&hash).instrument(span).await {
-                    Ok(r) => {
-                        tracing::info!(op, hash = h.as_str(), elapsed_ms = ms(start), "ok");
-                        json!(r)
-                    }
-                    Err(e) => {
-                        log_err(op, &e, start);
-                        json!({"success": false, "error": e.safe_message()})
-                    }
-                };
+                let result =
+                    match timeout(limits.cmd, svc.delete_memory(&hash).instrument(span)).await {
+                        Ok(Ok(r)) => {
+                            tracing::info!(op, hash = h.as_str(), elapsed_ms = ms(start), "ok");
+                            json!(r)
+                        }
+                        Ok(Err(e)) => {
+                            log_err(op, &e, start);
+                            json!({"success": false, "error": e.safe_message()})
+                        }
+                        Err(_) => deadline_exceeded(op, limits.cmd, start),
+                    };
                 let _ = reply.send(result);
             }
             CmdInner::GetMemory {
@@ -694,17 +864,26 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
             } => {
                 let span = tracing::info_span!(parent: &ps, "get_memory");
                 let h = truncate_hash(&hash);
-                let result = match svc.get_memory(&hash, output).instrument(span).await {
-                    Ok(r) => {
-                        let found = r.get("found").and_then(|f| f.as_bool()).unwrap_or(false);
-                        tracing::info!(op, hash = h.as_str(), found, elapsed_ms = ms(start), "ok");
-                        r
-                    }
-                    Err(e) => {
-                        log_err(op, &e, start);
-                        json!({"error": e.safe_message()})
-                    }
-                };
+                let result =
+                    match timeout(limits.cmd, svc.get_memory(&hash, output).instrument(span)).await
+                    {
+                        Ok(Ok(r)) => {
+                            let found = r.get("found").and_then(|f| f.as_bool()).unwrap_or(false);
+                            tracing::info!(
+                                op,
+                                hash = h.as_str(),
+                                found,
+                                elapsed_ms = ms(start),
+                                "ok"
+                            );
+                            r
+                        }
+                        Ok(Err(e)) => {
+                            log_err(op, &e, start);
+                            json!({"error": e.safe_message()})
+                        }
+                        Err(_) => deadline_exceeded(op, limits.cmd, start),
+                    };
                 let _ = reply.send(result);
             }
             CmdInner::Relation { params, reply } => {
@@ -717,8 +896,9 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                     .unwrap_or_default();
                 let rel_type = params.relation_type.clone().unwrap_or_default();
                 let span = tracing::info_span!(parent: &ps, "relation", %action);
-                let result = match svc.relation(params).instrument(span).await {
-                    Ok(r) => {
+                let result = match timeout(limits.cmd, svc.relation(params).instrument(span)).await
+                {
+                    Ok(Ok(r)) => {
                         tracing::info!(
                             op,
                             action = action.as_str(),
@@ -730,10 +910,11 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                         );
                         r
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         log_err(op, &e, start);
                         json!({"success": false, "error": e.safe_message()})
                     }
+                    Err(_) => deadline_exceeded(op, limits.cmd, start),
                 };
                 let _ = reply.send(result);
             }
@@ -747,12 +928,14 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 let old_h = truncate_hash(&old_hash);
                 let new_h = truncate_hash(&new_hash);
                 let reason_preview = truncate(&reason, 60);
-                let result = match svc
-                    .memory_supersede(&old_hash, &new_hash, &reason)
-                    .instrument(span)
-                    .await
+                let result = match timeout(
+                    limits.cmd,
+                    svc.memory_supersede(&old_hash, &new_hash, &reason)
+                        .instrument(span),
+                )
+                .await
                 {
-                    Ok(r) => {
+                    Ok(Ok(r)) => {
                         tracing::info!(
                             op,
                             old = old_h.as_str(),
@@ -763,7 +946,7 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                         );
                         r
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::error!(
                             op,
                             error = %e,
@@ -776,13 +959,19 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                         );
                         json!({"success": false, "error": e.safe_message()})
                     }
+                    Err(_) => deadline_exceeded(op, limits.cmd, start),
                 };
                 let _ = reply.send(result);
             }
             CmdInner::Contradictions { limit, reply } => {
                 let span = tracing::info_span!(parent: &ps, "contradictions");
-                let result = match svc.memory_contradictions(limit).instrument(span).await {
-                    Ok(r) => {
+                let result = match timeout(
+                    limits.cmd,
+                    svc.memory_contradictions(limit).instrument(span),
+                )
+                .await
+                {
+                    Ok(Ok(r)) => {
                         let pairs = r
                             .get("contradictions")
                             .and_then(|v| v.as_array())
@@ -791,10 +980,11 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                         tracing::info!(op, limit, pairs, elapsed_ms = ms(start), "ok");
                         r
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         log_err(op, &e, start);
                         json!({"success": false, "error": e.safe_message()})
                     }
+                    Err(_) => deadline_exceeded(op, limits.cmd, start),
                 };
                 let _ = reply.send(result);
             }
@@ -802,29 +992,33 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 let span = tracing::info_span!(parent: &ps, "patch");
                 let h = truncate_hash(&hash);
                 let fields = patch.changed_fields();
-                let result = match svc.patch_memory(&hash, &patch).instrument(span).await {
-                    Ok(mem) => {
-                        tracing::info!(
-                            op,
-                            hash = h.as_str(),
-                            fields = fields.as_str(),
-                            elapsed_ms = ms(start),
-                            "ok"
-                        );
-                        json!(mem)
-                    }
-                    Err(e) => {
-                        log_err(op, &e, start);
-                        json!({
-                            "error": e.safe_message(),
-                            "error_kind": match &e {
-                                alaya_types::AlayaError::NotFound(_) => "not_found",
-                                alaya_types::AlayaError::Validation(_) => "validation",
-                                _ => "internal",
-                            }
-                        })
-                    }
-                };
+                let result =
+                    match timeout(limits.cmd, svc.patch_memory(&hash, &patch).instrument(span))
+                        .await
+                    {
+                        Ok(Ok(mem)) => {
+                            tracing::info!(
+                                op,
+                                hash = h.as_str(),
+                                fields = fields.as_str(),
+                                elapsed_ms = ms(start),
+                                "ok"
+                            );
+                            json!(mem)
+                        }
+                        Ok(Err(e)) => {
+                            log_err(op, &e, start);
+                            json!({
+                                "error": e.safe_message(),
+                                "error_kind": match &e {
+                                    alaya_types::AlayaError::NotFound(_) => "not_found",
+                                    alaya_types::AlayaError::Validation(_) => "validation",
+                                    _ => "internal",
+                                }
+                            })
+                        }
+                        Err(_) => deadline_exceeded(op, limits.cmd, start),
+                    };
                 let _ = reply.send(result);
             }
 
@@ -838,10 +1032,16 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 let strat_name = format!("{strategy:?}").to_lowercase();
                 let span = tracing::info_span!(parent: &ps, "find_duplicates");
                 let svc = svc.clone();
+                let deadline = limits.long;
                 tokio::task::spawn_local(
                     async move {
-                        let result = match svc.find_duplicates(threshold, limit, strategy).await {
-                            Ok(r) => {
+                        let result = match timeout(
+                            deadline,
+                            svc.find_duplicates(threshold, limit, strategy),
+                        )
+                        .await
+                        {
+                            Ok(Ok(r)) => {
                                 let n = r
                                     .get("total_duplicates_found")
                                     .and_then(|v| v.as_u64())
@@ -865,10 +1065,11 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                                 );
                                 r
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 log_err(op, &e, start);
                                 json!({"success": false, "error": e.safe_message()})
                             }
+                            Err(_) => deadline_exceeded(op, deadline, start),
                         };
                         let _ = reply.send(result);
                     }
@@ -886,14 +1087,17 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 let svc = svc.clone();
                 let dup_count = duplicates.len();
                 let canonical_h = truncate_hash(&canonical);
+                let deadline = limits.long;
                 tokio::task::spawn_local(
                     async move {
                         let refs: Vec<&str> = duplicates.iter().map(|s| s.as_str()).collect();
-                        let result = match svc
-                            .merge_duplicates(&canonical, &refs, &reason, dry_run)
-                            .await
+                        let result = match timeout(
+                            deadline,
+                            svc.merge_duplicates(&canonical, &refs, &reason, dry_run),
+                        )
+                        .await
                         {
-                            Ok(r) => {
+                            Ok(Ok(r)) => {
                                 tracing::info!(
                                     op,
                                     canonical = canonical_h.as_str(),
@@ -904,10 +1108,11 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                                 );
                                 r
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 log_err(op, &e, start);
                                 json!({"success": false, "error": e.safe_message()})
                             }
+                            Err(_) => deadline_exceeded(op, deadline, start),
                         };
                         let _ = reply.send(result);
                     }
@@ -965,6 +1170,10 @@ async fn service_worker(mut rx: mpsc::Receiver<Cmd>, svc: MemoryService) {
                 );
             }
         }
+
+        // Watchdog heartbeat: the loop just finished (or spawned) a command.
+        // Stops advancing exactly when the worker stops draining.
+        progress.store(epoch_secs(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1116,6 +1325,11 @@ fn main() {
 
         let (tx, rx) = mpsc::channel::<Cmd>(CMD_CHANNEL_CAP);
 
+        // Watchdog heartbeat: epoch-seconds of the worker's last completed
+        // command. Written by the worker loop, read by the health checker.
+        let worker_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(epoch_secs()));
+        let progress_for_worker = worker_progress.clone();
+
         // Spawn MemoryService on a dedicated thread with LocalSet
         let cfg_clone = config.clone();
 
@@ -1213,7 +1427,7 @@ fn main() {
                     tracing::info!("RERANK_URL not set — cross-encoder rerank disabled");
                 }
 
-                service_worker(rx, svc).await;
+                service_worker(rx, svc, progress_for_worker, WorkerLimits::default()).await;
             });
         });
 
@@ -1226,7 +1440,29 @@ fn main() {
         // Health checker bypasses the service worker channel entirely —
         // runs directly on the multi-threaded axum runtime with its own
         // reqwest::Client. Prevents health probe timeouts during long ops.
-        let checker = HealthChecker::new(&config);
+        // The worker_progress watchdog covers the blind spot that bypass
+        // created (#63): a wedged worker now turns /health unhealthy (503).
+        let checker = HealthChecker::new(&config, worker_progress);
+
+        // Pinger: sends a no-op Ping through the worker channel so progress
+        // stays fresh while idle. try_send on purpose — if the channel is
+        // full, real commands are keeping (or failing to keep) progress
+        // fresh, which is exactly what the watchdog should observe.
+        let pinger = {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(PING_PERIOD);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    let (reply, _rx) = oneshot::channel();
+                    let _ = handle.tx.try_send(Cmd {
+                        inner: CmdInner::Ping { reply },
+                        span: tracing::Span::none(),
+                    });
+                }
+            })
+        };
 
         const MAX_BODY: usize = 1_048_576; // 1 MB — covers the /mcp Bytes extractor
 
@@ -1291,6 +1527,10 @@ fn main() {
             .await
             .expect("server error");
 
+        // The pinger holds a ServiceHandle clone — abort it or the worker's
+        // rx.recv() never sees the channel close and the drain below hangs.
+        pinger.abort();
+
         // axum returned — all in-flight requests done, router (and its
         // ServiceHandle/Sender clones) dropped. The worker's rx.recv()
         // will return None after processing any remaining queued commands.
@@ -1317,8 +1557,19 @@ async fn shutdown_signal() {
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
-async fn health(axum::extract::State(checker): axum::extract::State<HealthChecker>) -> Json<Value> {
-    Json(checker.check().await)
+/// `unhealthy` (wedged worker) returns 503 so an httpGet liveness probe
+/// restarts the pod; backend outages stay `degraded`/200 — a restart
+/// wouldn't fix those (#63).
+async fn health(
+    axum::extract::State(checker): axum::extract::State<HealthChecker>,
+) -> (StatusCode, Json<Value>) {
+    let v = checker.check().await;
+    let code = if v.get("status").and_then(|s| s.as_str()) == Some("unhealthy") {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (code, Json(v))
 }
 
 async fn store(
@@ -1518,34 +1769,32 @@ async fn patch_memory(
         return (StatusCode::BAD_REQUEST, Json(json!({"error": msg})));
     }
 
+    // call_rpc fast-fails on a full channel and bounds the reply await —
+    // this handler previously used a blocking send + unbounded await, both
+    // of which hang for as long as the worker does (#63).
     let (tx, rx) = oneshot::channel();
-    let cmd = Cmd {
-        inner: CmdInner::Patch {
-            hash: content_hash,
-            patch,
-            reply: tx,
-        },
-        span: tracing::Span::current(),
+    let v = match h
+        .call_rpc(
+            CmdInner::Patch {
+                hash: content_hash,
+                patch,
+                reply: tx,
+            },
+            rx,
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err((_code, msg)) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": msg})));
+        }
     };
 
-    if h.tx.send(cmd).await.is_err() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "service unavailable"})),
-        );
-    }
-
-    match rx.await {
-        Ok(v) => match v.get("error_kind").and_then(|k| k.as_str()) {
-            Some("not_found") => (StatusCode::NOT_FOUND, Json(v)),
-            Some("validation") => (StatusCode::BAD_REQUEST, Json(v)),
-            Some(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(v)),
-            None => (StatusCode::OK, Json(v)),
-        },
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "service dropped response"})),
-        ),
+    match v.get("error_kind").and_then(|k| k.as_str()) {
+        Some("not_found") => (StatusCode::NOT_FOUND, Json(v)),
+        Some("validation") => (StatusCode::BAD_REQUEST, Json(v)),
+        Some(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(v)),
+        None => (StatusCode::OK, Json(v)),
     }
 }
 
@@ -1567,29 +1816,23 @@ async fn get_memory(
         );
     }
 
+    // Non-blocking dispatch + bounded reply await — a full channel or a
+    // wedged worker fast-fails instead of hanging the HTTP request (#63).
     let (tx, rx) = oneshot::channel();
-    let cmd = Cmd {
-        inner: CmdInner::GetMemory {
-            hash: content_hash,
-            output: q.output,
-            reply: tx,
-        },
-        span: tracing::Span::current(),
-    };
-
-    // Non-blocking dispatch — a full command channel fast-fails instead of
-    // stalling the HTTP request behind the worker backlog.
-    if let Err((_code, msg)) = h.try_dispatch(cmd) {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": msg})));
-    }
-
-    let v = match rx.await {
+    let v = match h
+        .call_rpc(
+            CmdInner::GetMemory {
+                hash: content_hash,
+                output: q.output,
+                reply: tx,
+            },
+            rx,
+        )
+        .await
+    {
         Ok(v) => v,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "service dropped response"})),
-            );
+        Err((_code, msg)) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": msg})));
         }
     };
 
@@ -1664,5 +1907,350 @@ mod tests {
         // Public origins.
         assert!(!is_private_host("https://alaya.27b.io"));
         assert!(!is_private_host("https://example.com"));
+    }
+}
+
+/// Regression tests for #63: one stuck backend await must never wedge the
+/// service, and a wedged worker must be visible to the health check.
+#[cfg(test)]
+mod wedge_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+
+    use alaya_types::{
+        Result,
+        graph::{
+            CoAccessPair, Contradiction, ContradictionRef, Direction, Edge, EdgeMeta, GraphStats,
+            Neighbor, SystemRelationType, UserRelationType,
+        },
+        memory::{HealthStatus, Memory, MetadataUpdate, PatchMemoryRequest, ScrollResult},
+        search::{PayloadFilter, PromptName},
+    };
+
+    use super::*;
+    use alaya_backends::traits::{
+        ConsolidationService, EmbeddingProvider, GraphService, HebbianService, VectorStorage,
+    };
+    use alaya_types::memory::ScoredMemory;
+
+    /// VectorStorage whose `delete` blackholes — models a backend whose pod
+    /// IP vanished without an RST. Every other method panics: the test only
+    /// exercises the delete path and the no-op ping.
+    struct HangVectors;
+
+    #[async_trait(?Send)]
+    impl VectorStorage for HangVectors {
+        async fn store(&self, _memory: &Memory) -> Result<(bool, String)> {
+            unimplemented!()
+        }
+        async fn get_by_hash(&self, _content_hash: &str) -> Result<Option<Memory>> {
+            unimplemented!()
+        }
+        async fn get_batch(&self, _hashes: &[&str]) -> Result<Vec<Memory>> {
+            unimplemented!()
+        }
+        async fn delete(&self, _content_hash: &str) -> Result<bool> {
+            std::future::pending().await
+        }
+        async fn update_metadata(
+            &self,
+            _content_hash: &str,
+            _updates: MetadataUpdate,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+        async fn patch_memory(
+            &self,
+            _content_hash: &str,
+            _patch: &PatchMemoryRequest,
+        ) -> Result<Memory> {
+            unimplemented!()
+        }
+        async fn search_by_vector(
+            &self,
+            _embedding: &[f32],
+            _limit: usize,
+            _filters: Option<PayloadFilter>,
+        ) -> Result<Vec<ScoredMemory>> {
+            unimplemented!()
+        }
+        async fn search_by_tags(
+            &self,
+            _tags: &[&str],
+            _match_all: bool,
+            _limit: usize,
+        ) -> Result<Vec<ScoredMemory>> {
+            unimplemented!()
+        }
+        async fn search_similar_tags(
+            &self,
+            _tag_embedding: &[f32],
+            _limit: usize,
+        ) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_all(&self, _limit: usize, _offset: Option<&str>) -> Result<ScrollResult> {
+            unimplemented!()
+        }
+        async fn get_recent(
+            &self,
+            _limit: usize,
+            _start_from: Option<f64>,
+            _memory_type: Option<&str>,
+        ) -> Result<Vec<Memory>> {
+            unimplemented!()
+        }
+        async fn count(&self) -> Result<usize> {
+            unimplemented!()
+        }
+        async fn get_all_tags(&self) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+        async fn increment_access_count(&self, _content_hash: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            unimplemented!()
+        }
+    }
+
+    struct StubEmbeddings;
+
+    #[async_trait(?Send)]
+    impl EmbeddingProvider for StubEmbeddings {
+        async fn embed_batch(
+            &self,
+            _texts: &[&str],
+            _prompt_name: PromptName,
+        ) -> Result<Vec<Vec<f32>>> {
+            unimplemented!()
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        fn model_name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    struct StubGraph;
+
+    #[async_trait(?Send)]
+    impl GraphService for StubGraph {
+        async fn ensure_node(&self, _content_hash: &str, _created_at: f64) -> Result<()> {
+            unimplemented!()
+        }
+        async fn delete_node(&self, _content_hash: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn create_typed_edge(
+            &self,
+            _src: &str,
+            _dst: &str,
+            _rel: UserRelationType,
+            _meta: EdgeMeta,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn get_typed_edges(
+            &self,
+            _hash: &str,
+            _rel: Option<UserRelationType>,
+            _dir: Direction,
+            _limit: usize,
+        ) -> Result<Vec<Edge>> {
+            unimplemented!()
+        }
+        async fn delete_typed_edge(
+            &self,
+            _src: &str,
+            _dst: &str,
+            _rel: UserRelationType,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn create_system_edge(
+            &self,
+            _src: &str,
+            _dst: &str,
+            _rel: SystemRelationType,
+            _created_at: f64,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn get_all_contradictions(&self, _limit: usize) -> Result<Vec<Contradiction>> {
+            unimplemented!()
+        }
+        async fn get_contradictions_for_hashes(
+            &self,
+            _hashes: &[&str],
+        ) -> Result<HashMap<String, Vec<ContradictionRef>>> {
+            unimplemented!()
+        }
+        async fn get_neighbors(
+            &self,
+            _hash: &str,
+            _max_hops: u8,
+            _min_weight: f64,
+            _limit: usize,
+        ) -> Result<Vec<Neighbor>> {
+            unimplemented!()
+        }
+        async fn spreading_activation(
+            &self,
+            _seeds: &[&str],
+            _max_hops: u8,
+            _decay: f64,
+            _min_activation: f64,
+            _limit: usize,
+        ) -> Result<HashMap<String, f64>> {
+            unimplemented!()
+        }
+        async fn hebbian_boosts_within(&self, _hashes: &[&str]) -> Result<HashMap<String, f64>> {
+            unimplemented!()
+        }
+        async fn get_stats(&self) -> Result<GraphStats> {
+            unimplemented!()
+        }
+    }
+
+    struct StubHebbian;
+
+    #[async_trait(?Send)]
+    impl HebbianService for StubHebbian {
+        async fn enqueue_strengthen(&self, _pairs: &[CoAccessPair]) -> Result<()> {
+            unimplemented!()
+        }
+    }
+
+    struct StubConsolidation;
+
+    #[async_trait(?Send)]
+    impl ConsolidationService for StubConsolidation {
+        async fn decay_all_edges(&self, _decay_factor: f64, _limit: usize) -> Result<usize> {
+            unimplemented!()
+        }
+        async fn decay_stale_edges(
+            &self,
+            _stale_before: f64,
+            _decay_factor: f64,
+            _limit: usize,
+        ) -> Result<usize> {
+            unimplemented!()
+        }
+        async fn prune_weak_edges(&self, _threshold: f64, _limit: usize) -> Result<usize> {
+            unimplemented!()
+        }
+        async fn get_orphan_nodes(&self, _limit: usize) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+    }
+
+    fn hanging_service() -> MemoryService {
+        MemoryService::new(
+            Box::new(HangVectors),
+            Box::new(StubEmbeddings),
+            Box::new(StubGraph),
+            Box::new(StubHebbian),
+            Box::new(StubConsolidation),
+            None,
+        )
+    }
+
+    /// The incident scenario (#63): a backend await that never resolves.
+    /// The worker must reply with a timeout error at the command deadline
+    /// and keep draining the queue instead of wedging forever.
+    #[tokio::test(start_paused = true)]
+    async fn stuck_command_errors_at_deadline_and_worker_keeps_draining() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::channel::<Cmd>(8);
+                let progress = Arc::new(AtomicU64::new(epoch_secs()));
+                let limits = WorkerLimits {
+                    cmd: Duration::from_millis(100),
+                    long: Duration::from_millis(200),
+                };
+                tokio::task::spawn_local(service_worker(
+                    rx,
+                    hanging_service(),
+                    progress.clone(),
+                    limits,
+                ));
+
+                // 1. The stuck command errors out at its deadline.
+                let (rtx, rrx) = oneshot::channel();
+                tx.send(Cmd {
+                    inner: CmdInner::Delete {
+                        hash: "a".repeat(64),
+                        reply: rtx,
+                    },
+                    span: tracing::Span::none(),
+                })
+                .await
+                .unwrap();
+                let reply = tokio::time::timeout(Duration::from_secs(60), rrx)
+                    .await
+                    .expect("stuck command never replied — worker wedged")
+                    .expect("reply sender dropped");
+                assert_eq!(reply["error_kind"], "timeout");
+                assert!(reply["error"].as_str().unwrap().contains("timed out"));
+
+                // 2. Subsequent commands still complete — the worker drained.
+                let (ptx, prx) = oneshot::channel();
+                tx.send(Cmd {
+                    inner: CmdInner::Ping { reply: ptx },
+                    span: tracing::Span::none(),
+                })
+                .await
+                .unwrap();
+                let pong = tokio::time::timeout(Duration::from_secs(60), prx)
+                    .await
+                    .expect("worker did not drain after the stuck command")
+                    .expect("ping reply dropped");
+                assert_eq!(pong["ok"], true);
+            })
+            .await;
+    }
+
+    fn test_checker(progress_epoch_s: u64) -> HealthChecker {
+        HealthChecker {
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_millis(200))
+                .timeout(Duration::from_millis(500))
+                .build()
+                .unwrap(),
+            // Port 1 refuses immediately — models an unreachable backend.
+            qdrant_url: "http://127.0.0.1:1".into(),
+            collection: "test".into(),
+            graph_url: "http://127.0.0.1:1".into(),
+            graph_api_key: String::new(),
+            worker_progress: Arc::new(AtomicU64::new(progress_epoch_s)),
+            stall_threshold: WORKER_STALL_THRESHOLD,
+        }
+    }
+
+    /// Health semantics (#63): a stalled worker is `unhealthy` (503 → k8s
+    /// restarts the pod); dead backends alone stay `degraded` (200 — a
+    /// restart would not fix Qdrant being down).
+    #[tokio::test]
+    async fn health_distinguishes_worker_stall_from_backend_outage() {
+        // Fresh worker progress + unreachable backends → degraded, not unhealthy.
+        let v = test_checker(epoch_secs()).check().await;
+        assert_eq!(v["status"], "degraded");
+        assert_eq!(v["worker"]["stalled"], false);
+
+        // Stale worker progress → unhealthy, regardless of backend state.
+        let v = test_checker(epoch_secs() - 3600).check().await;
+        assert_eq!(v["status"], "unhealthy");
+        assert_eq!(v["worker"]["stalled"], true);
+        assert!(v["worker"]["last_progress_age_s"].as_u64().unwrap() >= 3600);
     }
 }
