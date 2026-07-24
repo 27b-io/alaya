@@ -463,10 +463,18 @@ impl ServiceHandle {
         }
     }
 
-    async fn call(&self, inner: CmdInner, rx: oneshot::Receiver<Value>) -> Json<Value> {
+    /// REST wrapper over `call_rpc`. Op-level errors ride inside a 200 body
+    /// (unchanged convention), but dispatch/transport failures — full channel,
+    /// closed channel, no reply within deadline — are 503, matching
+    /// `patch_memory`/`get_memory` so overload/stall semantics are uniform.
+    async fn call(
+        &self,
+        inner: CmdInner,
+        rx: oneshot::Receiver<Value>,
+    ) -> (StatusCode, Json<Value>) {
         match self.call_rpc(inner, rx).await {
-            Ok(v) => Json(v),
-            Err((_code, msg)) => Json(json!({"error": msg})),
+            Ok(v) => (StatusCode::OK, Json(v)),
+            Err((_code, msg)) => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": msg}))),
         }
     }
 }
@@ -526,11 +534,20 @@ impl HealthChecker {
         let (qdrant_health, graph_health, count) =
             tokio::join!(self.check_qdrant(), self.check_graph(), self.check_count(),);
 
-        let progress_age = epoch_secs().saturating_sub(
-            self.worker_progress
-                .load(std::sync::atomic::Ordering::Relaxed),
-        );
-        let worker_stalled = progress_age > self.stall_threshold.as_secs();
+        // 0 = worker loop not entered yet (backend bootstrap in progress).
+        // Bootstrap is deadline-bounded but can legitimately exceed the stall
+        // threshold on a cluster cold start — report "starting", not a stall,
+        // or the liveness probe would restart-loop a pod that's coming up.
+        let last_progress = self
+            .worker_progress
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let (worker_state, worker_stalled, progress_age) = if last_progress == 0 {
+            ("starting", false, 0)
+        } else {
+            let age = epoch_secs().saturating_sub(last_progress);
+            let stalled = age > self.stall_threshold.as_secs();
+            (if stalled { "stalled" } else { "ok" }, stalled, age)
+        };
 
         let status = if worker_stalled {
             "unhealthy"
@@ -556,6 +573,7 @@ impl HealthChecker {
             "version": option_env!("ALAYA_GIT_SHA").unwrap_or("dev"),
             "backend": "qdrant",
             "worker": {
+                "state": worker_state,
                 "stalled": worker_stalled,
                 "last_progress_age_s": progress_age,
             },
@@ -695,6 +713,11 @@ async fn service_worker(
     use tracing::Instrument;
 
     let svc = std::rc::Rc::new(svc);
+
+    // First heartbeat: bootstrap is done and the loop is live. Until this
+    // stamp the health checker reports the worker as "starting" (progress
+    // sentinel 0), never stalled — see the seed in main().
+    progress.store(epoch_secs(), std::sync::atomic::Ordering::Relaxed);
 
     while let Some(cmd) = rx.recv().await {
         let op = cmd.op_name();
@@ -1327,7 +1350,13 @@ fn main() {
 
         // Watchdog heartbeat: epoch-seconds of the worker's last completed
         // command. Written by the worker loop, read by the health checker.
-        let worker_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(epoch_secs()));
+        // Seeded 0 = "worker loop not entered yet": backend bootstrap
+        // (ensure_qdrant_collection + init_l2_cache retries) can legitimately
+        // exceed the stall threshold on a cluster cold start, and /health is
+        // already serving — a wall-clock seed here would misreport that as a
+        // stall and restart-loop the pod. Every bootstrap await is
+        // deadline-bounded, so the loop is always entered in bounded time.
+        let worker_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let progress_for_worker = worker_progress.clone();
 
         // Spawn MemoryService on a dedicated thread with LocalSet
@@ -1576,7 +1605,7 @@ async fn store(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(params): Json<StoreParams>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     let read_only = WritePolicy::for_principal(principal) == WritePolicy::ReadOnly;
     let (tx, rx) = oneshot::channel();
     h.call(
@@ -1594,7 +1623,7 @@ async fn search(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(params): Json<SearchParams>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     let read_only = WritePolicy::for_principal(principal) == WritePolicy::ReadOnly;
     let (tx, rx) = oneshot::channel();
     h.call(
@@ -1616,7 +1645,7 @@ struct DeleteReq {
 async fn delete(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
     Json(req): Json<DeleteReq>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::Delete {
@@ -1631,7 +1660,7 @@ async fn delete(
 async fn relation(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
     Json(params): Json<RelationParams>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     let (tx, rx) = oneshot::channel();
     h.call(CmdInner::Relation { params, reply: tx }, rx).await
 }
@@ -1647,7 +1676,7 @@ struct SupersedeReq {
 async fn supersede(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
     Json(req): Json<SupersedeReq>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::Supersede {
@@ -1673,7 +1702,7 @@ fn default_limit() -> usize {
 async fn contradictions(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
     Json(req): Json<ContradictionsReq>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::Contradictions {
@@ -1704,7 +1733,7 @@ fn default_dup_limit() -> usize {
 async fn find_duplicates(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
     Json(req): Json<FindDupReq>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::FindDuplicates {
@@ -1731,7 +1760,7 @@ struct MergeDupReq {
 async fn merge_duplicates(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
     Json(req): Json<MergeDupReq>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::MergeDuplicates {
@@ -1857,7 +1886,7 @@ fn default_backfill_limit() -> usize {
 async fn backfill_summaries(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
     Json(params): Json<BackfillParams>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::BackfillSummaries {
@@ -2173,7 +2202,9 @@ mod wedge_tests {
         local
             .run_until(async {
                 let (tx, rx) = mpsc::channel::<Cmd>(8);
-                let progress = Arc::new(AtomicU64::new(epoch_secs()));
+                // 0 sentinel, as main() seeds it — the worker's entry stamp
+                // must replace it (asserted below).
+                let progress = Arc::new(AtomicU64::new(0));
                 let limits = WorkerLimits {
                     cmd: Duration::from_millis(100),
                     long: Duration::from_millis(200),
@@ -2216,6 +2247,10 @@ mod wedge_tests {
                     .expect("worker did not drain after the stuck command")
                     .expect("ping reply dropped");
                 assert_eq!(pong["ok"], true);
+
+                // The worker stamped progress at loop entry and after each
+                // command — the 0 "starting" sentinel must be gone.
+                assert_ne!(progress.load(std::sync::atomic::Ordering::Relaxed), 0);
             })
             .await;
     }
@@ -2252,5 +2287,13 @@ mod wedge_tests {
         assert_eq!(v["status"], "unhealthy");
         assert_eq!(v["worker"]["stalled"], true);
         assert!(v["worker"]["last_progress_age_s"].as_u64().unwrap() >= 3600);
+
+        // 0 sentinel = worker still bootstrapping backends → "starting",
+        // never a stall: a slow cluster cold start must not restart-loop
+        // the pod before the command loop has even begun.
+        let v = test_checker(0).check().await;
+        assert_eq!(v["status"], "degraded");
+        assert_eq!(v["worker"]["state"], "starting");
+        assert_eq!(v["worker"]["stalled"], false);
     }
 }
