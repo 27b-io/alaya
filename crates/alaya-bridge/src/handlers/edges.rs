@@ -53,6 +53,11 @@ pub struct BatchCreateEdgeRequest {
     pub edges: Vec<CreateEdgeRequest>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BatchCreateSystemEdgeRequest {
+    pub edges: Vec<CreateSystemEdgeRequest>,
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Parse a relation_type string into a `UserRelationType`.
@@ -248,6 +253,45 @@ pub async fn delete(
 
     let count = result.count().unwrap_or(0);
     Ok(Json(json!({ "deleted": count > 0 })))
+}
+
+/// POST /edges/create-system-batch
+///
+/// Validate all edges up front, then execute each Cypher query sequentially.
+/// Single HTTP call from the client replaces N individual calls.
+pub async fn create_system_batch(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BatchCreateSystemEdgeRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    if req.edges.is_empty() {
+        return Ok(Json(json!({ "created": 0 })));
+    }
+
+    // Validate all edges before executing any
+    let mut queries = Vec::with_capacity(req.edges.len());
+    for edge in &req.edges {
+        if !validate_content_hash(&edge.source) || !validate_content_hash(&edge.target) {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let rel = parse_system_relation(&edge.relation_type)?;
+        queries.push(cypher::create_system_edge(
+            &edge.source,
+            &edge.target,
+            rel,
+            edge.created_at,
+        ));
+    }
+
+    // Execute all queries (each is a Redis round-trip, but within the bridge process)
+    let mut created = 0usize;
+    for (cypher, params, readonly) in queries {
+        let result = exec_query(&state, &cypher, params, readonly).await?;
+        if result.count().unwrap_or(0) > 0 {
+            created += 1;
+        }
+    }
+
+    Ok(Json(json!({ "created": created })))
 }
 
 /// POST /edges/create-system

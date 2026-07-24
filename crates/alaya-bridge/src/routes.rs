@@ -15,6 +15,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/edges/create", post(handlers::edges::create))
         .route("/edges/create-batch", post(handlers::edges::create_batch))
         .route("/edges/create-system", post(handlers::edges::create_system))
+        .route(
+            "/edges/create-system-batch",
+            post(handlers::edges::create_system_batch),
+        )
         .route("/edges/get", post(handlers::edges::get))
         .route("/edges/delete", post(handlers::edges::delete))
         .route("/stats", get(handlers::health::stats))
