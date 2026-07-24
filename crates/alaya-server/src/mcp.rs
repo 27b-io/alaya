@@ -13,14 +13,7 @@ use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{OutputMode, RelationParams, SearchParams, StoreParams};
 
 use crate::auth::{AuthPrincipal, oidc_allows};
-use crate::{Cmd, CmdInner, ServiceHandle};
-
-fn cmd(inner: CmdInner) -> Cmd {
-    Cmd {
-        inner,
-        span: tracing::Span::current(),
-    }
-}
+use crate::{CmdInner, ServiceHandle};
 
 // ─── Typed param structs for MCP dispatch ───────────────────────────────────
 
@@ -339,113 +332,135 @@ async fn dispatch_tool(
             let params: StoreParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle.try_dispatch(cmd(CmdInner::Store {
-                params,
-                read_only,
-                reply: tx,
-            }))?;
-            rx.await
-                .map_err(|_| (-32000, "Service dropped".to_string()))
+            handle
+                .call_rpc(
+                    CmdInner::Store {
+                        params,
+                        read_only,
+                        reply: tx,
+                    },
+                    rx,
+                )
+                .await
         }
         "search" => {
             let params: SearchParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle.try_dispatch(cmd(CmdInner::Search {
-                params,
-                read_only,
-                reply: tx,
-            }))?;
-            rx.await
-                .map_err(|_| (-32000, "Service dropped".to_string()))
+            handle
+                .call_rpc(
+                    CmdInner::Search {
+                        params,
+                        read_only,
+                        reply: tx,
+                    },
+                    rx,
+                )
+                .await
         }
         "delete_memory" => {
             let p: DeleteParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle.try_dispatch(cmd(CmdInner::Delete {
-                hash: p.content_hash,
-                reply: tx,
-            }))?;
-            rx.await
-                .map_err(|_| (-32000, "Service dropped".to_string()))
+            handle
+                .call_rpc(
+                    CmdInner::Delete {
+                        hash: p.content_hash,
+                        reply: tx,
+                    },
+                    rx,
+                )
+                .await
         }
         "get_memory" => {
             let p: GetMemoryParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle.try_dispatch(cmd(CmdInner::GetMemory {
-                hash: p.content_hash,
-                output: p.output,
-                reply: tx,
-            }))?;
-            rx.await
-                .map_err(|_| (-32000, "Service dropped".to_string()))
+            handle
+                .call_rpc(
+                    CmdInner::GetMemory {
+                        hash: p.content_hash,
+                        output: p.output,
+                        reply: tx,
+                    },
+                    rx,
+                )
+                .await
         }
         "check_database_health" => {
             let (tx, rx) = oneshot::channel();
-            handle.try_dispatch(cmd(CmdInner::Health { reply: tx }))?;
-            rx.await
-                .map_err(|_| (-32000, "Service dropped".to_string()))
+            handle.call_rpc(CmdInner::Health { reply: tx }, rx).await
         }
         "relation" => {
             let params: RelationParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle.try_dispatch(cmd(CmdInner::Relation { params, reply: tx }))?;
-            rx.await
-                .map_err(|_| (-32000, "Service dropped".to_string()))
+            handle
+                .call_rpc(CmdInner::Relation { params, reply: tx }, rx)
+                .await
         }
         "memory_supersede" => {
             let p: SupersedeParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle.try_dispatch(cmd(CmdInner::Supersede {
-                old_hash: p.old_id,
-                new_hash: p.new_id,
-                reason: p.reason,
-                reply: tx,
-            }))?;
-            rx.await
-                .map_err(|_| (-32000, "Service dropped".to_string()))
+            handle
+                .call_rpc(
+                    CmdInner::Supersede {
+                        old_hash: p.old_id,
+                        new_hash: p.new_id,
+                        reason: p.reason,
+                        reply: tx,
+                    },
+                    rx,
+                )
+                .await
         }
         "memory_contradictions" => {
             let p: ContradictionsParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle.try_dispatch(cmd(CmdInner::Contradictions {
-                limit: p.limit,
-                reply: tx,
-            }))?;
-            rx.await
-                .map_err(|_| (-32000, "Service dropped".to_string()))
+            handle
+                .call_rpc(
+                    CmdInner::Contradictions {
+                        limit: p.limit,
+                        reply: tx,
+                    },
+                    rx,
+                )
+                .await
         }
         "find_duplicates" => {
             let p: FindDuplicatesParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle.try_dispatch(cmd(CmdInner::FindDuplicates {
-                threshold: p.similarity_threshold,
-                limit: p.limit,
-                strategy: p.strategy,
-                reply: tx,
-            }))?;
-            rx.await
-                .map_err(|_| (-32000, "Service dropped".to_string()))
+            handle
+                .call_rpc(
+                    CmdInner::FindDuplicates {
+                        threshold: p.similarity_threshold,
+                        limit: p.limit,
+                        strategy: p.strategy,
+                        reply: tx,
+                    },
+                    rx,
+                )
+                .await
         }
         "merge_duplicates" => {
             let p: MergeDuplicatesParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
-            handle.try_dispatch(cmd(CmdInner::MergeDuplicates {
-                canonical: p.canonical_hash,
-                duplicates: p.duplicate_hashes,
-                reason: p.reason,
-                dry_run: p.dry_run,
-                reply: tx,
-            }))?;
-            rx.await
-                .map_err(|_| (-32000, "Service dropped".to_string()))
+            handle
+                .call_rpc(
+                    CmdInner::MergeDuplicates {
+                        canonical: p.canonical_hash,
+                        duplicates: p.duplicate_hashes,
+                        reason: p.reason,
+                        dry_run: p.dry_run,
+                        reply: tx,
+                    },
+                    rx,
+                )
+                .await
         }
         _ => Err((-32601, format!("Unknown tool: {name}"))),
     }

@@ -23,6 +23,15 @@ use alaya_types::search::PromptName;
 const BREAKER_THRESHOLD: u32 = 3;
 /// Seconds to wait before retrying L2 after circuit opens.
 const BREAKER_COOLDOWN_SECS: f64 = 30.0;
+/// Deadline for one L2 batch (Redis round-trips normally take <10ms).
+///
+/// cachekit-rs 0.3 sets no fred command timeout (default = wait forever) and
+/// no reconnect policy, so a blackholed connection — e.g. the Redis pod IP
+/// vanishing without an RST — hangs `get`/`set` awaits indefinitely. That
+/// silence never trips the circuit breaker (it only counts errors) and wedged
+/// the whole service for 25h (#63). This timeout converts the hang into a
+/// failure the breaker can act on, degrading to L1-only.
+const L2_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn now_secs() -> f64 {
     std::time::SystemTime::now()
@@ -138,7 +147,18 @@ impl CachedEmbedding {
         };
 
         let futs: Vec<_> = keys.iter().map(|(_, kh)| l2.get::<Vec<f32>>(kh)).collect();
-        let raw_results = futures::future::join_all(futs).await;
+        let raw_results =
+            match tokio::time::timeout(L2_OP_TIMEOUT, futures::future::join_all(futs)).await {
+                Ok(r) => r,
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_s = L2_OP_TIMEOUT.as_secs(),
+                        "L2 cache get batch timed out — treating as failure (non-fatal)"
+                    );
+                    self.l2_failure();
+                    return vec![None; keys.len()];
+                }
+            };
 
         let mut any_success = false;
         let mut any_failure = false;
@@ -181,8 +201,20 @@ impl CachedEmbedding {
             None => return,
         };
         let futs: Vec<_> = entries.iter().map(|(k, v)| l2.set(k, *v)).collect();
+        let results =
+            match tokio::time::timeout(L2_OP_TIMEOUT, futures::future::join_all(futs)).await {
+                Ok(r) => r,
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_s = L2_OP_TIMEOUT.as_secs(),
+                        "L2 cache set batch timed out — treating as failure (non-fatal)"
+                    );
+                    self.l2_failure();
+                    return;
+                }
+            };
         let mut any_failure = false;
-        for result in futures::future::join_all(futs).await {
+        for result in results {
             if let Err(e) = result {
                 tracing::debug!("L2 cache set failed (non-fatal): {e}");
                 any_failure = true;
@@ -275,5 +307,83 @@ impl EmbeddingProvider for CachedEmbedding {
 
     fn model_name(&self) -> &str {
         self.inner.model_name()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Backend whose every op blackholes — models a Redis connection to a
+    /// vanished pod IP (no RST, no error, just silence). This is the
+    /// suspected trigger of the 25h wedge (#63).
+    struct HangingBackend;
+
+    #[async_trait(?Send)]
+    impl cachekit::backend::Backend for HangingBackend {
+        async fn get(&self, _key: &str) -> BackendResult<Option<Vec<u8>>> {
+            std::future::pending().await
+        }
+        async fn set(
+            &self,
+            _key: &str,
+            _value: Vec<u8>,
+            _ttl: Option<std::time::Duration>,
+        ) -> BackendResult<()> {
+            std::future::pending().await
+        }
+        async fn delete(&self, _key: &str) -> BackendResult<bool> {
+            std::future::pending().await
+        }
+        async fn exists(&self, _key: &str) -> BackendResult<bool> {
+            std::future::pending().await
+        }
+        async fn health(&self) -> BackendResult<cachekit::backend::HealthStatus> {
+            std::future::pending().await
+        }
+    }
+
+    type BackendResult<T> = std::result::Result<T, cachekit::BackendError>;
+
+    struct StubEmbeddings;
+
+    #[async_trait(?Send)]
+    impl EmbeddingProvider for StubEmbeddings {
+        async fn embed_batch(
+            &self,
+            texts: &[&str],
+            _prompt_name: PromptName,
+        ) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.5_f32; 4]).collect())
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        fn model_name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    /// A blackholed L2 must not hang embed_batch: both batch phases time out
+    /// (each counts as one breaker failure) and the inner provider answers.
+    /// Paused clock — the 3s timeouts elapse instantly.
+    #[tokio::test(start_paused = true)]
+    async fn hanging_l2_times_out_and_degrades_to_inner_provider() {
+        let l2 = cachekit::CacheKit::builder()
+            .backend(std::rc::Rc::new(HangingBackend))
+            .namespace("test")
+            .no_l1()
+            .build()
+            .unwrap();
+        let cache = CachedEmbedding::new(Box::new(StubEmbeddings), 10, Some(l2));
+
+        let out = cache
+            .embed_batch(&["hello"], PromptName::Passage)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len(), 4);
+        // get-batch and set-batch each timed out → two breaker failures.
+        assert_eq!(cache.l2_failures.get(), 2);
     }
 }
