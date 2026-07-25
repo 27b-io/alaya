@@ -66,6 +66,20 @@ MCP clients that support OAuth (claude.ai's hosted MCP, for example) will:
 
 When `OIDC_ISSUER` is **unset**, the well-known endpoints return `404` and clients fall back to whatever bearer token you give them — typically a fixed `ALAYA_API_KEY`.
 
+### Codex
+
+The [Codex CLI](https://github.com/openai/codex) drives the whole flow itself — point it at the server and it discovers the IdP, registers a client (RFC 7591), and opens the browser login:
+
+```bash
+codex mcp add alaya --url https://your-alaya-host/mcp   # detects OAuth, starts login
+codex mcp login alaya                                   # re-run when the token expires
+```
+
+Two things to get right:
+
+- The URL must use the server's `PUBLIC_BASE_URL` origin. Access tokens are audience-bound to `{PUBLIC_BASE_URL}/mcp` (RFC 8707), so the same server reached via any other hostname rejects the token with `401`.
+- OAuth principals get the read/additive tool subset only: `search`, `get_memory`, `store_memory`, `check_database_health`, `memory_contradictions`, `find_duplicates`. Mutating tools (delete, supersede, merge, …) are denied with a "forbidden for this principal" error — they require the static `ALAYA_API_KEY` bearer.
+
 ## Verify
 
 The cheapest "is the server reachable from this client?" check is the unauthenticated health endpoint:
