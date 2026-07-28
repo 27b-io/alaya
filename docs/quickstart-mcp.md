@@ -95,7 +95,7 @@ From inside an MCP-enabled session, ask the model to:
 2. Search for it.
 3. Inspect the result.
 
-```
+```text
 You: Use the alaya store_memory tool to save: "Project alpha uses Rust 1.87 with the channel-based axum architecture — see CLAUDE.md."
 
 [model calls store_memory → returns content_hash: "a3f4...e891"]
@@ -109,7 +109,7 @@ That's it — you're integrated. From here, see the [MCP tool reference](./mcp-t
 ## Troubleshooting
 
 | Symptom | Likely cause |
-|---|---|
+|:--|:--|
 | Client shows "0 tools" | `Authorization` header missing or wrong; check `GET /health` works from the client's host |
 | Tools listed but calls return `401 Unauthorized` | `ALAYA_API_KEY` mismatch; server logs the expected prefix on startup |
 | `503 service unavailable` on `/store` or `/search` | Backend down (Qdrant, TEI, or FalkorDB); check `GET /health` for which one |

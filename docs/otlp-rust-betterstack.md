@@ -2,6 +2,21 @@
 
 Battle-tested instructions from alaya-server. Covers every pitfall discovered during integration.
 
+## Contents
+
+- [Dependencies](#dependencies)
+- [Telemetry Init](#telemetry-init)
+- [Environment Variables](#environment-variables)
+- [TraceLayer for axum](#tracelayer-for-axum)
+- [EnvFilter: The Global Gate](#envfilter-the-global-gate)
+- [Cross-Thread Span Propagation](#cross-thread-span-propagation)
+- [`#[tracing::instrument]` with `#[async_trait(?Send)]`](#tracinginstrument-with-async_traitsend)
+- [Stage Spans for Concurrent Operations](#stage-spans-for-concurrent-operations)
+- [Graceful Shutdown](#graceful-shutdown)
+- [Git SHA in Binary](#git-sha-in-binary)
+- [K8s Deployment](#k8s-deployment)
+- [Debugging Checklist](#debugging-checklist)
+
 ## Dependencies
 
 ```toml
@@ -147,12 +162,12 @@ let app = health.merge(app);
 
 If your `RUST_LOG` is `my_crate=info` and you have `#[tracing::instrument]` on methods in `my_lib`, those spans are silently dropped. You must include every crate that has instrumented methods:
 
-```
+```bash
 RUST_LOG=my_crate=info,my_lib=info,tower_http=info
 ```
 
 To see OTLP internal errors (normally invisible):
-```
+```bash
 RUST_LOG=my_crate=info,opentelemetry=debug,opentelemetry_sdk=debug
 ```
 

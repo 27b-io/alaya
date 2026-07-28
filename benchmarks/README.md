@@ -113,7 +113,7 @@ What this means for honest reading of the numbers:
 Three blocks, in order: bring up the isolated bench stack, run a stratified A/B
 smoke (rerank on vs off), then the full headline run.
 
-> [!WARNING]
+> [!CAUTION]
 > **The harness `DELETE`s and recreates its Qdrant collections (`bench_memories`,
 > `bench_memories_tags`) on _every question_.** Point `--qdrant-url` at the
 > **isolated bench Qdrant only** — never at a Qdrant that holds real data. The
@@ -138,6 +138,7 @@ EMBEDDING_URL=http://<your-tei-host> docker compose up -d
 docker compose ps   # wait until every service is healthy
 ```
 
+> [!WARNING]
 > The bench stack runs **unauthenticated by design** — it sets
 > `DANGEROUSLY_ALLOW_UNAUTHENTICATED=true` with a `localhost` origin so the
 > (otherwise fail-closed) server will boot without a key. That is fine because
@@ -224,7 +225,7 @@ docker compose down -v
 ## Config
 
 | Flag / env | Default | Meaning |
-|---|---|---|
+|:--|:--|:--|
 | `--stratified N` | — | Deterministic balanced sample of N across all 6 types. **Use this for A/B and headline runs.** |
 | `--limit N` | — | First N questions (one type only — debug use, **not** for A/B or published numbers). |
 | `--mode {raw,hybrid}` | `hybrid` | `hybrid` = full RRF pipeline; `raw` = vector-only. |
@@ -245,7 +246,7 @@ shipped server with rerank state confirmed in the logs (provenance follows the
 table). A figure ships here **only** after that verification.
 
 | Configuration | Questions | hit-rate@5 | hit-rate@10 | NDCG@5 |
-|---|---|---|---|---|
+|:--|--:|--:|--:|--:|
 | Hybrid (RRF), live server | `500` | `0.916` | `0.964` | `0.792` |
 | Hybrid + cross-encoder, live server | `500` | `0.986` | `0.988` | `0.920` |
 
@@ -255,6 +256,7 @@ model `Snowflake/snowflake-arctic-embed-l-v2.0` (1024-d, embedder fp16 on GPU (R
 rerank-fired-in-logs: `yes (TEI predict-count 1084->11084 on rerank-on, flat on rerank-off; 0 "rerank failed")`, headline framing: `Cross-encoder reranking lifts hit-rate@5 from 0.916 to 0.986 on the live server — +7.0 points, paired McNemar p≈5.5e-10 (36 questions fixed, 1 regressed).`,
 confidence interval: `95% CI [0.971, 0.993]; paired McNemar p≈5.5e-10 (36 questions fixed, 1 regressed)` (baseline hit-rate@5 `0.916`).
 
+> [!IMPORTANT]
 > **Offline algorithm validation (cached embeddings, NOT the live server).**
 > [`rerank_sweep.py`](rerank_sweep.py) re-implements Ālaya's RRF+blend scoring in
 > Python and replays it over **cached embeddings** to validate the *reranking

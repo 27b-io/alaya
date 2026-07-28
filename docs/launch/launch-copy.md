@@ -5,7 +5,7 @@
 ## 0. Channels & sequencing (orientation, not copy)
 
 | Asset | Channel | Number-bearing? |
-|---|---|---|
+|:--|:--|:--|
 | Tagline (§1) | Product Hunt name/tagline | No — number-free |
 | First comment / maker's note (§2) | Product Hunt first comment | Yes — proof sentence |
 | Reddit post (§3) | r/rust · r/LocalLLaMA · r/selfhosted (one body, swappable title) | Yes — proof sentence + hit-rate@5 |
