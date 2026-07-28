@@ -27,7 +27,7 @@ Failed auth returns `401 Unauthorized` with a `WWW-Authenticate: Bearer …` hea
 ## Endpoint summary
 
 | Method | Path | Purpose | Auth? |
-|---|---|---|---|
+|:--|:--|:--|:-:|
 | `GET`  | `/health` | Liveness + backend health | no |
 | `POST` | `/store` | Add a memory | yes |
 | `POST` | `/search` | Retrieve memories | yes |
@@ -134,7 +134,7 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" \
 ```
 
 | Status | Body |
-|---|---|
+|:--|:--|
 | `200 OK` | `{ "found": true, "memory": {...} }` |
 | `404 Not Found` | `{ "found": false }` |
 | `400 Bad Request` | `{ "error": "invalid content_hash format" }` — hash isn't 64 lowercase hex chars |
@@ -158,7 +158,7 @@ Content-Type: application/json
 Updatable fields: `summary`, `tags`, `metadata`. Content and `content_hash` are immutable by design — to change content, store a new memory and supersede the old.
 
 | Status | Meaning |
-|---|---|
+|:--|:--|
 | `200 OK` | Updated. Response echoes the new state. |
 | `400` | Empty patch, invalid hash, or validation failure. |
 | `404` | Memory doesn't exist. |
@@ -194,6 +194,7 @@ Content-Type: application/json
 
 ## `POST /supersede`
 
+> [!IMPORTANT]
 > **Field-name divergence.** `supersede` takes `old_hash`/`new_hash` on REST (`POST /supersede`) and `old_id`/`new_id` in MCP (`memory_supersede`). The **values are identical** — full 64-char content hashes; only the field names differ. (`relation` and `delete` use `content_hash`/`target_hash` on *both* protocols — no divergence.)
 
 See also [MCP: `memory_supersede`](./mcp-tools.md#memory_supersede).
@@ -289,7 +290,7 @@ See the [MCP tool reference](./mcp-tools.md) for the available `tools/call` meth
 REST endpoints use HTTP status codes plus a JSON body:
 
 | Status | When |
-|---|---|
+|:--|:--|
 | `400` | Malformed JSON, invalid `content_hash`, missing required field. Body: `{"error": "..."}`. |
 | `401` | Missing or wrong bearer token. |
 | `403` | Authenticated but the token is read-only (OAuth scope) and the endpoint mutates. |

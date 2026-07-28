@@ -15,7 +15,7 @@ Rust rewrite of the mcp-memory-service API layer. Deployed on k3s as a native se
 6-crate workspace (5 implemented, 1 deferred):
 
 | Crate | Target | Status | Purpose |
-|-------|--------|--------|---------|
+|:------|:-------|:-------|:--------|
 | **alaya-types** | wasm32 + native | Done | Shared types: Memory, Edge, SearchMode, AlayaError, PayloadFilter |
 | **alaya-bridge** | native only | Done | FalkorDB typed RPC bridge (axum + redis), 18 endpoints |
 | **alaya-backends** | wasm32 + native | Done | Trait definitions + HTTP clients (Qdrant, Embedding, Graph) |
@@ -23,7 +23,7 @@ Rust rewrite of the mcp-memory-service API layer. Deployed on k3s as a native se
 | **alaya-server** | native only | Done | REST API + MCP Streamable HTTP (axum, channel-based, 9 endpoints + /mcp) |
 | **alaya-worker** | wasm32 | Deferred | CF Worker entry point (reqwest-wasm unreliable on Workers, native server sufficient) |
 
-```
+```text
 crates/
 ├── alaya-types/src/
 │   ├── lib.rs          # Re-exports
@@ -103,7 +103,7 @@ Pre-commit hooks via prek enforce all four + gitleaks + trailing whitespace.
 Both services deployed in `mcp` namespace via `lab/k8s/mcp/alaya.yaml`:
 
 | Pod | Image | Port | Connects to |
-|-----|-------|------|-------------|
+|:----|:------|:-----|:------------|
 | alaya-bridge | ghcr.io/27b-io/alaya:latest | 8080 (svc: 3000) | FalkorDB (recsys:6379) |
 | alaya-server | ghcr.io/27b-io/alaya:latest | 3001 | Qdrant (mcp:6333), TEI (mcp:80), bridge (mcp:3000) |
 

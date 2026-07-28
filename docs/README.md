@@ -10,19 +10,20 @@ It speaks two protocols against the same storage layer:
 ## Getting started
 
 | You want to… | Read |
-|---|---|
+|:--|:--|
 | Connect an MCP client (Claude Code / Desktop) to a running server | [Quickstart: MCP clients](./quickstart-mcp.md) |
 | Run your own server with `docker compose` | [Quickstart: Self-hosting](./quickstart-selfhost.md) |
 
 ## Reference
 
 | Topic | Read |
-|---|---|
+|:--|:--|
 | All 10 MCP tools — schemas, params, examples | [MCP tool reference](./mcp-tools.md) |
 | REST endpoints — auth, request/response shapes | [REST API reference](./rest-api.md) |
 
 ## Gotchas
 
+> [!IMPORTANT]
 > **Field-name divergence.** `supersede` takes `old_hash`/`new_hash` on REST (`POST /supersede`) and `old_id`/`new_id` in MCP (`memory_supersede`). The **values are identical** — full 64-char content hashes; only the field names differ. (`relation` and `delete` use `content_hash`/`target_hash` on *both* protocols — no divergence.)
 
 Values are always full 64-char content hashes; when in doubt, the schemas in `crates/alaya-server/src/mcp.rs` win.
