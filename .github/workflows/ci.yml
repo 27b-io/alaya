@@ -4,16 +4,17 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: 27b-io/alaya
   CARGO_TERM_COLOR: always
-  RUSTUP_HOME: /tmp/rustup
-  CARGO_HOME: /tmp/cargo
 
 jobs:
   check:
-    runs-on: lab
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - name: Install Rust toolchain
@@ -31,7 +32,7 @@ jobs:
           cargo build -p alaya-core --target wasm32-unknown-unknown
 
   audit:
-    runs-on: lab
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - name: Install Rust toolchain
