@@ -136,7 +136,20 @@ OTEL_SERVICE_NAME=alaya-server
 RERANK_URL=                              # optional — empty disables cross-encoder rerank
 RERANK_API_KEY=                          # optional
 RERANK_TOP_N=20                          # how many RRF candidates to rerank
+CACHE_BACKEND=redis                      # L2 embedding cache backend: redis (default) | saas
+REDIS_CACHE_URL=                         # redis backend — empty disables L2 (L1-only)
+CACHEKIT_API_KEY=                        # saas backend — required when CACHE_BACKEND=saas
+CACHEKIT_API_URL=                        # saas backend — default https://api.cachekit.io
 ```
+
+**L2 cache keys are cross-SDK interop/v1** (`alaya:embed:{blake2b256-hex}` over
+`[model, dims, prompt_name, text]`, un-namespaced client — a client namespace
+silently prefixes keys and breaks conformance). Cutover from legacy SHA-256
+keys 2026-08-08 (LAB-372): legacy `alaya:embed:<model>:<dims>:*` entries are
+orphaned and expire via their 30-day TTL; flush to reclaim memory sooner:
+`redis-cli --scan --pattern 'alaya:embed:*:*' | xargs -r redis-cli del`
+(the extra `:*` spares new interop keys, which have no colon after `embed:`;
+safe either way — worst case is a one-time re-embed).
 
 ## Key Design Decisions
 

@@ -81,7 +81,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2",
  "subtle",
  "tokio",
  "tower-http",
@@ -347,9 +346,9 @@ dependencies = [
 
 [[package]]
 name = "cachekit-core"
-version = "0.2.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9622b3c3e47fcf7abfde287c557e6171674e37842a2dd26fda03f63720542f17"
+checksum = "6aba1513135a7b92a124ad6983f7e80e5f5c78c4f9c74384079efa3fbf491eab"
 dependencies = [
  "byteorder",
  "bytes",
@@ -364,9 +363,9 @@ dependencies = [
 
 [[package]]
 name = "cachekit-rs"
-version = "0.3.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf8c471ed63b9a297ee53524216f95cae119d4520ced15f13eba00b798f0715d"
+checksum = "7cf3f868e64c4120e4239b7855ae90c822ea39310e82f7fc54c2e8dbdd169436"
 dependencies = [
  "async-trait",
  "blake2",
@@ -374,10 +373,14 @@ dependencies = [
  "cachekit-core",
  "fred",
  "hex",
+ "js-sys",
  "moka",
+ "reqwest",
  "rmp-serde",
  "serde",
+ "serde_json",
  "thiserror",
+ "tokio",
  "url",
  "urlencoding",
  "uuid",
