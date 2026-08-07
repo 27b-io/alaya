@@ -245,18 +245,23 @@ fn init_l2_saas() -> std::result::Result<cachekit::CacheKit, Box<dyn std::error:
     ))?)
 }
 
-/// Env var treated as unset when blank — k8s manifests commonly ship
-/// `value: ""`, which must route to the explicit "missing" handling, not an
-/// opaque downstream builder error.
+/// Env var treated as unset when blank, returned trimmed — k8s manifests
+/// commonly ship `value: ""` (must route to the explicit "missing" handling,
+/// not an opaque downstream builder error) and padded/newline-suffixed values
+/// (folded YAML scalars, `echo`-piped secrets) that would fail string matches
+/// and downstream builders if passed through raw.
 fn env_non_empty(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|v| !v.is_empty())
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// L2 embedding cache init, dispatched on `CACHE_BACKEND` (default `redis`).
 /// Never fatal — any failure degrades to L1-only, matching the L2's
 /// non-fatal-by-design posture.
 async fn init_l2_cache() -> Option<cachekit::CacheKit> {
-    let backend = std::env::var("CACHE_BACKEND").unwrap_or_else(|_| "redis".to_string());
+    let backend = env_non_empty("CACHE_BACKEND").unwrap_or_else(|| "redis".to_string());
     // A CacheKit API key alongside a non-saas backend is a near-certain
     // "forgot the switch" misconfig — say so instead of silently ignoring it.
     if backend != "saas" && env_non_empty("CACHEKIT_API_KEY").is_some() {

@@ -53,7 +53,7 @@ fn now_secs() -> f64 {
 ///
 /// Replaced the legacy `SHA-256(prompt:text)` key under a
 /// `alaya:embed:{model}:{dims}` client namespace (LAB-372, 2026-08-08).
-fn cache_key(model: &str, dims: usize, prompt: PromptName, text: &str) -> String {
+fn cache_key(model: &str, dims: usize, prompt: PromptName, text: &str) -> Result<String> {
     use cachekit::interop::{InteropValue, interop_key};
     interop_key(
         "alaya",
@@ -67,8 +67,11 @@ fn cache_key(model: &str, dims: usize, prompt: PromptName, text: &str) -> String
     )
     // Infallible by construction: both segments satisfy the key grammar and
     // Str / in-range Int args always encode. An Err means cachekit changed
-    // its contract — fail loudly rather than silently stop caching.
-    .expect("interop_key: static segments and Str/Int args are always valid")
+    // its contract — surface it as a request error rather than panicking,
+    // which would kill the LocalSet worker thread the service runs on.
+    .map_err(|e| {
+        alaya_types::AlayaError::Embedding(format!("interop cache key construction failed: {e}"))
+    })
 }
 
 /// Build the L2 CacheKit client used for embeddings.
@@ -173,6 +176,36 @@ impl CachedEmbedding {
         }
     }
 
+    /// Feed the shared circuit breaker with one batch's per-op outcomes.
+    ///
+    /// Per-op deadlines make partial failure the normal degraded mode, so
+    /// batch-level flags would let a single fast key reset the breaker while
+    /// the rest of the batch times out. Failure wins ties: a half-dead L2
+    /// (e.g. 1 hit + 1 timeout per 2-key batch) must still trip the breaker
+    /// it exists for (#63), and a half-open probe that ties must not re-close
+    /// it.
+    fn record_l2_batch(
+        &self,
+        op: &'static str,
+        successes: usize,
+        failures: usize,
+        timeouts: usize,
+    ) {
+        if timeouts > 0 {
+            tracing::warn!(
+                op,
+                timeouts,
+                timeout_s = L2_OP_TIMEOUT.as_secs(),
+                "L2 cache ops timed out — treating as failures (non-fatal)"
+            );
+        }
+        if failures > 0 && failures >= successes {
+            self.l2_failure();
+        } else if successes > 0 {
+            self.l2_success();
+        }
+    }
+
     /// Concurrent L2 reads for a batch of keys. Reads use `interop_get`
     /// (strict interop/v1 decode): an off-format entry written by a foreign
     /// SDK becomes a diagnosable per-key miss instead of a breaker-tripping
@@ -193,8 +226,8 @@ impl CachedEmbedding {
             .collect();
         let raw_results = futures::future::join_all(futs).await;
 
-        let mut any_success = false;
-        let mut any_failure = false;
+        let mut successes = 0usize;
+        let mut failures = 0usize;
         let mut timeouts = 0usize;
 
         let results: Vec<Option<Vec<f32>>> = raw_results
@@ -206,38 +239,27 @@ impl CachedEmbedding {
                         .borrow_mut()
                         .insert(k.to_string(), embedding.clone());
                     self.hits_l2.set(self.hits_l2.get() + 1);
-                    any_success = true;
+                    successes += 1;
                     Some(embedding)
                 }
                 Ok(Ok(None)) => {
-                    any_success = true;
+                    successes += 1;
                     None
                 }
                 Ok(Err(e)) => {
                     tracing::debug!("L2 cache get failed (non-fatal): {e}");
-                    any_failure = true;
+                    failures += 1;
                     None
                 }
                 Err(_) => {
                     timeouts += 1;
-                    any_failure = true;
+                    failures += 1;
                     None
                 }
             })
             .collect();
 
-        if timeouts > 0 {
-            tracing::warn!(
-                timeouts,
-                timeout_s = L2_OP_TIMEOUT.as_secs(),
-                "L2 cache gets timed out — treating as failures (non-fatal)"
-            );
-        }
-        if any_success {
-            self.l2_success();
-        } else if any_failure {
-            self.l2_failure();
-        }
+        self.record_l2_batch("get", successes, failures, timeouts);
 
         results
     }
@@ -262,33 +284,23 @@ impl CachedEmbedding {
             .collect();
         let results = futures::future::join_all(futs).await;
 
-        let mut any_failure = false;
+        let mut successes = 0usize;
+        let mut failures = 0usize;
         let mut timeouts = 0usize;
         for result in results {
             match result {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => successes += 1,
                 Ok(Err(e)) => {
                     tracing::debug!("L2 cache set failed (non-fatal): {e}");
-                    any_failure = true;
+                    failures += 1;
                 }
                 Err(_) => {
                     timeouts += 1;
-                    any_failure = true;
+                    failures += 1;
                 }
             }
         }
-        if timeouts > 0 {
-            tracing::warn!(
-                timeouts,
-                timeout_s = L2_OP_TIMEOUT.as_secs(),
-                "L2 cache sets timed out — treating as failures (non-fatal)"
-            );
-        }
-        if any_failure {
-            self.l2_failure();
-        } else {
-            self.l2_success();
-        }
+        self.record_l2_batch("set", successes, failures, timeouts);
     }
 }
 
@@ -300,7 +312,7 @@ impl EmbeddingProvider for CachedEmbedding {
         let keys: Vec<String> = texts
             .iter()
             .map(|t| cache_key(model, dims, prompt_name, t))
-            .collect();
+            .collect::<Result<_>>()?;
 
         let mut results: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
         let mut miss_indices: Vec<usize> = Vec::new();
@@ -527,13 +539,14 @@ mod tests {
     /// Key derivation is deterministic and every argument is key-affecting.
     #[test]
     fn interop_key_deterministic_and_arg_sensitive() {
-        let k = cache_key("model-a", 1024, PromptName::Passage, "hello");
-        assert_eq!(k, cache_key("model-a", 1024, PromptName::Passage, "hello"));
+        let key = |m, d, p, t| cache_key(m, d, p, t).unwrap();
+        let k = key("model-a", 1024, PromptName::Passage, "hello");
+        assert_eq!(k, key("model-a", 1024, PromptName::Passage, "hello"));
         assert!(is_interop_embed_key(&k));
 
-        assert_ne!(k, cache_key("model-b", 1024, PromptName::Passage, "hello"));
-        assert_ne!(k, cache_key("model-a", 512, PromptName::Passage, "hello"));
-        assert_ne!(k, cache_key("model-a", 1024, PromptName::Query, "hello"));
-        assert_ne!(k, cache_key("model-a", 1024, PromptName::Passage, "world"));
+        assert_ne!(k, key("model-b", 1024, PromptName::Passage, "hello"));
+        assert_ne!(k, key("model-a", 512, PromptName::Passage, "hello"));
+        assert_ne!(k, key("model-a", 1024, PromptName::Query, "hello"));
+        assert_ne!(k, key("model-a", 1024, PromptName::Passage, "world"));
     }
 }
