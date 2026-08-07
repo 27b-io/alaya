@@ -244,6 +244,13 @@ impl CachedEmbedding {
 
     /// Batch L2 writes — concurrent, per-op deadline, errors tracked by
     /// circuit breaker.
+    ///
+    /// Plain `set` is the interop write path: cachekit-rs has no
+    /// `interop_set` because `set` already stores plain MessagePack with no
+    /// ByteStorage envelope — exactly the interop/v1 value format that
+    /// `interop_get` strict-decodes (documented on `CacheKit::interop_get`).
+    /// The write/read symmetry is proven cross-client by
+    /// `l2_keys_reach_backend_verbatim` below.
     async fn l2_set_batch(&self, entries: &[(&str, &Vec<f32>)]) {
         let l2 = match self.l2.as_ref() {
             Some(l2) => l2,
