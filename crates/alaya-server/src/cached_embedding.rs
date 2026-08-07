@@ -26,9 +26,11 @@ use alaya_types::search::PromptName;
 const BREAKER_THRESHOLD: u32 = 3;
 /// Seconds to wait before retrying L2 after circuit opens.
 const BREAKER_COOLDOWN_SECS: f64 = 30.0;
-/// Deadline for one L2 batch (Redis round-trips normally take <10ms).
+/// Per-op deadline for L2 reads/writes (Redis round-trips normally take
+/// <10ms; SaaS WAN round-trips hundreds of ms — ops in a batch run
+/// concurrently, so the batch wall clock stays ~this bound either way).
 ///
-/// cachekit-rs 0.3 sets no fred command timeout (default = wait forever) and
+/// cachekit-rs sets no fred command timeout (default = wait forever) and
 /// no reconnect policy, so a blackholed connection — e.g. the Redis pod IP
 /// vanishing without an RST — hangs `get`/`set` awaits indefinitely. That
 /// silence never trips the circuit breaker (it only counts errors) and wedged
@@ -47,8 +49,7 @@ fn now_secs() -> f64 {
 /// argument array `[model, dims, prompt_name, text]`). Cross-SDK shareable —
 /// any cachekit SDK hashing the same arguments derives the same key (spec:
 /// cachekit-protocol/spec/interop-mode.md). Model and dims live in the args,
-/// not a client namespace: interop segments forbid `/` and uppercase, and a
-/// namespace prefix would break key conformance (see [`build_l2_client`]).
+/// not a client namespace — see [`build_l2_client`] for why that matters.
 ///
 /// Replaced the legacy `SHA-256(prompt:text)` key under a
 /// `alaya:embed:{model}:{dims}` client namespace (LAB-372, 2026-08-08).
@@ -172,35 +173,35 @@ impl CachedEmbedding {
         }
     }
 
-    /// Concurrent L2 reads for a batch of keys.
+    /// Concurrent L2 reads for a batch of keys. Reads use `interop_get`
+    /// (strict interop/v1 decode): an off-format entry written by a foreign
+    /// SDK becomes a diagnosable per-key miss instead of a breaker-tripping
+    /// decode error — the exact mixed-SDK deployment this key format enables.
     async fn l2_get_batch(&self, keys: &[&str]) -> Vec<Option<Vec<f32>>> {
         let l2 = match self.l2.as_ref() {
             Some(l2) => l2,
             None => return vec![None; keys.len()],
         };
 
-        let futs: Vec<_> = keys.iter().map(|k| l2.get::<Vec<f32>>(k)).collect();
-        let raw_results =
-            match tokio::time::timeout(L2_OP_TIMEOUT, futures::future::join_all(futs)).await {
-                Ok(r) => r,
-                Err(_) => {
-                    tracing::warn!(
-                        timeout_s = L2_OP_TIMEOUT.as_secs(),
-                        "L2 cache get batch timed out — treating as failure (non-fatal)"
-                    );
-                    self.l2_failure();
-                    return vec![None; keys.len()];
-                }
-            };
+        // Per-op deadline (not whole-batch): ops run concurrently so the
+        // wall clock stays ~L2_OP_TIMEOUT, a single slow key degrades to a
+        // per-key miss instead of failing the whole batch, and the budget
+        // holds for both in-cluster Redis and WAN SaaS round-trips.
+        let futs: Vec<_> = keys
+            .iter()
+            .map(|k| tokio::time::timeout(L2_OP_TIMEOUT, l2.interop_get::<Vec<f32>>(k)))
+            .collect();
+        let raw_results = futures::future::join_all(futs).await;
 
         let mut any_success = false;
         let mut any_failure = false;
+        let mut timeouts = 0usize;
 
         let results: Vec<Option<Vec<f32>>> = raw_results
             .into_iter()
             .zip(keys)
             .map(|(result, k)| match result {
-                Ok(Some(embedding)) => {
+                Ok(Ok(Some(embedding))) => {
                     self.l1
                         .borrow_mut()
                         .insert(k.to_string(), embedding.clone());
@@ -208,18 +209,30 @@ impl CachedEmbedding {
                     any_success = true;
                     Some(embedding)
                 }
-                Ok(None) => {
+                Ok(Ok(None)) => {
                     any_success = true;
                     None
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::debug!("L2 cache get failed (non-fatal): {e}");
+                    any_failure = true;
+                    None
+                }
+                Err(_) => {
+                    timeouts += 1;
                     any_failure = true;
                     None
                 }
             })
             .collect();
 
+        if timeouts > 0 {
+            tracing::warn!(
+                timeouts,
+                timeout_s = L2_OP_TIMEOUT.as_secs(),
+                "L2 cache gets timed out — treating as failures (non-fatal)"
+            );
+        }
         if any_success {
             self.l2_success();
         } else if any_failure {
@@ -229,31 +242,40 @@ impl CachedEmbedding {
         results
     }
 
-    /// Batch L2 writes — concurrent, errors tracked by circuit breaker.
+    /// Batch L2 writes — concurrent, per-op deadline, errors tracked by
+    /// circuit breaker.
     async fn l2_set_batch(&self, entries: &[(&str, &Vec<f32>)]) {
         let l2 = match self.l2.as_ref() {
             Some(l2) => l2,
             None => return,
         };
-        let futs: Vec<_> = entries.iter().map(|(k, v)| l2.set(k, *v)).collect();
-        let results =
-            match tokio::time::timeout(L2_OP_TIMEOUT, futures::future::join_all(futs)).await {
-                Ok(r) => r,
-                Err(_) => {
-                    tracing::warn!(
-                        timeout_s = L2_OP_TIMEOUT.as_secs(),
-                        "L2 cache set batch timed out — treating as failure (non-fatal)"
-                    );
-                    self.l2_failure();
-                    return;
-                }
-            };
+        let futs: Vec<_> = entries
+            .iter()
+            .map(|(k, v)| tokio::time::timeout(L2_OP_TIMEOUT, l2.set(k, *v)))
+            .collect();
+        let results = futures::future::join_all(futs).await;
+
         let mut any_failure = false;
+        let mut timeouts = 0usize;
         for result in results {
-            if let Err(e) = result {
-                tracing::debug!("L2 cache set failed (non-fatal): {e}");
-                any_failure = true;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::debug!("L2 cache set failed (non-fatal): {e}");
+                    any_failure = true;
+                }
+                Err(_) => {
+                    timeouts += 1;
+                    any_failure = true;
+                }
             }
+        }
+        if timeouts > 0 {
+            tracing::warn!(
+                timeouts,
+                timeout_s = L2_OP_TIMEOUT.as_secs(),
+                "L2 cache sets timed out — treating as failures (non-fatal)"
+            );
         }
         if any_failure {
             self.l2_failure();
@@ -312,24 +334,19 @@ impl EmbeddingProvider for CachedEmbedding {
         let miss_texts: Vec<&str> = miss_indices.iter().map(|&i| texts[i]).collect();
         let fresh = self.inner.embed_batch(&miss_texts, prompt_name).await?;
 
-        // Populate L1 + results, collect keys for L2 batch write
-        let mut l2_write_keys: Vec<usize> = Vec::new();
+        // Populate L1 + results
         for (&idx, embedding) in miss_indices.iter().zip(fresh) {
             self.l1
                 .borrow_mut()
                 .insert(keys[idx].clone(), embedding.clone());
-            l2_write_keys.push(idx);
             results[idx] = Some(embedding);
         }
 
         // Batch L2 writes concurrently (if circuit breaker allows)
         if self.l2_available() {
-            let entries: Vec<(&str, &Vec<f32>)> = l2_write_keys
+            let entries: Vec<(&str, &Vec<f32>)> = miss_indices
                 .iter()
-                .filter_map(|&idx| {
-                    let emb = results[idx].as_ref()?;
-                    Some((keys[idx].as_str(), emb))
-                })
+                .filter_map(|&idx| Some((keys[idx].as_str(), results[idx].as_ref()?)))
                 .collect();
             self.l2_set_batch(&entries).await;
         }
@@ -465,12 +482,11 @@ mod tests {
         })
     }
 
-    /// LAB-372 Phase 2 namespace trap: keys must reach the backend as verbatim
-    /// interop/v1 keys — `alaya:embed:` + 64 lowercase hex, NO client `ns:`
-    /// prefix. A namespaced client silently prefixes plain get/set (unlike
-    /// interop_get, which fails closed), producing keys no other SDK can
-    /// compute. Exercises the same `build_l2_client` production uses, and
-    /// proves a second process (cold L1, shared L2) hits the cache.
+    /// LAB-372 Phase 2 namespace trap (see [`build_l2_client`]): keys must
+    /// reach the backend as verbatim interop/v1 keys — `alaya:embed:` + 64
+    /// lowercase hex, no client `ns:` prefix. Exercises the same
+    /// `build_l2_client` production uses, and proves a second process
+    /// (cold L1, shared L2) hits the cache.
     #[tokio::test]
     async fn l2_keys_reach_backend_verbatim() {
         let backend = std::rc::Rc::new(RecordingBackend::default());

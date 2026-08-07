@@ -233,10 +233,10 @@ async fn init_l2_redis(
 /// retry; the builder validates the API key and URL (HTTPS-only, host
 /// allowlist, private IPs blocked upstream).
 fn init_l2_saas() -> std::result::Result<cachekit::CacheKit, Box<dyn std::error::Error>> {
-    let api_key = std::env::var("CACHEKIT_API_KEY")
-        .map_err(|_| "CACHE_BACKEND=saas requires CACHEKIT_API_KEY")?;
+    let api_key =
+        env_non_empty("CACHEKIT_API_KEY").ok_or("CACHE_BACKEND=saas requires CACHEKIT_API_KEY")?;
     let mut builder = cachekit::backend::cachekitio::CachekitIO::builder().api_key(api_key);
-    if let Ok(url) = std::env::var("CACHEKIT_API_URL") {
+    if let Some(url) = env_non_empty("CACHEKIT_API_URL") {
         builder = builder.api_url(url);
     }
     let backend = builder.build()?;
@@ -245,61 +245,63 @@ fn init_l2_saas() -> std::result::Result<cachekit::CacheKit, Box<dyn std::error:
     ))?)
 }
 
+/// Env var treated as unset when blank — k8s manifests commonly ship
+/// `value: ""`, which must route to the explicit "missing" handling, not an
+/// opaque downstream builder error.
+fn env_non_empty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
 /// L2 embedding cache init, dispatched on `CACHE_BACKEND` (default `redis`).
 /// Never fatal — any failure degrades to L1-only, matching the L2's
 /// non-fatal-by-design posture.
 async fn init_l2_cache() -> Option<cachekit::CacheKit> {
     let backend = std::env::var("CACHE_BACKEND").unwrap_or_else(|_| "redis".to_string());
-    let l2 = match backend.as_str() {
+    // A CacheKit API key alongside a non-saas backend is a near-certain
+    // "forgot the switch" misconfig — say so instead of silently ignoring it.
+    if backend != "saas" && env_non_empty("CACHEKIT_API_KEY").is_some() {
+        tracing::warn!(
+            backend = %backend,
+            "CACHEKIT_API_KEY is set but CACHE_BACKEND is not \"saas\" — SaaS cache backend NOT in use"
+        );
+    }
+    let init = match backend.as_str() {
         "redis" => {
-            let url = match std::env::var("REDIS_CACHE_URL") {
-                Ok(url) => url,
-                Err(_) => {
-                    tracing::info!("REDIS_CACHE_URL not set — L1-only embedding cache");
-                    return None;
-                }
+            let Some(url) = env_non_empty("REDIS_CACHE_URL") else {
+                tracing::info!("REDIS_CACHE_URL not set — L1-only embedding cache");
+                return None;
             };
-            match init_l2_redis(&url).await {
-                Ok(ck) => {
-                    tracing::info!("L2 embedding cache enabled (Redis)");
-                    Some(ck)
-                }
-                Err(e) => {
-                    tracing::warn!("L2 cache init failed, running L1-only: {e}");
-                    None
-                }
-            }
+            init_l2_redis(&url).await
         }
-        "saas" => match init_l2_saas() {
-            Ok(ck) => {
-                tracing::info!("L2 embedding cache enabled (cachekit.io SaaS)");
-                Some(ck)
-            }
-            Err(e) => {
-                tracing::warn!("L2 SaaS cache init failed, running L1-only: {e}");
-                None
-            }
-        },
+        "saas" => init_l2_saas(),
         other => {
             tracing::warn!(
                 value = other,
                 "unknown CACHE_BACKEND (expected \"redis\" or \"saas\") — L1-only embedding cache"
             );
-            None
+            return None;
         }
     };
-    if l2.is_some() {
-        // Key-cutover announcement (LAB-372): interop/v1 keys replaced the
-        // legacy SHA-256 keys on 2026-08-08, invalidating the warm cache.
-        // Legacy entries (namespaced `alaya:embed:<model>:<dims>:<sha256>`)
-        // are orphaned and expire via their 30-day TTL; flush them to reclaim
-        // memory sooner. One-time re-embed cost until the cache re-warms.
-        tracing::info!(
-            "L2 embedding keys use cross-SDK interop/v1 — legacy SHA-256 entries \
-             are orphaned and expire via TTL (cutover 2026-08-08, LAB-372)"
-        );
+    match init {
+        Ok(ck) => {
+            // Key-cutover announcement (LAB-372): interop/v1 keys replaced the
+            // legacy SHA-256 keys on 2026-08-08, invalidating the warm cache.
+            // Legacy entries (namespaced `alaya:embed:<model>:<dims>:<sha256>`)
+            // are orphaned and expire via their 30-day TTL; flush them to
+            // reclaim memory sooner (command in CLAUDE.md). One-time re-embed
+            // cost until the cache re-warms. Log removable after 2026-09-08.
+            tracing::info!(
+                backend = %backend,
+                "L2 embedding cache enabled — keys are cross-SDK interop/v1; legacy \
+                 SHA-256 entries are orphaned and expire via TTL (cutover 2026-08-08, LAB-372)"
+            );
+            Some(ck)
+        }
+        Err(e) => {
+            tracing::warn!(backend = %backend, "L2 cache init failed, running L1-only: {e}");
+            None
+        }
     }
-    l2
 }
 
 /// Ensure the Qdrant collection exists before the server serves writes, so a
