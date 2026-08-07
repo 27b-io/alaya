@@ -184,6 +184,12 @@ impl CachedEmbedding {
     /// (e.g. 1 hit + 1 timeout per 2-key batch) must still trip the breaker
     /// it exists for (#63), and a half-open probe that ties must not re-close
     /// it.
+    ///
+    /// The majority rule applies to both get and set feeds. The set path's
+    /// old any-failure sensitivity was intentionally loosened (LAB-372): the
+    /// breaker guards L2 transport liveness, per-op deadlines already turn
+    /// stragglers into per-key misses, and a mostly-successful batch proves
+    /// the backend alive — tripping on it would discard all cache traffic.
     fn record_l2_batch(
         &self,
         op: &'static str,
@@ -234,6 +240,21 @@ impl CachedEmbedding {
             .into_iter()
             .zip(keys)
             .map(|(result, k)| match result {
+                // A hit must carry the dims this provider serves: a decodable
+                // Vec<f32> of the wrong length (misconfigured/buggy foreign
+                // writer) would flow into Qdrant as a poisoned embedding and,
+                // unlike an off-format entry, never fail loudly. Miss instead
+                // — the caller's re-embed overwrites it.
+                Ok(Ok(Some(embedding))) if embedding.len() != self.inner.dimensions() => {
+                    tracing::warn!(
+                        key = %k,
+                        got = embedding.len(),
+                        want = self.inner.dimensions(),
+                        "L2 entry has wrong dimensions — treating as miss"
+                    );
+                    successes += 1;
+                    None
+                }
                 Ok(Ok(Some(embedding))) => {
                     self.l1
                         .borrow_mut()
@@ -243,6 +264,17 @@ impl CachedEmbedding {
                     Some(embedding)
                 }
                 Ok(Ok(None)) => {
+                    successes += 1;
+                    None
+                }
+                // Decode failure ≠ transport failure: the backend round-trip
+                // succeeded, only the payload is off-format (foreign SDK bug,
+                // corrupt entry). Count it as a breaker success and a per-key
+                // miss — the caller's re-embed overwrites the bad entry, so
+                // this self-heals instead of opening the breaker on a healthy
+                // L2.
+                Ok(Err(cachekit::CachekitError::Serialization(e))) => {
+                    tracing::warn!(key = %k, "L2 entry failed interop decode — treating as miss: {e}");
                     successes += 1;
                     None
                 }
@@ -534,6 +566,68 @@ mod tests {
                 "key on the wire is not a verbatim interop/v1 key (namespaced client?): {k}"
             );
         }
+    }
+
+    /// Interop decode failures are per-key misses, not breaker failures:
+    /// repeated reads of an off-format entry (foreign SDK bug, corruption)
+    /// must never open the breaker — the backend transport is healthy.
+    #[tokio::test]
+    async fn decode_errors_are_misses_and_do_not_open_breaker() {
+        let backend = std::rc::Rc::new(RecordingBackend::default());
+        let key = cache_key("stub", 4, PromptName::Passage, "hello").unwrap();
+        // 0xc1 is reserved in MessagePack — guaranteed Serialization error.
+        backend.store.borrow_mut().insert(key.clone(), vec![0xc1]);
+
+        let l2 = build_l2_client(backend.clone()).unwrap();
+        let cache = CachedEmbedding::new(Box::new(StubEmbeddings), 10, Some(l2));
+
+        for _ in 0..BREAKER_THRESHOLD {
+            let got = cache.l2_get_batch(&[key.as_str()]).await;
+            assert_eq!(got, vec![None], "decode error must surface as a miss");
+        }
+        assert_eq!(cache.l2_failures.get(), 0, "decode errors fed the breaker");
+
+        // Full path self-heals: the miss re-embeds and overwrites the bad entry.
+        cache
+            .embed_batch(&["hello"], PromptName::Passage)
+            .await
+            .unwrap();
+        let stored = backend.store.borrow().get(&key).cloned().unwrap();
+        assert_ne!(
+            stored,
+            vec![0xc1],
+            "re-embed must overwrite the corrupt entry"
+        );
+    }
+
+    /// On-format poison: a decodable Vec<f32> with the wrong dimensions must
+    /// be a per-key miss (not a hit, not a breaker failure) — served as-is it
+    /// would reach Qdrant as a poisoned embedding, and it never decode-fails.
+    #[tokio::test]
+    async fn wrong_dims_entry_is_miss_and_overwritten() {
+        let backend = std::rc::Rc::new(RecordingBackend::default());
+        let key = cache_key("stub", 4, PromptName::Passage, "hello").unwrap();
+
+        // Plant a valid 3-dim entry via the same plain-set interop write path.
+        let planter = build_l2_client(backend.clone()).unwrap();
+        planter.set(&key, &vec![0.1_f32; 3]).await.unwrap();
+
+        let l2 = build_l2_client(backend.clone()).unwrap();
+        let cache = CachedEmbedding::new(Box::new(StubEmbeddings), 10, Some(l2));
+
+        let got = cache.l2_get_batch(&[key.as_str()]).await;
+        assert_eq!(got, vec![None], "wrong-dims entry must surface as a miss");
+        assert_eq!(cache.hits_l2.get(), 0);
+        assert_eq!(cache.l2_failures.get(), 0, "wrong dims fed the breaker");
+
+        // Self-heals: the miss re-embeds and overwrites with 4-dim data.
+        cache
+            .embed_batch(&["hello"], PromptName::Passage)
+            .await
+            .unwrap();
+        let reader = build_l2_client(backend.clone()).unwrap();
+        let healed: Option<Vec<f32>> = reader.interop_get(&key).await.unwrap();
+        assert_eq!(healed.unwrap().len(), 4, "re-embed must overwrite poison");
     }
 
     /// Key derivation is deterministic and every argument is key-affecting.
