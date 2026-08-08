@@ -260,9 +260,11 @@ fn handle_initialize(id: Value) -> JsonRpcResponse {
             "capabilities": {
                 "tools": { "listChanged": false }
             },
+            // SHA-qualified so an MCP client can tell two releases of the same
+            // crate version apart — bare CARGO_PKG_VERSION could not (#70).
             "serverInfo": {
                 "name": "alaya",
-                "version": env!("CARGO_PKG_VERSION")
+                "version": crate::build_info::version_qualified()
             },
             "instructions": SERVER_INSTRUCTIONS
         }),
@@ -676,6 +678,21 @@ mod tests {
         assert_eq!(v["result"]["protocolVersion"], "2025-03-26");
         assert!(v["result"]["capabilities"]["tools"].is_object());
         assert_eq!(v["result"]["serverInfo"]["name"], "alaya");
+
+        // serverInfo.version must carry build identity, not a bare crate
+        // version that can't distinguish two releases (#70). Without a build
+        // SHA it degrades to the bare version — never absent or empty.
+        let reported = v["result"]["serverInfo"]["version"]
+            .as_str()
+            .expect("serverInfo.version must be a string");
+        assert_eq!(reported, crate::build_info::version_qualified());
+        assert!(
+            reported.starts_with(crate::build_info::version()),
+            "serverInfo.version must begin with the crate version, got {reported}"
+        );
+        if let Some(sha) = crate::build_info::git_sha() {
+            assert_eq!(reported, format!("{}+{sha}", crate::build_info::version()));
+        }
 
         // instructions must carry the cross-tool hash convention
         let instructions = v["result"]["instructions"]

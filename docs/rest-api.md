@@ -53,15 +53,39 @@ curl http://localhost:3001/health
 
 ```json
 {
-  "status": "ok",
-  "qdrant": "ok",
-  "graph": "ok",
-  "embedding": "ok",
-  "memory_count": 1247
+  "status": "healthy",
+  "version": "0.1.0",
+  "git_sha": "2f9c1a4b6d8e0f2a4c6e8b0d2f4a6c8e0b2d4f6a",
+  "built_at": "2026-08-09T11:22:33Z",
+  "backend": "qdrant",
+  "worker": { "state": "ok", "stalled": false, "last_progress_age_s": 3 },
+  "vector_health": { "status": "green" },
+  "graph_health": { "status": "healthy" },
+  "total_memories": 1247
 }
 ```
 
-`status` is `ok` only when every backend is healthy. Returns HTTP 200 either way — read the body for detail.
+`status` is `healthy` when every backend is reachable, `degraded` (HTTP 200) when
+a backend is down — restarting the pod won't fix Qdrant — and `unhealthy`
+(HTTP 503) when the service worker has stalled, so a liveness probe restarts it.
+
+### Build identity
+
+`version`, `git_sha` and `built_at` answer "is build X live?" without cluster
+access. `version` is the crate semver; `git_sha` is the full 40-hex commit the
+binary was built from; `built_at` is an RFC3339 timestamp. The last two are
+`null` for any build that didn't pass them (a plain `cargo build`, or `docker
+build` without `--build-arg`) — absence is never an error. Verify a rollout with:
+
+```bash
+curl -s http://localhost:3001/health | jq -r .git_sha   # == git rev-parse HEAD
+```
+
+> [!NOTE]
+> Before v0.1.0's build-identity change, `version` carried the git SHA. It now
+> carries the crate semver — read `git_sha` for the commit. The MCP
+> `initialize` response reports both together as `serverInfo.version`
+> (`0.1.0+<sha>`, semver build metadata).
 
 ## `POST /store`
 

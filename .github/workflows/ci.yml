@@ -71,12 +71,21 @@ jobs:
             type=sha
             type=raw,value=latest
 
+      # Build identity for GET /health + MCP serverInfo (#70). Stamped here
+      # rather than in the Dockerfile so the value is deterministic per run
+      # and a cached build layer can't carry a stale timestamp forward.
+      - name: Stamp build timestamp
+        id: stamp
+        run: echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: GIT_SHA=${{ github.sha }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            BUILT_AT=${{ steps.stamp.outputs.built_at }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
