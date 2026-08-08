@@ -190,17 +190,15 @@ fn is_private_host(url: &str) -> bool {
 const L2_MAX_ATTEMPTS: u32 = 5;
 const L2_BASE_RETRY_MS: u64 = 500;
 
-async fn init_l2_cache(
+async fn init_l2_redis(
     url: &str,
-    model: &str,
-    dims: usize,
 ) -> std::result::Result<cachekit::CacheKit, Box<dyn std::error::Error>> {
     let redis = cachekit::backend::redis::RedisBackend::builder()
         .url(url)
         .build()?;
     // Retry connection with backoff — at pod startup the CNI/kube-proxy may
     // not have finished installing network rules yet, causing ECONNREFUSED.
-    // Each attempt is deadline-bounded: cachekit 0.3 sets no fred connect
+    // Each attempt is deadline-bounded: cachekit sets no fred connect
     // timeout, and a blackholed target here would otherwise hang the worker
     // thread before its command loop ever starts (#63).
     let mut last_err: Option<String> = None;
@@ -212,13 +210,7 @@ async fn init_l2_cache(
                 if attempt > 0 {
                     tracing::info!(attempt, "L2 cache connected after retry");
                 }
-                let ns = format!("alaya:embed:{model}:{dims}");
-                return Ok(cachekit::CacheKit::builder()
-                    .backend(std::rc::Rc::new(redis))
-                    .namespace(ns)
-                    .default_ttl(std::time::Duration::from_secs(86400 * 30))
-                    .no_l1()
-                    .build()?);
+                return Ok(cached_embedding::build_l2_client(std::rc::Rc::new(redis))?);
             }
             Ok(Err(e)) => e.to_string(),
             Err(_) => "connect timed out after 10s".to_string(),
@@ -235,6 +227,86 @@ async fn init_l2_cache(
     Err(last_err
         .unwrap_or_else(|| "L2 cache init: no connection attempts made".to_string())
         .into())
+}
+
+/// cachekit.io SaaS backend (`CACHE_BACKEND=saas`). HTTP — no connection to
+/// retry; the builder validates the API key and URL (HTTPS-only, host
+/// allowlist, private IPs blocked upstream).
+fn init_l2_saas() -> std::result::Result<cachekit::CacheKit, Box<dyn std::error::Error>> {
+    let api_key =
+        env_non_empty("CACHEKIT_API_KEY").ok_or("CACHE_BACKEND=saas requires CACHEKIT_API_KEY")?;
+    let mut builder = cachekit::backend::cachekitio::CachekitIO::builder().api_key(api_key);
+    if let Some(url) = env_non_empty("CACHEKIT_API_URL") {
+        builder = builder.api_url(url);
+    }
+    let backend = builder.build()?;
+    Ok(cached_embedding::build_l2_client(std::rc::Rc::new(
+        backend,
+    ))?)
+}
+
+/// Env var treated as unset when blank, returned trimmed — k8s manifests
+/// commonly ship `value: ""` (must route to the explicit "missing" handling,
+/// not an opaque downstream builder error) and padded/newline-suffixed values
+/// (folded YAML scalars, `echo`-piped secrets) that would fail string matches
+/// and downstream builders if passed through raw.
+fn env_non_empty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// L2 embedding cache init, dispatched on `CACHE_BACKEND` (default `redis`).
+/// Never fatal — any failure degrades to L1-only, matching the L2's
+/// non-fatal-by-design posture.
+async fn init_l2_cache() -> Option<cachekit::CacheKit> {
+    let backend = env_non_empty("CACHE_BACKEND").unwrap_or_else(|| "redis".to_string());
+    // A CacheKit API key alongside a non-saas backend is a near-certain
+    // "forgot the switch" misconfig — say so instead of silently ignoring it.
+    if backend != "saas" && env_non_empty("CACHEKIT_API_KEY").is_some() {
+        tracing::warn!(
+            backend = %backend,
+            "CACHEKIT_API_KEY is set but CACHE_BACKEND is not \"saas\" — SaaS cache backend NOT in use"
+        );
+    }
+    let init = match backend.as_str() {
+        "redis" => {
+            let Some(url) = env_non_empty("REDIS_CACHE_URL") else {
+                tracing::info!("REDIS_CACHE_URL not set — L1-only embedding cache");
+                return None;
+            };
+            init_l2_redis(&url).await
+        }
+        "saas" => init_l2_saas(),
+        other => {
+            tracing::warn!(
+                value = other,
+                "unknown CACHE_BACKEND (expected \"redis\" or \"saas\") — L1-only embedding cache"
+            );
+            return None;
+        }
+    };
+    match init {
+        Ok(ck) => {
+            // Key-cutover announcement (LAB-372): interop/v1 keys replaced the
+            // legacy SHA-256 keys on 2026-08-08, invalidating the warm cache.
+            // Legacy entries (namespaced `alaya:embed:<model>:<dims>:<sha256>`)
+            // are orphaned and expire via their 30-day TTL; flush them to
+            // reclaim memory sooner (command in CLAUDE.md). One-time re-embed
+            // cost until the cache re-warms. Log removable after 2026-09-08.
+            tracing::info!(
+                backend = %backend,
+                "L2 embedding cache enabled — keys are cross-SDK interop/v1; legacy \
+                 SHA-256 entries are orphaned and expire via TTL (cutover 2026-08-08, LAB-372)"
+            );
+            Some(ck)
+        }
+        Err(e) => {
+            tracing::warn!(backend = %backend, "L2 cache init failed, running L1-only: {e}");
+            None
+        }
+    }
 }
 
 /// Ensure the Qdrant collection exists before the server serves writes, so a
@@ -1378,31 +1450,16 @@ fn main() {
                 // Fresh-deploy bootstrap: create the memory collection if it is
                 // absent so the first write doesn't 404 (#31).
                 ensure_qdrant_collection(&qdrant, cfg_clone.embedding_dimensions).await;
-                let embed_model = cfg_clone.embedding_model;
-                let embed_dims = cfg_clone.embedding_dimensions;
                 let embeddings = EmbeddingClient::new(
                     cfg_clone.embedding_url,
-                    embed_model.clone(),
-                    embed_dims,
+                    cfg_clone.embedding_model,
+                    cfg_clone.embedding_dimensions,
                     cfg_clone.embedding_batch_size,
                     None,
                 );
-                // L2 embedding cache: Redis via cachekit-rs (optional)
-                let l2_cache = if let Ok(url) = std::env::var("REDIS_CACHE_URL") {
-                    match init_l2_cache(&url, &embed_model, embed_dims).await {
-                        Ok(ck) => {
-                            tracing::info!("L2 embedding cache enabled (Redis)");
-                            Some(ck)
-                        }
-                        Err(e) => {
-                            tracing::warn!("L2 cache init failed, running L1-only: {e}");
-                            None
-                        }
-                    }
-                } else {
-                    tracing::info!("REDIS_CACHE_URL not set — L1-only embedding cache");
-                    None
-                };
+                // L2 embedding cache via cachekit-rs (optional) — backend
+                // selected by CACHE_BACKEND (redis default, saas).
+                let l2_cache = init_l2_cache().await;
                 let cached_embeddings = cached_embedding::CachedEmbedding::new(
                     Box::new(embeddings),
                     10_000, // L1 max cached embeddings (~40 MB at 1024 dims)
