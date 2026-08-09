@@ -641,8 +641,13 @@ impl HealthChecker {
             tracing::debug!(op = "health", elapsed_ms = elapsed, status, "ok (direct)");
         }
 
-        let mut body = json!({
+        json!({
             "status": status,
+            // Build identity so any consumer can answer "is build X live?"
+            // without cluster access (#70). null when the build didn't pass it.
+            "version": build_info::version(),
+            "git_sha": build_info::git_sha(),
+            "built_at": build_info::built_at(),
             "backend": "qdrant",
             "worker": {
                 "state": worker_state,
@@ -658,16 +663,7 @@ impl HealthChecker {
                 Err(e) => json!({"status": "unhealthy", "error": e}),
             },
             "total_memories": count.unwrap_or(0),
-        });
-
-        // Build identity (version / git_sha / built_at) so any authenticated
-        // consumer can answer "is build X live?" without cluster access (#70).
-        // Merged rather than inlined so the key names live in one place.
-        body.as_object_mut()
-            .expect("health body is a json object")
-            .extend(build_info::health_fields());
-
-        body
+        })
     }
 
     async fn check_qdrant(&self) -> Result<Value, String> {

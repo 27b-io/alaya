@@ -679,20 +679,18 @@ mod tests {
         assert!(v["result"]["capabilities"]["tools"].is_object());
         assert_eq!(v["result"]["serverInfo"]["name"], "alaya");
 
-        // serverInfo.version must carry build identity, not a bare crate
-        // version that can't distinguish two releases (#70). Without a build
-        // SHA it degrades to the bare version — never absent or empty.
+        // serverInfo.version must lead with the crate version so the
+        // SHA-qualified form stays `<semver>+<sha>` (#70) — this catches a
+        // regression to a bare SHA or a SHA-first format. The qualification
+        // itself is tested in build_info::tests::qualify_appends_sha_as_build_metadata,
+        // since a test binary compiles with no ALAYA_GIT_SHA to qualify with.
         let reported = v["result"]["serverInfo"]["version"]
             .as_str()
             .expect("serverInfo.version must be a string");
-        assert_eq!(reported, crate::build_info::version_qualified());
         assert!(
             reported.starts_with(crate::build_info::version()),
             "serverInfo.version must begin with the crate version, got {reported}"
         );
-        if let Some(sha) = crate::build_info::git_sha() {
-            assert_eq!(reported, format!("{}+{sha}", crate::build_info::version()));
-        }
 
         // instructions must carry the cross-tool hash convention
         let instructions = v["result"]["instructions"]
