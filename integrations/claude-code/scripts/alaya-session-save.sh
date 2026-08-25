@@ -30,6 +30,17 @@ _numeric_or_default() { # <value> <default>
 DEDUP_THRESHOLD=$(_numeric_or_default "${ALAYA_DEDUP_THRESHOLD:-0.70}" 0.70)
 IMPORTANCE=$(_numeric_or_default "${ALAYA_IMPORTANCE:-0.7}" 0.7)
 
+# The gate vars feed integer [[ -lt ]] comparisons — a non-numeric override
+# ("5m") would error the test falsy and silently disable the gate entirely.
+_int_or_default() { # <value> <default>
+    [[ "$1" =~ ^[0-9]+$ ]] && printf '%s' "$1" || printf '%s' "$2"
+}
+MIN_DURATION_SECS=$(_int_or_default "$MIN_DURATION_SECS" 120)
+MIN_NEW_MESSAGES=$(_int_or_default "$MIN_NEW_MESSAGES" 5)
+COOLDOWN_SECS=$(_int_or_default "$COOLDOWN_SECS" 300)
+MEMORY_CAP=$(_int_or_default "$MEMORY_CAP" 3)
+SECRET_CACHE_MINUTES=$(_int_or_default "$SECRET_CACHE_MINUTES" 720)
+
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 _log_failure() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$STATE_DIR/failures.log" 2>/dev/null || true; }
 _skip() { _log_failure "$1"; exit 0; }
@@ -45,6 +56,12 @@ _iso_to_epoch() {
 # Absent config is a logged no-op, never a hook error surfaced into the session.
 [[ -z "${ALAYA_URL:-}" ]] && _skip "config: ALAYA_URL not set, skipping save"
 [[ -z "${ALAYA_LLM_URL:-}" ]] && _skip "config: ALAYA_LLM_URL not set, skipping save"
+command -v jq >/dev/null 2>&1 || _skip "config: jq not found on PATH, skipping save"
+
+# Disable errexit for everything downstream: pipelines that use head would die
+# to SIGPIPE under pipefail, and any parse failure past this point must reach
+# a logged skip, not an unlogged errexit death (LAB-170).
+set +e
 
 INPUT=$(cat)
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
@@ -53,13 +70,11 @@ TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
 # --- Gate: need a transcript ---
 [[ -z "$TRANSCRIPT" || ! -f "$TRANSCRIPT" ]] && exit 0
 
-# Disable errexit before pipelines that use head (SIGPIPE kills jq under pipefail)
-set +e
-
 # --- Gate: skip short sessions ---
 START_ISO=$(jq -r 'select(.timestamp != null) | .timestamp' "$TRANSCRIPT" 2>/dev/null | head -1)
 [[ -z "$START_ISO" ]] && exit 0
-START_EPOCH=$(_iso_to_epoch "$START_ISO") || exit 0
+START_EPOCH=$(_iso_to_epoch "$START_ISO")
+[[ -z "$START_EPOCH" ]] && _skip "cannot parse transcript timestamp '$START_ISO' (no working date/python3)"
 NOW_EPOCH=$(date +%s)
 DURATION=$((NOW_EPOCH - START_EPOCH))
 [[ $DURATION -lt $MIN_DURATION_SECS ]] && exit 0
@@ -87,6 +102,10 @@ LAST_SAVE_COUNT=0
 if [[ -f "$STATE_FILE" ]]; then
     LAST_SAVE_EPOCH=$(sed -n '1p' "$STATE_FILE" 2>/dev/null || echo 0)
     LAST_SAVE_COUNT=$(sed -n '2p' "$STATE_FILE" 2>/dev/null || echo 0)
+    # A torn/garbage state file must degrade to "no previous save", not kill
+    # the hook with an unlogged arithmetic error under set -u.
+    [[ "$LAST_SAVE_EPOCH" =~ ^[0-9]+$ ]] || LAST_SAVE_EPOCH=0
+    [[ "$LAST_SAVE_COUNT" =~ ^[0-9]+$ ]] || LAST_SAVE_COUNT=0
 fi
 
 # Skip if not enough new messages since last save
@@ -144,9 +163,16 @@ _resolve_secret() { # <env-var-name> <cache-file>
         # Resolver's own stderr (e.g. "op: command not found", vault-not-found)
         # goes to failures.log instead of /dev/null — it's the one piece of
         # info that explains WHICH failure mode this is.
-        if val=$(eval "$cmd" 2>>"$STATE_DIR/failures.log") && [[ -n "$val" ]]; then
-            printf '%s' "$val" > "$cache"
+        # Bound the resolver: a hung secret manager (locked 1Password app,
+        # vault network hang) would otherwise ride to the hook's 60s timeout
+        # and die by SIGKILL with no log line. With a bound, the failure
+        # falls through to the caller's logged "unresolved" skip.
+        if command -v timeout >/dev/null 2>&1; then
+            val=$(timeout 15 bash -c "$cmd" 2>>"$STATE_DIR/failures.log")
+        else
+            val=$(eval "$cmd" 2>>"$STATE_DIR/failures.log")
         fi
+        [[ -n "$val" ]] && printf '%s' "$val" > "$cache"
     fi
     [[ -r "$cache" ]] && cat "$cache"
 }
@@ -209,8 +235,12 @@ RESPONSE=$(printf '%s' "$RAW" | jq -r '.choices[0].message.content // empty' 2>/
 # --- Parse LLM output (strip markdown fences if present) ---
 printf '%s\n' "$RESPONSE" | sed 's/^```[a-zA-Z]*//;/^$/d' > "$_HOOKDIR/memories.json"
 
-MEMORY_COUNT=$(jq 'if type == "array" then length else 0 end' "$_HOOKDIR/memories.json" 2>&1) \
+# -1 = valid JSON but not an array (output-envelope drift, e.g. {"memories":[...]})
+# — must be logged, or a model/gateway change silently stops all saves (LAB-170).
+# An empty [] is a legitimate "nothing worth saving" and stays a quiet exit.
+MEMORY_COUNT=$(jq 'if type == "array" then length else -1 end' "$_HOOKDIR/memories.json" 2>&1) \
     || _skip "LLM output not valid JSON: ${MEMORY_COUNT:0:200}"
+[[ "$MEMORY_COUNT" -eq -1 ]] && _skip "LLM output valid JSON but not an array: $(head -c 200 "$_HOOKDIR/memories.json")"
 [[ "$MEMORY_COUNT" -eq 0 ]] && exit 0
 
 # Cap even if the LLM returned more

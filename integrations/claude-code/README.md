@@ -15,7 +15,7 @@ memory server:
 - `bash`
 - `jq`
 - `curl`
-- `python3` (used by the PreCompact hook to parse the hook's stdin JSON)
+- `python3` (PreCompact stdin parsing; Stop hook timestamp parsing on macOS/BSD, where GNU `date -d` is unavailable)
 - An Ālaya server reachable from wherever `claude` runs, with `ALAYA_API_KEY` auth enabled
 - An OpenAI chat-completions-compatible LLM endpoint for transcript extraction (the Stop hook
   calls this once per save; it does not have to be the same provider as the agent itself)
@@ -112,9 +112,9 @@ cold fetch calls the resolver once, a warm cache calls it zero times, the cache 
 ## Troubleshooting
 
 - **No memories are showing up** — check `$ALAYA_HOOK_STATE_DIR/failures.log` (default
-  `~/.cache/alaya-hook/failures.log`). Every failure path (missing config, unresolved secret,
-  dead LLM endpoint, failed store call) logs one line there — see LAB-170: a silent failure
-  here once cost 5 days of unsaved memories.
+  `~/.cache/alaya-hook/failures.log`). Every failure path (missing config or `jq`, unresolved
+  or hung secret command, dead LLM endpoint, unexpected LLM output shape, failed store call)
+  logs one line there — see LAB-170: a silent failure here once cost 5 days of unsaved memories.
 - **PreCompact keeps blocking** — it only unblocks once `mcp__alaya__store_memory` appears in
   the last `ALAYA_PRECOMPACT_RECENT_LINES` transcript lines; call it manually, or lower the
   Stop hook's gates (`ALAYA_MIN_NEW_MESSAGES`, `ALAYA_COOLDOWN_SECS`) so it fires sooner.
