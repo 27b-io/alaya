@@ -1,0 +1,21 @@
+{
+  "name": "alaya",
+  "owner": {
+    "name": "27b.io",
+    "url": "https://github.com/27b-io"
+  },
+  "description": "Claude Code plugins for the Ālaya long-term memory service",
+  "plugins": [
+    {
+      "name": "alaya-memory-hooks",
+      "source": "./integrations/claude-code",
+      "description": "Stop-hook memory extraction + PreCompact save-reminder for Ālaya",
+      "version": "1.0.0",
+      "author": {
+        "name": "27b.io"
+      },
+      "license": "MIT",
+      "keywords": ["memory", "mcp", "alaya", "hooks"]
+    }
+  ]
+}

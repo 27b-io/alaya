@@ -60,6 +60,7 @@ The default Compose stack is **5 containers** (Qdrant, FalkorDB, TEI, `alaya-bri
 - **Run your own server** → [docs/quickstart-selfhost.md](docs/quickstart-selfhost.md)
 - **Full MCP tool reference** → [docs/mcp-tools.md](docs/mcp-tools.md)
 - **Full REST API reference** → [docs/rest-api.md](docs/rest-api.md)
+- **Claude Code memory hooks (Stop + PreCompact)** → [integrations/claude-code](integrations/claude-code/README.md)
 
 ## Architecture
 
