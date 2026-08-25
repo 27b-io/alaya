@@ -32,8 +32,9 @@ IMPORTANCE=$(_numeric_or_default "${ALAYA_IMPORTANCE:-0.7}" 0.7)
 
 # The gate vars feed integer [[ -lt ]] comparisons — a non-numeric override
 # ("5m") would error the test falsy and silently disable the gate entirely.
+# 10# strips leading zeros ("08" would otherwise be rejected as bad octal).
 _int_or_default() { # <value> <default>
-    [[ "$1" =~ ^[0-9]+$ ]] && printf '%s' "$1" || printf '%s' "$2"
+    [[ "$1" =~ ^[0-9]+$ ]] && printf '%s' "$((10#$1))" || printf '%s' "$2"
 }
 MIN_DURATION_SECS=$(_int_or_default "$MIN_DURATION_SECS" 120)
 MIN_NEW_MESSAGES=$(_int_or_default "$MIN_NEW_MESSAGES" 5)

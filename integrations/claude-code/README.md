@@ -115,8 +115,12 @@ cold fetch calls the resolver once, a warm cache calls it zero times, the cache 
   `~/.cache/alaya-hook/failures.log`). Every failure path (missing config or `jq`, unresolved
   or hung secret command, dead LLM endpoint, unexpected LLM output shape, failed store call)
   logs one line there — see LAB-170: a silent failure here once cost 5 days of unsaved memories.
-- **PreCompact keeps blocking** — it only unblocks once `mcp__alaya__store_memory` appears in
-  the last `ALAYA_PRECOMPACT_RECENT_LINES` transcript lines; call it manually, or lower the
-  Stop hook's gates (`ALAYA_MIN_NEW_MESSAGES`, `ALAYA_COOLDOWN_SECS`) so it fires sooner.
+- **PreCompact keeps blocking** — it only unblocks once an `mcp__alaya__store_memory` tool
+  call appears in the last `ALAYA_PRECOMPACT_RECENT_LINES` transcript lines. This is deliberate:
+  the two hooks are independent persistence paths, and the PreCompact gate wants a *curated*
+  save made by Claude itself (via the Ālaya MCP server) before context is compacted away —
+  the Stop hook's automatic REST extraction does not satisfy it and is not meant to. Ask Claude
+  to save (the block message prompts it to), or disable the gate by removing the PreCompact
+  hook if you don't run the Ālaya MCP server.
 - **`claude plugin validate` fails** — run it with `--strict` locally before pushing; it flags
   unrecognized fields and missing metadata that the runtime otherwise tolerates silently.

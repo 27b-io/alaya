@@ -29,8 +29,11 @@ C="$T/cachefile"
 
 v1=$(_resolve_secret TEST_SECRET "$C"); c1=$(cat "$RESOLVECOUNT")
 v2=$(_resolve_secret TEST_SECRET "$C"); c2=$(cat "$RESOLVECOUNT")
-perms=$(stat -c %a "$C")
-touch -d '13 hours ago' "$C"; touch "$RESOLVEFAIL"   # stale cache + resolver now failing
+# GNU stat -c / BSD-macOS stat -f; touch -t (portable) with the 13-hours-ago
+# timestamp computed via python3 — GNU-only `touch -d '13 hours ago'` isn't.
+perms=$(stat -c %a "$C" 2>/dev/null || stat -f %Lp "$C")
+STALE=$(python3 -c 'import datetime; print((datetime.datetime.now()-datetime.timedelta(hours=13)).strftime("%Y%m%d%H%M"))')
+touch -t "$STALE" "$C"; touch "$RESOLVEFAIL"   # stale cache + resolver now failing
 v3=$(_resolve_secret TEST_SECRET "$C"); c3=$(cat "$RESOLVECOUNT")
 
 [[ "$v1" == "sekrit-value" ]] || { echo "FAIL cold value: $v1"; exit 1; }
