@@ -25,12 +25,13 @@ except Exception:
 
 if [ -n "$transcript" ] && [ -r "$transcript" ]; then
     # Scan the last $RECENT_LINES of the transcript for any store_memory tool_use.
-    # Match on the literal "name":"mcp__alaya__store_memory" substring inside a JSONL line.
-    # This is fast (tail + grep) and avoids false positives from text mentions, which
-    # would show up as "input":{"command":"... mcp__alaya__store_memory ..."} not as
-    # the tool_use name field.
+    # Match the "name" key with optional JSON whitespace around the colon — the
+    # transcript is compact JSON today, but legal serializations may add spaces.
+    # Forgery from message *content* stays impossible either way: the pattern
+    # requires raw double quotes, which JSON string-encoding always escapes to \"
+    # inside content, so only a genuine tool_use name field can match.
     if tail -n "$RECENT_LINES" "$transcript" 2>/dev/null \
-        | grep -q '"name":"mcp__alaya__store_memory"'; then
+        | grep -Eq '"name"[[:space:]]*:[[:space:]]*"mcp__alaya__store_memory"'; then
         exit 0
     fi
 fi

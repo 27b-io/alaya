@@ -22,6 +22,7 @@ sed -n '/^_resolve_secret()/,/^}/p' "$HOOK" > "$T/fn.sh"
 export RESOLVECOUNT="$T/count" RESOLVEFAIL="$T/fail.flag"
 export SECRET_CACHE_MINUTES=720
 export STATE_DIR="$T"
+unset TEST_SECRET # an inherited value would short-circuit the command-source path
 export TEST_SECRET_CMD="$T/resolver"
 source "$T/fn.sh"
 umask 077 # the real hook sets this globally; the function itself no longer does
@@ -48,4 +49,18 @@ export TEST_SECRET="direct-value"
 v4=$(_resolve_secret TEST_SECRET "$C"); c4=$(cat "$RESOLVECOUNT")
 [[ "$v4" == "direct-value" && "$c4" == 2 ]] || { echo "FAIL direct-value: v=$v4 c=$c4"; exit 1; }
 
-echo "ALL PASS: cold=1 call, warm=0 calls, 0600 perms, stale cache on resolver failure, direct-value bypass, hook syntax clean"
+# python3 watchdog branch (macOS/BSD path, where timeout(1) doesn't exist):
+# with timeout hidden from PATH, a hanging resolver must be killed at the
+# bound and logged — not ride to the hook's 60s SIGKILL. Linux CI would
+# otherwise never execute this branch.
+printf '%s\n' '#!/bin/bash' 'sleep 30' > "$T/hangs"; chmod +x "$T/hangs"
+mkdir "$T/nobin"
+for c in bash python3 find cat sleep; do ln -s "$(command -v "$c")" "$T/nobin/$c"; done
+start=$(date +%s)
+v5=$(env PATH="$T/nobin" STATE_DIR="$T" SECRET_CACHE_MINUTES=720 _RESOLVER_TIMEOUT_SECS=2 \
+    HANG_SECRET_CMD="$T/hangs" bash -c "source '$T/fn.sh'; _resolve_secret HANG_SECRET '$T/cache-hang'") || true
+took=$(( $(date +%s) - start ))
+[[ -z "$v5" && "$took" -le 15 ]] || { echo "FAIL watchdog: v='$v5' took=${took}s"; exit 1; }
+grep -q 'timed out' "$T/failures.log" || { echo "FAIL watchdog: no timeout line in failures.log"; exit 1; }
+
+echo "ALL PASS: cold=1 call, warm=0 calls, 0600 perms, stale cache on resolver failure, direct-value bypass, watchdog bound without timeout(1), hook syntax clean"

@@ -75,6 +75,12 @@ an env file you `source` before launching `claude`, or the top-level `"env"` key
 | `ALAYA_SECRET_CACHE_MINUTES` | no | `720` | How long a `_CMD`-resolved secret is cached |
 | `ALAYA_PRECOMPACT_RECENT_LINES` | no | `500` | PreCompact: how far back to scan for a recent save |
 
+**Transport security:** both endpoints receive a bearer token on every call. Use `https://`
+for anything that crosses a network you don't fully trust. Plain `http://` is only appropriate
+when the transport itself is trusted or encrypted underneath — loopback, an in-cluster service
+address (e.g. `http://alaya-server.mcp.svc:3001/store`), or a WireGuard/Tailscale underlay.
+The hooks do not enforce this; the endpoint choice is yours.
+
 **Value-or-command secrets:** `ALAYA_API_KEY` and `ALAYA_LLM_API_KEY` can each be set directly,
 or sourced from a command via the `_CMD` variant (e.g. `ALAYA_API_KEY_CMD='op read op://vault/item/field'`
 for a 1Password service account). The command's output is cached under `ALAYA_HOOK_STATE_DIR`

@@ -100,13 +100,16 @@ STATE_FILE="$STATE_DIR/${SESSION_ID:-default}"
 
 LAST_SAVE_EPOCH=0
 LAST_SAVE_COUNT=0
+PARTIAL_COUNT=0 # line 3: consecutive partial-store attempts (see checkpoint logic)
 if [[ -f "$STATE_FILE" ]]; then
     LAST_SAVE_EPOCH=$(sed -n '1p' "$STATE_FILE" 2>/dev/null || echo 0)
     LAST_SAVE_COUNT=$(sed -n '2p' "$STATE_FILE" 2>/dev/null || echo 0)
+    PARTIAL_COUNT=$(sed -n '3p' "$STATE_FILE" 2>/dev/null || echo 0)
     # A torn/garbage state file must degrade to "no previous save", not kill
     # the hook with an unlogged arithmetic error under set -u.
     [[ "$LAST_SAVE_EPOCH" =~ ^[0-9]+$ ]] || LAST_SAVE_EPOCH=0
     [[ "$LAST_SAVE_COUNT" =~ ^[0-9]+$ ]] || LAST_SAVE_COUNT=0
+    [[ "$PARTIAL_COUNT" =~ ^[0-9]+$ ]] || PARTIAL_COUNT=0
 fi
 
 # Skip if not enough new messages since last save
@@ -167,11 +170,22 @@ _resolve_secret() { # <env-var-name> <cache-file>
         # Bound the resolver: a hung secret manager (locked 1Password app,
         # vault network hang) would otherwise ride to the hook's 60s timeout
         # and die by SIGKILL with no log line. With a bound, the failure
-        # falls through to the caller's logged "unresolved" skip.
+        # falls through to the caller's logged "unresolved" skip. macOS/BSD
+        # ship no timeout(1), so fall back to a python3 watchdog (python3 is
+        # already a documented prerequisite) rather than an unbounded eval.
         if command -v timeout >/dev/null 2>&1; then
-            val=$(timeout 15 bash -c "$cmd" 2>>"$STATE_DIR/failures.log")
+            val=$(timeout "${_RESOLVER_TIMEOUT_SECS:-15}" bash -c "$cmd" 2>>"$STATE_DIR/failures.log")
         else
-            val=$(eval "$cmd" 2>>"$STATE_DIR/failures.log")
+            val=$(python3 -c '
+import subprocess, sys
+try:
+    r = subprocess.run(["bash", "-c", sys.argv[1]], capture_output=True, text=True, timeout=int(sys.argv[2]))
+    sys.stderr.write(r.stderr)
+    sys.stdout.write(r.stdout)
+    sys.exit(r.returncode)
+except subprocess.TimeoutExpired:
+    sys.stderr.write("secret resolver timed out after " + sys.argv[2] + "s\n")
+    sys.exit(124)' "$cmd" "${_RESOLVER_TIMEOUT_SECS:-15}" 2>>"$STATE_DIR/failures.log")
         fi
         [[ -n "$val" ]] && printf '%s' "$val" > "$cache"
     fi
@@ -249,6 +263,7 @@ MEMORY_COUNT=$(jq 'if type == "array" then length else -1 end' "$_HOOKDIR/memori
 
 # --- POST each memory to Alaya ---
 SAVED=0
+ATTEMPTED=0
 for i in $(seq 0 $((MEMORY_COUNT - 1))); do
     MEMORY=$(jq --argjson idx "$i" '.[$idx]' "$_HOOKDIR/memories.json" 2>/dev/null)
     [[ -z "$MEMORY" || "$MEMORY" == "null" ]] && continue
@@ -272,6 +287,7 @@ for i in $(seq 0 $((MEMORY_COUNT - 1))); do
             metadata: {importance: $importance}
         }' 2>/dev/null) || continue
 
+    ATTEMPTED=$((ATTEMPTED + 1))
     HTTP_CODE=$(curl -s -o /dev/null --max-time 5 -w '%{http_code}' \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $ALAYA_API_KEY" \
@@ -285,8 +301,25 @@ for i in $(seq 0 $((MEMORY_COUNT - 1))); do
 done
 
 # --- Update state: record this save ---
-if [[ $SAVED -gt 0 ]]; then
-    printf '%s\n%s\n' "$NOW_EPOCH" "$TOTAL" > "$STATE_FILE" 2>/dev/null || true
+# Checkpoint only on full success: a partial store (1 of 3 saved) must NOT
+# advance the message watermark, or the failed memories never get another
+# extraction attempt and are compacted away. Re-extraction may re-store the
+# ones that did succeed — safe by Alaya's dedup contract (content-hash keyed,
+# plus dedup_threshold on every store call). Capped at 3 consecutive partials:
+# a memory the server rejects deterministically (413, validation) must not
+# buy an LLM extraction call on every qualifying Stop forever — after the cap
+# we advance the watermark, log the drop, and move on (logged, per LAB-170).
+if [[ $SAVED -gt 0 && $SAVED -eq $ATTEMPTED ]]; then
+    printf '%s\n%s\n%s\n' "$NOW_EPOCH" "$TOTAL" "0" > "$STATE_FILE" 2>/dev/null || true
+elif [[ $SAVED -gt 0 ]]; then
+    PARTIAL_COUNT=$((PARTIAL_COUNT + 1))
+    if [[ $PARTIAL_COUNT -ge 3 ]]; then
+        printf '%s\n%s\n%s\n' "$NOW_EPOCH" "$TOTAL" "0" > "$STATE_FILE" 2>/dev/null || true
+        _log_failure "alaya store partial x$PARTIAL_COUNT: $SAVED/$ATTEMPTED saved, giving up on the failing memories and advancing state (url=$ALAYA_URL)"
+    else
+        printf '%s\n%s\n%s\n' "$LAST_SAVE_EPOCH" "$LAST_SAVE_COUNT" "$PARTIAL_COUNT" > "$STATE_FILE" 2>/dev/null || true
+        _log_failure "alaya store partial ($PARTIAL_COUNT/3): $SAVED/$ATTEMPTED saved, state not advanced, will retry next qualifying stop (url=$ALAYA_URL)"
+    fi
 else
-    _log_failure "alaya store failed: $MEMORY_COUNT memories extracted, 0 saved (url=$ALAYA_URL)"
+    _log_failure "alaya store failed: $MEMORY_COUNT extracted, $ATTEMPTED attempted, 0 saved (url=$ALAYA_URL)"
 fi
