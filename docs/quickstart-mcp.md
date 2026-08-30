@@ -72,7 +72,7 @@ The cheapest "is the server reachable from this client?" check is the unauthenti
 
 ```bash
 curl http://localhost:3001/health
-# open mode (no key set): full body — status, version, total_memories, backend detail
+# open mode (no key + DANGEROUSLY_ALLOW_UNAUTHENTICATED=true on a private origin): full body — status, version, total_memories, backend detail
 # with a key configured and no credentials: {"status":"healthy"} only
 ```
 
