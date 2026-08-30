@@ -62,6 +62,7 @@ struct Config {
     graph_api_key: String,
     listen_addr: String,
     api_key: String,
+    readonly_api_key: String,
     oidc_issuer: Option<String>,
     public_base_url: String,
     allow_unauthenticated: bool,
@@ -94,6 +95,7 @@ impl Config {
             graph_api_key: env_or("GRAPH_API_KEY", ""),
             listen_addr: env_or("LISTEN_ADDR", "0.0.0.0:3001"),
             api_key: env_or("ALAYA_API_KEY", ""),
+            readonly_api_key: env_or("ALAYA_READONLY_API_KEY", ""),
             oidc_issuer: std::env::var("OIDC_ISSUER").ok().filter(|s| !s.is_empty()),
             public_base_url: normalize_public_base_url(&env_or(
                 "PUBLIC_BASE_URL",
@@ -1360,6 +1362,19 @@ fn build_auth_state(config: &Config) -> AuthState {
     } else {
         Some(config.api_key.clone())
     };
+    let readonly_api_key = if config.readonly_api_key.is_empty() {
+        None
+    } else {
+        Some(config.readonly_api_key.clone())
+    };
+
+    // Fail-closed: `authenticate` checks the full key first, so equal keys
+    // would silently resolve the "read-only" bearer to Full. Refuse to start.
+    if let (Some(full), Some(ro)) = (&api_key, &readonly_api_key)
+        && full == ro
+    {
+        panic!("ALAYA_READONLY_API_KEY must differ from ALAYA_API_KEY");
+    }
 
     let oidc = config.oidc_issuer.as_ref().map(|issuer| {
         let audience = format!("{}/mcp", config.public_base_url);
@@ -1372,7 +1387,8 @@ fn build_auth_state(config: &Config) -> AuthState {
     });
 
     // Fail-closed: refuse to start with no auth unless the dev flag is set.
-    if api_key.is_none() && oidc.is_none() {
+    // A readonly key alone counts as configured auth (reads-only deployment).
+    if api_key.is_none() && readonly_api_key.is_none() && oidc.is_none() {
         if !config.allow_unauthenticated {
             panic!(
                 "no auth configured: set ALAYA_API_KEY or OIDC_ISSUER, or \
@@ -1391,8 +1407,13 @@ fn build_auth_state(config: &Config) -> AuthState {
         tracing::warn!("DANGEROUSLY_ALLOW_UNAUTHENTICATED ignored — auth is configured");
     }
 
+    if readonly_api_key.is_some() {
+        tracing::info!("read-only static bearer enabled (ALAYA_READONLY_API_KEY)");
+    }
+
     AuthState {
         api_key,
+        readonly_api_key,
         allow_unauthenticated: config.allow_unauthenticated,
         oidc,
         public_base_url: config.public_base_url.clone(),

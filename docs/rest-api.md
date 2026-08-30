@@ -16,6 +16,22 @@ Auth is **fail-closed**: with no `ALAYA_API_KEY` (and no `OIDC_ISSUER`) the serv
 
 If the server has `OIDC_ISSUER` set, clients use an OAuth access token instead of a fixed key. See [MCP quickstart → OAuth](./quickstart-mcp.md#oauth-optional) — the same flow applies to REST clients.
 
+### Read-only bearer (optional)
+
+Set `ALAYA_READONLY_API_KEY` (must differ from `ALAYA_API_KEY`) to mint a second static bearer for headless service consumers that must never mutate the corpus (e.g. a read-only dashboard). It authenticates the same way but is authorized for pure reads only — `POST /search`, `GET /memories/{content_hash}`, `POST /contradictions`, `POST /duplicates/find` — and receives `403 Forbidden` on every mutating route, including `POST /store`:
+
+```bash
+# succeeds
+curl -H "Authorization: Bearer $ALAYA_READONLY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "deploy checklist"}' http://localhost:3001/search
+
+# 403 — read-only bearer cannot mutate
+curl -H "Authorization: Bearer $ALAYA_READONLY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"content_hash": "…"}' http://localhost:3001/delete
+```
+
 Failed auth returns `401 Unauthorized` with a `WWW-Authenticate: Bearer …` header pointing at the protected-resource metadata when OAuth is enabled.
 
 ## Content types

@@ -129,6 +129,7 @@ EMBEDDING_DIMENSIONS=1024
 GRAPH_URL=http://alaya-bridge:3000       # required
 GRAPH_API_KEY=
 ALAYA_API_KEY=                           # empty = no auth (warns at startup)
+ALAYA_READONLY_API_KEY=                  # optional read-only bearer (pure reads; must differ from ALAYA_API_KEY)
 LISTEN_ADDR=0.0.0.0:3001
 RUST_LOG=alaya_server=info
 OTEL_EXPORTER_OTLP_ENDPOINT=http://phoenix-svc.recsys.svc:6006  # optional

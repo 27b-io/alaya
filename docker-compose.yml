@@ -129,6 +129,7 @@ services:
       GRAPH_URL: http://alaya-bridge:8080
       GRAPH_API_KEY: ${GRAPH_API_KEY:-}
       ALAYA_API_KEY: ${ALAYA_API_KEY:-}
+      ALAYA_READONLY_API_KEY: ${ALAYA_READONLY_API_KEY:-}
       # The server is FAIL-CLOSED: it panics at boot with no auth configured.
       # For local dev we opt into open mode so `docker compose up` just works.
       # This is localhost-only — the open mode is itself refused on any

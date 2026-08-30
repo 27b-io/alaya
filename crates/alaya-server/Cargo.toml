@@ -41,3 +41,5 @@ tracing-opentelemetry = "0.30"
 # test-util enables tokio's paused clock (start_paused) for the wedge
 # regression tests (#63) — deliberately dev-only.
 tokio = { workspace = true, features = ["test-util"] }
+# oneshot() for route-level middleware tests (already in-tree via axum).
+tower = { version = "0.5", features = ["util"] }
