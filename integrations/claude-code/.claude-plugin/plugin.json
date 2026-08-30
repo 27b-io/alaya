@@ -1,0 +1,15 @@
+{
+  "name": "alaya-memory-hooks",
+  "displayName": "Ālaya Memory Hooks",
+  "version": "1.0.0",
+  "description": "Stop-hook memory extraction and PreCompact save-reminder that persist Claude Code session knowledge into an Ālaya long-term memory server.",
+  "author": {
+    "name": "27b.io",
+    "url": "https://github.com/27b-io"
+  },
+  "homepage": "https://github.com/27b-io/alaya/tree/main/integrations/claude-code",
+  "repository": "https://github.com/27b-io/alaya",
+  "license": "MIT",
+  "keywords": ["memory", "mcp", "alaya", "hooks", "stop", "precompact"],
+  "hooks": "./hooks/hooks.json"
+}
