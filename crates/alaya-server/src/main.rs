@@ -7,7 +7,8 @@
 //! Endpoints:
 //!   POST /mcp          — MCP Streamable HTTP (JSON-RPC 2.0)
 //!   POST /store, etc.  — Plain REST API (for Prajna and internal consumers)
-//!   GET  /health       — Health check
+//!   GET  /health       — Liveness probe (status only, unauthenticated)
+//!   GET  /health/detail— Backend health, capacity, build identity (auth)
 
 mod auth;
 mod build_info;
@@ -1690,9 +1691,7 @@ fn health_code(health: &Value) -> StatusCode {
 ///
 /// Assembled here rather than inline in `main` so tests exercise the real
 /// composition: a handler-level test would still pass with the auth layer
-/// dropped, which is precisely the regression that matters. `HealthChecker`
-/// and `AuthState` are separate router states — axum allows that across a
-/// `merge`, the same trick `protected` uses for `require_auth`.
+/// dropped, which is precisely the regression that matters.
 fn health_routes(checker: HealthChecker, auth_state: AuthState) -> Router {
     let detail = Router::new()
         .route("/health/detail", get(health_detail))
@@ -2462,21 +2461,6 @@ mod wedge_tests {
         assert_eq!(keys, ["status"], "unauthenticated /health leaked fields");
     }
 
-    /// Backends are unreachable in these tests, so `check` takes the error
-    /// arms — the path that renders `reqwest::Error`, and with it in-cluster
-    /// URLs. None of it may reach an anonymous caller.
-    #[tokio::test]
-    async fn unauthenticated_health_hides_backend_error_detail() {
-        let app = health_routes(test_checker(epoch_secs()), test_auth_state());
-
-        let (_, bare) = probe(&app, "/health", None).await;
-        assert!(!bare.to_string().contains("127.0.0.1"));
-
-        // The detail view keeps it — that is what it is for.
-        let (_, detail) = probe(&app, "/health/detail", Some(TEST_KEY)).await;
-        assert!(detail["vector_health"]["error"].is_string());
-    }
-
     /// The operator view is unreachable without a credential, and complete
     /// with one.
     #[tokio::test]
@@ -2495,6 +2479,11 @@ mod wedge_tests {
         assert_eq!(body["total_memories"], 0);
         assert!(body["worker"].is_object());
         assert!(body["vector_health"].is_object());
+        // Backends are unreachable here, so `check` takes the error arms —
+        // the path that renders `reqwest::Error` and with it in-cluster URLs.
+        // The detail view keeps that; the bare probe's exact-key-set
+        // assertion above is what proves it never reaches an anonymous caller.
+        assert!(body["vector_health"]["error"].is_string());
         // Build identity (#70) rides the authenticated surface now.
         assert!(body.get("version").is_some());
         assert!(body.get("git_sha").is_some());

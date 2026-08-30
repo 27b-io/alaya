@@ -1,6 +1,6 @@
 FROM docker.io/library/rust:1.87-bookworm AS builder
 
-# Build identity surfaced by GET /health and MCP serverInfo (#70). Both are
+# Build identity surfaced by GET /health/detail and MCP serverInfo (#70). Both are
 # optional: an unset arg yields a null git_sha/built_at, never a build or
 # startup failure. GIT_SHA must be the full 40-hex SHA to be reported.
 ARG GIT_SHA=unknown

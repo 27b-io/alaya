@@ -48,7 +48,15 @@ curl http://localhost:3001/health
 Expect:
 
 ```json
-{"status":"ok","qdrant":"ok","graph":"ok","embedding":"ok",...}
+{"status":"healthy"}
+```
+
+`/health` is the unauthenticated probe and carries only `status`. For
+per-backend detail, memory count and build identity:
+
+```bash
+curl -H "Authorization: Bearer $ALAYA_API_KEY" \
+  http://localhost:3001/health/detail
 ```
 
 Then exercise the API end-to-end:

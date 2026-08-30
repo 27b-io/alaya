@@ -72,7 +72,7 @@ The cheapest "is the server reachable from this client?" check is the unauthenti
 
 ```bash
 curl http://localhost:3001/health
-# {"status":"ok","qdrant":"ok","graph":"ok","embedding":"ok",...}
+# {"status":"healthy"}
 ```
 
 If you set an API key, also test it works:
