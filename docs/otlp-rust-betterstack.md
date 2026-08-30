@@ -320,10 +320,17 @@ RUN cargo build --release
 ### In code
 
 ```rust
-let version = option_env!("ALAYA_GIT_SHA").unwrap_or("dev");
+let git_sha = crate::build_info::git_sha().unwrap_or("dev");
 ```
 
-Use in: health endpoint response, OTLP `service.version` resource attribute, startup log.
+`crates/alaya-server/src/build_info.rs` is the single home for these
+compile-time reads — don't re-scatter `option_env!` at call sites. It exposes
+`version()` (crate semver), `git_sha()`, `built_at()` and `version_qualified()`
+(`<semver>+<sha>`, used by MCP `serverInfo`).
+
+Used in: the `GET /health` body (`version` / `git_sha` / `built_at`), the OTLP
+`service.version` resource attribute (bare SHA, so existing SHA-equality
+queries keep matching), and the startup log.
 
 ## K8s Deployment
 
@@ -348,7 +355,7 @@ Network policy: allow egress on port 443 (HTTPS to BetterStack).
 
 If traces don't show up:
 
-1. **Check `/health` for version** — is the right code deployed?
+1. **Check `/health` for `git_sha`** — is the right code deployed?
 2. **Check startup log** — does it say "OTLP tracing enabled"?
 3. **Check for panics** — `kubectl logs | grep panic` — the BatchSpanProcessor panic is silent (background thread)
 4. **Check RUST_LOG** — does it include every crate with `#[instrument]`?

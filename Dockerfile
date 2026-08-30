@@ -1,6 +1,10 @@
 FROM docker.io/library/rust:1.87-bookworm AS builder
 
+# Build identity surfaced by GET /health and MCP serverInfo (#70). Both are
+# optional: an unset arg yields a null git_sha/built_at, never a build or
+# startup failure. GIT_SHA must be the full 40-hex SHA to be reported.
 ARG GIT_SHA=unknown
+ARG BUILT_AT=
 
 WORKDIR /app
 COPY . .
@@ -11,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends cmake \
     && rm -rf /var/lib/apt/lists/*
 
 ENV ALAYA_GIT_SHA=${GIT_SHA}
+ENV ALAYA_BUILT_AT=${BUILT_AT}
 RUN cargo build --release -p alaya-bridge -p alaya-server
 
 FROM docker.io/library/debian:bookworm-slim
