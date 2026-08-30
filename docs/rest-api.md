@@ -45,10 +45,25 @@ Failed auth returns `401 Unauthorized` with a `WWW-Authenticate: Bearer …` hea
 
 ## `GET /health`
 
-Unauthenticated. Returns per-backend status. Use this as your liveness + readiness probe.
+Unauthenticated route, caller-dependent body. Use this as your liveness + readiness probe.
+
+Without credentials the body is the liveness signal only:
 
 ```bash
 curl http://localhost:3001/health
+```
+
+```json
+{ "status": "healthy" }
+```
+
+With a valid `Authorization: Bearer` (static key or OIDC token) — or on a dev
+instance running in open mode — the full operational detail is returned. The
+detail is gated because build identity and corpus size are operator data, not
+public data (alaya#75).
+
+```bash
+curl -s -H "Authorization: Bearer $ALAYA_API_KEY" http://localhost:3001/health
 ```
 
 ```json
@@ -68,6 +83,7 @@ curl http://localhost:3001/health
 `status` is `healthy` when every backend is reachable, `degraded` (HTTP 200) when
 a backend is down — restarting the pod won't fix Qdrant — and `unhealthy`
 (HTTP 503) when the service worker has stalled, so a liveness probe restarts it.
+The HTTP status code is the same for every caller — probes need only the code.
 
 ### Build identity
 
@@ -78,7 +94,8 @@ build that didn't pass them (a plain `cargo build`, or `docker build` without
 `--build-arg`) — absence is never an error. Verify a rollout with:
 
 ```bash
-curl -s http://localhost:3001/health | jq -r .git_sha   # == git rev-parse HEAD
+curl -s -H "Authorization: Bearer $ALAYA_API_KEY" http://localhost:3001/health \
+  | jq -r .git_sha   # == git rev-parse HEAD
 ```
 
 CI images always carry the full 40-hex SHA. A build that passes an abbreviation

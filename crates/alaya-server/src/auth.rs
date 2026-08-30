@@ -6,7 +6,7 @@
 //! other op — current or future — requires the `Static` principal.
 
 use axum::extract::{Request, State};
-use axum::http::{Method, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use subtle::ConstantTimeEq;
@@ -63,6 +63,17 @@ pub struct AuthState {
     pub public_base_url: String,
 }
 
+impl AuthState {
+    /// Dev open mode: only reachable when startup confirmed no auth is
+    /// configured AND the dev flag is set. The compound condition is the
+    /// contract — `allow_unauthenticated` alone is ignored (with a startup
+    /// warning) when any credential is configured. Single definition so
+    /// `require_auth` and `optional_principal` can never drift.
+    fn open_mode(&self) -> bool {
+        self.api_key.is_none() && self.oidc.is_none() && self.allow_unauthenticated
+    }
+}
+
 /// Map a REST route to a canonical op-name in the `OIDC_ALLOWLIST` vocabulary.
 /// Keyed on `(method, path)` so `GET`/`PATCH` on the same path differ. An
 /// unmapped route resolves to a synthetic mutating op → denied for `Oidc`.
@@ -92,12 +103,109 @@ pub fn oidc_allows(op: &str) -> bool {
 /// Extract the bearer token from an `Authorization` header.
 /// RFC 6750 §2.1: the scheme name is case-insensitive (`Bearer`/`bearer`/`BEARER`
 /// are all valid); the credential follows whitespace after the scheme.
-fn bearer(req: &Request) -> Option<&str> {
-    let header = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    let header = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = header.split_once(|c: char| c.is_ascii_whitespace())?;
     if scheme.eq_ignore_ascii_case("bearer") {
-        Some(token.trim_start())
+        // MAX_TOKEN_LEN enforced here so the CPU-DoS guard cannot drift
+        // between the two auth entry points (require_auth / optional_principal).
+        Some(token.trim_start()).filter(|t| t.len() <= MAX_TOKEN_LEN)
     } else {
+        None
+    }
+}
+
+/// Resolve a principal from bare headers, for routes *outside* the protected
+/// router that vary their response by caller (e.g. `/health` detail gating,
+/// alaya#75). Same token rules as `require_auth`; dev open mode resolves to
+/// `Anonymous` so unauthenticated dev instances keep full behaviour. `None`
+/// means "treat as public".
+pub async fn optional_principal(auth: &AuthState, headers: &HeaderMap) -> Option<AuthPrincipal> {
+    // Flush runs on every call — not just rejections — so a guessing burst
+    // that then goes quiet still surfaces within ~one window: k8s probes
+    // traverse this path continuously (a rejection-only flush would defer the
+    // count indefinitely and misattribute it to a later unrelated rejection).
+    log_pending_rejections();
+    if auth.open_mode() {
+        return Some(AuthPrincipal::Anonymous);
+    }
+    let token = bearer(headers)?;
+    let principal = authenticate(auth, token).await;
+    if principal.is_none() {
+        // A credential was presented and rejected. This path returns 200 with
+        // the minimal body (no 401), so key-guessing must reach logs and
+        // alerting — but the route is public and unthrottled, so one info
+        // line per request would itself be a log-flood DoS vector. The
+        // limiter emits one windowed info line carrying the count; per-event
+        // detail stays at debug.
+        tracing::debug!(op = "optional_principal", "presented credential rejected");
+        REJECTION_LOG.note_rejection();
+        // Immediate flush so the first rejection after a quiet window logs
+        // at once — attack onset is never delayed.
+        log_pending_rejections();
+    }
+    principal
+}
+
+/// At most one info line per window on the unauthenticated rejection path.
+const REJECTION_LOG_WINDOW_S: u64 = 60;
+
+static REJECTION_LOG: RejectionLogLimiter = RejectionLogLimiter::new();
+
+/// Emit the windowed rejected-credential line when one is due.
+fn log_pending_rejections() {
+    if let Some(n) = REJECTION_LOG.flush(crate::epoch_secs()) {
+        tracing::info!(
+            op = "optional_principal",
+            rejected_since_last = n,
+            "presented credentials rejected"
+        );
+    }
+}
+
+/// Windowed rate limiter for rejected-credential logging. The first rejection
+/// after a quiet window logs immediately (attack onset is visible right away);
+/// subsequent ones are counted and emitted as one line per window.
+// ponytail: one global window, not per-source — per-IP keying needs the peer
+// addr plumbed through and a bounded map; add if one noisy source ever needs
+// isolating from the signal.
+struct RejectionLogLimiter {
+    rejected_since_log: std::sync::atomic::AtomicU64,
+    last_log_epoch_s: std::sync::atomic::AtomicU64,
+}
+
+impl RejectionLogLimiter {
+    const fn new() -> Self {
+        Self {
+            rejected_since_log: std::sync::atomic::AtomicU64::new(0),
+            last_log_epoch_s: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn note_rejection(&self) {
+        self.rejected_since_log
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `Some(n)` when the caller should emit the windowed info line covering
+    /// the `n` rejections since the last one; `None` while nothing is pending
+    /// or the window hasn't elapsed.
+    fn flush(&self, now_s: u64) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        if self.rejected_since_log.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let last = self.last_log_epoch_s.load(Ordering::Relaxed);
+        // The CAS elects exactly one logger per window under concurrency.
+        if now_s.saturating_sub(last) >= REJECTION_LOG_WINDOW_S
+            && self
+                .last_log_epoch_s
+                .compare_exchange(last, now_s, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let n = self.rejected_since_log.swap(0, Ordering::Relaxed);
+            return (n > 0).then_some(n);
+        }
         None
     }
 }
@@ -157,13 +265,12 @@ fn forbidden_403() -> Response {
 /// router. The `/mcp` op-gate is enforced in `mcp_handler` (post-parse), so
 /// this middleware only authenticates `/mcp` and sets the principal extension.
 pub async fn require_auth(State(auth): State<AuthState>, mut req: Request, next: Next) -> Response {
-    // Open mode: only reachable when startup confirmed no auth + the dev flag.
-    if auth.api_key.is_none() && auth.oidc.is_none() && auth.allow_unauthenticated {
+    if auth.open_mode() {
         req.extensions_mut().insert(AuthPrincipal::Anonymous);
         return next.run(req).await;
     }
 
-    let token = bearer(&req).filter(|t| t.len() <= MAX_TOKEN_LEN);
+    let token = bearer(req.headers());
     let Some(token) = token else {
         return challenge_401(&auth);
     };
@@ -293,13 +400,13 @@ mod tests {
 
     // ── authentication path (the dual-mode dispatch + 401 challenge) ─────────
 
-    use crate::testkit::auth_state as state;
+    use crate::testkit::{TEST_API_KEY, auth_state as state};
 
     #[tokio::test]
     async fn authenticate_static_key() {
-        let auth = state(Some("s3cret"), false);
+        let auth = state(Some(TEST_API_KEY), false);
         assert_eq!(
-            authenticate(&auth, "s3cret").await,
+            authenticate(&auth, TEST_API_KEY).await,
             Some(AuthPrincipal::Static)
         );
         assert_eq!(authenticate(&auth, "wrong").await, None);
@@ -353,16 +460,88 @@ mod tests {
 
     #[test]
     fn bearer_scheme_is_case_insensitive() {
-        let req = axum::http::Request::builder()
-            .header(header::AUTHORIZATION, "bearer  tok123")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(bearer(&req), Some("tok123"));
+        assert_eq!(bearer(&headers_with_auth("bearer  tok123")), Some("tok123"));
+        assert_eq!(bearer(&headers_with_auth("Basic abc")), None);
+    }
 
-        let not_bearer = axum::http::Request::builder()
-            .header(header::AUTHORIZATION, "Basic abc")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(bearer(&not_bearer), None);
+    // ── optional principal (detail gating on unprotected routes, alaya#75) ───
+
+    fn headers_with_auth(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, value.parse().unwrap());
+        h
+    }
+
+    #[tokio::test]
+    async fn optional_principal_static_wrong_and_missing() {
+        let auth = state(Some(TEST_API_KEY), false);
+        assert_eq!(
+            optional_principal(&auth, &headers_with_auth(&format!("Bearer {TEST_API_KEY}"))).await,
+            Some(AuthPrincipal::Static)
+        );
+        assert_eq!(
+            optional_principal(&auth, &headers_with_auth("Bearer wrong")).await,
+            None
+        );
+        assert_eq!(optional_principal(&auth, &HeaderMap::new()).await, None);
+    }
+
+    #[tokio::test]
+    async fn optional_principal_oidc_token_resolves() {
+        let auth = state(None, true);
+        let good = crate::testkit::mint(
+            jsonwebtoken::Algorithm::RS256,
+            Some(crate::testkit::KID_RSA),
+            &crate::testkit::TestClaims::valid(),
+        );
+        assert_eq!(
+            optional_principal(&auth, &headers_with_auth(&format!("Bearer {good}"))).await,
+            Some(AuthPrincipal::Oidc)
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_principal_open_mode_is_anonymous_but_only_with_flag() {
+        let mut auth = state(None, false);
+        // No keys, no flag: fail closed — public caller.
+        assert_eq!(optional_principal(&auth, &HeaderMap::new()).await, None);
+        auth.allow_unauthenticated = true;
+        assert_eq!(
+            optional_principal(&auth, &HeaderMap::new()).await,
+            Some(AuthPrincipal::Anonymous)
+        );
+        // Any configured credential kills open mode even with the flag set —
+        // the startup "flag ignored" warning must match runtime behaviour.
+        let mut keyed = state(Some("k"), false);
+        keyed.allow_unauthenticated = true;
+        assert_eq!(optional_principal(&keyed, &HeaderMap::new()).await, None);
+    }
+
+    /// The rejection-log limiter: onset logs immediately, the window
+    /// suppresses the rest, and — the burst-then-stop case — a pending count
+    /// flushes on any later call, with no new rejection required.
+    #[test]
+    fn rejection_log_limiter_windows() {
+        let l = RejectionLogLimiter::new();
+        assert_eq!(l.flush(1_000), None); // nothing pending: no line
+        l.note_rejection();
+        assert_eq!(l.flush(1_000), Some(1)); // attack onset visible at once
+        l.note_rejection();
+        assert_eq!(l.flush(1_000), None); // same second: suppressed
+        l.note_rejection();
+        assert_eq!(l.flush(1_030), None); // mid-window: suppressed
+        // Burst stopped; a probe-driven flush still surfaces the count.
+        assert_eq!(l.flush(1_060), Some(2));
+        assert_eq!(l.flush(1_120), None); // drained: quiet windows stay silent
+    }
+
+    #[tokio::test]
+    async fn bearer_enforces_token_length_cap() {
+        let auth = state(Some(TEST_API_KEY), false);
+        let oversized = format!("Bearer {}", "x".repeat(MAX_TOKEN_LEN + 1));
+        assert_eq!(
+            optional_principal(&auth, &headers_with_auth(&oversized)).await,
+            None
+        );
     }
 }
