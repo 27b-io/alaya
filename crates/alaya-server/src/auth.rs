@@ -63,6 +63,17 @@ pub struct AuthState {
     pub public_base_url: String,
 }
 
+impl AuthState {
+    /// Dev open mode: only reachable when startup confirmed no auth is
+    /// configured AND the dev flag is set. The compound condition is the
+    /// contract — `allow_unauthenticated` alone is ignored (with a startup
+    /// warning) when any credential is configured. Single definition so
+    /// `require_auth` and `optional_principal` can never drift.
+    fn open_mode(&self) -> bool {
+        self.api_key.is_none() && self.oidc.is_none() && self.allow_unauthenticated
+    }
+}
+
 /// Map a REST route to a canonical op-name in the `OIDC_ALLOWLIST` vocabulary.
 /// Keyed on `(method, path)` so `GET`/`PATCH` on the same path differ. An
 /// unmapped route resolves to a synthetic mutating op → denied for `Oidc`.
@@ -96,7 +107,9 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     let header = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = header.split_once(|c: char| c.is_ascii_whitespace())?;
     if scheme.eq_ignore_ascii_case("bearer") {
-        Some(token.trim_start())
+        // MAX_TOKEN_LEN enforced here so the CPU-DoS guard cannot drift
+        // between the two auth entry points (require_auth / optional_principal).
+        Some(token.trim_start()).filter(|t| t.len() <= MAX_TOKEN_LEN)
     } else {
         None
     }
@@ -108,11 +121,18 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 /// `Anonymous` so unauthenticated dev instances keep full behaviour. `None`
 /// means "treat as public".
 pub async fn optional_principal(auth: &AuthState, headers: &HeaderMap) -> Option<AuthPrincipal> {
-    if auth.api_key.is_none() && auth.oidc.is_none() && auth.allow_unauthenticated {
+    if auth.open_mode() {
         return Some(AuthPrincipal::Anonymous);
     }
-    let token = bearer(headers).filter(|t| t.len() <= MAX_TOKEN_LEN)?;
-    authenticate(auth, token).await
+    let token = bearer(headers)?;
+    let principal = authenticate(auth, token).await;
+    if principal.is_none() {
+        // A credential was presented and rejected. This path returns 200 with
+        // the minimal body (no 401), so without this line a key-guessing
+        // attempt here would be invisible to logs and alerting.
+        tracing::info!(op = "optional_principal", "presented credential rejected");
+    }
+    principal
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -170,13 +190,12 @@ fn forbidden_403() -> Response {
 /// router. The `/mcp` op-gate is enforced in `mcp_handler` (post-parse), so
 /// this middleware only authenticates `/mcp` and sets the principal extension.
 pub async fn require_auth(State(auth): State<AuthState>, mut req: Request, next: Next) -> Response {
-    // Open mode: only reachable when startup confirmed no auth + the dev flag.
-    if auth.api_key.is_none() && auth.oidc.is_none() && auth.allow_unauthenticated {
+    if auth.open_mode() {
         req.extensions_mut().insert(AuthPrincipal::Anonymous);
         return next.run(req).await;
     }
 
-    let token = bearer(req.headers()).filter(|t| t.len() <= MAX_TOKEN_LEN);
+    let token = bearer(req.headers());
     let Some(token) = token else {
         return challenge_401(&auth);
     };
@@ -415,6 +434,21 @@ mod tests {
         assert_eq!(
             optional_principal(&auth, &HeaderMap::new()).await,
             Some(AuthPrincipal::Anonymous)
+        );
+        // Any configured credential kills open mode even with the flag set —
+        // the startup "flag ignored" warning must match runtime behaviour.
+        let mut keyed = state(Some("k"), false);
+        keyed.allow_unauthenticated = true;
+        assert_eq!(optional_principal(&keyed, &HeaderMap::new()).await, None);
+    }
+
+    #[tokio::test]
+    async fn bearer_enforces_token_length_cap() {
+        let auth = state(Some("s3cret"), false);
+        let oversized = format!("Bearer {}", "x".repeat(MAX_TOKEN_LEN + 1));
+        assert_eq!(
+            optional_principal(&auth, &headers_with_auth(&oversized)).await,
+            None
         );
     }
 }

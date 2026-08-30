@@ -72,7 +72,8 @@ The cheapest "is the server reachable from this client?" check is the unauthenti
 
 ```bash
 curl http://localhost:3001/health
-# {"status":"healthy"}   — full backend detail requires auth (or dev open mode)
+# open mode (no key set): full body — status, version, total_memories, backend detail
+# with a key configured and no credentials: {"status":"healthy"} only
 ```
 
 If you set an API key, also test it works:

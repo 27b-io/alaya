@@ -570,7 +570,17 @@ struct HealthChecker {
     graph_api_key: String,
     worker_progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stall_threshold: std::time::Duration,
+    /// Single-flight TTL cache over the 3-backend fan-out. `/health` serves
+    /// unauthenticated callers, so without this a request flood amplifies 3×
+    /// into Qdrant + bridge (public exposure hardening, alaya#75). Shared
+    /// across clones; the async Mutex is held for the duration of a miss so
+    /// concurrent misses coalesce instead of stampeding.
+    cache: std::sync::Arc<tokio::sync::Mutex<Option<(std::time::Instant, Value)>>>,
 }
+
+/// Well under the 10s probe period, so probe freshness is unaffected; stall
+/// detection (threshold ≫ TTL) shifts by at most this much.
+const HEALTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl HealthChecker {
     fn new(config: &Config, worker_progress: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
@@ -596,10 +606,23 @@ impl HealthChecker {
             graph_api_key: config.graph_api_key.clone(),
             worker_progress,
             stall_threshold: WORKER_STALL_THRESHOLD,
+            cache: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
     async fn check(&self) -> Value {
+        let mut cache = self.cache.lock().await;
+        if let Some((at, v)) = cache.as_ref()
+            && at.elapsed() < HEALTH_CACHE_TTL
+        {
+            return v.clone();
+        }
+        let v = self.check_uncached().await;
+        *cache = Some((std::time::Instant::now(), v.clone()));
+        v
+    }
+
+    async fn check_uncached(&self) -> Value {
         let start = std::time::Instant::now();
 
         // All three checks run concurrently via tokio::join!
@@ -1579,8 +1602,6 @@ fn main() {
             ))
             .with_state(handle);
 
-        let health_auth = auth_state.clone();
-
         // Unauthenticated protected-resource metadata (404 when OIDC disabled).
         let wellknown = Router::new()
             .route(
@@ -1591,13 +1612,13 @@ fn main() {
                 "/.well-known/oauth-protected-resource/mcp",
                 get(wellknown::protected_resource_metadata),
             )
-            .with_state(auth_state);
+            .with_state(auth_state.clone());
 
         let health_route = Router::new()
             .route("/health", get(health))
             .with_state(HealthState {
                 checker,
-                auth: health_auth,
+                auth: auth_state,
             });
 
         // CORS is outermost so browser preflight (OPTIONS, no auth header) is
@@ -1648,9 +1669,6 @@ async fn shutdown_signal() {
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
-/// `unhealthy` (wedged worker) returns 503 so an httpGet liveness probe
-/// restarts the pod; backend outages stay `degraded`/200 — a restart
-/// wouldn't fix those (#63).
 /// `/health` state: the checker plus auth, because the response body varies by
 /// caller (alaya#75) while the route itself stays unauthenticated for probes.
 #[derive(Clone)]
@@ -1668,10 +1686,18 @@ fn minimal_health(v: &Value) -> Value {
     })
 }
 
+/// `unhealthy` (wedged worker) returns 503 so an httpGet liveness probe
+/// restarts the pod; backend outages stay `degraded`/200 — a restart
+/// wouldn't fix those (#63). The status code is computed from the full
+/// checker value for every caller; only the body varies by principal.
 async fn health(
     axum::extract::State(hs): axum::extract::State<HealthState>,
     headers: axum::http::HeaderMap,
-) -> (StatusCode, Json<Value>) {
+) -> (
+    StatusCode,
+    [(axum::http::HeaderName, &'static str); 1],
+    Json<Value>,
+) {
     let v = hs.checker.check().await;
     let code = if v.get("status").and_then(|s| s.as_str()) == Some("unhealthy") {
         StatusCode::SERVICE_UNAVAILABLE
@@ -1685,7 +1711,9 @@ async fn health(
     } else {
         minimal_health(&v)
     };
-    (code, Json(body))
+    // no-store: the body varies by Authorization; a shared cache must never
+    // serve a principal's full detail to an anonymous caller.
+    (code, [(header::CACHE_CONTROL, "no-store")], Json(body))
 }
 
 async fn store(
@@ -2377,7 +2405,38 @@ mod wedge_tests {
             graph_api_key: String::new(),
             worker_progress: Arc::new(AtomicU64::new(progress_epoch_s)),
             stall_threshold: WORKER_STALL_THRESHOLD,
+            cache: Arc::new(tokio::sync::Mutex::new(None)),
         }
+    }
+
+    /// The redaction gate itself (alaya#75): unauthenticated callers get the
+    /// liveness signal alone; a valid principal gets the full body. This is
+    /// the security-relevant branch — if the handler stops composing
+    /// `optional_principal` + `minimal_health`, this test fails.
+    #[tokio::test]
+    async fn health_handler_gates_detail_by_principal() {
+        let hs = HealthState {
+            checker: test_checker(epoch_secs()),
+            auth: crate::testkit::auth_state(Some("s3cret"), false),
+        };
+
+        // No credentials: exactly one key, no version/counts/topology.
+        let (code, hdrs, Json(body)) = health(
+            axum::extract::State(hs.clone()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK); // degraded backends are still 200
+        assert_eq!(hdrs[0].1, "no-store");
+        assert_eq!(body, json!({"status": "degraded"}));
+
+        // Valid static bearer: full operator detail.
+        let mut authed = axum::http::HeaderMap::new();
+        authed.insert(header::AUTHORIZATION, "Bearer s3cret".parse().unwrap());
+        let (_, _, Json(full)) = health(axum::extract::State(hs), authed).await;
+        assert!(full.get("worker").is_some());
+        assert!(full.get("vector_health").is_some());
+        assert!(full.get("version").is_some());
     }
 
     /// Health semantics (#63): a stalled worker is `unhealthy` (503 → k8s

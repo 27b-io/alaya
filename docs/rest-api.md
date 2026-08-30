@@ -63,8 +63,9 @@ instance running in open mode — the full operational detail is returned: build
 state. The detail is gated because build identity and corpus size are
 operator data, not public data (alaya#75).
 
-HTTP status is `200` for `healthy`/`starting` and `503` for `unhealthy`,
-for every caller — probes need only the code.
+HTTP status is `200` for `healthy`/`degraded` (a dead backend is `degraded` —
+restarting this pod would not fix it) and `503` for `unhealthy` (wedged
+worker), for every caller — probes need only the code.
 
 ## `POST /store`
 
