@@ -6,7 +6,7 @@
 //! other op — current or future — requires the `Static` principal.
 
 use axum::extract::{Request, State};
-use axum::http::{Method, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use subtle::ConstantTimeEq;
@@ -92,14 +92,27 @@ pub fn oidc_allows(op: &str) -> bool {
 /// Extract the bearer token from an `Authorization` header.
 /// RFC 6750 §2.1: the scheme name is case-insensitive (`Bearer`/`bearer`/`BEARER`
 /// are all valid); the credential follows whitespace after the scheme.
-fn bearer(req: &Request) -> Option<&str> {
-    let header = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    let header = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = header.split_once(|c: char| c.is_ascii_whitespace())?;
     if scheme.eq_ignore_ascii_case("bearer") {
         Some(token.trim_start())
     } else {
         None
     }
+}
+
+/// Resolve a principal from bare headers, for routes *outside* the protected
+/// router that vary their response by caller (e.g. `/health` detail gating,
+/// alaya#75). Same token rules as `require_auth`; dev open mode resolves to
+/// `Anonymous` so unauthenticated dev instances keep full behaviour. `None`
+/// means "treat as public".
+pub async fn optional_principal(auth: &AuthState, headers: &HeaderMap) -> Option<AuthPrincipal> {
+    if auth.api_key.is_none() && auth.oidc.is_none() && auth.allow_unauthenticated {
+        return Some(AuthPrincipal::Anonymous);
+    }
+    let token = bearer(headers).filter(|t| t.len() <= MAX_TOKEN_LEN)?;
+    authenticate(auth, token).await
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -163,7 +176,7 @@ pub async fn require_auth(State(auth): State<AuthState>, mut req: Request, next:
         return next.run(req).await;
     }
 
-    let token = bearer(&req).filter(|t| t.len() <= MAX_TOKEN_LEN);
+    let token = bearer(req.headers()).filter(|t| t.len() <= MAX_TOKEN_LEN);
     let Some(token) = token else {
         return challenge_401(&auth);
     };
@@ -353,16 +366,55 @@ mod tests {
 
     #[test]
     fn bearer_scheme_is_case_insensitive() {
-        let req = axum::http::Request::builder()
-            .header(header::AUTHORIZATION, "bearer  tok123")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(bearer(&req), Some("tok123"));
+        assert_eq!(bearer(&headers_with_auth("bearer  tok123")), Some("tok123"));
+        assert_eq!(bearer(&headers_with_auth("Basic abc")), None);
+    }
 
-        let not_bearer = axum::http::Request::builder()
-            .header(header::AUTHORIZATION, "Basic abc")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(bearer(&not_bearer), None);
+    // ── optional principal (detail gating on unprotected routes, alaya#75) ───
+
+    fn headers_with_auth(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, value.parse().unwrap());
+        h
+    }
+
+    #[tokio::test]
+    async fn optional_principal_static_wrong_and_missing() {
+        let auth = state(Some("s3cret"), false);
+        assert_eq!(
+            optional_principal(&auth, &headers_with_auth("Bearer s3cret")).await,
+            Some(AuthPrincipal::Static)
+        );
+        assert_eq!(
+            optional_principal(&auth, &headers_with_auth("Bearer wrong")).await,
+            None
+        );
+        assert_eq!(optional_principal(&auth, &HeaderMap::new()).await, None);
+    }
+
+    #[tokio::test]
+    async fn optional_principal_oidc_token_resolves() {
+        let auth = state(None, true);
+        let good = crate::testkit::mint(
+            jsonwebtoken::Algorithm::RS256,
+            Some(crate::testkit::KID_RSA),
+            &crate::testkit::TestClaims::valid(),
+        );
+        assert_eq!(
+            optional_principal(&auth, &headers_with_auth(&format!("Bearer {good}"))).await,
+            Some(AuthPrincipal::Oidc)
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_principal_open_mode_is_anonymous_but_only_with_flag() {
+        let mut auth = state(None, false);
+        // No keys, no flag: fail closed — public caller.
+        assert_eq!(optional_principal(&auth, &HeaderMap::new()).await, None);
+        auth.allow_unauthenticated = true;
+        assert_eq!(
+            optional_principal(&auth, &HeaderMap::new()).await,
+            Some(AuthPrincipal::Anonymous)
+        );
     }
 }

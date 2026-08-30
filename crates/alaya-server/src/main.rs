@@ -1579,6 +1579,8 @@ fn main() {
             ))
             .with_state(handle);
 
+        let health_auth = auth_state.clone();
+
         // Unauthenticated protected-resource metadata (404 when OIDC disabled).
         let wellknown = Router::new()
             .route(
@@ -1593,7 +1595,10 @@ fn main() {
 
         let health_route = Router::new()
             .route("/health", get(health))
-            .with_state(checker);
+            .with_state(HealthState {
+                checker,
+                auth: health_auth,
+            });
 
         // CORS is outermost so browser preflight (OPTIONS, no auth header) is
         // answered before `require_auth`.
@@ -1646,16 +1651,41 @@ async fn shutdown_signal() {
 /// `unhealthy` (wedged worker) returns 503 so an httpGet liveness probe
 /// restarts the pod; backend outages stay `degraded`/200 — a restart
 /// wouldn't fix those (#63).
+/// `/health` state: the checker plus auth, because the response body varies by
+/// caller (alaya#75) while the route itself stays unauthenticated for probes.
+#[derive(Clone)]
+struct HealthState {
+    checker: HealthChecker,
+    auth: auth::AuthState,
+}
+
+/// Strip `/health` detail down to the liveness signal. Build SHA, corpus size,
+/// and backend topology are operator data — on a public hostname they are
+/// disclosure to scanners, so they require a principal (alaya#75).
+fn minimal_health(v: &Value) -> Value {
+    serde_json::json!({
+        "status": v.get("status").cloned().unwrap_or(Value::Null)
+    })
+}
+
 async fn health(
-    axum::extract::State(checker): axum::extract::State<HealthChecker>,
+    axum::extract::State(hs): axum::extract::State<HealthState>,
+    headers: axum::http::HeaderMap,
 ) -> (StatusCode, Json<Value>) {
-    let v = checker.check().await;
+    let v = hs.checker.check().await;
     let code = if v.get("status").and_then(|s| s.as_str()) == Some("unhealthy") {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK
     };
-    (code, Json(v))
+    // k8s probes read only the status code; dev open mode resolves to a
+    // principal, so unauthenticated dev instances keep the full body.
+    let body = if auth::optional_principal(&hs.auth, &headers).await.is_some() {
+        v
+    } else {
+        minimal_health(&v)
+    };
+    (code, Json(body))
 }
 
 async fn store(
@@ -1958,6 +1988,27 @@ async fn backfill_summaries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minimal_health_keeps_only_the_liveness_signal() {
+        let full = serde_json::json!({
+            "status": "healthy",
+            "version": "ef5fe1a",
+            "total_memories": 9210,
+            "vector_health": {"status": "green"},
+            "graph_health": {"status": "ok"},
+            "worker": {"state": "ok"}
+        });
+        assert_eq!(
+            minimal_health(&full),
+            serde_json::json!({"status": "healthy"})
+        );
+        // A checker payload with no status must not panic or invent one.
+        assert_eq!(
+            minimal_health(&serde_json::json!({})),
+            serde_json::json!({"status": null})
+        );
+    }
 
     #[test]
     fn host_of_strips_port_and_unwraps_ipv6_brackets() {

@@ -45,23 +45,26 @@ Failed auth returns `401 Unauthorized` with a `WWW-Authenticate: Bearer …` hea
 
 ## `GET /health`
 
-Unauthenticated. Returns per-backend status. Use this as your liveness + readiness probe.
+Unauthenticated route, caller-dependent body. Use this as your liveness + readiness probe.
+
+Without credentials the body is the liveness signal only:
 
 ```bash
 curl http://localhost:3001/health
 ```
 
 ```json
-{
-  "status": "ok",
-  "qdrant": "ok",
-  "graph": "ok",
-  "embedding": "ok",
-  "memory_count": 1247
-}
+{ "status": "healthy" }
 ```
 
-`status` is `ok` only when every backend is healthy. Returns HTTP 200 either way — read the body for detail.
+With a valid `Authorization: Bearer` (static key or OIDC token) — or on a dev
+instance running in open mode — the full operational detail is returned: build
+`version`, `total_memories`, `vector_health`, `graph_health`, and `worker`
+state. The detail is gated because build identity and corpus size are
+operator data, not public data (alaya#75).
+
+HTTP status is `200` for `healthy`/`starting` and `503` for `unhealthy`,
+for every caller — probes need only the code.
 
 ## `POST /store`
 

@@ -65,8 +65,10 @@ api() {
 }
 
 # --- 0. health -------------------------------------------------------------
-# GET, unauthenticated — /health is not on the protected router. graph_health
-# must not be "unhealthy": /contradictions (step 3) reads from FalkorDB; if the
+# GET, unauthenticated — /health is not on the protected router. Full detail
+# (total_memories, graph_health, …) requires auth or dev open mode (alaya#75);
+# this demo targets the open-mode dev compose, so the fields are present.
+# graph_health must not be "unhealthy": /contradictions (step 3) reads from FalkorDB; if the
 # graph is down, store still works and the inline interference still appears,
 # but the CONTRADICTS edge can't be surfaced and step 3 returns pairs: [].
 echo "== 0. health =="
