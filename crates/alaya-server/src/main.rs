@@ -10,6 +10,7 @@
 //!   GET  /health       — Health check
 
 mod auth;
+mod build_info;
 mod cached_embedding;
 mod mcp;
 mod oidc;
@@ -665,7 +666,11 @@ impl HealthChecker {
 
         json!({
             "status": status,
-            "version": option_env!("ALAYA_GIT_SHA").unwrap_or("dev"),
+            // Build identity so any consumer can answer "is build X live?"
+            // without cluster access (#70). null when the build didn't pass it.
+            "version": build_info::version(),
+            "git_sha": build_info::git_sha(),
+            "built_at": build_info::built_at(),
             "backend": "qdrant",
             "worker": {
                 "state": worker_state,

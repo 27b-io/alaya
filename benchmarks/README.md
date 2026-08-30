@@ -128,7 +128,9 @@ Build the pinned local image, then start the stack. The bench Qdrant is
 
 ```bash
 # From the repo root — stamp the commit into /health so results are auditable.
-docker build -t localhost/alaya:bench --build-arg GIT_SHA="$(git rev-parse --short HEAD)" .
+# Read it back with `curl -s localhost:3001/health | jq -r .git_sha` (the
+# `version` field carries the crate semver, not the commit).
+docker build -t localhost/alaya:bench --build-arg GIT_SHA="$(git rev-parse HEAD)" .
 
 cd benchmarks
 # EMBEDDING_URL must serve Snowflake/snowflake-arctic-embed-l-v2.0 at 1024-d.

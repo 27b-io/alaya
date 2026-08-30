@@ -58,14 +58,55 @@ curl http://localhost:3001/health
 ```
 
 With a valid `Authorization: Bearer` (static key or OIDC token) — or on a dev
-instance running in open mode — the full operational detail is returned: build
-`version`, `total_memories`, `vector_health`, `graph_health`, and `worker`
-state. The detail is gated because build identity and corpus size are
-operator data, not public data (alaya#75).
+instance running in open mode — the full operational detail is returned. The
+detail is gated because build identity and corpus size are operator data, not
+public data (alaya#75).
 
-HTTP status is `200` for `healthy`/`degraded` (a dead backend is `degraded` —
-restarting this pod would not fix it) and `503` for `unhealthy` (wedged
-worker), for every caller — probes need only the code.
+```bash
+curl -s -H "Authorization: Bearer $ALAYA_API_KEY" http://localhost:3001/health
+```
+
+```json
+{
+  "status": "healthy",
+  "version": "0.1.0",
+  "git_sha": "2f9c1a4b6d8e0f2a4c6e8b0d2f4a6c8e0b2d4f6a",
+  "built_at": "2026-08-09T11:22:33Z",
+  "backend": "qdrant",
+  "worker": { "state": "ok", "stalled": false, "last_progress_age_s": 3 },
+  "vector_health": { "status": "green" },
+  "graph_health": { "status": "healthy" },
+  "total_memories": 1247
+}
+```
+
+`status` is `healthy` when every backend is reachable, `degraded` (HTTP 200) when
+a backend is down — restarting the pod won't fix Qdrant — and `unhealthy`
+(HTTP 503) when the service worker has stalled, so a liveness probe restarts it.
+The HTTP status code is the same for every caller — probes need only the code.
+
+### Build identity
+
+`version`, `git_sha` and `built_at` answer "is build X live?" without cluster
+access. `version` is the crate semver; `git_sha` is the commit the binary was
+built from; `built_at` is an RFC3339 timestamp. The last two are `null` for any
+build that didn't pass them (a plain `cargo build`, or `docker build` without
+`--build-arg`) — absence is never an error. Verify a rollout with:
+
+```bash
+curl -s -H "Authorization: Bearer $ALAYA_API_KEY" http://localhost:3001/health \
+  | jq -r .git_sha   # == git rev-parse HEAD
+```
+
+CI images always carry the full 40-hex SHA. A build that passes an abbreviation
+reports that prefix, so compare with `startswith` rather than equality if you
+accept locally-built images.
+
+> [!NOTE]
+> Before v0.1.0's build-identity change, `version` carried the git SHA. It now
+> carries the crate semver — read `git_sha` for the commit. The MCP
+> `initialize` response reports both together as `serverInfo.version`
+> (`0.1.0+<sha>`, semver build metadata).
 
 ## `POST /store`
 
