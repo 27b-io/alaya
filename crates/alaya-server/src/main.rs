@@ -1584,6 +1584,9 @@ fn main() {
             ))
             .with_state(handle);
 
+        // Health surfaces. Built before `wellknown` takes `auth_state`.
+        let health_route = health_routes(checker, auth_state.clone());
+
         // Unauthenticated protected-resource metadata (404 when OIDC disabled).
         let wellknown = Router::new()
             .route(
@@ -1595,10 +1598,6 @@ fn main() {
                 get(wellknown::protected_resource_metadata),
             )
             .with_state(auth_state);
-
-        let health_route = Router::new()
-            .route("/health", get(health))
-            .with_state(checker);
 
         // CORS is outermost so browser preflight (OPTIONS, no auth header) is
         // answered before `require_auth`.
@@ -1648,6 +1647,15 @@ async fn shutdown_signal() {
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
+/// Unauthenticated liveness/readiness probe: `status` plus the HTTP code,
+/// which is everything an automated prober consumes.
+///
+/// Nothing else belongs here. This route sits outside `require_auth`, so any
+/// field added to the body is world-readable — and the full document carries
+/// live capacity (`total_memories`), outage state (`worker.stalled`), the
+/// deployed commit, and per-backend error strings that render in-cluster URLs.
+/// That moved to `/health/detail` (#77).
+///
 /// `unhealthy` (wedged worker) returns 503 so an httpGet liveness probe
 /// restarts the pod; backend outages stay `degraded`/200 — a restart
 /// wouldn't fix those (#63).
@@ -1655,12 +1663,49 @@ async fn health(
     axum::extract::State(checker): axum::extract::State<HealthChecker>,
 ) -> (StatusCode, Json<Value>) {
     let v = checker.check().await;
-    let code = if v.get("status").and_then(|s| s.as_str()) == Some("unhealthy") {
+    (health_code(&v), Json(json!({ "status": v["status"] })))
+}
+
+/// Authenticated operator view: the full health document, including build
+/// identity (#70). Every intended consumer — radar, unified-memory, agents —
+/// already holds `ALAYA_API_KEY`, so "read the running build with zero cluster
+/// access" survives the move behind auth.
+async fn health_detail(
+    axum::extract::State(checker): axum::extract::State<HealthChecker>,
+) -> (StatusCode, Json<Value>) {
+    let v = checker.check().await;
+    (health_code(&v), Json(v))
+}
+
+/// Shared by both surfaces so they can never disagree on liveness.
+fn health_code(health: &Value) -> StatusCode {
+    if health.get("status").and_then(|s| s.as_str()) == Some("unhealthy") {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK
-    };
-    (code, Json(v))
+    }
+}
+
+/// The two health surfaces, composed.
+///
+/// Assembled here rather than inline in `main` so tests exercise the real
+/// composition: a handler-level test would still pass with the auth layer
+/// dropped, which is precisely the regression that matters. `HealthChecker`
+/// and `AuthState` are separate router states — axum allows that across a
+/// `merge`, the same trick `protected` uses for `require_auth`.
+fn health_routes(checker: HealthChecker, auth_state: AuthState) -> Router {
+    let detail = Router::new()
+        .route("/health/detail", get(health_detail))
+        .layer(middleware::from_fn_with_state(
+            auth_state,
+            auth::require_auth,
+        ))
+        .with_state(checker.clone());
+
+    Router::new()
+        .route("/health", get(health))
+        .with_state(checker)
+        .merge(detail)
 }
 
 async fn store(
@@ -2357,5 +2402,116 @@ mod wedge_tests {
         assert_eq!(v["status"], "degraded");
         assert_eq!(v["worker"]["state"], "starting");
         assert_eq!(v["worker"]["stalled"], false);
+    }
+
+    // ─── /health split (#77) ────────────────────────────────────────────────
+
+    const TEST_KEY: &str = "test-api-key";
+
+    fn test_auth_state() -> AuthState {
+        AuthState {
+            api_key: Some(TEST_KEY.into()),
+            allow_unauthenticated: false,
+            oidc: None,
+            public_base_url: "http://localhost:3001".into(),
+        }
+    }
+
+    /// Drive the composed router in-process. `token: None` models the k8s
+    /// probe and any anonymous caller.
+    async fn probe(app: &Router, path: &str, token: Option<&str>) -> (StatusCode, Value) {
+        use tower::ServiceExt;
+
+        let mut req = axum::http::Request::builder().uri(path);
+        if let Some(t) = token {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(axum::body::Body::empty()).expect("build request"))
+            .await
+            .expect("router call");
+
+        let code = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        (code, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    /// The unauthenticated probe carries `status` and nothing else.
+    ///
+    /// Asserted as an exact key set, not as spot-checks on the fields that
+    /// leak today: anything later added to `HealthChecker::check` is
+    /// world-readable the moment it lands, and this is the test that has to
+    /// fail when that happens.
+    #[tokio::test]
+    async fn unauthenticated_health_exposes_only_status() {
+        let app = health_routes(test_checker(epoch_secs()), test_auth_state());
+
+        let (code, body) = probe(&app, "/health", None).await;
+
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["status"], "degraded");
+        let keys: Vec<&str> = body
+            .as_object()
+            .expect("object body")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["status"], "unauthenticated /health leaked fields");
+    }
+
+    /// Backends are unreachable in these tests, so `check` takes the error
+    /// arms — the path that renders `reqwest::Error`, and with it in-cluster
+    /// URLs. None of it may reach an anonymous caller.
+    #[tokio::test]
+    async fn unauthenticated_health_hides_backend_error_detail() {
+        let app = health_routes(test_checker(epoch_secs()), test_auth_state());
+
+        let (_, bare) = probe(&app, "/health", None).await;
+        assert!(!bare.to_string().contains("127.0.0.1"));
+
+        // The detail view keeps it — that is what it is for.
+        let (_, detail) = probe(&app, "/health/detail", Some(TEST_KEY)).await;
+        assert!(detail["vector_health"]["error"].is_string());
+    }
+
+    /// The operator view is unreachable without a credential, and complete
+    /// with one.
+    #[tokio::test]
+    async fn health_detail_requires_auth() {
+        let app = health_routes(test_checker(epoch_secs()), test_auth_state());
+
+        let (code, _) = probe(&app, "/health/detail", None).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+
+        let (code, _) = probe(&app, "/health/detail", Some("wrong-key")).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+
+        let (code, body) = probe(&app, "/health/detail", Some(TEST_KEY)).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["total_memories"], 0);
+        assert!(body["worker"].is_object());
+        assert!(body["vector_health"].is_object());
+        // Build identity (#70) rides the authenticated surface now.
+        assert!(body.get("version").is_some());
+        assert!(body.get("git_sha").is_some());
+        assert!(body.get("built_at").is_some());
+    }
+
+    /// The #63 contract is the HTTP code, not the body: a wedged worker must
+    /// still 503 the *unauthenticated* probe, or k8s stops restarting stalled
+    /// pods. The failure path must not widen the body either.
+    #[tokio::test]
+    async fn stalled_worker_still_503s_the_bare_probe() {
+        let app = health_routes(test_checker(epoch_secs() - 3600), test_auth_state());
+
+        let (code, body) = probe(&app, "/health", None).await;
+
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "unhealthy");
+        assert_eq!(body.as_object().expect("object body").len(), 1);
     }
 }
