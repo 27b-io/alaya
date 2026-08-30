@@ -133,8 +133,8 @@ services:
       # The server is FAIL-CLOSED: it panics at boot with no auth configured.
       # For local dev we opt into open mode so `docker compose up` just works.
       # This is localhost-only — the open mode is itself refused on any
-      # non-private PUBLIC_BASE_URL. Set ALAYA_API_KEY above to a real token to
-      # enable auth (which auto-disables this flag). Before exposing this beyond
+      # non-private PUBLIC_BASE_URL. Setting either static key above (or OIDC)
+      # enables auth and auto-disables this flag. Before exposing this beyond
       # localhost: set ALAYA_API_KEY and a real PUBLIC_BASE_URL.
       DANGEROUSLY_ALLOW_UNAUTHENTICATED: ${DANGEROUSLY_ALLOW_UNAUTHENTICATED:-true}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3001}
