@@ -145,7 +145,7 @@ Copy `.env.example` to `.env`. All settings have sensible defaults for local dev
 | `GRAPH_URL` | — (required) | Bridge endpoint |
 | `GRAPH_API_KEY` | — | Bridge auth token |
 | `ALAYA_API_KEY` | — | Server auth token. Empty → server won't boot unless `DANGEROUSLY_ALLOW_UNAUTHENTICATED=true` (localhost dev only) |
-| `ALAYA_READONLY_API_KEY` | — | Read-only bearer for headless consumers (optional). Grants `search`/`get_memory`/health reads; 403 on every mutating route incl. `store`. Must differ from `ALAYA_API_KEY` |
+| `ALAYA_READONLY_API_KEY` | — | Read-only bearer for headless consumers (optional). Pure reads only (`search`, `get_memory`, contradictions, duplicate-find, health); 403 on every mutating route incl. `store`. Must differ from `ALAYA_API_KEY` |
 | `LISTEN_ADDR` | `0.0.0.0:3001` | Server bind address |
 | `REDIS_CACHE_URL` | — | L2 embedding cache (optional) |
 | `SUMMARY_URL` | — | Anthropic Messages API URL (optional) |

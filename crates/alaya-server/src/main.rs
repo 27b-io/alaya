@@ -1689,7 +1689,7 @@ async fn store(
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(params): Json<StoreParams>,
 ) -> (StatusCode, Json<Value>) {
-    let read_only = WritePolicy::for_principal(principal) == WritePolicy::ReadOnly;
+    let read_only = WritePolicy::read_only_for(principal);
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::Store {
@@ -1707,7 +1707,7 @@ async fn search(
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(params): Json<SearchParams>,
 ) -> (StatusCode, Json<Value>) {
-    let read_only = WritePolicy::for_principal(principal) == WritePolicy::ReadOnly;
+    let read_only = WritePolicy::read_only_for(principal);
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::Search {

@@ -78,6 +78,12 @@ impl WritePolicy {
             AuthPrincipal::Static | AuthPrincipal::Anonymous => WritePolicy::Full,
         }
     }
+
+    /// The `read_only` bool threaded into service calls — one derivation for
+    /// every gate site, so a new principal can't drift between them.
+    pub fn read_only_for(p: AuthPrincipal) -> bool {
+        Self::for_principal(p) == WritePolicy::ReadOnly
+    }
 }
 
 /// Auth configuration + verifier, built once at startup. Cheap to clone.
@@ -185,7 +191,11 @@ fn challenge_401(auth: &AuthState) -> Response {
         .into_response()
 }
 
-fn forbidden_403() -> Response {
+/// 403 for an authenticated-but-unauthorized request. Logged so an operator
+/// can diagnose a misconfigured consumer (e.g. radar holding the read-only key
+/// but calling a mutating route) without grepping silence.
+fn forbidden_403(principal: AuthPrincipal, op: &str) -> Response {
+    tracing::debug!(?principal, %op, "authorization denied");
     (
         StatusCode::FORBIDDEN,
         axum::Json(serde_json::json!({"error": "forbidden for this principal"})),
@@ -213,8 +223,11 @@ pub async fn require_auth(State(auth): State<AuthState>, mut req: Request, next:
 
     // REST authz (the /mcp path is gated in mcp_handler after JSON-RPC parse).
     let path = req.uri().path();
-    if path != "/mcp" && !principal.allows(rest_route_op(req.method(), path)) {
-        return forbidden_403();
+    if path != "/mcp" {
+        let op = rest_route_op(req.method(), path);
+        if !principal.allows(op) {
+            return forbidden_403(principal, op);
+        }
     }
 
     req.extensions_mut().insert(principal);

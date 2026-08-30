@@ -202,6 +202,7 @@ pub async fn mcp_handler(
             .and_then(|n| n.as_str())
             .unwrap_or("");
         if !principal.allows(tool) {
+            tracing::debug!(?principal, %tool, "authorization denied");
             let resp = JsonRpcResponse::error(id, -32001, "forbidden for this principal");
             return make_response(resp, wants_sse);
         }
@@ -328,7 +329,7 @@ async fn dispatch_tool(
     handle: &ServiceHandle,
     principal: AuthPrincipal,
 ) -> Result<Value, (i32, String)> {
-    let read_only = WritePolicy::for_principal(principal) == WritePolicy::ReadOnly;
+    let read_only = WritePolicy::read_only_for(principal);
     match name {
         "store_memory" => {
             let params: StoreParams = serde_json::from_value(args)
