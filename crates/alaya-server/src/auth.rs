@@ -121,6 +121,11 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 /// `Anonymous` so unauthenticated dev instances keep full behaviour. `None`
 /// means "treat as public".
 pub async fn optional_principal(auth: &AuthState, headers: &HeaderMap) -> Option<AuthPrincipal> {
+    // Flush runs on every call — not just rejections — so a guessing burst
+    // that then goes quiet still surfaces within ~one window: k8s probes
+    // traverse this path continuously (a rejection-only flush would defer the
+    // count indefinitely and misattribute it to a later unrelated rejection).
+    log_pending_rejections();
     if auth.open_mode() {
         return Some(AuthPrincipal::Anonymous);
     }
@@ -128,11 +133,81 @@ pub async fn optional_principal(auth: &AuthState, headers: &HeaderMap) -> Option
     let principal = authenticate(auth, token).await;
     if principal.is_none() {
         // A credential was presented and rejected. This path returns 200 with
-        // the minimal body (no 401), so without this line a key-guessing
-        // attempt here would be invisible to logs and alerting.
-        tracing::info!(op = "optional_principal", "presented credential rejected");
+        // the minimal body (no 401), so key-guessing must reach logs and
+        // alerting — but the route is public and unthrottled, so one info
+        // line per request would itself be a log-flood DoS vector. The
+        // limiter emits one windowed info line carrying the count; per-event
+        // detail stays at debug.
+        tracing::debug!(op = "optional_principal", "presented credential rejected");
+        REJECTION_LOG.note_rejection();
+        // Immediate flush so the first rejection after a quiet window logs
+        // at once — attack onset is never delayed.
+        log_pending_rejections();
     }
     principal
+}
+
+/// At most one info line per window on the unauthenticated rejection path.
+const REJECTION_LOG_WINDOW_S: u64 = 60;
+
+static REJECTION_LOG: RejectionLogLimiter = RejectionLogLimiter::new();
+
+/// Emit the windowed rejected-credential line when one is due.
+fn log_pending_rejections() {
+    if let Some(n) = REJECTION_LOG.flush(crate::epoch_secs()) {
+        tracing::info!(
+            op = "optional_principal",
+            rejected_since_last = n,
+            "presented credentials rejected"
+        );
+    }
+}
+
+/// Windowed rate limiter for rejected-credential logging. The first rejection
+/// after a quiet window logs immediately (attack onset is visible right away);
+/// subsequent ones are counted and emitted as one line per window.
+// ponytail: one global window, not per-source — per-IP keying needs the peer
+// addr plumbed through and a bounded map; add if one noisy source ever needs
+// isolating from the signal.
+struct RejectionLogLimiter {
+    rejected_since_log: std::sync::atomic::AtomicU64,
+    last_log_epoch_s: std::sync::atomic::AtomicU64,
+}
+
+impl RejectionLogLimiter {
+    const fn new() -> Self {
+        Self {
+            rejected_since_log: std::sync::atomic::AtomicU64::new(0),
+            last_log_epoch_s: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn note_rejection(&self) {
+        self.rejected_since_log
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `Some(n)` when the caller should emit the windowed info line covering
+    /// the `n` rejections since the last one; `None` while nothing is pending
+    /// or the window hasn't elapsed.
+    fn flush(&self, now_s: u64) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        if self.rejected_since_log.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let last = self.last_log_epoch_s.load(Ordering::Relaxed);
+        // The CAS elects exactly one logger per window under concurrency.
+        if now_s.saturating_sub(last) >= REJECTION_LOG_WINDOW_S
+            && self
+                .last_log_epoch_s
+                .compare_exchange(last, now_s, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let n = self.rejected_since_log.swap(0, Ordering::Relaxed);
+            return (n > 0).then_some(n);
+        }
+        None
+    }
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -325,13 +400,13 @@ mod tests {
 
     // ── authentication path (the dual-mode dispatch + 401 challenge) ─────────
 
-    use crate::testkit::auth_state as state;
+    use crate::testkit::{TEST_API_KEY, auth_state as state};
 
     #[tokio::test]
     async fn authenticate_static_key() {
-        let auth = state(Some("s3cret"), false);
+        let auth = state(Some(TEST_API_KEY), false);
         assert_eq!(
-            authenticate(&auth, "s3cret").await,
+            authenticate(&auth, TEST_API_KEY).await,
             Some(AuthPrincipal::Static)
         );
         assert_eq!(authenticate(&auth, "wrong").await, None);
@@ -399,9 +474,9 @@ mod tests {
 
     #[tokio::test]
     async fn optional_principal_static_wrong_and_missing() {
-        let auth = state(Some("s3cret"), false);
+        let auth = state(Some(TEST_API_KEY), false);
         assert_eq!(
-            optional_principal(&auth, &headers_with_auth("Bearer s3cret")).await,
+            optional_principal(&auth, &headers_with_auth(&format!("Bearer {TEST_API_KEY}"))).await,
             Some(AuthPrincipal::Static)
         );
         assert_eq!(
@@ -442,9 +517,27 @@ mod tests {
         assert_eq!(optional_principal(&keyed, &HeaderMap::new()).await, None);
     }
 
+    /// The rejection-log limiter: onset logs immediately, the window
+    /// suppresses the rest, and — the burst-then-stop case — a pending count
+    /// flushes on any later call, with no new rejection required.
+    #[test]
+    fn rejection_log_limiter_windows() {
+        let l = RejectionLogLimiter::new();
+        assert_eq!(l.flush(1_000), None); // nothing pending: no line
+        l.note_rejection();
+        assert_eq!(l.flush(1_000), Some(1)); // attack onset visible at once
+        l.note_rejection();
+        assert_eq!(l.flush(1_000), None); // same second: suppressed
+        l.note_rejection();
+        assert_eq!(l.flush(1_030), None); // mid-window: suppressed
+        // Burst stopped; a probe-driven flush still surfaces the count.
+        assert_eq!(l.flush(1_060), Some(2));
+        assert_eq!(l.flush(1_120), None); // drained: quiet windows stay silent
+    }
+
     #[tokio::test]
     async fn bearer_enforces_token_length_cap() {
-        let auth = state(Some("s3cret"), false);
+        let auth = state(Some(TEST_API_KEY), false);
         let oversized = format!("Bearer {}", "x".repeat(MAX_TOKEN_LEN + 1));
         assert_eq!(
             optional_principal(&auth, &headers_with_auth(&oversized)).await,

@@ -9,6 +9,10 @@
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
 
+/// Static bearer key fixture for auth tests — a named test value, never a
+/// real credential (this module is `#[cfg(test)]`-only).
+pub(crate) const TEST_API_KEY: &str = "test-api-key";
+
 pub(crate) const ISSUER: &str = "https://issuer.test";
 pub(crate) const AUDIENCE: &str = "https://rs.test/mcp";
 pub(crate) const KID_RSA: &str = "test-rsa";

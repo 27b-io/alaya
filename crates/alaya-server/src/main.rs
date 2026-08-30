@@ -2417,7 +2417,7 @@ mod wedge_tests {
     async fn health_handler_gates_detail_by_principal() {
         let hs = HealthState {
             checker: test_checker(epoch_secs()),
-            auth: crate::testkit::auth_state(Some("s3cret"), false),
+            auth: crate::testkit::auth_state(Some(crate::testkit::TEST_API_KEY), false),
         };
 
         // No credentials: exactly one key, no version/counts/topology.
@@ -2427,13 +2427,21 @@ mod wedge_tests {
         )
         .await;
         assert_eq!(code, StatusCode::OK); // degraded backends are still 200
-        assert_eq!(hdrs[0].1, "no-store");
+        assert_eq!(hdrs[0], (header::CACHE_CONTROL, "no-store"));
         assert_eq!(body, json!({"status": "degraded"}));
 
         // Valid static bearer: full operator detail.
         let mut authed = axum::http::HeaderMap::new();
-        authed.insert(header::AUTHORIZATION, "Bearer s3cret".parse().unwrap());
-        let (_, _, Json(full)) = health(axum::extract::State(hs), authed).await;
+        authed.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", crate::testkit::TEST_API_KEY)
+                .parse()
+                .unwrap(),
+        );
+        let (_, hdrs, Json(full)) = health(axum::extract::State(hs), authed).await;
+        // no-store on the authed variant too — a shared cache must never
+        // replay a principal's full body to an anonymous caller (CWE-200).
+        assert_eq!(hdrs[0], (header::CACHE_CONTROL, "no-store"));
         assert!(full.get("worker").is_some());
         assert!(full.get("vector_health").is_some());
         assert!(full.get("version").is_some());
