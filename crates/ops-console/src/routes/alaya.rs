@@ -168,7 +168,8 @@ pub async fn browse(
             .map(|last| base_qs(1, Some(vf(last, "created_at"))))
             .filter(|_| results.len() >= PAGE_SIZE)
     } else if has_more || results.len() >= PAGE_SIZE {
-        (mode == "scan" || mode == "tag").then(|| base_qs(q.page + 1, None))
+        // hybrid/scan/tag are all page-based upstream.
+        Some(base_qs(q.page + 1, None))
     } else {
         None
     };
@@ -177,8 +178,6 @@ pub async fn browse(
         .iter()
         .map(|m| {
             let hash = vs(m, "content_hash");
-            let href = memory_href(&hash);
-            let short = short_hash(&hash);
             let mtype = vs(m, "memory_type");
             let text = excerpt(m, 140);
             let tags: Vec<String> = m
@@ -195,11 +194,7 @@ pub async fn browse(
             let superseded = is_superseded(m);
             view! {
                 <TableRow>
-                    <TableCell>
-                        <a class="font-mono text-xs text-primary underline-offset-4 hover:underline" href=href>
-                            {short}
-                        </a>
-                    </TableCell>
+                    <TableCell><HashLink hash=hash /></TableCell>
                     <TableCell><span class=badge(BadgeKind::Secondary)>{mtype}</span></TableCell>
                     <TableCell>
                         <span class="text-sm">{text}</span>
@@ -304,6 +299,45 @@ fn urlenc(s: &str) -> String {
 
 // ─── Detail (AC3) ───────────────────────────────────────────────────────────
 
+/// Forward walk of the supersession chain from a memory's
+/// `metadata.superseded_by`: `(hash, excerpt)` per hop, bounded to 10 hops,
+/// cycle-proof. Fetch failures render as "(unavailable)" — the audit trail is
+/// shown even when a link is unreadable, never silently dropped.
+async fn supersession_chain(
+    alaya: &crate::alaya::AlayaClient,
+    mem: &Value,
+) -> Vec<(String, String)> {
+    let mut chain: Vec<(String, String)> = Vec::new();
+    let mut cursor = mem
+        .get("metadata")
+        .and_then(|m| m.get("superseded_by"))
+        .and_then(|s| s.as_str())
+        .map(String::from);
+    while let Some(next) = cursor.take() {
+        if chain.len() >= 10 || validate_hash(&next).is_err() {
+            break;
+        }
+        let label = match alaya.get_memory(&next).await {
+            Ok(r) => {
+                if let Some(m) = r.get("memory") {
+                    cursor = m
+                        .get("metadata")
+                        .and_then(|md| md.get("superseded_by"))
+                        .and_then(|s| s.as_str())
+                        .filter(|h| *h != next && !chain.iter().any(|(seen, _)| seen == h))
+                        .map(String::from);
+                    excerpt(m, 100)
+                } else {
+                    "(unavailable)".to_string()
+                }
+            }
+            Err(_) => "(unavailable)".to_string(),
+        };
+        chain.push((next, label));
+    }
+    chain
+}
+
 pub async fn detail(
     State(state): State<AppState>,
     session: Session,
@@ -329,37 +363,7 @@ pub async fn detail(
         .and_then(|r| r.get("relations").and_then(|x| x.as_array()).cloned())
         .unwrap_or_default();
 
-    // Supersession chain (forward walk, bounded — cycles can't loop us).
-    let mut chain: Vec<(String, String)> = Vec::new();
-    let mut cursor = mem
-        .get("metadata")
-        .and_then(|m| m.get("superseded_by"))
-        .and_then(|s| s.as_str())
-        .map(String::from);
-    let mut hops = 0;
-    while let Some(next) = cursor.take() {
-        if hops >= 10 || validate_hash(&next).is_err() {
-            break;
-        }
-        hops += 1;
-        let label = match state.alaya.get_memory(&next).await {
-            Ok(r) => {
-                if let Some(m) = r.get("memory") {
-                    cursor = m
-                        .get("metadata")
-                        .and_then(|md| md.get("superseded_by"))
-                        .and_then(|s| s.as_str())
-                        .filter(|h| *h != next && !chain.iter().any(|(seen, _)| seen == h))
-                        .map(String::from);
-                    excerpt(m, 100)
-                } else {
-                    "(unavailable)".to_string()
-                }
-            }
-            Err(_) => "(unavailable)".to_string(),
-        };
-        chain.push((next, label));
-    }
+    let chain = supersession_chain(&state.alaya, &mem).await;
 
     let content_text = vs(&mem, "content");
     let summary = vs(&mem, "summary");
@@ -405,21 +409,11 @@ pub async fn detail(
             let rel_badge = rel_type.clone();
             // Link to the far end of the edge, whichever side this memory is.
             let other = if source == hash { target.clone() } else { source.clone() };
-            let other_href = memory_href(&other);
-            let other_short = short_hash(&other);
-            let created = e
-                .get("created_at")
-                .and_then(|c| c.as_f64())
-                .map(fmt_epoch)
-                .unwrap_or_else(|| "—".into());
+            let created = fmt_epoch(vf(e, "created_at"));
             view! {
                 <TableRow>
                     <TableCell><span class=badge(BadgeKind::Info)>{rel_badge}</span></TableCell>
-                    <TableCell>
-                        <a class="font-mono text-xs text-primary underline-offset-4 hover:underline" href=other_href>
-                            {other_short}
-                        </a>
-                    </TableCell>
+                    <TableCell><HashLink hash=other /></TableCell>
                     <TableCell><span class="text-xs text-muted-foreground">{created}</span></TableCell>
                     <TableCell>
                         <form method="post" action="/alaya/relation/delete">
@@ -494,13 +488,12 @@ pub async fn detail(
                     <CardContent>
                         <ol class="space-y-2 text-sm">
                             {chain.iter().map(|(h, label)| {
-                                let href = memory_href(h);
-                                let short = short_hash(h);
+                                let h = h.clone();
                                 let label = label.clone();
                                 view! {
                                     <li class="flex gap-2 items-baseline">
                                         <span class="text-muted-foreground">"↳"</span>
-                                        <a class="font-mono text-xs text-primary underline-offset-4 hover:underline" href=href>{short}</a>
+                                        <HashLink hash=h />
                                         <span class="text-muted-foreground">{label}</span>
                                     </li>
                                 }
@@ -655,12 +648,10 @@ pub async fn supersede_form(
     let csrf = session.csrf.clone();
     let preview_card = |title: &'static str, p: Option<(String, String)>| {
         p.map(|(h, text)| {
-            let href = memory_href(&h);
-            let short = short_hash(&h);
             view! {
                 <div class="rounded-md border p-4">
                     <div class="text-xs font-medium text-muted-foreground mb-1">{title}</div>
-                    <a class="font-mono text-xs text-primary underline-offset-4 hover:underline" href=href>{short}</a>
+                    <HashLink hash=h />
                     <p class="text-sm mt-2">{text}</p>
                 </div>
             }
@@ -797,10 +788,26 @@ pub async fn correct_and_supersede(
         ));
     }
 
-    state
+    // Two-phase mutation: the correction is already stored. If the supersede
+    // half fails, the error must say exactly what landed — a generic 502
+    // would hide a committed write on the memory of record.
+    if let Err(e) = state
         .alaya
         .supersede(&hash, &new_hash, form.reason.trim())
-        .await?;
+        .await
+    {
+        tracing::error!(sub = %session.sub, old = %hash, new = %new_hash, "correction stored but supersede failed");
+        let detail = match e {
+            AppError::Upstream(d) => d,
+            _ => "supersede failed".to_string(),
+        };
+        return Err(AppError::Upstream(format!(
+            "correction WAS stored as {} but superseding {} failed ({detail}) — \
+             retry the supersede from the original memory's page",
+            short_hash(&new_hash),
+            short_hash(&hash),
+        )));
+    }
     tracing::info!(sub = %session.sub, old = %hash, new = %new_hash, "corrected + superseded");
     Ok(flash_redirect(
         jar,
@@ -921,10 +928,9 @@ pub async fn duplicates(
                 .iter()
                 .map(|h| {
                     let is_canonical = *h == canonical;
-                    let href = memory_href(h);
-                    let short = short_hash(h);
                     let h_radio = h.clone();
                     let h_check = h.clone();
+                    let h_link = h.clone();
                     view! {
                         <li class="flex items-center gap-3 text-sm">
                             <label class="flex items-center gap-1 text-xs text-muted-foreground">
@@ -935,7 +941,7 @@ pub async fn duplicates(
                                 <input type="checkbox" name="duplicate_hashes" value=h_check checked=!is_canonical />
                                 "merge"
                             </label>
-                            <a class="font-mono text-xs text-primary underline-offset-4 hover:underline" href=href>{short}</a>
+                            <HashLink hash=h_link />
                         </li>
                     }
                 })
@@ -1017,13 +1023,17 @@ pub async fn merge_submit(
     State(state): State<AppState>,
     session: Session,
     jar: PrivateCookieJar,
-    axum_extra::extract::Form(form): axum_extra::extract::Form<MergeForm>,
+    axum_extra::extract::Form(mut form): axum_extra::extract::Form<MergeForm>,
 ) -> Result<Response, AppError> {
     session.verify_csrf(&form.csrf)?;
     validate_hash(&form.canonical_hash)?;
+    // The form's checkbox state doesn't re-sync when the operator moves the
+    // canonical radio (no JS by design) — the chosen canonical may arrive
+    // inside duplicate_hashes. Filter it out instead of half-merging.
+    form.duplicate_hashes.retain(|h| *h != form.canonical_hash);
     if form.duplicate_hashes.is_empty() {
         return Err(AppError::BadRequest(
-            "select at least one duplicate to merge".into(),
+            "select at least one duplicate to merge (other than the canonical)".into(),
         ));
     }
     for h in &form.duplicate_hashes {
@@ -1054,9 +1064,10 @@ pub async fn merge_submit(
             })
             .unwrap_or_default();
         let csrf = session.csrf.clone();
-        let canonical_href = memory_href(&form.canonical_hash);
-        let canonical_short = short_hash(&form.canonical_hash);
         let dup_field = form.duplicate_hashes.clone();
+        let canonical_link = form.canonical_hash.clone();
+        let canonical_hidden = form.canonical_hash.clone();
+        let reason_hidden = form.reason.clone();
         let content = view! {
             <Card>
                 <CardHeader>
@@ -1066,23 +1077,22 @@ pub async fn merge_submit(
                 <CardContent>
                     <p class="text-sm mb-2">
                         "Canonical: "
-                        <a class="font-mono text-xs text-primary underline-offset-4 hover:underline" href=canonical_href>{canonical_short}</a>
+                        <HashLink hash=canonical_link />
                     </p>
                     <p class="text-sm mb-2">"Will supersede:"</p>
                     <ul class="space-y-1 mb-6">
                         {superseded.iter().map(|h| {
-                            let href = memory_href(h);
-                            let short = short_hash(h);
-                            view! { <li><a class="font-mono text-xs text-primary underline-offset-4 hover:underline" href=href>{short}</a></li> }
+                            let h = h.clone();
+                            view! { <li><HashLink hash=h /></li> }
                         }).collect_view()}
                     </ul>
                     <form method="post" action="/alaya/duplicates/merge" class="flex items-center gap-3">
                         <input type="hidden" name="csrf" value=csrf />
-                        <input type="hidden" name="canonical_hash" value=form.canonical_hash.clone() />
+                        <input type="hidden" name="canonical_hash" value=canonical_hidden />
                         {dup_field.into_iter().map(|h| view! {
                             <input type="hidden" name="duplicate_hashes" value=h />
                         }).collect_view()}
-                        <input type="hidden" name="reason" value=form.reason.clone() />
+                        <input type="hidden" name="reason" value=reason_hidden />
                         <button type="submit" class=btn(Btn::Destructive)>"Commit merge"</button>
                         <a href="/alaya/duplicates" class=btn(Btn::Outline)>"Cancel"</a>
                     </form>
@@ -1155,13 +1165,11 @@ pub async fn contradictions(
             let keep_a = format!("/alaya/supersede?old={b}&new={a}");
             let keep_b = format!("/alaya/supersede?old={a}&new={b}");
             let side = |hash: String, text: String, sup: bool, label: &'static str| {
-                let href = memory_href(&hash);
-                let short = short_hash(&hash);
                 view! {
                     <div class="rounded-md border p-4">
                         <div class="flex items-center gap-2 mb-2">
                             <span class="text-xs font-medium text-muted-foreground">{label}</span>
-                            <a class="font-mono text-xs text-primary underline-offset-4 hover:underline" href=href>{short}</a>
+                            <HashLink hash=hash />
                             {sup.then(|| view! { <span class=badge(BadgeKind::Warning)>"superseded"</span> })}
                         </div>
                         <p class="text-sm">{text}</p>
@@ -1262,7 +1270,6 @@ pub async fn auth_view(
                             Either::Right(view! { <span class=badge(BadgeKind::Muted)>"read / additive"</span> })
                         }}
                     </TableCell>
-                    <TableCell><span class=badge(BadgeKind::Success)>"allowed"</span></TableCell>
                     <TableCell>
                         {if oidc_ok {
                             Either::Left(view! { <span class=badge(BadgeKind::Success)>"allowed"</span> })
@@ -1303,8 +1310,8 @@ pub async fn auth_view(
             </Card>
             <Card>
                 <CardHeader>
-                    <CardTitle>"Principal × operation matrix"</CardTitle>
-                    <CardDescription>"Default-deny: any op not explicitly allowlisted is static-bearer only."</CardDescription>
+                    <CardTitle>"OIDC principal × operation matrix"</CardTitle>
+                    <CardDescription>"The static bearer has full access to every operation. OIDC principals are default-deny: any op not explicitly allowlisted is static-bearer only."</CardDescription>
                 </CardHeader>
                 <CardContent>
                     <TableWrapper><Table>
@@ -1312,7 +1319,6 @@ pub async fn auth_view(
                             <TableRow>
                                 <TableHead>"Operation"</TableHead>
                                 <TableHead>"Kind"</TableHead>
-                                <TableHead>"Static principal"</TableHead>
                                 <TableHead>"OIDC principal"</TableHead>
                             </TableRow>
                         </TableHeader>

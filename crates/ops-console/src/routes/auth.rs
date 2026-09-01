@@ -7,7 +7,7 @@
 
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum_extra::extract::cookie::{Cookie, PrivateCookieJar};
+use axum_extra::extract::cookie::PrivateCookieJar;
 use serde::Deserialize;
 
 use crate::error::AppError;
@@ -86,7 +86,7 @@ pub async fn callback(
         claims.name.or(claims.preferred_username),
     );
     let secure = state.secure_cookies();
-    let jar = jar.remove(Cookie::from(LOGIN_COOKIE));
+    let jar = jar.remove(session::removal_cookie(LOGIN_COOKIE));
     let jar = session::session_cookie(jar, &sess, secure);
     Ok((jar, Redirect::to(&safe_next(&login.next))).into_response())
 }
@@ -106,7 +106,7 @@ pub async fn logout(
     if let Some(sess) = session::read_session(&jar) {
         sess.verify_csrf(&form.csrf)?;
     }
-    let jar = jar.remove(Cookie::from(SESSION_COOKIE));
+    let jar = jar.remove(session::removal_cookie(SESSION_COOKIE));
     let jar = session::flash_cookie(
         jar,
         &Flash {

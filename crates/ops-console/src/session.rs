@@ -102,6 +102,14 @@ fn base_cookie(
     c
 }
 
+/// Removal cookie matching `base_cookie`'s attributes. Removal only takes
+/// effect when `Path` matches the stored cookie — a bare `Cookie::from(name)`
+/// removal inherits the request's path and silently fails everywhere but `/`
+/// (logout would be a no-op on the memory of record's write session).
+pub fn removal_cookie(name: &'static str) -> Cookie<'static> {
+    Cookie::build(name).path("/").build()
+}
+
 pub fn session_cookie(jar: PrivateCookieJar, s: &Session, secure: bool) -> PrivateCookieJar {
     let value = serde_json::to_string(s).expect("session serializes");
     jar.add(base_cookie(SESSION_COOKIE, value, secure, SESSION_TTL_SECS))
@@ -135,7 +143,7 @@ pub fn take_flash(jar: PrivateCookieJar) -> (PrivateCookieJar, Option<Flash>) {
     match jar.get(FLASH_COOKIE) {
         Some(c) => {
             let f: Option<Flash> = serde_json::from_str(c.value()).ok();
-            (jar.remove(Cookie::from(FLASH_COOKIE)), f)
+            (jar.remove(removal_cookie(FLASH_COOKIE)), f)
         }
         None => (jar, None),
     }
@@ -202,11 +210,12 @@ mod tests {
         );
     }
 
+    /// The removal cookie must carry `Path=/` to match `base_cookie`'s
+    /// attributes — otherwise the browser scopes the removal to the request
+    /// path and logout/flash-clear silently no-op off `/`.
     #[test]
-    fn expired_session_is_rejected_on_read() {
-        let mut s = new_session("sub".into(), None, None);
-        s.exp = now_epoch() - 1;
-        // read_session gate is (exp > now) — emulate it directly.
-        assert!(s.exp <= now_epoch());
+    fn removal_cookie_carries_root_path() {
+        assert_eq!(removal_cookie(SESSION_COOKIE).path(), Some("/"));
+        assert_eq!(removal_cookie(FLASH_COOKIE).path(), Some("/"));
     }
 }

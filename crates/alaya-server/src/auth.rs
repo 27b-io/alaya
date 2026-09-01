@@ -111,26 +111,25 @@ pub const ALL_OPS: &[(&str, bool)] = &[
 /// exist, the OIDC issuer/audience, and the principal × op matrix. Contains
 /// NO credential material — only presence flags and public identifiers.
 pub fn auth_config_view(auth: &AuthState) -> serde_json::Value {
+    // The static principal always has full access, so per-op "static" flags
+    // would be constants — the matrix only carries what varies (oidc).
     let ops: Vec<serde_json::Value> = ALL_OPS
         .iter()
         .map(|(op, mutating)| {
             serde_json::json!({
                 "op": op,
                 "mutating": mutating,
-                "static": true,
                 "oidc": oidc_allows(op),
             })
         })
         .collect();
     serde_json::json!({
         "static_bearer_configured": auth.api_key.is_some(),
-        "open_mode": auth.api_key.is_none() && auth.oidc.is_none() && auth.allow_unauthenticated,
         "oidc": {
             "enabled": auth.oidc.is_some(),
             "issuer": auth.oidc.as_ref().map(|v| v.issuer().to_string()),
             "audience": auth.oidc.as_ref().map(|v| v.audience().to_string()),
         },
-        "oidc_allowlist": OIDC_ALLOWLIST,
         "ops": ops,
     })
 }
@@ -350,7 +349,6 @@ mod tests {
                 oidc_allows(name),
                 "matrix must mirror oidc_allows for {name}"
             );
-            assert_eq!(op["static"], true);
         }
         // Every mutating op must be OIDC-denied — the read-only invariant
         // the view exists to display.
@@ -358,6 +356,39 @@ mod tests {
             if op["mutating"] == true {
                 assert_eq!(op["oidc"], false, "{} must be OIDC-denied", op["op"]);
             }
+        }
+    }
+
+    /// Drift guard: every op `rest_route_op` can emit (except the fail-closed
+    /// sentinel) must appear in `ALL_OPS`, or the auth-config view silently
+    /// under-reports the surface it exists to display.
+    #[test]
+    fn all_ops_covers_every_rest_route_op() {
+        let rest_ops = [
+            rest_route_op(&Method::POST, "/store"),
+            rest_route_op(&Method::POST, "/search"),
+            rest_route_op(&Method::POST, "/delete"),
+            rest_route_op(&Method::POST, "/relation"),
+            rest_route_op(&Method::POST, "/supersede"),
+            rest_route_op(&Method::POST, "/contradictions"),
+            rest_route_op(&Method::POST, "/duplicates/find"),
+            rest_route_op(&Method::POST, "/duplicates/merge"),
+            rest_route_op(&Method::POST, "/backfill/summaries"),
+            rest_route_op(&Method::GET, "/memories/x"),
+            rest_route_op(&Method::PATCH, "/memories/x"),
+        ];
+        for op in rest_ops {
+            assert!(
+                ALL_OPS.iter().any(|(name, _)| *name == op),
+                "ALL_OPS is missing '{op}' — the auth-config view under-reports"
+            );
+        }
+        // And the allowlist itself must be a subset of ALL_OPS.
+        for op in OIDC_ALLOWLIST {
+            assert!(
+                ALL_OPS.iter().any(|(name, _)| name == op),
+                "ALL_OPS is missing allowlisted op '{op}'"
+            );
         }
     }
 

@@ -144,6 +144,19 @@ pub fn TableCell(children: Children) -> impl IntoView {
     view! { <td class="p-3 align-middle">{children()}</td> }
 }
 
+/// Short, linked content-hash — the one way a hash renders anywhere in the
+/// console (browse rows, detail, chains, duplicates, contradictions).
+#[component]
+pub fn HashLink(hash: String) -> impl IntoView {
+    let href = format!("/alaya/memory/{hash}");
+    let short: String = hash.chars().take(12).collect();
+    view! {
+        <a class="font-mono text-xs text-primary underline-offset-4 hover:underline" href=href>
+            {short}
+        </a>
+    }
+}
+
 // ─── Form atoms (vendored: ui/input.rs, ui/label.rs, ui/textarea.rs,
 //     ui/select_native.rs — class strings only) ─────────────────────────────
 
