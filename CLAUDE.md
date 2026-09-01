@@ -128,7 +128,7 @@ EMBEDDING_MODEL=Snowflake/snowflake-arctic-embed-l-v2.0
 EMBEDDING_DIMENSIONS=1024
 GRAPH_URL=http://alaya-bridge:3000       # required
 GRAPH_API_KEY=
-ALAYA_API_KEY=                           # no auth only when this, the readonly key, and OIDC are all empty (warns at startup)
+ALAYA_API_KEY=                           # fail-closed: boot refused when this, the readonly key, and OIDC are all empty (unless dev open mode)
 ALAYA_READONLY_API_KEY=                  # optional read-only bearer (pure reads; must differ from ALAYA_API_KEY)
 LISTEN_ADDR=0.0.0.0:3001
 RUST_LOG=alaya_server=info

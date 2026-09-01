@@ -6,13 +6,13 @@ All endpoints below assume the server is reachable at `http://localhost:3001` �
 
 ## Authentication
 
-Set `ALAYA_API_KEY` on the server to require authentication. Clients then send:
+Set `ALAYA_API_KEY` (and/or `ALAYA_READONLY_API_KEY`, below) on the server to require authentication. Clients then send:
 
 ```http
 Authorization: Bearer <your-api-key>
 ```
 
-Auth is **fail-closed**: with no `ALAYA_API_KEY` (and no `OIDC_ISSUER`) the server refuses to boot — unless `DANGEROUSLY_ALLOW_UNAUTHENTICATED=true` is set, which the dev Compose does for `localhost` only (it is refused on any non-private `PUBLIC_BASE_URL`). Set `ALAYA_API_KEY` before exposing the server; that enables bearer auth and disables the dev-open flag.
+Auth is **fail-closed**: with no credential configured (`ALAYA_API_KEY`, `ALAYA_READONLY_API_KEY`, and `OIDC_ISSUER` all empty) the server refuses to boot — unless `DANGEROUSLY_ALLOW_UNAUTHENTICATED=true` is set, which the dev Compose does for `localhost` only (it is refused on any non-private `PUBLIC_BASE_URL`). Set a static key before exposing the server; either one enables bearer auth and disables the dev-open flag (a read-only deployment may set just `ALAYA_READONLY_API_KEY`).
 
 If the server has `OIDC_ISSUER` set, clients use an OAuth access token instead of a fixed key. See [MCP quickstart → OAuth](./quickstart-mcp.md#oauth-optional) — the same flow applies to REST clients.
 
@@ -337,7 +337,7 @@ REST endpoints use HTTP status codes plus a JSON body:
 |:--|:--|
 | `400` | Malformed JSON, invalid `content_hash`, missing required field. Body: `{"error": "..."}`. |
 | `401` | Missing or wrong bearer token. |
-| `403` | Authenticated but the token is read-only (OAuth scope) and the endpoint mutates. |
+| `403` | Authenticated but the token is read-only (the `ALAYA_READONLY_API_KEY` bearer, or a read-only OAuth scope) and the endpoint mutates. |
 | `404` | Memory doesn't exist (`get_memory`, `patch_memory`). |
 | `413` | Request body over 1 MB. |
 | `429` | Rate limited (only when running behind a rate-limiting proxy). |

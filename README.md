@@ -113,7 +113,7 @@ Connect any MCP client to `http://localhost:3001/mcp` (Streamable HTTP with SSE)
 
 ## REST API
 
-All endpoints accept/return JSON. Auth via `Authorization: Bearer ${ALAYA_API_KEY}` when configured (the dev Compose runs open on localhost — see [Quick Start](#quick-start)). Full reference: [docs/rest-api.md](docs/rest-api.md).
+All endpoints accept/return JSON. Auth via `Authorization: Bearer` with either static key — `ALAYA_API_KEY` (full) or `ALAYA_READONLY_API_KEY` (pure reads) — or an OIDC token, when configured (the dev Compose runs open on localhost — see [Quick Start](#quick-start)). Full reference: [docs/rest-api.md](docs/rest-api.md).
 
 | Method | Path | Description |
 |:-------|:-----|:------------|

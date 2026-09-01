@@ -135,7 +135,8 @@ services:
       # This is localhost-only — the open mode is itself refused on any
       # non-private PUBLIC_BASE_URL. Setting either static key above (or OIDC)
       # enables auth and auto-disables this flag. Before exposing this beyond
-      # localhost: set ALAYA_API_KEY and a real PUBLIC_BASE_URL.
+      # localhost: set at least one static key (a read-only deployment may set
+      # just ALAYA_READONLY_API_KEY) and a real PUBLIC_BASE_URL.
       DANGEROUSLY_ALLOW_UNAUTHENTICATED: ${DANGEROUSLY_ALLOW_UNAUTHENTICATED:-true}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3001}
       LISTEN_ADDR: 0.0.0.0:3001

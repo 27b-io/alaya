@@ -1391,8 +1391,8 @@ fn build_auth_state(config: &Config) -> AuthState {
     if api_key.is_none() && readonly_api_key.is_none() && oidc.is_none() {
         if !config.allow_unauthenticated {
             panic!(
-                "no auth configured: set ALAYA_API_KEY or OIDC_ISSUER, or \
-                 DANGEROUSLY_ALLOW_UNAUTHENTICATED=true for dev"
+                "no auth configured: set ALAYA_API_KEY, ALAYA_READONLY_API_KEY, \
+                 or OIDC_ISSUER, or DANGEROUSLY_ALLOW_UNAUTHENTICATED=true for dev"
             );
         }
         // The dev-only open mode must never run on a public origin.
