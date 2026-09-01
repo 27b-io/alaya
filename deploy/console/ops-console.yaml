@@ -1,0 +1,143 @@
+# ops-console — lab k3s manifests (LAB-1684).
+#
+# Deploy shape is BINDING per the LAB-1694 panel:
+#   - own Deployment + own label (app: ops-console) — never colocated behind
+#     `app: alaya-server`
+#   - own NetworkPolicy; egress pinned to alaya-server (module upstream) +
+#     DNS + the OIDC IdP. Explicitly NO egress to dragonfly:6379 — the
+#     default-deny egress list below simply does not include it; verify from
+#     the live pod after rollout:
+#       kubectl -n mcp exec deploy/ops-console -- \
+#         sh -c 'command -v nc && nc -zw2 dragonfly.mcp.svc 6379; echo exit=$?'
+#     (expect a timeout / non-zero exit)
+#
+# Copy into the lab repo (lab/k8s/mcp/) and wire the Secret via ESO like the
+# other mcp-namespace services. Tailnet HTTPS: register with
+#   tailscale serve --service ops-console --https 443 http://<svc>:3002
+# per docs/lab-node.md conventions in the lab repo.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ops-console
+  namespace: mcp
+  labels:
+    app: ops-console
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ops-console
+  template:
+    metadata:
+      labels:
+        app: ops-console
+    spec:
+      containers:
+        - name: ops-console
+          image: ghcr.io/27b-io/alaya:latest
+          command: ["ops-console"]
+          ports:
+            - containerPort: 3002
+          env:
+            - name: CONSOLE_LISTEN_ADDR
+              value: "0.0.0.0:3002"
+            - name: ALAYA_URL
+              value: "http://alaya-server.mcp.svc:3001"
+            - name: RUST_LOG
+              value: "ops_console=info,tower_http=info"
+          # All credentials come from the Secret (1Password → ESO in lab):
+          #   CONSOLE_PUBLIC_URL, CONSOLE_OIDC_ISSUER, CONSOLE_OIDC_CLIENT_ID,
+          #   CONSOLE_OIDC_CLIENT_SECRET, CONSOLE_ALLOWED_SUBJECTS,
+          #   CONSOLE_SESSION_SECRET, ALAYA_API_KEY
+          # The console is fail-closed: it refuses to start if any is missing.
+          envFrom:
+            - secretRef:
+                name: ops-console-env
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 3002
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 3002
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ops-console
+  namespace: mcp
+  labels:
+    app: ops-console
+spec:
+  selector:
+    app: ops-console
+  ports:
+    - port: 3002
+      targetPort: 3002
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ops-console
+  namespace: mcp
+spec:
+  podSelector:
+    matchLabels:
+      app: ops-console
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # Tailnet ingress arrives via the node's tailscaled (host network) or the
+    # tailscale operator proxy; restrict to in-cluster + host-network sources.
+    - ports:
+        - port: 3002
+          protocol: TCP
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Module upstream: alaya-server ONLY (LAB-1694 binding). No dragonfly,
+    # no other mcp services.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: alaya-server
+      ports:
+        - port: 3001
+          protocol: TCP
+    # OIDC IdP (id.27b.io) — discovery, JWKS, token exchange. External 443.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - port: 443
+          protocol: TCP

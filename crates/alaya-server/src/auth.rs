@@ -89,6 +89,52 @@ pub fn oidc_allows(op: &str) -> bool {
     OIDC_ALLOWLIST.contains(&op)
 }
 
+/// Every canonical op with its write classification, for the read-only
+/// auth-config view. `(op, mutating)` — "mutating" means it rewrites or
+/// removes shared state (store is additive, so it is not mutating).
+pub const ALL_OPS: &[(&str, bool)] = &[
+    ("search", false),
+    ("get_memory", false),
+    ("check_database_health", false),
+    ("memory_contradictions", false),
+    ("find_duplicates", false),
+    ("store_memory", false),
+    ("delete_memory", true),
+    ("memory_supersede", true),
+    ("merge_duplicates", true),
+    ("relation", true),
+    ("patch_memory", true),
+    ("backfill_summaries", true),
+];
+
+/// Read-only view of the auth configuration (LAB-1684 AC7): which principals
+/// exist, the OIDC issuer/audience, and the principal × op matrix. Contains
+/// NO credential material — only presence flags and public identifiers.
+pub fn auth_config_view(auth: &AuthState) -> serde_json::Value {
+    let ops: Vec<serde_json::Value> = ALL_OPS
+        .iter()
+        .map(|(op, mutating)| {
+            serde_json::json!({
+                "op": op,
+                "mutating": mutating,
+                "static": true,
+                "oidc": oidc_allows(op),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "static_bearer_configured": auth.api_key.is_some(),
+        "open_mode": auth.api_key.is_none() && auth.oidc.is_none() && auth.allow_unauthenticated,
+        "oidc": {
+            "enabled": auth.oidc.is_some(),
+            "issuer": auth.oidc.as_ref().map(|v| v.issuer().to_string()),
+            "audience": auth.oidc.as_ref().map(|v| v.audience().to_string()),
+        },
+        "oidc_allowlist": OIDC_ALLOWLIST,
+        "ops": ops,
+    })
+}
+
 /// Extract the bearer token from an `Authorization` header.
 /// RFC 6750 §2.1: the scheme name is case-insensitive (`Bearer`/`bearer`/`BEARER`
 /// are all valid); the credential follows whitespace after the scheme.
@@ -281,6 +327,45 @@ mod tests {
             "/some/new/route"
         )));
         assert!(!oidc_allows(rest_route_op(&Method::DELETE, "/memories/x")));
+    }
+
+    #[test]
+    fn auth_config_view_leaks_no_credentials_and_matches_allowlist() {
+        let auth = crate::testkit::auth_state(Some("super-secret-bearer"), true);
+        let v = auth_config_view(&auth);
+        let text = v.to_string();
+        assert!(
+            !text.contains("super-secret-bearer"),
+            "auth-config view must never contain the bearer"
+        );
+        assert_eq!(v["static_bearer_configured"], true);
+        assert_eq!(v["oidc"]["enabled"], true);
+
+        let ops = v["ops"].as_array().unwrap();
+        assert_eq!(ops.len(), ALL_OPS.len());
+        for op in ops {
+            let name = op["op"].as_str().unwrap();
+            assert_eq!(
+                op["oidc"].as_bool().unwrap(),
+                oidc_allows(name),
+                "matrix must mirror oidc_allows for {name}"
+            );
+            assert_eq!(op["static"], true);
+        }
+        // Every mutating op must be OIDC-denied — the read-only invariant
+        // the view exists to display.
+        for op in ops {
+            if op["mutating"] == true {
+                assert_eq!(op["oidc"], false, "{} must be OIDC-denied", op["op"]);
+            }
+        }
+    }
+
+    #[test]
+    fn auth_config_route_is_static_only_by_default_deny() {
+        // GET /auth/config is deliberately unmapped in rest_route_op →
+        // "__mutating__" → denied for Oidc principals.
+        assert!(!oidc_allows(rest_route_op(&Method::GET, "/auth/config")));
     }
 
     #[test]

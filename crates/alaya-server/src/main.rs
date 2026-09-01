@@ -1584,6 +1584,17 @@ fn main() {
             ))
             .with_state(handle);
 
+        // Read-only auth-config view (LAB-1684 AC7). Same auth middleware;
+        // GET /auth/config is unmapped in rest_route_op → static-bearer only
+        // (default-deny), and the payload carries no credential material.
+        let auth_config_route = Router::new()
+            .route("/auth/config", get(auth_config))
+            .layer(middleware::from_fn_with_state(
+                auth_state.clone(),
+                auth::require_auth,
+            ))
+            .with_state(auth_state.clone());
+
         // Unauthenticated protected-resource metadata (404 when OIDC disabled).
         let wellknown = Router::new()
             .route(
@@ -1604,6 +1615,7 @@ fn main() {
         // answered before `require_auth`.
         let app = health_route
             .merge(wellknown)
+            .merge(auth_config_route)
             .merge(protected)
             .layer(cors_layer());
 
@@ -1661,6 +1673,14 @@ async fn health(
         StatusCode::OK
     };
     (code, Json(v))
+}
+
+/// Read-only auth-config view (LAB-1684 AC7): principals, OIDC issuer /
+/// audience, and the principal × op matrix. No credential material.
+async fn auth_config(
+    axum::extract::State(auth): axum::extract::State<auth::AuthState>,
+) -> Json<Value> {
+    Json(auth::auth_config_view(&auth))
 }
 
 async fn store(

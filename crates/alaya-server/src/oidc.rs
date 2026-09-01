@@ -187,6 +187,11 @@ impl OidcVerifier {
         &self.inner.issuer
     }
 
+    /// The configured audience, for the read-only auth-config view.
+    pub fn audience(&self) -> &str {
+        &self.inner.audience
+    }
+
     /// Validate a bearer token. Returns Ok on a fully-valid token; any failure
     /// is `OidcError::Invalid` and must surface to the client as a generic 401.
     pub async fn validate(&self, token: &str) -> Result<(), OidcError> {
