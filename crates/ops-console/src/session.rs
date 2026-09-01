@@ -49,6 +49,8 @@ pub fn random_token() -> String {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Session {
+    /// Random session id — the handle logout revokes (`AppState::revoke_session`).
+    pub sid: String,
     pub sub: String,
     pub email: Option<String>,
     pub name: Option<String>,
@@ -162,6 +164,7 @@ pub fn take_flash(jar: PrivateCookieJar) -> (PrivateCookieJar, Option<Flash>) {
 
 pub fn new_session(sub: String, email: Option<String>, name: Option<String>) -> Session {
     Session {
+        sid: random_token(),
         sub,
         email,
         name,
@@ -191,7 +194,8 @@ impl FromRequestParts<AppState> for Session {
         let jar = PrivateCookieJar::from_request_parts(parts, state)
             .await
             .map_err(|_| AppError::LoginRedirect)?;
-        match read_session(&jar) {
+        // Logged-out sids are rejected identically to missing sessions.
+        match read_session(&jar).filter(|s| !state.is_revoked(&s.sid)) {
             Some(s) => Ok(s),
             None if parts.method == axum::http::Method::GET => Err(AppError::LoginRedirect),
             None => Err(AppError::Forbidden("no session".into())),

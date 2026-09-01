@@ -105,6 +105,9 @@ pub async fn logout(
     // CSRF-protect logout too — forced logout is a nuisance vector.
     if let Some(sess) = session::read_session(&jar) {
         sess.verify_csrf(&form.csrf)?;
+        // Server-side revocation: the cookie is dead even if a concurrent
+        // in-flight refresh re-lands it in the browser jar (CWE-613).
+        state.revoke_session(&sess.sid, sess.exp);
     }
     let jar = jar.remove(session::removal_cookie(SESSION_COOKIE));
     let jar = session::flash_cookie(

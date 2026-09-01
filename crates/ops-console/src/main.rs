@@ -74,10 +74,13 @@ async fn session_refresh(State(state): State<AppState>, req: Request, next: Next
     use axum_extra::extract::cookie::{Key, PrivateCookieJar};
     let key = Key::from_ref(&state);
     let jar = PrivateCookieJar::from_headers(req.headers(), key);
-    let refreshed = session::read_session(&jar).map(|mut s| {
-        s.last_seen = session::now_epoch();
-        s
-    });
+    // A logged-out sid must never be re-issued (CWE-613).
+    let refreshed = session::read_session(&jar)
+        .filter(|s| !state.is_revoked(&s.sid))
+        .map(|mut s| {
+            s.last_seen = session::now_epoch();
+            s
+        });
 
     let resp = next.run(req).await;
 
@@ -458,6 +461,58 @@ mod tests {
             session_cookies[0].contains("Max-Age=0"),
             "the surviving session cookie must be the removal: {}",
             session_cookies[0]
+        );
+    }
+
+    /// CWE-613: after logout, the old cookie is server-side revoked — a
+    /// request replaying it (e.g. an in-flight refresh racing the logout)
+    /// must be rejected AND must not re-issue the session cookie.
+    #[tokio::test]
+    async fn logged_out_cookie_is_revoked_and_never_reissued() {
+        let state = test_state();
+        let sess = session::new_session("admin-sub".into(), None, None);
+        let cookie_header = session_cookie_header(&state, &sess);
+        let csrf = sess.csrf.clone();
+        let app = app(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::post("/auth/logout")
+                    .header(header::ORIGIN, "https://console.test")
+                    .header(header::COOKIE, cookie_header.clone())
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("csrf={csrf}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        // Replay the original (still cryptographically valid) cookie.
+        let resp = app
+            .oneshot(
+                HttpRequest::get("/alaya")
+                    .header(header::COOKIE, cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SEE_OTHER,
+            "revoked sid must not authenticate"
+        );
+        let reissued = resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| v.starts_with(session::SESSION_COOKIE) && !v.contains("Max-Age=0"));
+        assert!(
+            !reissued,
+            "a revoked session must never be re-issued by the refresh middleware"
         );
     }
 

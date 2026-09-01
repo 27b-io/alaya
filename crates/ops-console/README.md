@@ -22,11 +22,13 @@ same class as radar and unified-memory:
   ACL/namespace decision.
 
 Session posture (LAB-1694 pass/fail set + team session rules): CSRF token on
-every form + strict `Origin` check on every non-GET request,
-`HttpOnly`/`SameSite=Lax`/`Secure` cookies, a fresh session cookie minted on
-the OIDC callback (fixation defense), 12 h absolute session lifetime **and**
-15 min idle timeout (sliding — refreshed on every authenticated request),
-strict CSP (`default-src 'none'`).
+every form + strict `Origin` check on every state-changing request (anything
+other than `GET`/`HEAD`), `HttpOnly`/`SameSite=Lax`/`Secure` cookies, a fresh
+session cookie minted on the OIDC callback (fixation defense), 12 h absolute
+session lifetime **and** 15 min idle timeout (sliding — refreshed on every
+authenticated request), server-side logout revocation (a logged-out session
+id is rejected until its absolute expiry, in-memory, single-replica), strict
+CSP (`default-src 'none'`).
 
 ## Configuration (fail-closed — missing anything below refuses startup)
 

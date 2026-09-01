@@ -1,6 +1,7 @@
 //! Shared application state.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::FromRef;
 use axum_extra::extract::cookie::Key;
@@ -18,6 +19,13 @@ pub struct AppState {
     /// AES-GCM key for the private cookie jar, derived from
     /// CONSOLE_SESSION_SECRET at startup.
     key: Key,
+    /// Logout revocation: sid → absolute cookie expiry. Stateless cookies
+    /// alone make logout advisory (a captured or in-flight-refreshed cookie
+    /// would outlive it); revoked sids are rejected until their absolute
+    /// expiry, after which the entry is purged.
+    // ponytail: in-memory, per-replica — matches the single-replica deploy
+    // (deploy/console: replicas 1). Move to shared storage if replicas > 1.
+    revoked: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl AppState {
@@ -40,6 +48,7 @@ impl AppState {
             alaya,
             oidc,
             key,
+            revoked: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -47,6 +56,22 @@ impl AppState {
     /// which is every deployment; plain http exists only for local dev.
     pub fn secure_cookies(&self) -> bool {
         self.config.public_url.scheme() == "https"
+    }
+
+    /// Revoke a session id until its absolute expiry (logout).
+    pub fn revoke_session(&self, sid: &str, exp: i64) {
+        let mut revoked = self.revoked.lock().expect("revocation lock poisoned");
+        let now = crate::session::now_epoch();
+        revoked.retain(|_, e| *e > now);
+        revoked.insert(sid.to_string(), exp);
+    }
+
+    /// True if this session id was logged out.
+    pub fn is_revoked(&self, sid: &str) -> bool {
+        let revoked = self.revoked.lock().expect("revocation lock poisoned");
+        revoked
+            .get(sid)
+            .is_some_and(|e| *e > crate::session::now_epoch())
     }
 }
 
