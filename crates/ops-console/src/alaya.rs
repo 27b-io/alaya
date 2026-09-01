@@ -160,8 +160,11 @@ impl AlayaClient {
         .await
     }
 
+    /// alaya-server split `/health` (LAB-2481): the bare probe carries only
+    /// `status`; the memory count the home card renders lives on the
+    /// authenticated detail view. The console holds the bearer anyway.
     pub async fn health(&self) -> Result<Value, AppError> {
-        self.get("/health").await
+        self.get("/health/detail").await
     }
 
     /// AC7: read-only auth-state view (OIDC config + principal tool matrix).
