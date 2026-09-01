@@ -71,7 +71,7 @@ jobs:
             type=sha
             type=raw,value=latest
 
-      # Build identity for GET /health + MCP serverInfo (#70). Stamped here
+      # Build identity for GET /health/detail + MCP serverInfo (#70). Stamped here
       # rather than in the Dockerfile so the value is deterministic per run
       # and a cached build layer can't carry a stale timestamp forward.
       - name: Stamp build timestamp

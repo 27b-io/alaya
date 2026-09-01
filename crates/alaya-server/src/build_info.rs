@@ -48,7 +48,7 @@ fn qualify(version: &str, git_sha: Option<&str>) -> String {
 /// `unknown` default, compose's `dev` — so `git_sha` is either verifiable or
 /// explicitly absent, never plausible-looking junk. Short SHAs are kept
 /// because `benchmarks/README.md` builds with `git rev-parse --short HEAD`
-/// expressly to stamp provenance into `/health`.
+/// expressly to stamp provenance into `/health/detail`.
 fn verified_sha(raw: Option<&str>) -> Option<&str> {
     raw.map(str::trim)
         .filter(|s| (7..=40).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit()))
