@@ -127,7 +127,8 @@ All endpoints accept/return JSON. Auth via `Authorization: Bearer` with either s
 | POST | `/duplicates/merge` | Merge duplicates |
 | PATCH | `/memories/{hash}` | Update memory metadata |
 | POST | `/backfill/summaries` | Batch-generate missing summaries |
-| GET | `/health` | Health check (no auth) |
+| GET | `/health` | Liveness probe — status only (no auth) |
+| GET | `/health/detail` | Backend health, capacity, build identity |
 | POST | `/mcp` | MCP JSON-RPC endpoint |
 
 ## Configuration

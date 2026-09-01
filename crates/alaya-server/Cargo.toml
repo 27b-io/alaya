@@ -41,5 +41,7 @@ tracing-opentelemetry = "0.30"
 # test-util enables tokio's paused clock (start_paused) for the wedge
 # regression tests (#63) — deliberately dev-only.
 tokio = { workspace = true, features = ["test-util"] }
-# oneshot() for route-level middleware tests (already in-tree via axum).
+# ServiceExt::oneshot drives composed Routers in-process: the health auth-split
+# tests (#77) and the read-only bearer middleware tests (#80) exercise the real
+# layering rather than a replica. Already in the lock via axum — pulls nothing new.
 tower = { version = "0.5", features = ["util"] }

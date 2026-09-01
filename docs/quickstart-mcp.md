@@ -72,7 +72,7 @@ The cheapest "is the server reachable from this client?" check is the unauthenti
 
 ```bash
 curl http://localhost:3001/health
-# {"status":"ok","qdrant":"ok","graph":"ok","embedding":"ok",...}
+# {"status":"healthy"}
 ```
 
 If you set an API key, also test it works:
@@ -112,5 +112,5 @@ That's it — you're integrated. From here, see the [MCP tool reference](./mcp-t
 |:--|:--|
 | Client shows "0 tools" | `Authorization` header missing or wrong; check `GET /health` works from the client's host |
 | Tools listed but calls return `401 Unauthorized` | `ALAYA_API_KEY` mismatch; server logs the expected prefix on startup |
-| `503 service unavailable` on `/store` or `/search` | Backend down (Qdrant, TEI, or FalkorDB); check `GET /health` for which one |
+| `503 service unavailable` on `/store` or `/search` | Backend down (Qdrant, TEI, or FalkorDB); check `GET /health/detail` (authenticated) for which one |
 | MCP client tries OAuth instead of bearer | Server has `OIDC_ISSUER` set; either configure OAuth on the client or unset `OIDC_ISSUER` on the server for dev |

@@ -18,7 +18,7 @@ If the server has `OIDC_ISSUER` set, clients use an OAuth access token instead o
 
 ### Read-only bearer (optional)
 
-Set `ALAYA_READONLY_API_KEY` (must differ from `ALAYA_API_KEY`) to mint a second static bearer for headless service consumers that must never mutate the corpus (e.g. a read-only dashboard). It authenticates the same way but is authorized for pure reads only — `POST /search`, `GET /memories/{content_hash}`, `POST /contradictions`, `POST /duplicates/find` — and receives `403 Forbidden` on every mutating route, including `POST /store`:
+Set `ALAYA_READONLY_API_KEY` (must differ from `ALAYA_API_KEY`) to mint a second static bearer for headless service consumers that must never mutate the corpus (e.g. a read-only dashboard). It authenticates the same way but is authorized for pure reads only — `POST /search`, `GET /memories/{content_hash}`, `POST /contradictions`, `POST /duplicates/find`, `GET /health/detail` — and receives `403 Forbidden` on every mutating route, including `POST /store`:
 
 ```bash
 # succeeds
@@ -44,7 +44,8 @@ Failed auth returns `401 Unauthorized` with a `WWW-Authenticate: Bearer …` hea
 
 | Method | Path | Purpose | Auth? |
 |:--|:--|:--|:-:|
-| `GET`  | `/health` | Liveness + backend health | no |
+| `GET`  | `/health` | Liveness probe — status only | no |
+| `GET`  | `/health/detail` | Backend health, capacity, build identity | yes |
 | `POST` | `/store` | Add a memory | yes |
 | `POST` | `/search` | Retrieve memories | yes |
 | `GET`  | `/memories/{content_hash}` | Fetch one memory | yes |
@@ -61,10 +62,32 @@ Failed auth returns `401 Unauthorized` with a `WWW-Authenticate: Bearer …` hea
 
 ## `GET /health`
 
-Unauthenticated. Returns per-backend status. Use this as your liveness + readiness probe.
+Unauthenticated liveness + readiness probe. Returns the status word and nothing
+else.
 
 ```bash
 curl http://localhost:3001/health
+```
+
+```json
+{ "status": "healthy" }
+```
+
+`status` is `healthy` when every backend is reachable, `degraded` (HTTP 200) when
+a backend is down — restarting the pod won't fix Qdrant — and `unhealthy`
+(HTTP 503) when the service worker has stalled, so a liveness probe restarts it.
+
+Probers read the HTTP code, so a k8s `httpGet` probe and `curl -sf .../health`
+both work against this endpoint unchanged.
+
+## `GET /health/detail`
+
+Authenticated. The full operational document — per-backend health, worker state,
+memory count and build identity.
+
+```bash
+curl -H "Authorization: Bearer $ALAYA_API_KEY" \
+  http://localhost:3001/health/detail
 ```
 
 ```json
@@ -81,9 +104,14 @@ curl http://localhost:3001/health
 }
 ```
 
-`status` is `healthy` when every backend is reachable, `degraded` (HTTP 200) when
-a backend is down — restarting the pod won't fix Qdrant — and `unhealthy`
-(HTTP 503) when the service worker has stalled, so a liveness probe restarts it.
+Same status and HTTP-code mapping as `/health`.
+
+> [!NOTE]
+> These fields were served by the unauthenticated `/health` in earlier builds.
+> They are live capacity, outage state and — on the failure path — in-cluster
+> backend URLs, so they now sit behind the same bearer auth as every other
+> read. If you probed `/health` for anything other than `status`, point that
+> reader at `/health/detail` and give it a token.
 
 ### Build identity
 
@@ -94,7 +122,8 @@ build that didn't pass them (a plain `cargo build`, or `docker build` without
 `--build-arg`) — absence is never an error. Verify a rollout with:
 
 ```bash
-curl -s http://localhost:3001/health | jq -r .git_sha   # == git rev-parse HEAD
+curl -s -H "Authorization: Bearer $ALAYA_API_KEY" \
+  http://localhost:3001/health/detail | jq -r .git_sha   # == git rev-parse HEAD
 ```
 
 CI images always carry the full 40-hex SHA. A build that passes an abbreviation
