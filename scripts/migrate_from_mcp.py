@@ -192,7 +192,7 @@ async def run() -> None:
     # ── Phase 3: Verify ─────────────────────────────────────────────
     print("\nPhase 3: Verifying...")
     try:
-        r = httpx.get(f"{ALAYA_URL}/health", headers=headers, timeout=10)
+        r = httpx.get(f"{ALAYA_URL}/health/detail", headers=headers, timeout=10)
         health = r.json()
         target_count = health.get("total_memories", "?")
         status = health.get("status", "?")

@@ -77,6 +77,7 @@ pub fn rest_route_op(method: &Method, path: &str) -> &'static str {
         ("POST", "/duplicates/find") => "find_duplicates",
         ("POST", "/duplicates/merge") => "merge_duplicates",
         ("POST", "/backfill/summaries") => "backfill_summaries",
+        ("GET", "/health/detail") => "check_database_health",
         ("GET", p) if p.starts_with("/memories/") => "get_memory",
         ("PATCH", p) if p.starts_with("/memories/") => "patch_memory",
         // Unmapped / unexpected method → fail-closed (not in allowlist).
@@ -187,6 +188,21 @@ pub async fn require_auth(State(auth): State<AuthState>, mut req: Request, next:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/health/detail` is a pure read, but default-deny resolves any unmapped
+    /// route to `__mutating__` — which would 403 an OIDC principal that can
+    /// already read substantially the same document through MCP
+    /// `check_database_health`. The mapping, not the allowlist, is the fix.
+    #[test]
+    fn health_detail_is_a_read_for_oidc_principals() {
+        let op = rest_route_op(&Method::GET, "/health/detail");
+        assert_eq!(op, "check_database_health");
+        assert!(oidc_allows(op));
+
+        // The bare probe is not on the protected router at all, so it must
+        // stay unmapped — fail-closed if it is ever moved behind auth.
+        assert_eq!(rest_route_op(&Method::GET, "/health"), "__mutating__");
+    }
 
     #[test]
     fn write_policy_readonly_only_for_oidc() {

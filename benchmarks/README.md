@@ -127,9 +127,11 @@ Build the pinned local image, then start the stack. The bench Qdrant is
 `tmpfs`-backed and ephemeral, published on host port **`16333`**:
 
 ```bash
-# From the repo root — stamp the commit into /health so results are auditable.
-# Read it back with `curl -s localhost:3001/health | jq -r .git_sha` (the
-# `version` field carries the crate semver, not the commit).
+# From the repo root — stamp the commit into /health/detail so results are
+# auditable. Read it back with
+# `curl -s localhost:3001/health/detail | jq -r .git_sha` (the `version`
+# field carries the crate semver, not the commit). The bench stack runs
+# unauthenticated, so no token is needed there.
 docker build -t localhost/alaya:bench --build-arg GIT_SHA="$(git rev-parse HEAD)" .
 
 cd benchmarks
