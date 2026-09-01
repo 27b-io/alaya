@@ -23,9 +23,13 @@ pub const SESSION_COOKIE: &str = "console_session";
 pub const LOGIN_COOKIE: &str = "console_login";
 pub const FLASH_COOKIE: &str = "console_flash";
 
-/// Absolute session lifetime. There is no refresh — an operator re-logs in
-/// through the IdP, which is cheap on the tailnet.
+/// Absolute session lifetime (team session rule: absolute ≤ 12 h). No
+/// absolute refresh — an operator re-logs in through the IdP, which is cheap
+/// on the tailnet.
 const SESSION_TTL_SECS: i64 = 12 * 3600;
+/// Idle timeout (team session rule: idle ≤ 15 min). `last_seen` slides on
+/// every authenticated request via the `session_refresh` middleware.
+pub const IDLE_TTL_SECS: i64 = 15 * 60;
 const LOGIN_TTL_SECS: i64 = 600;
 
 pub fn now_epoch() -> i64 {
@@ -49,7 +53,12 @@ pub struct Session {
     pub email: Option<String>,
     pub name: Option<String>,
     pub csrf: String,
+    /// Absolute expiry (epoch seconds).
     pub exp: i64,
+    /// Last activity (epoch seconds); slides on every authenticated request.
+    /// No serde default: a cookie without it (pre-idle-timeout format) is
+    /// simply invalid and forces a re-login.
+    pub last_seen: i64,
 }
 
 impl Session {
@@ -134,7 +143,9 @@ pub fn read_login(jar: &PrivateCookieJar) -> Option<LoginState> {
 pub fn read_session(jar: &PrivateCookieJar) -> Option<Session> {
     let c = jar.get(SESSION_COOKIE)?;
     let s: Session = serde_json::from_str(c.value()).ok()?;
-    (s.exp > now_epoch()).then_some(s)
+    let now = now_epoch();
+    // Both limits must hold: absolute lifetime AND idle window.
+    (s.exp > now && s.last_seen + IDLE_TTL_SECS > now).then_some(s)
 }
 
 /// Read-and-clear the flash. Returns the (possibly modified) jar so the
@@ -156,6 +167,7 @@ pub fn new_session(sub: String, email: Option<String>, name: Option<String>) -> 
         name,
         csrf: random_token(),
         exp: now_epoch() + SESSION_TTL_SECS,
+        last_seen: now_epoch(),
     }
 }
 
@@ -208,6 +220,30 @@ mod tests {
             a.chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         );
+    }
+
+    fn jar_with(s: &Session) -> PrivateCookieJar {
+        let key = axum_extra::extract::cookie::Key::from(&[7u8; 64]);
+        session_cookie(PrivateCookieJar::new(key), s, true)
+    }
+
+    /// read_session enforces BOTH the absolute lifetime and the idle window
+    /// (team session rule: absolute ≤ 12 h, idle ≤ 15 min).
+    #[test]
+    fn read_session_enforces_idle_and_absolute_limits() {
+        let fresh = new_session("sub".into(), None, None);
+        assert!(read_session(&jar_with(&fresh)).is_some());
+
+        let mut idle = new_session("sub".into(), None, None);
+        idle.last_seen = now_epoch() - IDLE_TTL_SECS - 1;
+        assert!(
+            read_session(&jar_with(&idle)).is_none(),
+            "idle-expired session must be rejected even inside absolute lifetime"
+        );
+
+        let mut expired = new_session("sub".into(), None, None);
+        expired.exp = now_epoch() - 1;
+        assert!(read_session(&jar_with(&expired)).is_none());
     }
 
     /// The removal cookie must carry `Path=/` to match `base_cookie`'s

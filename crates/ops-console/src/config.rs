@@ -48,6 +48,30 @@ impl fmt::Debug for Config {
     }
 }
 
+/// https everywhere; plaintext http exists only for loopback local dev (a
+/// non-loopback http URL would also silently disable the Secure cookie flag
+/// — refuse instead).
+fn validate_public_url(public_url: &url::Url) -> Result<(), String> {
+    let Some(host) = public_url.host_str() else {
+        return Err("CONSOLE_PUBLIC_URL must have a host".into());
+    };
+    // host_str() keeps brackets on IPv6 literals ("[::1]") — strip for parse.
+    let bare_host = host.trim_start_matches('[').trim_end_matches(']');
+    let is_loopback = bare_host == "localhost"
+        || bare_host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+    match public_url.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback => Ok(()),
+        "http" => {
+            Err("CONSOLE_PUBLIC_URL must be https (http is allowed only for loopback dev)".into())
+        }
+        _ => Err("CONSOLE_PUBLIC_URL must be http(s)".into()),
+    }
+}
+
 fn required(key: &str) -> Result<String, String> {
     match std::env::var(key) {
         Ok(v) if !v.trim().is_empty() => Ok(v.trim().to_string()),
@@ -76,12 +100,7 @@ impl Config {
         let public_url: url::Url = required("CONSOLE_PUBLIC_URL")?
             .parse()
             .map_err(|e| format!("CONSOLE_PUBLIC_URL is not a valid URL: {e}"))?;
-        if public_url.scheme() != "https" && public_url.scheme() != "http" {
-            return Err("CONSOLE_PUBLIC_URL must be http(s)".into());
-        }
-        if public_url.host_str().is_none() {
-            return Err("CONSOLE_PUBLIC_URL must have a host".into());
-        }
+        validate_public_url(&public_url)?;
 
         let oidc_issuer = required("CONSOLE_OIDC_ISSUER")?;
         if !oidc_issuer.starts_with("https://") {
@@ -131,6 +150,20 @@ mod tests {
         assert_eq!(origin_of(&u), "https://console.example.com");
         let u: url::Url = "http://localhost:3002/".parse().unwrap();
         assert_eq!(origin_of(&u), "http://localhost:3002");
+    }
+
+    #[test]
+    fn public_url_requires_https_except_loopback() {
+        let ok = |u: &str| validate_public_url(&u.parse().unwrap()).is_ok();
+        assert!(ok("https://console.tail1234.ts.net"));
+        assert!(ok("http://localhost:3002"));
+        assert!(ok("http://127.0.0.1:3002"));
+        assert!(ok("http://[::1]:3002"));
+        // Plaintext http on a routable host would ship the session cookie
+        // without Secure — must refuse startup.
+        assert!(!ok("http://console.tail1234.ts.net"));
+        assert!(!ok("http://192.168.1.10:3002"));
+        assert!(!ok("ftp://console.example"));
     }
 
     #[test]

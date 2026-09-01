@@ -20,7 +20,7 @@ mod state;
 mod ui;
 
 use axum::Router;
-use axum::extract::{Request, State};
+use axum::extract::{FromRef, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -63,6 +63,36 @@ async fn origin_check(State(state): State<AppState>, req: Request, next: Next) -
         }
     }
     next.run(req).await
+}
+
+/// Sliding idle-timeout refresh (team session rule: idle ≤ 15 min): every
+/// request carrying a valid session gets a re-issued cookie with a fresh
+/// `last_seen`. Skipped when the handler already set the session cookie
+/// itself (login callback, logout) — a stale refresh must never clobber a
+/// deliberate mint or removal.
+async fn session_refresh(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    use axum_extra::extract::cookie::{Key, PrivateCookieJar};
+    let key = Key::from_ref(&state);
+    let jar = PrivateCookieJar::from_headers(req.headers(), key);
+    let refreshed = session::read_session(&jar).map(|mut s| {
+        s.last_seen = session::now_epoch();
+        s
+    });
+
+    let resp = next.run(req).await;
+
+    let Some(sess) = refreshed else { return resp };
+    let handler_touched_session = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.starts_with(session::SESSION_COOKIE));
+    if handler_touched_session {
+        return resp;
+    }
+    let jar = session::session_cookie(jar, &sess, state.secure_cookies());
+    (jar, resp).into_response()
 }
 
 /// No inline JS exists, so the CSP can be maximally strict.
@@ -126,6 +156,10 @@ fn app(state: AppState) -> Router {
         .route("/alaya/contradictions", get(routes::alaya::contradictions))
         .route("/alaya/auth", get(routes::alaya::auth_view))
         .layer(middleware::from_fn_with_state(state.clone(), origin_check))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            session_refresh,
+        ))
         .layer(middleware::from_fn(security_headers))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
@@ -350,6 +384,89 @@ mod tests {
         let state = test_state();
         let mut sess = session::new_session("admin-sub".into(), None, None);
         sess.exp = session::now_epoch() - 10;
+        let cookie_header = session_cookie_header(&state, &sess);
+        let app = app(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::get("/alaya")
+                    .header(header::COOKIE, cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    }
+
+    /// Sliding idle timeout: an authenticated GET re-issues the session
+    /// cookie with a fresh last_seen.
+    #[tokio::test]
+    async fn authenticated_request_refreshes_session_cookie() {
+        let state = test_state();
+        let sess = session::new_session("admin-sub".into(), None, None);
+        let cookie_header = session_cookie_header(&state, &sess);
+        let app = app(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::get("/")
+                    .header(header::COOKIE, cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let refreshed = resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| v.starts_with(session::SESSION_COOKIE) && !v.contains("Max-Age=0"));
+        assert!(refreshed, "session cookie must slide on activity");
+    }
+
+    /// The refresh middleware must never clobber logout's removal cookie:
+    /// exactly one console_session Set-Cookie, and it's the removal.
+    #[tokio::test]
+    async fn logout_removal_is_not_clobbered_by_refresh() {
+        let state = test_state();
+        let sess = session::new_session("admin-sub".into(), None, None);
+        let cookie_header = session_cookie_header(&state, &sess);
+        let csrf = sess.csrf.clone();
+        let app = app(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::post("/auth/logout")
+                    .header(header::ORIGIN, "https://console.test")
+                    .header(header::COOKIE, cookie_header)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("csrf={csrf}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let session_cookies: Vec<&str> = resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .filter(|v| v.starts_with(session::SESSION_COOKIE))
+            .collect();
+        assert_eq!(session_cookies.len(), 1, "exactly one session Set-Cookie");
+        assert!(
+            session_cookies[0].contains("Max-Age=0"),
+            "the surviving session cookie must be the removal: {}",
+            session_cookies[0]
+        );
+    }
+
+    /// Idle-expired session (inside absolute lifetime) is rejected.
+    #[tokio::test]
+    async fn idle_expired_session_redirects_to_login() {
+        let state = test_state();
+        let mut sess = session::new_session("admin-sub".into(), None, None);
+        sess.last_seen = session::now_epoch() - session::IDLE_TTL_SECS - 1;
         let cookie_header = session_cookie_header(&state, &sess);
         let app = app(state);
         let resp = app

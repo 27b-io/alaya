@@ -931,12 +931,21 @@ pub async fn duplicates(
                     let h_radio = h.clone();
                     let h_check = h.clone();
                     let h_link = h.clone();
+                    // The suggested canonical also rides along as a hidden
+                    // duplicate_hashes value: if the operator moves the radio
+                    // to another member, the old canonical becomes a merge
+                    // candidate; merge_submit filters out whichever canonical
+                    // was actually chosen, so the whole group always merges.
+                    let h_hidden = h.clone();
                     view! {
                         <li class="flex items-center gap-3 text-sm">
                             <label class="flex items-center gap-1 text-xs text-muted-foreground">
                                 <input type="radio" name="canonical_hash" value=h_radio checked=is_canonical />
                                 "canonical"
                             </label>
+                            {is_canonical.then(|| view! {
+                                <input type="hidden" name="duplicate_hashes" value=h_hidden />
+                            })}
                             <label class="flex items-center gap-1 text-xs text-muted-foreground">
                                 <input type="checkbox" name="duplicate_hashes" value=h_check checked=!is_canonical />
                                 "merge"

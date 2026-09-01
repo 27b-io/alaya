@@ -21,16 +21,18 @@ same class as radar and unified-memory:
   authorization semantics to alaya-server and does not pre-empt the LAB-1084
   ACL/namespace decision.
 
-Session posture (LAB-1694 pass/fail set): CSRF token on every form + strict
-`Origin` check on every non-GET request, `HttpOnly`/`SameSite=Lax`/`Secure`
-cookies, a fresh session cookie minted on the OIDC callback (fixation
-defense), 12 h absolute session lifetime, strict CSP (`default-src 'none'`).
+Session posture (LAB-1694 pass/fail set + team session rules): CSRF token on
+every form + strict `Origin` check on every non-GET request,
+`HttpOnly`/`SameSite=Lax`/`Secure` cookies, a fresh session cookie minted on
+the OIDC callback (fixation defense), 12 h absolute session lifetime **and**
+15 min idle timeout (sliding — refreshed on every authenticated request),
+strict CSP (`default-src 'none'`).
 
 ## Configuration (fail-closed — missing anything below refuses startup)
 
 | Variable | Meaning |
 |:---------|:--------|
-| `CONSOLE_PUBLIC_URL` | External base URL (tailnet HTTPS). `redirect_uri` is pinned to `{url}/auth/callback` — register exactly that on the IdP client. |
+| `CONSOLE_PUBLIC_URL` | External base URL — **must be https** (plain http is accepted only for loopback local dev; anything else refuses startup). `redirect_uri` is pinned to `{url}/auth/callback` — register exactly that on the IdP client. |
 | `CONSOLE_OIDC_ISSUER` | `https://id.27b.io` |
 | `CONSOLE_OIDC_CLIENT_ID` / `CONSOLE_OIDC_CLIENT_SECRET` | Confidential OIDC client (authorization-code + PKCE). |
 | `CONSOLE_ALLOWED_SUBJECTS` | Comma-separated OIDC `sub` values allowed to log in. Default-deny; must be non-empty. |
