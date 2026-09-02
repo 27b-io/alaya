@@ -628,21 +628,29 @@ impl HealthChecker {
     /// No exact-count scan, no graph round trip (#78).
     async fn check_status(&self) -> Value {
         let start = std::time::Instant::now();
-        let qdrant_health = self.check_qdrant().await;
-        let (_, worker_stalled, progress_age) = self.worker_state();
-        let status = Self::status_from(worker_stalled, qdrant_health.is_ok());
 
-        let elapsed = start.elapsed().as_millis();
+        // Worker stall check first: if stalled, status is "unhealthy"
+        // regardless of Qdrant — skip the network call entirely so k8s
+        // sees the 503 in microseconds, not after a 10s Qdrant timeout.
+        let (_, worker_stalled, progress_age) = self.worker_state();
         if worker_stalled {
             tracing::error!(
                 progress_age_s = progress_age,
                 threshold_s = self.stall_threshold.as_secs(),
                 "service worker stalled — reporting unhealthy so the pod gets restarted"
             );
-        } else {
-            tracing::debug!(op = "health", elapsed_ms = elapsed, status, "ok (probe)");
+            return json!({ "status": "unhealthy" });
         }
 
+        let qdrant_health = self.check_qdrant().await;
+        let status = Self::status_from(false, qdrant_health.is_ok());
+
+        tracing::debug!(
+            op = "health",
+            elapsed_ms = start.elapsed().as_millis(),
+            status,
+            "ok (probe)"
+        );
         json!({ "status": status })
     }
 
@@ -668,6 +676,7 @@ impl HealthChecker {
 
         json!({
             "status": status,
+            // "is build X live?" without cluster access (#70)
             "version": build_info::version(),
             "git_sha": build_info::git_sha(),
             "built_at": build_info::built_at(),
