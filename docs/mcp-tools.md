@@ -14,7 +14,7 @@ Almost every tool below either returns or takes a `content_hash`. Two rules that
 ## Tools at a glance
 
 | Tool | Purpose | Mutates? |
-|---|---|---|
+|:--|:--|:-:|
 | [`store_memory`](#store_memory) | Add a new memory | ✓ |
 | [`search`](#search) | Retrieve memories — hybrid, vector, tag, recent, or full scan | |
 | [`get_memory`](#get_memory) | Fetch one memory by exact `content_hash` | |
@@ -33,7 +33,7 @@ Almost every tool below either returns or takes a `content_hash`. Two rules that
 Embed text and persist it. Returns the new memory's `content_hash`.
 
 | Param | Type | Required | Default | Notes |
-|---|---|---|---|---|
+|:--|:--|:-:|:--|:--|
 | `content` | string | ✓ | | The text to store. Embedded for semantic search. |
 | `tags` | string[] or string | | | Labels for tag-mode search. Accepts `["a","b"]` or `"a,b"`. |
 | `memory_type` | enum | | `note` | One of `note`, `decision`, `task`, `reference`. Used by `memory_type` filter on `search`. |
@@ -65,7 +65,7 @@ Embed text and persist it. Returns the new memory's `content_hash`.
 The one retrieval tool. Mode selects the algorithm.
 
 | Param | Type | Default | Notes |
-|---|---|---|---|
+|:--|:--|:--|:--|
 | `query` | string | `""` | Natural-language query. Required for `hybrid` and `similar`. |
 | `mode` | enum | `hybrid` | One of `hybrid`, `scan`, `similar`, `tag`, `recent`. |
 | `tags` | string[] | | Required for `tag` mode; optional filter on others. |
@@ -84,8 +84,8 @@ The one retrieval tool. Mode selects the algorithm.
 **Modes:**
 
 | Mode | What it does |
-|---|---|
-| `hybrid` | Vector + keyword fused with [RRF](https://en.wikipedia.org/wiki/Reciprocal_rank_fusion), optionally re-scored by a cross-encoder if `RERANK_URL` is set. **Default — use this unless you have a reason not to.** |
+|:--|:--|
+| `hybrid` | Vector + keyword fused with [RRF](https://qdrant.tech/documentation/concepts/hybrid-queries/), optionally re-scored by a cross-encoder if `RERANK_URL` is set. **Default — use this unless you have a reason not to.** |
 | `similar` | Pure vector similarity. Faster than `hybrid` but ignores keyword signal. |
 | `tag` | Filter by tag(s). With `match_all=true`, all tags must match. |
 | `recent` | Reverse chronological. Use `cursor` to paginate. |
@@ -113,7 +113,7 @@ The one retrieval tool. Mode selects the algorithm.
 Fetch a single memory by its exact hash. Returns `{"found": false}` if it doesn't exist — superseded memories still return `{"found": true}` and you can check `metadata.superseded_by`.
 
 | Param | Type | Required | Default | Notes |
-|---|---|---|---|---|
+|:--|:--|:-:|:--|:--|
 | `content_hash` | string | ✓ | | Full 64-char SHA-256 hex. |
 | `output` | enum | | `full` | `full`, `summary`, or `both`. |
 
@@ -137,7 +137,7 @@ Fetch a single memory by its exact hash. Returns `{"found": false}` if it doesn'
 Hard-delete. Vector is removed from Qdrant, node from FalkorDB. **No tombstone, no recovery** — use `memory_supersede` if you might want history.
 
 | Param | Type | Required |
-|---|---|---|
+|:--|:--|:-:|
 | `content_hash` | string | ✓ |
 
 **Returns:** `{ "deleted": true }` or an error.
@@ -159,7 +159,7 @@ No params. Returns backend status and per-backend stats — vector count, graph 
 Manage typed edges between two memories in the knowledge graph. One tool with three actions.
 
 | Param | Type | Required | Notes |
-|---|---|---|---|
+|:--|:--|:-:|:--|
 | `action` | enum | ✓ | `create`, `get`, or `delete`. |
 | `content_hash` | string | ✓ | Source memory hash. For `get`, all outgoing edges of this node are returned. |
 | `target_hash` | string | for `create`/`delete` | Target memory hash. |
@@ -168,7 +168,7 @@ Manage typed edges between two memories in the knowledge graph. One tool with th
 **Relation types:**
 
 | Type | Meaning |
-|---|---|
+|:--|:--|
 | `RELATES_TO` | Generic association. Used by spreading-activation to boost search results. |
 | `PRECEDES` | Temporal ordering — `A PRECEDES B` means A happened before B. |
 | `CONTRADICTS` | Explicit contradiction. Surfaces in `memory_contradictions`. Use `memory_supersede` to resolve. |
@@ -194,11 +194,12 @@ Manage typed edges between two memories in the knowledge graph. One tool with th
 Mark `old_id` as superseded by `new_id`. The old memory stays in storage (so the history is auditable) but is filtered out of default `search` results. Use this to resolve a contradiction without losing the old answer.
 
 | Param | Type | Required | Default |
-|---|---|---|---|
+|:--|:--|:-:|:--|
 | `old_id` | string | ✓ | |
 | `new_id` | string | ✓ | |
 | `reason` | string | | `""` |
 
+> [!IMPORTANT]
 > **Field-name divergence.** `supersede` takes `old_hash`/`new_hash` on REST (`POST /supersede`) and `old_id`/`new_id` in MCP (`memory_supersede`). The **values are identical** — full 64-char content hashes; only the field names differ. (`relation` and `delete` use `content_hash`/`target_hash` on *both* protocols — no divergence.)
 
 See [REST: `POST /supersede`](rest-api.md#post-supersede) for the REST equivalent.
@@ -223,7 +224,7 @@ See [REST: `POST /supersede`](rest-api.md#post-supersede) for the REST equivalen
 List pairs of memories the contradiction detector has flagged (via negation, antonym, or temporal cues) and that haven't been resolved with `memory_supersede`. Use this to triage what to reconcile.
 
 | Param | Type | Default | Notes |
-|---|---|---|---|
+|:--|:--|:--|:--|
 | `limit` | int | `20` | Max number of pairs to return. |
 
 **Returns:** array of `{ a: <memory>, b: <memory>, reason: string, ... }`.
@@ -235,7 +236,7 @@ List pairs of memories the contradiction detector has flagged (via negation, ant
 Scan up to `limit` memories for near-duplicates by embedding cosine similarity. **Does not mutate anything** — it's a planning tool. To act on the clusters it finds, call `merge_duplicates`.
 
 | Param | Type | Default | Notes |
-|---|---|---|---|
+|:--|:--|:--|:--|
 | `similarity_threshold` | number | `0.95` | Cosine similarity cutoff for "near-duplicate". |
 | `limit` | int | `500` | Max memories to scan. |
 | `strategy` | enum | `keep_newest` | Which memory in a cluster to mark canonical: `keep_newest`, `keep_oldest`, or `keep_most_accessed`. |
@@ -249,7 +250,7 @@ Scan up to `limit` memories for near-duplicates by embedding cosine similarity. 
 Supersede each `duplicate_hashes` entry with `canonical_hash`. Typically called after inspecting `find_duplicates` output.
 
 | Param | Type | Required | Default |
-|---|---|---|---|
+|:--|:--|:-:|:--|
 | `canonical_hash` | string | ✓ | |
 | `duplicate_hashes` | string[] | ✓ | |
 | `reason` | string | | `Merged by deduplication` |
@@ -264,7 +265,7 @@ Supersede each `duplicate_hashes` entry with `canonical_hash`. Typically called 
 All tools return JSON-RPC error codes. The ones you'll see most:
 
 | Code | Meaning |
-|---|---|
+|:--|:--|
 | `-32600` | Invalid request — usually a missing `jsonrpc` or `method`. |
 | `-32601` | Method (tool) not found — check the name. |
 | `-32602` | Invalid params — wrong type, missing required field, or a truncated `content_hash`. |

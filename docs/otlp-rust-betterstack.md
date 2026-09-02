@@ -2,6 +2,21 @@
 
 Battle-tested instructions from alaya-server. Covers every pitfall discovered during integration.
 
+## Contents
+
+- [Dependencies](#dependencies)
+- [Telemetry Init](#telemetry-init)
+- [Environment Variables](#environment-variables)
+- [TraceLayer for axum](#tracelayer-for-axum)
+- [EnvFilter: The Global Gate](#envfilter-the-global-gate)
+- [Cross-Thread Span Propagation](#cross-thread-span-propagation)
+- [`#[tracing::instrument]` with `#[async_trait(?Send)]`](#tracinginstrument-with-async_traitsend)
+- [Stage Spans for Concurrent Operations](#stage-spans-for-concurrent-operations)
+- [Graceful Shutdown](#graceful-shutdown)
+- [Git SHA in Binary](#git-sha-in-binary)
+- [K8s Deployment](#k8s-deployment)
+- [Debugging Checklist](#debugging-checklist)
+
 ## Dependencies
 
 ```toml
@@ -147,12 +162,12 @@ let app = health.merge(app);
 
 If your `RUST_LOG` is `my_crate=info` and you have `#[tracing::instrument]` on methods in `my_lib`, those spans are silently dropped. You must include every crate that has instrumented methods:
 
-```
+```bash
 RUST_LOG=my_crate=info,my_lib=info,tower_http=info
 ```
 
 To see OTLP internal errors (normally invisible):
-```
+```bash
 RUST_LOG=my_crate=info,opentelemetry=debug,opentelemetry_sdk=debug
 ```
 
@@ -305,10 +320,17 @@ RUN cargo build --release
 ### In code
 
 ```rust
-let version = option_env!("ALAYA_GIT_SHA").unwrap_or("dev");
+let git_sha = crate::build_info::git_sha().unwrap_or("dev");
 ```
 
-Use in: health endpoint response, OTLP `service.version` resource attribute, startup log.
+`crates/alaya-server/src/build_info.rs` is the single home for these
+compile-time reads — don't re-scatter `option_env!` at call sites. It exposes
+`version()` (crate semver), `git_sha()`, `built_at()` and `version_qualified()`
+(`<semver>+<sha>`, used by MCP `serverInfo`).
+
+Used in: the `GET /health/detail` body (`version` / `git_sha` / `built_at`), the OTLP
+`service.version` resource attribute (bare SHA, so existing SHA-equality
+queries keep matching), and the startup log.
 
 ## K8s Deployment
 
@@ -333,7 +355,7 @@ Network policy: allow egress on port 443 (HTTPS to BetterStack).
 
 If traces don't show up:
 
-1. **Check `/health` for version** — is the right code deployed?
+1. **Check `/health/detail` for `git_sha`** (authenticated) — is the right code deployed?
 2. **Check startup log** — does it say "OTLP tracing enabled"?
 3. **Check for panics** — `kubectl logs | grep panic` — the BatchSpanProcessor panic is silent (background thread)
 4. **Check RUST_LOG** — does it include every crate with `#[instrument]`?

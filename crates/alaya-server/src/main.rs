@@ -7,9 +7,11 @@
 //! Endpoints:
 //!   POST /mcp          — MCP Streamable HTTP (JSON-RPC 2.0)
 //!   POST /store, etc.  — Plain REST API (for Prajna and internal consumers)
-//!   GET  /health       — Health check
+//!   GET  /health       — Liveness probe (status only, unauthenticated)
+//!   GET  /health/detail— Backend health, capacity, build identity (auth)
 
 mod auth;
+mod build_info;
 mod cached_embedding;
 mod mcp;
 mod oidc;
@@ -190,17 +192,15 @@ fn is_private_host(url: &str) -> bool {
 const L2_MAX_ATTEMPTS: u32 = 5;
 const L2_BASE_RETRY_MS: u64 = 500;
 
-async fn init_l2_cache(
+async fn init_l2_redis(
     url: &str,
-    model: &str,
-    dims: usize,
 ) -> std::result::Result<cachekit::CacheKit, Box<dyn std::error::Error>> {
     let redis = cachekit::backend::redis::RedisBackend::builder()
         .url(url)
         .build()?;
     // Retry connection with backoff — at pod startup the CNI/kube-proxy may
     // not have finished installing network rules yet, causing ECONNREFUSED.
-    // Each attempt is deadline-bounded: cachekit 0.3 sets no fred connect
+    // Each attempt is deadline-bounded: cachekit sets no fred connect
     // timeout, and a blackholed target here would otherwise hang the worker
     // thread before its command loop ever starts (#63).
     let mut last_err: Option<String> = None;
@@ -212,13 +212,7 @@ async fn init_l2_cache(
                 if attempt > 0 {
                     tracing::info!(attempt, "L2 cache connected after retry");
                 }
-                let ns = format!("alaya:embed:{model}:{dims}");
-                return Ok(cachekit::CacheKit::builder()
-                    .backend(std::rc::Rc::new(redis))
-                    .namespace(ns)
-                    .default_ttl(std::time::Duration::from_secs(86400 * 30))
-                    .no_l1()
-                    .build()?);
+                return Ok(cached_embedding::build_l2_client(std::rc::Rc::new(redis))?);
             }
             Ok(Err(e)) => e.to_string(),
             Err(_) => "connect timed out after 10s".to_string(),
@@ -235,6 +229,86 @@ async fn init_l2_cache(
     Err(last_err
         .unwrap_or_else(|| "L2 cache init: no connection attempts made".to_string())
         .into())
+}
+
+/// cachekit.io SaaS backend (`CACHE_BACKEND=saas`). HTTP — no connection to
+/// retry; the builder validates the API key and URL (HTTPS-only, host
+/// allowlist, private IPs blocked upstream).
+fn init_l2_saas() -> std::result::Result<cachekit::CacheKit, Box<dyn std::error::Error>> {
+    let api_key =
+        env_non_empty("CACHEKIT_API_KEY").ok_or("CACHE_BACKEND=saas requires CACHEKIT_API_KEY")?;
+    let mut builder = cachekit::backend::cachekitio::CachekitIO::builder().api_key(api_key);
+    if let Some(url) = env_non_empty("CACHEKIT_API_URL") {
+        builder = builder.api_url(url);
+    }
+    let backend = builder.build()?;
+    Ok(cached_embedding::build_l2_client(std::rc::Rc::new(
+        backend,
+    ))?)
+}
+
+/// Env var treated as unset when blank, returned trimmed — k8s manifests
+/// commonly ship `value: ""` (must route to the explicit "missing" handling,
+/// not an opaque downstream builder error) and padded/newline-suffixed values
+/// (folded YAML scalars, `echo`-piped secrets) that would fail string matches
+/// and downstream builders if passed through raw.
+fn env_non_empty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// L2 embedding cache init, dispatched on `CACHE_BACKEND` (default `redis`).
+/// Never fatal — any failure degrades to L1-only, matching the L2's
+/// non-fatal-by-design posture.
+async fn init_l2_cache() -> Option<cachekit::CacheKit> {
+    let backend = env_non_empty("CACHE_BACKEND").unwrap_or_else(|| "redis".to_string());
+    // A CacheKit API key alongside a non-saas backend is a near-certain
+    // "forgot the switch" misconfig — say so instead of silently ignoring it.
+    if backend != "saas" && env_non_empty("CACHEKIT_API_KEY").is_some() {
+        tracing::warn!(
+            backend = %backend,
+            "CACHEKIT_API_KEY is set but CACHE_BACKEND is not \"saas\" — SaaS cache backend NOT in use"
+        );
+    }
+    let init = match backend.as_str() {
+        "redis" => {
+            let Some(url) = env_non_empty("REDIS_CACHE_URL") else {
+                tracing::info!("REDIS_CACHE_URL not set — L1-only embedding cache");
+                return None;
+            };
+            init_l2_redis(&url).await
+        }
+        "saas" => init_l2_saas(),
+        other => {
+            tracing::warn!(
+                value = other,
+                "unknown CACHE_BACKEND (expected \"redis\" or \"saas\") — L1-only embedding cache"
+            );
+            return None;
+        }
+    };
+    match init {
+        Ok(ck) => {
+            // Key-cutover announcement (LAB-372): interop/v1 keys replaced the
+            // legacy SHA-256 keys on 2026-08-08, invalidating the warm cache.
+            // Legacy entries (namespaced `alaya:embed:<model>:<dims>:<sha256>`)
+            // are orphaned and expire via their 30-day TTL; flush them to
+            // reclaim memory sooner (command in CLAUDE.md). One-time re-embed
+            // cost until the cache re-warms. Log removable after 2026-09-08.
+            tracing::info!(
+                backend = %backend,
+                "L2 embedding cache enabled — keys are cross-SDK interop/v1; legacy \
+                 SHA-256 entries are orphaned and expire via TTL (cutover 2026-08-08, LAB-372)"
+            );
+            Some(ck)
+        }
+        Err(e) => {
+            tracing::warn!(backend = %backend, "L2 cache init failed, running L1-only: {e}");
+            None
+        }
+    }
 }
 
 /// Ensure the Qdrant collection exists before the server serves writes, so a
@@ -570,7 +644,11 @@ impl HealthChecker {
 
         json!({
             "status": status,
-            "version": option_env!("ALAYA_GIT_SHA").unwrap_or("dev"),
+            // Build identity so any consumer can answer "is build X live?"
+            // without cluster access (#70). null when the build didn't pass it.
+            "version": build_info::version(),
+            "git_sha": build_info::git_sha(),
+            "built_at": build_info::built_at(),
             "backend": "qdrant",
             "worker": {
                 "state": worker_state,
@@ -1378,31 +1456,16 @@ fn main() {
                 // Fresh-deploy bootstrap: create the memory collection if it is
                 // absent so the first write doesn't 404 (#31).
                 ensure_qdrant_collection(&qdrant, cfg_clone.embedding_dimensions).await;
-                let embed_model = cfg_clone.embedding_model;
-                let embed_dims = cfg_clone.embedding_dimensions;
                 let embeddings = EmbeddingClient::new(
                     cfg_clone.embedding_url,
-                    embed_model.clone(),
-                    embed_dims,
+                    cfg_clone.embedding_model,
+                    cfg_clone.embedding_dimensions,
                     cfg_clone.embedding_batch_size,
                     None,
                 );
-                // L2 embedding cache: Redis via cachekit-rs (optional)
-                let l2_cache = if let Ok(url) = std::env::var("REDIS_CACHE_URL") {
-                    match init_l2_cache(&url, &embed_model, embed_dims).await {
-                        Ok(ck) => {
-                            tracing::info!("L2 embedding cache enabled (Redis)");
-                            Some(ck)
-                        }
-                        Err(e) => {
-                            tracing::warn!("L2 cache init failed, running L1-only: {e}");
-                            None
-                        }
-                    }
-                } else {
-                    tracing::info!("REDIS_CACHE_URL not set — L1-only embedding cache");
-                    None
-                };
+                // L2 embedding cache via cachekit-rs (optional) — backend
+                // selected by CACHE_BACKEND (redis default, saas).
+                let l2_cache = init_l2_cache().await;
                 let cached_embeddings = cached_embedding::CachedEmbedding::new(
                     Box::new(embeddings),
                     10_000, // L1 max cached embeddings (~40 MB at 1024 dims)
@@ -1522,6 +1585,20 @@ fn main() {
             ))
             .with_state(handle);
 
+        // Read-only auth-config view (LAB-1684 AC7). Same auth middleware;
+        // GET /auth/config is unmapped in rest_route_op → static-bearer only
+        // (default-deny), and the payload carries no credential material.
+        let auth_config_route = Router::new()
+            .route("/auth/config", get(auth_config))
+            .layer(middleware::from_fn_with_state(
+                auth_state.clone(),
+                auth::require_auth,
+            ))
+            .with_state(auth_state.clone());
+
+        // Health surfaces. Built before `wellknown` takes `auth_state`.
+        let health_route = health_routes(checker, auth_state.clone());
+
         // Unauthenticated protected-resource metadata (404 when OIDC disabled).
         let wellknown = Router::new()
             .route(
@@ -1534,14 +1611,11 @@ fn main() {
             )
             .with_state(auth_state);
 
-        let health_route = Router::new()
-            .route("/health", get(health))
-            .with_state(checker);
-
         // CORS is outermost so browser preflight (OPTIONS, no auth header) is
         // answered before `require_auth`.
         let app = health_route
             .merge(wellknown)
+            .merge(auth_config_route)
             .merge(protected)
             .layer(cors_layer());
 
@@ -1586,6 +1660,15 @@ async fn shutdown_signal() {
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
+/// Unauthenticated liveness/readiness probe: `status` plus the HTTP code,
+/// which is everything an automated prober consumes.
+///
+/// Nothing else belongs here. This route sits outside `require_auth`, so any
+/// field added to the body is world-readable — and the full document carries
+/// live capacity (`total_memories`), outage state (`worker.stalled`), the
+/// deployed commit, and per-backend error strings that render in-cluster URLs.
+/// That moved to `/health/detail` (#77).
+///
 /// `unhealthy` (wedged worker) returns 503 so an httpGet liveness probe
 /// restarts the pod; backend outages stay `degraded`/200 — a restart
 /// wouldn't fix those (#63).
@@ -1593,12 +1676,55 @@ async fn health(
     axum::extract::State(checker): axum::extract::State<HealthChecker>,
 ) -> (StatusCode, Json<Value>) {
     let v = checker.check().await;
-    let code = if v.get("status").and_then(|s| s.as_str()) == Some("unhealthy") {
+    (health_code(&v), Json(json!({ "status": v["status"] })))
+}
+
+/// Authenticated operator view: the full health document, including build
+/// identity (#70). Every intended consumer — radar, unified-memory, agents —
+/// already holds `ALAYA_API_KEY`, so "read the running build with zero cluster
+/// access" survives the move behind auth.
+async fn health_detail(
+    axum::extract::State(checker): axum::extract::State<HealthChecker>,
+) -> (StatusCode, Json<Value>) {
+    let v = checker.check().await;
+    (health_code(&v), Json(v))
+}
+
+/// Shared by both surfaces so they can never disagree on liveness.
+fn health_code(health: &Value) -> StatusCode {
+    if health.get("status").and_then(|s| s.as_str()) == Some("unhealthy") {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK
-    };
-    (code, Json(v))
+    }
+}
+
+/// The two health surfaces, composed.
+///
+/// Assembled here rather than inline in `main` so tests exercise the real
+/// composition: a handler-level test would still pass with the auth layer
+/// dropped, which is precisely the regression that matters.
+fn health_routes(checker: HealthChecker, auth_state: AuthState) -> Router {
+    let detail = Router::new()
+        .route("/health/detail", get(health_detail))
+        .layer(middleware::from_fn_with_state(
+            auth_state,
+            auth::require_auth,
+        ))
+        .with_state(checker.clone());
+
+    Router::new()
+        .route("/health", get(health))
+        .with_state(checker)
+        .merge(detail)
+}
+
+/// Read-only auth-config view (LAB-1684 AC7): principals, OIDC issuer /
+/// audience, and the principal × op matrix. No credential material.
+async fn auth_config(
+    axum::extract::State(auth): axum::extract::State<auth::AuthState>,
+) -> Json<Value> {
+    Json(auth::auth_config_view(&auth))
 }
 
 async fn store(
@@ -2295,5 +2421,106 @@ mod wedge_tests {
         assert_eq!(v["status"], "degraded");
         assert_eq!(v["worker"]["state"], "starting");
         assert_eq!(v["worker"]["stalled"], false);
+    }
+
+    // ─── /health split (#77) ────────────────────────────────────────────────
+
+    const TEST_KEY: &str = "test-api-key";
+
+    fn test_auth_state() -> AuthState {
+        AuthState {
+            api_key: Some(TEST_KEY.into()),
+            allow_unauthenticated: false,
+            oidc: None,
+            public_base_url: "http://localhost:3001".into(),
+        }
+    }
+
+    /// Drive the composed router in-process. `token: None` models the k8s
+    /// probe and any anonymous caller.
+    async fn probe(app: &Router, path: &str, token: Option<&str>) -> (StatusCode, Value) {
+        use tower::ServiceExt;
+
+        let mut req = axum::http::Request::builder().uri(path);
+        if let Some(t) = token {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(axum::body::Body::empty()).expect("build request"))
+            .await
+            .expect("router call");
+
+        let code = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        (code, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    /// The unauthenticated probe carries `status` and nothing else.
+    ///
+    /// Asserted as an exact key set, not as spot-checks on the fields that
+    /// leak today: anything later added to `HealthChecker::check` is
+    /// world-readable the moment it lands, and this is the test that has to
+    /// fail when that happens.
+    #[tokio::test]
+    async fn unauthenticated_health_exposes_only_status() {
+        let app = health_routes(test_checker(epoch_secs()), test_auth_state());
+
+        let (code, body) = probe(&app, "/health", None).await;
+
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["status"], "degraded");
+        let keys: Vec<&str> = body
+            .as_object()
+            .expect("object body")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["status"], "unauthenticated /health leaked fields");
+    }
+
+    /// The operator view is unreachable without a credential, and complete
+    /// with one.
+    #[tokio::test]
+    async fn health_detail_requires_auth() {
+        let app = health_routes(test_checker(epoch_secs()), test_auth_state());
+
+        let (code, _) = probe(&app, "/health/detail", None).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+
+        let (code, _) = probe(&app, "/health/detail", Some("wrong-key")).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+
+        let (code, body) = probe(&app, "/health/detail", Some(TEST_KEY)).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["total_memories"], 0);
+        assert!(body["worker"].is_object());
+        assert!(body["vector_health"].is_object());
+        // Backends are unreachable here, so `check` takes the error arms —
+        // the path that renders `reqwest::Error` and with it in-cluster URLs.
+        // The detail view keeps that; the bare probe's exact-key-set
+        // assertion above is what proves it never reaches an anonymous caller.
+        assert!(body["vector_health"]["error"].is_string());
+        // Build identity (#70) rides the authenticated surface now.
+        assert!(body.get("version").is_some());
+        assert!(body.get("git_sha").is_some());
+        assert!(body.get("built_at").is_some());
+    }
+
+    /// The #63 contract is the HTTP code, not the body: a wedged worker must
+    /// still 503 the *unauthenticated* probe, or k8s stops restarting stalled
+    /// pods. The failure path must not widen the body either.
+    #[tokio::test]
+    async fn stalled_worker_still_503s_the_bare_probe() {
+        let app = health_routes(test_checker(epoch_secs() - 3600), test_auth_state());
+
+        let (code, body) = probe(&app, "/health", None).await;
+
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "unhealthy");
+        assert_eq!(body.as_object().expect("object body").len(), 1);
     }
 }

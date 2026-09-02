@@ -19,10 +19,11 @@ docker compose up -d
 
 That starts five containers (six with `--profile rerank`):
 
+> [!WARNING]
 > **Auth is fail-closed.** The server won't boot without auth, so the dev Compose opts into open mode on `localhost` (`DANGEROUSLY_ALLOW_UNAUTHENTICATED=true`, automatically refused on any non-private origin). Set `ALAYA_API_KEY` in `.env` before exposing it — that enables `Authorization: Bearer` auth and disables the dev-open flag.
 
 | Service | Purpose | Default host port |
-|---|---|---|
+|:--|:--|:--|
 | `falkordb` | Graph database (Redis + FalkorDB module) — also doubles as the L2 embedding cache | `6379` |
 | `qdrant` | Vector database | `6333` (HTTP), `6334` (gRPC) |
 | `tei` | Embedding inference (Snowflake Arctic embed v2.0 by default) | `8888` |
@@ -35,6 +36,7 @@ First boot takes a few minutes — TEI has to download the ~600 MB embedding mod
 
 `alaya-server` ensures its Qdrant collection exists at startup, so a fresh Qdrant volume — even after `docker compose down -v` — accepts writes with no manual step. The collection name comes from `QDRANT_COLLECTION` (`memories_arctic1024` by default, for the Snowflake Arctic embed model) and is created with `EMBEDDING_DIMENSIONS`-wide Cosine vectors.
 
+> [!WARNING]
 > Qdrant has no auth in the default compose; this assumes localhost — don't expose :6333.
 
 ## Verify
@@ -46,7 +48,15 @@ curl http://localhost:3001/health
 Expect:
 
 ```json
-{"status":"ok","qdrant":"ok","graph":"ok","embedding":"ok",...}
+{"status":"healthy"}
+```
+
+`/health` is the unauthenticated probe and carries only `status`. For
+per-backend detail, memory count and build identity:
+
+```bash
+curl -H "Authorization: Bearer $ALAYA_API_KEY" \
+  http://localhost:3001/health/detail
 ```
 
 Then exercise the API end-to-end:
@@ -98,7 +108,7 @@ The server gracefully degrades to plain RRF ordering if `RERANK_URL` is unset or
 Every knob lives in `.env`. The interesting ones:
 
 | Variable | Default | Notes |
-|---|---|---|
+|:--|:--|:--|
 | `ALAYA_API_KEY` | empty | Bearer token clients must send. Empty is fail-closed: the server won't boot unless the dev Compose sets `DANGEROUSLY_ALLOW_UNAUTHENTICATED=true` (localhost only). **Set this for any non-local deployment.** |
 | `GRAPH_API_KEY` | empty | Bridge bearer token. Set if exposing the bridge port. |
 | `QDRANT_COLLECTION` | `memories_arctic1024` | Name of the collection the server auto-creates at startup. |

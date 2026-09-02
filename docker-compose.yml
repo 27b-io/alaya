@@ -96,6 +96,7 @@ services:
       context: .
       args:
         GIT_SHA: ${GIT_SHA:-dev}
+        BUILT_AT: ${BUILT_AT:-}
     entrypoint: ["/usr/local/bin/alaya-bridge"]
     ports:
       - "${BRIDGE_PORT:-8080}:8080"

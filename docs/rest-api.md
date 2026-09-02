@@ -27,8 +27,9 @@ Failed auth returns `401 Unauthorized` with a `WWW-Authenticate: Bearer …` hea
 ## Endpoint summary
 
 | Method | Path | Purpose | Auth? |
-|---|---|---|---|
-| `GET`  | `/health` | Liveness + backend health | no |
+|:--|:--|:--|:-:|
+| `GET`  | `/health` | Liveness probe — status only | no |
+| `GET`  | `/health/detail` | Backend health, capacity, build identity | yes |
 | `POST` | `/store` | Add a memory | yes |
 | `POST` | `/search` | Retrieve memories | yes |
 | `GET`  | `/memories/{content_hash}` | Fetch one memory | yes |
@@ -45,23 +46,79 @@ Failed auth returns `401 Unauthorized` with a `WWW-Authenticate: Bearer …` hea
 
 ## `GET /health`
 
-Unauthenticated. Returns per-backend status. Use this as your liveness + readiness probe.
+Unauthenticated liveness + readiness probe. Returns the status word and nothing
+else.
 
 ```bash
 curl http://localhost:3001/health
 ```
 
 ```json
+{ "status": "healthy" }
+```
+
+`status` is `healthy` when every backend is reachable, `degraded` (HTTP 200) when
+a backend is down — restarting the pod won't fix Qdrant — and `unhealthy`
+(HTTP 503) when the service worker has stalled, so a liveness probe restarts it.
+
+Probers read the HTTP code, so a k8s `httpGet` probe and `curl -sf .../health`
+both work against this endpoint unchanged.
+
+## `GET /health/detail`
+
+Authenticated. The full operational document — per-backend health, worker state,
+memory count and build identity.
+
+```bash
+curl -H "Authorization: Bearer $ALAYA_API_KEY" \
+  http://localhost:3001/health/detail
+```
+
+```json
 {
-  "status": "ok",
-  "qdrant": "ok",
-  "graph": "ok",
-  "embedding": "ok",
-  "memory_count": 1247
+  "status": "healthy",
+  "version": "0.1.0",
+  "git_sha": "2f9c1a4b6d8e0f2a4c6e8b0d2f4a6c8e0b2d4f6a",
+  "built_at": "2026-08-09T11:22:33Z",
+  "backend": "qdrant",
+  "worker": { "state": "ok", "stalled": false, "last_progress_age_s": 3 },
+  "vector_health": { "status": "green" },
+  "graph_health": { "status": "healthy" },
+  "total_memories": 1247
 }
 ```
 
-`status` is `ok` only when every backend is healthy. Returns HTTP 200 either way — read the body for detail.
+Same status and HTTP-code mapping as `/health`.
+
+> [!NOTE]
+> These fields were served by the unauthenticated `/health` in earlier builds.
+> They are live capacity, outage state and — on the failure path — in-cluster
+> backend URLs, so they now sit behind the same bearer auth as every other
+> read. If you probed `/health` for anything other than `status`, point that
+> reader at `/health/detail` and give it a token.
+
+### Build identity
+
+`version`, `git_sha` and `built_at` answer "is build X live?" without cluster
+access. `version` is the crate semver; `git_sha` is the commit the binary was
+built from; `built_at` is an RFC3339 timestamp. The last two are `null` for any
+build that didn't pass them (a plain `cargo build`, or `docker build` without
+`--build-arg`) — absence is never an error. Verify a rollout with:
+
+```bash
+curl -s -H "Authorization: Bearer $ALAYA_API_KEY" \
+  http://localhost:3001/health/detail | jq -r .git_sha   # == git rev-parse HEAD
+```
+
+CI images always carry the full 40-hex SHA. A build that passes an abbreviation
+reports that prefix, so compare with `startswith` rather than equality if you
+accept locally-built images.
+
+> [!NOTE]
+> Before v0.1.0's build-identity change, `version` carried the git SHA. It now
+> carries the crate semver — read `git_sha` for the commit. The MCP
+> `initialize` response reports both together as `serverInfo.version`
+> (`0.1.0+<sha>`, semver build metadata).
 
 ## `POST /store`
 
@@ -134,7 +191,7 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" \
 ```
 
 | Status | Body |
-|---|---|
+|:--|:--|
 | `200 OK` | `{ "found": true, "memory": {...} }` |
 | `404 Not Found` | `{ "found": false }` |
 | `400 Bad Request` | `{ "error": "invalid content_hash format" }` — hash isn't 64 lowercase hex chars |
@@ -158,7 +215,7 @@ Content-Type: application/json
 Updatable fields: `summary`, `tags`, `metadata`. Content and `content_hash` are immutable by design — to change content, store a new memory and supersede the old.
 
 | Status | Meaning |
-|---|---|
+|:--|:--|
 | `200 OK` | Updated. Response echoes the new state. |
 | `400` | Empty patch, invalid hash, or validation failure. |
 | `404` | Memory doesn't exist. |
@@ -194,6 +251,7 @@ Content-Type: application/json
 
 ## `POST /supersede`
 
+> [!IMPORTANT]
 > **Field-name divergence.** `supersede` takes `old_hash`/`new_hash` on REST (`POST /supersede`) and `old_id`/`new_id` in MCP (`memory_supersede`). The **values are identical** — full 64-char content hashes; only the field names differ. (`relation` and `delete` use `content_hash`/`target_hash` on *both* protocols — no divergence.)
 
 See also [MCP: `memory_supersede`](./mcp-tools.md#memory_supersede).
@@ -289,7 +347,7 @@ See the [MCP tool reference](./mcp-tools.md) for the available `tools/call` meth
 REST endpoints use HTTP status codes plus a JSON body:
 
 | Status | When |
-|---|---|
+|:--|:--|
 | `400` | Malformed JSON, invalid `content_hash`, missing required field. Body: `{"error": "..."}`. |
 | `401` | Missing or wrong bearer token. |
 | `403` | Authenticated but the token is read-only (OAuth scope) and the endpoint mutates. |

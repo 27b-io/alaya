@@ -65,12 +65,14 @@ api() {
 }
 
 # --- 0. health -------------------------------------------------------------
-# GET, unauthenticated — /health is not on the protected router. graph_health
-# must not be "unhealthy": /contradictions (step 3) reads from FalkorDB; if the
-# graph is down, store still works and the inline interference still appears,
-# but the CONTRADICTS edge can't be surfaced and step 3 returns pairs: [].
+# Per-backend detail lives on /health/detail, which IS on the protected router
+# (the bare /health carries only `status`). graph_health must not be
+# "unhealthy": /contradictions (step 3) reads from FalkorDB; if the graph is
+# down, store still works and the inline interference still appears, but the
+# CONTRADICTS edge can't be surfaced and step 3 returns pairs: [].
 echo "== 0. health =="
-curl -fsS "${ALAYA_URL}/health" | jq '{status, total_memories, graph_health: .graph_health.status}'
+curl -fsS "${AUTH[@]}" "${ALAYA_URL}/health/detail" \
+  | jq '{status, total_memories, graph_health: .graph_health.status}'
 
 # --- 1. store fact A (the original policy) ----------------------------------
 echo "== 1. store A (the original fact) =="

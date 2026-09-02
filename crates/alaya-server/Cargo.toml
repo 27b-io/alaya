@@ -13,7 +13,6 @@ alaya-backends = { path = "../alaya-backends" }
 alaya-core = { path = "../alaya-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
@@ -42,3 +41,7 @@ tracing-opentelemetry = "0.30"
 # test-util enables tokio's paused clock (start_paused) for the wedge
 # regression tests (#63) — deliberately dev-only.
 tokio = { workspace = true, features = ["test-util"] }
+# ServiceExt::oneshot drives the composed health Router in-process, so the
+# auth-split tests (#77) exercise the real layering rather than a replica.
+# Already in the lock via axum — this pulls nothing new.
+tower = { version = "0.5", features = ["util"] }

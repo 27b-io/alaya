@@ -41,7 +41,11 @@ pub fn init_tracing() {
     if let Some(ref endpoint) = otel_endpoint {
         let service_name =
             std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "alaya-server".to_string());
-        let git_sha = option_env!("ALAYA_GIT_SHA").unwrap_or("dev");
+        // Deliberately the bare SHA, not the qualified version: existing
+        // BetterStack queries filter service.version by SHA equality, and this
+        // ticket has no mandate to break them. Reads through build_info only to
+        // retire the duplicate option_env! — the emitted value is unchanged.
+        let git_sha = crate::build_info::git_sha().unwrap_or("dev");
 
         let resource = Resource::builder()
             .with_service_name(service_name)

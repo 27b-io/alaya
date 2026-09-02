@@ -24,7 +24,7 @@ Measured on **LongMemEval** (`longmemeval_s_cleaned`, 500 multi-session QA items
 We report **hit-rate@5**: the fraction of questions where at least one ground-truth session lands in the top 5 results. This is the *any-correct-in-top-k* metric (a binary per-question hit, averaged across questions) — we label it hit-rate, **not** classical recall, because that is what the harness computes (`recall_at_k` in `benchmarks/longmemeval_bench.py`: `float(any(cid in top_k ...))`).
 
 | Configuration              | hit-rate@5 | hit-rate@10 |
-|----------------------------|------------|-------------|
+|:---------------------------|-----------:|------------:|
 | Hybrid (RRF)               | 0.916      | 0.964       |
 | Hybrid + cross-encoder     | 0.986      | 0.988       |
 
@@ -49,6 +49,7 @@ http://localhost:3001/mcp      # MCP endpoint
 http://localhost:8080/health   # bridge
 ```
 
+> [!WARNING]
 > **Auth is fail-closed.** The server won't start without auth, so the dev Compose opts into open mode on `localhost` (`DANGEROUSLY_ALLOW_UNAUTHENTICATED=true`, automatically refused on any non-private origin). Before exposing this anywhere, set `ALAYA_API_KEY` in `.env` — that enables `Authorization: Bearer` auth and disables the dev-open flag. See [Self-hosting → hardening](docs/quickstart-selfhost.md).
 
 The default Compose stack is **5 containers** (Qdrant, FalkorDB, TEI, `alaya-bridge`, `alaya-server`); the opt-in reranker (`--profile rerank`) adds a sixth.
@@ -59,6 +60,7 @@ The default Compose stack is **5 containers** (Qdrant, FalkorDB, TEI, `alaya-bri
 - **Run your own server** → [docs/quickstart-selfhost.md](docs/quickstart-selfhost.md)
 - **Full MCP tool reference** → [docs/mcp-tools.md](docs/mcp-tools.md)
 - **Full REST API reference** → [docs/rest-api.md](docs/rest-api.md)
+- **Claude Code memory hooks (Stop + PreCompact)** → [integrations/claude-code](integrations/claude-code/README.md)
 
 ## Architecture
 
@@ -83,7 +85,7 @@ The default Compose stack is **5 containers** (Qdrant, FalkorDB, TEI, `alaya-bri
 Six Rust crates, five compiled:
 
 | Crate | Purpose |
-|-------|---------|
+|:------|:--------|
 | `alaya-types` | Shared types (Memory, Edge, SearchMode, AlayaError) |
 | `alaya-backends` | Trait definitions + HTTP clients (Qdrant, Embedding, Graph, Summary) |
 | `alaya-core` | MemoryService orchestration — all 10 MCP tools, hybrid search, interference detection |
@@ -97,7 +99,7 @@ Six Rust crates, five compiled:
 Connect any MCP client to `http://localhost:3001/mcp` (Streamable HTTP with SSE). Full parameter reference: [docs/mcp-tools.md](docs/mcp-tools.md).
 
 | Tool | Description |
-|------|-------------|
+|:-----|:------------|
 | `store_memory` | Store content with tags, metadata, and optional auto-summary |
 | `search` | Hybrid semantic + tag-boosted retrieval (5 modes: hybrid, scan, similar, tag, recent) |
 | `get_memory` | Fetch a single memory by content hash |
@@ -114,7 +116,7 @@ Connect any MCP client to `http://localhost:3001/mcp` (Streamable HTTP with SSE)
 All endpoints accept/return JSON. Auth via `Authorization: Bearer ${ALAYA_API_KEY}` when configured (the dev Compose runs open on localhost — see [Quick Start](#quick-start)). Full reference: [docs/rest-api.md](docs/rest-api.md).
 
 | Method | Path | Description |
-|--------|------|-------------|
+|:-------|:-----|:------------|
 | POST | `/store` | Store a memory |
 | POST | `/search` | Search memories |
 | POST | `/delete` | Delete a memory |
@@ -125,7 +127,8 @@ All endpoints accept/return JSON. Auth via `Authorization: Bearer ${ALAYA_API_KE
 | POST | `/duplicates/merge` | Merge duplicates |
 | PATCH | `/memories/{hash}` | Update memory metadata |
 | POST | `/backfill/summaries` | Batch-generate missing summaries |
-| GET | `/health` | Health check (no auth) |
+| GET | `/health` | Liveness probe — status only (no auth) |
+| GET | `/health/detail` | Backend health, capacity, build identity |
 | POST | `/mcp` | MCP JSON-RPC endpoint |
 
 ## Configuration
@@ -133,7 +136,7 @@ All endpoints accept/return JSON. Auth via `Authorization: Bearer ${ALAYA_API_KE
 Copy `.env.example` to `.env`. All settings have sensible defaults for local dev.
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+|:---------|:--------|:------------|
 | `QDRANT_URL` | — (required) | Qdrant HTTP endpoint |
 | `QDRANT_COLLECTION` | `memories_arctic1024` | Vector collection name |
 | `QDRANT_API_KEY` | — | Optional Qdrant auth |
@@ -195,7 +198,7 @@ Installed via `.pre-commit-config.yaml` — enforces fmt, clippy, tests, WASM ga
 ## Docker Compose Services
 
 | Service | Image | Host Port | Purpose |
-|---------|-------|-----------|---------|
+|:--------|:------|:----------|:--------|
 | `falkordb` | `falkordb/falkordb` | 6379 | Graph database (Redis + FalkorDB module) |
 | `qdrant` | `qdrant/qdrant` | 6333, 6334 | Vector database |
 | `tei` | `ghcr.io/huggingface/text-embeddings-inference:${TEI_TAG:-cpu-arm64-latest}` | 8888 | Embedding inference (CPU) |
