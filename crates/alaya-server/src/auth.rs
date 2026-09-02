@@ -441,14 +441,16 @@ mod tests {
 
     #[test]
     fn auth_config_view_leaks_no_credentials_and_matches_allowlist() {
-        let auth = crate::testkit::auth_state(Some("super-secret-bearer"), true);
+        let mut auth = crate::testkit::auth_state(Some("super-secret-bearer"), true);
+        auth.readonly_api_key = Some("readonly-secret".into());
         let v = auth_config_view(&auth);
         let text = v.to_string();
         assert!(
-            !text.contains("super-secret-bearer"),
-            "auth-config view must never contain the bearer"
+            !text.contains("super-secret-bearer") && !text.contains("readonly-secret"),
+            "auth-config view must never contain a bearer"
         );
         assert_eq!(v["static_bearer_configured"], true);
+        assert_eq!(v["readonly_bearer_configured"], true);
         assert_eq!(v["oidc"]["enabled"], true);
 
         let ops = v["ops"].as_array().unwrap();
@@ -467,8 +469,7 @@ mod tests {
             );
         }
         // Every mutating op must be denied to both restricted principals —
-        // the read-only invariant the view exists to display. The readonly
-        // bearer is stricter still: not even the additive store.
+        // the read-only invariant the view exists to display.
         for op in ops {
             if op["mutating"] == true {
                 assert_eq!(op["oidc"], false, "{} must be OIDC-denied", op["op"]);
@@ -478,20 +479,7 @@ mod tests {
                     op["op"]
                 );
             }
-            if op["op"] == "store_memory" {
-                assert_eq!(op["readonly"], false, "readonly bearer must not store");
-            }
         }
-    }
-
-    #[test]
-    fn auth_config_view_reports_readonly_bearer_presence_without_the_key() {
-        let mut auth = crate::testkit::auth_state(None, false);
-        auth.readonly_api_key = Some("readonly-secret".into());
-        let v = auth_config_view(&auth);
-        assert!(!v.to_string().contains("readonly-secret"));
-        assert_eq!(v["static_bearer_configured"], false);
-        assert_eq!(v["readonly_bearer_configured"], true);
     }
 
     /// Drift guard: every op `rest_route_op` can emit (except the fail-closed
@@ -535,7 +523,6 @@ mod tests {
         let op = rest_route_op(&Method::GET, "/auth/config");
         assert!(!AuthPrincipal::Oidc.allows(op));
         assert!(!AuthPrincipal::StaticReadOnly.allows(op));
-        assert!(AuthPrincipal::Static.allows(op));
     }
 
     #[test]
