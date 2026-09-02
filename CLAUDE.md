@@ -21,6 +21,7 @@ Rust rewrite of the mcp-memory-service API layer. Deployed on k3s as a native se
 | **alaya-backends** | wasm32 + native | Done | Trait definitions + HTTP clients (Qdrant, Embedding, Graph) |
 | **alaya-core** | wasm32 + native | Done | MemoryService orchestration (all 10 MCP tools), 5 integration tests |
 | **alaya-server** | native only | Done | REST API + MCP Streamable HTTP (axum, channel-based, 9 endpoints + /mcp) |
+| **ops-console** | native only | Done | OIDC-gated admin console (Leptos SSR + vendored Rust/UI, LAB-1684) — memory curation UI over alaya-server's REST API; see `crates/ops-console/README.md` |
 | **alaya-worker** | wasm32 | Deferred | CF Worker entry point (reqwest-wasm unreliable on Workers, native server sufficient) |
 
 ```text

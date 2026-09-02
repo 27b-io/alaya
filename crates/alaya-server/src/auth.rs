@@ -130,6 +130,54 @@ pub fn rest_route_op(method: &Method, path: &str) -> &'static str {
     }
 }
 
+/// Every canonical op with its write classification, for the read-only
+/// auth-config view. `(op, mutating)` — "mutating" means it rewrites or
+/// removes shared state (store is additive, so it is not mutating).
+pub const ALL_OPS: &[(&str, bool)] = &[
+    ("search", false),
+    ("get_memory", false),
+    ("check_database_health", false),
+    ("memory_contradictions", false),
+    ("find_duplicates", false),
+    ("store_memory", false),
+    ("delete_memory", true),
+    ("memory_supersede", true),
+    ("merge_duplicates", true),
+    ("relation", true),
+    ("patch_memory", true),
+    ("backfill_summaries", true),
+];
+
+/// Read-only view of the auth configuration (LAB-1684 AC7): which principals
+/// exist, the OIDC issuer/audience, and the principal × op matrix. Contains
+/// NO credential material — only presence flags and public identifiers.
+pub fn auth_config_view(auth: &AuthState) -> serde_json::Value {
+    // The full static principal always has full access, so per-op "static"
+    // flags would be constants — the matrix only carries what varies: the
+    // two restricted principals (oidc, readonly).
+    let ops: Vec<serde_json::Value> = ALL_OPS
+        .iter()
+        .map(|(op, mutating)| {
+            serde_json::json!({
+                "op": op,
+                "mutating": mutating,
+                "oidc": AuthPrincipal::Oidc.allows(op),
+                "readonly": AuthPrincipal::StaticReadOnly.allows(op),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "static_bearer_configured": auth.api_key.is_some(),
+        "readonly_bearer_configured": auth.readonly_api_key.is_some(),
+        "oidc": {
+            "enabled": auth.oidc.is_some(),
+            "issuer": auth.oidc.as_ref().map(|v| v.issuer().to_string()),
+            "audience": auth.oidc.as_ref().map(|v| v.audience().to_string()),
+        },
+        "ops": ops,
+    })
+}
+
 /// Extract the bearer token from an `Authorization` header.
 /// RFC 6750 §2.1: the scheme name is case-insensitive (`Bearer`/`bearer`/`BEARER`
 /// are all valid); the credential follows whitespace after the scheme.
@@ -389,6 +437,105 @@ mod tests {
             assert!(!p.allows(rest_route_op(&Method::POST, "/some/new/route")));
             assert!(!p.allows(rest_route_op(&Method::DELETE, "/memories/x")));
         }
+    }
+
+    #[test]
+    fn auth_config_view_leaks_no_credentials_and_matches_allowlist() {
+        let auth = crate::testkit::auth_state(Some("super-secret-bearer"), true);
+        let v = auth_config_view(&auth);
+        let text = v.to_string();
+        assert!(
+            !text.contains("super-secret-bearer"),
+            "auth-config view must never contain the bearer"
+        );
+        assert_eq!(v["static_bearer_configured"], true);
+        assert_eq!(v["oidc"]["enabled"], true);
+
+        let ops = v["ops"].as_array().unwrap();
+        assert_eq!(ops.len(), ALL_OPS.len());
+        for op in ops {
+            let name = op["op"].as_str().unwrap();
+            assert_eq!(
+                op["oidc"].as_bool().unwrap(),
+                AuthPrincipal::Oidc.allows(name),
+                "matrix must mirror Oidc.allows for {name}"
+            );
+            assert_eq!(
+                op["readonly"].as_bool().unwrap(),
+                AuthPrincipal::StaticReadOnly.allows(name),
+                "matrix must mirror StaticReadOnly.allows for {name}"
+            );
+        }
+        // Every mutating op must be denied to both restricted principals —
+        // the read-only invariant the view exists to display. The readonly
+        // bearer is stricter still: not even the additive store.
+        for op in ops {
+            if op["mutating"] == true {
+                assert_eq!(op["oidc"], false, "{} must be OIDC-denied", op["op"]);
+                assert_eq!(
+                    op["readonly"], false,
+                    "{} must be readonly-denied",
+                    op["op"]
+                );
+            }
+            if op["op"] == "store_memory" {
+                assert_eq!(op["readonly"], false, "readonly bearer must not store");
+            }
+        }
+    }
+
+    #[test]
+    fn auth_config_view_reports_readonly_bearer_presence_without_the_key() {
+        let mut auth = crate::testkit::auth_state(None, false);
+        auth.readonly_api_key = Some("readonly-secret".into());
+        let v = auth_config_view(&auth);
+        assert!(!v.to_string().contains("readonly-secret"));
+        assert_eq!(v["static_bearer_configured"], false);
+        assert_eq!(v["readonly_bearer_configured"], true);
+    }
+
+    /// Drift guard: every op `rest_route_op` can emit (except the fail-closed
+    /// sentinel) must appear in `ALL_OPS`, or the auth-config view silently
+    /// under-reports the surface it exists to display.
+    #[test]
+    fn all_ops_covers_every_rest_route_op() {
+        let rest_ops = [
+            rest_route_op(&Method::POST, "/store"),
+            rest_route_op(&Method::POST, "/search"),
+            rest_route_op(&Method::POST, "/delete"),
+            rest_route_op(&Method::POST, "/relation"),
+            rest_route_op(&Method::POST, "/supersede"),
+            rest_route_op(&Method::POST, "/contradictions"),
+            rest_route_op(&Method::POST, "/duplicates/find"),
+            rest_route_op(&Method::POST, "/duplicates/merge"),
+            rest_route_op(&Method::POST, "/backfill/summaries"),
+            rest_route_op(&Method::GET, "/memories/x"),
+            rest_route_op(&Method::PATCH, "/memories/x"),
+        ];
+        for op in rest_ops {
+            assert!(
+                ALL_OPS.iter().any(|(name, _)| *name == op),
+                "ALL_OPS is missing '{op}' — the auth-config view under-reports"
+            );
+        }
+        // And both allowlists must be subsets of ALL_OPS.
+        for op in OIDC_ALLOWLIST.iter().chain(READONLY_ALLOWLIST) {
+            assert!(
+                ALL_OPS.iter().any(|(name, _)| name == op),
+                "ALL_OPS is missing allowlisted op '{op}'"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_config_route_is_static_only_by_default_deny() {
+        // GET /auth/config is deliberately unmapped in rest_route_op →
+        // "__mutating__" → denied for every restricted principal. The
+        // read-only bearer reads memories, not the auth configuration.
+        let op = rest_route_op(&Method::GET, "/auth/config");
+        assert!(!AuthPrincipal::Oidc.allows(op));
+        assert!(!AuthPrincipal::StaticReadOnly.allows(op));
+        assert!(AuthPrincipal::Static.allows(op));
     }
 
     #[test]

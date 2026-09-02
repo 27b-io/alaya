@@ -366,7 +366,7 @@ REST endpoints use HTTP status codes plus a JSON body:
 |:--|:--|
 | `400` | Malformed JSON, invalid `content_hash`, missing required field. Body: `{"error": "..."}`. |
 | `401` | Missing or wrong bearer token. |
-| `403` | Authenticated but the token is read-only (the `ALAYA_READONLY_API_KEY` bearer, or a read-only OAuth scope) and the endpoint mutates. |
+| `403` | Authenticated, but the principal is not authorized for this endpoint: the `ALAYA_READONLY_API_KEY` bearer on anything but a pure read, or an OIDC bearer on a mutating route (delete / supersede / merge / relation / patch / backfill). OAuth scopes are not evaluated. |
 | `404` | Memory doesn't exist (`get_memory`, `patch_memory`). |
 | `413` | Request body over 1 MB. |
 | `429` | Rate limited (only when running behind a rate-limiting proxy). |
