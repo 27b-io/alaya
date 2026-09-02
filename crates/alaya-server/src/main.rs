@@ -1585,6 +1585,17 @@ fn main() {
             ))
             .with_state(handle);
 
+        // Read-only auth-config view (LAB-1684 AC7). Same auth middleware;
+        // GET /auth/config is unmapped in rest_route_op → static-bearer only
+        // (default-deny), and the payload carries no credential material.
+        let auth_config_route = Router::new()
+            .route("/auth/config", get(auth_config))
+            .layer(middleware::from_fn_with_state(
+                auth_state.clone(),
+                auth::require_auth,
+            ))
+            .with_state(auth_state.clone());
+
         // Health surfaces. Built before `wellknown` takes `auth_state`.
         let health_route = health_routes(checker, auth_state.clone());
 
@@ -1604,6 +1615,7 @@ fn main() {
         // answered before `require_auth`.
         let app = health_route
             .merge(wellknown)
+            .merge(auth_config_route)
             .merge(protected)
             .layer(cors_layer());
 
@@ -1705,6 +1717,14 @@ fn health_routes(checker: HealthChecker, auth_state: AuthState) -> Router {
         .route("/health", get(health))
         .with_state(checker)
         .merge(detail)
+}
+
+/// Read-only auth-config view (LAB-1684 AC7): principals, OIDC issuer /
+/// audience, and the principal × op matrix. No credential material.
+async fn auth_config(
+    axum::extract::State(auth): axum::extract::State<auth::AuthState>,
+) -> Json<Value> {
+    Json(auth::auth_config_view(&auth))
 }
 
 async fn store(

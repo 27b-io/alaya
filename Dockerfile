@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends cmake \
 
 ENV ALAYA_GIT_SHA=${GIT_SHA}
 ENV ALAYA_BUILT_AT=${BUILT_AT}
-RUN cargo build --release -p alaya-bridge -p alaya-server
+RUN cargo build --release -p alaya-bridge -p alaya-server -p ops-console
 
 FROM docker.io/library/debian:bookworm-slim
 
@@ -24,5 +24,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 COPY --from=builder /app/target/release/alaya-bridge /usr/local/bin/
 COPY --from=builder /app/target/release/alaya-server /usr/local/bin/
+COPY --from=builder /app/target/release/ops-console /usr/local/bin/
 
-EXPOSE 3000 3001
+EXPOSE 3000 3001 3002
