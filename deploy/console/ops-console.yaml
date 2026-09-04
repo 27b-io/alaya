@@ -38,10 +38,10 @@
 # Credentials: Secret ops-console-env from lab ops-console-externalsecret.yaml
 # (1Password item `ops-console` + alaya-config/credential).
 #
-# Tailnet HTTPS: tailscale VIP service svc:ops-console on the lab node,
+# Tailnet HTTPS: tailscale VIP service svc:ops on the lab node,
 # 443 → this Service:3002, mirroring svc:alaya. ORDER MATTERS (Ray, LAB-2712):
 # define the service in the Tailscale admin console FIRST, then on the host:
-#   tailscale serve --bg --service svc:ops-console --https 443 http://ops-console.mcp.svc.cluster.local:3002
+#   tailscale serve --bg --service svc:ops --https 443 http://ops-console.mcp.svc.cluster.local:3002
 # CLI-first prints "approval from an admin is required" and exits 0, but the
 # service never appears in the console for approval — a silent dead end.
 # `serve --service`, never plain `serve` (lab docs/lab-node.md).
@@ -86,7 +86,7 @@ spec:
             # {CONSOLE_PUBLIC_URL}/auth/callback and must match the client
             # registration on the IdP exactly.
             - name: CONSOLE_PUBLIC_URL
-              value: "https://ops-console.lobster-python.ts.net"
+              value: "https://ops.lobster-python.ts.net"
             - name: CONSOLE_OIDC_ISSUER
               value: "https://id.27b.io"
             - name: RUST_LOG
