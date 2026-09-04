@@ -83,9 +83,10 @@ item `ops-console` (fields `oidc-client-id`, `oidc-client-secret`,
 `alaya-config/credential`, rendered by ESO into Secret `ops-console-env`.
 Editing the Secret rolls the pod (Reloader annotation).
 
-Tailnet HTTPS: `tailscale serve --bg --service svc:ops-console --https 443
-http://ops-console.mcp.svc.cluster.local:3002` on the lab node, then approve
-the host in the Tailscale admin console (no DNS record until approved).
+Tailnet HTTPS — order matters: define `svc:ops-console` in the Tailscale admin
+console **first**, then on the lab node run `tailscale serve --bg --service
+svc:ops-console --https 443 http://ops-console.mcp.svc.cluster.local:3002`.
+CLI-first exits 0 but the service never appears in the console for approval.
 
 Post-rollout egress check (the image has `curl`, not `nc`; k3s netpol rejects,
 so expect "Connection refused" on the first two and `alaya=200`):

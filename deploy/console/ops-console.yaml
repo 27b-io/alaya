@@ -39,9 +39,12 @@
 # (1Password item `ops-console` + alaya-config/credential).
 #
 # Tailnet HTTPS: tailscale VIP service svc:ops-console on the lab node,
-# 443 → this Service:3002, mirroring svc:alaya. Registered on the host per
-# lab docs/lab-node.md (`serve --service`, never plain `serve`); the control
-# plane must approve the host before the DNS record exists.
+# 443 → this Service:3002, mirroring svc:alaya. ORDER MATTERS (Ray, LAB-2712):
+# define the service in the Tailscale admin console FIRST, then on the host:
+#   tailscale serve --bg --service svc:ops-console --https 443 http://ops-console.mcp.svc.cluster.local:3002
+# CLI-first prints "approval from an admin is required" and exits 0, but the
+# service never appears in the console for approval — a silent dead end.
+# `serve --service`, never plain `serve` (lab docs/lab-node.md).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
