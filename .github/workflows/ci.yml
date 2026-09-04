@@ -47,7 +47,10 @@ jobs:
   build-image:
     needs: [check, audit]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: lab
+    # Hosted, not `lab` (LAB-1302): alaya is public, and the private-only runner
+    # group that protects the lab pool cannot admit a public repo. Public-repo
+    # minutes are free; the registry buildcache below keeps rebuilds tolerable.
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
