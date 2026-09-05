@@ -297,6 +297,18 @@ impl MemoryService {
 
         let now = (self.clock)();
         let content_hash = generate_content_hash(&params.content);
+
+        // A read-only principal's store is additive only. Re-storing content
+        // that already exists would replace the record's caller-owned fields
+        // (tags, metadata, summary, memory_type) — the effect of patch /
+        // supersede, which read-only is denied — so refuse before spending an
+        // embedding call. Fails closed on a lookup error.
+        if read_only && self.vectors.get_by_hash(&content_hash).await?.is_some() {
+            return Err(AlayaError::Validation(format!(
+                "memory {content_hash} already exists; read-only principals may only add new memories"
+            )));
+        }
+
         let tags = params.tags.unwrap_or_default();
         let memory_type = params.memory_type.unwrap_or_else(|| "note".into());
 
@@ -3347,6 +3359,50 @@ mod tests {
         assert_eq!(m.access_count, 7, "access_count must survive re-store");
         assert_eq!(m.access_timestamps, vec![first_now + 1.0, first_now + 2.0]);
         assert_eq!(m.updated_at, first_now + 3600.0, "updated_at moves to now");
+    }
+
+    /// A read-only principal may add memories but never reshape an existing
+    /// record by re-storing its content (panel finding on alaya#86).
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_only_restore_of_existing_content_is_refused() {
+        let stored = Rc::new(RefCell::new(HashMap::new()));
+        let svc = MemoryService::with_clock(
+            Box::new(MockVectorsPersisting {
+                stored: stored.clone(),
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            mock_clock,
+        );
+        let params = |tag: &str| StoreParams {
+            content: "shared fact".into(),
+            tags: Some(vec![tag.into()]),
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: None,
+        };
+
+        let first = svc
+            .store_memory_with(params("original"), true)
+            .await
+            .expect("read-only may add a new memory");
+        assert_eq!(first.get("created"), Some(&serde_json::json!(true)));
+        let hash = first["content_hash"].as_str().unwrap().to_string();
+
+        let err = svc
+            .store_memory_with(params("hijack"), true)
+            .await
+            .expect_err("read-only re-store of existing content must be refused");
+        assert!(matches!(err, AlayaError::Validation(_)), "got {err:?}");
+        assert_eq!(
+            stored.borrow()[&hash].tags,
+            vec!["original".to_string()],
+            "nothing on the existing record may be rewritten"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
