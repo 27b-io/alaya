@@ -8,7 +8,7 @@ pub mod handlers;
 pub mod resp;
 pub mod routes;
 
-pub mod auth;
+mod auth;
 pub mod queue;
 
 pub use auth::BridgeAuth;

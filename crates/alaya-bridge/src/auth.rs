@@ -46,7 +46,7 @@ impl BridgeAuth {
     }
 
     /// Fail-closed startup invariant: no key and no opt-in is an error.
-    pub fn resolve(key: &str, allow_unauthenticated: bool) -> Result<Self, &'static str> {
+    fn resolve(key: &str, allow_unauthenticated: bool) -> Result<Self, &'static str> {
         if !key.is_empty() {
             if allow_unauthenticated {
                 tracing::warn!("DANGEROUSLY_ALLOW_UNAUTHENTICATED ignored — auth is configured");
@@ -85,10 +85,10 @@ pub async fn require_bearer(
         .and_then(|v| v.strip_prefix("Bearer "));
 
     if auth.permits(token) {
-        Ok(next.run(req).await)
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
+        return Ok(next.run(req).await);
     }
+    tracing::warn!(path = %req.uri().path(), "bearer rejected");
+    Err(StatusCode::UNAUTHORIZED)
 }
 
 #[cfg(test)]
@@ -113,20 +113,12 @@ mod tests {
             .status()
     }
 
-    // (a) empty key, no opt-in: startup error naming both remedies.
+    // Empty key, no opt-in: startup error naming both remedies.
     #[test]
     fn empty_key_without_opt_in_is_startup_error() {
         let err = BridgeAuth::resolve("", false).unwrap_err();
         assert!(err.contains("GRAPH_API_KEY"), "{err}");
         assert!(err.contains("DANGEROUSLY_ALLOW_UNAUTHENTICATED"), "{err}");
-    }
-
-    #[test]
-    fn empty_key_with_opt_in_is_open() {
-        assert!(matches!(
-            BridgeAuth::resolve("", true),
-            Ok(BridgeAuth::Open)
-        ));
     }
 
     #[test]
@@ -137,13 +129,14 @@ mod tests {
         ));
     }
 
-    // (b) empty key, opt-in: requests pass with no bearer at all.
+    // Empty key, opt-in: requests pass with no bearer at all.
     #[tokio::test]
     async fn open_mode_passes_without_bearer() {
-        assert_eq!(status(BridgeAuth::Open, None).await, StatusCode::OK);
+        let auth = BridgeAuth::resolve("", true).unwrap();
+        assert_eq!(status(auth, None).await, StatusCode::OK);
     }
 
-    // (c) key set: missing or wrong bearer is 401, exact bearer is 200.
+    // Key set: missing or wrong bearer is 401, exact bearer is 200.
     #[tokio::test]
     async fn bearer_mode_rejects_missing_and_wrong_accepts_exact() {
         let auth = BridgeAuth::resolve("s3cret", false).unwrap();
