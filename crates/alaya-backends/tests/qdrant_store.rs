@@ -9,6 +9,7 @@
 use alaya_backends::{VectorStorage, qdrant::QdrantClient};
 use alaya_types::memory::{Memory, PatchMemoryRequest};
 use serde_json::{Value, json};
+use std::time::Duration;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -406,5 +407,131 @@ async fn patch_keeps_embedding_when_summary_unchanged_or_replaced() {
     assert!(
         requests.iter().all(|r| r.url.path() != PAYLOAD_DELETE_PATH),
         "no delete for an unchanged summary or a replaced embedding"
+    );
+}
+
+/// Writes to the payload endpoints, in arrival order, as (path, body).
+async fn payload_writes(server: &MockServer) -> Vec<(String, Value)> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() != POINTS_PATH)
+        .map(|r| {
+            (
+                r.url.path().to_string(),
+                serde_json::from_slice(&r.body).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Stage the race Helly R found: a summary-only patch (A→B) is mid-flight,
+/// parked on its `summary_embedding` delete, when an enrichment-style patch
+/// (A + vector(A)) arrives from another task. Unserialised, the second patch
+/// lands between the first one's delete and set and the record ends up as
+/// summary B + vector(A). The client's write lock forces the second patch to
+/// wait, so the delete and its set stay adjacent and the last complete
+/// writer wins whole. The delete delay only matters for the unlocked mutant;
+/// with the lock the order is forced regardless of timing.
+async fn race_server() -> MockServer {
+    let server = MockServer::start().await;
+    mount_retrieve(&server, vec![point_with_summary("summary A")]).await;
+    Mock::given(method("POST"))
+        .and(path(PAYLOAD_DELETE_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"status": "ok", "result": {"status": "completed"}}))
+                .set_delay(Duration::from_millis(400)),
+        )
+        .mount(&server)
+        .await;
+    mount_ok(&server, PAYLOAD_PATH).await;
+    mount_upsert_ok(&server).await;
+    server
+}
+
+#[tokio::test]
+async fn concurrent_patch_cannot_land_inside_another_patch_invalidation() {
+    let server = race_server().await;
+    let client = client_for(&server);
+    let hash = "a".repeat(64);
+
+    let to_b = PatchMemoryRequest {
+        summary: Some("summary B".into()),
+        ..Default::default()
+    };
+    let user_patch = client.patch_memory(&hash, &to_b);
+    let enrichment = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client
+            .patch_memory(
+                &hash,
+                &PatchMemoryRequest {
+                    summary: Some("summary A".into()),
+                    summary_embedding: Some(vec![0.5, 0.75]),
+                    ..Default::default()
+                },
+            )
+            .await
+    };
+    let (a, b) = tokio::join!(user_patch, enrichment);
+    a.expect("user patch succeeds");
+    b.expect("enrichment patch succeeds");
+
+    let writes = payload_writes(&server).await;
+    let paths: Vec<&str> = writes.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec![PAYLOAD_DELETE_PATH, PAYLOAD_PATH, PAYLOAD_PATH],
+        "the set that completes the invalidation must directly follow its delete"
+    );
+    assert_eq!(writes[1].1["payload"]["summary"], json!("summary B"));
+    assert!(writes[1].1["payload"].get("summary_embedding").is_none());
+    assert_eq!(
+        writes[2].1["payload"]["summary_embedding"],
+        json!([0.5, 0.75])
+    );
+}
+
+/// Same window, different second writer: a re-store that has already
+/// retrieved the point with vector(A) would otherwise PUT that vector back
+/// between the patch's delete and set.
+#[tokio::test]
+async fn concurrent_store_cannot_land_inside_a_patch_invalidation() {
+    let server = race_server().await;
+    let client = client_for(&server);
+    let hash = "a".repeat(64);
+
+    let to_b = PatchMemoryRequest {
+        summary: Some("summary B".into()),
+        ..Default::default()
+    };
+    let user_patch = client.patch_memory(&hash, &to_b);
+    let restore = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut same_summary = incoming();
+        same_summary.summary = Some("summary A".into());
+        client.store(&same_summary).await
+    };
+    let (a, b) = tokio::join!(user_patch, restore);
+    a.expect("user patch succeeds");
+    b.expect("store succeeds");
+
+    let requests = server.received_requests().await.unwrap();
+    let order: Vec<String> = requests
+        .iter()
+        .filter(|r| r.url.path() != POINTS_PATH || r.method == "PUT")
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            format!("POST {PAYLOAD_DELETE_PATH}"),
+            format!("POST {PAYLOAD_PATH}"),
+            format!("PUT {POINTS_PATH}"),
+        ],
+        "the store's PUT must not fall between the patch's delete and set"
     );
 }

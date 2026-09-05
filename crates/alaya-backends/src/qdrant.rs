@@ -27,6 +27,14 @@ pub struct QdrantClient {
     base_url: String,
     collection: String,
     tag_collection: String,
+    /// Serialises the multi-request write sections (`store`: retrieve→PUT;
+    /// `patch_memory`: read→delete→set). The service is single-threaded but
+    /// cooperative: enrichment runs in spawned tasks that call `patch_memory`
+    /// directly, so without this a task yielding between two Qdrant requests
+    /// lets another writer re-insert a summary vector that is being
+    /// invalidated, leaving `summary` and `summary_embedding` mismatched
+    /// (alaya#86). Reads never take it.
+    write_lock: futures::lock::Mutex<()>,
 }
 
 impl QdrantClient {
@@ -55,6 +63,7 @@ impl QdrantClient {
             base_url,
             collection,
             tag_collection,
+            write_lock: futures::lock::Mutex::new(()),
         }
     }
 
@@ -443,6 +452,10 @@ impl VectorStorage for QdrantClient {
             .as_ref()
             .ok_or_else(|| AlayaError::Validation("memory has no embedding".into()))?;
 
+        // Held through the PUT so no `patch_memory` can land between the
+        // retrieve and the write (see `write_lock`).
+        let _write = self.write_lock.lock().await;
+
         // Qdrant upsert replaces the payload wholesale and the point id is
         // derived from content_hash, so the existing point's server-maintained
         // fields must be carried over or a re-store silently zeroes them
@@ -639,6 +652,11 @@ impl VectorStorage for QdrantClient {
         }
 
         let point_id = hash_to_uuid(content_hash)?;
+
+        // Held through the final read-back so the read→delete→set sequence
+        // below cannot interleave with another `patch_memory` or a `store`
+        // (see `write_lock`).
+        let _write = self.write_lock.lock().await;
 
         // Verify the memory exists before any writes. Also needed for metadata merge.
         let existing = self

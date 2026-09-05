@@ -34,7 +34,9 @@ pub trait VectorStorage {
     /// or silently drops derived retrieval state (alaya#86). Every other
     /// payload field is written from `memory` as given and fields absent on
     /// `memory` are removed; `updated_at` is therefore whatever the caller
-    /// set.
+    /// set. The retrieve→write section MUST be mutually exclusive with
+    /// `patch_memory` on the same client, so a concurrent in-process writer
+    /// cannot re-insert a vector another writer is invalidating.
     async fn store(&self, memory: &Memory) -> Result<(bool, String)>;
     /// Whether a point with this `content_hash` exists, judged exactly as
     /// `store` judges it: raw point presence, not whether the payload still
@@ -73,8 +75,10 @@ pub trait VectorStorage {
     /// `summary_embedding` is derived from `summary`: a patch that changes
     /// `summary` without supplying `summary_embedding` MUST remove the stored
     /// embedding, so the pair is never stale and `store`'s carry-over rule
-    /// (keep the embedding while the summary is unchanged) stays sound
-    /// (alaya#86).
+    /// (keep the embedding while the summary is unchanged) stays sound. The
+    /// read→invalidate→write sequence MUST be mutually exclusive with other
+    /// `patch_memory` and `store` calls on the same client; crash-safety
+    /// (invalidate first) is not concurrency-safety (alaya#86).
     async fn patch_memory(&self, content_hash: &str, patch: &PatchMemoryRequest) -> Result<Memory>;
 
     // Vector search
