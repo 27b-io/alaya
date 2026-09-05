@@ -76,6 +76,24 @@ impl QdrantClient {
         Ok(())
     }
 
+    /// Remove payload keys from one point (a set-payload merge cannot unset).
+    async fn delete_payload_keys(&self, point_id: &str, keys: &[&str]) -> Result<()> {
+        let resp = self
+            .client
+            .post(format!(
+                "{}/collections/{}/points/payload/delete?wait=true",
+                self.base_url, self.collection
+            ))
+            .json(&json!({ "keys": keys, "points": [point_id] }))
+            .send()
+            .await
+            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(qdrant_error(resp).await);
+        }
+        Ok(())
+    }
+
     /// Ensure the memory collections exist, creating any that are absent with
     /// the configured vector size and Cosine distance. Idempotent — an existing
     /// collection is left untouched (never recreated, so no data is dropped).
@@ -662,6 +680,20 @@ impl VectorStorage for QdrantClient {
             .unwrap_or_default()
             .as_secs_f64();
         payload.insert("updated_at".into(), json!(now));
+
+        // summary_embedding is derived from the summary text. A patch that
+        // changes the text without a replacement vector must remove the old
+        // one, or the record carries an embedding of text it no longer holds
+        // and every later re-store faithfully preserves that stale pair (see
+        // `store`). Delete FIRST: if the process dies between the two writes
+        // the record is un-enriched but consistent, never stale.
+        if let Some(new_summary) = &patch.summary
+            && patch.summary_embedding.is_none()
+            && existing.summary.as_deref() != Some(new_summary.as_str())
+        {
+            self.delete_payload_keys(&point_id, &["summary_embedding"])
+                .await?;
+        }
 
         let body = json!({
             "payload": payload,

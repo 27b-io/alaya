@@ -69,6 +69,12 @@ pub trait VectorStorage {
     /// Updates only the provided fields, sets `updated_at`, and returns the
     /// full updated memory. Metadata merge: incoming keys are merged into
     /// existing metadata; keys with JSON `null` values are deleted.
+    ///
+    /// `summary_embedding` is derived from `summary`: a patch that changes
+    /// `summary` without supplying `summary_embedding` MUST remove the stored
+    /// embedding, so the pair is never stale and `store`'s carry-over rule
+    /// (keep the embedding while the summary is unchanged) stays sound
+    /// (alaya#86).
     async fn patch_memory(&self, content_hash: &str, patch: &PatchMemoryRequest) -> Result<Memory>;
 
     // Vector search
