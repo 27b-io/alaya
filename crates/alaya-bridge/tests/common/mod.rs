@@ -89,6 +89,8 @@ pub fn build_state(
     alaya_bridge::AppState {
         redis: conn.clone(),
         graph_name: graph_name.to_string(),
+        // Tests call `exec_query` directly; the auth layer is not on this path.
+        auth: alaya_bridge::BridgeAuth::Open,
     }
 }
 

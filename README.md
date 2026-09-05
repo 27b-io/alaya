@@ -144,7 +144,7 @@ Copy `.env.example` to `.env`. All settings have sensible defaults for local dev
 | `EMBEDDING_MODEL` | `Snowflake/snowflake-arctic-embed-l-v2.0` | Model name |
 | `EMBEDDING_DIMENSIONS` | `1024` | Vector dimensionality |
 | `GRAPH_URL` | — (required) | Bridge endpoint |
-| `GRAPH_API_KEY` | — | Bridge auth token |
+| `GRAPH_API_KEY` | — | Bridge auth token. Empty → bridge won't boot unless `DANGEROUSLY_ALLOW_UNAUTHENTICATED=true` (dev only) |
 | `ALAYA_API_KEY` | — | Server auth token. Empty → server won't boot unless `DANGEROUSLY_ALLOW_UNAUTHENTICATED=true` (localhost dev only) |
 | `LISTEN_ADDR` | `0.0.0.0:3001` | Server bind address |
 | `REDIS_CACHE_URL` | — | L2 embedding cache (optional) |

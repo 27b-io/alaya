@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use alaya_bridge::AppState;
+use alaya_bridge::{AppState, BridgeAuth};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -9,6 +9,9 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
+
+    // Fail-closed: refuse to start with no auth unless the dev flag is set.
+    let auth = BridgeAuth::from_env().unwrap_or_else(|e| panic!("{e}"));
 
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
     let graph_name = std::env::var("GRAPH_NAME").unwrap_or_else(|_| "memory_graph".into());
@@ -18,7 +21,11 @@ async fn main() {
         .await
         .expect("Failed to connect to Redis");
 
-    let state = Arc::new(AppState { redis, graph_name });
+    let state = Arc::new(AppState {
+        redis,
+        graph_name,
+        auth,
+    });
 
     // BRPOP is a blocking command that starves a multiplexed ConnectionManager.
     // Give the consumer its own dedicated connection so it doesn't block query handlers.

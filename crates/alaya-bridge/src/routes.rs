@@ -47,7 +47,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/consolidation/orphans",
             post(handlers::consolidation::orphans),
         )
-        .layer(middleware::from_fn(auth::require_bearer));
+        .layer(middleware::from_fn_with_state(
+            state.auth.clone(),
+            auth::require_bearer,
+        ));
 
     // /health is unauthenticated — merge after auth layer
     Router::new()

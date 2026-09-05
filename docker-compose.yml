@@ -104,6 +104,11 @@ services:
       REDIS_URL: redis://falkordb:6379
       GRAPH_NAME: ${GRAPH_NAME:-memory_graph}
       GRAPH_API_KEY: ${GRAPH_API_KEY:-}
+      # The bridge is FAIL-CLOSED like the server: it refuses to boot with an
+      # empty GRAPH_API_KEY unless this opt-in is set. Local dev only. Set
+      # GRAPH_API_KEY above to a real token to enable auth (which auto-disables
+      # this flag; the server block passes the same key).
+      DANGEROUSLY_ALLOW_UNAUTHENTICATED: ${DANGEROUSLY_ALLOW_UNAUTHENTICATED:-true}
       RUST_LOG: ${RUST_LOG_BRIDGE:-alaya_bridge=info}
     depends_on:
       falkordb:

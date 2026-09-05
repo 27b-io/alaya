@@ -13,6 +13,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 sha2 = "0.10"
+# Constant-time bearer compare (server + bridge auth)
+subtle = "2"
 
 # WASM-compat deps (backends + core)
 async-trait = "0.1"
