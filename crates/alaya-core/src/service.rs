@@ -384,8 +384,20 @@ impl MemoryService {
             summary_embedding: None,
         };
 
-        // Store in vector DB
+        // Store in vector DB. `created == false` means a point with this
+        // content_hash already existed: the backend carried its created_at,
+        // access history and supersession marker over (see
+        // VectorStorage::store), while the caller-supplied fields above — and
+        // provenance — replaced the stored ones. Who owns provenance when two
+        // callers store the same content is LAB-1084's decision; today's
+        // replace semantics stand until then.
         let (created, _) = self.vectors.store(&memory).await?;
+        if !created {
+            tracing::info!(
+                hash = %content_hash,
+                "re-store of existing memory: payload replaced, access history preserved"
+            );
+        }
 
         // The memory itself was stored unconditionally above, so its tags are
         // now in Qdrant. Always invalidate the in-process tag cache so the
@@ -3185,6 +3197,156 @@ mod tests {
             Some(&serde_json::json!(live_hash)),
             "duplicate must be reported against the LIVE memory, not the superseded one"
         );
+    }
+
+    /// In-memory VectorStorage honouring the `store` contract: an existing
+    /// point keeps its server-maintained history and reports `created=false`.
+    struct MockVectorsPersisting {
+        stored: Rc<RefCell<HashMap<String, Memory>>>,
+    }
+
+    #[async_trait(?Send)]
+    impl VectorStorage for MockVectorsPersisting {
+        async fn store(&self, m: &Memory) -> Result<(bool, String)> {
+            let mut stored = self.stored.borrow_mut();
+            let mut next = m.clone();
+            let created = match stored.get(&m.content_hash) {
+                Some(prev) => {
+                    next.created_at = prev.created_at;
+                    next.access_count = prev.access_count;
+                    next.access_timestamps = prev.access_timestamps.clone();
+                    false
+                }
+                None => true,
+            };
+            stored.insert(m.content_hash.clone(), next);
+            Ok((created, m.content_hash.clone()))
+        }
+        async fn get_by_hash(&self, h: &str) -> Result<Option<Memory>> {
+            Ok(self.stored.borrow().get(h).cloned())
+        }
+        async fn get_batch(&self, _h: &[&str]) -> Result<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn delete(&self, _h: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn update_metadata(&self, _h: &str, _u: MetadataUpdate) -> Result<()> {
+            Ok(())
+        }
+        async fn patch_memory(&self, _h: &str, _p: &PatchMemoryRequest) -> Result<Memory> {
+            Ok(dummy_memory())
+        }
+        async fn search_by_vector(
+            &self,
+            _e: &[f32],
+            _l: usize,
+            _f: Option<PayloadFilter>,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(vec![])
+        }
+        async fn search_by_tags(
+            &self,
+            _t: &[&str],
+            _m: bool,
+            _l: usize,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(vec![])
+        }
+        async fn search_similar_tags(&self, _e: &[f32], _l: usize) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
+            Ok(())
+        }
+        async fn get_all(&self, _l: usize, _o: Option<&str>) -> Result<ScrollResult> {
+            Ok(ScrollResult {
+                memories: vec![],
+                next_offset: None,
+            })
+        }
+        async fn get_recent(
+            &self,
+            _l: usize,
+            _s: Option<f64>,
+            _t: Option<&str>,
+        ) -> Result<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn count(&self) -> Result<usize> {
+            Ok(self.stored.borrow().len())
+        }
+        async fn get_all_tags(&self) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn increment_access_count(&self, _h: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            Ok(HealthStatus {
+                status: "ok".into(),
+                backend: "mock".into(),
+                details: None,
+            })
+        }
+    }
+
+    /// alaya#86: a second `store_memory` of identical content, with no
+    /// `dedup_threshold`, must report `created: false` / "Memory updated" and
+    /// leave the record's server-maintained history intact.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restore_of_existing_content_preserves_history_and_reports_updated() {
+        let stored = Rc::new(RefCell::new(HashMap::new()));
+        let svc = MemoryService::with_clock(
+            Box::new(MockVectorsPersisting {
+                stored: stored.clone(),
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            mock_clock,
+        );
+        let params = || StoreParams {
+            content: "the same fact, stored twice".into(),
+            tags: None,
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: None,
+        };
+
+        let first_now = mock_clock();
+        let first = svc.store_memory(params()).await.expect("first store");
+        assert_eq!(first.get("created"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            first.get("message"),
+            Some(&serde_json::json!("Memory stored successfully"))
+        );
+        let hash = first["content_hash"].as_str().unwrap().to_string();
+
+        // Searches accrue access history on the record between the two stores.
+        {
+            let mut s = stored.borrow_mut();
+            let m = s.get_mut(&hash).unwrap();
+            m.access_count = 7;
+            m.access_timestamps = vec![first_now + 1.0, first_now + 2.0];
+        }
+        advance_clock(3600.0);
+
+        let second = svc.store_memory(params()).await.expect("second store");
+        assert_eq!(second.get("created"), Some(&serde_json::json!(false)));
+        assert_eq!(
+            second.get("message"),
+            Some(&serde_json::json!("Memory updated"))
+        );
+
+        let m = stored.borrow().get(&hash).cloned().unwrap();
+        assert_eq!(m.created_at, first_now, "created_at must survive re-store");
+        assert_eq!(m.access_count, 7, "access_count must survive re-store");
+        assert_eq!(m.access_timestamps, vec![first_now + 1.0, first_now + 2.0]);
+        assert_eq!(m.updated_at, first_now + 3600.0, "updated_at moves to now");
     }
 
     #[tokio::test(flavor = "current_thread")]

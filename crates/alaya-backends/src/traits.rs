@@ -20,6 +20,19 @@ use alaya_types::{
 #[async_trait(?Send)]
 pub trait VectorStorage {
     // Core CRUD
+
+    /// Upsert a memory keyed by `content_hash`.
+    ///
+    /// Returns `(created, content_hash)`. `created` is `false` when a point
+    /// with the same `content_hash` already existed, whether or not its
+    /// stored payload still parses as a `Memory`. On that path the
+    /// implementation MUST carry the existing point's server-maintained
+    /// fields over the caller's values — `created_at`, `access_count`,
+    /// `access_timestamps`, `supersession_reason`, and
+    /// `metadata.superseded_by` — so a re-store never zeroes ranking inputs
+    /// or resurrects a superseded memory (alaya#86). Every other payload
+    /// field is written from `memory` as given and fields absent on `memory`
+    /// are removed; `updated_at` is therefore whatever the caller set.
     async fn store(&self, memory: &Memory) -> Result<(bool, String)>;
     async fn get_by_hash(&self, content_hash: &str) -> Result<Option<Memory>>;
     async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>>;

@@ -380,47 +380,9 @@ async fn qdrant_error(resp: reqwest::Response) -> AlayaError {
     AlayaError::Storage(format!("Qdrant {status}: {body}"))
 }
 
-// ─── VectorStorage ──────────────────────────────────────────────────────────
-
-#[async_trait(?Send)]
-impl VectorStorage for QdrantClient {
-    #[tracing::instrument(skip(self, memory), fields(hash = %memory.content_hash))]
-    async fn store(&self, memory: &Memory) -> Result<(bool, String)> {
-        let point_id = hash_to_uuid(&memory.content_hash)?;
-        let embedding = memory
-            .embedding
-            .as_ref()
-            .ok_or_else(|| AlayaError::Validation("memory has no embedding".into()))?;
-
-        let body = json!({
-            "points": [{
-                "id": point_id,
-                "vector": embedding,
-                "payload": memory_to_payload(memory),
-            }]
-        });
-
-        let resp = self
-            .client
-            .put(format!(
-                "{}/collections/{}/points?wait=true",
-                self.base_url, self.collection
-            ))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(qdrant_error(resp).await);
-        }
-
-        Ok((true, memory.content_hash.clone()))
-    }
-
-    async fn get_by_hash(&self, content_hash: &str) -> Result<Option<Memory>> {
-        let point_id = hash_to_uuid(content_hash)?;
-
+impl QdrantClient {
+    /// Retrieve one raw point (payload, no vector) by id; `None` when absent.
+    async fn retrieve_point(&self, point_id: &str) -> Result<Option<Value>> {
         let body = json!({
             "ids": [point_id],
             "with_payload": true,
@@ -447,12 +409,84 @@ impl VectorStorage for QdrantClient {
             .await
             .map_err(|e| AlayaError::Storage(e.to_string()))?;
 
-        let points = data.result.unwrap_or_default();
-        if points.is_empty() {
-            return Ok(None);
+        Ok(data.result.unwrap_or_default().into_iter().next())
+    }
+}
+
+// ─── VectorStorage ──────────────────────────────────────────────────────────
+
+#[async_trait(?Send)]
+impl VectorStorage for QdrantClient {
+    #[tracing::instrument(skip(self, memory), fields(hash = %memory.content_hash))]
+    async fn store(&self, memory: &Memory) -> Result<(bool, String)> {
+        let point_id = hash_to_uuid(&memory.content_hash)?;
+        let embedding = memory
+            .embedding
+            .as_ref()
+            .ok_or_else(|| AlayaError::Validation("memory has no embedding".into()))?;
+
+        // Qdrant upsert replaces the payload wholesale and the point id is
+        // derived from content_hash, so the existing point's server-maintained
+        // fields must be carried over or a re-store silently zeroes them
+        // (alaya#86). Existence is judged on the raw point: a payload that no
+        // longer parses as a Memory still exists and must not be blindly
+        // overwritten. Fail closed: an existence-check error propagates rather
+        // than falling through to a blind upsert.
+        let existing = self.retrieve_point(&point_id).await?;
+        let mut payload = memory_to_payload(memory);
+        if let Some(prev) = existing.as_ref().and_then(|p| p.get("payload")) {
+            for key in [
+                "created_at",
+                "access_count",
+                "access_timestamps",
+                "supersession_reason",
+            ] {
+                if let Some(v) = prev.get(key) {
+                    payload[key] = v.clone();
+                }
+            }
+            // The supersession marker is written by mark_superseded, never by
+            // a store caller, so it is server-maintained too: a re-store must
+            // not resurrect a superseded memory (alaya-core's is_superseded
+            // reads exactly this key).
+            if let Some(sb) = prev.pointer("/metadata/superseded_by") {
+                payload["metadata"]["superseded_by"] = sb.clone();
+            }
         }
 
-        Ok(point_to_memory(&points[0]))
+        let body = json!({
+            "points": [{
+                "id": point_id,
+                "vector": embedding,
+                "payload": payload,
+            }]
+        });
+
+        let resp = self
+            .client
+            .put(format!(
+                "{}/collections/{}/points?wait=true",
+                self.base_url, self.collection
+            ))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(qdrant_error(resp).await);
+        }
+
+        Ok((existing.is_none(), memory.content_hash.clone()))
+    }
+
+    async fn get_by_hash(&self, content_hash: &str) -> Result<Option<Memory>> {
+        let point_id = hash_to_uuid(content_hash)?;
+        Ok(self
+            .retrieve_point(&point_id)
+            .await?
+            .as_ref()
+            .and_then(point_to_memory))
     }
 
     async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>> {
