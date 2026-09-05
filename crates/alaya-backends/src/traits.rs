@@ -28,12 +28,20 @@ pub trait VectorStorage {
     /// stored payload still parses as a `Memory`. On that path the
     /// implementation MUST carry the existing point's server-maintained
     /// fields over the caller's values — `created_at`, `access_count`,
-    /// `access_timestamps`, `supersession_reason`, and
-    /// `metadata.superseded_by` — so a re-store never zeroes ranking inputs
-    /// or resurrects a superseded memory (alaya#86). Every other payload
-    /// field is written from `memory` as given and fields absent on `memory`
-    /// are removed; `updated_at` is therefore whatever the caller set.
+    /// `access_timestamps`, `supersession_reason`, `metadata.superseded_by`,
+    /// and `summary_embedding` for as long as `summary` is unchanged — so a
+    /// re-store never zeroes ranking inputs, resurrects a superseded memory,
+    /// or silently drops derived retrieval state (alaya#86). Every other
+    /// payload field is written from `memory` as given and fields absent on
+    /// `memory` are removed; `updated_at` is therefore whatever the caller
+    /// set.
     async fn store(&self, memory: &Memory) -> Result<(bool, String)>;
+    /// Whether a point with this `content_hash` exists, judged exactly as
+    /// `store` judges it: raw point presence, not whether the payload still
+    /// parses as a `Memory`. Authorization (read-only principals may only
+    /// add) relies on this agreeing with `store`'s `created` result, so an
+    /// implementation MUST answer from the same source `store` reads.
+    async fn exists(&self, content_hash: &str) -> Result<bool>;
     async fn get_by_hash(&self, content_hash: &str) -> Result<Option<Memory>>;
     async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>>;
     async fn delete(&self, content_hash: &str) -> Result<bool>;

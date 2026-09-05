@@ -208,3 +208,81 @@ async fn store_treats_unparseable_existing_point_as_existing() {
     );
     assert_eq!(upsert_payload(&server).await["created_at"], json!(1000.0));
 }
+
+/// `exists` must answer from the same raw-point source `store` reads, so the
+/// read-only guard in alaya-core can never disagree with the write.
+#[tokio::test]
+async fn exists_judges_raw_presence_not_parseability() {
+    let present = MockServer::start().await;
+    mount_retrieve(
+        &present,
+        vec![json!({
+            "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "payload": { "created_at": 1000.0 }
+        })],
+    )
+    .await;
+    assert!(
+        client_for(&present).exists(&"a".repeat(64)).await.unwrap(),
+        "an unparseable point still exists"
+    );
+
+    let absent = MockServer::start().await;
+    mount_retrieve(&absent, vec![]).await;
+    assert!(!client_for(&absent).exists(&"a".repeat(64)).await.unwrap());
+}
+
+/// `summary_embedding` is derived from the summary text server-side. It must
+/// survive a re-store that keeps the summary unchanged (no enrichment re-runs
+/// when the caller supplies a summary) and must NOT survive when the summary
+/// changes or is removed, so no stale vector describes the wrong summary.
+#[tokio::test]
+async fn store_keeps_summary_embedding_only_while_summary_unchanged() {
+    // Unchanged: existing summary == incoming "new summary" → embedding kept.
+    let same = MockServer::start().await;
+    let mut point = existing_point();
+    point["payload"]["summary"] = json!("new summary");
+    point["payload"]["summary_embedding"] = json!([0.5, 0.6]);
+    mount_retrieve(&same, vec![point.clone()]).await;
+    mount_upsert_ok(&same).await;
+    client_for(&same)
+        .store(&incoming())
+        .await
+        .expect("store succeeds");
+    assert_eq!(
+        upsert_payload(&same).await["summary_embedding"],
+        json!([0.5, 0.6])
+    );
+
+    // Changed: existing summary differs from the incoming one → dropped.
+    let changed = MockServer::start().await;
+    point["payload"]["summary"] = json!("old summary");
+    mount_retrieve(&changed, vec![point.clone()]).await;
+    mount_upsert_ok(&changed).await;
+    client_for(&changed)
+        .store(&incoming())
+        .await
+        .expect("store succeeds");
+    assert!(
+        upsert_payload(&changed)
+            .await
+            .get("summary_embedding")
+            .is_none(),
+        "a changed summary must not keep the old summary's vector"
+    );
+
+    // Removed: incoming carries no summary at all → dropped.
+    let removed = MockServer::start().await;
+    point["payload"]["summary"] = json!("new summary");
+    mount_retrieve(&removed, vec![point]).await;
+    mount_upsert_ok(&removed).await;
+    let mut no_summary = incoming();
+    no_summary.summary = None;
+    client_for(&removed)
+        .store(&no_summary)
+        .await
+        .expect("store succeeds");
+    let payload = upsert_payload(&removed).await;
+    assert!(payload.get("summary").is_none());
+    assert!(payload.get("summary_embedding").is_none());
+}

@@ -452,6 +452,17 @@ impl VectorStorage for QdrantClient {
             if let Some(sb) = prev.pointer("/metadata/superseded_by") {
                 payload["metadata"]["superseded_by"] = sb.clone();
             }
+            // summary_embedding is derived server-side from the summary text.
+            // Keep it only while that text is unchanged, so a re-store neither
+            // drops it silently nor keeps a vector for a summary it no longer
+            // describes.
+            if payload.get("summary_embedding").is_none()
+                && prev.get("summary").is_some()
+                && prev.get("summary") == payload.get("summary")
+                && let Some(se) = prev.get("summary_embedding")
+            {
+                payload["summary_embedding"] = se.clone();
+            }
         }
 
         let body = json!({
@@ -487,6 +498,11 @@ impl VectorStorage for QdrantClient {
             .await?
             .as_ref()
             .and_then(point_to_memory))
+    }
+
+    async fn exists(&self, content_hash: &str) -> Result<bool> {
+        let point_id = hash_to_uuid(content_hash)?;
+        Ok(self.retrieve_point(&point_id).await?.is_some())
     }
 
     async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>> {

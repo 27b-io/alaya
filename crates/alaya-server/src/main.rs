@@ -2105,6 +2105,9 @@ mod wedge_tests {
         async fn get_by_hash(&self, _content_hash: &str) -> Result<Option<Memory>> {
             unimplemented!()
         }
+        async fn exists(&self, _content_hash: &str) -> Result<bool> {
+            unimplemented!()
+        }
         async fn get_batch(&self, _hashes: &[&str]) -> Result<Vec<Memory>> {
             unimplemented!()
         }
