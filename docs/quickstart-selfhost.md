@@ -110,7 +110,7 @@ Every knob lives in `.env`. The interesting ones:
 | Variable | Default | Notes |
 |:--|:--|:--|
 | `ALAYA_API_KEY` | empty | Bearer token clients must send. Empty is fail-closed: the server won't boot unless the dev Compose sets `DANGEROUSLY_ALLOW_UNAUTHENTICATED=true` (localhost only). **Set this for any non-local deployment.** |
-| `GRAPH_API_KEY` | empty | Bridge bearer token. Set if exposing the bridge port. |
+| `GRAPH_API_KEY` | empty | Bridge bearer token. Empty → bridge won't boot unless `DANGEROUSLY_ALLOW_UNAUTHENTICATED=true` (the dev Compose sets it). |
 | `QDRANT_COLLECTION` | `memories_arctic1024` | Name of the collection the server auto-creates at startup. |
 | `TEI_MODEL` | `Snowflake/snowflake-arctic-embed-l-v2.0` | Embedding model. Change this and you'll need a new collection with the matching dimensionality. |
 | `EMBEDDING_DIMENSIONS` | `1024` | Must match `TEI_MODEL`'s output. |

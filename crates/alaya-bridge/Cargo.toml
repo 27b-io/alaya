@@ -13,6 +13,9 @@ path = "src/main.rs"
 
 [dev-dependencies]
 anyhow = "1"
+# ServiceExt::oneshot drives a Router through the real auth layer in-process.
+# Already in the lock via axum — this pulls nothing new.
+tower = { version = "0.5", features = ["util"] }
 
 [dependencies]
 alaya-types = { path = "../alaya-types" }
@@ -25,3 +28,4 @@ thiserror = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+subtle = { workspace = true }
