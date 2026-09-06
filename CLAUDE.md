@@ -206,7 +206,7 @@ issues on `27b-io/alaya` are the public commentary surface. See `docs/agents/iss
 ### Triage labels
 
 Multica's native vocabulary — `needs-grooming` / `needs-info` / `ready-for-todo`, with
-human-vs-agent as assignee type and won't-fix as `cancelled`. See `docs/agents/triage-labels.md`.
+human-vs-agent as assignee type and `wontfix` as `cancelled`. See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 

@@ -40,7 +40,8 @@ Only open a GitHub issue instead when the item is genuinely for a public audienc
 - **List**: `multica issue list --project 2d8f6caa-d432-4cf2-ab44-1b0918ff5cfa --status <key> --output json`
 - **Search**: `multica issue search "<text>" --output json`
 - **Comment**: `multica issue comment add LAB-NNNN --body "..."`
-- **Label**: `multica issue label add LAB-NNNN <label>` / `label remove`
+- **Label**: `multica issue label add LAB-NNNN <label>` /
+  `multica issue label remove LAB-NNNN <label>`
 - **Status**: `multica issue status LAB-NNNN <key>` — keys: `backlog`, `todo`,
   `in_progress`, `in_review`, `done`, `blocked`, `cancelled`. Add `--no-start` to change
   status without launching an agent.
