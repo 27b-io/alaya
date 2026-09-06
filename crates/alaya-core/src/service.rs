@@ -578,6 +578,17 @@ impl MemoryService {
     /// applied. Failures are logged and swallowed; enrichment is best-effort
     /// by design.
     pub async fn enrich_summary(&self, hash: &str, content: &str) -> bool {
+        // Guard before anything else: the hash may come from a stored payload
+        // (backfill), and both the log prefix below and the backend's
+        // point-id derivation byte-slice it. A malformed value must be a
+        // logged skip, never a panic that kills the detached task.
+        if !alaya_types::memory::validate_content_hash(hash) {
+            tracing::warn!(
+                hash_len = hash.len(),
+                "enrich_summary: invalid content_hash, skipping"
+            );
+            return false;
+        }
         let Some(ref summarizer) = self.summary else {
             return false;
         };
@@ -3680,6 +3691,47 @@ mod tests {
             m.summary_embedding.is_some(),
             "generated summary carries its vector"
         );
+    }
+
+    /// Summary provider that must never be reached.
+    struct UnreachableSummary;
+
+    #[async_trait(?Send)]
+    impl SummaryProvider for UnreachableSummary {
+        async fn summarize(&self, _content: &str) -> Result<String> {
+            unreachable!("provider must not be called for a malformed hash")
+        }
+    }
+
+    /// Helly R's seventh finding: backfill forwards stored `content_hash`
+    /// values, and a 64-byte value with a multibyte character panicked the
+    /// byte slices in the log prefix and in the point-id derivation, killing
+    /// the detached backfill task. Malformed hashes are now a logged skip
+    /// before any provider or storage call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn enrich_summary_skips_malformed_hash_without_panicking() {
+        let svc = MemoryService::new(
+            Box::new(MockVectorsPersisting {
+                stored: Rc::new(RefCell::new(HashMap::new())),
+                raw_only: Default::default(),
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            Some(Box::new(UnreachableSummary)),
+        );
+        // 'é' is two bytes: across byte 8 (the log prefix slice) and across
+        // byte 32 (the point-id slice). Both values are exactly 64 bytes.
+        let across_8 = format!("abcdefgé{}", "a".repeat(55));
+        let across_32 = format!("{}é{}", "a".repeat(31), "a".repeat(31));
+        for hash in [across_8, across_32] {
+            assert_eq!(hash.len(), 64);
+            assert!(
+                !svc.enrich_summary(&hash, "content").await,
+                "a malformed hash must be a skip, not a panic"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

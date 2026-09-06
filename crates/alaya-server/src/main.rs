@@ -1301,7 +1301,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn truncate_hash(s: &str) -> String {
-    s[..8.min(s.len())].to_string()
+    s[..s.floor_char_boundary(8.min(s.len()))].to_string()
 }
 
 fn log_err(op: &str, e: &alaya_types::AlayaError, start: std::time::Instant) {
@@ -2049,6 +2049,20 @@ mod wedge_tests {
         ConsolidationService, EmbeddingProvider, GraphService, HebbianService, VectorStorage,
     };
     use alaya_types::memory::ScoredMemory;
+
+    /// The log-prefix helper sees caller-supplied hashes before validation
+    /// (get_memory, delete, relation), so it must never byte-slice into a
+    /// multibyte character.
+    #[test]
+    fn truncate_hash_is_char_boundary_safe() {
+        assert_eq!(truncate_hash("abcdefgh0123"), "abcdefgh");
+        assert_eq!(truncate_hash("abc"), "abc");
+        // 'é' spans bytes 7-8: the cut must fall back to the boundary before it.
+        assert_eq!(
+            truncate_hash(&format!("abcdefgé{}", "a".repeat(55))),
+            "abcdefg"
+        );
+    }
 
     /// VectorStorage whose `delete` blackholes — models a backend whose pod
     /// IP vanished without an RST. Every other method panics: the test only

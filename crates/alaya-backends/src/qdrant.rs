@@ -275,7 +275,10 @@ fn cap_timestamps(timestamps: &mut Vec<f64>, max: usize) {
 /// Python takes the first 32 hex chars and formats as UUID-4 style.
 /// Must match exactly for data compatibility.
 fn hash_to_uuid(content_hash: &str) -> Result<String> {
-    if content_hash.len() != 64 {
+    // Byte length alone is not enough: a 64-byte value holding a multibyte
+    // character would make the slice below panic mid-character. All-hex
+    // guarantees ASCII, so every byte index is a char boundary.
+    if content_hash.len() != 64 || !content_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(AlayaError::Validation(format!(
             "content_hash must be 64-char SHA-256 hex, got {} chars. \
              Pass the full content_hash from search/store_memory results, \
@@ -1423,6 +1426,14 @@ mod tests {
     fn hash_to_uuid_non_hex_returns_error() {
         let result = hash_to_uuid(&"zz".repeat(32));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn hash_to_uuid_multibyte_64_bytes_returns_error_not_panic() {
+        // 31 ASCII + 'é' (2 bytes) + 31 ASCII = 64 bytes, byte 32 mid-character.
+        let hash = format!("{}é{}", "a".repeat(31), "a".repeat(31));
+        assert_eq!(hash.len(), 64);
+        assert!(hash_to_uuid(&hash).is_err());
     }
 
     #[test]
