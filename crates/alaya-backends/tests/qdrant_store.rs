@@ -295,7 +295,9 @@ async fn store_keeps_summary_embedding_only_while_summary_unchanged() {
 
 /// Every write mock requires `wait=true`: a writer that returns on Qdrant's
 /// acknowledgement rather than application would release the client's write
-/// lock before its write is visible, so such a request must not match.
+/// lock before its write is visible, so such a request must not match. A
+/// writer that swallows a failed request (the batch access increment) is
+/// caught by `write_order` instead, which includes the query string.
 async fn mount_ok(server: &MockServer, p: &str) {
     Mock::given(method("POST"))
         .and(path(p))
@@ -527,18 +529,12 @@ async fn concurrent_store_cannot_land_inside_a_patch_invalidation() {
     a.expect("user patch succeeds");
     b.expect("store succeeds");
 
-    let requests = server.received_requests().await.unwrap();
-    let order: Vec<String> = requests
-        .iter()
-        .filter(|r| r.url.path() != POINTS_PATH || r.method == "PUT")
-        .map(|r| format!("{} {}", r.method, r.url.path()))
-        .collect();
     assert_eq!(
-        order,
+        write_order(&server).await,
         vec![
-            format!("POST {PAYLOAD_DELETE_PATH}"),
-            format!("POST {PAYLOAD_PATH}"),
-            format!("PUT {POINTS_PATH}"),
+            format!("POST {PAYLOAD_DELETE_PATH}?wait=true"),
+            format!("POST {PAYLOAD_PATH}?wait=true"),
+            format!("PUT {POINTS_PATH}?wait=true"),
         ],
         "the store's PUT must not fall between the patch's delete and set"
     );
@@ -567,7 +563,10 @@ async fn store_race_server() -> MockServer {
     server
 }
 
-/// Every request except retrieves, in arrival order, as "METHOD path".
+/// Every request except retrieves, in arrival order, as "METHOD path?query".
+/// The query is part of the contract: a write without `wait=true` returns on
+/// Qdrant's acknowledgement and would release the client's write lock before
+/// the write is visible.
 async fn write_order(server: &MockServer) -> Vec<String> {
     server
         .received_requests()
@@ -575,7 +574,10 @@ async fn write_order(server: &MockServer) -> Vec<String> {
         .unwrap()
         .iter()
         .filter(|r| !(r.method == "POST" && r.url.path() == POINTS_PATH))
-        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .map(|r| match r.url.query() {
+            Some(q) => format!("{} {}?{}", r.method, r.url.path(), q),
+            None => format!("{} {}", r.method, r.url.path()),
+        })
         .collect()
 }
 
@@ -612,9 +614,9 @@ async fn concurrent_supersession_cannot_land_inside_a_restore() {
     assert_eq!(
         write_order(&server).await,
         vec![
-            format!("PUT {POINTS_PATH}"),
-            format!("POST {PAYLOAD_PATH}"),
-            format!("POST {PAYLOAD_PATH}"),
+            format!("PUT {POINTS_PATH}?wait=true"),
+            format!("POST {PAYLOAD_PATH}?wait=true"),
+            format!("POST {PAYLOAD_PATH}?wait=true"),
         ],
         "supersession writes must not fall inside the store's retrieve→PUT window"
     );
@@ -638,7 +640,10 @@ async fn concurrent_access_increment_cannot_land_inside_a_restore() {
 
     assert_eq!(
         write_order(&server).await,
-        vec![format!("PUT {POINTS_PATH}"), format!("POST {PAYLOAD_PATH}")],
+        vec![
+            format!("PUT {POINTS_PATH}?wait=true"),
+            format!("POST {PAYLOAD_PATH}?wait=true")
+        ],
         "an access increment must not be rolled back by a store snapshot"
     );
 }
@@ -661,7 +666,10 @@ async fn concurrent_batch_access_increment_cannot_land_inside_a_restore() {
 
     assert_eq!(
         write_order(&server).await,
-        vec![format!("PUT {POINTS_PATH}"), format!("POST {PAYLOAD_PATH}")],
+        vec![
+            format!("PUT {POINTS_PATH}?wait=true"),
+            format!("POST {PAYLOAD_PATH}?wait=true")
+        ],
         "a batch access increment must not be rolled back by a store snapshot"
     );
 }
@@ -685,8 +693,8 @@ async fn concurrent_delete_cannot_land_inside_a_restore() {
     assert_eq!(
         write_order(&server).await,
         vec![
-            format!("PUT {POINTS_PATH}"),
-            format!("POST {POINTS_DELETE_PATH}")
+            format!("PUT {POINTS_PATH}?wait=true"),
+            format!("POST {POINTS_DELETE_PATH}?wait=true")
         ],
         "a store snapshot must not resurrect a point deleted inside its window"
     );
