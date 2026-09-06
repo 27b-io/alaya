@@ -1,9 +1,11 @@
 //! Dual-mode authentication + default-deny authorization.
 //!
-//! Two auth modes on the protected router: a static bearer key (service/CLI)
-//! and a provider-agnostic OIDC JWT (browser). Authorization is a default-deny
-//! allowlist: an `Oidc` principal may only invoke read/additive ops; every
-//! other op — current or future — requires the `Static` principal.
+//! Three credentials on the protected router: a full static bearer key
+//! (service/CLI), a read-only static bearer key (headless service consumers,
+//! e.g. radar), and a provider-agnostic OIDC JWT (browser). Authorization is a
+//! default-deny allowlist per principal: `Oidc` may only invoke read/additive
+//! ops, `StaticReadOnly` only pure reads; every other op — current or future —
+//! requires the full `Static` principal.
 
 use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode, header};
@@ -29,12 +31,36 @@ pub const OIDC_ALLOWLIST: &[&str] = &[
     "store_memory",
 ];
 
+/// Pure-read ops a `StaticReadOnly` principal may invoke. Stricter than
+/// `OIDC_ALLOWLIST`: no `store_memory` — the read-only bearer exists for
+/// consumers (radar) that must never mutate the corpus, additively or not.
+pub const READONLY_ALLOWLIST: &[&str] = &[
+    "search",
+    "get_memory",
+    "check_database_health",
+    "memory_contradictions",
+    "find_duplicates",
+];
+
 /// Authenticated principal, inserted into request extensions by `require_auth`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AuthPrincipal {
     Static,
+    StaticReadOnly,
     Oidc,
     Anonymous,
+}
+
+impl AuthPrincipal {
+    /// Default-deny op gate. `Static` and `Anonymous` (dev open mode) may
+    /// invoke anything; restricted principals only their allowlist.
+    pub fn allows(self, op: &str) -> bool {
+        match self {
+            AuthPrincipal::Static | AuthPrincipal::Anonymous => true,
+            AuthPrincipal::Oidc => OIDC_ALLOWLIST.contains(&op),
+            AuthPrincipal::StaticReadOnly => READONLY_ALLOWLIST.contains(&op),
+        }
+    }
 }
 
 /// Whether a service operation may perform shared-state writes. No `Default`:
@@ -48,9 +74,15 @@ pub enum WritePolicy {
 impl WritePolicy {
     pub fn for_principal(p: AuthPrincipal) -> Self {
         match p {
-            AuthPrincipal::Oidc => WritePolicy::ReadOnly,
+            AuthPrincipal::Oidc | AuthPrincipal::StaticReadOnly => WritePolicy::ReadOnly,
             AuthPrincipal::Static | AuthPrincipal::Anonymous => WritePolicy::Full,
         }
+    }
+
+    /// The `read_only` bool threaded into service calls — one derivation for
+    /// every gate site, so a new principal can't drift between them.
+    pub fn read_only_for(p: AuthPrincipal) -> bool {
+        Self::for_principal(p) == WritePolicy::ReadOnly
     }
 }
 
@@ -58,9 +90,22 @@ impl WritePolicy {
 #[derive(Clone)]
 pub struct AuthState {
     pub api_key: Option<String>,
+    pub readonly_api_key: Option<String>,
     pub allow_unauthenticated: bool,
     pub oidc: Option<OidcVerifier>,
     pub public_base_url: String,
+}
+
+impl AuthState {
+    /// True only when NO credential of any kind is configured AND the dev flag
+    /// opted in. A readonly key counts as configured auth — otherwise open
+    /// mode would hand `Anonymous` (= Full) to the bearer meant as read-only.
+    pub fn open_mode(&self) -> bool {
+        self.api_key.is_none()
+            && self.readonly_api_key.is_none()
+            && self.oidc.is_none()
+            && self.allow_unauthenticated
+    }
 }
 
 /// Map a REST route to a canonical op-name in the `OIDC_ALLOWLIST` vocabulary.
@@ -85,11 +130,6 @@ pub fn rest_route_op(method: &Method, path: &str) -> &'static str {
     }
 }
 
-/// True if an `Oidc` principal is permitted to invoke `op`.
-pub fn oidc_allows(op: &str) -> bool {
-    OIDC_ALLOWLIST.contains(&op)
-}
-
 /// Every canonical op with its write classification, for the read-only
 /// auth-config view. `(op, mutating)` — "mutating" means it rewrites or
 /// removes shared state (store is additive, so it is not mutating).
@@ -112,20 +152,23 @@ pub const ALL_OPS: &[(&str, bool)] = &[
 /// exist, the OIDC issuer/audience, and the principal × op matrix. Contains
 /// NO credential material — only presence flags and public identifiers.
 pub fn auth_config_view(auth: &AuthState) -> serde_json::Value {
-    // The static principal always has full access, so per-op "static" flags
-    // would be constants — the matrix only carries what varies (oidc).
+    // The full static principal always has full access, so per-op "static"
+    // flags would be constants — the matrix only carries what varies: the
+    // two restricted principals (oidc, readonly).
     let ops: Vec<serde_json::Value> = ALL_OPS
         .iter()
         .map(|(op, mutating)| {
             serde_json::json!({
                 "op": op,
                 "mutating": mutating,
-                "oidc": oidc_allows(op),
+                "oidc": AuthPrincipal::Oidc.allows(op),
+                "readonly": AuthPrincipal::StaticReadOnly.allows(op),
             })
         })
         .collect();
     serde_json::json!({
         "static_bearer_configured": auth.api_key.is_some(),
+        "readonly_bearer_configured": auth.readonly_api_key.is_some(),
         "oidc": {
             "enabled": auth.oidc.is_some(),
             "issuer": auth.oidc.as_ref().map(|v| v.issuer().to_string()),
@@ -153,12 +196,18 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 async fn authenticate(auth: &AuthState, token: &str) -> Option<AuthPrincipal> {
-    // Static key first (cheap, constant-time). A static token is never routed
-    // to JWT validation.
+    // Static keys first (cheap, constant-time). A static token is never routed
+    // to JWT validation. Full key is checked before the readonly key; startup
+    // refuses equal keys, so a readonly bearer can never resolve to `Static`.
     if let Some(ref key) = auth.api_key
         && constant_time_eq(token.as_bytes(), key.as_bytes())
     {
         return Some(AuthPrincipal::Static);
+    }
+    if let Some(ref key) = auth.readonly_api_key
+        && constant_time_eq(token.as_bytes(), key.as_bytes())
+    {
+        return Some(AuthPrincipal::StaticReadOnly);
     }
     // OIDC: only attempt for JWT-shaped tokens (exactly two dots).
     if let Some(ref verifier) = auth.oidc
@@ -191,7 +240,11 @@ fn challenge_401(auth: &AuthState) -> Response {
         .into_response()
 }
 
-fn forbidden_403() -> Response {
+/// 403 for an authenticated-but-unauthorized request. Logged so an operator
+/// can diagnose a misconfigured consumer (e.g. radar holding the read-only key
+/// but calling a mutating route) without grepping silence.
+fn forbidden_403(principal: AuthPrincipal, op: &str) -> Response {
+    tracing::debug!(?principal, %op, "authorization denied");
     (
         StatusCode::FORBIDDEN,
         axum::Json(serde_json::json!({"error": "forbidden for this principal"})),
@@ -204,7 +257,7 @@ fn forbidden_403() -> Response {
 /// this middleware only authenticates `/mcp` and sets the principal extension.
 pub async fn require_auth(State(auth): State<AuthState>, mut req: Request, next: Next) -> Response {
     // Open mode: only reachable when startup confirmed no auth + the dev flag.
-    if auth.api_key.is_none() && auth.oidc.is_none() && auth.allow_unauthenticated {
+    if auth.open_mode() {
         req.extensions_mut().insert(AuthPrincipal::Anonymous);
         return next.run(req).await;
     }
@@ -218,11 +271,11 @@ pub async fn require_auth(State(auth): State<AuthState>, mut req: Request, next:
     };
 
     // REST authz (the /mcp path is gated in mcp_handler after JSON-RPC parse).
-    let path = req.uri().path().to_string();
-    if path != "/mcp" && principal == AuthPrincipal::Oidc {
-        let op = rest_route_op(req.method(), &path);
-        if !oidc_allows(op) {
-            return forbidden_403();
+    let path = req.uri().path();
+    if path != "/mcp" {
+        let op = rest_route_op(req.method(), path);
+        if !principal.allows(op) {
+            return forbidden_403(principal, op);
         }
     }
 
@@ -238,11 +291,15 @@ mod tests {
     /// route to `__mutating__` — which would 403 an OIDC principal that can
     /// already read substantially the same document through MCP
     /// `check_database_health`. The mapping, not the allowlist, is the fix.
+    /// The read-only static bearer (#80) gets the same view: it is on
+    /// `READONLY_ALLOWLIST` because a headless consumer polling health is
+    /// exactly the read-only use case.
     #[test]
-    fn health_detail_is_a_read_for_oidc_principals() {
+    fn health_detail_is_a_read_for_restricted_principals() {
         let op = rest_route_op(&Method::GET, "/health/detail");
         assert_eq!(op, "check_database_health");
-        assert!(oidc_allows(op));
+        assert!(AuthPrincipal::Oidc.allows(op));
+        assert!(AuthPrincipal::StaticReadOnly.allows(op));
 
         // The bare probe is not on the protected router at all, so it must
         // stay unmapped — fail-closed if it is ever moved behind auth.
@@ -250,9 +307,13 @@ mod tests {
     }
 
     #[test]
-    fn write_policy_readonly_only_for_oidc() {
+    fn write_policy_readonly_for_restricted_principals() {
         assert_eq!(
             WritePolicy::for_principal(AuthPrincipal::Oidc),
+            WritePolicy::ReadOnly
+        );
+        assert_eq!(
+            WritePolicy::for_principal(AuthPrincipal::StaticReadOnly),
             WritePolicy::ReadOnly
         );
         assert_eq!(
@@ -266,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_is_exactly_the_read_additive_ops() {
+    fn oidc_allowlist_is_exactly_the_read_additive_ops() {
         for op in [
             "search",
             "get_memory",
@@ -275,14 +336,35 @@ mod tests {
             "find_duplicates",
             "store_memory",
         ] {
-            assert!(oidc_allows(op), "{op} should be allowed for Oidc");
+            assert!(
+                AuthPrincipal::Oidc.allows(op),
+                "{op} should be allowed for Oidc"
+            );
         }
     }
 
     #[test]
-    fn every_mutating_op_is_denied_for_oidc() {
+    fn readonly_allowlist_is_pure_read() {
+        for op in [
+            "search",
+            "get_memory",
+            "check_database_health",
+            "memory_contradictions",
+            "find_duplicates",
+        ] {
+            assert!(
+                AuthPrincipal::StaticReadOnly.allows(op),
+                "{op} should be allowed for StaticReadOnly"
+            );
+        }
+        // Stricter than Oidc: no additive writes either.
+        assert!(!AuthPrincipal::StaticReadOnly.allows("store_memory"));
+    }
+
+    #[test]
+    fn every_mutating_op_is_denied_for_restricted_principals() {
         // The whole point of default-deny: these (and any future op) are NOT
-        // in the allowlist, so an Oidc principal can't invoke them.
+        // in an allowlist, so a restricted principal can't invoke them.
         for op in [
             "delete_memory",
             "memory_supersede",
@@ -293,7 +375,22 @@ mod tests {
             "__mutating__",
             "some_future_tool_added_next_year",
         ] {
-            assert!(!oidc_allows(op), "{op} must be denied for Oidc");
+            assert!(
+                !AuthPrincipal::Oidc.allows(op),
+                "{op} must be denied for Oidc"
+            );
+            assert!(
+                !AuthPrincipal::StaticReadOnly.allows(op),
+                "{op} must be denied for StaticReadOnly"
+            );
+        }
+    }
+
+    #[test]
+    fn full_principals_allow_everything() {
+        for op in ["store_memory", "delete_memory", "__mutating__"] {
+            assert!(AuthPrincipal::Static.allows(op));
+            assert!(AuthPrincipal::Anonymous.allows(op));
         }
     }
 
@@ -307,12 +404,11 @@ mod tests {
             rest_route_op(&Method::PATCH, "/memories/abc123"),
             "patch_memory"
         );
-        // GET is allowed for Oidc, PATCH is not.
-        assert!(oidc_allows(rest_route_op(&Method::GET, "/memories/abc123")));
-        assert!(!oidc_allows(rest_route_op(
-            &Method::PATCH,
-            "/memories/abc123"
-        )));
+        // GET is allowed for restricted principals, PATCH is not.
+        for p in [AuthPrincipal::Oidc, AuthPrincipal::StaticReadOnly] {
+            assert!(p.allows(rest_route_op(&Method::GET, "/memories/abc123")));
+            assert!(!p.allows(rest_route_op(&Method::PATCH, "/memories/abc123")));
+        }
     }
 
     #[test]
@@ -337,23 +433,24 @@ mod tests {
     #[test]
     fn rest_route_op_unmapped_fails_closed() {
         // An unknown route or unexpected method must not be allowlisted.
-        assert!(!oidc_allows(rest_route_op(
-            &Method::POST,
-            "/some/new/route"
-        )));
-        assert!(!oidc_allows(rest_route_op(&Method::DELETE, "/memories/x")));
+        for p in [AuthPrincipal::Oidc, AuthPrincipal::StaticReadOnly] {
+            assert!(!p.allows(rest_route_op(&Method::POST, "/some/new/route")));
+            assert!(!p.allows(rest_route_op(&Method::DELETE, "/memories/x")));
+        }
     }
 
     #[test]
     fn auth_config_view_leaks_no_credentials_and_matches_allowlist() {
-        let auth = crate::testkit::auth_state(Some("super-secret-bearer"), true);
+        let mut auth = crate::testkit::auth_state(Some("super-secret-bearer"), true);
+        auth.readonly_api_key = Some("readonly-secret".into());
         let v = auth_config_view(&auth);
         let text = v.to_string();
         assert!(
-            !text.contains("super-secret-bearer"),
-            "auth-config view must never contain the bearer"
+            !text.contains("super-secret-bearer") && !text.contains("readonly-secret"),
+            "auth-config view must never contain a bearer"
         );
         assert_eq!(v["static_bearer_configured"], true);
+        assert_eq!(v["readonly_bearer_configured"], true);
         assert_eq!(v["oidc"]["enabled"], true);
 
         let ops = v["ops"].as_array().unwrap();
@@ -362,15 +459,25 @@ mod tests {
             let name = op["op"].as_str().unwrap();
             assert_eq!(
                 op["oidc"].as_bool().unwrap(),
-                oidc_allows(name),
-                "matrix must mirror oidc_allows for {name}"
+                AuthPrincipal::Oidc.allows(name),
+                "matrix must mirror Oidc.allows for {name}"
+            );
+            assert_eq!(
+                op["readonly"].as_bool().unwrap(),
+                AuthPrincipal::StaticReadOnly.allows(name),
+                "matrix must mirror StaticReadOnly.allows for {name}"
             );
         }
-        // Every mutating op must be OIDC-denied — the read-only invariant
-        // the view exists to display.
+        // Every mutating op must be denied to both restricted principals —
+        // the read-only invariant the view exists to display.
         for op in ops {
             if op["mutating"] == true {
                 assert_eq!(op["oidc"], false, "{} must be OIDC-denied", op["op"]);
+                assert_eq!(
+                    op["readonly"], false,
+                    "{} must be readonly-denied",
+                    op["op"]
+                );
             }
         }
     }
@@ -399,8 +506,8 @@ mod tests {
                 "ALL_OPS is missing '{op}' — the auth-config view under-reports"
             );
         }
-        // And the allowlist itself must be a subset of ALL_OPS.
-        for op in OIDC_ALLOWLIST {
+        // And both allowlists must be subsets of ALL_OPS.
+        for op in OIDC_ALLOWLIST.iter().chain(READONLY_ALLOWLIST) {
             assert!(
                 ALL_OPS.iter().any(|(name, _)| name == op),
                 "ALL_OPS is missing allowlisted op '{op}'"
@@ -411,8 +518,11 @@ mod tests {
     #[test]
     fn auth_config_route_is_static_only_by_default_deny() {
         // GET /auth/config is deliberately unmapped in rest_route_op →
-        // "__mutating__" → denied for Oidc principals.
-        assert!(!oidc_allows(rest_route_op(&Method::GET, "/auth/config")));
+        // "__mutating__" → denied for every restricted principal. The
+        // read-only bearer reads memories, not the auth configuration.
+        let op = rest_route_op(&Method::GET, "/auth/config");
+        assert!(!AuthPrincipal::Oidc.allows(op));
+        assert!(!AuthPrincipal::StaticReadOnly.allows(op));
     }
 
     #[test]
@@ -435,6 +545,40 @@ mod tests {
             Some(AuthPrincipal::Static)
         );
         assert_eq!(authenticate(&auth, "wrong").await, None);
+    }
+
+    #[tokio::test]
+    async fn authenticate_readonly_key() {
+        let mut auth = state(Some("full-key"), false);
+        auth.readonly_api_key = Some("ro-key".to_string());
+        assert_eq!(
+            authenticate(&auth, "ro-key").await,
+            Some(AuthPrincipal::StaticReadOnly)
+        );
+        assert_eq!(
+            authenticate(&auth, "full-key").await,
+            Some(AuthPrincipal::Static)
+        );
+        assert_eq!(authenticate(&auth, "wrong").await, None);
+
+        // Readonly key works standalone (no full key configured).
+        let mut ro_only = state(None, false);
+        ro_only.readonly_api_key = Some("ro-key".to_string());
+        assert_eq!(
+            authenticate(&ro_only, "ro-key").await,
+            Some(AuthPrincipal::StaticReadOnly)
+        );
+    }
+
+    #[test]
+    fn readonly_key_disables_open_mode() {
+        // Fail-closed: a readonly key + the dev flag must NOT grant Anonymous
+        // (= Full) to everyone — the key counts as configured auth.
+        let mut auth = state(None, false);
+        auth.allow_unauthenticated = true;
+        assert!(auth.open_mode());
+        auth.readonly_api_key = Some("ro-key".to_string());
+        assert!(!auth.open_mode());
     }
 
     #[tokio::test]
@@ -480,6 +624,87 @@ mod tests {
         assert_eq!(
             resp.headers().get(header::WWW_AUTHENTICATE).unwrap(),
             "Bearer"
+        );
+    }
+
+    // ── middleware wiring: route-level 200 vs 401/403 per bearer ─────────────
+
+    fn test_router(auth: AuthState) -> axum::Router {
+        use axum::routing::{get, post};
+        async fn ok() -> &'static str {
+            "ok"
+        }
+        axum::Router::new()
+            .route("/search", post(ok))
+            .route("/store", post(ok))
+            .route("/delete", post(ok))
+            .route("/supersede", post(ok))
+            .route("/relation", post(ok))
+            .route("/duplicates/merge", post(ok))
+            .route("/memories/{content_hash}", get(ok).patch(ok))
+            .layer(axum::middleware::from_fn_with_state(auth, require_auth))
+    }
+
+    async fn status_for(
+        router: &axum::Router,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+    ) -> StatusCode {
+        use tower::ServiceExt;
+        let mut builder = axum::http::Request::builder().method(method).uri(path);
+        if let Some(t) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let req = builder.body(axum::body::Body::empty()).unwrap();
+        router.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn readonly_bearer_reads_succeed_and_mutations_403() {
+        let mut auth = state(Some("full-key"), false);
+        auth.readonly_api_key = Some("ro-key".to_string());
+        let app = test_router(auth);
+
+        // Reads succeed.
+        assert_eq!(
+            status_for(&app, Method::POST, "/search", Some("ro-key")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_for(&app, Method::GET, "/memories/abc", Some("ro-key")).await,
+            StatusCode::OK
+        );
+
+        // Every mutating route → 403 (authenticated but not authorized).
+        for (method, path) in [
+            (Method::POST, "/store"),
+            (Method::POST, "/delete"),
+            (Method::POST, "/supersede"),
+            (Method::POST, "/relation"),
+            (Method::POST, "/duplicates/merge"),
+            (Method::PATCH, "/memories/abc"),
+            (Method::POST, "/some/unmapped/route"),
+        ] {
+            assert_eq!(
+                status_for(&app, method.clone(), path, Some("ro-key")).await,
+                StatusCode::FORBIDDEN,
+                "{method} {path} must be 403 for the readonly bearer"
+            );
+        }
+
+        // The full key is unaffected; a bad key still 401s.
+        assert_eq!(
+            status_for(&app, Method::POST, "/delete", Some("full-key")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_for(&app, Method::POST, "/search", Some("bogus")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status_for(&app, Method::POST, "/search", None).await,
+            StatusCode::UNAUTHORIZED
         );
     }
 

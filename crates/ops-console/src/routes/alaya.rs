@@ -1297,7 +1297,7 @@ pub async fn auth_view(
                 <CardHeader>
                     <CardTitle>"Ālaya auth state (read-only)"</CardTitle>
                     <CardDescription>
-                        "Live from alaya-server. OIDC principals are read-only by design; changing this is a product decision (LAB-1084), not a console feature."
+                        "Live from alaya-server. OIDC principals are read / additive by design (store only, no mutation); changing this is a product decision (LAB-1084), not a console feature."
                     </CardDescription>
                 </CardHeader>
                 <CardContent>

@@ -113,7 +113,7 @@ Connect any MCP client to `http://localhost:3001/mcp` (Streamable HTTP with SSE)
 
 ## REST API
 
-All endpoints accept/return JSON. Auth via `Authorization: Bearer ${ALAYA_API_KEY}` when configured (the dev Compose runs open on localhost — see [Quick Start](#quick-start)). Full reference: [docs/rest-api.md](docs/rest-api.md).
+All endpoints accept/return JSON. Auth via `Authorization: Bearer` with either static key — `ALAYA_API_KEY` (full) or `ALAYA_READONLY_API_KEY` (pure reads) — or an OIDC token, when configured (the dev Compose runs open on localhost — see [Quick Start](#quick-start)). Full reference: [docs/rest-api.md](docs/rest-api.md).
 
 | Method | Path | Description |
 |:-------|:-----|:------------|
@@ -145,7 +145,8 @@ Copy `.env.example` to `.env`. All settings have sensible defaults for local dev
 | `EMBEDDING_DIMENSIONS` | `1024` | Vector dimensionality |
 | `GRAPH_URL` | — (required) | Bridge endpoint |
 | `GRAPH_API_KEY` | — | Bridge auth token |
-| `ALAYA_API_KEY` | — | Server auth token. Empty → server won't boot unless `DANGEROUSLY_ALLOW_UNAUTHENTICATED=true` (localhost dev only) |
+| `ALAYA_API_KEY` | — | Server auth token. With no credential configured (this, `ALAYA_READONLY_API_KEY`, and `OIDC_ISSUER` all empty) the server won't boot unless `DANGEROUSLY_ALLOW_UNAUTHENTICATED=true` (localhost dev only) |
+| `ALAYA_READONLY_API_KEY` | — | Read-only bearer for headless consumers (optional). Pure reads only (`search`, `get_memory`, contradictions, duplicate-find, health); 403 on every mutating route incl. `store`. Must differ from `ALAYA_API_KEY` |
 | `LISTEN_ADDR` | `0.0.0.0:3001` | Server bind address |
 | `REDIS_CACHE_URL` | — | L2 embedding cache (optional) |
 | `SUMMARY_URL` | — | Anthropic Messages API URL (optional) |

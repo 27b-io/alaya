@@ -12,7 +12,7 @@ use tokio::sync::oneshot;
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{OutputMode, RelationParams, SearchParams, StoreParams};
 
-use crate::auth::{AuthPrincipal, oidc_allows};
+use crate::auth::{AuthPrincipal, WritePolicy};
 use crate::{CmdInner, ServiceHandle};
 
 // ─── Typed param structs for MCP dispatch ───────────────────────────────────
@@ -192,16 +192,17 @@ pub async fn mcp_handler(
         return StatusCode::ACCEPTED.into_response();
     }
 
-    // Default-deny authorization: an Oidc principal may only call allowlisted
-    // tools. Enforced here, axum-side, before any channel dispatch.
-    if req.method == "tools/call" && principal == AuthPrincipal::Oidc {
+    // Default-deny authorization: a restricted principal may only call its
+    // allowlisted tools. Enforced here, axum-side, before any channel dispatch.
+    if req.method == "tools/call" {
         let tool = req
             .params
             .as_ref()
             .and_then(|p| p.get("name"))
             .and_then(|n| n.as_str())
             .unwrap_or("");
-        if !oidc_allows(tool) {
+        if !principal.allows(tool) {
+            tracing::debug!(?principal, %tool, "authorization denied");
             let resp = JsonRpcResponse::error(id, -32001, "forbidden for this principal");
             return make_response(resp, wants_sse);
         }
@@ -328,7 +329,7 @@ async fn dispatch_tool(
     handle: &ServiceHandle,
     principal: AuthPrincipal,
 ) -> Result<Value, (i32, String)> {
-    let read_only = matches!(principal, AuthPrincipal::Oidc);
+    let read_only = WritePolicy::read_only_for(principal);
     match name {
         "store_memory" => {
             let params: StoreParams = serde_json::from_value(args)
