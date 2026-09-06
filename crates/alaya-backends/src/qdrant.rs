@@ -522,7 +522,14 @@ impl QdrantClient {
             .await
             .map_err(|e| AlayaError::Storage(e.to_string()))?;
 
-        Ok(data.result.unwrap_or_default().into_iter().next())
+        // `result: []` is the only legitimate "absent". A 2xx whose `result`
+        // is missing or null is a protocol violation; treating it as absent
+        // would re-arm the blind upsert in `store` and make `exists` answer
+        // false for a present point. Fail closed.
+        let points = data
+            .result
+            .ok_or_else(|| AlayaError::Storage("Qdrant retrieve returned no result".into()))?;
+        Ok(points.into_iter().next())
     }
 }
 

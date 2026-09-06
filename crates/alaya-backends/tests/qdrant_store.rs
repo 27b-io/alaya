@@ -733,3 +733,36 @@ async fn generated_summary_commits_only_while_summary_is_absent() {
         "nothing may be written over a caller summary"
     );
 }
+
+/// `result: []` is the only legitimate "absent". A 2xx whose `result` is
+/// missing or `null` is a protocol violation and must fail closed: `store`
+/// sends no PUT and `exists` does not answer `false`.
+#[tokio::test]
+async fn store_and_exists_fail_closed_when_retrieve_has_no_result() {
+    for body in [
+        json!({"status": "ok"}),
+        json!({"status": "ok", "result": null}),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(POINTS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+            .mount(&server)
+            .await;
+        mount_upsert_ok(&server).await;
+        let client = client_for(&server);
+
+        assert!(
+            client.store(&incoming()).await.is_err(),
+            "store must fail closed on {body}"
+        );
+        assert!(
+            client.exists(&"a".repeat(64)).await.is_err(),
+            "exists must fail closed on {body}"
+        );
+        assert!(
+            write_order(&server).await.is_empty(),
+            "no write may follow a malformed retrieve: {body}"
+        );
+    }
+}
