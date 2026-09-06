@@ -1,20 +1,50 @@
-# ops-console — lab k3s manifests (LAB-1684).
+# MIRROR of 27b-io/lab k8s/mcp/ops-console.yaml — the deployed manifest is the
+# truth; keep this copy in sync (LAB-2712). Only the image line differs: lab
+# pins :main@sha256:<digest> with the flux-system:alaya imagepolicy marker.
+#
+# ops-console — Ālaya curation console (LAB-2712 go-live; code + template shipped
+# by alaya#81 / LAB-1684).
 #
 # Deploy shape is BINDING per the LAB-1694 panel:
 #   - own Deployment + own label (app: ops-console) — never colocated behind
 #     `app: alaya-server`
-#   - own NetworkPolicy; egress pinned to alaya-server (module upstream) +
-#     DNS + the OIDC IdP. Explicitly NO egress to dragonfly:6379 — the
-#     default-deny egress list below simply does not include it; verify from
-#     the live pod after rollout:
-#       kubectl -n mcp exec deploy/ops-console -- \
-#         sh -c 'command -v nc && nc -zw2 dragonfly.mcp.svc 6379; echo exit=$?'
-#     (expect a timeout / non-zero exit)
+#   - own NetworkPolicy; egress pinned to alaya-server (module upstream) + the
+#     OIDC IdP (external :443); DNS comes from the namespace-wide allow-dns
+#     policy (lab network-policies.yaml). Explicitly NO egress to dragonfly:6379
+#     — the allowlist below simply does not include it. Verify from the live pod
+#     after rollout (the image has curl, not nc; k3s netpol REJECTS, so expect
+#     "Connection refused" / exit 7 on both probes and alaya=200):
+#       kubectl -n mcp exec deploy/ops-console -- sh -c '
+#         curl -sS -m3 telnet://dragonfly.mcp.svc:6379; echo dragonfly_exit=$?;
+#         curl -sS -m3 telnet://alaya-bridge.mcp.svc:3000; echo bridge_exit=$?;
+#         curl -sS -m3 -o /dev/null -w "alaya=%{http_code}\n" http://alaya-server.mcp.svc:3001/health'
+#     (alaya-bridge-policy admits any source on its port, so a refusal there
+#     proves THIS pod's egress rule, not the target's ingress rule.)
 #
-# Copy into the lab repo (lab/k8s/mcp/) and wire the Secret via ESO like the
-# other mcp-namespace services. Tailnet HTTPS: register with
-#   tailscale serve --service ops-console --https 443 http://<svc>:3002
-# per docs/lab-node.md conventions in the lab repo.
+# Lab-specific points, each commented inline:
+#   - image digest-pinned with the flux-system:alaya imagepolicy marker, so the
+#     console rolls with alaya-server (same image, same CI push) and is never
+#     stale against the API it fronts.
+#   - imagePullSecrets ghcr-creds — ghcr.io/27b-io/alaya is a private package.
+#   - Reloader annotation — updating the ops-console-env Secret (e.g. adding a
+#     subject to CONSOLE_ALLOWED_SUBJECTS) restarts the pod; no manual rollout.
+#   - CONSOLE_PUBLIC_URL / CONSOLE_OIDC_ISSUER are plain env, exactly as
+#     alaya.yaml carries PUBLIC_BASE_URL / OIDC_ISSUER: deploy-shape constants,
+#     reviewable in git, and two fewer 1Password fields on the whole-
+#     ExternalSecret failure surface (LAB-1237).
+#   - no SA token mount, seccomp RuntimeDefault, tailnet/link-local excluded
+#     from the IdP egress block — matches the namespace's stricter peers.
+#
+# Credentials: Secret ops-console-env from lab ops-console-externalsecret.yaml
+# (1Password item `ops-console` + alaya-config/credential).
+#
+# Tailnet HTTPS: tailscale VIP service svc:ops on the lab node,
+# 443 → this Service:3002, mirroring svc:alaya. ORDER MATTERS (Ray, LAB-2712):
+# define the service in the Tailscale admin console FIRST, then on the host:
+#   tailscale serve --bg --service svc:ops --https 443 http://ops-console.mcp.svc.cluster.local:3002
+# CLI-first prints "approval from an admin is required" and exits 0, but the
+# service never appears in the console for approval — a silent dead end.
+# `serve --service`, never plain `serve` (lab docs/lab-node.md).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -22,7 +52,10 @@ metadata:
   namespace: mcp
   labels:
     app: ops-console
+  annotations:
+    secret.reloader.stakater.com/reload: "ops-console-env"
 spec:
+  # Single replica BY DESIGN: logout revocation is in-memory (LAB-1684 ceiling).
   replicas: 1
   selector:
     matchLabels:
@@ -32,23 +65,35 @@ spec:
       labels:
         app: ops-console
     spec:
+      # Never talks to the k8s API; a tailnet-reachable admin pod gets no token.
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: ghcr-creds
       containers:
         - name: ops-console
-          image: ghcr.io/27b-io/alaya:latest
+          image: ghcr.io/27b-io/alaya:main # lab: :main@sha256:<digest> + flux-system:alaya imagepolicy marker
           command: ["ops-console"]
           ports:
             - containerPort: 3002
+              name: http
           env:
-            - name: CONSOLE_LISTEN_ADDR
-              value: "0.0.0.0:3002"
             - name: ALAYA_URL
               value: "http://alaya-server.mcp.svc:3001"
+            # OIDC relying party against id.27b.io. redirect_uri is derived as
+            # {CONSOLE_PUBLIC_URL}/auth/callback and must match the client
+            # registration on the IdP exactly.
+            - name: CONSOLE_PUBLIC_URL
+              value: "https://ops.lobster-python.ts.net"
+            - name: CONSOLE_OIDC_ISSUER
+              value: "https://id.27b.io"
             - name: RUST_LOG
               value: "ops_console=info,tower_http=info"
-          # All credentials come from the Secret (1Password → ESO in lab):
-          #   CONSOLE_PUBLIC_URL, CONSOLE_OIDC_ISSUER, CONSOLE_OIDC_CLIENT_ID,
-          #   CONSOLE_OIDC_CLIENT_SECRET, CONSOLE_ALLOWED_SUBJECTS,
-          #   CONSOLE_SESSION_SECRET, ALAYA_API_KEY
+          # Credentials come from the Secret (1Password → ESO):
+          #   CONSOLE_OIDC_CLIENT_ID, CONSOLE_OIDC_CLIENT_SECRET,
+          #   CONSOLE_ALLOWED_SUBJECTS, CONSOLE_SESSION_SECRET, ALAYA_API_KEY
           # The console is fail-closed: it refuses to start if any is missing.
           envFrom:
             - secretRef:
@@ -92,6 +137,7 @@ spec:
   ports:
     - port: 3002
       targetPort: 3002
+      name: http
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -104,23 +150,14 @@ spec:
       app: ops-console
   policyTypes: ["Ingress", "Egress"]
   ingress:
-    # Tailnet ingress arrives via the node's tailscaled (host network) or the
-    # tailscale operator proxy; restrict to in-cluster + host-network sources.
+    # Tailnet ingress arrives via the node's tailscaled (host network); same
+    # port-only rule as alaya-server-policy. Only the pre-auth surface
+    # (/auth/*, /healthz) is reachable without a session.
     - ports:
         - port: 3002
           protocol: TCP
   egress:
-    # DNS
-    - to:
-        - namespaceSelector: {}
-          podSelector:
-            matchLabels:
-              k8s-app: kube-dns
-      ports:
-        - port: 53
-          protocol: UDP
-        - port: 53
-          protocol: TCP
+    # DNS: granted namespace-wide by allow-dns (lab network-policies.yaml).
     # Module upstream: alaya-server ONLY (LAB-1694 binding). No dragonfly,
     # no other mcp services.
     - to:
@@ -130,7 +167,9 @@ spec:
       ports:
         - port: 3001
           protocol: TCP
-    # OIDC IdP (id.27b.io) — discovery, JWKS, token exchange. External 443.
+    # OIDC IdP (id.27b.io, Cloudflare) — discovery, JWKS, token exchange.
+    # External 443 only: RFC1918 (cluster), CGNAT (tailnet VIPs + hosts) and
+    # link-local excluded, matching every other public-egress rule in mcp.
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
@@ -138,6 +177,8 @@ spec:
               - 10.0.0.0/8
               - 172.16.0.0/12
               - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
       ports:
         - port: 443
           protocol: TCP

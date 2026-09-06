@@ -65,12 +65,38 @@ CSP (`default-src 'none'`).
 
 ## Deploy
 
-Manifests: `deploy/console/ops-console.yaml` (Deployment + Service +
-NetworkPolicy — own label, egress pinned to alaya-server + DNS + IdP :443,
-**no dragonfly egress**). Copy into the lab repo (`lab/k8s/mcp/`), wire the
-`ops-console-env` Secret via ESO, and register tailnet HTTPS per
-`docs/lab-node.md`. The binary ships in the existing `ghcr.io/27b-io/alaya`
-image (`command: ["ops-console"]`).
+Deployed from the lab repo: `27b-io/lab` `k8s/mcp/ops-console.yaml` +
+`ops-console-externalsecret.yaml` (LAB-2712). `deploy/console/ops-console.yaml`
+here is a mirror of that manifest — keep them in sync. Shape: Deployment +
+Service + NetworkPolicy — own label, egress pinned to alaya-server + IdP :443
+(DNS via the namespace `allow-dns` policy), **no dragonfly egress**,
+`imagePullSecrets: ghcr-creds` (the package is private), image digest-pinned
+via the `flux-system:alaya` imagepolicy marker so the console rolls with
+alaya-server. The binary ships in the existing `ghcr.io/27b-io/alaya` image
+(`command: ["ops-console"]`).
+
+Config split: `CONSOLE_PUBLIC_URL`, `CONSOLE_OIDC_ISSUER`, `ALAYA_URL` are plain
+env in the manifest; `CONSOLE_OIDC_CLIENT_ID`, `CONSOLE_OIDC_CLIENT_SECRET`,
+`CONSOLE_ALLOWED_SUBJECTS`, `CONSOLE_SESSION_SECRET` come from the 1Password
+item `ops-console` (fields `oidc-client-id`, `oidc-client-secret`,
+`allowed-subjects`, `session-secret`) and `ALAYA_API_KEY` from
+`alaya-config/credential`, rendered by ESO into Secret `ops-console-env`.
+Editing the Secret rolls the pod (Reloader annotation).
+
+Tailnet HTTPS — order matters: define `svc:ops` in the Tailscale admin
+console **first**, then on the lab node run `tailscale serve --bg --service
+svc:ops --https 443 http://ops-console.mcp.svc.cluster.local:3002`.
+CLI-first exits 0 but the service never appears in the console for approval.
+
+Post-rollout egress check (the image has `curl`, not `nc`; k3s netpol rejects,
+so expect "Connection refused" on the first two and `alaya=200`):
+
+```bash
+kubectl -n mcp exec deploy/ops-console -- sh -c '
+  curl -sS -m3 telnet://dragonfly.mcp.svc:6379; echo dragonfly_exit=$?;
+  curl -sS -m3 telnet://alaya-bridge.mcp.svc:3000; echo bridge_exit=$?;
+  curl -sS -m3 -o /dev/null -w "alaya=%{http_code}\n" http://alaya-server.mcp.svc:3001/health'
+```
 
 ## Development
 
