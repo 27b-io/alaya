@@ -600,35 +600,67 @@ impl HealthChecker {
         }
     }
 
-    async fn check(&self) -> Value {
-        let start = std::time::Instant::now();
-
-        // All three checks run concurrently via tokio::join!
-        let (qdrant_health, graph_health, count) =
-            tokio::join!(self.check_qdrant(), self.check_graph(), self.check_count(),);
-
-        // 0 = worker loop not entered yet (backend bootstrap in progress).
-        // Bootstrap is deadline-bounded but can legitimately exceed the stall
-        // threshold on a cluster cold start — report "starting", not a stall,
-        // or the liveness probe would restart-loop a pod that's coming up.
+    fn worker_state(&self) -> (&'static str, bool, u64) {
         let last_progress = self
             .worker_progress
             .load(std::sync::atomic::Ordering::Relaxed);
-        let (worker_state, worker_stalled, progress_age) = if last_progress == 0 {
+        if last_progress == 0 {
             ("starting", false, 0)
         } else {
             let age = epoch_secs().saturating_sub(last_progress);
             let stalled = age > self.stall_threshold.as_secs();
             (if stalled { "stalled" } else { "ok" }, stalled, age)
-        };
+        }
+    }
 
-        let status = if worker_stalled {
+    fn status_from(worker_stalled: bool, qdrant_ok: bool) -> &'static str {
+        if worker_stalled {
             "unhealthy"
-        } else if qdrant_health.is_ok() {
+        } else if qdrant_ok {
             "healthy"
         } else {
             "degraded"
-        };
+        }
+    }
+
+    /// Bare-probe path: worker stall (atomic read) + Qdrant reachability only.
+    /// No exact-count scan, no graph round trip (#78).
+    async fn check_status(&self) -> Value {
+        let start = std::time::Instant::now();
+
+        // Worker stall check first: if stalled, status is "unhealthy"
+        // regardless of Qdrant — skip the network call entirely so k8s
+        // sees the 503 in microseconds, not after a 10s Qdrant timeout.
+        let (_, worker_stalled, progress_age) = self.worker_state();
+        if worker_stalled {
+            tracing::error!(
+                progress_age_s = progress_age,
+                threshold_s = self.stall_threshold.as_secs(),
+                "service worker stalled — reporting unhealthy so the pod gets restarted"
+            );
+            return json!({ "status": "unhealthy" });
+        }
+
+        let qdrant_health = self.check_qdrant().await;
+        let status = Self::status_from(false, qdrant_health.is_ok());
+
+        tracing::debug!(
+            op = "health",
+            elapsed_ms = start.elapsed().as_millis(),
+            status,
+            "ok (probe)"
+        );
+        json!({ "status": status })
+    }
+
+    async fn check(&self) -> Value {
+        let start = std::time::Instant::now();
+
+        let (qdrant_health, graph_health, count) =
+            tokio::join!(self.check_qdrant(), self.check_graph(), self.check_count(),);
+
+        let (worker_state, worker_stalled, progress_age) = self.worker_state();
+        let status = Self::status_from(worker_stalled, qdrant_health.is_ok());
 
         let elapsed = start.elapsed().as_millis();
         if worker_stalled {
@@ -643,8 +675,7 @@ impl HealthChecker {
 
         json!({
             "status": status,
-            // Build identity so any consumer can answer "is build X live?"
-            // without cluster access (#70). null when the build didn't pass it.
+            // "is build X live?" without cluster access (#70)
             "version": build_info::version(),
             "git_sha": build_info::git_sha(),
             "built_at": build_info::built_at(),
@@ -1633,8 +1664,8 @@ async fn shutdown_signal() {
 async fn health(
     axum::extract::State(checker): axum::extract::State<HealthChecker>,
 ) -> (StatusCode, Json<Value>) {
-    let v = checker.check().await;
-    (health_code(&v), Json(json!({ "status": v["status"] })))
+    let v = checker.check_status().await;
+    (health_code(&v), Json(v))
 }
 
 /// Authenticated operator view: the full health document, including build
@@ -2404,6 +2435,27 @@ mod wedge_tests {
         assert_eq!(v["status"], "degraded");
         assert_eq!(v["worker"]["state"], "starting");
         assert_eq!(v["worker"]["stalled"], false);
+    }
+
+    /// check_status() preserves the #63 tri-state contract and carries no
+    /// fields beyond `status` — proving the bare probe does zero count/graph
+    /// I/O by construction (#78).
+    #[tokio::test]
+    async fn check_status_preserves_tri_state_and_carries_only_status() {
+        // Fresh worker, unreachable backends → degraded (200).
+        let v = test_checker(epoch_secs()).check_status().await;
+        assert_eq!(v["status"], "degraded");
+        assert_eq!(v.as_object().unwrap().len(), 1, "bare probe leaked fields");
+
+        // Stale worker → unhealthy (503).
+        let v = test_checker(epoch_secs() - 3600).check_status().await;
+        assert_eq!(v["status"], "unhealthy");
+        assert_eq!(v.as_object().unwrap().len(), 1);
+
+        // Bootstrap sentinel → degraded, not a stall.
+        let v = test_checker(0).check_status().await;
+        assert_eq!(v["status"], "degraded");
+        assert_eq!(v.as_object().unwrap().len(), 1);
     }
 
     // ─── /health split (#77) ────────────────────────────────────────────────
