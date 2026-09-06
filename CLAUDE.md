@@ -195,3 +195,19 @@ These were discovered during integration testing and are NOT documented in Falko
 7. **OTLP tracing** — Wired but degraded (reqwest async client issue in container, falls back to stderr)
 8. **Prajna integration** — Replace writer.rs qdrant-client with Ālaya HTTP calls
 9. **cachekit-rs integration** — Embedding cache for edge performance (immutable, content-addressed)
+
+## Agent skills
+
+### Issue tracker
+
+Multica is the primary execution tracker (project `alaya`, identifiers `LAB-NNNN`); GitHub
+issues on `27b-io/alaya` are the public commentary surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Multica's native vocabulary — `needs-grooming` / `needs-info` / `ready-for-todo`, with
+human-vs-agent as assignee type and won't-fix as `cancelled`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
