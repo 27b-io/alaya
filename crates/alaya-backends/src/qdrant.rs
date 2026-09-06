@@ -27,13 +27,16 @@ pub struct QdrantClient {
     base_url: String,
     collection: String,
     tag_collection: String,
-    /// Serialises the multi-request write sections (`store`: retrieve→PUT;
-    /// `patch_memory`: read→delete→set). The service is single-threaded but
-    /// cooperative: enrichment runs in spawned tasks that call `patch_memory`
-    /// directly, so without this a task yielding between two Qdrant requests
-    /// lets another writer re-insert a summary vector that is being
-    /// invalidated, leaving `summary` and `summary_embedding` mismatched
-    /// (alaya#86). Reads never take it.
+    /// Serialises every write to the memories collection. `store` replaces
+    /// the whole payload from a snapshot, so any write that lands between its
+    /// retrieve and its PUT is rolled back: a supersession marker, an access
+    /// increment, a summary vector, even a delete (the PUT would resurrect
+    /// the point). The service is single-threaded but cooperative, and
+    /// spawned tasks (enrichment, duplicate merge, access increments) call
+    /// this client outside the worker's serialised loop, so the exclusion
+    /// has to live here. Held by `store`, `patch_memory`,
+    /// `update_metadata_batch`, `increment_access_count{,_batch}` and
+    /// `delete`; reads never take it (alaya#86).
     write_lock: futures::lock::Mutex<()>,
 }
 
@@ -452,8 +455,8 @@ impl VectorStorage for QdrantClient {
             .as_ref()
             .ok_or_else(|| AlayaError::Validation("memory has no embedding".into()))?;
 
-        // Held through the PUT so no `patch_memory` can land between the
-        // retrieve and the write (see `write_lock`).
+        // Held through the PUT so no other write can land between the
+        // retrieve and the PUT that would replace it (see `write_lock`).
         let _write = self.write_lock.lock().await;
 
         // Qdrant upsert replaces the payload wholesale and the point id is
@@ -582,6 +585,9 @@ impl VectorStorage for QdrantClient {
 
     async fn delete(&self, content_hash: &str) -> Result<bool> {
         let point_id = hash_to_uuid(content_hash)?;
+        // Ordered against `store`: a PUT from a pre-delete snapshot would
+        // resurrect the point (see `write_lock`).
+        let _write = self.write_lock.lock().await;
 
         let body = json!({
             "points": [point_id]
@@ -617,6 +623,11 @@ impl VectorStorage for QdrantClient {
         if content_hashes.is_empty() {
             return Ok(());
         }
+
+        // Ordered against `store`: its whole-payload PUT from a snapshot
+        // taken before these writes would roll both of them back (see
+        // `write_lock`).
+        let _write = self.write_lock.lock().await;
 
         let point_ids: Vec<String> = content_hashes
             .iter()
@@ -1124,7 +1135,10 @@ impl VectorStorage for QdrantClient {
     }
 
     async fn increment_access_count(&self, content_hash: &str) -> Result<()> {
-        // Read current value, increment, write back
+        // Read current value, increment, write back. Locked so a concurrent
+        // `store` snapshot cannot roll the increment back, and so two
+        // increments cannot lose one another (see `write_lock`).
+        let _write = self.write_lock.lock().await;
         let memory = self.get_by_hash(content_hash).await?;
         let Some(memory) = memory else {
             return Ok(());
@@ -1172,6 +1186,9 @@ impl VectorStorage for QdrantClient {
         if content_hashes.is_empty() {
             return Ok(());
         }
+
+        // See `increment_access_count` and `write_lock`.
+        let _write = self.write_lock.lock().await;
 
         // Single batch GET instead of N individual GETs
         let memories = match self.get_batch(content_hashes).await {

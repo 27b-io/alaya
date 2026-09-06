@@ -7,8 +7,9 @@
 //! carries that history over, and reports `created: false`.
 
 use alaya_backends::{VectorStorage, qdrant::QdrantClient};
-use alaya_types::memory::{Memory, PatchMemoryRequest};
+use alaya_types::memory::{Memory, MetadataUpdate, PatchMemoryRequest};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::time::Duration;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -16,6 +17,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const POINTS_PATH: &str = "/collections/memories/points";
 const PAYLOAD_PATH: &str = "/collections/memories/points/payload";
 const PAYLOAD_DELETE_PATH: &str = "/collections/memories/points/payload/delete";
+const POINTS_DELETE_PATH: &str = "/collections/memories/points/delete";
 
 fn client_for(server: &MockServer) -> QdrantClient {
     QdrantClient::new(server.uri(), "memories".into(), None)
@@ -533,5 +535,153 @@ async fn concurrent_store_cannot_land_inside_a_patch_invalidation() {
             format!("PUT {POINTS_PATH}"),
         ],
         "the store's PUT must not fall between the patch's delete and set"
+    );
+}
+
+/// Park a `store` inside its retrieve→PUT window: only the FIRST retrieve
+/// (the store's) is delayed, so a second writer's own reads are instant and,
+/// unlocked, its writes land inside the window where the store's
+/// whole-payload PUT would roll them back. With the lock the PUT comes first.
+async fn store_race_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(POINTS_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"status": "ok", "result": [point_with_summary("summary A")]}))
+                .set_delay(Duration::from_millis(400)),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount_retrieve(&server, vec![point_with_summary("summary A")]).await;
+    mount_upsert_ok(&server).await;
+    mount_ok(&server, PAYLOAD_PATH).await;
+    mount_ok(&server, POINTS_DELETE_PATH).await;
+    server
+}
+
+/// Every request except retrieves, in arrival order, as "METHOD path".
+async fn write_order(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| !(r.method == "POST" && r.url.path() == POINTS_PATH))
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect()
+}
+
+/// Helly R's fourth finding: a spawned duplicate-merge supersedes D while a
+/// re-store of D is between retrieve and PUT; unlocked, the PUT wipes both
+/// the marker and the reason and D reappears as live.
+#[tokio::test]
+async fn concurrent_supersession_cannot_land_inside_a_restore() {
+    let server = store_race_server().await;
+    let client = client_for(&server);
+    let hash = "a".repeat(64);
+    let mem = incoming();
+
+    let restore = client.store(&mem);
+    let supersede = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut extra = HashMap::new();
+        extra.insert("supersession_reason".to_string(), json!("merged"));
+        client
+            .update_metadata_batch(
+                &[hash.as_str()],
+                MetadataUpdate {
+                    superseded_by: Some("b".repeat(64)),
+                    extra: Some(extra),
+                    ..Default::default()
+                },
+            )
+            .await
+    };
+    let (a, b) = tokio::join!(restore, supersede);
+    a.expect("store succeeds");
+    b.expect("supersede succeeds");
+
+    assert_eq!(
+        write_order(&server).await,
+        vec![
+            format!("PUT {POINTS_PATH}"),
+            format!("POST {PAYLOAD_PATH}"),
+            format!("POST {PAYLOAD_PATH}"),
+        ],
+        "supersession writes must not fall inside the store's retrieve→PUT window"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_access_increment_cannot_land_inside_a_restore() {
+    let server = store_race_server().await;
+    let client = client_for(&server);
+    let hash = "a".repeat(64);
+    let mem = incoming();
+
+    let restore = client.store(&mem);
+    let bump = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.increment_access_count(&hash).await
+    };
+    let (a, b) = tokio::join!(restore, bump);
+    a.expect("store succeeds");
+    b.expect("increment succeeds");
+
+    assert_eq!(
+        write_order(&server).await,
+        vec![format!("PUT {POINTS_PATH}"), format!("POST {PAYLOAD_PATH}")],
+        "an access increment must not be rolled back by a store snapshot"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_batch_access_increment_cannot_land_inside_a_restore() {
+    let server = store_race_server().await;
+    let client = client_for(&server);
+    let hash = "a".repeat(64);
+    let mem = incoming();
+
+    let restore = client.store(&mem);
+    let bump = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.increment_access_count_batch(&[hash.as_str()]).await
+    };
+    let (a, b) = tokio::join!(restore, bump);
+    a.expect("store succeeds");
+    b.expect("batch increment succeeds");
+
+    assert_eq!(
+        write_order(&server).await,
+        vec![format!("PUT {POINTS_PATH}"), format!("POST {PAYLOAD_PATH}")],
+        "a batch access increment must not be rolled back by a store snapshot"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_delete_cannot_land_inside_a_restore() {
+    let server = store_race_server().await;
+    let client = client_for(&server);
+    let hash = "a".repeat(64);
+    let mem = incoming();
+
+    let restore = client.store(&mem);
+    let remove = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.delete(&hash).await
+    };
+    let (a, b) = tokio::join!(restore, remove);
+    a.expect("store succeeds");
+    b.expect("delete succeeds");
+
+    assert_eq!(
+        write_order(&server).await,
+        vec![
+            format!("PUT {POINTS_PATH}"),
+            format!("POST {POINTS_DELETE_PATH}")
+        ],
+        "a store snapshot must not resurrect a point deleted inside its window"
     );
 }
