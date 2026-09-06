@@ -1137,7 +1137,10 @@ impl VectorStorage for QdrantClient {
     async fn increment_access_count(&self, content_hash: &str) -> Result<()> {
         // Read current value, increment, write back. Locked so a concurrent
         // `store` snapshot cannot roll the increment back, and so two
-        // increments cannot lose one another (see `write_lock`).
+        // increments cannot lose one another (see `write_lock`). The write
+        // must use `wait=true`: without it Qdrant acknowledges before
+        // applying, the lock is released early, and the next locked reader
+        // still sees the old count.
         let _write = self.write_lock.lock().await;
         let memory = self.get_by_hash(content_hash).await?;
         let Some(memory) = memory else {
@@ -1166,7 +1169,7 @@ impl VectorStorage for QdrantClient {
         let resp = self
             .client
             .post(format!(
-                "{}/collections/{}/points/payload",
+                "{}/collections/{}/points/payload?wait=true",
                 self.base_url, self.collection
             ))
             .json(&body)
@@ -1230,7 +1233,7 @@ impl VectorStorage for QdrantClient {
             let resp = self
                 .client
                 .post(format!(
-                    "{}/collections/{}/points/payload",
+                    "{}/collections/{}/points/payload?wait=true",
                     self.base_url, self.collection
                 ))
                 .json(&body)

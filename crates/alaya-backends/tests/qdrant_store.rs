@@ -11,7 +11,7 @@ use alaya_types::memory::{Memory, MetadataUpdate, PatchMemoryRequest};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::time::Duration;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const POINTS_PATH: &str = "/collections/memories/points";
@@ -77,6 +77,7 @@ async fn mount_retrieve(server: &MockServer, points: Vec<Value>) {
 async fn mount_upsert_ok(server: &MockServer) {
     Mock::given(method("PUT"))
         .and(path(POINTS_PATH))
+        .and(query_param("wait", "true"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({"status": "ok", "result": {"status": "completed"}})),
@@ -292,9 +293,13 @@ async fn store_keeps_summary_embedding_only_while_summary_unchanged() {
     assert!(payload.get("summary_embedding").is_none());
 }
 
+/// Every write mock requires `wait=true`: a writer that returns on Qdrant's
+/// acknowledgement rather than application would release the client's write
+/// lock before its write is visible, so such a request must not match.
 async fn mount_ok(server: &MockServer, p: &str) {
     Mock::given(method("POST"))
         .and(path(p))
+        .and(query_param("wait", "true"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({"status": "ok", "result": {"status": "completed"}})),
@@ -442,6 +447,7 @@ async fn race_server() -> MockServer {
     mount_retrieve(&server, vec![point_with_summary("summary A")]).await;
     Mock::given(method("POST"))
         .and(path(PAYLOAD_DELETE_PATH))
+        .and(query_param("wait", "true"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({"status": "ok", "result": {"status": "completed"}}))
