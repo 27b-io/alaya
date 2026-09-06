@@ -83,6 +83,19 @@ pub trait VectorStorage {
     /// (invalidate first) is not concurrency-safety (alaya#86).
     async fn patch_memory(&self, content_hash: &str, patch: &PatchMemoryRequest) -> Result<Memory>;
 
+    /// Commit a server-generated summary (and its embedding) only if the
+    /// record still has no summary. The check and the write happen under the
+    /// same exclusion as every other write, so a background job that started
+    /// before a caller supplied a summary can never overwrite it: a caller's
+    /// summary always wins. Returns whether the generated summary was applied
+    /// (alaya#86).
+    async fn set_generated_summary(
+        &self,
+        content_hash: &str,
+        summary: &str,
+        summary_embedding: Option<Vec<f32>>,
+    ) -> Result<bool>;
+
     // Vector search
     async fn search_by_vector(
         &self,

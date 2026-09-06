@@ -699,3 +699,37 @@ async fn concurrent_delete_cannot_land_inside_a_restore() {
         "a store snapshot must not resurrect a point deleted inside its window"
     );
 }
+
+/// `set_generated_summary` decides under the write lock whether the record
+/// still lacks a summary: a caller summary that landed first always wins.
+#[tokio::test]
+async fn generated_summary_commits_only_while_summary_is_absent() {
+    let absent = MockServer::start().await;
+    mount_retrieve(&absent, vec![existing_point()]).await;
+    mount_ok(&absent, PAYLOAD_PATH).await;
+    let applied = client_for(&absent)
+        .set_generated_summary(&"a".repeat(64), "generated A", Some(vec![0.5, 0.75]))
+        .await
+        .expect("commit succeeds");
+    assert!(applied);
+    let writes = payload_writes(&absent).await;
+    assert_eq!(writes.len(), 1, "exactly one set-payload: {writes:?}");
+    assert_eq!(writes[0].1["payload"]["summary"], json!("generated A"));
+    assert_eq!(
+        writes[0].1["payload"]["summary_embedding"],
+        json!([0.5, 0.75])
+    );
+
+    let present = MockServer::start().await;
+    mount_retrieve(&present, vec![point_with_summary("caller B")]).await;
+    mount_ok(&present, PAYLOAD_PATH).await;
+    let applied = client_for(&present)
+        .set_generated_summary(&"a".repeat(64), "generated A", Some(vec![0.5, 0.75]))
+        .await
+        .expect("no-op succeeds");
+    assert!(!applied, "a caller summary that landed first must win");
+    assert!(
+        write_order(&present).await.is_empty(),
+        "nothing may be written over a caller summary"
+    );
+}

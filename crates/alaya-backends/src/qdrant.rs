@@ -106,6 +106,86 @@ impl QdrantClient {
         Ok(())
     }
 
+    /// The write half of `patch_memory`: the caller holds `write_lock` and
+    /// passes the record it read under it.
+    async fn patch_locked(
+        &self,
+        point_id: &str,
+        existing: &Memory,
+        patch: &PatchMemoryRequest,
+    ) -> Result<()> {
+        // Build set_payload with only the provided fields
+        let mut payload = serde_json::Map::new();
+
+        if let Some(ref tags) = patch.tags {
+            payload.insert("tags".into(), json!(tags));
+        }
+        if let Some(ref summary) = patch.summary {
+            payload.insert("summary".into(), json!(summary));
+        }
+        if let Some(ref memory_type) = patch.memory_type {
+            payload.insert("memory_type".into(), json!(memory_type));
+        }
+        if let Some(ref se) = patch.summary_embedding {
+            payload.insert("summary_embedding".into(), json!(se));
+        }
+
+        // Metadata merge: apply incoming keys, delete null keys
+        if let Some(ref incoming) = patch.metadata {
+            let mut merged = existing.metadata.clone().unwrap_or_default();
+            for (k, v) in incoming {
+                if v.is_null() {
+                    merged.remove(k);
+                } else {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+            payload.insert("metadata".into(), json!(merged));
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        payload.insert("updated_at".into(), json!(now));
+
+        // summary_embedding is derived from the summary text. A patch that
+        // changes the text without a replacement vector must remove the old
+        // one, or the record carries an embedding of text it no longer holds
+        // and every later re-store faithfully preserves that stale pair (see
+        // `store`). Delete FIRST: if the process dies between the two writes
+        // the record is un-enriched but consistent, never stale.
+        if let Some(new_summary) = &patch.summary
+            && patch.summary_embedding.is_none()
+            && existing.summary.as_deref() != Some(new_summary.as_str())
+        {
+            self.delete_payload_keys(point_id, &["summary_embedding"])
+                .await?;
+        }
+
+        let body = json!({
+            "payload": payload,
+            "points": [point_id],
+        });
+
+        let resp = self
+            .client
+            .post(format!(
+                "{}/collections/{}/points/payload?wait=true",
+                self.base_url, self.collection
+            ))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(qdrant_error(resp).await);
+        }
+
+        Ok(())
+    }
+
     /// Ensure the memory collections exist, creating any that are absent with
     /// the configured vector size and Cosine distance. Idempotent — an existing
     /// collection is left untouched (never recreated, so no data is dropped).
@@ -665,8 +745,7 @@ impl VectorStorage for QdrantClient {
         let point_id = hash_to_uuid(content_hash)?;
 
         // Held through the final read-back so the read→delete→set sequence
-        // below cannot interleave with another `patch_memory` or a `store`
-        // (see `write_lock`).
+        // cannot interleave with any other write (see `write_lock`).
         let _write = self.write_lock.lock().await;
 
         // Verify the memory exists before any writes. Also needed for metadata merge.
@@ -675,79 +754,41 @@ impl VectorStorage for QdrantClient {
             .await?
             .ok_or_else(|| AlayaError::NotFound(format!("memory {content_hash} not found")))?;
 
-        // Build set_payload with only the provided fields
-        let mut payload = serde_json::Map::new();
-
-        if let Some(ref tags) = patch.tags {
-            payload.insert("tags".into(), json!(tags));
-        }
-        if let Some(ref summary) = patch.summary {
-            payload.insert("summary".into(), json!(summary));
-        }
-        if let Some(ref memory_type) = patch.memory_type {
-            payload.insert("memory_type".into(), json!(memory_type));
-        }
-        if let Some(ref se) = patch.summary_embedding {
-            payload.insert("summary_embedding".into(), json!(se));
-        }
-
-        // Metadata merge: apply incoming keys, delete null keys
-        if let Some(ref incoming) = patch.metadata {
-            let mut merged = existing.metadata.clone().unwrap_or_default();
-            for (k, v) in incoming {
-                if v.is_null() {
-                    merged.remove(k);
-                } else {
-                    merged.insert(k.clone(), v.clone());
-                }
-            }
-            payload.insert("metadata".into(), json!(merged));
-        }
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        payload.insert("updated_at".into(), json!(now));
-
-        // summary_embedding is derived from the summary text. A patch that
-        // changes the text without a replacement vector must remove the old
-        // one, or the record carries an embedding of text it no longer holds
-        // and every later re-store faithfully preserves that stale pair (see
-        // `store`). Delete FIRST: if the process dies between the two writes
-        // the record is un-enriched but consistent, never stale.
-        if let Some(new_summary) = &patch.summary
-            && patch.summary_embedding.is_none()
-            && existing.summary.as_deref() != Some(new_summary.as_str())
-        {
-            self.delete_payload_keys(&point_id, &["summary_embedding"])
-                .await?;
-        }
-
-        let body = json!({
-            "payload": payload,
-            "points": [point_id],
-        });
-
-        let resp = self
-            .client
-            .post(format!(
-                "{}/collections/{}/points/payload?wait=true",
-                self.base_url, self.collection
-            ))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(qdrant_error(resp).await);
-        }
+        self.patch_locked(&point_id, &existing, patch).await?;
 
         // Return the updated memory
         self.get_by_hash(content_hash)
             .await?
             .ok_or_else(|| AlayaError::NotFound(format!("memory {content_hash} not found")))
+    }
+
+    async fn set_generated_summary(
+        &self,
+        content_hash: &str,
+        summary: &str,
+        summary_embedding: Option<Vec<f32>>,
+    ) -> Result<bool> {
+        let point_id = hash_to_uuid(content_hash)?;
+        let _write = self.write_lock.lock().await;
+        let existing = self
+            .get_by_hash(content_hash)
+            .await?
+            .ok_or_else(|| AlayaError::NotFound(format!("memory {content_hash} not found")))?;
+
+        // Decided under the lock: a caller summary that landed after the
+        // background job started wins, and nothing can land between this
+        // read and the write below.
+        if existing.summary.is_some() {
+            return Ok(false);
+        }
+
+        let patch = PatchMemoryRequest {
+            summary: Some(summary.to_string()),
+            summary_embedding,
+            ..Default::default()
+        };
+        self.patch_locked(&point_id, &existing, &patch).await?;
+        Ok(true)
     }
 
     #[tracing::instrument(skip(self, embedding, filters), fields(limit))]

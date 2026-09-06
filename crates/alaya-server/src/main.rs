@@ -46,7 +46,6 @@ use alaya_backends::{
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{MemoryService, OutputMode, RelationParams, SearchParams, StoreParams};
 use alaya_types::memory::PatchMemoryRequest;
-use alaya_types::search::PromptName;
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -883,7 +882,7 @@ async fn service_worker(
                             let hash_owned = full_hash.to_string();
                             let svc = svc.clone();
                             tokio::task::spawn_local(async move {
-                                enrich_summary(&svc, &hash_owned, &content).await;
+                                svc.enrich_summary(&hash_owned, &content).await;
                             });
                         }
 
@@ -1263,7 +1262,7 @@ async fn service_worker(
 
                         // Generate summaries sequentially (avoid API rate limits)
                         for (hash, content) in &targets {
-                            enrich_summary(&svc, hash, content).await;
+                            svc.enrich_summary(hash, content).await;
                         }
                         tracing::info!(queued, "backfill summaries complete");
                     }
@@ -1281,47 +1280,6 @@ async fn service_worker(
 /// Fire-and-forget summary generation helper.
 /// Called from spawn_local — logs errors, never panics.
 /// Generates summary text AND its embedding for search boosting.
-async fn enrich_summary(svc: &MemoryService, hash: &str, content: &str) {
-    let Some(ref summarizer) = svc.summary else {
-        return;
-    };
-    let h = &hash[..8.min(hash.len())];
-    match summarizer.summarize(content).await {
-        Ok(summary) => {
-            // Embed the summary for search boost (non-fatal if it fails)
-            let summary_embedding = match svc
-                .embeddings
-                .embed_batch(&[summary.as_str()], PromptName::Passage)
-                .await
-            {
-                Ok(mut embs) if !embs.is_empty() => Some(embs.remove(0)),
-                Ok(_) => {
-                    tracing::warn!(hash = h, "summary embedding returned empty (non-fatal)");
-                    None
-                }
-                Err(e) => {
-                    tracing::warn!(hash = h, "summary embedding failed (non-fatal): {e}");
-                    None
-                }
-            };
-
-            let patch = PatchMemoryRequest {
-                summary: Some(summary),
-                summary_embedding,
-                ..Default::default()
-            };
-            if let Err(e) = svc.patch_memory(hash, &patch).await {
-                tracing::warn!(hash = h, "summary patch failed (non-fatal): {e}");
-            } else {
-                tracing::debug!(hash = h, "auto-summary + embedding applied");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(hash = h, "summary generation failed (non-fatal): {e}");
-        }
-    }
-}
-
 fn ms(start: std::time::Instant) -> u64 {
     start.elapsed().as_millis() as u64
 }
@@ -2106,6 +2064,14 @@ mod wedge_tests {
             unimplemented!()
         }
         async fn exists(&self, _content_hash: &str) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn set_generated_summary(
+            &self,
+            _content_hash: &str,
+            _summary: &str,
+            _summary_embedding: Option<Vec<f32>>,
+        ) -> Result<bool> {
             unimplemented!()
         }
         async fn get_batch(&self, _hashes: &[&str]) -> Result<Vec<Memory>> {
