@@ -214,6 +214,8 @@ Content-Type: application/json
 
 Updatable fields: `summary`, `tags`, `metadata`. Content and `content_hash` are immutable by design — to change content, store a new memory and supersede the old.
 
+Changing `summary` also drops the stored summary embedding (the hybrid-search boost vector) so the two never disagree; the boost returns when the summary is next generated server-side.
+
 | Status | Meaning |
 |:--|:--|
 | `200 OK` | Updated. Response echoes the new state. |

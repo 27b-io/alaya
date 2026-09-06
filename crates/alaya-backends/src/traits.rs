@@ -20,7 +20,32 @@ use alaya_types::{
 #[async_trait(?Send)]
 pub trait VectorStorage {
     // Core CRUD
+
+    /// Upsert a memory keyed by `content_hash`.
+    ///
+    /// Returns `(created, content_hash)`. `created` is `false` when a point
+    /// with the same `content_hash` already existed, whether or not its
+    /// stored payload still parses as a `Memory`. On that path the
+    /// implementation MUST carry the existing point's server-maintained
+    /// fields over the caller's values — `created_at`, `access_count`,
+    /// `access_timestamps`, `supersession_reason`, `metadata.superseded_by`,
+    /// and `summary_embedding` for as long as `summary` is unchanged — so a
+    /// re-store never zeroes ranking inputs, resurrects a superseded memory,
+    /// or silently drops derived retrieval state (alaya#86). Every other
+    /// payload field is written from `memory` as given and fields absent on
+    /// `memory` are removed; `updated_at` is therefore whatever the caller
+    /// set. Because the write replaces the whole payload from that snapshot,
+    /// the retrieve→write section MUST be mutually exclusive with every
+    /// other write on the same client (`patch_memory`, `update_metadata*`,
+    /// `increment_access_count*`, `delete`): a write landing inside it would
+    /// be silently rolled back, and a delete would be undone.
     async fn store(&self, memory: &Memory) -> Result<(bool, String)>;
+    /// Whether a point with this `content_hash` exists, judged exactly as
+    /// `store` judges it: raw point presence, not whether the payload still
+    /// parses as a `Memory`. Authorization (read-only principals may only
+    /// add) relies on this agreeing with `store`'s `created` result, so an
+    /// implementation MUST answer from the same source `store` reads.
+    async fn exists(&self, content_hash: &str) -> Result<bool>;
     async fn get_by_hash(&self, content_hash: &str) -> Result<Option<Memory>>;
     async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>>;
     async fn delete(&self, content_hash: &str) -> Result<bool>;
@@ -48,7 +73,28 @@ pub trait VectorStorage {
     /// Updates only the provided fields, sets `updated_at`, and returns the
     /// full updated memory. Metadata merge: incoming keys are merged into
     /// existing metadata; keys with JSON `null` values are deleted.
+    ///
+    /// `summary_embedding` is derived from `summary`: a patch that changes
+    /// `summary` without supplying `summary_embedding` MUST remove the stored
+    /// embedding, so the pair is never stale and `store`'s carry-over rule
+    /// (keep the embedding while the summary is unchanged) stays sound. The
+    /// read→invalidate→write sequence MUST be mutually exclusive with other
+    /// `patch_memory` and `store` calls on the same client; crash-safety
+    /// (invalidate first) is not concurrency-safety (alaya#86).
     async fn patch_memory(&self, content_hash: &str, patch: &PatchMemoryRequest) -> Result<Memory>;
+
+    /// Commit a server-generated summary (and its embedding) only if the
+    /// record still has no summary. The check and the write happen under the
+    /// same exclusion as every other write, so a background job that started
+    /// before a caller supplied a summary can never overwrite it: a caller's
+    /// summary always wins. Returns whether the generated summary was applied
+    /// (alaya#86).
+    async fn set_generated_summary(
+        &self,
+        content_hash: &str,
+        summary: &str,
+        summary_embedding: Option<Vec<f32>>,
+    ) -> Result<bool>;
 
     // Vector search
     async fn search_by_vector(
