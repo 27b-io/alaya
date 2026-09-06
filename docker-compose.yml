@@ -99,7 +99,8 @@ services:
         BUILT_AT: ${BUILT_AT:-}
     entrypoint: ["/usr/local/bin/alaya-bridge"]
     ports:
-      - "${BRIDGE_PORT:-8080}:8080"
+      # Loopback-only: the bridge runs DANGEROUSLY_ALLOW_UNAUTHENTICATED below.
+      - "127.0.0.1:${BRIDGE_PORT:-8080}:8080"
     environment:
       REDIS_URL: redis://falkordb:6379
       GRAPH_NAME: ${GRAPH_NAME:-memory_graph}
@@ -124,7 +125,8 @@ services:
     restart: unless-stopped
     entrypoint: ["/usr/local/bin/alaya-server"]
     ports:
-      - "${SERVER_PORT:-3001}:3001"
+      # Loopback-only: the server runs DANGEROUSLY_ALLOW_UNAUTHENTICATED below.
+      - "127.0.0.1:${SERVER_PORT:-3001}:3001"
     environment:
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-memories_arctic1024}
