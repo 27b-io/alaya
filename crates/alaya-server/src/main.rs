@@ -290,17 +290,7 @@ async fn init_l2_cache() -> Option<cachekit::CacheKit> {
     };
     match init {
         Ok(ck) => {
-            // Key-cutover announcement (LAB-372): interop/v1 keys replaced the
-            // legacy SHA-256 keys on 2026-08-08, invalidating the warm cache.
-            // Legacy entries (namespaced `alaya:embed:<model>:<dims>:<sha256>`)
-            // are orphaned and expire via their 30-day TTL; flush them to
-            // reclaim memory sooner (command in CLAUDE.md). One-time re-embed
-            // cost until the cache re-warms. Log removable after 2026-09-08.
-            tracing::info!(
-                backend = %backend,
-                "L2 embedding cache enabled — keys are cross-SDK interop/v1; legacy \
-                 SHA-256 entries are orphaned and expire via TTL (cutover 2026-08-08, LAB-372)"
-            );
+            tracing::info!(backend = %backend, "L2 embedding cache enabled");
             Some(ck)
         }
         Err(e) => {

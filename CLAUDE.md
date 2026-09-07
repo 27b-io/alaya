@@ -145,15 +145,7 @@ CACHEKIT_API_URL=                        # saas backend — default https://api.
 
 **L2 cache keys are cross-SDK interop/v1** (`alaya:embed:{blake2b256-hex}` over
 `[model, dims, prompt_name, text]`, un-namespaced client — a client namespace
-silently prefixes keys and breaks conformance). Cutover from legacy SHA-256
-keys 2026-08-08 (LAB-372): legacy `alaya:embed:<model>:<dims>:*` entries are
-orphaned and expire via their 30-day TTL; flush to reclaim memory sooner:
-`redis-cli --scan --pattern 'alaya:embed:*:*' | xargs -r redis-cli del`
-(the extra `:*` spares new interop keys, which have no colon after `embed:`;
-safe either way — worst case is a one-time re-embed). The flush command is
-Redis-backend only; with `CACHE_BACKEND=saas` rely on TTL expiry or
-provider-side cleanup (moot in practice — the SaaS backend shipped with the
-cutover, so it never held legacy keys).
+silently prefixes keys and breaks conformance).
 
 ## Key Design Decisions
 
