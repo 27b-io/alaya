@@ -114,6 +114,7 @@ pub(crate) fn mint(alg: Algorithm, kid: Option<&str>, claims: &TestClaims) -> St
 pub(crate) fn auth_state(api_key: Option<&str>, oidc_on: bool) -> crate::auth::AuthState {
     crate::auth::AuthState {
         api_key: api_key.map(str::to_string),
+        readonly_api_key: None,
         allow_unauthenticated: false,
         oidc: oidc_on.then(crate::oidc::OidcVerifier::test_with_rsa_key),
         public_base_url: "https://rs.test".to_string(),
