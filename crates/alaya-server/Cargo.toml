@@ -32,10 +32,10 @@ jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 subtle = "2"
 
 # OpenTelemetry (optional — enabled when OTEL_ENDPOINT is set)
-opentelemetry = "0.29"
-opentelemetry_sdk = { version = "0.29", features = ["rt-tokio-current-thread"] }
-opentelemetry-otlp = { version = "0.29", default-features = false, features = ["http-proto", "reqwest-client", "trace"] }
-tracing-opentelemetry = "0.30"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio-current-thread"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-client", "trace"] }
+tracing-opentelemetry = "0.33"
 
 [dev-dependencies]
 # test-util enables tokio's paused clock (start_paused) for the wedge

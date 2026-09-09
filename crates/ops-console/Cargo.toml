@@ -24,13 +24,13 @@ leptos = { version = "0.8", features = ["ssr"] }
 
 # Encrypted (private) cookie jar for sessions — AES-GCM via the cookie crate.
 # `form` adds multi-value form support (serde_html_form) for checkbox groups.
-axum-extra = { version = "0.10", features = ["cookie-private", "form"] }
+axum-extra = { version = "0.12", features = ["cookie-private", "form"] }
 
 # ID-token verification for the OIDC RP flow. Same version + crypto backend
 # as alaya-server (aws_lc_rs keeps RUSTSEC-2023-0071 `rsa` out of the tree).
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 
-base64 = "0.22"
+base64 = "0.23"
 rand = "0.9"
 url = "2"
 time = { version = "0.3", features = ["formatting"] }
