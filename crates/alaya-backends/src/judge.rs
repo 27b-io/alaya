@@ -178,10 +178,18 @@ impl RawVerdict {
                 self.confidence
             )));
         }
-        // A survivor is only meaningful when something has to give way.
+        // A survivor is only meaningful when something has to give way. A
+        // supersession *is* the claim that one side survives, so one without
+        // a survivor gives the operator (and Phase 2) nothing to act on: a
+        // deterministic failure, not a verdict. A contradiction may honestly
+        // leave the survivor open.
         let survivor = match self.verdict {
             Verdict::Coexist | Verdict::Unrelated => None,
-            Verdict::Contradiction | Verdict::Supersession => self.survivor,
+            Verdict::Contradiction => self.survivor,
+            Verdict::Supersession => Some(
+                self.survivor
+                    .ok_or_else(|| AlayaError::Judge("supersession without a survivor".into()))?,
+            ),
             // The schema's enum excludes it; a proxy that drops
             // `output_config` could let it through, and it is not the
             // model's to say.
@@ -225,6 +233,18 @@ mod tests {
             .unwrap();
         assert_eq!(j.verdict, Verdict::Supersession);
         assert_eq!(j.survivor, Some(Survivor::B));
+    }
+
+    #[test]
+    fn supersession_without_a_survivor_is_rejected_but_contradiction_may_leave_it_open() {
+        let e = raw(Verdict::Supersession, None, 0.9)
+            .validate("m".into(), Usage::default())
+            .unwrap_err();
+        assert!(matches!(e, AlayaError::Judge(_)), "{e:?}");
+        let j = raw(Verdict::Contradiction, None, 0.6)
+            .validate("m".into(), Usage::default())
+            .unwrap();
+        assert_eq!((j.verdict, j.survivor), (Verdict::Contradiction, None));
     }
 
     #[test]
