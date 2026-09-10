@@ -64,12 +64,29 @@ async fn golden_set_precision_recall() {
         "AC-8 requires ≥50 labelled pairs, fixture has {}",
         fixture.pairs.len()
     );
+    // A class with no labelled sample cannot be measured; say so up front
+    // rather than printing NaN and letting a reader miss it. Not a failure:
+    // the golden set is grown by human ratification, and the other classes
+    // are still worth measuring meanwhile.
+    let unmeasured: Vec<&str> = Verdict::CLASSES
+        .iter()
+        .filter(|c| !fixture.pairs.iter().any(|p| p.label == **c))
+        .map(|c| c.as_str())
+        .collect();
+    if !unmeasured.is_empty() {
+        println!("\n!! UNMEASURED CLASSES (no labelled pairs in the fixture): {unmeasured:?}");
+    }
 
     let alaya_url = env("ALAYA_URL");
     let alaya_key = env("ALAYA_API_KEY");
     let model = env("JUDGE_MODEL");
     let judge = JudgeClient::new(env("JUDGE_URL"), model.clone(), Some(env("JUDGE_API_KEY")));
-    let http = reqwest::Client::new();
+    // Test harness: a transport failure is a failed run, so `expect` is the
+    // right shape here; the timeout keeps a dead endpoint from hanging it.
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("reqwest client");
 
     // Fetch every distinct memory once.
     let mut hashes: Vec<&str> = fixture

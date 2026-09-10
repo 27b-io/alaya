@@ -149,10 +149,10 @@ Copy `.env.example` to `.env`. All settings have sensible defaults for local dev
 | `ALAYA_READONLY_API_KEY` | — | Read-only bearer for headless consumers (optional). Pure reads only (`search`, `get_memory`, contradictions, duplicate-find, health); 403 on every mutating route incl. `store`. Must differ from `ALAYA_API_KEY` |
 | `LISTEN_ADDR` | `0.0.0.0:3001` | Server bind address |
 | `REDIS_CACHE_URL` | — | L2 embedding cache (optional) |
-| `SUMMARY_URL` | — | Anthropic Messages API URL (optional) |
+| `SUMMARY_URL` | — | Anthropic API origin, e.g. `https://api.anthropic.com` or an in-cluster proxy (optional). The client appends `/v1/messages` — do not include the path |
 | `SUMMARY_API_KEY` | — | Required if `SUMMARY_URL` is set |
 | `SUMMARY_MODEL` | `claude-haiku-4-5-20251001` | Summary model |
-| `JUDGE_URL` | `SUMMARY_URL` | Contradiction judge Messages API URL (optional). Falls back to `SUMMARY_URL`; unset both to disable the judge |
+| `JUDGE_URL` | `SUMMARY_URL` | Contradiction judge API origin, same format as `SUMMARY_URL` (optional). Falls back to `SUMMARY_URL`; unset both to disable the judge |
 | `JUDGE_API_KEY` | `SUMMARY_API_KEY` | Falls back to `SUMMARY_API_KEY` |
 | `JUDGE_MODEL` | `SUMMARY_MODEL` | Model that judges `CONTRADICTS` pairs (advisory verdicts on the edge; never writes memories) |
 | `RERANK_URL` | — | TEI `/rerank` endpoint (empty = rerank disabled) |

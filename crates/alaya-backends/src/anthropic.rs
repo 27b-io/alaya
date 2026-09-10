@@ -19,12 +19,12 @@ pub(crate) const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Durat
 /// chars give sufficient signal without burning excess input tokens.
 pub(crate) const MAX_CONTENT_CHARS: usize = 4000;
 
-/// Truncate at a char boundary to avoid token waste on large memories.
+/// Keep the first `MAX_CONTENT_CHARS` characters (not bytes) to avoid token
+/// waste on large memories.
 pub(crate) fn truncate_chars(content: &str) -> &str {
-    if content.len() > MAX_CONTENT_CHARS {
-        &content[..content.floor_char_boundary(MAX_CONTENT_CHARS)]
-    } else {
-        content
+    match content.char_indices().nth(MAX_CONTENT_CHARS) {
+        Some((byte_idx, _)) => &content[..byte_idx],
+        None => content,
     }
 }
 
@@ -55,9 +55,14 @@ impl MessagesTransport {
 
         let builder = Client::builder().default_headers(headers);
 
+        // No redirects: reqwest strips `Authorization` on a cross-origin
+        // redirect but not a custom `x-api-key`, so a redirecting endpoint
+        // could exfiltrate the key. The Messages API never redirects; a 3xx
+        // surfaces as `Unavailable`.
         #[cfg(not(target_arch = "wasm32"))]
         let builder = builder
             .http1_only()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(request_timeout);
 
@@ -230,11 +235,13 @@ mod tests {
     }
 
     #[test]
-    fn truncate_respects_char_boundary() {
-        let s = "é".repeat(MAX_CONTENT_CHARS);
+    fn truncate_counts_characters_not_bytes() {
+        let s = "é".repeat(MAX_CONTENT_CHARS + 10);
         let t = truncate_chars(&s);
-        assert!(t.len() <= MAX_CONTENT_CHARS);
+        assert_eq!(t.chars().count(), MAX_CONTENT_CHARS);
         assert!(t.chars().all(|c| c == 'é'));
         assert_eq!(truncate_chars("short"), "short");
+        let exact = "a".repeat(MAX_CONTENT_CHARS);
+        assert_eq!(truncate_chars(&exact), exact);
     }
 }

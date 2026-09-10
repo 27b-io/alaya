@@ -204,6 +204,27 @@ fn is_private_host(url: &str) -> bool {
     }
 }
 
+/// Cluster-local or private: `is_private_host`, plus single-label hostnames
+/// (`http://anthropic-lb:8082`) — Kubernetes service DNS that never resolves
+/// off the cluster. Used only to decide whether plain HTTP with a credential
+/// deserves a startup warning; the auth gates use `is_private_host` alone.
+fn is_cluster_local(url: &str) -> bool {
+    is_private_host(url) || host_of(url).is_some_and(|h| !h.contains('.'))
+}
+
+/// A key sent over plain HTTP to a host that is not cluster-local is a
+/// credential on the wire. Not refused — an operator may front the API with
+/// an internal plaintext proxy — but never silent (CodeRabbit on alaya#93).
+fn warn_if_plaintext_credentials(var: &str, url: &str, has_api_key: bool) {
+    if has_api_key && url.starts_with("http://") && !is_cluster_local(url) {
+        tracing::warn!(
+            var,
+            url,
+            "API key will be sent over plain HTTP to a non-cluster host; use https://"
+        );
+    }
+}
+
 const L2_MAX_ATTEMPTS: u32 = 5;
 const L2_BASE_RETRY_MS: u64 = 500;
 
@@ -1480,10 +1501,17 @@ async fn backfill_judge(
     use futures::StreamExt;
     let outcomes: Vec<JudgeOutcome> = futures::stream::iter(pairs)
         .map(|p| async move {
-            let Ok(_permit) = gate.acquire().await else {
-                return JudgeOutcome::Unjudged { marked: false };
-            };
-            with_backoff(|| svc.judge_contradiction(&p.memory_a_hash, &p.memory_b_hash)).await
+            // Permit per attempt, not per pair: a rate-limit sleep inside
+            // `with_backoff` must not hold one of the four shared permits
+            // (four sleeping pairs would stall the pass and the store path).
+            with_backoff(|| async {
+                let Ok(_permit) = gate.acquire().await else {
+                    return JudgeOutcome::Unjudged { marked: false };
+                };
+                svc.judge_contradiction(&p.memory_a_hash, &p.memory_b_hash)
+                    .await
+            })
+            .await
         })
         .buffer_unordered(JUDGE_CONCURRENCY)
         .collect()
@@ -1729,6 +1757,11 @@ fn main() {
 
                 let summary: Option<Box<dyn alaya_backends::SummaryProvider>> =
                     if let Some(url) = &cfg_clone.summary_url {
+                        warn_if_plaintext_credentials(
+                            "SUMMARY_URL",
+                            url,
+                            cfg_clone.summary_api_key.is_some(),
+                        );
                         tracing::info!(
                             url = url.as_str(),
                             model = cfg_clone.summary_model.as_str(),
@@ -1755,6 +1788,11 @@ fn main() {
                 );
 
                 if let Some(url) = &cfg_clone.judge_url {
+                    warn_if_plaintext_credentials(
+                        "JUDGE_URL",
+                        url,
+                        cfg_clone.judge_api_key.is_some(),
+                    );
                     tracing::info!(
                         url = url.as_str(),
                         model = cfg_clone.judge_model.as_str(),
@@ -2438,6 +2476,26 @@ mod tests {
             "{out:?}"
         );
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn cluster_local_accepts_service_dns_and_private_hosts_only() {
+        for ok in [
+            "http://anthropic-lb:8082",
+            "http://alaya-bridge:3000",
+            "http://alaya-server.mcp.svc:3001",
+            "http://localhost:8082",
+            "http://10.43.144.201:8082",
+        ] {
+            assert!(is_cluster_local(ok), "{ok}");
+        }
+        for no in [
+            "http://api.anthropic.com",
+            "http://proxy.example.net:8082",
+            "http://1.2.3.4",
+        ] {
+            assert!(!is_cluster_local(no), "{no}");
+        }
     }
 
     #[test]

@@ -138,7 +138,7 @@ LISTEN_ADDR=0.0.0.0:3001
 RUST_LOG=alaya_server=info
 OTEL_EXPORTER_OTLP_ENDPOINT=http://phoenix-svc.recsys.svc:6006  # optional
 OTEL_SERVICE_NAME=alaya-server
-SUMMARY_URL=                             # optional — Anthropic Messages API (or anthropic-lb); empty disables auto-summary
+SUMMARY_URL=                             # optional — Anthropic API origin (https://api.anthropic.com or http://anthropic-lb:8082); client appends /v1/messages
 SUMMARY_API_KEY=
 SUMMARY_MODEL=claude-haiku-4-5-20251001
 JUDGE_URL=                               # contradiction judge; each JUDGE_* falls back to its SUMMARY_* twin
