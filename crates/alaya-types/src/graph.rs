@@ -70,6 +70,66 @@ pub struct Neighbor {
     pub hops: u32,
 }
 
+/// Machine verdict on a `CONTRADICTS` pair, produced by the contradiction
+/// judge (LAB-3283). Wire form is lowercase (`"coexist"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    /// Both claim to be current and cannot both be true.
+    Contradiction,
+    /// The newer memory replaces the older claim; a survivor is named.
+    Supersession,
+    /// Both are true (e.g. progress snapshots of the same work).
+    Coexist,
+    /// Shared vocabulary only; the pair is a detector false positive.
+    Unrelated,
+}
+
+impl Verdict {
+    pub const ALL: [Verdict; 4] = [
+        Verdict::Contradiction,
+        Verdict::Supersession,
+        Verdict::Coexist,
+        Verdict::Unrelated,
+    ];
+
+    /// Sentinel used on read surfaces for an edge with no verdict yet.
+    pub const UNJUDGED: &'static str = "unjudged";
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Contradiction => "contradiction",
+            Self::Supersession => "supersession",
+            Self::Coexist => "coexist",
+            Self::Unrelated => "unrelated",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == s)
+    }
+}
+
+/// Verdict fields as persisted on a `CONTRADICTS` edge. Field names are the
+/// edge property names, so this flattens 1:1 onto the bridge wire shape.
+/// Only `verdict` is required: a partially-written edge still reads as
+/// judged (not silently re-queued for backfill).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EdgeVerdict {
+    pub verdict: Verdict,
+    /// `content_hash` of the recommended survivor, when the verdict names one.
+    #[serde(default)]
+    pub verdict_survivor: Option<String>,
+    #[serde(default)]
+    pub verdict_reason: String,
+    #[serde(default)]
+    pub verdict_confidence: f64,
+    #[serde(default)]
+    pub verdict_model: String,
+    #[serde(default)]
+    pub judged_at: f64,
+}
+
 /// A contradiction pair from the dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contradiction {
@@ -77,6 +137,9 @@ pub struct Contradiction {
     pub memory_b_hash: String,
     pub confidence: Option<f64>,
     pub created_at: Option<f64>,
+    /// `None` = unjudged. Flattened so the wire shape stays flat.
+    #[serde(default, flatten, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<EdgeVerdict>,
 }
 
 /// Reference to a contradicting memory (used in search enrichment).

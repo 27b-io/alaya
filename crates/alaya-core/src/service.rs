@@ -9,6 +9,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use alaya_backends::{ContradictionJudge, Judgement, Survivor};
+use alaya_types::graph::{EdgeVerdict, Verdict};
+
 // ─── Tag deserialization ───────────────────────────────────────────────────────
 
 /// Accept `["a","b"]`, `"a, b"`, or `null` — always yields `Option<Vec<String>>`.
@@ -200,6 +203,28 @@ const SCORE_CAP: f64 = 1.5;
 /// signal for production (where boosts amplify it).
 const RRF_BLEND_WEIGHT: f64 = 0.4;
 
+/// `tracing` target of the contradiction-judge shadow log (LAB-3283 AC-4b).
+/// One event per judged pair with stable field names; Phase 2 promotion is
+/// decided on these events, so treat the field set as a contract.
+pub const SHADOW_LOG_TARGET: &str = "alaya::judge";
+
+/// Verdict filter applied by `memory_contradictions` when the caller passes
+/// none: genuine conflicts plus pairs the judge has not seen yet. Callers
+/// that want `coexist`/`unrelated` name them explicitly.
+pub const DEFAULT_VERDICT_FILTER: [&str; 3] = ["contradiction", "supersession", Verdict::UNJUDGED];
+
+/// Result of judging one CONTRADICTS pair.
+#[derive(Debug)]
+pub enum JudgeOutcome {
+    /// Verdict produced (and, graph permitting, persisted on the edge).
+    Judged(Judgement),
+    /// No verdict: judge disabled, endpoint missing, transport/parse/schema
+    /// failure. Nothing was written. The pair stays eligible for backfill.
+    Unjudged,
+    /// Upstream 429. Nothing was written; the caller owns any backoff.
+    RateLimited { retry_after_secs: Option<u64> },
+}
+
 pub struct MemoryService {
     pub vectors: Box<dyn VectorStorage>,
     pub embeddings: Box<dyn EmbeddingProvider>,
@@ -209,6 +234,10 @@ pub struct MemoryService {
     /// Optional summary generator. When set, summaries are auto-generated
     /// fire-and-forget after store when the caller omits one.
     pub summary: Option<Box<dyn SummaryProvider>>,
+    /// Optional contradiction judge (LAB-3283). When set, new CONTRADICTS
+    /// signals are judged fire-and-forget after store and the operator
+    /// backfill can annotate the existing queue. Advisory only in Phase 1.
+    pub judge: Option<Box<dyn ContradictionJudge>>,
     /// Optional cross-encoder reranker. When set, hybrid search re-scores
     /// the top-N RRF candidates as (query, doc) pairs and reorders them.
     pub reranker: Option<Box<dyn RerankingService>>,
@@ -235,6 +264,7 @@ impl MemoryService {
             hebbian,
             consolidation,
             summary,
+            judge: None,
             reranker: None,
             tag_cache: RefCell::new(None),
             clock: current_timestamp,
@@ -245,6 +275,12 @@ impl MemoryService {
     /// re-scores the top-N RRF candidates and reorders them.
     pub fn with_reranker(mut self, reranker: Box<dyn RerankingService>) -> Self {
         self.reranker = Some(reranker);
+        self
+    }
+
+    /// Builder: attach a contradiction judge (LAB-3283).
+    pub fn with_judge(mut self, judge: Box<dyn ContradictionJudge>) -> Self {
+        self.judge = Some(judge);
         self
     }
 
@@ -265,6 +301,7 @@ impl MemoryService {
             hebbian,
             consolidation,
             summary: None,
+            judge: None,
             reranker: None,
             tag_cache: RefCell::new(None),
             clock,
@@ -1679,11 +1716,145 @@ impl MemoryService {
         Ok(())
     }
 
+    // ─── Contradiction judge (LAB-3283, Phase 1: advisory) ──────────────
+
+    /// Judge one `src -> dst` CONTRADICTS pair, off the request path.
+    ///
+    /// Phase 1 is advisory: the verdict is written onto the edge (through
+    /// the `GraphService` trait, so scoping applies uniformly) and one
+    /// structured shadow-log event records the supersession the engine
+    /// *would* apply. No memory payload is touched and no edge is created
+    /// or deleted. Every failure is a logged `Unjudged`, never a panic —
+    /// this runs detached from any request.
+    pub async fn judge_contradiction(&self, src: &str, dst: &str) -> JudgeOutcome {
+        let Some(ref judge) = self.judge else {
+            return JudgeOutcome::Unjudged;
+        };
+        if !alaya_types::memory::validate_content_hash(src)
+            || !alaya_types::memory::validate_content_hash(dst)
+            || src == dst
+        {
+            tracing::warn!(
+                src_len = src.len(),
+                dst_len = dst.len(),
+                "judge_contradiction: invalid pair, skipping"
+            );
+            return JudgeOutcome::Unjudged;
+        }
+        let (sa, sd) = (&src[..8], &dst[..8]);
+
+        let batch = match self.vectors.get_batch(&[src, dst]).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(a = sa, b = sd, "judge_contradiction: fetch failed: {e}");
+                return JudgeOutcome::Unjudged;
+            }
+        };
+        let a = batch.iter().find(|m| m.content_hash == src);
+        let b = batch.iter().find(|m| m.content_hash == dst);
+        let (Some(a), Some(b)) = (a, b) else {
+            tracing::warn!(
+                a = sa,
+                b = sd,
+                "judge_contradiction: endpoint missing, skipping"
+            );
+            return JudgeOutcome::Unjudged;
+        };
+
+        let j = match judge.judge(a, b).await {
+            Ok(j) => j,
+            Err(AlayaError::RateLimited { retry_after_secs }) => {
+                tracing::warn!(a = sa, b = sd, retry_after_secs, "judge rate limited");
+                return JudgeOutcome::RateLimited { retry_after_secs };
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: SHADOW_LOG_TARGET,
+                    memory_a = src,
+                    memory_b = dst,
+                    verdict = Verdict::UNJUDGED,
+                    survivor = "none",
+                    would_supersede = "none",
+                    error = %e,
+                    "contradiction unjudged"
+                );
+                return JudgeOutcome::Unjudged;
+            }
+        };
+
+        let survivor = j.survivor.map(|s| match s {
+            Survivor::A => src.to_string(),
+            Survivor::B => dst.to_string(),
+        });
+        let edge = EdgeVerdict {
+            verdict: j.verdict,
+            verdict_survivor: survivor.clone(),
+            verdict_reason: j.reason.clone(),
+            verdict_confidence: j.confidence,
+            verdict_model: j.model.clone(),
+            judged_at: (self.clock)(),
+        };
+        match self.graph.set_contradiction_verdict(src, dst, &edge).await {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                a = sa,
+                b = sd,
+                "judge_contradiction: no CONTRADICTS edge matched; verdict not persisted"
+            ),
+            Err(e) => tracing::warn!(a = sa, b = sd, "verdict persist failed (non-fatal): {e}"),
+        }
+
+        // Shadow log (AC-4b): what Phase 2 would write. Only a supersession
+        // with a named survivor is actionable; everything else is "none".
+        let would_supersede = match (j.verdict, survivor.as_deref()) {
+            (Verdict::Supersession, Some(s)) => {
+                let loser = if s == src { dst } else { src };
+                format!("{loser} -> {s}")
+            }
+            _ => "none".to_string(),
+        };
+        tracing::info!(
+            target: SHADOW_LOG_TARGET,
+            memory_a = src,
+            memory_b = dst,
+            verdict = j.verdict.as_str(),
+            survivor = survivor.as_deref().unwrap_or("none"),
+            confidence = j.confidence,
+            model = %j.model,
+            would_supersede = %would_supersede,
+            input_tokens = j.input_tokens,
+            output_tokens = j.output_tokens,
+            reason = %j.reason,
+            "contradiction judged"
+        );
+        JudgeOutcome::Judged(j)
+    }
+
     // ─── Tool 7: memory_contradictions ──────────────────────────────────
 
+    /// List CONTRADICTS pairs with their judge verdicts.
+    ///
+    /// `include_resolved = false` hides pairs where either endpoint is
+    /// already superseded (filtered here, not in Qdrant — see
+    /// `is_superseded`). `verdicts` is passed through to the graph; `None`
+    /// applies `DEFAULT_VERDICT_FILTER`. `limit` bounds the graph fetch, so
+    /// the resolved filter can return fewer than `limit` pairs.
     #[tracing::instrument(skip(self))]
-    pub async fn memory_contradictions(&self, limit: usize) -> Result<Value> {
-        let pairs = self.graph.get_all_contradictions(limit).await?;
+    pub async fn memory_contradictions(
+        &self,
+        limit: usize,
+        include_resolved: bool,
+        verdicts: Option<&[String]>,
+    ) -> Result<Value> {
+        let default: Vec<String> = DEFAULT_VERDICT_FILTER
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let verdicts = verdicts.unwrap_or(&default);
+        let pairs = self
+            .graph
+            .get_all_contradictions(limit, Some(verdicts))
+            .await?;
 
         // Batch fetch all referenced memories (was: N+1 sequential queries)
         let all_hashes: Vec<&str> = pairs
@@ -1707,23 +1878,32 @@ impl MemoryService {
         for pair in &pairs {
             let a = lookup.get(pair.memory_a_hash.as_str());
             let b = lookup.get(pair.memory_b_hash.as_str());
+            let a_superseded = a.is_some_and(|m| is_superseded(m));
+            let b_superseded = b.is_some_and(|m| is_superseded(m));
+            if !include_resolved && (a_superseded || b_superseded) {
+                continue;
+            }
+            let v = pair.verdict.as_ref();
 
             enriched.push(serde_json::json!({
                 "memory_a_hash": pair.memory_a_hash,
                 "memory_b_hash": pair.memory_b_hash,
                 "confidence": pair.confidence,
+                "created_at": pair.created_at,
                 "memory_a_content": a.map(|m| {
                     m.summary.clone().unwrap_or_else(|| truncate(&m.content, 200))
                 }),
                 "memory_b_content": b.map(|m| {
                     m.summary.clone().unwrap_or_else(|| truncate(&m.content, 200))
                 }),
-                "memory_a_superseded": a.and_then(|m| {
-                    m.metadata.as_ref()?.get("superseded_by")
-                }).is_some(),
-                "memory_b_superseded": b.and_then(|m| {
-                    m.metadata.as_ref()?.get("superseded_by")
-                }).is_some(),
+                "memory_a_superseded": a_superseded,
+                "memory_b_superseded": b_superseded,
+                "verdict": v.map(|v| v.verdict.as_str()).unwrap_or(Verdict::UNJUDGED),
+                "verdict_reason": v.map(|v| v.verdict_reason.as_str()),
+                "survivor": v.and_then(|v| v.verdict_survivor.as_deref()),
+                "verdict_confidence": v.map(|v| v.verdict_confidence),
+                "verdict_model": v.map(|v| v.verdict_model.as_str()),
+                "judged_at": v.map(|v| v.judged_at),
             }));
         }
 
@@ -2308,8 +2488,20 @@ mod tests {
         ) -> Result<bool> {
             Ok(true)
         }
-        async fn get_all_contradictions(&self, _l: usize) -> Result<Vec<Contradiction>> {
+        async fn get_all_contradictions(
+            &self,
+            _l: usize,
+            _v: Option<&[String]>,
+        ) -> Result<Vec<Contradiction>> {
             Ok(vec![])
+        }
+        async fn set_contradiction_verdict(
+            &self,
+            _s: &str,
+            _d: &str,
+            _v: &alaya_types::graph::EdgeVerdict,
+        ) -> Result<bool> {
+            Ok(true)
         }
         async fn get_contradictions_for_hashes(
             &self,
@@ -2937,8 +3129,20 @@ mod tests {
         ) -> Result<bool> {
             Ok(true)
         }
-        async fn get_all_contradictions(&self, _l: usize) -> Result<Vec<Contradiction>> {
+        async fn get_all_contradictions(
+            &self,
+            _l: usize,
+            _v: Option<&[String]>,
+        ) -> Result<Vec<Contradiction>> {
             Ok(vec![])
+        }
+        async fn set_contradiction_verdict(
+            &self,
+            _s: &str,
+            _d: &str,
+            _v: &alaya_types::graph::EdgeVerdict,
+        ) -> Result<bool> {
+            Ok(true)
         }
         async fn get_contradictions_for_hashes(
             &self,
@@ -4051,8 +4255,20 @@ mod tests {
         ) -> Result<bool> {
             Ok(true)
         }
-        async fn get_all_contradictions(&self, _l: usize) -> Result<Vec<Contradiction>> {
+        async fn get_all_contradictions(
+            &self,
+            _l: usize,
+            _v: Option<&[String]>,
+        ) -> Result<Vec<Contradiction>> {
             Ok(vec![])
+        }
+        async fn set_contradiction_verdict(
+            &self,
+            _s: &str,
+            _d: &str,
+            _v: &alaya_types::graph::EdgeVerdict,
+        ) -> Result<bool> {
+            Ok(true)
         }
         async fn get_contradictions_for_hashes(
             &self,
@@ -4759,8 +4975,20 @@ mod tests {
             }
             Ok(edges.len())
         }
-        async fn get_all_contradictions(&self, _l: usize) -> Result<Vec<Contradiction>> {
+        async fn get_all_contradictions(
+            &self,
+            _l: usize,
+            _v: Option<&[String]>,
+        ) -> Result<Vec<Contradiction>> {
             Ok(vec![])
+        }
+        async fn set_contradiction_verdict(
+            &self,
+            _s: &str,
+            _d: &str,
+            _v: &alaya_types::graph::EdgeVerdict,
+        ) -> Result<bool> {
+            Ok(true)
         }
         async fn get_contradictions_for_hashes(
             &self,
@@ -5204,6 +5432,536 @@ mod tests {
                 hashes, all,
                 "{mode:?}: include_superseded=true must return all 10 memories"
             );
+        }
+    }
+
+    // ─── Contradiction judge (LAB-3283: AC-2 failure paths, AC-4, AC-4b) ──
+
+    mod judge_tests {
+        use super::*;
+        use crate::service::{JudgeOutcome, SHADOW_LOG_TARGET};
+        use alaya_backends::{ContradictionJudge, Judgement, Survivor};
+        use alaya_types::graph::{EdgeVerdict, Verdict};
+        use std::rc::Rc;
+        use std::sync::{Arc, Mutex};
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        fn src() -> String {
+            "a".repeat(64)
+        }
+        fn dst() -> String {
+            "b".repeat(64)
+        }
+
+        fn mem(hash: &str, created_at: f64) -> Memory {
+            Memory {
+                content: format!("content of {}", &hash[..4]),
+                content_hash: hash.to_string(),
+                tags: vec![],
+                memory_type: "note".into(),
+                metadata: None,
+                created_at,
+                updated_at: created_at,
+                embedding: None,
+                summary: None,
+                salience_score: 0.0,
+                access_count: 0,
+                access_timestamps: vec![],
+                emotional_valence: None,
+                encoding_context: None,
+                provenance: None,
+                summary_embedding: None,
+            }
+        }
+
+        enum Script {
+            Ok(Judgement),
+            Err(fn() -> AlayaError),
+            Hang,
+        }
+
+        struct ScriptedJudge(Script);
+
+        #[async_trait(?Send)]
+        impl ContradictionJudge for ScriptedJudge {
+            async fn judge(&self, _a: &Memory, _b: &Memory) -> Result<Judgement> {
+                match &self.0 {
+                    Script::Ok(j) => Ok(j.clone()),
+                    Script::Err(mk) => Err(mk()),
+                    Script::Hang => std::future::pending().await,
+                }
+            }
+        }
+
+        fn judgement(verdict: Verdict, survivor: Option<Survivor>) -> Judgement {
+            Judgement {
+                verdict,
+                survivor,
+                reason: "because".into(),
+                confidence: 0.9,
+                model: "test-model".into(),
+                input_tokens: 10,
+                output_tokens: 2,
+            }
+        }
+
+        /// Serves exactly the memories it was built with. Every write method
+        /// panics: the judge must never touch the vector store (AC-2, AC-4b).
+        struct PairVectors(Vec<Memory>);
+
+        #[async_trait(?Send)]
+        impl VectorStorage for PairVectors {
+            async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+                unreachable!("judge must never write to the vector store")
+            }
+            async fn exists(&self, h: &str) -> Result<bool> {
+                Ok(self.0.iter().any(|m| m.content_hash == h))
+            }
+            async fn get_by_hash(&self, h: &str) -> Result<Option<Memory>> {
+                Ok(self.0.iter().find(|m| m.content_hash == h).cloned())
+            }
+            async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>> {
+                Ok(self
+                    .0
+                    .iter()
+                    .filter(|m| hashes.contains(&m.content_hash.as_str()))
+                    .cloned()
+                    .collect())
+            }
+            async fn delete(&self, _h: &str) -> Result<bool> {
+                unreachable!("judge must never write to the vector store")
+            }
+            async fn update_metadata(&self, _h: &str, _u: MetadataUpdate) -> Result<()> {
+                unreachable!("judge must never write to the vector store")
+            }
+            async fn patch_memory(&self, _h: &str, _p: &PatchMemoryRequest) -> Result<Memory> {
+                unreachable!("judge must never write to the vector store")
+            }
+            async fn set_generated_summary(
+                &self,
+                _h: &str,
+                _s: &str,
+                _e: Option<Vec<f32>>,
+            ) -> Result<bool> {
+                unreachable!("judge must never write to the vector store")
+            }
+            async fn search_by_vector(
+                &self,
+                _e: &[f32],
+                _l: usize,
+                _f: Option<PayloadFilter>,
+            ) -> Result<Vec<ScoredMemory>> {
+                unimplemented!()
+            }
+            async fn search_by_tags(
+                &self,
+                _t: &[&str],
+                _a: bool,
+                _l: usize,
+            ) -> Result<Vec<ScoredMemory>> {
+                unimplemented!()
+            }
+            async fn search_similar_tags(&self, _e: &[f32], _l: usize) -> Result<Vec<String>> {
+                unimplemented!()
+            }
+            async fn upsert_tags(&self, _t: &[(&str, Vec<f32>)]) -> Result<()> {
+                unreachable!("judge must never write to the vector store")
+            }
+            async fn get_all(&self, _l: usize, _o: Option<&str>) -> Result<ScrollResult> {
+                unimplemented!()
+            }
+            async fn get_recent(
+                &self,
+                _l: usize,
+                _s: Option<f64>,
+                _t: Option<&str>,
+            ) -> Result<Vec<Memory>> {
+                unimplemented!()
+            }
+            async fn count(&self) -> Result<usize> {
+                Ok(self.0.len())
+            }
+            async fn get_all_tags(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            async fn increment_access_count(&self, _h: &str) -> Result<()> {
+                unreachable!("judge must never write to the vector store")
+            }
+            async fn health(&self) -> Result<HealthStatus> {
+                unimplemented!()
+            }
+        }
+
+        type Recorded = Rc<RefCell<Vec<(String, String, EdgeVerdict)>>>;
+
+        /// Records verdict writes; every other graph call is out of scope.
+        struct RecordingGraph {
+            verdicts: Recorded,
+            /// What `set_contradiction_verdict` reports: did an edge match?
+            matched: bool,
+        }
+
+        #[async_trait(?Send)]
+        impl GraphService for RecordingGraph {
+            async fn ensure_node(&self, _h: &str, _t: f64) -> Result<()> {
+                unimplemented!()
+            }
+            async fn delete_node(&self, _h: &str) -> Result<()> {
+                unimplemented!()
+            }
+            async fn create_typed_edge(
+                &self,
+                _s: &str,
+                _d: &str,
+                _r: UserRelationType,
+                _m: EdgeMeta,
+            ) -> Result<bool> {
+                unimplemented!()
+            }
+            async fn get_typed_edges(
+                &self,
+                _h: &str,
+                _r: Option<UserRelationType>,
+                _d: Direction,
+                _l: usize,
+            ) -> Result<Vec<Edge>> {
+                unimplemented!()
+            }
+            async fn delete_typed_edge(
+                &self,
+                _s: &str,
+                _d: &str,
+                _r: UserRelationType,
+            ) -> Result<bool> {
+                unimplemented!()
+            }
+            async fn create_system_edge(
+                &self,
+                _s: &str,
+                _d: &str,
+                _r: SystemRelationType,
+                _t: f64,
+            ) -> Result<bool> {
+                unimplemented!()
+            }
+            async fn get_all_contradictions(
+                &self,
+                _l: usize,
+                _v: Option<&[String]>,
+            ) -> Result<Vec<Contradiction>> {
+                Ok(vec![])
+            }
+            async fn set_contradiction_verdict(
+                &self,
+                s: &str,
+                d: &str,
+                v: &EdgeVerdict,
+            ) -> Result<bool> {
+                self.verdicts
+                    .borrow_mut()
+                    .push((s.to_string(), d.to_string(), v.clone()));
+                Ok(self.matched)
+            }
+            async fn get_contradictions_for_hashes(
+                &self,
+                _h: &[&str],
+            ) -> Result<HashMap<String, Vec<ContradictionRef>>> {
+                unimplemented!()
+            }
+            async fn get_neighbors(
+                &self,
+                _h: &str,
+                _hops: u8,
+                _w: f64,
+                _l: usize,
+            ) -> Result<Vec<Neighbor>> {
+                unimplemented!()
+            }
+            async fn spreading_activation(
+                &self,
+                _s: &[&str],
+                _hops: u8,
+                _d: f64,
+                _min: f64,
+                _l: usize,
+            ) -> Result<HashMap<String, f64>> {
+                unimplemented!()
+            }
+            async fn hebbian_boosts_within(&self, _h: &[&str]) -> Result<HashMap<String, f64>> {
+                unimplemented!()
+            }
+            async fn get_stats(&self) -> Result<GraphStats> {
+                unimplemented!()
+            }
+        }
+
+        /// Collects every event on the shadow-log target as a field map.
+        struct Capture(Arc<Mutex<Vec<HashMap<String, String>>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() != SHADOW_LOG_TARGET {
+                    return;
+                }
+                let mut fields = HashMap::new();
+                fields.insert("level".to_string(), event.metadata().level().to_string());
+                event.record(&mut Fields(&mut fields));
+                self.0.lock().unwrap().push(fields);
+            }
+        }
+
+        struct Fields<'a>(&'a mut HashMap<String, String>);
+
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.0.insert(f.name().to_string(), format!("{v:?}"));
+            }
+            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                self.0.insert(f.name().to_string(), v.to_string());
+            }
+            fn record_f64(&mut self, f: &tracing::field::Field, v: f64) {
+                self.0.insert(f.name().to_string(), v.to_string());
+            }
+            fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
+                self.0.insert(f.name().to_string(), v.to_string());
+            }
+            fn record_i64(&mut self, f: &tracing::field::Field, v: i64) {
+                self.0.insert(f.name().to_string(), v.to_string());
+            }
+        }
+
+        async fn captured<T>(
+            fut: impl std::future::Future<Output = T>,
+        ) -> (T, Vec<HashMap<String, String>>) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::registry().with(Capture(events.clone()));
+            let out = fut.with_subscriber(subscriber).await;
+            let collected = events.lock().unwrap().clone();
+            (out, collected)
+        }
+
+        fn service(
+            judge: Option<Script>,
+            vectors: Vec<Memory>,
+            matched: bool,
+        ) -> (MemoryService, Recorded) {
+            let verdicts: Recorded = Rc::new(RefCell::new(Vec::new()));
+            let mut svc = MemoryService::new(
+                Box::new(PairVectors(vectors)),
+                Box::new(MockEmbeddings),
+                Box::new(RecordingGraph {
+                    verdicts: verdicts.clone(),
+                    matched,
+                }),
+                Box::new(MockHebbian),
+                Box::new(MockConsolidation),
+                None,
+            );
+            if let Some(s) = judge {
+                svc = svc.with_judge(Box::new(ScriptedJudge(s)));
+            }
+            (svc, verdicts)
+        }
+
+        fn pair() -> Vec<Memory> {
+            vec![mem(&src(), 1_000.0), mem(&dst(), 2_000.0)]
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn every_verdict_class_persists_on_the_edge_and_emits_one_shadow_event() {
+            for (verdict, survivor) in [
+                (Verdict::Supersession, Some(Survivor::B)),
+                (Verdict::Contradiction, Some(Survivor::A)),
+                (Verdict::Coexist, None),
+                (Verdict::Unrelated, None),
+            ] {
+                let (svc, verdicts) =
+                    service(Some(Script::Ok(judgement(verdict, survivor))), pair(), true);
+                let (outcome, events) = captured(svc.judge_contradiction(&src(), &dst())).await;
+                assert!(
+                    matches!(outcome, JudgeOutcome::Judged(ref j) if j.verdict == verdict),
+                    "{verdict:?}: {outcome:?}"
+                );
+
+                // Persisted through the graph trait; survivor resolved to a hash.
+                let recorded = verdicts.borrow();
+                assert_eq!(recorded.len(), 1, "{verdict:?}");
+                let (s, d, ev) = &recorded[0];
+                assert_eq!((s.as_str(), d.as_str()), (src().as_str(), dst().as_str()));
+                assert_eq!(ev.verdict, verdict);
+                let expected_survivor = match survivor {
+                    Some(Survivor::A) => Some(src()),
+                    Some(Survivor::B) => Some(dst()),
+                    None => None,
+                };
+                assert_eq!(ev.verdict_survivor, expected_survivor, "{verdict:?}");
+                assert_eq!(ev.verdict_model, "test-model");
+                assert_eq!(ev.verdict_reason, "because");
+
+                // Exactly one shadow-log event carrying the contract fields.
+                assert_eq!(events.len(), 1, "{verdict:?}: {events:?}");
+                let e = &events[0];
+                assert_eq!(e["level"], "INFO");
+                assert_eq!(e["verdict"], verdict.as_str());
+                assert_eq!(e["memory_a"], src());
+                assert_eq!(e["memory_b"], dst());
+                assert_eq!(e["model"], "test-model");
+                assert_eq!(e["confidence"], "0.9");
+                let expected_would = if verdict == Verdict::Supersession {
+                    format!("{} -> {}", src(), dst())
+                } else {
+                    "none".to_string()
+                };
+                assert_eq!(e["would_supersede"], expected_would, "{verdict:?}");
+                assert_eq!(
+                    e["survivor"],
+                    expected_survivor.unwrap_or_else(|| "none".into())
+                );
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn judge_failure_is_unjudged_writes_nothing_and_warns_once() {
+            let (svc, verdicts) = service(
+                Some(Script::Err(|| AlayaError::Judge("boom".into()))),
+                pair(),
+                true,
+            );
+            let (outcome, events) = captured(svc.judge_contradiction(&src(), &dst())).await;
+            assert!(matches!(outcome, JudgeOutcome::Unjudged), "{outcome:?}");
+            assert!(verdicts.borrow().is_empty(), "no graph write on failure");
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_eq!(events[0]["level"], "WARN");
+            assert_eq!(events[0]["verdict"], "unjudged");
+            assert_eq!(events[0]["would_supersede"], "none");
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn rate_limit_is_surfaced_for_the_caller_to_back_off() {
+            let (svc, verdicts) = service(
+                Some(Script::Err(|| AlayaError::RateLimited {
+                    retry_after_secs: Some(3),
+                })),
+                pair(),
+                true,
+            );
+            let outcome = svc.judge_contradiction(&src(), &dst()).await;
+            assert!(
+                matches!(
+                    outcome,
+                    JudgeOutcome::RateLimited {
+                        retry_after_secs: Some(3)
+                    }
+                ),
+                "{outcome:?}"
+            );
+            assert!(verdicts.borrow().is_empty());
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn missing_endpoint_bad_hash_or_no_judge_is_unjudged_without_a_write() {
+            // Endpoint missing from the vector store.
+            let (svc, verdicts) = service(
+                Some(Script::Ok(judgement(Verdict::Coexist, None))),
+                vec![mem(&src(), 1.0)],
+                true,
+            );
+            assert!(matches!(
+                svc.judge_contradiction(&src(), &dst()).await,
+                JudgeOutcome::Unjudged
+            ));
+            // Malformed hash and self-pair never reach the judge.
+            assert!(matches!(
+                svc.judge_contradiction("nope", &dst()).await,
+                JudgeOutcome::Unjudged
+            ));
+            assert!(matches!(
+                svc.judge_contradiction(&src(), &src()).await,
+                JudgeOutcome::Unjudged
+            ));
+            assert!(verdicts.borrow().is_empty());
+            // Judge not configured.
+            let (svc, verdicts) = service(None, pair(), true);
+            assert!(matches!(
+                svc.judge_contradiction(&src(), &dst()).await,
+                JudgeOutcome::Unjudged
+            ));
+            assert!(verdicts.borrow().is_empty());
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn unmatched_edge_still_emits_the_shadow_event() {
+            let (svc, verdicts) = service(
+                Some(Script::Ok(judgement(
+                    Verdict::Supersession,
+                    Some(Survivor::B),
+                ))),
+                pair(),
+                false,
+            );
+            let (outcome, events) = captured(svc.judge_contradiction(&src(), &dst())).await;
+            assert!(matches!(outcome, JudgeOutcome::Judged(_)));
+            assert_eq!(verdicts.borrow().len(), 1, "the write was attempted");
+            assert_eq!(
+                events.len(),
+                1,
+                "shadow log does not depend on the graph write landing"
+            );
+        }
+
+        /// AC-4: the store path never awaits the judge. With a judge that
+        /// hangs forever, store completes and returns the same shape as with
+        /// no judge configured.
+        #[tokio::test(flavor = "current_thread")]
+        async fn store_path_never_awaits_the_judge_and_response_shape_is_unchanged() {
+            let mk = |judge: Option<Script>| {
+                let mut svc = MemoryService::new(
+                    Box::new(MockVectorsPersisting {
+                        stored: Rc::new(RefCell::new(HashMap::new())),
+                        raw_only: Default::default(),
+                    }),
+                    Box::new(MockEmbeddings),
+                    Box::new(MockGraph),
+                    Box::new(MockHebbian),
+                    Box::new(MockConsolidation),
+                    None,
+                );
+                if let Some(s) = judge {
+                    svc = svc.with_judge(Box::new(ScriptedJudge(s)));
+                }
+                svc
+            };
+            let params = || StoreParams {
+                content: "judge me".into(),
+                tags: None,
+                memory_type: None,
+                metadata: None,
+                client_hostname: None,
+                summary: None,
+                dedup_threshold: None,
+            };
+
+            let with_judge = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                mk(Some(Script::Hang)).store_memory(params()),
+            )
+            .await
+            .expect("store must not wait on the judge")
+            .expect("store ok");
+            let without = mk(None).store_memory(params()).await.expect("store ok");
+
+            let keys = |m: &HashMap<String, Value>| {
+                let mut k: Vec<_> = m.keys().cloned().collect();
+                k.sort();
+                k
+            };
+            assert_eq!(keys(&with_judge), keys(&without));
+            assert_eq!(with_judge["content_hash"], without["content_hash"]);
         }
     }
 }

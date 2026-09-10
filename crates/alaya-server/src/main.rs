@@ -39,12 +39,16 @@ use alaya_backends::{
     embedding::EmbeddingClient,
     graph::GraphHttpClient,
     graph_ref::{ConsolidationRef, GraphRef, HebbianRef},
+    judge::JudgeClient,
     qdrant::QdrantClient,
     rerank::RerankClient,
     summary::SummaryClient,
 };
 use alaya_core::deduplication::CanonicalStrategy;
-use alaya_core::service::{MemoryService, OutputMode, RelationParams, SearchParams, StoreParams};
+use alaya_core::service::{
+    JudgeOutcome, MemoryService, OutputMode, RelationParams, SearchParams, StoreParams,
+};
+use alaya_types::graph::Contradiction;
 use alaya_types::memory::PatchMemoryRequest;
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -69,6 +73,11 @@ struct Config {
     summary_url: Option<String>,
     summary_api_key: Option<String>,
     summary_model: String,
+    /// Contradiction judge (LAB-3283). Each falls back to the SUMMARY_*
+    /// counterpart; with neither set the engine is disabled.
+    judge_url: Option<String>,
+    judge_api_key: Option<String>,
+    judge_model: String,
     rerank_url: Option<String>,
     rerank_api_key: Option<String>,
     rerank_top_n: usize,
@@ -108,6 +117,10 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty()),
             summary_model: env_or("SUMMARY_MODEL", "claude-haiku-4-5-20251001"),
+            judge_url: env_opt("JUDGE_URL").or_else(|| env_opt("SUMMARY_URL")),
+            judge_api_key: env_opt("JUDGE_API_KEY").or_else(|| env_opt("SUMMARY_API_KEY")),
+            judge_model: env_opt("JUDGE_MODEL")
+                .unwrap_or_else(|| env_or("SUMMARY_MODEL", "claude-haiku-4-5-20251001")),
             rerank_url: std::env::var("RERANK_URL").ok().filter(|s| !s.is_empty()),
             rerank_api_key: std::env::var("RERANK_API_KEY")
                 .ok()
@@ -125,6 +138,11 @@ fn env_required(key: &str) -> String {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Set and non-empty, else `None`.
+fn env_opt(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
 /// Normalize the single origin source-of-truth: strip a trailing slash and
@@ -424,6 +442,8 @@ pub(crate) enum CmdInner {
     },
     Contradictions {
         limit: usize,
+        include_resolved: bool,
+        verdicts: Option<Vec<String>>,
         reply: oneshot::Sender<Value>,
     },
     FindDuplicates {
@@ -448,6 +468,11 @@ pub(crate) enum CmdInner {
         limit: usize,
         reply: oneshot::Sender<Value>,
     },
+    /// Judge every unjudged CONTRADICTS pair, up to `limit` (LAB-3283 AC-5).
+    BackfillContradictions {
+        limit: usize,
+        reply: oneshot::Sender<Value>,
+    },
 }
 
 impl CmdInner {
@@ -457,7 +482,8 @@ impl CmdInner {
         match self {
             CmdInner::FindDuplicates { .. }
             | CmdInner::MergeDuplicates { .. }
-            | CmdInner::BackfillSummaries { .. } => LONG_CMD_DEADLINE,
+            | CmdInner::BackfillSummaries { .. }
+            | CmdInner::BackfillContradictions { .. } => LONG_CMD_DEADLINE,
             _ => CMD_DEADLINE,
         }
     }
@@ -479,6 +505,7 @@ impl Cmd {
             CmdInner::MergeDuplicates { .. } => "merge_duplicates",
             CmdInner::Patch { .. } => "patch",
             CmdInner::BackfillSummaries { .. } => "backfill_summaries",
+            CmdInner::BackfillContradictions { .. } => "backfill_contradictions",
         }
     }
 }
@@ -888,6 +915,25 @@ async fn service_worker(
                             });
                         }
 
+                        // Fire-and-forget (LAB-3283 AC-4): judge each new
+                        // CONTRADICTS signal off the store path. Suppressed
+                        // under read_only — no edges were written — and when
+                        // no judge is configured. The edge direction is
+                        // (new) -> (existing), matching the batch write above.
+                        if !read_only
+                            && svc.judge.is_some()
+                            && !skipped
+                            && let Some(new_hash) = r.get("content_hash").and_then(|v| v.as_str())
+                        {
+                            for dst in contradicted_hashes(&r) {
+                                let src = new_hash.to_string();
+                                let svc = svc.clone();
+                                tokio::task::spawn_local(async move {
+                                    svc.judge_contradiction(&src, &dst).await;
+                                });
+                            }
+                        }
+
                         json!(r)
                     }
                     Ok(Err(e)) => {
@@ -1065,17 +1111,23 @@ async fn service_worker(
                 };
                 let _ = reply.send(result);
             }
-            CmdInner::Contradictions { limit, reply } => {
-                let span = tracing::info_span!(parent: &ps, "contradictions");
+            CmdInner::Contradictions {
+                limit,
+                include_resolved,
+                verdicts,
+                reply,
+            } => {
+                let span = tracing::info_span!(parent: &ps, "contradictions", include_resolved);
                 let result = match timeout(
                     limits.cmd,
-                    svc.memory_contradictions(limit).instrument(span),
+                    svc.memory_contradictions(limit, include_resolved, verdicts.as_deref())
+                        .instrument(span),
                 )
                 .await
                 {
                     Ok(Ok(r)) => {
                         let pairs = r
-                            .get("contradictions")
+                            .get("pairs")
                             .and_then(|v| v.as_array())
                             .map(|a| a.len())
                             .unwrap_or(0);
@@ -1271,12 +1323,156 @@ async fn service_worker(
                     .instrument(span),
                 );
             }
+            CmdInner::BackfillContradictions { limit, reply } => {
+                let span = tracing::info_span!(parent: &ps, "backfill_contradictions");
+                let svc = svc.clone();
+                tokio::task::spawn_local(
+                    async move {
+                        if svc.judge.is_none() {
+                            let _ =
+                                reply.send(json!({"error": "contradiction judge not configured"}));
+                            return;
+                        }
+                        // Only pairs with no verdict: re-running is idempotent
+                        // and never re-spends on judged edges (AC-5).
+                        let unjudged = [alaya_types::graph::Verdict::UNJUDGED.to_string()];
+                        let pairs = match svc
+                            .graph
+                            .get_all_contradictions(limit.min(500), Some(&unjudged))
+                            .await
+                        {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::warn!("backfill: fetching unjudged pairs failed: {e}");
+                                let _ = reply
+                                    .send(json!({"success": false, "error": e.safe_message()}));
+                                return;
+                            }
+                        };
+                        let queued = pairs.len();
+                        tracing::info!(queued, "backfill: judging contradictions");
+                        let t = backfill_judge(&svc, pairs).await;
+                        tracing::info!(
+                            queued,
+                            judged = t.judged,
+                            unjudged = t.unjudged,
+                            input_tokens = t.input_tokens,
+                            output_tokens = t.output_tokens,
+                            "backfill contradictions complete"
+                        );
+                        let _ = reply.send(json!({
+                            "queued": queued,
+                            "judged": t.judged,
+                            "unjudged": t.unjudged,
+                            "input_tokens": t.input_tokens,
+                            "output_tokens": t.output_tokens,
+                        }));
+                    }
+                    .instrument(span),
+                );
+            }
         }
 
         // Watchdog heartbeat: the loop just finished (or spawned) a command.
         // Stops advancing exactly when the worker stops draining.
         progress.store(epoch_secs(), std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// `existing_hash` of every contradiction signal in a store result, deduped
+/// (negation and temporal cues can both fire on one neighbour).
+fn contradicted_hashes(store_result: &std::collections::HashMap<String, Value>) -> Vec<String> {
+    let mut hashes: Vec<String> = store_result
+        .get("interference")
+        .and_then(|i| i.get("contradictions"))
+        .and_then(Value::as_array)
+        .map(|signals| {
+            signals
+                .iter()
+                .filter_map(|s| s.get("existing_hash").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    hashes.sort();
+    hashes.dedup();
+    hashes
+}
+
+/// In-flight judge calls during a backfill (LAB-3283 AC-5).
+const JUDGE_CONCURRENCY: usize = 4;
+/// Retries on 429 before a pair is counted unjudged (AC-9).
+const JUDGE_MAX_RETRIES: u32 = 5;
+const JUDGE_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Default, Debug, PartialEq)]
+struct BackfillTotals {
+    judged: usize,
+    unjudged: usize,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+/// Judge `pairs` with at most `JUDGE_CONCURRENCY` calls in flight.
+async fn backfill_judge(svc: &MemoryService, pairs: Vec<Contradiction>) -> BackfillTotals {
+    use futures::StreamExt;
+    let outcomes: Vec<Option<alaya_backends::Judgement>> = futures::stream::iter(pairs)
+        .map(|p| async move {
+            with_backoff(|| svc.judge_contradiction(&p.memory_a_hash, &p.memory_b_hash)).await
+        })
+        .buffer_unordered(JUDGE_CONCURRENCY)
+        .collect()
+        .await;
+    let mut t = BackfillTotals::default();
+    for o in outcomes {
+        match o {
+            Some(j) => {
+                t.judged += 1;
+                t.input_tokens += j.input_tokens;
+                t.output_tokens += j.output_tokens;
+            }
+            None => t.unjudged += 1,
+        }
+    }
+    t
+}
+
+/// Retry one judge attempt on 429, honouring `retry-after` when the LB
+/// sends it and doubling from 1s (capped) when it doesn't. Any other
+/// outcome is final.
+async fn with_backoff<F, Fut>(mut attempt: F) -> Option<alaya_backends::Judgement>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = JudgeOutcome>,
+{
+    let mut backoff = std::time::Duration::from_secs(1);
+    for n in 0..=JUDGE_MAX_RETRIES {
+        match attempt().await {
+            JudgeOutcome::Judged(j) => return Some(j),
+            JudgeOutcome::Unjudged => return None,
+            JudgeOutcome::RateLimited { retry_after_secs } => {
+                if n == JUDGE_MAX_RETRIES {
+                    tracing::warn!(
+                        retries = n,
+                        "backfill: still rate limited, giving up on pair"
+                    );
+                    return None;
+                }
+                let wait = retry_after_secs
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or(backoff)
+                    .min(JUDGE_MAX_BACKOFF);
+                tracing::info!(
+                    attempt = n + 1,
+                    wait_s = wait.as_secs(),
+                    "backfill: rate limited, backing off"
+                );
+                tokio::time::sleep(wait).await;
+                backoff = (backoff * 2).min(JUDGE_MAX_BACKOFF);
+            }
+        }
+    }
+    None
 }
 
 /// Fire-and-forget summary generation helper.
@@ -1482,6 +1678,22 @@ fn main() {
                     summary,
                 );
 
+                if let Some(url) = &cfg_clone.judge_url {
+                    tracing::info!(
+                        url = url.as_str(),
+                        model = cfg_clone.judge_model.as_str(),
+                        has_api_key = cfg_clone.judge_api_key.is_some(),
+                        "contradiction judge enabled (advisory: annotates CONTRADICTS edges, never writes memories)"
+                    );
+                    svc = svc.with_judge(Box::new(JudgeClient::new(
+                        url.clone(),
+                        cfg_clone.judge_model.clone(),
+                        cfg_clone.judge_api_key.clone(),
+                    )));
+                } else {
+                    tracing::info!("JUDGE_URL/SUMMARY_URL not set — contradiction judge disabled");
+                }
+
                 if let Some(url) = &cfg_clone.rerank_url {
                     tracing::info!(
                         url = url.as_str(),
@@ -1554,6 +1766,7 @@ fn main() {
                 get(get_memory).patch(patch_memory),
             )
             .route("/backfill/summaries", post(backfill_summaries))
+            .route("/backfill/contradictions", post(backfill_contradictions))
             .layer(middleware::from_fn_with_state(
                 auth_state.clone(),
                 auth::require_auth,
@@ -1799,6 +2012,12 @@ async fn supersede(
 struct ContradictionsReq {
     #[serde(default = "default_limit")]
     limit: usize,
+    /// Show pairs where an endpoint is already superseded (default hidden).
+    #[serde(default)]
+    include_resolved: bool,
+    /// Verdict filter; omitted = `contradiction,supersession,unjudged`.
+    #[serde(default)]
+    verdicts: Option<Vec<String>>,
 }
 fn default_limit() -> usize {
     20
@@ -1812,6 +2031,8 @@ async fn contradictions(
     h.call(
         CmdInner::Contradictions {
             limit: req.limit,
+            include_resolved: req.include_resolved,
+            verdicts: req.verdicts,
             reply: tx,
         },
         rx,
@@ -2003,9 +2224,121 @@ async fn backfill_summaries(
     .await
 }
 
+/// Operator-only (same auth class as `/backfill/summaries`, enforced in
+/// `auth::rest_route_op`). Blocks until the pass completes and returns
+/// `{queued, judged, unjudged, input_tokens, output_tokens}`.
+async fn backfill_contradictions(
+    axum::extract::State(h): axum::extract::State<ServiceHandle>,
+    Json(params): Json<BackfillParams>,
+) -> (StatusCode, Json<Value>) {
+    let (tx, rx) = oneshot::channel();
+    h.call(
+        CmdInner::BackfillContradictions {
+            limit: params.limit,
+            reply: tx,
+        },
+        rx,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Contradiction judge plumbing (LAB-3283 AC-4, AC-5, AC-9) ─────────
+
+    #[test]
+    fn contradicted_hashes_dedups_signals_and_tolerates_missing_key() {
+        let mut r = std::collections::HashMap::new();
+        assert!(contradicted_hashes(&r).is_empty());
+        r.insert(
+            "interference".to_string(),
+            json!({"contradictions": [
+                {"existing_hash": "b", "signal_type": "Negation"},
+                {"existing_hash": "a", "signal_type": "Temporal"},
+                {"existing_hash": "b", "signal_type": "Antonym"},
+                {"signal_type": "Bogus"}
+            ]}),
+        );
+        assert_eq!(
+            contradicted_hashes(&r),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    fn judged() -> JudgeOutcome {
+        JudgeOutcome::Judged(alaya_backends::Judgement {
+            verdict: alaya_types::graph::Verdict::Coexist,
+            survivor: None,
+            reason: String::new(),
+            confidence: 0.5,
+            model: "m".into(),
+            input_tokens: 1,
+            output_tokens: 1,
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_backoff_honours_retry_after_then_succeeds() {
+        let calls = std::cell::Cell::new(0u32);
+        let start = tokio::time::Instant::now();
+        let out = with_backoff(|| {
+            let n = calls.get();
+            calls.set(n + 1);
+            async move {
+                if n < 2 {
+                    JudgeOutcome::RateLimited {
+                        retry_after_secs: Some(3),
+                    }
+                } else {
+                    judged()
+                }
+            }
+        })
+        .await;
+        assert!(out.is_some());
+        assert_eq!(calls.get(), 3);
+        assert!(
+            start.elapsed() >= std::time::Duration::from_secs(6),
+            "two 3s waits"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_backoff_doubles_without_a_hint_and_gives_up() {
+        let calls = std::cell::Cell::new(0u32);
+        let start = tokio::time::Instant::now();
+        let out = with_backoff(|| {
+            calls.set(calls.get() + 1);
+            async {
+                JudgeOutcome::RateLimited {
+                    retry_after_secs: None,
+                }
+            }
+        })
+        .await;
+        assert!(out.is_none());
+        assert_eq!(calls.get(), JUDGE_MAX_RETRIES + 1);
+        // 1+2+4+8+16 s of doubling before the final attempt gives up.
+        assert!(start.elapsed() >= std::time::Duration::from_secs(31));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(63),
+            "no wait after the last attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_backoff_unjudged_is_final() {
+        let calls = std::cell::Cell::new(0u32);
+        let out = with_backoff(|| {
+            calls.set(calls.get() + 1);
+            async { JudgeOutcome::Unjudged }
+        })
+        .await;
+        assert!(out.is_none());
+        assert_eq!(calls.get(), 1);
+    }
 
     #[test]
     fn host_of_strips_port_and_unwraps_ipv6_brackets() {
@@ -2244,7 +2577,19 @@ mod wedge_tests {
         ) -> Result<bool> {
             unimplemented!()
         }
-        async fn get_all_contradictions(&self, _limit: usize) -> Result<Vec<Contradiction>> {
+        async fn get_all_contradictions(
+            &self,
+            _limit: usize,
+            _verdicts: Option<&[String]>,
+        ) -> Result<Vec<Contradiction>> {
+            unimplemented!()
+        }
+        async fn set_contradiction_verdict(
+            &self,
+            _src: &str,
+            _dst: &str,
+            _verdict: &alaya_types::graph::EdgeVerdict,
+        ) -> Result<bool> {
             unimplemented!()
         }
         async fn get_contradictions_for_hashes(

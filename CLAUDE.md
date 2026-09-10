@@ -46,13 +46,16 @@ crates/
 │       ├── edges.rs     # POST /edges/create, /edges/get, /edges/delete, /edges/create-system
 │       ├── health.rs    # GET /health (unauth), GET /stats
 │       ├── hebbian.rs   # POST /hebbian/{neighbors,spreading,boosts-within,strengthen}
-│       ├── contradictions.rs  # POST /contradictions/{all,for}
+│       ├── contradictions.rs  # POST /contradictions/{all,for,verdict}
 │       └── consolidation.rs   # POST /consolidation/{decay-all,decay-stale,prune,orphans}
 ├── alaya-backends/src/
 │   ├── lib.rs           # Re-exports
-│   ├── traits.rs        # VectorStorage, EmbeddingProvider, GraphService, HebbianService, ConsolidationService
+│   ├── traits.rs        # VectorStorage, EmbeddingProvider, GraphService, HebbianService, ConsolidationService, SummaryProvider, ContradictionJudge
 │   ├── qdrant.rs        # QdrantClient — Qdrant REST API (WASM-compat)
 │   ├── embedding.rs     # EmbeddingClient — OpenAI-compat /v1/embeddings
+│   ├── anthropic.rs     # Shared raw-HTTP Anthropic Messages transport (no SDK; 429 → RateLimited)
+│   ├── summary.rs       # SummaryClient — one-line summaries over anthropic.rs
+│   ├── judge.rs         # JudgeClient — CONTRADICTS pair verdicts via structured output (LAB-3283)
 │   └── graph.rs         # GraphHttpClient — bridge HTTP wrapper (3 trait impls)
 ├── alaya-core/src/
 │   ├── lib.rs           # Re-exports
@@ -135,6 +138,12 @@ LISTEN_ADDR=0.0.0.0:3001
 RUST_LOG=alaya_server=info
 OTEL_EXPORTER_OTLP_ENDPOINT=http://phoenix-svc.recsys.svc:6006  # optional
 OTEL_SERVICE_NAME=alaya-server
+SUMMARY_URL=                             # optional — Anthropic Messages API (or anthropic-lb); empty disables auto-summary
+SUMMARY_API_KEY=
+SUMMARY_MODEL=claude-haiku-4-5-20251001
+JUDGE_URL=                               # contradiction judge; each JUDGE_* falls back to its SUMMARY_* twin
+JUDGE_API_KEY=                           #   (so SUMMARY_URL alone enables the judge). All unset = judge disabled.
+JUDGE_MODEL=                             #   Advisory: verdicts annotate CONTRADICTS edges, never memory payloads.
 RERANK_URL=                              # optional — empty disables cross-encoder rerank
 RERANK_API_KEY=                          # optional
 RERANK_TOP_N=20                          # how many RRF candidates to rerank
@@ -162,6 +171,7 @@ cutover, so it never held legacy keys).
 - **UUID from content_hash** — `Uuid::parse_str(&hash[..32])` — takes first 32 hex chars, NOT uuid5. Must match Python `uuid.UUID(hash[:32])` for data compatibility.
 - **Superseded filtering** — Done at application layer, NOT Qdrant filter level. Qdrant's `is_null` on nested payload fields is unreliable without explicit indexes.
 - **Graph operations are non-fatal** — All graph calls (spreading activation, Hebbian, interference) use `unwrap_or_default()`. Service degrades gracefully when FalkorDB is down.
+- **Contradiction judge is advisory (LAB-3283 Phase 1)** — an LLM judge (`ContradictionJudge`, Haiku via anthropic-lb by default) classifies every `CONTRADICTS` pair as `contradiction` / `supersession` / `coexist` / `unrelated`, off the store path (`spawn_local` after store, plus `POST /backfill/contradictions`). Verdicts are written onto the edge via the bridge (`POST /contradictions/verdict`, MATCH-only) and one `tracing` event on target `alaya::judge` records `would_supersede` per verdict — the shadow log Phase 2 (LAB-3285) is promoted on. Any failure is `unjudged`: no graph write, no vector write, never a panic. `memory_contradictions` defaults to `contradiction,supersession,unjudged` and hides resolved pairs.
 - **reqwest default-features = false** — Workspace-level and per-crate. Uses `rustls-tls` on native, bare `json` on wasm32. Prevents OpenSSL dependency in containers.
 - **MCP protocol 2025-03-26** — SSE response format (`event: message\ndata: {...}\n\n`) when client sends `Accept: text/event-stream`. Plain JSON otherwise.
 - **Cross-encoder rerank** — Optional second-stage reranker (TEI `/rerank` endpoint, default model `BAAI/bge-reranker-v2-m3`). When `RERANK_URL` is set, `search_hybrid` re-scores the top-N RRF candidates as (query, doc) pairs and reorders them; the rerank score replaces the RRF+cosine blend for those entries. Validated on LongMemEval (2026-05-23, cached embeddings + Python re-impl, 500q): R@5 0.936 → 0.990 with top_n=20. Graceful degradation: rerank failures log and fall back to RRF order, never break the search.

@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use alaya_types::{
     Result,
     graph::{
-        CoAccessPair, Contradiction, ContradictionRef, Direction, Edge, EdgeMeta, GraphStats,
-        Neighbor, SystemRelationType, UserRelationType,
+        CoAccessPair, Contradiction, ContradictionRef, Direction, Edge, EdgeMeta, EdgeVerdict,
+        GraphStats, Neighbor, SystemRelationType, UserRelationType, Verdict,
     },
     memory::{
         HealthStatus, Memory, MetadataUpdate, PatchMemoryRequest, ScoredMemory, ScrollResult,
@@ -206,7 +206,22 @@ pub trait GraphService {
     }
 
     // Contradiction queries
-    async fn get_all_contradictions(&self, limit: usize) -> Result<Vec<Contradiction>>;
+    /// Newest-first CONTRADICTS pairs. `verdicts` restricts to edges whose
+    /// verdict is in the list; the sentinel `"unjudged"` selects edges with
+    /// no verdict. `None` = every edge (legacy behaviour).
+    async fn get_all_contradictions(
+        &self,
+        limit: usize,
+        verdicts: Option<&[String]>,
+    ) -> Result<Vec<Contradiction>>;
+    /// Write the judge's verdict onto the existing `src -> dst` CONTRADICTS
+    /// edge. Never creates or deletes an edge; returns whether one matched.
+    async fn set_contradiction_verdict(
+        &self,
+        src: &str,
+        dst: &str,
+        verdict: &EdgeVerdict,
+    ) -> Result<bool>;
     async fn get_contradictions_for_hashes(
         &self,
         hashes: &[&str],
@@ -278,6 +293,42 @@ pub trait ConsolidationService {
 pub trait SummaryProvider {
     /// Generate a one-line summary (~50 tokens) for the given content.
     async fn summarize(&self, content: &str) -> Result<String>;
+}
+
+/// Which side of a judged pair should survive, in the judge's own frame
+/// (`a` = the first memory passed to `judge`, `b` = the second).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Survivor {
+    A,
+    B,
+}
+
+/// A judge's verdict on one pair, plus what it cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Judgement {
+    pub verdict: Verdict,
+    pub survivor: Option<Survivor>,
+    /// One line, ≤200 chars.
+    pub reason: String,
+    /// 0.0–1.0.
+    pub confidence: f64,
+    /// Model id that produced the verdict.
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// Pairwise contradiction judge (LAB-3283). Pluggable via env in the server;
+/// the one production impl is `JudgeClient` (Anthropic Messages API).
+///
+/// Optional — when absent, CONTRADICTS edges are never annotated and the
+/// read surfaces report every pair as `unjudged`.
+#[async_trait(?Send)]
+pub trait ContradictionJudge {
+    /// Judge whether `a` and `b` conflict. Any transport, parse or schema
+    /// failure is an `Err`; the caller treats that as *unjudged* and must
+    /// not write anything.
+    async fn judge(&self, a: &Memory, b: &Memory) -> Result<Judgement>;
 }
 
 /// Cross-encoder reranking backend (TEI `/rerank` endpoint).

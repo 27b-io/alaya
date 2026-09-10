@@ -1,4 +1,4 @@
-//! Contradiction handlers — POST /contradictions/all, POST /contradictions/for
+//! Contradiction handlers — POST /contradictions/{all,for,verdict}
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -7,7 +7,10 @@ use axum::{Json, extract::State, http::StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use alaya_types::graph::Contradiction;
+use alaya_types::{
+    graph::{Contradiction, EdgeVerdict, Verdict},
+    memory::validate_content_hash,
+};
 
 use crate::{AppState, cypher, handlers::exec_query};
 
@@ -17,6 +20,17 @@ use crate::{AppState, cypher, handlers::exec_query};
 pub struct AllContradictionsRequest {
     /// Max results (default 20)
     pub limit: Option<i64>,
+    /// Restrict to these verdicts; `"unjudged"` selects edges with none.
+    /// Absent = every edge.
+    pub verdicts: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetVerdictRequest {
+    pub source: String,
+    pub target: String,
+    #[serde(flatten)]
+    pub verdict: EdgeVerdict,
 }
 
 #[derive(Debug, Deserialize)]
@@ -28,17 +42,18 @@ pub struct ContradictionsForRequest {
 
 /// POST /contradictions/all
 ///
-/// Return all CONTRADICTS pairs ordered by `created_at DESC`.
+/// Return CONTRADICTS pairs ordered by `created_at DESC`, optionally
+/// filtered by verdict, each carrying its persisted verdict (if any).
 pub async fn all(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AllContradictionsRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     let limit = req.limit.unwrap_or(20).clamp(1, 500) as u32;
 
-    let (cypher, params, readonly) = cypher::get_all_contradictions(limit);
+    let (cypher, params, readonly) = cypher::get_all_contradictions(limit, req.verdicts.as_deref());
     let result = exec_query(&state, &cypher, params, readonly).await?;
 
-    // Row: [a.content_hash, b.content_hash, e.confidence, e.created_at]
+    // Row layout: cypher::CONTRADICTION_COLUMNS
     let mut contradictions: Vec<Contradiction> = Vec::with_capacity(result.result_set.len());
     for row in &result.result_set {
         if row.len() < 2 {
@@ -56,10 +71,64 @@ pub async fn all(
             memory_b_hash,
             confidence,
             created_at,
+            verdict: parse_verdict(row),
         });
     }
 
     Ok(Json(json!({ "contradictions": contradictions })))
+}
+
+/// Columns 4.. of a `CONTRADICTION_COLUMNS` row. `None` when the edge has
+/// no (recognised) verdict — an unknown verdict string reads as unjudged so
+/// the backfill re-judges it rather than trusting a corrupt value.
+fn parse_verdict(row: &[Value]) -> Option<EdgeVerdict> {
+    let verdict = Verdict::parse(row.get(4)?.as_str()?)?;
+    Some(EdgeVerdict {
+        verdict,
+        verdict_survivor: row.get(5).and_then(Value::as_str).map(str::to_string),
+        verdict_reason: row
+            .get(6)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        verdict_confidence: row.get(7).and_then(Value::as_f64).unwrap_or_default(),
+        verdict_model: row
+            .get(8)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        judged_at: row.get(9).and_then(Value::as_f64).unwrap_or_default(),
+    })
+}
+
+/// POST /contradictions/verdict
+///
+/// Annotate an existing `source -> target` CONTRADICTS edge with the judge's
+/// verdict. MATCH-only (LAB-3283 AC-3): the edge is never created or
+/// deleted, and no Memory node is touched. `updated: false` means no such
+/// edge exists.
+pub async fn set_verdict(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SetVerdictRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    if !validate_content_hash(&req.source) || !validate_content_hash(&req.target) {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    if let Some(s) = &req.verdict.verdict_survivor
+        && !validate_content_hash(s)
+    {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    if !(0.0..=1.0).contains(&req.verdict.verdict_confidence) {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let (cypher, params, readonly) =
+        cypher::set_contradiction_verdict(&req.source, &req.target, &req.verdict);
+    let result = exec_query(&state, &cypher, params, readonly).await?;
+
+    let count = result.count().unwrap_or(0);
+    Ok(Json(json!({ "updated": count > 0 })))
 }
 
 /// POST /contradictions/for

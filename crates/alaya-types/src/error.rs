@@ -28,6 +28,14 @@ pub enum AlayaError {
     #[error("rerank error: {0}")]
     Rerank(String),
 
+    #[error("contradiction judge error: {0}")]
+    Judge(String),
+
+    /// Upstream returned 429. `retry_after_secs` is the server's hint, when
+    /// it sent one; callers that retry own the backoff.
+    #[error("upstream rate limited (retry-after: {retry_after_secs:?}s)")]
+    RateLimited { retry_after_secs: Option<u64> },
+
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 }
@@ -44,6 +52,8 @@ impl AlayaError {
             Self::NotFound(_) => -32004,
             Self::Summary(_) => -32005,
             Self::Rerank(_) => -32006,
+            Self::Judge(_) => -32007,
+            Self::RateLimited { .. } => -32008,
             Self::Serialization(_) => -32600,
         }
     }
@@ -60,6 +70,8 @@ impl AlayaError {
             Self::NotFound(_) => "Resource not found",
             Self::Summary(_) => "Summary generation failed",
             Self::Rerank(_) => "Rerank operation failed",
+            Self::Judge(_) => "Contradiction judge failed",
+            Self::RateLimited { .. } => "Upstream rate limited",
             Self::Serialization(_) => "Invalid request format",
         }
     }

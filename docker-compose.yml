@@ -151,6 +151,11 @@ services:
       # SUMMARY_URL: https://api.anthropic.com/v1/messages
       # SUMMARY_API_KEY: ${SUMMARY_API_KEY:-}
       # SUMMARY_MODEL: ${SUMMARY_MODEL:-claude-haiku-4-5-20251001}
+      # Contradiction judge (LAB-3283) — each defaults to its SUMMARY_* twin,
+      # so the three above enable it too. Override to use a different model.
+      # JUDGE_URL: ${JUDGE_URL:-}
+      # JUDGE_API_KEY: ${JUDGE_API_KEY:-}
+      # JUDGE_MODEL: ${JUDGE_MODEL:-claude-haiku-4-5-20251001}
       # OAuth Resource Server (delegated auth via OIDC) — empty disables.
       # See README.md → OAuth section.
       # OIDC_ISSUER: ${OIDC_ISSUER:-}

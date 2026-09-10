@@ -152,6 +152,9 @@ Copy `.env.example` to `.env`. All settings have sensible defaults for local dev
 | `SUMMARY_URL` | — | Anthropic Messages API URL (optional) |
 | `SUMMARY_API_KEY` | — | Required if `SUMMARY_URL` is set |
 | `SUMMARY_MODEL` | `claude-haiku-4-5-20251001` | Summary model |
+| `JUDGE_URL` | `SUMMARY_URL` | Contradiction judge Messages API URL (optional). Falls back to `SUMMARY_URL`; unset both to disable the judge |
+| `JUDGE_API_KEY` | `SUMMARY_API_KEY` | Falls back to `SUMMARY_API_KEY` |
+| `JUDGE_MODEL` | `SUMMARY_MODEL` | Model that judges `CONTRADICTS` pairs (advisory verdicts on the edge; never writes memories) |
 | `RERANK_URL` | — | TEI `/rerank` endpoint (empty = rerank disabled) |
 | `RERANK_API_KEY` | — | Optional bearer token for `RERANK_URL` |
 | `RERANK_TOP_N` | `20` | How many top RRF candidates to rerank |

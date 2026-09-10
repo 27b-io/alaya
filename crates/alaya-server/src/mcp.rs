@@ -41,6 +41,10 @@ struct SupersedeParams {
 struct ContradictionsParams {
     #[serde(default = "default_contradictions_limit")]
     limit: usize,
+    #[serde(default)]
+    include_resolved: bool,
+    #[serde(default)]
+    verdicts: Option<Vec<String>>,
 }
 fn default_contradictions_limit() -> usize {
     20
@@ -426,6 +430,8 @@ async fn dispatch_tool(
                 .call_rpc(
                     CmdInner::Contradictions {
                         limit: p.limit,
+                        include_resolved: p.include_resolved,
+                        verdicts: p.verdicts,
                         reply: tx,
                     },
                     rx,
@@ -606,11 +612,13 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "memory_contradictions",
-            "description": "List unresolved contradiction pairs for review and resolution.",
+            "description": "List CONTRADICTS pairs with the judge's verdict per pair (contradiction | supersession | coexist | unrelated | unjudged), the recommended survivor hash and a one-line reason. Pairs with a superseded endpoint are hidden unless include_resolved is true. Returns {pairs: [{memory_a_hash, memory_b_hash, confidence, memory_a_content, memory_b_content, memory_a_superseded, memory_b_superseded, verdict, verdict_reason, survivor, verdict_confidence, verdict_model, judged_at}], total}.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "limit": { "type": "integer", "default": 20, "description": "Max contradiction pairs to return" }
+                    "limit": { "type": "integer", "default": 20, "description": "Max contradiction pairs to fetch (1-500)" },
+                    "include_resolved": { "type": "boolean", "default": false, "description": "Also return pairs where one endpoint is already superseded" },
+                    "verdicts": { "type": "array", "items": { "type": "string", "enum": ["contradiction", "supersession", "coexist", "unrelated", "unjudged"] }, "description": "Only pairs with these verdicts. Default: contradiction, supersession, unjudged" }
                 }
             }
         },

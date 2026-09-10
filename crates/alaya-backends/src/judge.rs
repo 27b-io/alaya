@@ -1,0 +1,448 @@
+//! JudgeClient — `ContradictionJudge` over the Anthropic Messages API with
+//! structured output (LAB-3283 Phase 1, advisory).
+//!
+//! Rides the same transport as `SummaryClient` (`anthropic.rs`). The
+//! verdict comes back as JSON constrained by `output_config.format`; anything
+//! that is not a well-formed verdict is an `AlayaError::Judge`, which the
+//! caller records as *unjudged* — never a graph or vector write.
+
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use alaya_types::{AlayaError, Result, graph::Verdict, memory::Memory};
+
+use crate::anthropic::{MessagesTransport, Usage, truncate_chars};
+use crate::{ContradictionJudge, Judgement, Survivor};
+
+const SYSTEM_PROMPT: &str = "You judge whether two memories from an engineering team's long-term memory store conflict. \
+Classify the pair as exactly one verdict:\n\
+- \"supersession\": the newer memory updates or replaces a claim the older one makes about the same thing (a fact, state, decision or plan that changed). Name the memory that should survive.\n\
+- \"contradiction\": both claim to be current and cannot both be true, and recency alone does not settle it (e.g. two values for the same setting with no sign which is newer). Name a survivor only if the evidence favours one; otherwise null.\n\
+- \"coexist\": both are true at once. Typical: progress snapshots of the same work at different times, a plan and its later outcome, a decision and the analysis behind it, different facets of one topic. Recording history is intended — these are not supersessions.\n\
+- \"unrelated\": the memories merely share vocabulary or a project name; neither bears on the other's claim.\n\
+Be conservative: call \"supersession\" or \"contradiction\" only when a reader relying on the older memory today would be misled. Superseding hides the loser from search, so a wrong \"supersession\" erases history.\n\
+survivor: \"a\" or \"b\" for supersession/contradiction, null otherwise.\n\
+reason: one sentence, at most 200 characters, naming the specific claim that changed or conflicts.\n\
+confidence: 0.0-1.0, your probability that the verdict is correct.";
+
+/// Reason is clipped to this many chars on the way in. The schema asks for
+/// ≤200; a longer reason is a cosmetic overrun, not a semantic violation,
+/// so it is clipped rather than costing a paid call.
+const MAX_REASON_CHARS: usize = 200;
+
+/// Output budget. The verdict JSON is ~90 tokens, but models with adaptive
+/// thinking on by default (Sonnet 5) spend output tokens thinking first; a
+/// tight cap truncated the JSON on 67/174 golden pairs. The cap is an upper
+/// bound, not a spend — a Haiku verdict still costs ~90 output tokens.
+const MAX_OUTPUT_TOKENS: u32 = 4096;
+
+pub struct JudgeClient {
+    transport: MessagesTransport,
+    model: String,
+}
+
+impl JudgeClient {
+    pub fn new(base_url: String, model: String, api_key: Option<String>) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        let timeout = crate::anthropic::DEFAULT_REQUEST_TIMEOUT;
+        #[cfg(target_arch = "wasm32")]
+        let timeout = std::time::Duration::from_secs(30);
+        Self::with_request_timeout(base_url, model, api_key, timeout)
+    }
+
+    /// Same as `new` with an explicit request timeout (native only takes
+    /// effect). Tests use a short one to exercise the timeout path.
+    pub fn with_request_timeout(
+        base_url: String,
+        model: String,
+        api_key: Option<String>,
+        request_timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            transport: MessagesTransport::new(base_url, api_key, request_timeout),
+            model,
+        }
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+/// JSON schema the response is constrained to (`output_config.format`).
+/// Kept to the widely supported subset: enum, anyOf/null, required,
+/// additionalProperties. Range and length are enforced in `RawVerdict::validate`.
+fn verdict_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "verdict": {
+                "type": "string",
+                "enum": ["contradiction", "supersession", "coexist", "unrelated"]
+            },
+            "survivor": {
+                "anyOf": [
+                    {"type": "string", "enum": ["a", "b"]},
+                    {"type": "null"}
+                ]
+            },
+            "reason": {"type": "string"},
+            "confidence": {"type": "number"}
+        },
+        "required": ["verdict", "survivor", "reason", "confidence"],
+        "additionalProperties": false
+    })
+}
+
+/// Render the pair for the model. Recency is stated explicitly (days apart)
+/// because supersession is a temporal judgement and the epoch floats alone
+/// are opaque to the model.
+pub fn render_pair(a: &Memory, b: &Memory) -> String {
+    let days = (b.created_at - a.created_at) / 86_400.0;
+    let order = if days.abs() < 1.0 {
+        "A and B were recorded within a day of each other".to_string()
+    } else if days > 0.0 {
+        format!("A was recorded {:.0} days BEFORE B", days)
+    } else {
+        format!("A was recorded {:.0} days AFTER B", -days)
+    };
+    format!("{order}.\n\n{}\n\n{}", describe("A", a), describe("B", b))
+}
+
+fn describe(label: &str, m: &Memory) -> String {
+    let tags = if m.tags.is_empty() {
+        "-".to_string()
+    } else {
+        m.tags.join(", ")
+    };
+    format!(
+        "Memory {label} (recorded_at={:.0}; type: {}; tags: {tags}):\n{}",
+        m.created_at,
+        m.memory_type,
+        truncate_chars(&m.content)
+    )
+}
+
+#[async_trait(?Send)]
+impl ContradictionJudge for JudgeClient {
+    #[tracing::instrument(skip(self, a, b), fields(a = %&a.content_hash[..8.min(a.content_hash.len())], b = %&b.content_hash[..8.min(b.content_hash.len())]))]
+    async fn judge(&self, a: &Memory, b: &Memory) -> Result<Judgement> {
+        let body = json!({
+            "model": self.model,
+            "max_tokens": MAX_OUTPUT_TOKENS,
+            "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": render_pair(a, b)}],
+            "output_config": {"format": {"type": "json_schema", "schema": verdict_schema()}},
+        });
+
+        let resp = self.transport.messages(&body, AlayaError::Judge).await?;
+        let stop = resp.stop_reason.clone().unwrap_or_default();
+        let text = resp.first_text().ok_or_else(|| {
+            AlayaError::Judge(format!(
+                "empty response from messages API (stop_reason={stop:?})"
+            ))
+        })?;
+        let raw: RawVerdict = serde_json::from_str(&text).map_err(|e| {
+            AlayaError::Judge(format!(
+                "verdict is not valid JSON (stop_reason={stop:?}): {e}"
+            ))
+        })?;
+        raw.validate(self.model.clone(), resp.usage)
+    }
+}
+
+// ─── Verdict parsing ───────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct RawVerdict {
+    verdict: String,
+    #[serde(default)]
+    survivor: Option<String>,
+    #[serde(default)]
+    reason: String,
+    confidence: f64,
+}
+
+impl RawVerdict {
+    fn validate(self, model: String, usage: Usage) -> Result<Judgement> {
+        let verdict = Verdict::parse(&self.verdict)
+            .ok_or_else(|| AlayaError::Judge(format!("unknown verdict {:?}", self.verdict)))?;
+        let survivor = match self.survivor.as_deref().map(str::trim) {
+            None | Some("") | Some("null") => None,
+            Some("a") => Some(Survivor::A),
+            Some("b") => Some(Survivor::B),
+            Some(other) => {
+                return Err(AlayaError::Judge(format!("unknown survivor {other:?}")));
+            }
+        };
+        if !(0.0..=1.0).contains(&self.confidence) {
+            return Err(AlayaError::Judge(format!(
+                "confidence {} outside 0.0..=1.0",
+                self.confidence
+            )));
+        }
+        // A survivor is only meaningful when something has to give way.
+        let survivor = match verdict {
+            Verdict::Coexist | Verdict::Unrelated => None,
+            Verdict::Contradiction | Verdict::Supersession => survivor,
+        };
+        let reason: String = self.reason.trim().chars().take(MAX_REASON_CHARS).collect();
+        Ok(Judgement {
+            verdict,
+            survivor,
+            reason,
+            confidence: self.confidence,
+            model,
+            input_tokens: usage.total_input_tokens(),
+            output_tokens: usage.output_tokens,
+        })
+    }
+}
+
+// ─── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw(verdict: &str, survivor: Option<&str>, confidence: f64) -> RawVerdict {
+        RawVerdict {
+            verdict: verdict.into(),
+            survivor: survivor.map(Into::into),
+            reason: "r".into(),
+            confidence,
+        }
+    }
+
+    #[test]
+    fn valid_supersession_keeps_survivor() {
+        let j = raw("supersession", Some("b"), 0.9)
+            .validate("m".into(), Usage::default())
+            .unwrap();
+        assert_eq!(j.verdict, Verdict::Supersession);
+        assert_eq!(j.survivor, Some(Survivor::B));
+    }
+
+    #[test]
+    fn coexist_drops_a_stray_survivor() {
+        let j = raw("coexist", Some("a"), 0.5)
+            .validate("m".into(), Usage::default())
+            .unwrap();
+        assert_eq!(j.survivor, None);
+    }
+
+    #[test]
+    fn unknown_verdict_is_rejected() {
+        let e = raw("maybe", None, 0.5)
+            .validate("m".into(), Usage::default())
+            .unwrap_err();
+        assert!(matches!(e, AlayaError::Judge(_)), "{e:?}");
+    }
+
+    #[test]
+    fn unknown_survivor_is_rejected() {
+        let e = raw("contradiction", Some("c"), 0.5)
+            .validate("m".into(), Usage::default())
+            .unwrap_err();
+        assert!(matches!(e, AlayaError::Judge(_)), "{e:?}");
+    }
+
+    #[test]
+    fn confidence_out_of_range_is_rejected() {
+        for c in [1.5, -0.1, f64::NAN] {
+            let e = raw("coexist", None, c)
+                .validate("m".into(), Usage::default())
+                .unwrap_err();
+            assert!(matches!(e, AlayaError::Judge(_)), "{c}: {e:?}");
+        }
+    }
+
+    #[test]
+    fn long_reason_is_clipped_not_rejected() {
+        let mut r = raw("unrelated", None, 0.5);
+        r.reason = "x".repeat(500);
+        let j = r.validate("m".into(), Usage::default()).unwrap();
+        assert_eq!(j.reason.chars().count(), MAX_REASON_CHARS);
+    }
+
+    #[test]
+    fn render_states_recency_in_days() {
+        let a = mem("a", 1_000.0);
+        let b = mem("b", 1_000.0 + 3.0 * 86_400.0);
+        let s = render_pair(&a, &b);
+        assert!(s.contains("A was recorded 3 days BEFORE B"), "{s}");
+        assert!(s.contains("Memory A (recorded_at=1000; type: note; tags: -):\ncontent a"));
+        let s2 = render_pair(&b, &a);
+        assert!(s2.contains("A was recorded 3 days AFTER B"), "{s2}");
+    }
+
+    fn mem(id: &str, created_at: f64) -> Memory {
+        Memory {
+            content: format!("content {id}"),
+            content_hash: id.repeat(64),
+            tags: vec![],
+            memory_type: "note".into(),
+            metadata: None,
+            created_at,
+            updated_at: created_at,
+            embedding: None,
+            summary: None,
+            salience_score: 0.0,
+            access_count: 0,
+            access_timestamps: vec![],
+            emotional_valence: None,
+            encoding_context: None,
+            provenance: None,
+            summary_embedding: None,
+        }
+    }
+
+    // ── HTTP failure paths (AC-2): every one is an Err, never a panic ──────
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod http {
+        use super::*;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn client(server: &MockServer) -> JudgeClient {
+            JudgeClient::with_request_timeout(
+                server.uri(),
+                "test-model".into(),
+                Some("k".into()),
+                std::time::Duration::from_millis(300),
+            )
+        }
+
+        fn ok_body(text: &str) -> serde_json::Value {
+            json!({"content": [{"type": "text", "text": text}],
+                   "usage": {"input_tokens": 120, "output_tokens": 30}})
+        }
+
+        #[tokio::test]
+        async fn valid_response_is_judged_with_usage_and_structured_output_request() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .and(header("x-api-key", "k"))
+                .and(header("anthropic-version", "2023-06-01"))
+                .and(wiremock::matchers::body_partial_json(json!({
+                    "model": "test-model",
+                    "output_config": {"format": {"type": "json_schema"}}
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_body(
+                    r#"{"verdict":"supersession","survivor":"b","reason":"B replaces A","confidence":0.92}"#,
+                )))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let j = client(&server)
+                .judge(&mem("a", 1.0), &mem("b", 2.0))
+                .await
+                .unwrap();
+            assert_eq!(j.verdict, Verdict::Supersession);
+            assert_eq!(j.survivor, Some(Survivor::B));
+            assert_eq!(j.model, "test-model");
+            assert_eq!((j.input_tokens, j.output_tokens), (120, 30));
+        }
+
+        #[tokio::test]
+        async fn non_2xx_is_a_judge_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+                .mount(&server)
+                .await;
+            let e = client(&server)
+                .judge(&mem("a", 1.0), &mem("b", 2.0))
+                .await
+                .unwrap_err();
+            assert!(matches!(e, AlayaError::Judge(_)), "{e:?}");
+        }
+
+        #[tokio::test]
+        async fn rate_limit_surfaces_retry_after() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "7"))
+                .mount(&server)
+                .await;
+            let e = client(&server)
+                .judge(&mem("a", 1.0), &mem("b", 2.0))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    e,
+                    AlayaError::RateLimited {
+                        retry_after_secs: Some(7)
+                    }
+                ),
+                "{e:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn timeout_is_a_judge_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(ok_body("{}"))
+                        .set_delay(std::time::Duration::from_secs(2)),
+                )
+                .mount(&server)
+                .await;
+            let e = client(&server)
+                .judge(&mem("a", 1.0), &mem("b", 2.0))
+                .await
+                .unwrap_err();
+            assert!(matches!(e, AlayaError::Judge(_)), "{e:?}");
+        }
+
+        #[tokio::test]
+        async fn non_json_text_is_a_judge_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_body("I think B wins.")))
+                .mount(&server)
+                .await;
+            let e = client(&server)
+                .judge(&mem("a", 1.0), &mem("b", 2.0))
+                .await
+                .unwrap_err();
+            assert!(matches!(e, AlayaError::Judge(_)), "{e:?}");
+        }
+
+        #[tokio::test]
+        async fn schema_violation_is_a_judge_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_body(
+                    r#"{"verdict":"contradiction","survivor":"a","reason":"x","confidence":7}"#,
+                )))
+                .mount(&server)
+                .await;
+            let e = client(&server)
+                .judge(&mem("a", 1.0), &mem("b", 2.0))
+                .await
+                .unwrap_err();
+            assert!(matches!(e, AlayaError::Judge(_)), "{e:?}");
+        }
+
+        #[tokio::test]
+        async fn empty_content_is_a_judge_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"content": []})))
+                .mount(&server)
+                .await;
+            let e = client(&server)
+                .judge(&mem("a", 1.0), &mem("b", 2.0))
+                .await
+                .unwrap_err();
+            assert!(matches!(e, AlayaError::Judge(_)), "{e:?}");
+        }
+    }
+}

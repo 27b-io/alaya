@@ -91,8 +91,17 @@ macro_rules! impl_graph_service {
             async fn get_all_contradictions(
                 &self,
                 l: usize,
+                v: Option<&[String]>,
             ) -> alaya_types::Result<Vec<alaya_types::graph::Contradiction>> {
-                self.0.get_all_contradictions(l).await
+                self.0.get_all_contradictions(l, v).await
+            }
+            async fn set_contradiction_verdict(
+                &self,
+                s: &str,
+                d: &str,
+                v: &alaya_types::graph::EdgeVerdict,
+            ) -> alaya_types::Result<bool> {
+                self.0.set_contradiction_verdict(s, d, v).await
             }
             async fn get_contradictions_for_hashes(
                 &self,

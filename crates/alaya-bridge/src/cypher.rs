@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use alaya_types::graph::{Direction, SystemRelationType, UserRelationType};
+use alaya_types::graph::{Direction, EdgeVerdict, SystemRelationType, UserRelationType, Verdict};
 use serde_json::{Value, json};
 
 /// A fully-constructed Cypher query ready to dispatch.
@@ -182,14 +182,64 @@ pub fn create_system_edge(src: &str, dst: &str, rel: SystemRelationType, ts: f64
 
 // ─── contradiction operations ─────────────────────────────────────────────────
 
-/// Fetch all CONTRADICTS pairs ordered by `created_at DESC`.
-pub fn get_all_contradictions(limit: u32) -> CypherQuery {
-    let q = "MATCH (a:Memory)-[e:CONTRADICTS]->(b:Memory) \
-             RETURN a.content_hash, b.content_hash, e.confidence, e.created_at \
-             ORDER BY e.created_at DESC \
-             LIMIT $lim"
-        .to_string();
-    (q, params(&[("lim", json!(limit))]), true)
+/// Columns every contradiction-pair query returns, in this order. The
+/// handler indexes rows by position, so keep the two in lock-step.
+pub const CONTRADICTION_COLUMNS: &str = "a.content_hash, b.content_hash, e.confidence, e.created_at, \
+     e.verdict, e.verdict_survivor, e.verdict_reason, e.verdict_confidence, \
+     e.verdict_model, e.judged_at";
+
+/// Fetch CONTRADICTS pairs ordered by `created_at DESC`.
+///
+/// `verdicts` filters on the judge's verdict property: the sentinel
+/// `"unjudged"` matches edges with no verdict. The WHERE clause is picked
+/// from three constant strings; the list itself travels as a parameter.
+pub fn get_all_contradictions(limit: u32, verdicts: Option<&[String]>) -> CypherQuery {
+    let filter = match verdicts {
+        None => "",
+        Some(v) if v.iter().any(|s| s == Verdict::UNJUDGED) => {
+            "WHERE e.verdict IS NULL OR e.verdict IN $verdicts "
+        }
+        Some(_) => "WHERE e.verdict IN $verdicts ",
+    };
+    let q = format!(
+        "MATCH (a:Memory)-[e:CONTRADICTS]->(b:Memory) \
+         {filter}\
+         RETURN {CONTRADICTION_COLUMNS} \
+         ORDER BY e.created_at DESC \
+         LIMIT $lim"
+    );
+    let mut p = params(&[("lim", json!(limit))]);
+    if let Some(v) = verdicts {
+        p.insert("verdicts".to_string(), json!(v));
+    }
+    (q, p, true)
+}
+
+/// SET the judge's verdict on an existing `src -> dst` CONTRADICTS edge.
+/// MATCH-only: never creates or deletes the edge. A `None` survivor is
+/// written as `null`, which clears the property.
+pub fn set_contradiction_verdict(src: &str, dst: &str, v: &EdgeVerdict) -> CypherQuery {
+    let q =
+        "MATCH (a:Memory {content_hash: $src})-[e:CONTRADICTS]->(b:Memory {content_hash: $dst}) \
+             SET e.verdict = $verdict, e.verdict_survivor = $survivor, \
+                 e.verdict_reason = $reason, e.verdict_confidence = $conf, \
+                 e.verdict_model = $model, e.judged_at = $ts \
+             RETURN count(e)"
+            .to_string();
+    (
+        q,
+        params(&[
+            ("src", json!(src)),
+            ("dst", json!(dst)),
+            ("verdict", json!(v.verdict.as_str())),
+            ("survivor", json!(v.verdict_survivor)),
+            ("reason", json!(v.verdict_reason)),
+            ("conf", json!(v.verdict_confidence)),
+            ("model", json!(v.verdict_model)),
+            ("ts", json!(v.judged_at)),
+        ]),
+        false,
+    )
 }
 
 /// Fetch CONTRADICTS pairs touching any of the supplied hashes.
@@ -397,6 +447,75 @@ pub fn get_graph_stats_union() -> CypherQuery {
 mod tests {
     use super::*;
 
+    // contradiction operations (LAB-3283)
+
+    #[test]
+    fn get_all_contradictions_unfiltered_has_no_where() {
+        let (q, p, ro) = get_all_contradictions(20, None);
+        assert!(!q.contains("WHERE"));
+        assert!(q.contains("e.verdict, e.verdict_survivor"));
+        assert!(q.contains("ORDER BY e.created_at DESC"));
+        assert!(!p.contains_key("verdicts"));
+        assert!(ro);
+    }
+
+    #[test]
+    fn get_all_contradictions_verdict_filter_is_parameterised() {
+        let v = vec!["contradiction".to_string(), "supersession".to_string()];
+        let (q, p, _) = get_all_contradictions(20, Some(&v));
+        assert!(q.contains("WHERE e.verdict IN $verdicts "));
+        assert!(!q.contains("IS NULL"));
+        assert!(
+            !q.contains("contradiction"),
+            "verdict text must not be interpolated"
+        );
+        assert_eq!(p["verdicts"], json!(["contradiction", "supersession"]));
+    }
+
+    #[test]
+    fn get_all_contradictions_unjudged_sentinel_selects_null_verdicts() {
+        let v = vec!["unjudged".to_string()];
+        let (q, _, _) = get_all_contradictions(20, Some(&v));
+        assert!(q.contains("WHERE e.verdict IS NULL OR e.verdict IN $verdicts "));
+    }
+
+    #[test]
+    fn set_contradiction_verdict_matches_never_merges() {
+        let v = EdgeVerdict {
+            verdict: Verdict::Supersession,
+            verdict_survivor: Some("b".repeat(64)),
+            verdict_reason: "it's newer".into(),
+            verdict_confidence: 0.9,
+            verdict_model: "m".into(),
+            judged_at: 1.0,
+        };
+        let (q, p, ro) = set_contradiction_verdict(&"a".repeat(64), &"b".repeat(64), &v);
+        assert!(q.starts_with("MATCH"));
+        assert!(!q.contains("MERGE") && !q.contains("CREATE") && !q.contains("DELETE"));
+        assert!(q.contains("SET e.verdict = $verdict"));
+        assert_eq!(p["verdict"], json!("supersession"));
+        assert_eq!(p["survivor"], json!("b".repeat(64)));
+        assert!(
+            !q.contains("it's"),
+            "reason must be a parameter, not interpolated"
+        );
+        assert!(!ro);
+    }
+
+    #[test]
+    fn set_contradiction_verdict_null_survivor_clears_property() {
+        let v = EdgeVerdict {
+            verdict: Verdict::Coexist,
+            verdict_survivor: None,
+            verdict_reason: String::new(),
+            verdict_confidence: 0.5,
+            verdict_model: "m".into(),
+            judged_at: 1.0,
+        };
+        let (_, p, _) = set_contradiction_verdict("a", "b", &v);
+        assert_eq!(p["survivor"], Value::Null);
+    }
+
     // node operations
 
     #[test]
@@ -494,7 +613,7 @@ mod tests {
 
     #[test]
     fn get_all_contradictions_shape() {
-        let (q, p, ro) = get_all_contradictions(20);
+        let (q, p, ro) = get_all_contradictions(20, None);
         assert!(q.contains("CONTRADICTS"));
         assert!(q.contains("ORDER BY e.created_at DESC"));
         assert!(p.contains_key("lim"));
