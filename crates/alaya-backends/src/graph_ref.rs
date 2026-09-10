@@ -90,10 +90,9 @@ macro_rules! impl_graph_service {
             }
             async fn get_all_contradictions(
                 &self,
-                l: usize,
-                v: Option<&[String]>,
+                q: &alaya_types::graph::ContradictionQuery,
             ) -> alaya_types::Result<Vec<alaya_types::graph::Contradiction>> {
-                self.0.get_all_contradictions(l, v).await
+                self.0.get_all_contradictions(q).await
             }
             async fn set_contradiction_verdict(
                 &self,

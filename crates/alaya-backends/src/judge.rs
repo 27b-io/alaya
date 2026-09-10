@@ -137,6 +137,10 @@ impl ContradictionJudge for JudgeClient {
         })?;
         raw.validate(self.model.clone(), resp.usage)
     }
+
+    fn model_name(&self) -> &str {
+        &self.model
+    }
 }
 
 // ─── Verdict parsing ───────────────────────────────────────────────────────
@@ -155,6 +159,13 @@ struct RawVerdict {
 
 impl RawVerdict {
     fn validate(self, model: String, usage: Usage) -> Result<Judgement> {
+        // The schema's enum excludes it; a proxy that drops `output_config`
+        // could still let it through, and it is not the model's to say.
+        if self.verdict == Verdict::Unjudged {
+            return Err(AlayaError::Judge(
+                "model answered 'unjudged', which is not a class".into(),
+            ));
+        }
         if !(0.0..=1.0).contains(&self.confidence) {
             return Err(AlayaError::Judge(format!(
                 "confidence {} outside 0.0..=1.0",
@@ -163,7 +174,7 @@ impl RawVerdict {
         }
         // A survivor is only meaningful when something has to give way.
         let survivor = match self.verdict {
-            Verdict::Coexist | Verdict::Unrelated => None,
+            Verdict::Coexist | Verdict::Unrelated | Verdict::Unjudged => None,
             Verdict::Contradiction | Verdict::Supersession => self.survivor,
         };
         // Model-authored text ends up in a line-oriented log: no control
@@ -349,10 +360,10 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn non_2xx_is_a_judge_error() {
+        async fn request_fault_4xx_is_a_deterministic_judge_error() {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
-                .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+                .respond_with(ResponseTemplate::new(400).set_body_string("invalid_request"))
                 .mount(&server)
                 .await;
             let e = client(&server)
@@ -360,6 +371,22 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(e, AlayaError::Judge(_)), "{e:?}");
+        }
+
+        #[tokio::test]
+        async fn server_errors_and_misconfiguration_are_transient() {
+            for status in [500u16, 502, 503, 529, 401, 403, 404] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .respond_with(ResponseTemplate::new(status).set_body_string("boom"))
+                    .mount(&server)
+                    .await;
+                let e = client(&server)
+                    .judge(&mem("a", 1.0), &mem("b", 2.0))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(e, AlayaError::Unavailable(_)), "{status}: {e:?}");
+            }
         }
 
         #[tokio::test]
@@ -385,7 +412,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn timeout_is_a_judge_error() {
+        async fn timeout_is_transient() {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .respond_with(
@@ -393,6 +420,22 @@ mod tests {
                         .set_body_json(ok_body("{}"))
                         .set_delay(std::time::Duration::from_secs(2)),
                 )
+                .mount(&server)
+                .await;
+            let e = client(&server)
+                .judge(&mem("a", 1.0), &mem("b", 2.0))
+                .await
+                .unwrap_err();
+            assert!(matches!(e, AlayaError::Unavailable(_)), "{e:?}");
+        }
+
+        #[tokio::test]
+        async fn model_answering_unjudged_is_a_deterministic_judge_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_body(
+                    r#"{"verdict":"unjudged","survivor":null,"reason":"x","confidence":0.5}"#,
+                )))
                 .mount(&server)
                 .await;
             let e = client(&server)

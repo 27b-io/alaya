@@ -36,6 +36,13 @@ pub enum AlayaError {
     #[error("upstream rate limited (retry-after: {retry_after_secs:?}s)")]
     RateLimited { retry_after_secs: Option<u64> },
 
+    /// Transient upstream failure — connect/timeout, 5xx, or an auth/model
+    /// misconfiguration (401/403/404) that is not the request's fault.
+    /// Nothing about the input caused it, so callers must not record a
+    /// per-item failure; retry later.
+    #[error("upstream unavailable: {0}")]
+    Unavailable(String),
+
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 }
@@ -54,6 +61,7 @@ impl AlayaError {
             Self::Rerank(_) => -32006,
             Self::Judge(_) => -32007,
             Self::RateLimited { .. } => -32008,
+            Self::Unavailable(_) => -32009,
             Self::Serialization(_) => -32600,
         }
     }
@@ -72,6 +80,7 @@ impl AlayaError {
             Self::Rerank(_) => "Rerank operation failed",
             Self::Judge(_) => "Contradiction judge failed",
             Self::RateLimited { .. } => "Upstream rate limited",
+            Self::Unavailable(_) => "Upstream temporarily unavailable",
             Self::Serialization(_) => "Invalid request format",
         }
     }

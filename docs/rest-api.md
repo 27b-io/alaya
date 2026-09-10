@@ -294,14 +294,15 @@ Content-Type: application/json
 POST /contradictions
 Content-Type: application/json
 
-{"limit": 20, "include_resolved": false, "verdicts": ["contradiction", "supersession", "unjudged"]}
+{"limit": 20, "offset": 0, "include_resolved": false, "verdicts": ["contradiction", "supersession", "unjudged"]}
 ```
 
 | Field | Default | Notes |
 |:--|:--|:--|
-| `limit` | `20` | Pairs fetched from the graph, newest edge first (1–500). |
-| `include_resolved` | `false` | `false` hides pairs where either memory is already superseded. |
-| `verdicts` | `["contradiction","supersession","unjudged"]` | Only pairs whose judge verdict is in the list. `unjudged` = no verdict yet. Add `coexist` / `unrelated` to see everything. |
+| `limit` | `20` | Page size (1–500), newest edge first. |
+| `offset` | `0` | Page cursor: pass back the previous response's `next_offset`. |
+| `include_resolved` | `false` | `false` hides pairs where either memory is already superseded. The filter runs in the graph (an incoming `SUPERSEDES` edge is the resolved state), so a run of resolved pairs at the top of the queue never hides the rest. |
+| `verdicts` | `["contradiction","supersession","unjudged"]` | Only pairs whose judge verdict is in the list. `unjudged` = no verdict yet, or a pair the judge could not classify (see `verdict_reason`). Add `coexist` / `unrelated` to see everything. Unknown values are a `400`. |
 
 Each pair carries the lexical detector's `confidence` plus the judge's advisory verdict (LAB-3283). A verdict never mutates a memory; `survivor` is a recommendation for `POST /supersede`.
 
@@ -326,11 +327,12 @@ Each pair carries the lexical detector's `confidence` plus the judge's advisory 
       "judged_at": 1789000000.0
     }
   ],
-  "total": 1
+  "total": 1,
+  "next_offset": 20
 }
 ```
 
-`verdict` is one of `contradiction`, `supersession`, `coexist`, `unrelated`, or `unjudged` (the other verdict fields are `null` when unjudged). Pure read — the read-only bearer may call it.
+`verdict` is one of `contradiction`, `supersession`, `coexist`, `unrelated`, or `unjudged`. An edge the judge has never seen has `null` for the other verdict fields; an edge the judge failed on deterministically (unparseable or empty answer, request rejected) is `unjudged` with `verdict_reason` starting `unjudged:` and `verdict_model` set. `next_offset` is `null` on the last page. Pure read — the read-only bearer may call it.
 
 ## `POST /duplicates/find`
 
@@ -386,16 +388,24 @@ Judge `CONTRADICTS` pairs that have no verdict yet (LAB-3283). Operator-only, sa
 POST /backfill/contradictions
 Content-Type: application/json
 
-{"limit": 100}
+{"limit": 100, "rejudge": false}
 ```
 
 Blocks until the pass completes and returns what happened:
 
 ```json
-{"queued": 100, "judged": 97, "persisted": 97, "unjudged": 3, "input_tokens": 231044, "output_tokens": 7112}
+{"queued": 100, "judged": 95, "persisted": 95, "marked": 2, "unjudged": 3, "input_tokens": 231044, "output_tokens": 7112}
 ```
 
-`limit` defaults to `100` (max 500 per call). At most 4 judge calls are in flight — a cap shared with the judging that runs after each `POST /store` — and a `429` from the provider is retried with backoff (honouring `retry-after`). Re-running is idempotent: only edges still without a verdict are judged, so persisted verdicts never cost again. `unjudged` counts pairs the judge could not classify (timeout, malformed answer, endpoint missing); `judged - persisted` is verdicts that were produced but did not land on an edge (graph blip). Both stay eligible for the next run. Verdicts are written onto the graph edge only; no memory record is modified.
+`limit` defaults to `100` (max 500 per call). At most 4 judge calls are in flight — a cap shared with the judging that runs after each `POST /store` — and a `429` from the provider is retried with backoff (honouring `retry-after`). Resolved pairs (an endpoint with a `SUPERSEDES` edge) are not judged.
+
+Failures are classified so one poison pair cannot stall the pass or re-bill forever:
+
+- **deterministic** (unparseable or empty answer, request rejected with 400/413/422) → the edge is marked `verdict = unjudged` with `verdict_reason = "unjudged: <error>"` and the configured model; counted in `marked`, skipped by later passes, visible on `POST /contradictions` under `verdicts: ["unjudged"]`.
+- **transient** (timeout, 5xx, 429 after retries, upstream misconfiguration, endpoint missing) → nothing is written; counted in `unjudged`, retried next pass.
+- `judged - persisted` is verdicts produced that did not land on an edge (graph blip); they are retried next pass.
+
+Re-running is idempotent: only edges with no verdict at all are selected. **Switching `JUDGE_MODEL`** does not touch existing verdicts; run with `"rejudge": true` to also re-annotate every edge whose `verdict_model` differs from the configured model (markers included), paging with `limit` until `queued` is `0`. Verdicts are written onto the graph edge only; no memory record is modified.
 
 One pass at a time: a second call while one is running returns `{"success": false, "error": "backfill already running"}`. The HTTP reply waits at most 630 s, so keep `limit` around 200 per call; a pass that outlives the reply still runs to completion and the next call is refused until it finishes.
 

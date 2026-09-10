@@ -48,7 +48,7 @@ use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{
     JudgeOutcome, MemoryService, OutputMode, RelationParams, SearchParams, StoreParams,
 };
-use alaya_types::graph::Contradiction;
+use alaya_types::graph::{Contradiction, ContradictionQuery};
 use alaya_types::memory::PatchMemoryRequest;
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -438,6 +438,7 @@ pub(crate) enum CmdInner {
     },
     Contradictions {
         limit: usize,
+        offset: usize,
         include_resolved: bool,
         verdicts: Option<Vec<String>>,
         reply: oneshot::Sender<Value>,
@@ -464,9 +465,11 @@ pub(crate) enum CmdInner {
         limit: usize,
         reply: oneshot::Sender<Value>,
     },
-    /// Judge every unjudged CONTRADICTS pair, up to `limit` (LAB-3283 AC-5).
+    /// Judge up to `limit` CONTRADICTS pairs with no verdict (LAB-3283 AC-5);
+    /// `rejudge` also re-annotates pairs judged by a different model.
     BackfillContradictions {
         limit: usize,
+        rejudge: bool,
         reply: oneshot::Sender<Value>,
     },
 }
@@ -1124,14 +1127,16 @@ async fn service_worker(
             }
             CmdInner::Contradictions {
                 limit,
+                offset,
                 include_resolved,
                 verdicts,
                 reply,
             } => {
-                let span = tracing::info_span!(parent: &ps, "contradictions", include_resolved);
+                let span =
+                    tracing::info_span!(parent: &ps, "contradictions", offset, include_resolved);
                 let result = match timeout(
                     limits.cmd,
-                    svc.memory_contradictions(limit, include_resolved, verdicts.as_deref())
+                    svc.memory_contradictions(limit, offset, include_resolved, verdicts.as_deref())
                         .instrument(span),
                 )
                 .await
@@ -1334,7 +1339,11 @@ async fn service_worker(
                     .instrument(span),
                 );
             }
-            CmdInner::BackfillContradictions { limit, reply } => {
+            CmdInner::BackfillContradictions {
+                limit,
+                rejudge,
+                reply,
+            } => {
                 if backfill_running.replace(true) {
                     let _ = reply.send(json!({
                         "success": false,
@@ -1347,7 +1356,7 @@ async fn service_worker(
                     let running = backfill_running.clone();
                     tokio::task::spawn_local(
                         async move {
-                            run_backfill_contradictions(&svc, &gate, limit, reply).await;
+                            run_backfill_contradictions(&svc, &gate, limit, rejudge, reply).await;
                             running.set(false);
                         }
                         .instrument(span),
@@ -1393,6 +1402,9 @@ struct BackfillTotals {
     judged: usize,
     /// Judged verdicts that actually landed on an edge.
     persisted: usize,
+    /// Deterministic failures persisted as an `unjudged` marker (skipped next pass).
+    marked: usize,
+    /// Transient failures: nothing written, retried next pass.
     unjudged: usize,
     input_tokens: u64,
     output_tokens: u64,
@@ -1404,23 +1416,29 @@ async fn run_backfill_contradictions(
     svc: &MemoryService,
     gate: &std::rc::Rc<tokio::sync::Semaphore>,
     limit: usize,
+    rejudge: bool,
     reply: oneshot::Sender<Value>,
 ) {
-    if svc.judge.is_none() {
+    let Some(judge) = svc.judge.as_ref() else {
         let _ = reply.send(json!({
             "success": false,
             "error": "contradiction judge not configured"
         }));
         return;
-    }
-    // Only pairs with no verdict: re-running is idempotent and never
-    // re-spends on judged edges (AC-5). The bridge caps `limit` at 500.
-    let unjudged = [alaya_types::graph::Verdict::UNJUDGED.to_string()];
-    let pairs = match svc
-        .graph
-        .get_all_contradictions(limit, Some(&unjudged))
-        .await
-    {
+    };
+    // Only edges with no verdict at all: a persisted `unjudged` marker is a
+    // deterministic failure and is skipped, so re-running is idempotent and
+    // never re-spends (AC-5). `rejudge` widens the selection to edges judged
+    // by a different model — the recovery path for a model switch. Resolved
+    // pairs are hidden from the read surface, so judging them is waste.
+    let query = ContradictionQuery {
+        limit,
+        needs_judging: true,
+        rejudge_model: rejudge.then(|| judge.model_name().to_string()),
+        exclude_resolved: true,
+        ..Default::default()
+    };
+    let pairs = match svc.graph.get_all_contradictions(&query).await {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("backfill: fetching unjudged pairs failed: {e}");
@@ -1429,12 +1447,13 @@ async fn run_backfill_contradictions(
         }
     };
     let queued = pairs.len();
-    tracing::info!(queued, "backfill: judging contradictions");
+    tracing::info!(queued, rejudge, "backfill: judging contradictions");
     let t = backfill_judge(svc, gate, pairs).await;
     tracing::info!(
         queued,
         judged = t.judged,
         persisted = t.persisted,
+        marked = t.marked,
         unjudged = t.unjudged,
         input_tokens = t.input_tokens,
         output_tokens = t.output_tokens,
@@ -1444,6 +1463,7 @@ async fn run_backfill_contradictions(
         "queued": queued,
         "judged": t.judged,
         "persisted": t.persisted,
+        "marked": t.marked,
         "unjudged": t.unjudged,
         "input_tokens": t.input_tokens,
         "output_tokens": t.output_tokens,
@@ -1458,9 +1478,11 @@ async fn backfill_judge(
     pairs: Vec<Contradiction>,
 ) -> BackfillTotals {
     use futures::StreamExt;
-    let outcomes: Vec<Option<(alaya_backends::Judgement, bool)>> = futures::stream::iter(pairs)
+    let outcomes: Vec<JudgeOutcome> = futures::stream::iter(pairs)
         .map(|p| async move {
-            let _permit = gate.acquire().await.ok()?;
+            let Ok(_permit) = gate.acquire().await else {
+                return JudgeOutcome::Unjudged { marked: false };
+            };
             with_backoff(|| svc.judge_contradiction(&p.memory_a_hash, &p.memory_b_hash)).await
         })
         .buffer_unordered(JUDGE_CONCURRENCY)
@@ -1469,15 +1491,22 @@ async fn backfill_judge(
     let mut t = BackfillTotals::default();
     for o in outcomes {
         match o {
-            Some((j, persisted)) => {
+            JudgeOutcome::Judged {
+                judgement,
+                persisted,
+            } => {
                 t.judged += 1;
                 if persisted {
                     t.persisted += 1;
                 }
-                t.input_tokens += j.input_tokens;
-                t.output_tokens += j.output_tokens;
+                t.input_tokens += judgement.input_tokens;
+                t.output_tokens += judgement.output_tokens;
             }
-            None => t.unjudged += 1,
+            JudgeOutcome::Unjudged { marked: true } => t.marked += 1,
+            // `with_backoff` never returns RateLimited; treat it as transient.
+            JudgeOutcome::Unjudged { marked: false } | JudgeOutcome::RateLimited { .. } => {
+                t.unjudged += 1
+            }
         }
     }
     t
@@ -1485,8 +1514,8 @@ async fn backfill_judge(
 
 /// Retry one judge attempt on 429, honouring `retry-after` when the LB
 /// sends it and doubling from 1s (capped) when it doesn't. Any other
-/// outcome is final.
-async fn with_backoff<F, Fut>(mut attempt: F) -> Option<(alaya_backends::Judgement, bool)>
+/// outcome is final; exhausted retries count as a transient unjudged.
+async fn with_backoff<F, Fut>(mut attempt: F) -> JudgeOutcome
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = JudgeOutcome>,
@@ -1494,18 +1523,16 @@ where
     let mut backoff = std::time::Duration::from_secs(1);
     for n in 0..=JUDGE_MAX_RETRIES {
         match attempt().await {
-            JudgeOutcome::Judged {
-                judgement,
-                persisted,
-            } => return Some((judgement, persisted)),
-            JudgeOutcome::Unjudged => return None,
+            outcome @ (JudgeOutcome::Judged { .. } | JudgeOutcome::Unjudged { .. }) => {
+                return outcome;
+            }
             JudgeOutcome::RateLimited { retry_after_secs } => {
                 if n == JUDGE_MAX_RETRIES {
                     tracing::warn!(
                         retries = n,
                         "backfill: still rate limited, giving up on pair"
                     );
-                    return None;
+                    return JudgeOutcome::Unjudged { marked: false };
                 }
                 let wait = retry_after_secs
                     .map(std::time::Duration::from_secs)
@@ -1521,7 +1548,7 @@ where
             }
         }
     }
-    None
+    JudgeOutcome::Unjudged { marked: false }
 }
 
 /// Fire-and-forget summary generation helper.
@@ -2067,6 +2094,9 @@ struct ContradictionsReq {
     /// Verdict filter; omitted = `contradiction,supersession,unjudged`.
     #[serde(default)]
     verdicts: Option<Vec<String>>,
+    /// Pairs to skip (page cursor: pass back the previous `next_offset`).
+    #[serde(default)]
+    offset: usize,
 }
 fn default_limit() -> usize {
     20
@@ -2080,6 +2110,7 @@ async fn contradictions(
     h.call(
         CmdInner::Contradictions {
             limit: req.limit,
+            offset: req.offset,
             include_resolved: req.include_resolved,
             verdicts: req.verdicts,
             reply: tx,
@@ -2273,17 +2304,28 @@ async fn backfill_summaries(
     .await
 }
 
+#[derive(Deserialize)]
+struct BackfillContradictionsParams {
+    #[serde(default = "default_backfill_limit")]
+    limit: usize,
+    /// Also re-judge edges whose `verdict_model` differs from the configured
+    /// judge model (recovery path for a model switch).
+    #[serde(default)]
+    rejudge: bool,
+}
+
 /// Operator-only (same auth class as `/backfill/summaries`, enforced in
 /// `auth::rest_route_op`). Blocks until the pass completes and returns
-/// `{queued, judged, unjudged, input_tokens, output_tokens}`.
+/// `{queued, judged, persisted, marked, unjudged, input_tokens, output_tokens}`.
 async fn backfill_contradictions(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
-    Json(params): Json<BackfillParams>,
+    Json(params): Json<BackfillContradictionsParams>,
 ) -> (StatusCode, Json<Value>) {
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::BackfillContradictions {
             limit: params.limit,
+            rejudge: params.rejudge,
             reply: tx,
         },
         rx,
@@ -2349,7 +2391,7 @@ mod tests {
             }
         })
         .await;
-        assert!(out.is_some());
+        assert!(matches!(out, JudgeOutcome::Judged { .. }), "{out:?}");
         assert_eq!(calls.get(), 3);
         assert!(
             start.elapsed() >= std::time::Duration::from_secs(6),
@@ -2370,7 +2412,10 @@ mod tests {
             }
         })
         .await;
-        assert!(out.is_none());
+        assert!(
+            matches!(out, JudgeOutcome::Unjudged { marked: false }),
+            "{out:?}"
+        );
         assert_eq!(calls.get(), JUDGE_MAX_RETRIES + 1);
         // 1+2+4+8+16 s of doubling before the final attempt gives up.
         assert!(start.elapsed() >= std::time::Duration::from_secs(31));
@@ -2385,10 +2430,13 @@ mod tests {
         let calls = std::cell::Cell::new(0u32);
         let out = with_backoff(|| {
             calls.set(calls.get() + 1);
-            async { JudgeOutcome::Unjudged }
+            async { JudgeOutcome::Unjudged { marked: true } }
         })
         .await;
-        assert!(out.is_none());
+        assert!(
+            matches!(out, JudgeOutcome::Unjudged { marked: true }),
+            "{out:?}"
+        );
         assert_eq!(calls.get(), 1);
     }
 
@@ -2631,8 +2679,7 @@ mod wedge_tests {
         }
         async fn get_all_contradictions(
             &self,
-            _limit: usize,
-            _verdicts: Option<&[String]>,
+            _query: &alaya_types::graph::ContradictionQuery,
         ) -> Result<Vec<Contradiction>> {
             unimplemented!()
         }

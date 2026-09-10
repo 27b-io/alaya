@@ -121,7 +121,7 @@ async fn golden_set_precision_recall() {
             .await;
 
     // Confusion matrix: predicted (rows, incl. unjudged) × label (cols).
-    let classes = Verdict::ALL;
+    let classes = Verdict::CLASSES;
     let idx = |v: Verdict| classes.iter().position(|c| *c == v).unwrap();
     let mut matrix = [[0usize; 4]; 5]; // row 4 = unjudged
     let (mut in_tok, mut out_tok) = (0u64, 0u64);

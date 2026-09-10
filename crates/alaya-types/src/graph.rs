@@ -83,17 +83,32 @@ pub enum Verdict {
     Coexist,
     /// Shared vocabulary only; the pair is a detector false positive.
     Unrelated,
+    /// No usable verdict. Persisted only for a *deterministic* judge
+    /// failure (schema / parse / empty answer) so the backfill's NULL
+    /// filter stops re-matching the pair; also the read-surface sentinel
+    /// for an edge with no verdict at all. Never accepted from the model.
+    Unjudged,
 }
 
 impl Verdict {
-    pub const ALL: [Verdict; 4] = [
+    /// The four classes the model may answer with.
+    pub const CLASSES: [Verdict; 4] = [
         Verdict::Contradiction,
         Verdict::Supersession,
         Verdict::Coexist,
         Verdict::Unrelated,
     ];
 
-    /// Sentinel used on read surfaces for an edge with no verdict yet.
+    /// Every value an edge may carry, including the failure marker.
+    pub const ALL: [Verdict; 5] = [
+        Verdict::Contradiction,
+        Verdict::Supersession,
+        Verdict::Coexist,
+        Verdict::Unrelated,
+        Verdict::Unjudged,
+    ];
+
+    /// Wire/sentinel form of `Verdict::Unjudged`.
     pub const UNJUDGED: &'static str = "unjudged";
 
     pub fn as_str(&self) -> &'static str {
@@ -102,6 +117,7 @@ impl Verdict {
             Self::Supersession => "supersession",
             Self::Coexist => "coexist",
             Self::Unrelated => "unrelated",
+            Self::Unjudged => Self::UNJUDGED,
         }
     }
 
@@ -128,6 +144,35 @@ pub struct EdgeVerdict {
     pub verdict_model: String,
     #[serde(default)]
     pub judged_at: f64,
+}
+
+/// Selection for `GraphService::get_all_contradictions` (bridge
+/// `POST /contradictions/all`). Every filter is applied in Cypher, so a
+/// page is a page of *matching* edges — the fix for the LAB-3283 review's
+/// queue-starvation finding (app-side filtering over a LIMIT-only read).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContradictionQuery {
+    /// Page size (the bridge clamps to 1..=500).
+    pub limit: usize,
+    /// Edges to skip in `created_at DESC` order.
+    #[serde(default)]
+    pub skip: usize,
+    /// Only edges whose verdict is in the list. `"unjudged"` matches both
+    /// an absent verdict and the persisted failure marker. `None` = any.
+    #[serde(default)]
+    pub verdicts: Option<Vec<String>>,
+    /// Drop pairs where either endpoint has an incoming `SUPERSEDES` edge —
+    /// the graph-side resolved state `mark_superseded` writes.
+    #[serde(default)]
+    pub exclude_resolved: bool,
+    /// Backfill selection: edges with no verdict at all (`NULL`; a persisted
+    /// `unjudged` marker does NOT match, so a poison pair is skipped).
+    #[serde(default)]
+    pub needs_judging: bool,
+    /// With `needs_judging`, also select edges whose `verdict_model` differs
+    /// from this one — the re-judge path for a model switch.
+    #[serde(default)]
+    pub rejudge_model: Option<String>,
 }
 
 /// A contradiction pair from the dashboard.

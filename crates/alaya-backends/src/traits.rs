@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use alaya_types::{
     Result,
     graph::{
-        CoAccessPair, Contradiction, ContradictionRef, Direction, Edge, EdgeMeta, EdgeVerdict,
-        GraphStats, Neighbor, SystemRelationType, UserRelationType, Verdict,
+        CoAccessPair, Contradiction, ContradictionQuery, ContradictionRef, Direction, Edge,
+        EdgeMeta, EdgeVerdict, GraphStats, Neighbor, SystemRelationType, UserRelationType, Verdict,
     },
     memory::{
         HealthStatus, Memory, MetadataUpdate, PatchMemoryRequest, ScoredMemory, ScrollResult,
@@ -206,13 +206,11 @@ pub trait GraphService {
     }
 
     // Contradiction queries
-    /// Newest-first CONTRADICTS pairs. `verdicts` restricts to edges whose
-    /// verdict is in the list; the sentinel `"unjudged"` selects edges with
-    /// no verdict. `None` = every edge (legacy behaviour).
+    /// One page of CONTRADICTS pairs, newest first, with every filter in
+    /// `query` applied graph-side (see `ContradictionQuery`).
     async fn get_all_contradictions(
         &self,
-        limit: usize,
-        verdicts: Option<&[String]>,
+        query: &ContradictionQuery,
     ) -> Result<Vec<Contradiction>>;
     /// Write the judge's verdict onto the existing `src -> dst` CONTRADICTS
     /// edge. Never creates or deletes an edge; returns whether one matched.
@@ -327,10 +325,16 @@ pub struct Judgement {
 /// read surfaces report every pair as `unjudged`.
 #[async_trait(?Send)]
 pub trait ContradictionJudge {
-    /// Judge whether `a` and `b` conflict. Any transport, parse or schema
-    /// failure is an `Err`; the caller treats that as *unjudged* and must
-    /// not write anything.
+    /// Judge whether `a` and `b` conflict. Errors are classified: `Judge`
+    /// means this pair will fail the same way again (schema / parse / empty
+    /// answer / 4xx request fault) and the caller persists an `unjudged`
+    /// marker; `RateLimited` and `Unavailable` are transient and the caller
+    /// writes nothing so the pair is retried.
     async fn judge(&self, a: &Memory, b: &Memory) -> Result<Judgement>;
+
+    /// Model id stamped on verdicts (and on failure markers) — the value a
+    /// re-judge compares `verdict_model` against.
+    fn model_name(&self) -> &str;
 }
 
 /// Cross-encoder reranking backend (TEI `/rerank` endpoint).

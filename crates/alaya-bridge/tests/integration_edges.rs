@@ -303,7 +303,12 @@ async fn get_all_contradictions_returns_created_pairs() -> anyhow::Result<()> {
     .await;
 
     let result = ctx
-        .exec_tuple(cypher::get_all_contradictions(50, None))
+        .exec_tuple(cypher::get_all_contradictions(
+            &alaya_types::graph::ContradictionQuery {
+                limit: 50,
+                ..Default::default()
+            },
+        ))
         .await;
 
     assert!(

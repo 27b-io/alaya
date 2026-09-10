@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use alaya_types::{
     AlayaError, Result,
     graph::{
-        CoAccessPair, Contradiction, ContradictionRef, Direction, Edge, EdgeMeta, EdgeVerdict,
-        GraphStats, Neighbor, SystemRelationType, UserRelationType,
+        CoAccessPair, Contradiction, ContradictionQuery, ContradictionRef, Direction, Edge,
+        EdgeMeta, EdgeVerdict, GraphStats, Neighbor, SystemRelationType, UserRelationType,
     },
 };
 
@@ -225,13 +225,6 @@ struct DeletedResp {
 #[derive(Deserialize)]
 struct EdgesResp {
     edges: Vec<Edge>,
-}
-
-#[derive(Serialize)]
-struct ContradictionsAllReq<'a> {
-    limit: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    verdicts: Option<&'a [String]>,
 }
 
 #[derive(Serialize)]
@@ -478,13 +471,12 @@ impl GraphService for GraphHttpClient {
 
     async fn get_all_contradictions(
         &self,
-        limit: usize,
-        verdicts: Option<&[String]>,
+        query: &ContradictionQuery,
     ) -> Result<Vec<Contradiction>> {
         let resp = self
             .client
             .post(format!("{}/contradictions/all", self.base_url))
-            .json(&ContradictionsAllReq { limit, verdicts })
+            .json(query)
             .send()
             .await
             .map_err(|e| AlayaError::Graph(e.to_string()))?;

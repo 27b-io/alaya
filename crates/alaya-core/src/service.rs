@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use alaya_backends::{ContradictionJudge, Judgement, Survivor};
-use alaya_types::graph::{EdgeVerdict, Verdict};
+use alaya_types::graph::{ContradictionQuery, EdgeVerdict, Verdict};
 
 // ─── Tag deserialization ───────────────────────────────────────────────────────
 
@@ -217,6 +217,13 @@ pub const SHADOW_LOG_TARGET: &str = "alaya::judge";
 /// that want `coexist`/`unrelated` name them explicitly.
 const DEFAULT_VERDICT_FILTER: [&str; 3] = ["contradiction", "supersession", Verdict::UNJUDGED];
 
+/// Page cap for `memory_contradictions` (the bridge clamps to the same).
+const CONTRADICTION_PAGE_MAX: usize = 500;
+/// Extra graph pages the read may pull to fill `limit` when the residual
+/// Qdrant-side `superseded_by` check hides a pair the graph filter let
+/// through. Measured 0 such pairs on 2026-09-10; the bound is a fuse.
+const MAX_CONTRADICTION_PAGES: usize = 5;
+
 /// Result of judging one CONTRADICTS pair.
 #[derive(Debug)]
 pub enum JudgeOutcome {
@@ -227,9 +234,13 @@ pub enum JudgeOutcome {
         judgement: Judgement,
         persisted: bool,
     },
-    /// No verdict: judge disabled, endpoint missing, transport/parse/schema
-    /// failure. Nothing was written. The pair stays eligible for backfill.
-    Unjudged,
+    /// No verdict. `marked` = a *deterministic* failure (schema / parse /
+    /// empty answer / request fault) was persisted as `verdict = unjudged`
+    /// with the error class as reason, so the backfill's NULL filter skips
+    /// the pair instead of re-billing it forever. `marked = false` =
+    /// transient (judge disabled, endpoint missing, fetch failed, upstream
+    /// unavailable): nothing written, the pair is retried later.
+    Unjudged { marked: bool },
     /// Upstream 429. Nothing was written; the caller owns any backoff.
     RateLimited { retry_after_secs: Option<u64> },
 }
@@ -1737,7 +1748,7 @@ impl MemoryService {
     /// this runs detached from any request.
     pub async fn judge_contradiction(&self, src: &str, dst: &str) -> JudgeOutcome {
         let Some(ref judge) = self.judge else {
-            return JudgeOutcome::Unjudged;
+            return JudgeOutcome::Unjudged { marked: false };
         };
         if !alaya_types::memory::validate_content_hash(src)
             || !alaya_types::memory::validate_content_hash(dst)
@@ -1748,7 +1759,7 @@ impl MemoryService {
                 dst_len = dst.len(),
                 "judge_contradiction: invalid pair, skipping"
             );
-            return JudgeOutcome::Unjudged;
+            return JudgeOutcome::Unjudged { marked: false };
         }
         let (sa, sd) = (&src[..8], &dst[..8]);
 
@@ -1756,7 +1767,7 @@ impl MemoryService {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(a = sa, b = sd, "judge_contradiction: fetch failed: {e}");
-                return JudgeOutcome::Unjudged;
+                return JudgeOutcome::Unjudged { marked: false };
             }
         };
         let a = batch.iter().find(|m| m.content_hash == src);
@@ -1767,7 +1778,7 @@ impl MemoryService {
                 b = sd,
                 "judge_contradiction: endpoint missing, skipping"
             );
-            return JudgeOutcome::Unjudged;
+            return JudgeOutcome::Unjudged { marked: false };
         };
 
         let j = match judge.judge(a, b).await {
@@ -1776,17 +1787,39 @@ impl MemoryService {
                 tracing::warn!(a = sa, b = sd, retry_after_secs, "judge rate limited");
                 return JudgeOutcome::RateLimited { retry_after_secs };
             }
-            Err(e) => {
-                // Default target on purpose: the shadow-log target carries
-                // judged pairs only. `?e` keeps an upstream body escaped.
+            Err(AlayaError::Unavailable(e)) => {
                 tracing::warn!(
                     memory_a = src,
                     memory_b = dst,
                     verdict = Verdict::UNJUDGED,
                     error = ?e,
-                    "contradiction unjudged"
+                    "contradiction unjudged (transient; will retry)"
                 );
-                return JudgeOutcome::Unjudged;
+                return JudgeOutcome::Unjudged { marked: false };
+            }
+            Err(e) => {
+                // Deterministic: this pair fails the same way every time, so
+                // mark the edge `unjudged` with the error class — otherwise
+                // the backfill's NULL filter re-matches it on every pass
+                // (poison pill). Default log target on purpose: the shadow
+                // log carries judged pairs only. `?e` keeps a body escaped.
+                tracing::warn!(
+                    memory_a = src,
+                    memory_b = dst,
+                    verdict = Verdict::UNJUDGED,
+                    error = ?e,
+                    "contradiction unjudged (deterministic; marking edge)"
+                );
+                let marker = EdgeVerdict {
+                    verdict: Verdict::Unjudged,
+                    verdict_survivor: None,
+                    verdict_reason: log_safe(&format!("unjudged: {e}")),
+                    verdict_confidence: 0.0,
+                    verdict_model: judge.model_name().to_string(),
+                    judged_at: (self.clock)(),
+                };
+                let marked = self.persist_verdict(src, dst, &marker).await;
+                return JudgeOutcome::Unjudged { marked };
             }
         };
 
@@ -1802,21 +1835,7 @@ impl MemoryService {
             verdict_model: j.model.clone(),
             judged_at: (self.clock)(),
         };
-        let persisted = match self.graph.set_contradiction_verdict(src, dst, &edge).await {
-            Ok(true) => true,
-            Ok(false) => {
-                tracing::warn!(
-                    a = sa,
-                    b = sd,
-                    "judge_contradiction: no CONTRADICTS edge matched; verdict not persisted"
-                );
-                false
-            }
-            Err(e) => {
-                tracing::warn!(a = sa, b = sd, "verdict persist failed (non-fatal): {e}");
-                false
-            }
-        };
+        let persisted = self.persist_verdict(src, dst, &edge).await;
 
         // Shadow log (AC-4b): what Phase 2 would write. Only a supersession
         // with a named survivor is actionable; everything else is "none".
@@ -1849,19 +1868,47 @@ impl MemoryService {
         }
     }
 
+    /// Write a verdict (or failure marker) onto the `src -> dst` edge through
+    /// the graph trait. Graph blips are non-fatal by design: `false` means the
+    /// edge is still unannotated and the next backfill pass sees it again.
+    async fn persist_verdict(&self, src: &str, dst: &str, edge: &EdgeVerdict) -> bool {
+        let (sa, sd) = (&src[..8.min(src.len())], &dst[..8.min(dst.len())]);
+        match self.graph.set_contradiction_verdict(src, dst, edge).await {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::warn!(
+                    a = sa,
+                    b = sd,
+                    "no CONTRADICTS edge matched; verdict not persisted"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(a = sa, b = sd, "verdict persist failed (non-fatal): {e}");
+                false
+            }
+        }
+    }
+
     // ─── Tool 7: memory_contradictions ──────────────────────────────────
 
-    /// List CONTRADICTS pairs with their judge verdicts.
+    /// List CONTRADICTS pairs with their judge verdicts, newest first.
     ///
-    /// `include_resolved = false` hides pairs where either endpoint is
-    /// already superseded (filtered here, not in Qdrant — see
-    /// `is_superseded`). `verdicts` is passed through to the graph; `None`
-    /// applies `DEFAULT_VERDICT_FILTER`. `limit` bounds the graph fetch, so
-    /// the resolved filter can return fewer than `limit` pairs.
+    /// Every filter runs graph-side (`ContradictionQuery`), so `offset` and
+    /// `limit` page over *matching* pairs: a run of resolved pairs at the
+    /// top of the queue can never hide the rest (LAB-3283 review).
+    /// `include_resolved = false` excludes pairs whose endpoint carries an
+    /// incoming `SUPERSEDES` edge — the graph-side twin of Qdrant's
+    /// `superseded_by`, measured complete on 2026-09-10. Qdrant is still
+    /// checked per page as a residual guard; if it hides a pair the loop
+    /// pulls another page (bounded) so the caller still gets `limit`.
+    /// `verdicts = None` applies `DEFAULT_VERDICT_FILTER`. The response
+    /// carries `next_offset` when more pairs may follow.
     #[tracing::instrument(skip(self))]
     pub async fn memory_contradictions(
         &self,
         limit: usize,
+        offset: usize,
         include_resolved: bool,
         verdicts: Option<&[String]>,
     ) -> Result<Value> {
@@ -1870,86 +1917,91 @@ impl MemoryService {
             .map(|s| s.to_string())
             .collect();
         let verdicts = verdicts.unwrap_or(&default);
-        if verdicts.is_empty()
-            || verdicts
-                .iter()
-                .any(|v| v != Verdict::UNJUDGED && Verdict::parse(v).is_none())
-        {
+        if verdicts.is_empty() || verdicts.iter().any(|v| Verdict::parse(v).is_none()) {
             return Err(AlayaError::Validation(format!(
-                "verdicts must be a non-empty subset of {:?} plus {:?}",
-                Verdict::ALL.map(|v| v.as_str()),
-                Verdict::UNJUDGED
+                "verdicts must be a non-empty subset of {:?}",
+                Verdict::ALL.map(|v| v.as_str())
             )));
         }
-        // The resolved filter runs here, after the fetch, so over-fetch
-        // (bounded by the bridge's 500 cap) and trim to `limit` below —
-        // otherwise a newest-first window of resolved pairs reads as empty.
-        let fetch = if include_resolved {
-            limit
-        } else {
-            limit.saturating_mul(4).min(500)
-        };
-        let pairs = self
-            .graph
-            .get_all_contradictions(fetch, Some(verdicts))
-            .await?;
+        let limit = limit.clamp(1, CONTRADICTION_PAGE_MAX);
 
-        // Batch fetch all referenced memories (was: N+1 sequential queries)
-        let all_hashes: Vec<&str> = pairs
-            .iter()
-            .flat_map(|p| [p.memory_a_hash.as_str(), p.memory_b_hash.as_str()])
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
+        let mut enriched: Vec<Value> = Vec::with_capacity(limit);
+        let mut consumed = 0usize;
+        let mut exhausted = false;
+        for _ in 0..MAX_CONTRADICTION_PAGES {
+            let query = ContradictionQuery {
+                limit,
+                skip: offset + consumed,
+                verdicts: Some(verdicts.to_vec()),
+                exclude_resolved: !include_resolved,
+                ..Default::default()
+            };
+            let pairs = self.graph.get_all_contradictions(&query).await?;
+            exhausted = pairs.len() < limit;
 
-        let memories = self
-            .vectors
-            .get_batch(&all_hashes)
-            .await
-            .unwrap_or_default();
-        let lookup: std::collections::HashMap<&str, &Memory> = memories
-            .iter()
-            .map(|m| (m.content_hash.as_str(), m))
-            .collect();
+            // Batch fetch all referenced memories (was: N+1 sequential queries)
+            let all_hashes: Vec<&str> = pairs
+                .iter()
+                .flat_map(|p| [p.memory_a_hash.as_str(), p.memory_b_hash.as_str()])
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            let memories = self
+                .vectors
+                .get_batch(&all_hashes)
+                .await
+                .unwrap_or_default();
+            let lookup: std::collections::HashMap<&str, &Memory> = memories
+                .iter()
+                .map(|m| (m.content_hash.as_str(), m))
+                .collect();
 
-        let mut enriched: Vec<Value> = Vec::new();
-        for pair in &pairs {
-            let a = lookup.get(pair.memory_a_hash.as_str());
-            let b = lookup.get(pair.memory_b_hash.as_str());
-            let a_superseded = a.is_some_and(|m| is_superseded(m));
-            let b_superseded = b.is_some_and(|m| is_superseded(m));
-            if !include_resolved && (a_superseded || b_superseded) {
-                continue;
+            for pair in &pairs {
+                consumed += 1;
+                let a = lookup.get(pair.memory_a_hash.as_str());
+                let b = lookup.get(pair.memory_b_hash.as_str());
+                let a_superseded = a.is_some_and(|m| is_superseded(m));
+                let b_superseded = b.is_some_and(|m| is_superseded(m));
+                if !include_resolved && (a_superseded || b_superseded) {
+                    continue;
+                }
+                let v = pair.verdict.as_ref();
+
+                enriched.push(serde_json::json!({
+                    "memory_a_hash": pair.memory_a_hash,
+                    "memory_b_hash": pair.memory_b_hash,
+                    "confidence": pair.confidence,
+                    "created_at": pair.created_at,
+                    "memory_a_content": a.map(|m| {
+                        m.summary.clone().unwrap_or_else(|| truncate(&m.content, 200))
+                    }),
+                    "memory_b_content": b.map(|m| {
+                        m.summary.clone().unwrap_or_else(|| truncate(&m.content, 200))
+                    }),
+                    "memory_a_superseded": a_superseded,
+                    "memory_b_superseded": b_superseded,
+                    "verdict": v.map(|v| v.verdict.as_str()).unwrap_or(Verdict::UNJUDGED),
+                    "verdict_reason": v.map(|v| v.verdict_reason.as_str()),
+                    "survivor": v.and_then(|v| v.verdict_survivor.as_deref()),
+                    "verdict_confidence": v.map(|v| v.verdict_confidence),
+                    "verdict_model": v.map(|v| v.verdict_model.as_str()),
+                    "judged_at": v.map(|v| v.judged_at),
+                }));
+                if enriched.len() == limit {
+                    break;
+                }
             }
-            let v = pair.verdict.as_ref();
-
-            enriched.push(serde_json::json!({
-                "memory_a_hash": pair.memory_a_hash,
-                "memory_b_hash": pair.memory_b_hash,
-                "confidence": pair.confidence,
-                "created_at": pair.created_at,
-                "memory_a_content": a.map(|m| {
-                    m.summary.clone().unwrap_or_else(|| truncate(&m.content, 200))
-                }),
-                "memory_b_content": b.map(|m| {
-                    m.summary.clone().unwrap_or_else(|| truncate(&m.content, 200))
-                }),
-                "memory_a_superseded": a_superseded,
-                "memory_b_superseded": b_superseded,
-                "verdict": v.map(|v| v.verdict.as_str()).unwrap_or(Verdict::UNJUDGED),
-                "verdict_reason": v.map(|v| v.verdict_reason.as_str()),
-                "survivor": v.and_then(|v| v.verdict_survivor.as_deref()),
-                "verdict_confidence": v.map(|v| v.verdict_confidence),
-                "verdict_model": v.map(|v| v.verdict_model.as_str()),
-                "judged_at": v.map(|v| v.judged_at),
-            }));
+            if enriched.len() >= limit || exhausted {
+                break;
+            }
         }
-        enriched.truncate(limit);
 
+        let next_offset = (!exhausted || enriched.len() >= limit).then_some(offset + consumed);
         Ok(serde_json::json!({
             "success": true,
             "pairs": enriched,
             "total": enriched.len(),
+            "next_offset": next_offset,
         }))
     }
 
@@ -2286,6 +2338,18 @@ fn format_memory_result(memory: &Memory, score: f64, output: OutputMode) -> Valu
     v
 }
 
+/// Model- or upstream-authored text that ends up on an edge and in a
+/// line-oriented log: no control characters, clipped to the schema's 200.
+fn log_safe(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(200)
+        .collect()
+}
+
 fn truncate(s: &str, max_chars: usize) -> String {
     let char_count = s.chars().count();
     if char_count <= max_chars {
@@ -2529,8 +2593,7 @@ mod tests {
         }
         async fn get_all_contradictions(
             &self,
-            _l: usize,
-            _v: Option<&[String]>,
+            _q: &alaya_types::graph::ContradictionQuery,
         ) -> Result<Vec<Contradiction>> {
             Ok(vec![])
         }
@@ -3170,8 +3233,7 @@ mod tests {
         }
         async fn get_all_contradictions(
             &self,
-            _l: usize,
-            _v: Option<&[String]>,
+            _q: &alaya_types::graph::ContradictionQuery,
         ) -> Result<Vec<Contradiction>> {
             Ok(vec![])
         }
@@ -4296,8 +4358,7 @@ mod tests {
         }
         async fn get_all_contradictions(
             &self,
-            _l: usize,
-            _v: Option<&[String]>,
+            _q: &alaya_types::graph::ContradictionQuery,
         ) -> Result<Vec<Contradiction>> {
             Ok(vec![])
         }
@@ -5016,8 +5077,7 @@ mod tests {
         }
         async fn get_all_contradictions(
             &self,
-            _l: usize,
-            _v: Option<&[String]>,
+            _q: &alaya_types::graph::ContradictionQuery,
         ) -> Result<Vec<Contradiction>> {
             Ok(vec![])
         }
@@ -5531,6 +5591,10 @@ mod tests {
                     Script::Hang => std::future::pending().await,
                 }
             }
+
+            fn model_name(&self) -> &str {
+                "test-model"
+            }
         }
 
         fn judgement(verdict: Verdict, survivor: Option<Survivor>) -> Judgement {
@@ -5686,8 +5750,7 @@ mod tests {
             }
             async fn get_all_contradictions(
                 &self,
-                _l: usize,
-                _v: Option<&[String]>,
+                _q: &alaya_types::graph::ContradictionQuery,
             ) -> Result<Vec<Contradiction>> {
                 Ok(vec![])
             }
@@ -5869,20 +5932,283 @@ mod tests {
             }
         }
 
+        /// AC-5 (amended): a deterministic failure is persisted as an
+        /// `unjudged` marker carrying the error class, so the backfill's
+        /// NULL filter never re-matches the pair; no shadow event.
         #[tokio::test(flavor = "current_thread")]
-        async fn judge_failure_is_unjudged_writes_nothing_and_emits_no_shadow_event() {
+        async fn deterministic_failure_marks_the_edge_unjudged_and_emits_no_shadow_event() {
             let (svc, verdicts) = service(
-                Some(Script::Err(|| AlayaError::Judge("boom".into()))),
+                Some(Script::Err(|| {
+                    AlayaError::Judge(
+                        "verdict is not valid JSON\n(stop_reason=\"max_tokens\")".into(),
+                    )
+                })),
                 pair(),
                 true,
             );
             let (outcome, events) = captured(svc.judge_contradiction(&src(), &dst())).await;
-            assert!(matches!(outcome, JudgeOutcome::Unjudged), "{outcome:?}");
-            assert!(verdicts.borrow().is_empty(), "no graph write on failure");
+            assert!(
+                matches!(outcome, JudgeOutcome::Unjudged { marked: true }),
+                "{outcome:?}"
+            );
+            let recorded = verdicts.borrow();
+            assert_eq!(recorded.len(), 1, "the marker is the only graph write");
+            let (s, d, marker) = &recorded[0];
+            assert_eq!((s.as_str(), d.as_str()), (src().as_str(), dst().as_str()));
+            assert_eq!(marker.verdict, Verdict::Unjudged);
+            assert_eq!(marker.verdict_survivor, None);
+            assert_eq!(marker.verdict_model, "test-model");
+            assert!(
+                marker
+                    .verdict_reason
+                    .starts_with("unjudged: contradiction judge error: verdict is not valid JSON"),
+                "{}",
+                marker.verdict_reason
+            );
+            assert!(
+                !marker.verdict_reason.contains('\n'),
+                "control chars stripped"
+            );
             assert!(
                 events.is_empty(),
                 "the shadow-log target carries judged pairs only: {events:?}"
             );
+        }
+
+        /// A transient failure (upstream down, 5xx, timeout) writes nothing so
+        /// the pair is retried by the next pass.
+        #[tokio::test(flavor = "current_thread")]
+        async fn transient_failure_is_unjudged_and_writes_nothing() {
+            let (svc, verdicts) = service(
+                Some(Script::Err(|| {
+                    AlayaError::Unavailable("502 from the LB".into())
+                })),
+                pair(),
+                true,
+            );
+            let (outcome, events) = captured(svc.judge_contradiction(&src(), &dst())).await;
+            assert!(
+                matches!(outcome, JudgeOutcome::Unjudged { marked: false }),
+                "{outcome:?}"
+            );
+            assert!(
+                verdicts.borrow().is_empty(),
+                "no graph write on a transient failure"
+            );
+            assert!(events.is_empty(), "{events:?}");
+        }
+
+        /// Graph whose `get_all_contradictions` implements the real
+        /// selection semantics (newest first, SKIP/LIMIT, `exclude_resolved`)
+        /// over an in-memory edge list. Verdict writes are refused.
+        struct PagingGraph {
+            /// (edge, resolved-in-graph)
+            edges: Vec<(Contradiction, bool)>,
+        }
+
+        #[async_trait(?Send)]
+        impl GraphService for PagingGraph {
+            async fn ensure_node(&self, _h: &str, _t: f64) -> Result<()> {
+                unimplemented!()
+            }
+            async fn delete_node(&self, _h: &str) -> Result<()> {
+                unimplemented!()
+            }
+            async fn create_typed_edge(
+                &self,
+                _s: &str,
+                _d: &str,
+                _r: UserRelationType,
+                _m: EdgeMeta,
+            ) -> Result<bool> {
+                unimplemented!()
+            }
+            async fn get_typed_edges(
+                &self,
+                _h: &str,
+                _r: Option<UserRelationType>,
+                _d: Direction,
+                _l: usize,
+            ) -> Result<Vec<Edge>> {
+                unimplemented!()
+            }
+            async fn delete_typed_edge(
+                &self,
+                _s: &str,
+                _d: &str,
+                _r: UserRelationType,
+            ) -> Result<bool> {
+                unimplemented!()
+            }
+            async fn create_system_edge(
+                &self,
+                _s: &str,
+                _d: &str,
+                _r: SystemRelationType,
+                _t: f64,
+            ) -> Result<bool> {
+                unimplemented!()
+            }
+            async fn get_all_contradictions(
+                &self,
+                q: &ContradictionQuery,
+            ) -> Result<Vec<Contradiction>> {
+                let mut edges: Vec<&(Contradiction, bool)> = self
+                    .edges
+                    .iter()
+                    .filter(|(_, resolved)| !(q.exclude_resolved && *resolved))
+                    .collect();
+                edges.sort_by(|x, y| y.0.created_at.partial_cmp(&x.0.created_at).unwrap());
+                Ok(edges
+                    .into_iter()
+                    .skip(q.skip)
+                    .take(q.limit.clamp(1, 500))
+                    .map(|(c, _)| c.clone())
+                    .collect())
+            }
+            async fn set_contradiction_verdict(
+                &self,
+                _s: &str,
+                _d: &str,
+                _v: &EdgeVerdict,
+            ) -> Result<bool> {
+                unreachable!("the read surface must not write verdicts")
+            }
+            async fn get_contradictions_for_hashes(
+                &self,
+                _h: &[&str],
+            ) -> Result<HashMap<String, Vec<ContradictionRef>>> {
+                unimplemented!()
+            }
+            async fn get_neighbors(
+                &self,
+                _h: &str,
+                _hops: u8,
+                _w: f64,
+                _l: usize,
+            ) -> Result<Vec<Neighbor>> {
+                unimplemented!()
+            }
+            async fn spreading_activation(
+                &self,
+                _s: &[&str],
+                _hops: u8,
+                _d: f64,
+                _min: f64,
+                _l: usize,
+            ) -> Result<HashMap<String, f64>> {
+                unimplemented!()
+            }
+            async fn hebbian_boosts_within(&self, _h: &[&str]) -> Result<HashMap<String, f64>> {
+                unimplemented!()
+            }
+            async fn get_stats(&self) -> Result<GraphStats> {
+                unimplemented!()
+            }
+        }
+
+        fn hash(i: usize) -> String {
+            format!("{i:064x}")
+        }
+
+        /// AC-6 (amended): with more resolved pairs at the top of the queue
+        /// than one page holds, `limit = N` still returns N unresolved pairs,
+        /// and a pair Qdrant alone knows is resolved is skipped by pulling
+        /// another page rather than shortening the result.
+        #[tokio::test(flavor = "current_thread")]
+        async fn resolved_run_at_the_top_cannot_starve_the_queue() {
+            // 60 pairs, newest first by created_at; the newest 50 are resolved
+            // graph-side (SUPERSEDES). Pair #52 is superseded in Qdrant only.
+            let mut edges = Vec::new();
+            let mut memories = Vec::new();
+            for i in 0..60usize {
+                let (a, b) = (hash(1000 + i), hash(2000 + i));
+                let ts = 100_000.0 - i as f64; // i = 0 is the newest
+                edges.push((
+                    Contradiction {
+                        memory_a_hash: a.clone(),
+                        memory_b_hash: b.clone(),
+                        confidence: Some(0.7),
+                        created_at: Some(ts),
+                        verdict: None,
+                    },
+                    i < 50,
+                ));
+                let mut ma = mem(&a, ts);
+                if i == 52 {
+                    ma.metadata = Some(HashMap::from([(
+                        "superseded_by".to_string(),
+                        serde_json::json!(hash(9)),
+                    )]));
+                }
+                memories.push(ma);
+                memories.push(mem(&b, ts));
+            }
+            let svc = MemoryService::new(
+                Box::new(PairVectors(memories)),
+                Box::new(MockEmbeddings),
+                Box::new(PagingGraph { edges }),
+                Box::new(MockHebbian),
+                Box::new(MockConsolidation),
+                None,
+            );
+
+            // Page 1: five unresolved pairs despite 50 resolved ones on top.
+            let page = svc.memory_contradictions(5, 0, false, None).await.unwrap();
+            let pairs = page["pairs"].as_array().unwrap();
+            assert_eq!(pairs.len(), 5, "{page}");
+            let got: Vec<&str> = pairs
+                .iter()
+                .map(|p| p["memory_a_hash"].as_str().unwrap())
+                .collect();
+            // Pair 52 (Qdrant-resolved) is skipped and the page is still full.
+            assert_eq!(
+                got,
+                [hash(1050), hash(1051), hash(1053), hash(1054), hash(1055)]
+            );
+            assert!(pairs.iter().all(|p| p["verdict"] == "unjudged"));
+            // next_offset counts every row consumed, filtered ones included.
+            assert_eq!(page["next_offset"], 6);
+
+            // Page 2 continues from next_offset without repeats.
+            let page2 = svc.memory_contradictions(5, 6, false, None).await.unwrap();
+            let got2: Vec<&str> = page2["pairs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["memory_a_hash"].as_str().unwrap())
+                .collect();
+            assert_eq!(got2[0], hash(1056));
+            assert_eq!(got2.len(), 4, "only 9 unresolved pairs exist in total");
+            assert_eq!(page2["next_offset"], Value::Null);
+
+            // include_resolved shows the resolved run again.
+            let all = svc.memory_contradictions(5, 0, true, None).await.unwrap();
+            assert_eq!(all["pairs"][0]["memory_a_hash"], hash(1000));
+            assert_eq!(all["pairs"][0]["memory_a_superseded"], false);
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn unknown_verdict_filter_is_a_validation_error() {
+            let svc = MemoryService::new(
+                Box::new(PairVectors(vec![])),
+                Box::new(MockEmbeddings),
+                Box::new(PagingGraph { edges: vec![] }),
+                Box::new(MockHebbian),
+                Box::new(MockConsolidation),
+                None,
+            );
+            for bad in [
+                vec![],
+                vec!["Supersession".to_string()],
+                vec!["foo".to_string()],
+            ] {
+                let e = svc
+                    .memory_contradictions(5, 0, false, Some(&bad))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(e, AlayaError::Validation(_)), "{bad:?}: {e:?}");
+            }
         }
 
         #[tokio::test(flavor = "current_thread")]
@@ -5917,23 +6243,23 @@ mod tests {
             );
             assert!(matches!(
                 svc.judge_contradiction(&src(), &dst()).await,
-                JudgeOutcome::Unjudged
+                JudgeOutcome::Unjudged { marked: false }
             ));
             // Malformed hash and self-pair never reach the judge.
             assert!(matches!(
                 svc.judge_contradiction("nope", &dst()).await,
-                JudgeOutcome::Unjudged
+                JudgeOutcome::Unjudged { marked: false }
             ));
             assert!(matches!(
                 svc.judge_contradiction(&src(), &src()).await,
-                JudgeOutcome::Unjudged
+                JudgeOutcome::Unjudged { marked: false }
             ));
             assert!(verdicts.borrow().is_empty());
             // Judge not configured.
             let (svc, verdicts) = service(None, pair(), true);
             assert!(matches!(
                 svc.judge_contradiction(&src(), &dst()).await,
-                JudgeOutcome::Unjudged
+                JudgeOutcome::Unjudged { marked: false }
             ));
             assert!(verdicts.borrow().is_empty());
         }

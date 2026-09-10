@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use alaya_types::{
-    graph::{Contradiction, EdgeVerdict, Verdict},
+    graph::{Contradiction, ContradictionQuery, EdgeVerdict, Verdict},
     memory::validate_content_hash,
 };
 
@@ -16,13 +16,13 @@ use crate::{AppState, cypher, handlers::exec_query};
 
 // ─── Request types ────────────────────────────────────────────────────────────
 
+/// `POST /contradictions/for` refuses more hashes than one page can hold —
+/// an accidental 10k-hash `IN` list is a FalkorDB DoS (LAB-3283 review).
+pub const MAX_FOR_HASHES: usize = cypher::MAX_CONTRADICTION_PAGE;
+
 #[derive(Debug, Deserialize)]
-pub struct AllContradictionsRequest {
-    /// Max results (default 20)
-    pub limit: Option<i64>,
-    /// Restrict to these verdicts; `"unjudged"` selects edges with none.
-    /// Absent = every edge.
-    pub verdicts: Option<Vec<String>>,
+pub struct ContradictionsForRequest {
+    pub hashes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,24 +33,18 @@ pub struct SetVerdictRequest {
     pub verdict: EdgeVerdict,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ContradictionsForRequest {
-    pub hashes: Vec<String>,
-}
-
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 /// POST /contradictions/all
 ///
-/// Return CONTRADICTS pairs ordered by `created_at DESC`, optionally
-/// filtered by verdict, each carrying its persisted verdict (if any).
+/// One page of CONTRADICTS pairs ordered by `created_at DESC`, every filter
+/// in the body applied in Cypher (see `ContradictionQuery`; `limit` is
+/// clamped to 1..=500), each carrying its persisted verdict (if any).
 pub async fn all(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<AllContradictionsRequest>,
+    Json(query): Json<ContradictionQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    let limit = req.limit.unwrap_or(20).clamp(1, 500) as u32;
-
-    let (cypher, params, readonly) = cypher::get_all_contradictions(limit, req.verdicts.as_deref());
+    let (cypher, params, readonly) = cypher::get_all_contradictions(&query);
     let result = exec_query(&state, &cypher, params, readonly).await?;
 
     // Row layout: cypher::CONTRADICTION_COLUMNS
@@ -140,6 +134,9 @@ pub async fn for_hashes(
 ) -> Result<Json<Value>, StatusCode> {
     if req.hashes.is_empty() {
         return Ok(Json(json!({ "contradictions": {} })));
+    }
+    if req.hashes.len() > MAX_FOR_HASHES {
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     let hashes_ref: Vec<&str> = req.hashes.iter().map(String::as_str).collect();

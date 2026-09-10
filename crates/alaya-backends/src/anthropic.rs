@@ -66,10 +66,14 @@ impl MessagesTransport {
         Self { client, base_url }
     }
 
-    /// POST `/v1/messages`. `err` wraps transport/HTTP failures in the
-    /// caller's own error variant. A 429 always surfaces as
-    /// `AlayaError::RateLimited` so a caller that retries can back off on
-    /// the server's hint instead of string-matching a message.
+    /// POST `/v1/messages`. Failures are classified so callers can tell a
+    /// per-request (deterministic) failure from one that has nothing to do
+    /// with the request:
+    /// - 429 → `AlayaError::RateLimited` (with the `retry-after` hint);
+    /// - connect/timeout, 5xx, and auth/model misconfiguration
+    ///   (401/403/404) → `AlayaError::Unavailable` (transient);
+    /// - 400/413/422 and an unparseable body → `err(..)`, the caller's own
+    ///   variant, meaning *this request* will fail the same way again.
     pub(crate) async fn messages(
         &self,
         body: &Value,
@@ -82,7 +86,7 @@ impl MessagesTransport {
             .json(body)
             .send()
             .await
-            .map_err(|e| err(e.to_string()))?;
+            .map_err(|e| AlayaError::Unavailable(e.to_string()))?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -95,13 +99,26 @@ impl MessagesTransport {
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_else(|_| "<unreadable>".into());
-            return Err(err(format!("messages API returned {status}: {body}")));
+            let msg = format!("messages API returned {status}: {body}");
+            return Err(if is_request_fault(status) {
+                err(msg)
+            } else {
+                AlayaError::Unavailable(msg)
+            });
         }
 
         resp.json::<MessagesResponse>()
             .await
             .map_err(|e| err(format!("failed to parse response: {e}")))
     }
+}
+
+/// Statuses that mean the request itself is unacceptable and will be again:
+/// 400 invalid_request, 413 request_too_large, 422 unprocessable. Everything
+/// else non-2xx (401/403 bad key, 404 bad model, 408/409, 5xx, 529) is not
+/// the request's fault.
+fn is_request_fault(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 400 | 413 | 422)
 }
 
 // ─── Response types ────────────────────────────────────────────────────────
@@ -174,6 +191,29 @@ mod tests {
         );
         assert_eq!(parsed.usage.input_tokens, 50);
         assert_eq!(parsed.usage.output_tokens, 10);
+    }
+
+    #[test]
+    fn request_fault_statuses_are_the_deterministic_ones() {
+        use reqwest::StatusCode as S;
+        for s in [
+            S::BAD_REQUEST,
+            S::PAYLOAD_TOO_LARGE,
+            S::UNPROCESSABLE_ENTITY,
+        ] {
+            assert!(is_request_fault(s), "{s}");
+        }
+        for s in [
+            S::UNAUTHORIZED,
+            S::FORBIDDEN,
+            S::NOT_FOUND,
+            S::REQUEST_TIMEOUT,
+            S::INTERNAL_SERVER_ERROR,
+            S::BAD_GATEWAY,
+            S::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(!is_request_fault(s), "{s}");
+        }
     }
 
     #[test]
