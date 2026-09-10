@@ -17,7 +17,8 @@ same class as radar and unified-memory:
 - Every alaya-server call executes **server-side with the static bearer**
   (`ALAYA_API_KEY`). No token, bearer, or client secret ever reaches the
   browser — there is no JS bundle at all (SSR-only Leptos, plain HTML forms).
-- Ālaya's own OIDC principals stay **read-only**; this console adds zero new
+- Ālaya's own OIDC principals stay **read / additive** (store only, never
+  delete / supersede / merge / relation / patch / backfill); this console adds zero new
   authorization semantics to alaya-server and does not pre-empt the LAB-1084
   ACL/namespace decision.
 
