@@ -622,7 +622,7 @@ fn tool_schemas() -> Value {
                     "limit": { "type": "integer", "default": 20, "description": "Max contradiction pairs to fetch (1-500)" },
                     "offset": { "type": "integer", "default": 0, "description": "Pairs to skip; pass the previous response's next_offset to page" },
                     "include_resolved": { "type": "boolean", "default": false, "description": "Also return pairs where one endpoint is already superseded" },
-                    "verdicts": { "type": "array", "items": { "type": "string", "enum": ["contradiction", "supersession", "coexist", "unrelated", "unjudged"] }, "description": "Only pairs with these verdicts. Default: contradiction, supersession, unjudged" }
+                    "verdicts": { "type": "array", "items": { "type": "string", "enum": alaya_types::graph::Verdict::ALL.map(|v| v.as_str()) }, "description": "Only pairs with these verdicts. Default: contradiction, supersession, unjudged" }
                 }
             }
         },

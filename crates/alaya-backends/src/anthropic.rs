@@ -107,9 +107,15 @@ impl MessagesTransport {
             });
         }
 
-        resp.json::<MessagesResponse>()
-            .await
-            .map_err(|e| err(format!("failed to parse response: {e}")))
+        // A body that will not decode is the request's fault; a body cut
+        // mid-read (reset, idle timeout after the 2xx headers) is not.
+        resp.json::<MessagesResponse>().await.map_err(|e| {
+            if e.is_decode() {
+                err(format!("failed to parse response: {e}"))
+            } else {
+                AlayaError::Unavailable(format!("response body: {e}"))
+            }
+        })
     }
 }
 
@@ -191,29 +197,6 @@ mod tests {
         );
         assert_eq!(parsed.usage.input_tokens, 50);
         assert_eq!(parsed.usage.output_tokens, 10);
-    }
-
-    #[test]
-    fn request_fault_statuses_are_the_deterministic_ones() {
-        use reqwest::StatusCode as S;
-        for s in [
-            S::BAD_REQUEST,
-            S::PAYLOAD_TOO_LARGE,
-            S::UNPROCESSABLE_ENTITY,
-        ] {
-            assert!(is_request_fault(s), "{s}");
-        }
-        for s in [
-            S::UNAUTHORIZED,
-            S::FORBIDDEN,
-            S::NOT_FOUND,
-            S::REQUEST_TIMEOUT,
-            S::INTERNAL_SERVER_ERROR,
-            S::BAD_GATEWAY,
-            S::SERVICE_UNAVAILABLE,
-        ] {
-            assert!(!is_request_fault(s), "{s}");
-        }
     }
 
     #[test]

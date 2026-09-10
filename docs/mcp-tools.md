@@ -226,7 +226,7 @@ List pairs of memories the contradiction detector has flagged (via negation, ant
 | Param | Type | Default | Notes |
 |:--|:--|:--|:--|
 | `limit` | int | `20` | Page size (1–500), newest first. |
-| `offset` | int | `0` | Page cursor — pass back the previous response's `next_offset`; `null` means last page. |
+| `offset` | int | `0` | Page cursor — pass back the previous response's `next_offset` until it is `null`. |
 | `include_resolved` | bool | `false` | `true` also returns pairs where one memory is already superseded. Filtered in the graph, so paging always reaches the unresolved pairs. |
 | `verdicts` | string[] | `["contradiction","supersession","unjudged"]` | Only pairs whose verdict is in the list. `unjudged` = not judged yet, or a pair the judge could not classify (`verdict_reason` says why). |
 

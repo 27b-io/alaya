@@ -150,9 +150,9 @@ pub struct EdgeVerdict {
 /// `POST /contradictions/all`). Every filter is applied in Cypher, so a
 /// page is a page of *matching* edges — the fix for the LAB-3283 review's
 /// queue-starvation finding (app-side filtering over a LIMIT-only read).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContradictionQuery {
-    /// Page size (the bridge clamps to 1..=500).
+    /// Page size; every consumer clamps to `1..=MAX_LIMIT`.
     pub limit: usize,
     /// Edges to skip in `created_at DESC` order.
     #[serde(default)]
@@ -169,10 +169,23 @@ pub struct ContradictionQuery {
     /// `unjudged` marker does NOT match, so a poison pair is skipped).
     #[serde(default)]
     pub needs_judging: bool,
-    /// With `needs_judging`, also select edges whose `verdict_model` differs
-    /// from this one — the re-judge path for a model switch.
+    /// Re-judge path for a model switch (implies `needs_judging`): also
+    /// select edges whose `verdict_model` differs from this one, and every
+    /// `unjudged` marker (so an operator can retry deterministic failures).
     #[serde(default)]
     pub rejudge_model: Option<String>,
+}
+
+impl ContradictionQuery {
+    /// Page cap, shared by the bridge (Cypher `LIMIT`) and every caller.
+    /// The two MUST agree: a caller's "page was full" test is
+    /// `pairs.len() == limit`.
+    pub const MAX_LIMIT: usize = 500;
+
+    /// Whether this query is a backfill selection (see `needs_judging`).
+    pub fn selects_unjudged(&self) -> bool {
+        self.needs_judging || self.rejudge_model.is_some()
+    }
 }
 
 /// A contradiction pair from the dashboard.

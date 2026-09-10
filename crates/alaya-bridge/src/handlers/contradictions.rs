@@ -16,9 +16,9 @@ use crate::{AppState, cypher, handlers::exec_query};
 
 // ─── Request types ────────────────────────────────────────────────────────────
 
-/// `POST /contradictions/for` refuses more hashes than one page can hold —
-/// an accidental 10k-hash `IN` list is a FalkorDB DoS (LAB-3283 review).
-pub const MAX_FOR_HASHES: usize = cypher::MAX_CONTRADICTION_PAGE;
+/// `POST /contradictions/for` refuses oversized hash lists — an accidental
+/// 10k-hash `IN` list is a FalkorDB DoS (LAB-3283 review).
+pub const MAX_FOR_HASHES: usize = 500;
 
 #[derive(Debug, Deserialize)]
 pub struct ContradictionsForRequest {

@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use alaya_backends::judge::sanitize_reason;
 use alaya_backends::{ContradictionJudge, Judgement, Survivor};
 use alaya_types::graph::{ContradictionQuery, EdgeVerdict, Verdict};
 
@@ -216,13 +217,6 @@ pub const SHADOW_LOG_TARGET: &str = "alaya::judge";
 /// none: genuine conflicts plus pairs the judge has not seen yet. Callers
 /// that want `coexist`/`unrelated` name them explicitly.
 const DEFAULT_VERDICT_FILTER: [&str; 3] = ["contradiction", "supersession", Verdict::UNJUDGED];
-
-/// Page cap for `memory_contradictions` (the bridge clamps to the same).
-const CONTRADICTION_PAGE_MAX: usize = 500;
-/// Extra graph pages the read may pull to fill `limit` when the residual
-/// Qdrant-side `superseded_by` check hides a pair the graph filter let
-/// through. Measured 0 such pairs on 2026-09-10; the bound is a fuse.
-const MAX_CONTRADICTION_PAGES: usize = 5;
 
 /// Result of judging one CONTRADICTS pair.
 #[derive(Debug)]
@@ -1773,12 +1767,22 @@ impl MemoryService {
         let a = batch.iter().find(|m| m.content_hash == src);
         let b = batch.iter().find(|m| m.content_hash == dst);
         let (Some(a), Some(b)) = (a, b) else {
+            // Deterministic until the memory reappears: mark it, or the
+            // backfill's NULL selection re-spends a slot on it every pass.
             tracing::warn!(
                 a = sa,
                 b = sd,
-                "judge_contradiction: endpoint missing, skipping"
+                "judge_contradiction: endpoint missing; marking edge"
             );
-            return JudgeOutcome::Unjudged { marked: false };
+            let marked = self
+                .mark_unjudged(
+                    src,
+                    dst,
+                    judge.model_name(),
+                    "endpoint missing from vector store",
+                )
+                .await;
+            return JudgeOutcome::Unjudged { marked };
         };
 
         let j = match judge.judge(a, b).await {
@@ -1810,15 +1814,9 @@ impl MemoryService {
                     error = ?e,
                     "contradiction unjudged (deterministic; marking edge)"
                 );
-                let marker = EdgeVerdict {
-                    verdict: Verdict::Unjudged,
-                    verdict_survivor: None,
-                    verdict_reason: log_safe(&format!("unjudged: {e}")),
-                    verdict_confidence: 0.0,
-                    verdict_model: judge.model_name().to_string(),
-                    judged_at: (self.clock)(),
-                };
-                let marked = self.persist_verdict(src, dst, &marker).await;
+                let marked = self
+                    .mark_unjudged(src, dst, judge.model_name(), &e.to_string())
+                    .await;
                 return JudgeOutcome::Unjudged { marked };
             }
         };
@@ -1868,6 +1866,21 @@ impl MemoryService {
         }
     }
 
+    /// Persist a deterministic-failure marker: `verdict = unjudged`, the
+    /// error class as reason, the judge model. The bridge only lets a marker
+    /// land on an edge with no real verdict.
+    async fn mark_unjudged(&self, src: &str, dst: &str, model: &str, why: &str) -> bool {
+        let marker = EdgeVerdict {
+            verdict: Verdict::Unjudged,
+            verdict_survivor: None,
+            verdict_reason: sanitize_reason(&format!("unjudged: {why}")),
+            verdict_confidence: 0.0,
+            verdict_model: model.to_string(),
+            judged_at: (self.clock)(),
+        };
+        self.persist_verdict(src, dst, &marker).await
+    }
+
     /// Write a verdict (or failure marker) onto the `src -> dst` edge through
     /// the graph trait. Graph blips are non-fatal by design: `false` means the
     /// edge is still unannotated and the next backfill pass sees it again.
@@ -1895,15 +1908,15 @@ impl MemoryService {
     /// List CONTRADICTS pairs with their judge verdicts, newest first.
     ///
     /// Every filter runs graph-side (`ContradictionQuery`), so `offset` and
-    /// `limit` page over *matching* pairs: a run of resolved pairs at the
+    /// `limit` page over *matching* pairs and a run of resolved pairs at the
     /// top of the queue can never hide the rest (LAB-3283 review).
     /// `include_resolved = false` excludes pairs whose endpoint carries an
     /// incoming `SUPERSEDES` edge — the graph-side twin of Qdrant's
-    /// `superseded_by`, measured complete on 2026-09-10. Qdrant is still
-    /// checked per page as a residual guard; if it hides a pair the loop
-    /// pulls another page (bounded) so the caller still gets `limit`.
-    /// `verdicts = None` applies `DEFAULT_VERDICT_FILTER`. The response
-    /// carries `next_offset` when more pairs may follow.
+    /// `superseded_by`, measured complete on 2026-09-10. The Qdrant flag is
+    /// still applied per pair as a guard against a failed edge write (graph
+    /// writes are non-fatal); that can only shorten a page, never hide the
+    /// next one. `verdicts = None` applies `DEFAULT_VERDICT_FILTER`.
+    /// `next_offset` is set while the graph page was full.
     #[tracing::instrument(skip(self))]
     pub async fn memory_contradictions(
         &self,
@@ -1923,80 +1936,68 @@ impl MemoryService {
                 Verdict::ALL.map(|v| v.as_str())
             )));
         }
-        let limit = limit.clamp(1, CONTRADICTION_PAGE_MAX);
+        let limit = limit.clamp(1, ContradictionQuery::MAX_LIMIT);
 
-        let mut enriched: Vec<Value> = Vec::with_capacity(limit);
-        let mut consumed = 0usize;
-        let mut exhausted = false;
-        for _ in 0..MAX_CONTRADICTION_PAGES {
-            let query = ContradictionQuery {
-                limit,
-                skip: offset + consumed,
-                verdicts: Some(verdicts.to_vec()),
-                exclude_resolved: !include_resolved,
-                ..Default::default()
-            };
-            let pairs = self.graph.get_all_contradictions(&query).await?;
-            exhausted = pairs.len() < limit;
+        let query = ContradictionQuery {
+            limit,
+            skip: offset,
+            verdicts: Some(verdicts.to_vec()),
+            exclude_resolved: !include_resolved,
+            ..Default::default()
+        };
+        let pairs = self.graph.get_all_contradictions(&query).await?;
+        let next_offset = (pairs.len() == limit).then_some(offset + limit);
 
-            // Batch fetch all referenced memories (was: N+1 sequential queries)
-            let all_hashes: Vec<&str> = pairs
-                .iter()
-                .flat_map(|p| [p.memory_a_hash.as_str(), p.memory_b_hash.as_str()])
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-            let memories = self
-                .vectors
-                .get_batch(&all_hashes)
-                .await
-                .unwrap_or_default();
-            let lookup: std::collections::HashMap<&str, &Memory> = memories
-                .iter()
-                .map(|m| (m.content_hash.as_str(), m))
-                .collect();
+        // Batch fetch all referenced memories (was: N+1 sequential queries)
+        let all_hashes: Vec<&str> = pairs
+            .iter()
+            .flat_map(|p| [p.memory_a_hash.as_str(), p.memory_b_hash.as_str()])
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let memories = self
+            .vectors
+            .get_batch(&all_hashes)
+            .await
+            .unwrap_or_default();
+        let lookup: std::collections::HashMap<&str, &Memory> = memories
+            .iter()
+            .map(|m| (m.content_hash.as_str(), m))
+            .collect();
 
-            for pair in &pairs {
-                consumed += 1;
-                let a = lookup.get(pair.memory_a_hash.as_str());
-                let b = lookup.get(pair.memory_b_hash.as_str());
-                let a_superseded = a.is_some_and(|m| is_superseded(m));
-                let b_superseded = b.is_some_and(|m| is_superseded(m));
-                if !include_resolved && (a_superseded || b_superseded) {
-                    continue;
-                }
-                let v = pair.verdict.as_ref();
-
-                enriched.push(serde_json::json!({
-                    "memory_a_hash": pair.memory_a_hash,
-                    "memory_b_hash": pair.memory_b_hash,
-                    "confidence": pair.confidence,
-                    "created_at": pair.created_at,
-                    "memory_a_content": a.map(|m| {
-                        m.summary.clone().unwrap_or_else(|| truncate(&m.content, 200))
-                    }),
-                    "memory_b_content": b.map(|m| {
-                        m.summary.clone().unwrap_or_else(|| truncate(&m.content, 200))
-                    }),
-                    "memory_a_superseded": a_superseded,
-                    "memory_b_superseded": b_superseded,
-                    "verdict": v.map(|v| v.verdict.as_str()).unwrap_or(Verdict::UNJUDGED),
-                    "verdict_reason": v.map(|v| v.verdict_reason.as_str()),
-                    "survivor": v.and_then(|v| v.verdict_survivor.as_deref()),
-                    "verdict_confidence": v.map(|v| v.verdict_confidence),
-                    "verdict_model": v.map(|v| v.verdict_model.as_str()),
-                    "judged_at": v.map(|v| v.judged_at),
-                }));
-                if enriched.len() == limit {
-                    break;
-                }
+        let mut enriched: Vec<Value> = Vec::with_capacity(pairs.len());
+        for pair in &pairs {
+            let a = lookup.get(pair.memory_a_hash.as_str());
+            let b = lookup.get(pair.memory_b_hash.as_str());
+            let a_superseded = a.is_some_and(|m| is_superseded(m));
+            let b_superseded = b.is_some_and(|m| is_superseded(m));
+            if !include_resolved && (a_superseded || b_superseded) {
+                continue;
             }
-            if enriched.len() >= limit || exhausted {
-                break;
-            }
+            let v = pair.verdict.as_ref();
+
+            enriched.push(serde_json::json!({
+                "memory_a_hash": pair.memory_a_hash,
+                "memory_b_hash": pair.memory_b_hash,
+                "confidence": pair.confidence,
+                "created_at": pair.created_at,
+                "memory_a_content": a.map(|m| {
+                    m.summary.clone().unwrap_or_else(|| truncate(&m.content, 200))
+                }),
+                "memory_b_content": b.map(|m| {
+                    m.summary.clone().unwrap_or_else(|| truncate(&m.content, 200))
+                }),
+                "memory_a_superseded": a_superseded,
+                "memory_b_superseded": b_superseded,
+                "verdict": v.map(|v| v.verdict.as_str()).unwrap_or(Verdict::UNJUDGED),
+                "verdict_reason": v.map(|v| v.verdict_reason.as_str()),
+                "survivor": v.and_then(|v| v.verdict_survivor.as_deref()),
+                "verdict_confidence": v.map(|v| v.verdict_confidence),
+                "verdict_model": v.map(|v| v.verdict_model.as_str()),
+                "judged_at": v.map(|v| v.judged_at),
+            }));
         }
 
-        let next_offset = (!exhausted || enriched.len() >= limit).then_some(offset + consumed);
         Ok(serde_json::json!({
             "success": true,
             "pairs": enriched,
@@ -2336,18 +2337,6 @@ fn format_memory_result(memory: &Memory, score: f64, output: OutputMode) -> Valu
         }
     }
     v
-}
-
-/// Model- or upstream-authored text that ends up on an edge and in a
-/// line-oriented log: no control characters, clipped to the schema's 200.
-fn log_safe(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>()
-        .trim()
-        .chars()
-        .take(200)
-        .collect()
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -5698,11 +5687,16 @@ mod tests {
 
         type Recorded = Rc<RefCell<Vec<(String, String, EdgeVerdict)>>>;
 
-        /// Records verdict writes; every other graph call is out of scope.
+        /// Records verdict writes and serves `get_all_contradictions` with the
+        /// real selection semantics (newest first with pair tiebreak,
+        /// SKIP/LIMIT, `exclude_resolved`) over `edges`; every other graph
+        /// call is out of scope.
         struct RecordingGraph {
             verdicts: Recorded,
             /// What `set_contradiction_verdict` reports: did an edge match?
             matched: bool,
+            /// (edge, resolved-in-graph)
+            edges: Vec<(Contradiction, bool)>,
         }
 
         #[async_trait(?Send)]
@@ -5750,9 +5744,25 @@ mod tests {
             }
             async fn get_all_contradictions(
                 &self,
-                _q: &alaya_types::graph::ContradictionQuery,
+                q: &ContradictionQuery,
             ) -> Result<Vec<Contradiction>> {
-                Ok(vec![])
+                let mut edges: Vec<&(Contradiction, bool)> = self
+                    .edges
+                    .iter()
+                    .filter(|(_, resolved)| !(q.exclude_resolved && *resolved))
+                    .collect();
+                edges.sort_by(|x, y| {
+                    y.0.created_at
+                        .partial_cmp(&x.0.created_at)
+                        .unwrap()
+                        .then_with(|| x.0.memory_a_hash.cmp(&y.0.memory_a_hash))
+                });
+                Ok(edges
+                    .into_iter()
+                    .skip(q.skip)
+                    .take(q.limit.clamp(1, ContradictionQuery::MAX_LIMIT))
+                    .map(|(c, _)| c.clone())
+                    .collect())
             }
             async fn set_contradiction_verdict(
                 &self,
@@ -5859,6 +5869,7 @@ mod tests {
                 Box::new(RecordingGraph {
                     verdicts: verdicts.clone(),
                     matched,
+                    edges: vec![],
                 }),
                 Box::new(MockHebbian),
                 Box::new(MockConsolidation),
@@ -5998,127 +6009,18 @@ mod tests {
             assert!(events.is_empty(), "{events:?}");
         }
 
-        /// Graph whose `get_all_contradictions` implements the real
-        /// selection semantics (newest first, SKIP/LIMIT, `exclude_resolved`)
-        /// over an in-memory edge list. Verdict writes are refused.
-        struct PagingGraph {
-            /// (edge, resolved-in-graph)
-            edges: Vec<(Contradiction, bool)>,
-        }
-
-        #[async_trait(?Send)]
-        impl GraphService for PagingGraph {
-            async fn ensure_node(&self, _h: &str, _t: f64) -> Result<()> {
-                unimplemented!()
-            }
-            async fn delete_node(&self, _h: &str) -> Result<()> {
-                unimplemented!()
-            }
-            async fn create_typed_edge(
-                &self,
-                _s: &str,
-                _d: &str,
-                _r: UserRelationType,
-                _m: EdgeMeta,
-            ) -> Result<bool> {
-                unimplemented!()
-            }
-            async fn get_typed_edges(
-                &self,
-                _h: &str,
-                _r: Option<UserRelationType>,
-                _d: Direction,
-                _l: usize,
-            ) -> Result<Vec<Edge>> {
-                unimplemented!()
-            }
-            async fn delete_typed_edge(
-                &self,
-                _s: &str,
-                _d: &str,
-                _r: UserRelationType,
-            ) -> Result<bool> {
-                unimplemented!()
-            }
-            async fn create_system_edge(
-                &self,
-                _s: &str,
-                _d: &str,
-                _r: SystemRelationType,
-                _t: f64,
-            ) -> Result<bool> {
-                unimplemented!()
-            }
-            async fn get_all_contradictions(
-                &self,
-                q: &ContradictionQuery,
-            ) -> Result<Vec<Contradiction>> {
-                let mut edges: Vec<&(Contradiction, bool)> = self
-                    .edges
-                    .iter()
-                    .filter(|(_, resolved)| !(q.exclude_resolved && *resolved))
-                    .collect();
-                edges.sort_by(|x, y| y.0.created_at.partial_cmp(&x.0.created_at).unwrap());
-                Ok(edges
-                    .into_iter()
-                    .skip(q.skip)
-                    .take(q.limit.clamp(1, 500))
-                    .map(|(c, _)| c.clone())
-                    .collect())
-            }
-            async fn set_contradiction_verdict(
-                &self,
-                _s: &str,
-                _d: &str,
-                _v: &EdgeVerdict,
-            ) -> Result<bool> {
-                unreachable!("the read surface must not write verdicts")
-            }
-            async fn get_contradictions_for_hashes(
-                &self,
-                _h: &[&str],
-            ) -> Result<HashMap<String, Vec<ContradictionRef>>> {
-                unimplemented!()
-            }
-            async fn get_neighbors(
-                &self,
-                _h: &str,
-                _hops: u8,
-                _w: f64,
-                _l: usize,
-            ) -> Result<Vec<Neighbor>> {
-                unimplemented!()
-            }
-            async fn spreading_activation(
-                &self,
-                _s: &[&str],
-                _hops: u8,
-                _d: f64,
-                _min: f64,
-                _l: usize,
-            ) -> Result<HashMap<String, f64>> {
-                unimplemented!()
-            }
-            async fn hebbian_boosts_within(&self, _h: &[&str]) -> Result<HashMap<String, f64>> {
-                unimplemented!()
-            }
-            async fn get_stats(&self) -> Result<GraphStats> {
-                unimplemented!()
-            }
-        }
-
         fn hash(i: usize) -> String {
             format!("{i:064x}")
         }
 
         /// AC-6 (amended): with more resolved pairs at the top of the queue
-        /// than one page holds, `limit = N` still returns N unresolved pairs,
-        /// and a pair Qdrant alone knows is resolved is skipped by pulling
-        /// another page rather than shortening the result.
+        /// than one page holds, `limit = N` still returns N unresolved pairs
+        /// and `next_offset` walks the rest. A pair Qdrant alone knows is
+        /// resolved is dropped from its page without disturbing the cursor.
         #[tokio::test(flavor = "current_thread")]
         async fn resolved_run_at_the_top_cannot_starve_the_queue() {
             // 60 pairs, newest first by created_at; the newest 50 are resolved
-            // graph-side (SUPERSEDES). Pair #52 is superseded in Qdrant only.
+            // graph-side (SUPERSEDES). Pair #57 is superseded in Qdrant only.
             let mut edges = Vec::new();
             let mut memories = Vec::new();
             for i in 0..60usize {
@@ -6135,7 +6037,7 @@ mod tests {
                     i < 50,
                 ));
                 let mut ma = mem(&a, ts);
-                if i == 52 {
+                if i == 57 {
                     ma.metadata = Some(HashMap::from([(
                         "superseded_by".to_string(),
                         serde_json::json!(hash(9)),
@@ -6144,60 +6046,71 @@ mod tests {
                 memories.push(ma);
                 memories.push(mem(&b, ts));
             }
+            let verdicts: Recorded = Rc::new(RefCell::new(Vec::new()));
             let svc = MemoryService::new(
                 Box::new(PairVectors(memories)),
                 Box::new(MockEmbeddings),
-                Box::new(PagingGraph { edges }),
+                Box::new(RecordingGraph {
+                    verdicts: verdicts.clone(),
+                    matched: true,
+                    edges,
+                }),
                 Box::new(MockHebbian),
                 Box::new(MockConsolidation),
                 None,
             );
+            let a_hashes = |page: &Value| -> Vec<String> {
+                page["pairs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| p["memory_a_hash"].as_str().unwrap().to_string())
+                    .collect()
+            };
 
             // Page 1: five unresolved pairs despite 50 resolved ones on top.
             let page = svc.memory_contradictions(5, 0, false, None).await.unwrap();
-            let pairs = page["pairs"].as_array().unwrap();
-            assert_eq!(pairs.len(), 5, "{page}");
-            let got: Vec<&str> = pairs
-                .iter()
-                .map(|p| p["memory_a_hash"].as_str().unwrap())
-                .collect();
-            // Pair 52 (Qdrant-resolved) is skipped and the page is still full.
             assert_eq!(
-                got,
-                [hash(1050), hash(1051), hash(1053), hash(1054), hash(1055)]
+                a_hashes(&page),
+                [hash(1050), hash(1051), hash(1052), hash(1053), hash(1054)]
             );
-            assert!(pairs.iter().all(|p| p["verdict"] == "unjudged"));
-            // next_offset counts every row consumed, filtered ones included.
-            assert_eq!(page["next_offset"], 6);
+            assert!(
+                page["pairs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|p| p["verdict"] == "unjudged")
+            );
+            assert_eq!(page["next_offset"], 5);
 
-            // Page 2 continues from next_offset without repeats.
-            let page2 = svc.memory_contradictions(5, 6, false, None).await.unwrap();
-            let got2: Vec<&str> = page2["pairs"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|p| p["memory_a_hash"].as_str().unwrap())
-                .collect();
-            assert_eq!(got2[0], hash(1056));
-            assert_eq!(got2.len(), 4, "only 9 unresolved pairs exist in total");
-            assert_eq!(page2["next_offset"], Value::Null);
+            // Page 2: #57 is dropped by the Qdrant guard; the cursor still
+            // advances by the full graph page.
+            let page2 = svc.memory_contradictions(5, 5, false, None).await.unwrap();
+            assert_eq!(
+                a_hashes(&page2),
+                [hash(1055), hash(1056), hash(1058), hash(1059)]
+            );
+            assert_eq!(page2["next_offset"], 10);
+
+            // Page 3: nothing left, cursor ends.
+            let page3 = svc.memory_contradictions(5, 10, false, None).await.unwrap();
+            assert_eq!(page3["total"], 0);
+            assert_eq!(page3["next_offset"], Value::Null);
 
             // include_resolved shows the resolved run again.
             let all = svc.memory_contradictions(5, 0, true, None).await.unwrap();
             assert_eq!(all["pairs"][0]["memory_a_hash"], hash(1000));
             assert_eq!(all["pairs"][0]["memory_a_superseded"], false);
+
+            assert!(
+                verdicts.borrow().is_empty(),
+                "the read surface never writes"
+            );
         }
 
         #[tokio::test(flavor = "current_thread")]
         async fn unknown_verdict_filter_is_a_validation_error() {
-            let svc = MemoryService::new(
-                Box::new(PairVectors(vec![])),
-                Box::new(MockEmbeddings),
-                Box::new(PagingGraph { edges: vec![] }),
-                Box::new(MockHebbian),
-                Box::new(MockConsolidation),
-                None,
-            );
+            let (svc, _) = service(None, vec![], true);
             for bad in [
                 vec![],
                 vec!["Supersession".to_string()],
@@ -6234,8 +6147,9 @@ mod tests {
         }
 
         #[tokio::test(flavor = "current_thread")]
-        async fn missing_endpoint_bad_hash_or_no_judge_is_unjudged_without_a_write() {
-            // Endpoint missing from the vector store.
+        async fn missing_endpoint_is_marked_bad_hash_or_no_judge_writes_nothing() {
+            // Endpoint missing from the vector store: deterministic until the
+            // memory reappears, so it is marked rather than re-selected forever.
             let (svc, verdicts) = service(
                 Some(Script::Ok(judgement(Verdict::Coexist, None))),
                 vec![mem(&src(), 1.0)],
@@ -6243,9 +6157,18 @@ mod tests {
             );
             assert!(matches!(
                 svc.judge_contradiction(&src(), &dst()).await,
-                JudgeOutcome::Unjudged { marked: false }
+                JudgeOutcome::Unjudged { marked: true }
             ));
-            // Malformed hash and self-pair never reach the judge.
+            {
+                let recorded = verdicts.borrow();
+                assert_eq!(recorded.len(), 1);
+                assert_eq!(recorded[0].2.verdict, Verdict::Unjudged);
+                assert_eq!(
+                    recorded[0].2.verdict_reason,
+                    "unjudged: endpoint missing from vector store"
+                );
+            }
+            // Malformed hash and self-pair never reach the judge or the graph.
             assert!(matches!(
                 svc.judge_contradiction("nope", &dst()).await,
                 JudgeOutcome::Unjudged { marked: false }
@@ -6254,7 +6177,7 @@ mod tests {
                 svc.judge_contradiction(&src(), &src()).await,
                 JudgeOutcome::Unjudged { marked: false }
             ));
-            assert!(verdicts.borrow().is_empty());
+            assert_eq!(verdicts.borrow().len(), 1);
             // Judge not configured.
             let (svc, verdicts) = service(None, pair(), true);
             assert!(matches!(

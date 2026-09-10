@@ -328,11 +328,11 @@ Each pair carries the lexical detector's `confidence` plus the judge's advisory 
     }
   ],
   "total": 1,
-  "next_offset": 20
+  "next_offset": null
 }
 ```
 
-`verdict` is one of `contradiction`, `supersession`, `coexist`, `unrelated`, or `unjudged`. An edge the judge has never seen has `null` for the other verdict fields; an edge the judge failed on deterministically (unparseable or empty answer, request rejected) is `unjudged` with `verdict_reason` starting `unjudged:` and `verdict_model` set. `next_offset` is `null` on the last page. Pure read — the read-only bearer may call it.
+`verdict` is one of `contradiction`, `supersession`, `coexist`, `unrelated`, or `unjudged`. An edge the judge has never seen has `null` for the other verdict fields; an edge the judge failed on deterministically (unparseable or empty answer, request rejected, endpoint missing) is `unjudged` with `verdict_reason` starting `unjudged:` and `verdict_model` set. `next_offset` is set whenever the graph page was full (an exactly-full last page yields a cursor to an empty page) and `null` once the server knows nothing follows. A page can hold fewer than `limit` pairs when Qdrant marks a memory superseded that the graph does not yet know about; the cursor still advances. Pure read — the read-only bearer may call it.
 
 ## `POST /duplicates/find`
 
@@ -405,7 +405,7 @@ Failures are classified so one poison pair cannot stall the pass or re-bill fore
 - **transient** (timeout, 5xx, 429 after retries, upstream misconfiguration, endpoint missing) → nothing is written; counted in `unjudged`, retried next pass.
 - `judged - persisted` is verdicts produced that did not land on an edge (graph blip); they are retried next pass.
 
-Re-running is idempotent: only edges with no verdict at all are selected. **Switching `JUDGE_MODEL`** does not touch existing verdicts; run with `"rejudge": true` to also re-annotate every edge whose `verdict_model` differs from the configured model (markers included), paging with `limit` until `queued` is `0`. Verdicts are written onto the graph edge only; no memory record is modified.
+Re-running is idempotent: only edges with no verdict at all are selected. **Switching `JUDGE_MODEL`** does not touch existing verdicts; run with `"rejudge": true` to also re-annotate every edge whose `verdict_model` differs from the configured model **and every `unjudged` marker** (the operator's way to retry deterministic failures after a fix), paging with `limit` until `queued` is `0`. A marker never overwrites a real verdict — if a re-judge fails on a pair that already has one, the old verdict stands. Verdicts are written onto the graph edge only; no memory record is modified.
 
 One pass at a time: a second call while one is running returns `{"success": false, "error": "backfill already running"}`. The HTTP reply waits at most 630 s, so keep `limit` around 200 per call; a pass that outlives the reply still runs to completion and the next call is refused until it finishes.
 

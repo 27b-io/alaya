@@ -146,7 +146,6 @@ async fn needs_judging_skips_marked_failures_and_rejudge_selects_other_models() 
     let rejudge = ctx
         .exec_tuple(cypher::get_all_contradictions(&ContradictionQuery {
             limit: 10,
-            needs_judging: true,
             rejudge_model: Some("model-y".into()),
             ..Default::default()
         }))
@@ -156,18 +155,71 @@ async fn needs_judging_skips_marked_failures_and_rejudge_selects_other_models() 
         [hash(1000), hash(1001), hash(1002), hash(1003)],
         "a model switch re-selects every edge not judged by the new model"
     );
+    // Same model: real verdicts stay, but the marker is retried on opt-in.
     let same_model = ctx
         .exec_tuple(cypher::get_all_contradictions(&ContradictionQuery {
             limit: 10,
-            needs_judging: true,
             rejudge_model: Some("model-x".into()),
             ..Default::default()
         }))
         .await;
-    assert_eq!(a_hashes(&same_model), [hash(1000), hash(1003)]);
+    assert_eq!(a_hashes(&same_model), [hash(1000), hash(1002), hash(1003)]);
 
-    // Read surface: `unjudged` matches NULL and the marker; the marker
-    // carries its reason (column 6) so the operator sees why.
+    // A marker never clobbers a real verdict (store-path spawn racing a
+    // backfill, or a failed re-judge): pair 1 keeps `coexist`.
+    let r = ctx
+        .exec_tuple(cypher::set_contradiction_verdict(
+            &hash(1001),
+            &hash(2001),
+            &EdgeVerdict {
+                verdict: Verdict::Unjudged,
+                verdict_survivor: None,
+                verdict_reason: "unjudged: late failure".into(),
+                verdict_confidence: 0.0,
+                verdict_model: "model-y".into(),
+                judged_at: 2.0,
+            },
+        ))
+        .await;
+    assert_eq!(r.count(), Some(0), "marker must not match a judged edge");
+    // …but a real verdict overwrites a marker (pair 2), and a marker may
+    // replace an older marker (pair 3 gets one).
+    for (i, verdict, reason, conf) in [
+        (2usize, Verdict::Unrelated, "shared vocabulary", 0.8),
+        (
+            3,
+            Verdict::Unjudged,
+            "unjudged: verdict is not valid JSON",
+            0.0,
+        ),
+    ] {
+        let r = ctx
+            .exec_tuple(cypher::set_contradiction_verdict(
+                &hash(1000 + i),
+                &hash(2000 + i),
+                &EdgeVerdict {
+                    verdict,
+                    verdict_survivor: None,
+                    verdict_reason: reason.into(),
+                    verdict_confidence: conf,
+                    verdict_model: "model-y".into(),
+                    judged_at: 2.0,
+                },
+            ))
+            .await;
+        assert_eq!(r.count(), Some(1), "edge {i}");
+    }
+    let judged = ctx
+        .exec_tuple(cypher::get_all_contradictions(&ContradictionQuery {
+            limit: 10,
+            verdicts: Some(vec!["coexist".into(), "unrelated".into()]),
+            ..Default::default()
+        }))
+        .await;
+    assert_eq!(a_hashes(&judged), [hash(1001), hash(1002)]);
+
+    // Read surface: `unjudged` matches NULL and a marker; a marker carries
+    // its reason (column 6) so the operator sees why.
     let unjudged = ctx
         .exec_tuple(cypher::get_all_contradictions(&ContradictionQuery {
             limit: 10,
@@ -175,17 +227,75 @@ async fn needs_judging_skips_marked_failures_and_rejudge_selects_other_models() 
             ..Default::default()
         }))
         .await;
-    assert_eq!(a_hashes(&unjudged), [hash(1000), hash(1002), hash(1003)]);
+    assert_eq!(a_hashes(&unjudged), [hash(1000), hash(1003)]);
     let marked_row = unjudged
         .result_set
         .iter()
-        .find(|r| r[0].as_str() == Some(hash(1002).as_str()))
+        .find(|r| r[0].as_str() == Some(hash(1003).as_str()))
         .unwrap();
     assert_eq!(marked_row[4].as_str(), Some("unjudged"));
     assert_eq!(
         marked_row[6].as_str(),
         Some("unjudged: verdict is not valid JSON")
     );
+
+    ctx.cleanup().await;
+    Ok(())
+}
+
+/// Panel CRIT: every edge written by one `store` shares `created_at`, and
+/// FalkorDB orders ties differently per SKIP/LIMIT window. With the pair
+/// tiebreak, paging over a tie group returns every edge exactly once.
+#[tokio::test]
+async fn paging_over_created_at_ties_is_stable_and_complete() -> anyhow::Result<()> {
+    let Some(ctx) = common::TestContext::new().await else {
+        return Ok(());
+    };
+    // 30 pairs in three tie groups of 10.
+    let ts0 = 1_800_000_000.0_f64;
+    for i in 0..30usize {
+        let (a, b) = (hash(1000 + i), hash(2000 + i));
+        let ts = ts0 - (i / 10) as f64;
+        ctx.exec_tuple(cypher::ensure_node(&a, ts)).await;
+        ctx.exec_tuple(cypher::ensure_node(&b, ts)).await;
+        ctx.exec_tuple(cypher::create_typed_edge(
+            &a,
+            &b,
+            UserRelationType::Contradicts,
+            ts,
+            Some(0.7),
+        ))
+        .await;
+    }
+    for page_size in [4usize, 7] {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut skip = 0;
+        loop {
+            let page = ctx
+                .exec_tuple(cypher::get_all_contradictions(&ContradictionQuery {
+                    limit: page_size,
+                    skip,
+                    ..Default::default()
+                }))
+                .await;
+            let rows = a_hashes(&page);
+            for h in &rows {
+                assert!(
+                    seen.insert(h.clone()),
+                    "duplicate {h} at skip {skip} (page {page_size})"
+                );
+            }
+            if rows.len() < page_size {
+                break;
+            }
+            skip += page_size;
+        }
+        assert_eq!(
+            seen.len(),
+            30,
+            "page size {page_size} must reach every edge once"
+        );
+    }
 
     ctx.cleanup().await;
     Ok(())

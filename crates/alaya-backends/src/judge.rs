@@ -29,7 +29,20 @@ confidence: 0.0-1.0, your probability that the verdict is correct.";
 /// Reason is clipped to this many chars on the way in. The schema asks for
 /// ≤200; a longer reason is a cosmetic overrun, not a semantic violation,
 /// so it is clipped rather than costing a paid call.
-const MAX_REASON_CHARS: usize = 200;
+pub const MAX_REASON_CHARS: usize = 200;
+
+/// Text that ends up on an edge and in a line-oriented log — a model's
+/// `reason` or an upstream error — with control characters stripped (log
+/// forging) and clipped to `MAX_REASON_CHARS`.
+pub fn sanitize_reason(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(MAX_REASON_CHARS)
+        .collect()
+}
 
 /// Output budget. The verdict JSON is ~90 tokens, but models with adaptive
 /// thinking on by default (Sonnet 5) spend output tokens thinking first; a
@@ -66,7 +79,7 @@ fn verdict_schema() -> Value {
         "properties": {
             "verdict": {
                 "type": "string",
-                "enum": ["contradiction", "supersession", "coexist", "unrelated"]
+                "enum": Verdict::CLASSES.map(|v| v.as_str())
             },
             "survivor": {
                 "anyOf": [
@@ -159,13 +172,6 @@ struct RawVerdict {
 
 impl RawVerdict {
     fn validate(self, model: String, usage: Usage) -> Result<Judgement> {
-        // The schema's enum excludes it; a proxy that drops `output_config`
-        // could still let it through, and it is not the model's to say.
-        if self.verdict == Verdict::Unjudged {
-            return Err(AlayaError::Judge(
-                "model answered 'unjudged', which is not a class".into(),
-            ));
-        }
         if !(0.0..=1.0).contains(&self.confidence) {
             return Err(AlayaError::Judge(format!(
                 "confidence {} outside 0.0..=1.0",
@@ -174,24 +180,21 @@ impl RawVerdict {
         }
         // A survivor is only meaningful when something has to give way.
         let survivor = match self.verdict {
-            Verdict::Coexist | Verdict::Unrelated | Verdict::Unjudged => None,
+            Verdict::Coexist | Verdict::Unrelated => None,
             Verdict::Contradiction | Verdict::Supersession => self.survivor,
+            // The schema's enum excludes it; a proxy that drops
+            // `output_config` could let it through, and it is not the
+            // model's to say.
+            Verdict::Unjudged => {
+                return Err(AlayaError::Judge(
+                    "model answered 'unjudged', which is not a class".into(),
+                ));
+            }
         };
-        // Model-authored text ends up in a line-oriented log: no control
-        // characters (log forging), and clipped to the schema's length.
-        let reason: String = self
-            .reason
-            .chars()
-            .filter(|c| !c.is_control())
-            .collect::<String>()
-            .trim()
-            .chars()
-            .take(MAX_REASON_CHARS)
-            .collect();
         Ok(Judgement {
             verdict: self.verdict,
             survivor,
-            reason,
+            reason: sanitize_reason(&self.reason),
             confidence: self.confidence,
             model,
             input_tokens: usage.total_input_tokens(),
@@ -361,16 +364,18 @@ mod tests {
 
         #[tokio::test]
         async fn request_fault_4xx_is_a_deterministic_judge_error() {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .respond_with(ResponseTemplate::new(400).set_body_string("invalid_request"))
-                .mount(&server)
-                .await;
-            let e = client(&server)
-                .judge(&mem("a", 1.0), &mem("b", 2.0))
-                .await
-                .unwrap_err();
-            assert!(matches!(e, AlayaError::Judge(_)), "{e:?}");
+            for status in [400u16, 413, 422] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .respond_with(ResponseTemplate::new(status).set_body_string("invalid_request"))
+                    .mount(&server)
+                    .await;
+                let e = client(&server)
+                    .judge(&mem("a", 1.0), &mem("b", 2.0))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(e, AlayaError::Judge(_)), "{status}: {e:?}");
+            }
         }
 
         #[tokio::test]
