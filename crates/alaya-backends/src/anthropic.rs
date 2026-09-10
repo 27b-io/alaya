@@ -10,8 +10,8 @@ use serde_json::Value;
 
 use alaya_types::{AlayaError, Result};
 
-/// Request timeout used by every production client.
-#[cfg(not(target_arch = "wasm32"))]
+/// Request timeout for one-line summaries. (Ignored on wasm32, where
+/// reqwest has no timeouts — the const still compiles there.)
 pub(crate) const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Maximum content length sent to the LLM per document. A one-line summary

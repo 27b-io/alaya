@@ -11,7 +11,8 @@
 //! ```
 //!
 //! Prints the confusion matrix, per-class precision/recall, survivor
-//! accuracy and token spend. It does NOT assert the quality bar: missing it
+//! accuracy and token totals (price them at the current list rate; a price
+//! table here would rot). It does NOT assert the quality bar: missing it
 //! blocks Phase 2 (LAB-3285), not this test.
 
 use std::collections::HashMap;
@@ -52,20 +53,6 @@ struct MemoryEnvelope {
 
 fn env(key: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| panic!("{key} must be set for the golden-set run"))
-}
-
-/// USD per million (input, output) tokens at list price, by model family.
-fn list_price(model: &str) -> Option<(f64, f64)> {
-    let m = model.to_ascii_lowercase();
-    if m.contains("haiku") {
-        Some((1.0, 5.0))
-    } else if m.contains("sonnet") {
-        Some((2.0, 10.0))
-    } else if m.contains("opus") {
-        Some((5.0, 25.0))
-    } else {
-        None
-    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -225,17 +212,13 @@ async fn golden_set_precision_recall() {
     } else {
         f64::NAN
     };
-    let cost =
-        list_price(&model).map(|(pi, po)| in_tok as f64 / 1e6 * pi + out_tok as f64 / 1e6 * po);
     println!(
         "\nbar: precision(supersession)={sup_precision:.3} (≥0.90)  coexist→conflict={coexist_escalation_rate:.3} (≤0.10)  survivor_acc(on true supersessions)={survivor_acc:.3}"
     );
     println!(
-        "tokens: input={in_tok} output={out_tok} per_pair_in={:.0} per_pair_out={:.1} cost_usd={}",
+        "tokens: input={in_tok} output={out_tok} per_pair_in={:.0} per_pair_out={:.1}",
         in_tok as f64 / results.len().max(1) as f64,
-        out_tok as f64 / results.len().max(1) as f64,
-        cost.map(|c| format!("{c:.4}"))
-            .unwrap_or_else(|| "n/a".into())
+        out_tok as f64 / results.len().max(1) as f64
     );
     // Per-source breakdown helps spot label-source bias.
     let mut by_source: HashMap<&str, (usize, usize)> = HashMap::new();

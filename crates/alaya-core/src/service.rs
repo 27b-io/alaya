@@ -204,20 +204,29 @@ const SCORE_CAP: f64 = 1.5;
 const RRF_BLEND_WEIGHT: f64 = 0.4;
 
 /// `tracing` target of the contradiction-judge shadow log (LAB-3283 AC-4b).
-/// One event per judged pair with stable field names; Phase 2 promotion is
-/// decided on these events, so treat the field set as a contract.
+/// Exactly one INFO event per *judged* pair, always the same field set
+/// (`memory_a`, `memory_b`, `verdict`, `survivor`, `confidence`, `model`,
+/// `would_supersede`, `persisted`, `input_tokens`, `output_tokens`,
+/// `reason`); unjudged outcomes warn on the default target and never appear
+/// here. Phase 2 promotion is decided on these events — the field set is a
+/// contract.
 pub const SHADOW_LOG_TARGET: &str = "alaya::judge";
 
 /// Verdict filter applied by `memory_contradictions` when the caller passes
 /// none: genuine conflicts plus pairs the judge has not seen yet. Callers
 /// that want `coexist`/`unrelated` name them explicitly.
-pub const DEFAULT_VERDICT_FILTER: [&str; 3] = ["contradiction", "supersession", Verdict::UNJUDGED];
+const DEFAULT_VERDICT_FILTER: [&str; 3] = ["contradiction", "supersession", Verdict::UNJUDGED];
 
 /// Result of judging one CONTRADICTS pair.
 #[derive(Debug)]
 pub enum JudgeOutcome {
-    /// Verdict produced (and, graph permitting, persisted on the edge).
-    Judged(Judgement),
+    /// Verdict produced. `persisted` is whether the edge write landed; a
+    /// graph blip (non-fatal by design) leaves the pair judged-but-unwritten,
+    /// so the next backfill pass re-judges it.
+    Judged {
+        judgement: Judgement,
+        persisted: bool,
+    },
     /// No verdict: judge disabled, endpoint missing, transport/parse/schema
     /// failure. Nothing was written. The pair stays eligible for backfill.
     Unjudged,
@@ -1768,14 +1777,13 @@ impl MemoryService {
                 return JudgeOutcome::RateLimited { retry_after_secs };
             }
             Err(e) => {
+                // Default target on purpose: the shadow-log target carries
+                // judged pairs only. `?e` keeps an upstream body escaped.
                 tracing::warn!(
-                    target: SHADOW_LOG_TARGET,
                     memory_a = src,
                     memory_b = dst,
                     verdict = Verdict::UNJUDGED,
-                    survivor = "none",
-                    would_supersede = "none",
-                    error = %e,
+                    error = ?e,
                     "contradiction unjudged"
                 );
                 return JudgeOutcome::Unjudged;
@@ -1794,15 +1802,21 @@ impl MemoryService {
             verdict_model: j.model.clone(),
             judged_at: (self.clock)(),
         };
-        match self.graph.set_contradiction_verdict(src, dst, &edge).await {
-            Ok(true) => {}
-            Ok(false) => tracing::warn!(
-                a = sa,
-                b = sd,
-                "judge_contradiction: no CONTRADICTS edge matched; verdict not persisted"
-            ),
-            Err(e) => tracing::warn!(a = sa, b = sd, "verdict persist failed (non-fatal): {e}"),
-        }
+        let persisted = match self.graph.set_contradiction_verdict(src, dst, &edge).await {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::warn!(
+                    a = sa,
+                    b = sd,
+                    "judge_contradiction: no CONTRADICTS edge matched; verdict not persisted"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(a = sa, b = sd, "verdict persist failed (non-fatal): {e}");
+                false
+            }
+        };
 
         // Shadow log (AC-4b): what Phase 2 would write. Only a supersession
         // with a named survivor is actionable; everything else is "none".
@@ -1822,12 +1836,17 @@ impl MemoryService {
             confidence = j.confidence,
             model = %j.model,
             would_supersede = %would_supersede,
+            persisted,
             input_tokens = j.input_tokens,
             output_tokens = j.output_tokens,
-            reason = %j.reason,
+            // Debug-quoted: model-authored text in a line-oriented log.
+            reason = ?j.reason,
             "contradiction judged"
         );
-        JudgeOutcome::Judged(j)
+        JudgeOutcome::Judged {
+            judgement: j,
+            persisted,
+        }
     }
 
     // ─── Tool 7: memory_contradictions ──────────────────────────────────
@@ -1851,9 +1870,28 @@ impl MemoryService {
             .map(|s| s.to_string())
             .collect();
         let verdicts = verdicts.unwrap_or(&default);
+        if verdicts.is_empty()
+            || verdicts
+                .iter()
+                .any(|v| v != Verdict::UNJUDGED && Verdict::parse(v).is_none())
+        {
+            return Err(AlayaError::Validation(format!(
+                "verdicts must be a non-empty subset of {:?} plus {:?}",
+                Verdict::ALL.map(|v| v.as_str()),
+                Verdict::UNJUDGED
+            )));
+        }
+        // The resolved filter runs here, after the fetch, so over-fetch
+        // (bounded by the bridge's 500 cap) and trim to `limit` below —
+        // otherwise a newest-first window of resolved pairs reads as empty.
+        let fetch = if include_resolved {
+            limit
+        } else {
+            limit.saturating_mul(4).min(500)
+        };
         let pairs = self
             .graph
-            .get_all_contradictions(limit, Some(verdicts))
+            .get_all_contradictions(fetch, Some(verdicts))
             .await?;
 
         // Batch fetch all referenced memories (was: N+1 sequential queries)
@@ -1906,6 +1944,7 @@ impl MemoryService {
                 "judged_at": v.map(|v| v.judged_at),
             }));
         }
+        enriched.truncate(limit);
 
         Ok(serde_json::json!({
             "success": true,
@@ -5784,7 +5823,11 @@ mod tests {
                     service(Some(Script::Ok(judgement(verdict, survivor))), pair(), true);
                 let (outcome, events) = captured(svc.judge_contradiction(&src(), &dst())).await;
                 assert!(
-                    matches!(outcome, JudgeOutcome::Judged(ref j) if j.verdict == verdict),
+                    matches!(
+                        outcome,
+                        JudgeOutcome::Judged { ref judgement, persisted: true }
+                            if judgement.verdict == verdict
+                    ),
                     "{verdict:?}: {outcome:?}"
                 );
 
@@ -5811,6 +5854,7 @@ mod tests {
                 assert_eq!(e["memory_a"], src());
                 assert_eq!(e["memory_b"], dst());
                 assert_eq!(e["model"], "test-model");
+                assert_eq!(e["persisted"], "true");
                 assert_eq!(e["confidence"], "0.9");
                 let expected_would = if verdict == Verdict::Supersession {
                     format!("{} -> {}", src(), dst())
@@ -5826,7 +5870,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "current_thread")]
-        async fn judge_failure_is_unjudged_writes_nothing_and_warns_once() {
+        async fn judge_failure_is_unjudged_writes_nothing_and_emits_no_shadow_event() {
             let (svc, verdicts) = service(
                 Some(Script::Err(|| AlayaError::Judge("boom".into()))),
                 pair(),
@@ -5835,10 +5879,10 @@ mod tests {
             let (outcome, events) = captured(svc.judge_contradiction(&src(), &dst())).await;
             assert!(matches!(outcome, JudgeOutcome::Unjudged), "{outcome:?}");
             assert!(verdicts.borrow().is_empty(), "no graph write on failure");
-            assert_eq!(events.len(), 1, "{events:?}");
-            assert_eq!(events[0]["level"], "WARN");
-            assert_eq!(events[0]["verdict"], "unjudged");
-            assert_eq!(events[0]["would_supersede"], "none");
+            assert!(
+                events.is_empty(),
+                "the shadow-log target carries judged pairs only: {events:?}"
+            );
         }
 
         #[tokio::test(flavor = "current_thread")]
@@ -5905,13 +5949,20 @@ mod tests {
                 false,
             );
             let (outcome, events) = captured(svc.judge_contradiction(&src(), &dst())).await;
-            assert!(matches!(outcome, JudgeOutcome::Judged(_)));
+            assert!(matches!(
+                outcome,
+                JudgeOutcome::Judged {
+                    persisted: false,
+                    ..
+                }
+            ));
             assert_eq!(verdicts.borrow().len(), 1, "the write was attempted");
             assert_eq!(
                 events.len(),
                 1,
                 "shadow log does not depend on the graph write landing"
             );
+            assert_eq!(events[0]["persisted"], "false");
         }
 
         /// AC-4: the store path never awaits the judge. With a judge that

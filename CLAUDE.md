@@ -28,16 +28,16 @@ Rust rewrite of the mcp-memory-service API layer. Deployed on k3s as a native se
 crates/
 ├── alaya-types/src/
 │   ├── lib.rs          # Re-exports
-│   ├── error.rs        # AlayaError (6 variants, JSON-RPC codes, safe_message())
+│   ├── error.rs        # AlayaError (JSON-RPC codes, safe_message())
 │   ├── graph.rs        # UserRelationType, SystemRelationType, Edge, Neighbor, etc.
 │   ├── memory.rs       # Memory (15 fields), ScoredMemory, ScrollResult, MetadataUpdate
 │   └── search.rs       # SearchMode (5 modes), PromptName, PayloadFilter
 ├── alaya-bridge/src/
 │   ├── lib.rs           # Library target (re-exports for integration tests)
 │   ├── main.rs          # Binary entry — reads REDIS_URL/GRAPH_NAME, starts axum + queue
-│   ├── routes.rs        # 18 HTTP endpoints, auth middleware on API routes
+│   ├── routes.rs        # HTTP endpoints, auth middleware on API routes
 │   ├── auth.rs          # Bearer token middleware (GRAPH_API_KEY env)
-│   ├── cypher.rs        # Typed Cypher query builders (17 functions, all parameterized)
+│   ├── cypher.rs        # Typed Cypher query builders (all parameterized)
 │   ├── resp.rs          # FalkorDB RESP parser (compact + non-compact modes)
 │   ├── queue.rs         # Hebbian write queue (LPUSH/BRPOP, rate-limited 100 ops/sec)
 │   └── handlers/

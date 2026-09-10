@@ -612,7 +612,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "memory_contradictions",
-            "description": "List CONTRADICTS pairs with the judge's verdict per pair (contradiction | supersession | coexist | unrelated | unjudged), the recommended survivor hash and a one-line reason. Pairs with a superseded endpoint are hidden unless include_resolved is true. Returns {pairs: [{memory_a_hash, memory_b_hash, confidence, memory_a_content, memory_b_content, memory_a_superseded, memory_b_superseded, verdict, verdict_reason, survivor, verdict_confidence, verdict_model, judged_at}], total}.",
+            "description": "List CONTRADICTS pairs with the judge's verdict per pair (contradiction | supersession | coexist | unrelated | unjudged), the recommended survivor hash and a one-line reason. Pairs with a superseded endpoint are hidden unless include_resolved is true. Returns {pairs: [{memory_a_hash, memory_b_hash, confidence, created_at, memory_a_content, memory_b_content, memory_a_superseded, memory_b_superseded, verdict, verdict_reason, survivor, verdict_confidence, verdict_model, judged_at}], total}.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -182,9 +182,11 @@ pub fn create_system_edge(src: &str, dst: &str, rel: SystemRelationType, ts: f64
 
 // ─── contradiction operations ─────────────────────────────────────────────────
 
-/// Columns every contradiction-pair query returns, in this order. The
-/// handler indexes rows by position, so keep the two in lock-step.
-pub const CONTRADICTION_COLUMNS: &str = "a.content_hash, b.content_hash, e.confidence, e.created_at, \
+/// Row layout of `get_all_contradictions`, in this order.
+/// `handlers::contradictions::parse_verdict` indexes columns 4.. by
+/// position, so keep the two in lock-step. (`get_contradictions_for_hashes`
+/// deliberately returns no verdict columns.)
+const CONTRADICTION_COLUMNS: &str = "a.content_hash, b.content_hash, e.confidence, e.created_at, \
      e.verdict, e.verdict_survivor, e.verdict_reason, e.verdict_confidence, \
      e.verdict_model, e.judged_at";
 

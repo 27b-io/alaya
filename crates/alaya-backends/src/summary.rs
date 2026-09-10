@@ -6,7 +6,7 @@ use serde_json::json;
 use alaya_types::{AlayaError, Result};
 
 use crate::SummaryProvider;
-use crate::anthropic::{MessagesTransport, truncate_chars};
+use crate::anthropic::{DEFAULT_REQUEST_TIMEOUT, MessagesTransport, truncate_chars};
 
 const SYSTEM_PROMPT: &str = "Summarize the following in one concise sentence of approximately 50 tokens. \
      Return only the summary, no preamble.";
@@ -18,12 +18,8 @@ pub struct SummaryClient {
 
 impl SummaryClient {
     pub fn new(base_url: String, model: String, api_key: Option<String>) -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
-        let timeout = crate::anthropic::DEFAULT_REQUEST_TIMEOUT;
-        #[cfg(target_arch = "wasm32")]
-        let timeout = std::time::Duration::from_secs(30);
         Self {
-            transport: MessagesTransport::new(base_url, api_key, timeout),
+            transport: MessagesTransport::new(base_url, api_key, DEFAULT_REQUEST_TIMEOUT),
             model,
         }
     }

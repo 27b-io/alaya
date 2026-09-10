@@ -392,10 +392,12 @@ Content-Type: application/json
 Blocks until the pass completes and returns what happened:
 
 ```json
-{"queued": 100, "judged": 97, "unjudged": 3, "input_tokens": 231044, "output_tokens": 7112}
+{"queued": 100, "judged": 97, "persisted": 97, "unjudged": 3, "input_tokens": 231044, "output_tokens": 7112}
 ```
 
-`limit` defaults to `100` (max 500 per call). At most 4 judge calls are in flight; a `429` from the provider is retried with backoff (honouring `retry-after`). Re-running is idempotent — only edges still without a verdict are judged, so already-judged pairs never cost again. `unjudged` counts pairs the judge could not classify (timeout, malformed answer, endpoint missing); they stay eligible for the next run. Verdicts are written onto the graph edge only; no memory record is modified.
+`limit` defaults to `100` (max 500 per call). At most 4 judge calls are in flight — a cap shared with the judging that runs after each `POST /store` — and a `429` from the provider is retried with backoff (honouring `retry-after`). Re-running is idempotent: only edges still without a verdict are judged, so persisted verdicts never cost again. `unjudged` counts pairs the judge could not classify (timeout, malformed answer, endpoint missing); `judged - persisted` is verdicts that were produced but did not land on an edge (graph blip). Both stay eligible for the next run. Verdicts are written onto the graph edge only; no memory record is modified.
+
+One pass at a time: a second call while one is running returns `{"success": false, "error": "backfill already running"}`. The HTTP reply waits at most 630 s, so keep `limit` around 200 per call; a pass that outlives the reply still runs to completion and the next call is refused until it finishes.
 
 ## `POST /mcp`
 

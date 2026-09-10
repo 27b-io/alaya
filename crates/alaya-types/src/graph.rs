@@ -137,9 +137,48 @@ pub struct Contradiction {
     pub memory_b_hash: String,
     pub confidence: Option<f64>,
     pub created_at: Option<f64>,
-    /// `None` = unjudged. Flattened so the wire shape stays flat.
+    /// `None` = unjudged. Flattened so the wire shape stays flat. Serde's
+    /// flattened-`Option` semantics swallow ANY `EdgeVerdict` deserialize
+    /// error into `None` — so every field but `verdict` must stay
+    /// `#[serde(default)]`, or judged pairs silently read as unjudged.
     #[serde(default, flatten, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<EdgeVerdict>,
+}
+
+#[cfg(test)]
+mod verdict_wire_tests {
+    use super::*;
+
+    fn pair(extra: &str) -> Contradiction {
+        let json = format!(
+            r#"{{"memory_a_hash":"a","memory_b_hash":"b","confidence":0.7,"created_at":1.0{extra}}}"#
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn flattened_verdict_round_trips_and_absent_reads_as_unjudged() {
+        assert!(pair("").verdict.is_none());
+
+        let judged = pair(
+            r#","verdict":"supersession","verdict_survivor":"b","verdict_reason":"r","verdict_confidence":0.9,"verdict_model":"m","judged_at":2.0"#,
+        );
+        let v = judged.verdict.clone().expect("judged");
+        assert_eq!(v.verdict, Verdict::Supersession);
+        assert_eq!(v.verdict_survivor.as_deref(), Some("b"));
+        let back: Contradiction =
+            serde_json::from_str(&serde_json::to_string(&judged).unwrap()).unwrap();
+        assert_eq!(back.verdict, judged.verdict);
+
+        // Only `verdict` is required: a partially written edge still reads judged.
+        assert!(pair(r#","verdict":"coexist""#).verdict.is_some());
+        // A corrupt verdict string reads as unjudged (re-judged by backfill).
+        assert!(
+            pair(r#","verdict":"bogus","verdict_reason":"r""#)
+                .verdict
+                .is_none()
+        );
+    }
 }
 
 /// Reference to a contradicting memory (used in search enrichment).

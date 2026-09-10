@@ -296,8 +296,10 @@ pub trait SummaryProvider {
 }
 
 /// Which side of a judged pair should survive, in the judge's own frame
-/// (`a` = the first memory passed to `judge`, `b` = the second).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// (`a` = the first memory passed to `judge`, `b` = the second). Wire form
+/// is the lowercase letter the verdict schema asks the model for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Survivor {
     A,
     B,

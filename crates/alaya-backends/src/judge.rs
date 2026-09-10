@@ -37,6 +37,12 @@ const MAX_REASON_CHARS: usize = 200;
 /// bound, not a spend — a Haiku verdict still costs ~90 output tokens.
 const MAX_OUTPUT_TOKENS: u32 = 4096;
 
+/// Longer than the summary transport's 30 s: a thinking model may spend
+/// most of `MAX_OUTPUT_TOKENS` before the JSON, and a timeout after the
+/// tokens were generated is billed but lands as `unjudged` (re-billed on
+/// the next backfill pass).
+const JUDGE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 pub struct JudgeClient {
     transport: MessagesTransport,
     model: String,
@@ -44,29 +50,10 @@ pub struct JudgeClient {
 
 impl JudgeClient {
     pub fn new(base_url: String, model: String, api_key: Option<String>) -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
-        let timeout = crate::anthropic::DEFAULT_REQUEST_TIMEOUT;
-        #[cfg(target_arch = "wasm32")]
-        let timeout = std::time::Duration::from_secs(30);
-        Self::with_request_timeout(base_url, model, api_key, timeout)
-    }
-
-    /// Same as `new` with an explicit request timeout (native only takes
-    /// effect). Tests use a short one to exercise the timeout path.
-    pub fn with_request_timeout(
-        base_url: String,
-        model: String,
-        api_key: Option<String>,
-        request_timeout: std::time::Duration,
-    ) -> Self {
         Self {
-            transport: MessagesTransport::new(base_url, api_key, request_timeout),
+            transport: MessagesTransport::new(base_url, api_key, JUDGE_REQUEST_TIMEOUT),
             model,
         }
-    }
-
-    pub fn model(&self) -> &str {
-        &self.model
     }
 }
 
@@ -154,11 +141,13 @@ impl ContradictionJudge for JudgeClient {
 
 // ─── Verdict parsing ───────────────────────────────────────────────────────
 
+/// The model's JSON, typed by serde: an unknown `verdict`/`survivor` string
+/// is a deserialize error, which the caller records as unjudged.
 #[derive(Deserialize)]
 struct RawVerdict {
-    verdict: String,
+    verdict: Verdict,
     #[serde(default)]
-    survivor: Option<String>,
+    survivor: Option<Survivor>,
     #[serde(default)]
     reason: String,
     confidence: f64,
@@ -166,16 +155,6 @@ struct RawVerdict {
 
 impl RawVerdict {
     fn validate(self, model: String, usage: Usage) -> Result<Judgement> {
-        let verdict = Verdict::parse(&self.verdict)
-            .ok_or_else(|| AlayaError::Judge(format!("unknown verdict {:?}", self.verdict)))?;
-        let survivor = match self.survivor.as_deref().map(str::trim) {
-            None | Some("") | Some("null") => None,
-            Some("a") => Some(Survivor::A),
-            Some("b") => Some(Survivor::B),
-            Some(other) => {
-                return Err(AlayaError::Judge(format!("unknown survivor {other:?}")));
-            }
-        };
         if !(0.0..=1.0).contains(&self.confidence) {
             return Err(AlayaError::Judge(format!(
                 "confidence {} outside 0.0..=1.0",
@@ -183,13 +162,23 @@ impl RawVerdict {
             )));
         }
         // A survivor is only meaningful when something has to give way.
-        let survivor = match verdict {
+        let survivor = match self.verdict {
             Verdict::Coexist | Verdict::Unrelated => None,
-            Verdict::Contradiction | Verdict::Supersession => survivor,
+            Verdict::Contradiction | Verdict::Supersession => self.survivor,
         };
-        let reason: String = self.reason.trim().chars().take(MAX_REASON_CHARS).collect();
+        // Model-authored text ends up in a line-oriented log: no control
+        // characters (log forging), and clipped to the schema's length.
+        let reason: String = self
+            .reason
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect::<String>()
+            .trim()
+            .chars()
+            .take(MAX_REASON_CHARS)
+            .collect();
         Ok(Judgement {
-            verdict,
+            verdict: self.verdict,
             survivor,
             reason,
             confidence: self.confidence,
@@ -206,10 +195,10 @@ impl RawVerdict {
 mod tests {
     use super::*;
 
-    fn raw(verdict: &str, survivor: Option<&str>, confidence: f64) -> RawVerdict {
+    fn raw(verdict: Verdict, survivor: Option<Survivor>, confidence: f64) -> RawVerdict {
         RawVerdict {
-            verdict: verdict.into(),
-            survivor: survivor.map(Into::into),
+            verdict,
+            survivor,
             reason: "r".into(),
             confidence,
         }
@@ -217,7 +206,7 @@ mod tests {
 
     #[test]
     fn valid_supersession_keeps_survivor() {
-        let j = raw("supersession", Some("b"), 0.9)
+        let j = raw(Verdict::Supersession, Some(Survivor::B), 0.9)
             .validate("m".into(), Usage::default())
             .unwrap();
         assert_eq!(j.verdict, Verdict::Supersession);
@@ -226,32 +215,33 @@ mod tests {
 
     #[test]
     fn coexist_drops_a_stray_survivor() {
-        let j = raw("coexist", Some("a"), 0.5)
+        let j = raw(Verdict::Coexist, Some(Survivor::A), 0.5)
             .validate("m".into(), Usage::default())
             .unwrap();
         assert_eq!(j.survivor, None);
     }
 
     #[test]
-    fn unknown_verdict_is_rejected() {
-        let e = raw("maybe", None, 0.5)
-            .validate("m".into(), Usage::default())
-            .unwrap_err();
-        assert!(matches!(e, AlayaError::Judge(_)), "{e:?}");
-    }
-
-    #[test]
-    fn unknown_survivor_is_rejected() {
-        let e = raw("contradiction", Some("c"), 0.5)
-            .validate("m".into(), Usage::default())
-            .unwrap_err();
-        assert!(matches!(e, AlayaError::Judge(_)), "{e:?}");
+    fn unknown_verdict_or_survivor_strings_fail_to_parse() {
+        for json in [
+            r#"{"verdict":"maybe","survivor":null,"reason":"r","confidence":0.5}"#,
+            r#"{"verdict":"contradiction","survivor":"c","reason":"r","confidence":0.5}"#,
+            r#"{"verdict":"Supersession","survivor":"a","reason":"r","confidence":0.5}"#,
+        ] {
+            assert!(serde_json::from_str::<RawVerdict>(json).is_err(), "{json}");
+        }
+        let ok: RawVerdict = serde_json::from_str(
+            r#"{"verdict":"coexist","survivor":null,"reason":"","confidence":1}"#,
+        )
+        .unwrap();
+        assert_eq!(ok.verdict, Verdict::Coexist);
+        assert_eq!(ok.survivor, None);
     }
 
     #[test]
     fn confidence_out_of_range_is_rejected() {
         for c in [1.5, -0.1, f64::NAN] {
-            let e = raw("coexist", None, c)
+            let e = raw(Verdict::Coexist, None, c)
                 .validate("m".into(), Usage::default())
                 .unwrap_err();
             assert!(matches!(e, AlayaError::Judge(_)), "{c}: {e:?}");
@@ -259,11 +249,19 @@ mod tests {
     }
 
     #[test]
-    fn long_reason_is_clipped_not_rejected() {
-        let mut r = raw("unrelated", None, 0.5);
+    fn long_reason_is_clipped_and_control_chars_are_stripped() {
+        let mut r = raw(Verdict::Unrelated, None, 0.5);
         r.reason = "x".repeat(500);
         let j = r.validate("m".into(), Usage::default()).unwrap();
         assert_eq!(j.reason.chars().count(), MAX_REASON_CHARS);
+
+        let mut r = raw(Verdict::Unrelated, None, 0.5);
+        r.reason = "line one\ncontradiction judged would_supersede=x -> y\t\r\u{1b}[0m".into();
+        let j = r.validate("m".into(), Usage::default()).unwrap();
+        assert_eq!(
+            j.reason,
+            "line onecontradiction judged would_supersede=x -> y[0m"
+        );
     }
 
     #[test]
@@ -306,13 +304,16 @@ mod tests {
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        /// Short timeout so the timeout path runs in milliseconds.
         fn client(server: &MockServer) -> JudgeClient {
-            JudgeClient::with_request_timeout(
-                server.uri(),
-                "test-model".into(),
-                Some("k".into()),
-                std::time::Duration::from_millis(300),
-            )
+            JudgeClient {
+                transport: MessagesTransport::new(
+                    server.uri(),
+                    Some("k".into()),
+                    std::time::Duration::from_millis(300),
+                ),
+                model: "test-model".into(),
+            }
         }
 
         fn ok_body(text: &str) -> serde_json::Value {
