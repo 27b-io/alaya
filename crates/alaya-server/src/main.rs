@@ -213,16 +213,18 @@ fn is_cluster_local(url: &str) -> bool {
 }
 
 /// A key sent over plain HTTP to a host that is not cluster-local is a
-/// credential on the wire. Not refused — an operator may front the API with
-/// an internal plaintext proxy — but never silent (CodeRabbit on alaya#93).
-fn warn_if_plaintext_credentials(var: &str, url: &str, has_api_key: bool) {
+/// credential on the wire. Fail closed at boot (Ray on LAB-3283, 2026-09-11):
+/// `https://` anywhere, or plain `http://` only to a cluster-local proxy
+/// such as `http://anthropic-lb:8082`. Checked before the transport is
+/// built, so no request can ever carry `x-api-key` to another plaintext host.
+fn check_credential_transport(var: &str, url: &str, has_api_key: bool) -> Result<(), String> {
     if has_api_key && url.starts_with("http://") && !is_cluster_local(url) {
-        tracing::warn!(
-            var,
-            url,
-            "API key will be sent over plain HTTP to a non-cluster host; use https://"
-        );
+        return Err(format!(
+            "{var}={url} would send an API key over plain HTTP to a non-cluster host; \
+             use https:// (or a cluster-local proxy)"
+        ));
     }
+    Ok(())
 }
 
 const L2_MAX_ATTEMPTS: u32 = 5;
@@ -1757,11 +1759,13 @@ fn main() {
 
                 let summary: Option<Box<dyn alaya_backends::SummaryProvider>> =
                     if let Some(url) = &cfg_clone.summary_url {
-                        warn_if_plaintext_credentials(
+                        if let Err(e) = check_credential_transport(
                             "SUMMARY_URL",
                             url,
                             cfg_clone.summary_api_key.is_some(),
-                        );
+                        ) {
+                            panic!("{e}");
+                        }
                         tracing::info!(
                             url = url.as_str(),
                             model = cfg_clone.summary_model.as_str(),
@@ -1788,11 +1792,13 @@ fn main() {
                 );
 
                 if let Some(url) = &cfg_clone.judge_url {
-                    warn_if_plaintext_credentials(
+                    if let Err(e) = check_credential_transport(
                         "JUDGE_URL",
                         url,
                         cfg_clone.judge_api_key.is_some(),
-                    );
+                    ) {
+                        panic!("{e}");
+                    }
                     tracing::info!(
                         url = url.as_str(),
                         model = cfg_clone.judge_model.as_str(),
@@ -2496,6 +2502,32 @@ mod tests {
         ] {
             assert!(!is_cluster_local(no), "{no}");
         }
+    }
+
+    #[test]
+    fn credential_transport_refuses_plaintext_off_cluster_only() {
+        // Refused: a key over http:// to a host that is not cluster-local.
+        for bad in ["http://api.anthropic.com", "http://proxy.example.net:8082"] {
+            assert!(
+                check_credential_transport("JUDGE_URL", bad, true).is_err(),
+                "{bad}"
+            );
+        }
+        // Allowed: https anywhere, cluster-local plaintext, or no key at all.
+        for ok in [
+            "https://api.anthropic.com",
+            "http://anthropic-lb:8082",
+            "http://alaya-bridge.mcp.svc:3000",
+            "http://localhost:8082",
+        ] {
+            assert!(
+                check_credential_transport("SUMMARY_URL", ok, true).is_ok(),
+                "{ok}"
+            );
+        }
+        assert!(
+            check_credential_transport("SUMMARY_URL", "http://api.anthropic.com", false).is_ok()
+        );
     }
 
     #[test]

@@ -139,8 +139,8 @@ RUST_LOG=alaya_server=info
 OTEL_EXPORTER_OTLP_ENDPOINT=http://phoenix-svc.recsys.svc:6006  # optional
 OTEL_SERVICE_NAME=alaya-server
 SUMMARY_URL=                             # optional — Anthropic API origin; client appends /v1/messages. https:// required off-cluster
-                                         #   (https://api.anthropic.com); plain http only for a cluster-local proxy (http://anthropic-lb:8082) —
-                                         #   the server warns at boot when a key would go over http to any other host
+                                         #   (https://api.anthropic.com); plain http only for a cluster-local proxy (http://anthropic-lb:8082).
+                                         #   Boot is refused when a key would go over http to any other host (applies to JUDGE_URL too)
 SUMMARY_API_KEY=
 SUMMARY_MODEL=claude-haiku-4-5-20251001
 JUDGE_URL=                               # contradiction judge; each JUDGE_* falls back to its SUMMARY_* twin
