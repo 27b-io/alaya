@@ -295,4 +295,8 @@ pub trait RerankingService {
 
     /// Number of candidates to rerank per query.
     fn top_n(&self) -> usize;
+
+    /// Budget the caller should apply via `tokio::time::timeout` around
+    /// `rerank()`, so a stalled reranker costs at most this long per search.
+    fn timeout(&self) -> std::time::Duration;
 }

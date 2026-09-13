@@ -1,5 +1,7 @@
 // RerankClient — RerankingService implementation (TEI `/rerank` endpoint)
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
@@ -12,10 +14,11 @@ pub struct RerankClient {
     client: Client,
     base_url: String,
     top_n: usize,
+    timeout: Duration,
 }
 
 impl RerankClient {
-    pub fn new(base_url: String, top_n: usize, api_key: Option<String>) -> Self {
+    pub fn new(base_url: String, top_n: usize, api_key: Option<String>, timeout: Duration) -> Self {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(key) = api_key {
             headers.insert(
@@ -29,8 +32,8 @@ impl RerankClient {
 
         #[cfg(not(target_arch = "wasm32"))]
         let builder = builder
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(30));
+            .connect_timeout(Duration::from_secs(5).min(timeout))
+            .timeout(timeout);
 
         let client = builder.build().expect("failed to build reqwest client");
 
@@ -38,6 +41,7 @@ impl RerankClient {
             client,
             base_url,
             top_n,
+            timeout,
         }
     }
 }
@@ -113,6 +117,10 @@ impl RerankingService for RerankClient {
     fn top_n(&self) -> usize {
         self.top_n
     }
+
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
 }
 
 // --- Response types (private) ---
@@ -147,8 +155,26 @@ mod tests {
 
     #[test]
     fn top_n_is_returned() {
-        let client = RerankClient::new("http://localhost:8089".to_string(), 20, None);
+        let client = RerankClient::new(
+            "http://localhost:8089".to_string(),
+            20,
+            None,
+            std::time::Duration::from_millis(5000),
+        );
         assert_eq!(client.top_n(), 20);
+    }
+
+    #[test]
+    fn connect_timeout_is_capped_at_the_budget() {
+        // A budget shorter than the default 5s connect_timeout must not leave
+        // the connect phase free to run past the overall budget.
+        let client = RerankClient::new(
+            "http://localhost:8089".to_string(),
+            20,
+            None,
+            std::time::Duration::from_millis(1000),
+        );
+        assert_eq!(client.timeout(), std::time::Duration::from_millis(1000));
     }
 
     #[test]

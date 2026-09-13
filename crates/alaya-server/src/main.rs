@@ -72,6 +72,7 @@ struct Config {
     rerank_url: Option<String>,
     rerank_api_key: Option<String>,
     rerank_top_n: usize,
+    rerank_timeout_ms: u64,
 }
 
 impl Config {
@@ -115,6 +116,9 @@ impl Config {
             rerank_top_n: env_or("RERANK_TOP_N", "20")
                 .parse()
                 .expect("RERANK_TOP_N must be a number"),
+            rerank_timeout_ms: env_or("RERANK_TIMEOUT_MS", "5000")
+                .parse()
+                .expect("RERANK_TIMEOUT_MS must be a number"),
         }
     }
 }
@@ -1486,6 +1490,7 @@ fn main() {
                     tracing::info!(
                         url = url.as_str(),
                         top_n = cfg_clone.rerank_top_n,
+                        timeout_ms = cfg_clone.rerank_timeout_ms,
                         has_api_key = cfg_clone.rerank_api_key.is_some(),
                         "cross-encoder reranker enabled"
                     );
@@ -1493,6 +1498,7 @@ fn main() {
                         url.clone(),
                         cfg_clone.rerank_top_n,
                         cfg_clone.rerank_api_key.clone(),
+                        std::time::Duration::from_millis(cfg_clone.rerank_timeout_ms),
                     )));
                 } else {
                     tracing::info!("RERANK_URL not set — cross-encoder rerank disabled");
