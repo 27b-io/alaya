@@ -296,7 +296,8 @@ pub trait RerankingService {
     /// Number of candidates to rerank per query.
     fn top_n(&self) -> usize;
 
-    /// Budget the caller should apply via `tokio::time::timeout` around
-    /// `rerank()`, so a stalled reranker costs at most this long per search.
+    /// Budget for one `rerank()` call. Native callers enforce it with
+    /// `tokio::time::timeout`; implementations must also bound their own
+    /// transport with it, since that is the sole bound on wasm32.
     fn timeout(&self) -> std::time::Duration;
 }

@@ -28,22 +28,14 @@ impl RerankClient {
             );
         }
 
-        let builder = Client::builder().default_headers(headers);
-
-        // reqwest's own timeout gets a margin above `timeout` so the
-        // call-site `tokio::time::timeout(timeout, …)` in service.rs always
-        // wins the race on a stalled request. Without the margin the two
-        // fire photo-finish and whichever trips first decides the log line
-        // ("rerank timed out" vs "rerank failed") — the ticket's post-deploy
-        // check greps for the former, so it must be the one that fires.
-        // reqwest stays the backstop that releases the socket, and the sole
-        // bound on wasm32 where the call site has no timer.
-        #[cfg(not(target_arch = "wasm32"))]
-        let builder = builder
-            .connect_timeout(Duration::from_secs(5).min(timeout))
-            .timeout(timeout + Duration::from_secs(1));
-
-        let client = builder.build().expect("failed to build reqwest client");
+        // No connect_timeout: any value <= the budget fires in the same tick
+        // as the call-site tokio timer on a blackholed connect and steals its
+        // log line. The per-request total timeout in `rerank()` bounds the
+        // connect phase too.
+        let client = Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("failed to build reqwest client");
 
         Self {
             client,
@@ -70,10 +62,15 @@ impl RerankingService for RerankClient {
             "raw_scores": false,
         });
 
+        // +1s margin so the call-site `tokio::time::timeout(timeout, …)` in
+        // service.rs fires first and logs "rerank timed out" — the ticket's
+        // post-deploy check greps for that line. reqwest is the backstop that
+        // releases the socket; on wasm32 (no tokio timer) it is the sole bound.
         let resp = self
             .client
             .post(url.as_str())
             .json(&body)
+            .timeout(self.timeout + Duration::from_secs(1))
             .send()
             .await
             .map_err(|e| AlayaError::Rerank(e.to_string()))?;
@@ -170,28 +167,6 @@ mod tests {
             std::time::Duration::from_millis(5000),
         );
         assert_eq!(client.top_n(), 20);
-    }
-
-    #[test]
-    fn connect_timeout_is_capped_at_the_budget() {
-        // reqwest exposes no connect_timeout getter, so this mirrors the
-        // `Duration::from_secs(5).min(timeout)` expression from `new()`
-        // directly rather than asserting through the client (which can only
-        // read back `timeout`, not `connect_timeout` — a prior version of
-        // this test did that and proved nothing about the cap).
-        let short_budget = Duration::from_millis(1000);
-        assert_eq!(
-            Duration::from_secs(5).min(short_budget),
-            short_budget,
-            "a budget shorter than 5s must cap connect_timeout to the budget"
-        );
-
-        let long_budget = Duration::from_secs(30);
-        assert_eq!(
-            Duration::from_secs(5).min(long_budget),
-            Duration::from_secs(5),
-            "a budget longer than 5s must leave connect_timeout at 5s"
-        );
     }
 
     #[test]
