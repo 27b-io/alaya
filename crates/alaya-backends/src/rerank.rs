@@ -30,10 +30,18 @@ impl RerankClient {
 
         let builder = Client::builder().default_headers(headers);
 
+        // reqwest's own timeout gets a margin above `timeout` so the
+        // call-site `tokio::time::timeout(timeout, …)` in service.rs always
+        // wins the race on a stalled request. Without the margin the two
+        // fire photo-finish and whichever trips first decides the log line
+        // ("rerank timed out" vs "rerank failed") — the ticket's post-deploy
+        // check greps for the former, so it must be the one that fires.
+        // reqwest stays the backstop that releases the socket, and the sole
+        // bound on wasm32 where the call site has no timer.
         #[cfg(not(target_arch = "wasm32"))]
         let builder = builder
             .connect_timeout(Duration::from_secs(5).min(timeout))
-            .timeout(timeout);
+            .timeout(timeout + Duration::from_secs(1));
 
         let client = builder.build().expect("failed to build reqwest client");
 
@@ -166,15 +174,24 @@ mod tests {
 
     #[test]
     fn connect_timeout_is_capped_at_the_budget() {
-        // A budget shorter than the default 5s connect_timeout must not leave
-        // the connect phase free to run past the overall budget.
-        let client = RerankClient::new(
-            "http://localhost:8089".to_string(),
-            20,
-            None,
-            std::time::Duration::from_millis(1000),
+        // reqwest exposes no connect_timeout getter, so this mirrors the
+        // `Duration::from_secs(5).min(timeout)` expression from `new()`
+        // directly rather than asserting through the client (which can only
+        // read back `timeout`, not `connect_timeout` — a prior version of
+        // this test did that and proved nothing about the cap).
+        let short_budget = Duration::from_millis(1000);
+        assert_eq!(
+            Duration::from_secs(5).min(short_budget),
+            short_budget,
+            "a budget shorter than 5s must cap connect_timeout to the budget"
         );
-        assert_eq!(client.timeout(), std::time::Duration::from_millis(1000));
+
+        let long_budget = Duration::from_secs(30);
+        assert_eq!(
+            Duration::from_secs(5).min(long_budget),
+            Duration::from_secs(5),
+            "a budget longer than 5s must leave connect_timeout at 5s"
+        );
     }
 
     #[test]

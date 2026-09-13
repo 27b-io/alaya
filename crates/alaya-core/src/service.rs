@@ -4401,18 +4401,27 @@ mod tests {
         }
     }
 
-    /// Reranker that sleeps a configured duration before returning a score —
-    /// exercises the `RERANK_TIMEOUT_MS` budget (LAB-3507).
+    /// Reranker that sleeps a configured duration, then scores by doc prefix
+    /// (mirrors `MockReranker`) — exercises the `RERANK_TIMEOUT_MS` budget
+    /// (LAB-3507). Scoring by content, not a fixed tie, lets a within-budget
+    /// test prove a real reorder happened rather than merely not crashing.
     struct SlowReranker {
         sleep_for: std::time::Duration,
         budget: std::time::Duration,
+        scores_by_doc_prefix: HashMap<String, f32>,
     }
 
     #[async_trait(?Send)]
     impl alaya_backends::RerankingService for SlowReranker {
         async fn rerank(&self, _query: &str, texts: &[&str]) -> Result<Vec<f32>> {
             tokio::time::sleep(self.sleep_for).await;
-            Ok(vec![1.0; texts.len()])
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let key: String = t.chars().take(8).collect();
+                    self.scores_by_doc_prefix.get(&key).copied().unwrap_or(0.0)
+                })
+                .collect())
         }
         fn top_n(&self) -> usize {
             20
@@ -4620,6 +4629,7 @@ mod tests {
             Some(Box::new(SlowReranker {
                 sleep_for: budget * 2,
                 budget,
+                scores_by_doc_prefix: HashMap::new(),
             })),
         );
 
@@ -4649,21 +4659,28 @@ mod tests {
     }
 
     /// A reranker that finishes within budget still reorders normally —
-    /// the timeout wrapper is a no-op on the happy path (LAB-3507).
+    /// the timeout wrapper is a no-op on the happy path (LAB-3507). The
+    /// reranker scores directly *invert* RRF order, so only a real rerank
+    /// pass (not a silent RRF fallback) can produce the asserted order.
     #[tokio::test(flavor = "current_thread")]
     async fn rerank_within_budget_still_reorders() {
         let hash_a = "a".repeat(64);
         let hash_b = "b".repeat(64);
         let results = vec![
-            make_scored_memory(&hash_a, "doc-aaaa cosine wins", 0.9),
-            make_scored_memory(&hash_b, "doc-bbbb cosine second", 0.5),
+            make_scored_memory(&hash_a, "doc-aaaa first by cosine", 0.9),
+            make_scored_memory(&hash_b, "doc-bbbb second by cosine", 0.5),
         ];
+
+        let mut scores = HashMap::new();
+        scores.insert("doc-aaaa".to_string(), 0.1_f32);
+        scores.insert("doc-bbbb".to_string(), 0.9_f32);
 
         let svc = build_rerank_test_service(
             results,
             Some(Box::new(SlowReranker {
                 sleep_for: std::time::Duration::from_millis(10),
                 budget: std::time::Duration::from_millis(500),
+                scores_by_doc_prefix: scores,
             })),
         );
 
@@ -4678,10 +4695,13 @@ mod tests {
             .filter_map(|x| x["content_hash"].as_str())
             .collect();
 
-        // SlowReranker scores every candidate 1.0 — a tie, so the reorder
-        // step (not the RRF fallback) drove the result; both entries stay
-        // present with reranked entries occupying the front of the list.
-        assert_eq!(result_hashes.len(), 2);
+        assert_eq!(
+            result_hashes.first(),
+            Some(&hash_b.as_str()),
+            "rerank should put the cross-encoder's preferred doc (bbbb) first, \
+             even though RRF/cosine ranked doc-aaaa above it — only a real \
+             rerank pass (not a silent RRF fallback) produces this order"
+        );
     }
 
     /// Without a reranker, search behavior is unchanged — RRF/cosine wins.
