@@ -156,7 +156,7 @@ Copy `.env.example` to `.env`. All settings have sensible defaults for local dev
 | `JUDGE_API_KEY` | `SUMMARY_API_KEY` | Falls back to `SUMMARY_API_KEY` |
 | `JUDGE_MODEL` | `SUMMARY_MODEL` | Model that judges `CONTRADICTS` pairs (advisory verdicts on the edge; never writes memories) |
 | `RERANK_URL` | — | TEI `/rerank` endpoint (empty = rerank disabled) |
-| `RERANK_API_KEY` | — | Optional bearer token for `RERANK_URL` |
+| `RERANK_API_KEY` | — | Optional bearer token for `RERANK_URL`. With it set, plain `http://` to a host that is not cluster-local is refused at boot, as for `SUMMARY_URL` |
 | `RERANK_TOP_N` | `20` | How many top RRF candidates to rerank |
 | `OIDC_ISSUER` | — | OAuth Resource Server issuer URL (empty = no OAuth) |
 

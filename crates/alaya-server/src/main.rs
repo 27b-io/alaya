@@ -86,7 +86,7 @@ struct Config {
 impl Config {
     fn from_env() -> Self {
         let summary_model = env_or("SUMMARY_MODEL", "claude-haiku-4-5-20251001");
-        Self {
+        let cfg = Self {
             qdrant_url: env_required("QDRANT_URL"),
             qdrant_collection: env_or("QDRANT_COLLECTION", "memories_arctic1024"),
             qdrant_api_key: std::env::var("QDRANT_API_KEY").ok(),
@@ -124,7 +124,24 @@ impl Config {
             rerank_top_n: env_or("RERANK_TOP_N", "20")
                 .parse()
                 .expect("RERANK_TOP_N must be a number"),
+        };
+        // Every credential-bearing endpoint, checked on the main thread before
+        // the runtime, the worker thread or the listener exist: a refused
+        // endpoint means the process never starts.
+        for (var, url, has_api_key) in [
+            (
+                "SUMMARY_URL",
+                &cfg.summary_url,
+                cfg.summary_api_key.is_some(),
+            ),
+            ("JUDGE_URL", &cfg.judge_url, cfg.judge_api_key.is_some()),
+            ("RERANK_URL", &cfg.rerank_url, cfg.rerank_api_key.is_some()),
+        ] {
+            if let Some(url) = url {
+                check_credential_transport(var, url, has_api_key).unwrap_or_else(|e| panic!("{e}"));
+            }
         }
+        cfg
     }
 }
 
@@ -184,14 +201,29 @@ fn host_of(url: &str) -> Option<String> {
     Some(host.to_ascii_lowercase())
 }
 
+/// `url` with any userinfo removed, for log lines: a configured endpoint may
+/// carry `user:password@`, and that is a credential. Something that does not
+/// parse cannot be redacted, so it is not echoed either.
+fn redact_userinfo(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut u) => {
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            u.to_string()
+        }
+        Err(_) => "<unparseable>".to_string(),
+    }
+}
+
 /// True for hosts that are not publicly routable: loopback, RFC1918, or
 /// cluster-internal (`.svc`, `.internal`). Used to forbid the dev-only open
 /// mode on a public origin. Real IP-literal parsing prevents confusable
 /// hostnames like `127.0.0.1.evil.com` from masquerading as loopback.
 fn is_private_host(url: &str) -> bool {
-    let Some(h) = host_of(url) else {
-        return false;
-    };
+    host_of(url).is_some_and(|h| host_is_private(&h))
+}
+
+fn host_is_private(h: &str) -> bool {
     // DNS-only special names — these can't be IP literals.
     if h == "localhost" || h.ends_with(".svc") || h.ends_with(".internal") {
         return true;
@@ -204,27 +236,41 @@ fn is_private_host(url: &str) -> bool {
     }
 }
 
-/// Cluster-local or private: `is_private_host`, plus single-label hostnames
+/// Cluster-local or private: `host_is_private`, plus single-label hostnames
 /// (`http://anthropic-lb:8082`) — Kubernetes service DNS that never resolves
-/// off the cluster. Used only to decide whether plain HTTP with a credential
-/// deserves a startup warning; the auth gates use `is_private_host` alone.
-fn is_cluster_local(url: &str) -> bool {
-    is_private_host(url) || host_of(url).is_some_and(|h| !h.contains('.'))
+/// off the cluster. Decides whether plain HTTP with a credential is refused at
+/// boot; the auth gates use `is_private_host` alone. Classifies the host as
+/// reqwest parsed it, so userinfo cannot pose as the host and an IPv6 literal
+/// (no dots) is never mistaken for a single-label service name.
+fn is_cluster_local(url: &reqwest::Url) -> bool {
+    let Some(h) = url.host_str() else {
+        return false;
+    };
+    let h = h.trim_start_matches('[').trim_end_matches(']');
+    host_is_private(h) || (h.parse::<std::net::IpAddr>().is_err() && !h.contains('.'))
 }
 
-/// A key sent over plain HTTP to a host that is not cluster-local is a
+/// A key sent in the clear to a host that is not cluster-local is a
 /// credential on the wire. Fail closed at boot (Ray on LAB-3283, 2026-09-11):
-/// `https://` anywhere, or plain `http://` only to a cluster-local proxy
-/// such as `http://anthropic-lb:8082`. Checked before the transport is
-/// built, so no request can ever carry `x-api-key` to another plaintext host.
+/// `https://` anywhere, plain `http://` only to a cluster-local proxy such as
+/// `http://anthropic-lb:8082`, anything else refused. Classified on the URL
+/// as reqwest parses it (lowercased scheme, real host), so the check and the
+/// transport cannot disagree about where the key goes. Messages name the host,
+/// never the raw value: a URL may carry userinfo.
 fn check_credential_transport(var: &str, url: &str, has_api_key: bool) -> Result<(), String> {
-    if has_api_key && url.starts_with("http://") && !is_cluster_local(url) {
-        return Err(format!(
-            "{var}={url} would send an API key over plain HTTP to a non-cluster host; \
-             use https:// (or a cluster-local proxy)"
-        ));
+    if !has_api_key {
+        return Ok(());
     }
-    Ok(())
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("{var} is not a valid URL ({e})"))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if is_cluster_local(&parsed) => Ok(()),
+        scheme => Err(format!(
+            "{var}: {scheme}://{} is neither https nor a cluster-local http proxy; \
+             an API key must not travel in the clear",
+            parsed.host_str().unwrap_or("")
+        )),
+    }
 }
 
 const L2_MAX_ATTEMPTS: u32 = 5;
@@ -1759,15 +1805,8 @@ fn main() {
 
                 let summary: Option<Box<dyn alaya_backends::SummaryProvider>> =
                     if let Some(url) = &cfg_clone.summary_url {
-                        if let Err(e) = check_credential_transport(
-                            "SUMMARY_URL",
-                            url,
-                            cfg_clone.summary_api_key.is_some(),
-                        ) {
-                            panic!("{e}");
-                        }
                         tracing::info!(
-                            url = url.as_str(),
+                            url = %redact_userinfo(url),
                             model = cfg_clone.summary_model.as_str(),
                             has_api_key = cfg_clone.summary_api_key.is_some(),
                             "summary provider enabled"
@@ -1792,15 +1831,8 @@ fn main() {
                 );
 
                 if let Some(url) = &cfg_clone.judge_url {
-                    if let Err(e) = check_credential_transport(
-                        "JUDGE_URL",
-                        url,
-                        cfg_clone.judge_api_key.is_some(),
-                    ) {
-                        panic!("{e}");
-                    }
                     tracing::info!(
-                        url = url.as_str(),
+                        url = %redact_userinfo(url),
                         model = cfg_clone.judge_model.as_str(),
                         has_api_key = cfg_clone.judge_api_key.is_some(),
                         "contradiction judge enabled (advisory: annotates CONTRADICTS edges, never writes memories)"
@@ -1816,7 +1848,7 @@ fn main() {
 
                 if let Some(url) = &cfg_clone.rerank_url {
                     tracing::info!(
-                        url = url.as_str(),
+                        url = %redact_userinfo(url),
                         top_n = cfg_clone.rerank_top_n,
                         has_api_key = cfg_clone.rerank_api_key.is_some(),
                         "cross-encoder reranker enabled"
@@ -1832,6 +1864,17 @@ fn main() {
 
                 service_worker(rx, svc, progress_for_worker, WorkerLimits::default()).await;
             });
+        });
+
+        // A worker panic must take the process down. Left to unwind, it ends
+        // only that thread: the listener stays bound, every worker-backed
+        // request answers 503, and /health reads progress 0 as "starting"
+        // forever, so nothing restarts the pod. The shutdown path joins this
+        // supervisor, which returns once the worker has drained.
+        let worker_handle = std::thread::spawn(move || {
+            if worker_handle.join().is_err() {
+                std::process::exit(101);
+            }
         });
 
         // Axum on the main multi-threaded runtime
@@ -2486,28 +2529,49 @@ mod tests {
 
     #[test]
     fn cluster_local_accepts_service_dns_and_private_hosts_only() {
+        let parse = |u: &str| reqwest::Url::parse(u).unwrap();
         for ok in [
             "http://anthropic-lb:8082",
             "http://alaya-bridge:3000",
             "http://alaya-server.mcp.svc:3001",
             "http://localhost:8082",
             "http://10.43.144.201:8082",
+            "http://[::1]:8082",
+            // Userinfo bound for a cluster-local proxy is that proxy's business.
+            "http://user:pass@anthropic-lb:8082",
         ] {
-            assert!(is_cluster_local(ok), "{ok}");
+            assert!(is_cluster_local(&parse(ok)), "{ok}");
         }
         for no in [
             "http://api.anthropic.com",
             "http://proxy.example.net:8082",
             "http://1.2.3.4",
+            // The host is what reqwest connects to, not what precedes the `@`.
+            "http://user:pass@api.anthropic.com",
+            "http://anthropic-lb:8082@api.anthropic.com",
+            // An IPv6 literal has no dots but is not a service name.
+            "http://[2606:4700::1111]",
+            "http://[::ffff:1.2.3.4]",
         ] {
-            assert!(!is_cluster_local(no), "{no}");
+            assert!(!is_cluster_local(&parse(no)), "{no}");
         }
     }
 
     #[test]
-    fn credential_transport_refuses_plaintext_off_cluster_only() {
-        // Refused: a key over http:// to a host that is not cluster-local.
-        for bad in ["http://api.anthropic.com", "http://proxy.example.net:8082"] {
+    fn credential_transport_fails_closed_off_cluster() {
+        // Refused with a key: plain http to a non-cluster host whatever the
+        // scheme's case (the transport parses it case-insensitively), a
+        // scheme that is not https at all, or a value that does not parse.
+        for bad in [
+            "http://api.anthropic.com",
+            "http://proxy.example.net:8082",
+            "HTTP://api.anthropic.com",
+            "Http://API.Anthropic.com:80",
+            "http://user:pass@api.anthropic.com",
+            "htps://api.anthropic.com",
+            "api.anthropic.com:443",
+            "not a url",
+        ] {
             assert!(
                 check_credential_transport("JUDGE_URL", bad, true).is_err(),
                 "{bad}"
@@ -2516,7 +2580,9 @@ mod tests {
         // Allowed: https anywhere, cluster-local plaintext, or no key at all.
         for ok in [
             "https://api.anthropic.com",
+            "HTTPS://api.anthropic.com",
             "http://anthropic-lb:8082",
+            "HTTP://Anthropic-LB:8082",
             "http://alaya-bridge.mcp.svc:3000",
             "http://localhost:8082",
         ] {
@@ -2525,9 +2591,31 @@ mod tests {
                 "{ok}"
             );
         }
+        for keyless in ["http://api.anthropic.com", "not a url"] {
+            assert!(check_credential_transport("SUMMARY_URL", keyless, false).is_ok());
+        }
+        // The refusal goes to pod logs: name the host, never echo a value
+        // that may carry userinfo.
+        let err =
+            check_credential_transport("JUDGE_URL", "http://user:s3cret@api.anthropic.com", true)
+                .unwrap_err();
         assert!(
-            check_credential_transport("SUMMARY_URL", "http://api.anthropic.com", false).is_ok()
+            err.contains("api.anthropic.com") && !err.contains("s3cret"),
+            "{err}"
         );
+    }
+
+    #[test]
+    fn redact_userinfo_strips_credentials_only() {
+        assert_eq!(
+            redact_userinfo("http://u:p@anthropic-lb:8082"),
+            "http://anthropic-lb:8082/"
+        );
+        assert_eq!(
+            redact_userinfo("HTTPS://api.anthropic.com"),
+            "https://api.anthropic.com/"
+        );
+        assert_eq!(redact_userinfo("not a url"), "<unparseable>");
     }
 
     #[test]
