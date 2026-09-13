@@ -951,9 +951,16 @@ impl MemoryService {
                 })
                 .collect();
 
-            let scores = match reranker.rerank(&params.query, &candidate_contents).await {
-                Ok(s) if s.len() == top_n => s,
-                Ok(s) => {
+            let budget = reranker.timeout();
+            let started = std::time::Instant::now();
+            let scores = match rerank_with_budget(
+                budget,
+                reranker.rerank(&params.query, &candidate_contents),
+            )
+            .await
+            {
+                Some(Ok(s)) if s.len() == top_n => s,
+                Some(Ok(s)) => {
                     tracing::warn!(
                         got = s.len(),
                         expected = top_n,
@@ -961,8 +968,21 @@ impl MemoryService {
                     );
                     break 'rerank HashMap::new();
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "rerank failed (non-fatal); using RRF order");
+                Some(Err(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        budget_ms = budget.as_millis() as u64,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "rerank failed (non-fatal); using RRF order"
+                    );
+                    break 'rerank HashMap::new();
+                }
+                None => {
+                    tracing::warn!(
+                        budget_ms = budget.as_millis() as u64,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "rerank timed out (non-fatal); using RRF order"
+                    );
                     break 'rerank HashMap::new();
                 }
             };
@@ -1962,6 +1982,27 @@ impl MemoryService {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// Runs `fut` under [`RerankingService::timeout`]; `None` means the budget
+/// expired. Native builds (alaya-server, production) race it against
+/// `tokio::time::timeout`. wasm32 (`alaya-worker`, deferred) has no tokio
+/// timer and awaits directly — there the per-request reqwest timeout in
+/// `RerankClient::rerank` is the bound and surfaces as `Some(Err)`.
+#[cfg(not(target_arch = "wasm32"))]
+async fn rerank_with_budget(
+    budget: std::time::Duration,
+    fut: impl std::future::Future<Output = Result<Vec<f32>>>,
+) -> Option<Result<Vec<f32>>> {
+    tokio::time::timeout(budget, fut).await.ok()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn rerank_with_budget(
+    _budget: std::time::Duration,
+    fut: impl std::future::Future<Output = Result<Vec<f32>>>,
+) -> Option<Result<Vec<f32>>> {
+    Some(fut.await)
+}
 
 fn current_timestamp() -> f64 {
     std::time::SystemTime::now()
@@ -4311,14 +4352,19 @@ mod tests {
 
     /// Mock reranker that returns a configured score per (query, doc) pair,
     /// keyed by the first 8 chars of the doc content. Unknown docs get 0.0.
+    /// `sleep_for` stalls before scoring and `budget` is what `timeout()`
+    /// reports, so the `RERANK_TIMEOUT_MS` budget (LAB-3507) can be exercised.
     struct MockReranker {
         top_n: usize,
         scores_by_doc_prefix: HashMap<String, f32>,
+        sleep_for: std::time::Duration,
+        budget: std::time::Duration,
     }
 
     #[async_trait(?Send)]
     impl alaya_backends::RerankingService for MockReranker {
         async fn rerank(&self, _query: &str, texts: &[&str]) -> Result<Vec<f32>> {
+            tokio::time::sleep(self.sleep_for).await;
             Ok(texts
                 .iter()
                 .map(|t| {
@@ -4329,6 +4375,9 @@ mod tests {
         }
         fn top_n(&self) -> usize {
             self.top_n
+        }
+        fn timeout(&self) -> std::time::Duration {
+            self.budget
         }
     }
 
@@ -4342,6 +4391,9 @@ mod tests {
         }
         fn top_n(&self) -> usize {
             10
+        }
+        fn timeout(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(5)
         }
     }
 
@@ -4413,6 +4465,8 @@ mod tests {
             Some(Box::new(MockReranker {
                 top_n: 20,
                 scores_by_doc_prefix: scores,
+                sleep_for: std::time::Duration::ZERO,
+                budget: std::time::Duration::from_secs(5),
             })),
         );
 
@@ -4497,6 +4551,8 @@ mod tests {
             Some(Box::new(MockReranker {
                 top_n: 2,
                 scores_by_doc_prefix: scores,
+                sleep_for: std::time::Duration::ZERO,
+                budget: std::time::Duration::from_secs(5),
             })),
         );
 
@@ -4523,6 +4579,107 @@ mod tests {
             pos_c,
             Some(2),
             "high-cosine tail must follow reranked top-N"
+        );
+    }
+
+    /// A reranker that stalls past its budget is cut off and RRF order is
+    /// used (LAB-3507). Its scores would *invert* RRF order, so `hash_a`
+    /// first proves the rerank result was discarded, not merely a tie.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rerank_timeout_falls_back_to_rrf_order() {
+        let hash_a = "a".repeat(64);
+        let hash_b = "b".repeat(64);
+        let results = vec![
+            make_scored_memory(&hash_a, "doc-aaaa cosine wins", 0.9),
+            make_scored_memory(&hash_b, "doc-bbbb cosine second", 0.5),
+        ];
+
+        let mut scores = HashMap::new();
+        scores.insert("doc-aaaa".to_string(), 0.1_f32);
+        scores.insert("doc-bbbb".to_string(), 0.9_f32);
+
+        let budget = std::time::Duration::from_millis(50);
+        let sleep_for = budget * 10;
+        let svc = build_rerank_test_service(
+            results,
+            Some(Box::new(MockReranker {
+                top_n: 20,
+                scores_by_doc_prefix: scores,
+                sleep_for,
+                budget,
+            })),
+        );
+
+        let started = std::time::Instant::now();
+        let r = svc
+            .search(search_params("test query"))
+            .await
+            .expect("search should still succeed when rerank times out");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < sleep_for,
+            "search took {elapsed:?}; a completed rerank needs at least {sleep_for:?}"
+        );
+
+        let result_hashes: Vec<&str> = r["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x["content_hash"].as_str())
+            .collect();
+        assert_eq!(
+            result_hashes.first(),
+            Some(&hash_a.as_str()),
+            "RRF order (cosine-driven) preserved when rerank times out — a \
+             completed rerank would have put doc-bbbb first"
+        );
+    }
+
+    /// A reranker that finishes within budget still reorders normally —
+    /// the timeout wrapper is a no-op on the happy path (LAB-3507). The
+    /// reranker scores directly *invert* RRF order, so only a real rerank
+    /// pass (not a silent RRF fallback) can produce the asserted order.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rerank_within_budget_still_reorders() {
+        let hash_a = "a".repeat(64);
+        let hash_b = "b".repeat(64);
+        let results = vec![
+            make_scored_memory(&hash_a, "doc-aaaa first by cosine", 0.9),
+            make_scored_memory(&hash_b, "doc-bbbb second by cosine", 0.5),
+        ];
+
+        let mut scores = HashMap::new();
+        scores.insert("doc-aaaa".to_string(), 0.1_f32);
+        scores.insert("doc-bbbb".to_string(), 0.9_f32);
+
+        let svc = build_rerank_test_service(
+            results,
+            Some(Box::new(MockReranker {
+                top_n: 20,
+                scores_by_doc_prefix: scores,
+                sleep_for: std::time::Duration::from_millis(10),
+                budget: std::time::Duration::from_millis(500),
+            })),
+        );
+
+        let r = svc
+            .search(search_params("test query"))
+            .await
+            .expect("search succeeds");
+        let result_hashes: Vec<&str> = r["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x["content_hash"].as_str())
+            .collect();
+
+        assert_eq!(
+            result_hashes.first(),
+            Some(&hash_b.as_str()),
+            "rerank should put the cross-encoder's preferred doc (bbbb) first, \
+             even though RRF/cosine ranked doc-aaaa above it — only a real \
+             rerank pass (not a silent RRF fallback) produces this order"
         );
     }
 

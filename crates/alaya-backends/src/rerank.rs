@@ -1,5 +1,7 @@
 // RerankClient — RerankingService implementation (TEI `/rerank` endpoint)
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
@@ -12,10 +14,11 @@ pub struct RerankClient {
     client: Client,
     base_url: String,
     top_n: usize,
+    timeout: Duration,
 }
 
 impl RerankClient {
-    pub fn new(base_url: String, top_n: usize, api_key: Option<String>) -> Self {
+    pub fn new(base_url: String, top_n: usize, api_key: Option<String>, timeout: Duration) -> Self {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(key) = api_key {
             headers.insert(
@@ -25,19 +28,20 @@ impl RerankClient {
             );
         }
 
-        let builder = Client::builder().default_headers(headers);
-
-        #[cfg(not(target_arch = "wasm32"))]
-        let builder = builder
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(30));
-
-        let client = builder.build().expect("failed to build reqwest client");
+        // No connect_timeout: any value <= the budget fires in the same tick
+        // as the call-site tokio timer on a blackholed connect and steals its
+        // log line. The per-request total timeout in `rerank()` bounds the
+        // connect phase too.
+        let client = Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("failed to build reqwest client");
 
         Self {
             client,
             base_url,
             top_n,
+            timeout,
         }
     }
 }
@@ -58,10 +62,21 @@ impl RerankingService for RerankClient {
             "raw_scores": false,
         });
 
+        // Native: +1s margin so the call-site `tokio::time::timeout` in
+        // service.rs fires first and logs "rerank timed out" — the ticket's
+        // post-deploy check greps for that line; reqwest is the backstop that
+        // releases the socket. wasm32 has no tokio timer, so this per-request
+        // timeout (a fetch abort timer) is the sole bound — no margin there.
+        #[cfg(not(target_arch = "wasm32"))]
+        let deadline = self.timeout + Duration::from_secs(1);
+        #[cfg(target_arch = "wasm32")]
+        let deadline = self.timeout;
+
         let resp = self
             .client
             .post(url.as_str())
             .json(&body)
+            .timeout(deadline)
             .send()
             .await
             .map_err(|e| AlayaError::Rerank(e.to_string()))?;
@@ -113,6 +128,10 @@ impl RerankingService for RerankClient {
     fn top_n(&self) -> usize {
         self.top_n
     }
+
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
 }
 
 // --- Response types (private) ---
@@ -147,7 +166,12 @@ mod tests {
 
     #[test]
     fn top_n_is_returned() {
-        let client = RerankClient::new("http://localhost:8089".to_string(), 20, None);
+        let client = RerankClient::new(
+            "http://localhost:8089".to_string(),
+            20,
+            None,
+            std::time::Duration::from_millis(5000),
+        );
         assert_eq!(client.top_n(), 20);
     }
 
