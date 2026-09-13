@@ -971,6 +971,7 @@ impl MemoryService {
                 Some(Err(e)) => {
                     tracing::warn!(
                         error = %e,
+                        budget_ms = budget.as_millis() as u64,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "rerank failed (non-fatal); using RRF order"
                     );

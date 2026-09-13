@@ -62,15 +62,21 @@ impl RerankingService for RerankClient {
             "raw_scores": false,
         });
 
-        // +1s margin so the call-site `tokio::time::timeout(timeout, …)` in
+        // Native: +1s margin so the call-site `tokio::time::timeout` in
         // service.rs fires first and logs "rerank timed out" — the ticket's
-        // post-deploy check greps for that line. reqwest is the backstop that
-        // releases the socket; on wasm32 (no tokio timer) it is the sole bound.
+        // post-deploy check greps for that line; reqwest is the backstop that
+        // releases the socket. wasm32 has no tokio timer, so this per-request
+        // timeout (a fetch abort timer) is the sole bound — no margin there.
+        #[cfg(not(target_arch = "wasm32"))]
+        let deadline = self.timeout + Duration::from_secs(1);
+        #[cfg(target_arch = "wasm32")]
+        let deadline = self.timeout;
+
         let resp = self
             .client
             .post(url.as_str())
             .json(&body)
-            .timeout(self.timeout + Duration::from_secs(1))
+            .timeout(deadline)
             .send()
             .await
             .map_err(|e| AlayaError::Rerank(e.to_string()))?;
