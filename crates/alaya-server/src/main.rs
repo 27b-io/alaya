@@ -201,14 +201,17 @@ fn host_of(url: &str) -> Option<String> {
     Some(host.to_ascii_lowercase())
 }
 
-/// `url` with any userinfo removed, for log lines: a configured endpoint may
-/// carry `user:password@`, and that is a credential. Something that does not
-/// parse cannot be redacted, so it is not echoed either.
-fn redact_userinfo(url: &str) -> String {
+/// `url` reduced to scheme, host, port and path for log lines: userinfo, query
+/// and fragment are dropped, since a configured endpoint may carry a credential
+/// in any of them. Something that does not parse cannot be redacted, so it is
+/// not echoed either.
+fn redact_url(url: &str) -> String {
     match reqwest::Url::parse(url) {
         Ok(mut u) => {
             let _ = u.set_username("");
             let _ = u.set_password(None);
+            u.set_query(None);
+            u.set_fragment(None);
             u.to_string()
         }
         Err(_) => "<unparseable>".to_string(),
@@ -1806,7 +1809,7 @@ fn main() {
                 let summary: Option<Box<dyn alaya_backends::SummaryProvider>> =
                     if let Some(url) = &cfg_clone.summary_url {
                         tracing::info!(
-                            url = %redact_userinfo(url),
+                            url = %redact_url(url),
                             model = cfg_clone.summary_model.as_str(),
                             has_api_key = cfg_clone.summary_api_key.is_some(),
                             "summary provider enabled"
@@ -1832,7 +1835,7 @@ fn main() {
 
                 if let Some(url) = &cfg_clone.judge_url {
                     tracing::info!(
-                        url = %redact_userinfo(url),
+                        url = %redact_url(url),
                         model = cfg_clone.judge_model.as_str(),
                         has_api_key = cfg_clone.judge_api_key.is_some(),
                         "contradiction judge enabled (advisory: annotates CONTRADICTS edges, never writes memories)"
@@ -1848,7 +1851,7 @@ fn main() {
 
                 if let Some(url) = &cfg_clone.rerank_url {
                     tracing::info!(
-                        url = %redact_userinfo(url),
+                        url = %redact_url(url),
                         top_n = cfg_clone.rerank_top_n,
                         has_api_key = cfg_clone.rerank_api_key.is_some(),
                         "cross-encoder reranker enabled"
@@ -2606,16 +2609,16 @@ mod tests {
     }
 
     #[test]
-    fn redact_userinfo_strips_credentials_only() {
+    fn redact_url_keeps_scheme_host_port_path_only() {
         assert_eq!(
-            redact_userinfo("http://u:p@anthropic-lb:8082"),
-            "http://anthropic-lb:8082/"
+            redact_url("http://u:p@anthropic-lb:8082/v1?api_key=s3cret#tok"),
+            "http://anthropic-lb:8082/v1"
         );
         assert_eq!(
-            redact_userinfo("HTTPS://api.anthropic.com"),
+            redact_url("HTTPS://api.anthropic.com"),
             "https://api.anthropic.com/"
         );
-        assert_eq!(redact_userinfo("not a url"), "<unparseable>");
+        assert_eq!(redact_url("not a url"), "<unparseable>");
     }
 
     #[test]
