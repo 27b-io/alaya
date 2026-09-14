@@ -37,6 +37,13 @@ def main() -> None:
     assert seed.startswith("You judge whether two memories"), seed[:60]
     assert seed.endswith("your probability that the verdict is correct."), seed[-60:]
     assert "\\n" not in seed and '\\"' not in seed, "Rust escapes left in the seed"
+    assert tune.unescape_rust('a\\n\\"b\\"\\\\ \\\n    c') == 'a\n"b"\\ c'
+    try:
+        tune.unescape_rust("tab\\tok \\x41 crash")
+    except SystemExit as e:  # an escape the map lacks must exit, never pass through
+        assert "unsupported escapes" in str(e) and "'x'" in str(e), e
+    else:
+        raise AssertionError("unknown escape must exit")
 
     # render_pair: the cases judge.rs tests.
     a, b = mem("content a", 1000.0), mem("content b", 1000.0 + 3 * 86_400)

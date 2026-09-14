@@ -237,15 +237,35 @@ def load_split(pairs: list[Pair]) -> tuple[list[Pair], list[Pair]]:
     return train, val
 
 
+RUST_ESCAPES = {
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "0": "\0",
+    '"': '"',
+    "'": "'",
+    "\\": "\\",
+}
+
+
+def unescape_rust(literal: str) -> str:
+    """The body of a Rust `"..."` literal as the string it compiles to."""
+    literal = re.sub(r"\\\n\s*", "", literal)  # `\` + newline continues the line
+    unknown = set(re.findall(r"\\(.)", literal)) - set(RUST_ESCAPES)
+    if unknown:  # passing one through would tune a prompt the server never sends
+        sys.exit(
+            f"unsupported escapes in SYSTEM_PROMPT: {sorted(unknown)}; extend RUST_ESCAPES"
+        )
+    return re.sub(r"\\(.)", lambda e: RUST_ESCAPES[e.group(1)], literal)
+
+
 def seed_prompt() -> str:
     """The `SYSTEM_PROMPT` literal in judge.rs, unescaped."""
     src = JUDGE_RS.read_text(encoding="utf-8")
     m = re.search(r'const SYSTEM_PROMPT: &str = "(.*?)";\n', src, re.S)
     if not m:
         sys.exit(f"SYSTEM_PROMPT not found in {JUDGE_RS}")
-    literal = re.sub(r"\\\n\s*", "", m.group(1))  # `\` + newline continues the line
-    escapes = {"n": "\n", '"': '"', "\\": "\\"}
-    prompt = re.sub(r"\\(.)", lambda e: escapes[e.group(1)], literal)
+    prompt = unescape_rust(m.group(1))
     missing = [p for p in REQUIRED_PHRASES if p not in prompt]
     if missing:
         sys.exit(f"seed prompt in judge.rs lacks required text: {missing}")
@@ -263,9 +283,12 @@ def fetch_memories(pairs: list[Pair]) -> dict[str, dict]:
     transport = httpx.HTTPTransport(retries=3)
     with httpx.Client(timeout=60, headers=headers, transport=transport) as client:
         for h in hashes:
-            resp = client.get(f"{url}/memories/{h}")
-            resp.raise_for_status()
-            envelope = resp.json()
+            try:
+                resp = client.get(f"{url}/memories/{h}")
+                resp.raise_for_status()
+                envelope = resp.json()
+            except (httpx.HTTPError, ValueError) as e:  # transport, status, non-JSON
+                sys.exit(f"GET /memories/{h}: {e}")
             if not envelope.get("found") or not envelope.get("memory"):
                 sys.exit(f"memory {h} is missing (deleted since labelling?)")
             memories[h] = envelope["memory"]
