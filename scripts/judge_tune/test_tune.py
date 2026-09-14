@@ -9,6 +9,8 @@ No network, no keys. Mirrors the unit tests in judge.rs so the Python port
 and the Rust stay in step.
 """
 
+import sys
+
 import tune
 
 
@@ -33,6 +35,8 @@ def verdict(**over) -> dict:
 
 
 def main() -> None:
+    if not __debug__:  # every check below is an assert; -O would strip them all
+        sys.exit("run this file without -O")
     seed = tune.seed_prompt()
     assert seed.startswith("You judge whether two memories"), seed[:60]
     assert seed.endswith("your probability that the verdict is correct."), seed[-60:]
