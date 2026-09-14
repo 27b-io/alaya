@@ -147,10 +147,17 @@ services:
       RERANK_URL: ${RERANK_URL:-}
       RERANK_API_KEY: ${RERANK_API_KEY:-}
       RERANK_TOP_N: ${RERANK_TOP_N:-20}
-      # Uncomment for auto-summary (requires Anthropic API key):
-      # SUMMARY_URL: https://api.anthropic.com/v1/messages
+      # Uncomment for auto-summary (requires Anthropic API key). Origin only:
+      # the client appends /v1/messages itself.
+      # SUMMARY_URL: https://api.anthropic.com
       # SUMMARY_API_KEY: ${SUMMARY_API_KEY:-}
       # SUMMARY_MODEL: ${SUMMARY_MODEL:-claude-haiku-4-5-20251001}
+      # Contradiction judge (LAB-3283) — URL and key default to their SUMMARY_*
+      # twin, so SUMMARY_URL + SUMMARY_API_KEY enable it too. The model does
+      # not: the judge needs Sonnet-class precision, summaries do not.
+      # JUDGE_URL: ${JUDGE_URL:-}
+      # JUDGE_API_KEY: ${JUDGE_API_KEY:-}
+      # JUDGE_MODEL: ${JUDGE_MODEL:-claude-sonnet-5}
       # OAuth Resource Server (delegated auth via OIDC) — empty disables.
       # See README.md → OAuth section.
       # OIDC_ISSUER: ${OIDC_ISSUER:-}

@@ -28,16 +28,16 @@ Rust rewrite of the mcp-memory-service API layer. Deployed on k3s as a native se
 crates/
 ├── alaya-types/src/
 │   ├── lib.rs          # Re-exports
-│   ├── error.rs        # AlayaError (6 variants, JSON-RPC codes, safe_message())
+│   ├── error.rs        # AlayaError (JSON-RPC codes, safe_message())
 │   ├── graph.rs        # UserRelationType, SystemRelationType, Edge, Neighbor, etc.
 │   ├── memory.rs       # Memory (15 fields), ScoredMemory, ScrollResult, MetadataUpdate
 │   └── search.rs       # SearchMode (5 modes), PromptName, PayloadFilter
 ├── alaya-bridge/src/
 │   ├── lib.rs           # Library target (re-exports for integration tests)
 │   ├── main.rs          # Binary entry — reads REDIS_URL/GRAPH_NAME, starts axum + queue
-│   ├── routes.rs        # 18 HTTP endpoints, auth middleware on API routes
+│   ├── routes.rs        # HTTP endpoints, auth middleware on API routes
 │   ├── auth.rs          # Bearer token middleware (GRAPH_API_KEY env)
-│   ├── cypher.rs        # Typed Cypher query builders (17 functions, all parameterized)
+│   ├── cypher.rs        # Typed Cypher query builders (all parameterized)
 │   ├── resp.rs          # FalkorDB RESP parser (compact + non-compact modes)
 │   ├── queue.rs         # Hebbian write queue (LPUSH/BRPOP, rate-limited 100 ops/sec)
 │   └── handlers/
@@ -46,13 +46,16 @@ crates/
 │       ├── edges.rs     # POST /edges/create, /edges/get, /edges/delete, /edges/create-system
 │       ├── health.rs    # GET /health (unauth), GET /stats
 │       ├── hebbian.rs   # POST /hebbian/{neighbors,spreading,boosts-within,strengthen}
-│       ├── contradictions.rs  # POST /contradictions/{all,for}
+│       ├── contradictions.rs  # POST /contradictions/{all,for,verdict}
 │       └── consolidation.rs   # POST /consolidation/{decay-all,decay-stale,prune,orphans}
 ├── alaya-backends/src/
 │   ├── lib.rs           # Re-exports
-│   ├── traits.rs        # VectorStorage, EmbeddingProvider, GraphService, HebbianService, ConsolidationService
+│   ├── traits.rs        # VectorStorage, EmbeddingProvider, GraphService, HebbianService, ConsolidationService, SummaryProvider, ContradictionJudge
 │   ├── qdrant.rs        # QdrantClient — Qdrant REST API (WASM-compat)
 │   ├── embedding.rs     # EmbeddingClient — OpenAI-compat /v1/embeddings
+│   ├── anthropic.rs     # Shared raw-HTTP Anthropic Messages transport (no SDK; 429 → RateLimited)
+│   ├── summary.rs       # SummaryClient — one-line summaries over anthropic.rs
+│   ├── judge.rs         # JudgeClient — CONTRADICTS pair verdicts via structured output (LAB-3283)
 │   └── graph.rs         # GraphHttpClient — bridge HTTP wrapper (3 trait impls)
 ├── alaya-core/src/
 │   ├── lib.rs           # Re-exports
@@ -135,6 +138,15 @@ LISTEN_ADDR=0.0.0.0:3001
 RUST_LOG=alaya_server=info
 OTEL_EXPORTER_OTLP_ENDPOINT=http://phoenix-svc.recsys.svc:6006  # optional
 OTEL_SERVICE_NAME=alaya-server
+SUMMARY_URL=                             # optional — Anthropic API origin; client appends /v1/messages. https:// required off-cluster
+                                         #   (https://api.anthropic.com); plain http only for a cluster-local proxy (http://anthropic-lb:8082).
+                                         #   Boot is refused when a key would go over http to any other host (applies to JUDGE_URL too)
+SUMMARY_API_KEY=
+SUMMARY_MODEL=claude-haiku-4-5-20251001
+JUDGE_URL=                               # contradiction judge; URL and key fall back to their SUMMARY_* twin
+JUDGE_API_KEY=                           #   (so SUMMARY_URL alone enables the judge). Both unset = judge disabled.
+JUDGE_MODEL=claude-sonnet-5              #   Own default, not SUMMARY_MODEL: Haiku fails the golden-set precision bar.
+                                         #   Advisory: verdicts annotate CONTRADICTS edges, never memory payloads.
 RERANK_URL=                              # optional — empty disables cross-encoder rerank
 RERANK_API_KEY=                          # optional
 RERANK_TOP_N=20                          # how many RRF candidates to rerank
@@ -162,6 +174,7 @@ cutover, so it never held legacy keys).
 - **UUID from content_hash** — `Uuid::parse_str(&hash[..32])` — takes first 32 hex chars, NOT uuid5. Must match Python `uuid.UUID(hash[:32])` for data compatibility.
 - **Superseded filtering** — Done at application layer, NOT Qdrant filter level. Qdrant's `is_null` on nested payload fields is unreliable without explicit indexes.
 - **Graph operations are non-fatal** — All graph calls (spreading activation, Hebbian, interference) use `unwrap_or_default()`. Service degrades gracefully when FalkorDB is down.
+- **Contradiction judge is advisory (LAB-3283 Phase 1)** — an LLM judge (`ContradictionJudge`, `claude-sonnet-5` by default; prompt tuned with `scripts/judge_tune/`) classifies every `CONTRADICTS` pair as `contradiction` / `supersession` / `coexist` / `unrelated`, off the store path (`spawn_local` after store, plus `POST /backfill/contradictions`). Verdicts are written onto the edge via the bridge (`POST /contradictions/verdict`, MATCH-only) and one `tracing` event on target `alaya::judge` records `would_supersede` per verdict — the shadow log Phase 2 is promoted on. Failures are classified: transient (429/5xx/timeout/misconfig) write nothing and are retried; deterministic (schema/parse/empty/400) persist `verdict = unjudged` + the error as reason so the backfill's NULL selection skips the pair (`rejudge: true` re-selects edges judged by another model). Never a vector write, never a panic. `memory_contradictions` filters entirely in Cypher (`ContradictionQuery`: verdicts, `exclude_resolved` via incoming `SUPERSEDES` edges, `SKIP`/`LIMIT`) and pages with `offset`/`next_offset` — app-side filtering over a LIMIT-only read starved the queue (review, 2026-09-10).
 - **reqwest default-features = false** — Workspace-level and per-crate. Uses `rustls-tls` on native, bare `json` on wasm32. Prevents OpenSSL dependency in containers.
 - **MCP protocol 2025-03-26** — SSE response format (`event: message\ndata: {...}\n\n`) when client sends `Accept: text/event-stream`. Plain JSON otherwise.
 - **Cross-encoder rerank** — Optional second-stage reranker (TEI `/rerank` endpoint, default model `BAAI/bge-reranker-v2-m3`). When `RERANK_URL` is set, `search_hybrid` re-scores the top-N RRF candidates as (query, doc) pairs and reorders them; the rerank score replaces the RRF+cosine blend for those entries. Validated on LongMemEval (2026-05-23, cached embeddings + Python re-impl, 500q): R@5 0.936 → 0.990 with top_n=20. Graceful degradation: rerank failures log and fall back to RRF order, never break the search.

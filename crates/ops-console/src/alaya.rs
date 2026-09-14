@@ -124,9 +124,18 @@ impl AlayaClient {
         .await
     }
 
-    pub async fn contradictions(&self, limit: usize) -> Result<Value, AppError> {
-        self.post("/contradictions", json!({ "limit": limit }))
-            .await
+    /// `verdicts = None` lets the server apply its default filter
+    /// (contradiction, supersession, unjudged).
+    pub async fn contradictions(
+        &self,
+        limit: usize,
+        verdicts: Option<&[&str]>,
+    ) -> Result<Value, AppError> {
+        let mut body = json!({ "limit": limit });
+        if let Some(v) = verdicts {
+            body["verdicts"] = json!(v);
+        }
+        self.post("/contradictions", body).await
     }
 
     pub async fn find_duplicates(

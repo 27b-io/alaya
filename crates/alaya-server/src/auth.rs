@@ -122,6 +122,7 @@ pub fn rest_route_op(method: &Method, path: &str) -> &'static str {
         ("POST", "/duplicates/find") => "find_duplicates",
         ("POST", "/duplicates/merge") => "merge_duplicates",
         ("POST", "/backfill/summaries") => "backfill_summaries",
+        ("POST", "/backfill/contradictions") => "backfill_contradictions",
         ("GET", "/health/detail") => "check_database_health",
         ("GET", p) if p.starts_with("/memories/") => "get_memory",
         ("PATCH", p) if p.starts_with("/memories/") => "patch_memory",
@@ -146,6 +147,7 @@ pub const ALL_OPS: &[(&str, bool)] = &[
     ("relation", true),
     ("patch_memory", true),
     ("backfill_summaries", true),
+    ("backfill_contradictions", true),
 ];
 
 /// Read-only view of the auth configuration (LAB-1684 AC7): which principals
@@ -428,6 +430,14 @@ mod tests {
             rest_route_op(&Method::POST, "/backfill/summaries"),
             "backfill_summaries"
         );
+        assert_eq!(
+            rest_route_op(&Method::POST, "/backfill/contradictions"),
+            "backfill_contradictions"
+        );
+        // Operator-only: neither restricted principal may run a backfill.
+        for p in [AuthPrincipal::Oidc, AuthPrincipal::StaticReadOnly] {
+            assert!(!p.allows("backfill_contradictions"));
+        }
     }
 
     #[test]
@@ -497,6 +507,7 @@ mod tests {
             rest_route_op(&Method::POST, "/duplicates/find"),
             rest_route_op(&Method::POST, "/duplicates/merge"),
             rest_route_op(&Method::POST, "/backfill/summaries"),
+            rest_route_op(&Method::POST, "/backfill/contradictions"),
             rest_route_op(&Method::GET, "/memories/x"),
             rest_route_op(&Method::PATCH, "/memories/x"),
         ];

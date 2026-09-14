@@ -17,3 +17,5 @@ regex = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 reqwest = { workspace = true }
+# Captures the contradiction-judge shadow-log events in tests (LAB-3283 AC-4b).
+tracing-subscriber = { workspace = true }

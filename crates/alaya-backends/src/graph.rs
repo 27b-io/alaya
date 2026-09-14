@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use alaya_types::{
     AlayaError, Result,
     graph::{
-        CoAccessPair, Contradiction, ContradictionRef, Direction, Edge, EdgeMeta, GraphStats,
-        Neighbor, SystemRelationType, UserRelationType,
+        CoAccessPair, Contradiction, ContradictionQuery, ContradictionRef, Direction, Edge,
+        EdgeMeta, EdgeVerdict, GraphStats, Neighbor, SystemRelationType, UserRelationType,
     },
 };
 
@@ -225,6 +225,19 @@ struct DeletedResp {
 #[derive(Deserialize)]
 struct EdgesResp {
     edges: Vec<Edge>,
+}
+
+#[derive(Serialize)]
+struct SetVerdictReq<'a> {
+    source: &'a str,
+    target: &'a str,
+    #[serde(flatten)]
+    verdict: &'a EdgeVerdict,
+}
+
+#[derive(Deserialize)]
+struct UpdatedResp {
+    updated: bool,
 }
 
 #[derive(Deserialize)]
@@ -456,17 +469,42 @@ impl GraphService for GraphHttpClient {
         Ok(body.created)
     }
 
-    async fn get_all_contradictions(&self, limit: usize) -> Result<Vec<Contradiction>> {
+    async fn get_all_contradictions(
+        &self,
+        query: &ContradictionQuery,
+    ) -> Result<Vec<Contradiction>> {
         let resp = self
             .client
             .post(format!("{}/contradictions/all", self.base_url))
-            .json(&LimitReq { limit })
+            .json(query)
             .send()
             .await
             .map_err(|e| AlayaError::Graph(e.to_string()))?;
 
         let body: ContradictionsResp = handle_response(resp).await?;
         Ok(body.contradictions)
+    }
+
+    async fn set_contradiction_verdict(
+        &self,
+        src: &str,
+        dst: &str,
+        verdict: &EdgeVerdict,
+    ) -> Result<bool> {
+        let resp = self
+            .client
+            .post(format!("{}/contradictions/verdict", self.base_url))
+            .json(&SetVerdictReq {
+                source: src,
+                target: dst,
+                verdict,
+            })
+            .send()
+            .await
+            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+
+        let body: UpdatedResp = handle_response(resp).await?;
+        Ok(body.updated)
     }
 
     async fn get_contradictions_for_hashes(

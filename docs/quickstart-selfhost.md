@@ -119,7 +119,8 @@ Every knob lives in `.env`. The interesting ones:
 | `RERANK_URL` | empty | Set to `http://tei-rerank:80` to enable rerank (requires `--profile rerank`). |
 | `RERANK_TOP_N` | `20` | How many top RRF candidates to re-score. |
 | `OIDC_ISSUER` | empty | Set to your IdP's issuer URL to enable OAuth Resource Server mode. See [MCP quickstart → OAuth](./quickstart-mcp.md#oauth-optional). |
-| `SUMMARY_URL` | empty | Set + provide `SUMMARY_API_KEY` to auto-generate one-line summaries via Anthropic's Messages API. |
+| `SUMMARY_URL` | empty | Anthropic API origin (`https://api.anthropic.com`, no path — the client appends `/v1/messages`). Set + provide `SUMMARY_API_KEY` to auto-generate one-line summaries. Plain `http://` is accepted only for a cluster-local proxy; anything else is refused at boot. |
+| `JUDGE_URL` / `JUDGE_API_KEY` / `JUDGE_MODEL` | the `SUMMARY_*` values | Contradiction judge: annotates every flagged `CONTRADICTS` pair with an advisory verdict (`contradiction` / `supersession` / `coexist` / `unrelated`). Each falls back to its `SUMMARY_*` counterpart, so setting `SUMMARY_URL` enables both. |
 
 The complete list — including the bridge-side variables — lives in `CLAUDE.md` under "Environment Variables".
 
