@@ -250,13 +250,20 @@ RUST_ESCAPES = {
 
 def unescape_rust(literal: str) -> str:
     """The body of a Rust `"..."` literal as the string it compiles to."""
-    literal = re.sub(r"\\\n\s*", "", literal)  # `\` + newline continues the line
-    unknown = set(re.findall(r"\\(.)", literal)) - set(RUST_ESCAPES)
-    if unknown:  # passing one through would tune a prompt the server never sends
-        sys.exit(
-            f"unsupported escapes in SYSTEM_PROMPT: {sorted(unknown)}; extend RUST_ESCAPES"
-        )
-    return re.sub(r"\\(.)", lambda e: RUST_ESCAPES[e.group(1)], literal)
+
+    def one(m: re.Match) -> str:
+        c = m.group(1)
+        if c is None:  # `\` + newline: rustc drops it and the next line's ASCII indent
+            return ""
+        if c not in RUST_ESCAPES:  # a pass-through would tune a prompt never sent
+            sys.exit(
+                f"unsupported Rust escape {m.group(0)!r}; "
+                f"unescape_rust knows {sorted(RUST_ESCAPES)}"
+            )
+        return RUST_ESCAPES[c]
+
+    # One pass, left to right, so `\\` before a newline is a backslash, not a continuation.
+    return re.sub(r"\\(?:\n[ \t\r\n]*|(.))", one, literal)
 
 
 def seed_prompt() -> str:
@@ -285,13 +292,17 @@ def fetch_memories(pairs: list[Pair]) -> dict[str, dict]:
         for h in hashes:
             try:
                 resp = client.get(f"{url}/memories/{h}")
+                if resp.status_code == 404:  # the server maps found:false to 404
+                    sys.exit(f"memory {h} is missing (deleted since labelling?)")
                 resp.raise_for_status()
-                envelope = resp.json()
-            except (httpx.HTTPError, ValueError) as e:  # transport, status, non-JSON
+                memory = resp.json().get("memory")
+            except httpx.HTTPStatusError as e:  # str(e) echoes the URL, userinfo too
+                sys.exit(f"GET /memories/{h}: HTTP {e.response.status_code}")
+            except (httpx.HTTPError, ValueError) as e:  # transport, non-JSON body
                 sys.exit(f"GET /memories/{h}: {e}")
-            if not envelope.get("found") or not envelope.get("memory"):
-                sys.exit(f"memory {h} is missing (deleted since labelling?)")
-            memories[h] = envelope["memory"]
+            if not memory:
+                sys.exit(f"GET /memories/{h}: 200 without a memory body")
+            memories[h] = memory
     log(f"fetched {len(memories)} memories for {len(pairs)} pairs")
     return memories
 

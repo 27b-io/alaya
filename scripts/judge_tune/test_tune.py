@@ -38,10 +38,13 @@ def main() -> None:
     assert seed.endswith("your probability that the verdict is correct."), seed[-60:]
     assert "\\n" not in seed and '\\"' not in seed, "Rust escapes left in the seed"
     assert tune.unescape_rust('a\\n\\"b\\"\\\\ \\\n    c') == 'a\n"b"\\ c'
+    # `\\` then a newline is a backslash, not a continuation; rustc skips ASCII indent only.
+    assert tune.unescape_rust("a\\\\\nb") == "a\\\nb"
+    assert tune.unescape_rust("a\\\n \u00a0b") == "a\u00a0b"
     try:
         tune.unescape_rust("tab\\tok \\x41 crash")
     except SystemExit as e:  # an escape the map lacks must exit, never pass through
-        assert "unsupported escapes" in str(e) and "'x'" in str(e), e
+        assert "unsupported Rust escape '\\\\x'" in str(e), e
     else:
         raise AssertionError("unknown escape must exit")
 
