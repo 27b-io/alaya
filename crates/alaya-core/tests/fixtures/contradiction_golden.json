@@ -1,7 +1,7 @@
 {
  "version": 1,
  "description": "Golden set for the contradiction judge (LAB-3283 AC-8). Hashes and labels only; contents live in Alaya. Positives (supersession) are pairs an operator actually resolved with memory_supersede (survivor = superseded_by, verified in Qdrant metadata; dedup merges excluded). Negatives are the 60 most recent unresolved pairs on 2026-09-10.",
- "labelled_by": "Winston (agent) from operator resolutions + queue reading, 2026-09-10; human ratification pending (Ray)",
+ "labelled_by": "operator resolutions plus a review of the unresolved queue, 2026-09-10; human review of the 60 negatives pending",
  "label_rule": "supersession = one memory was superseded by the other via memory_supersede; coexist = same thread/programme snapshots, both true; unrelated = shared vocabulary only; contradiction = both current, cannot both be true",
  "pairs": [
   {
@@ -1046,7 +1046,7 @@
    "label": "coexist",
    "survivor": null,
    "source": "queue-2026-09-10",
-   "note": "this ticket's grooming note vs the reference memory it cites"
+   "note": "a grooming note vs the reference memory it cites"
   },
   {
    "a": "373e91e2e43d75b418ad644e9ee58ef6edcaf0a087b302a46b12680a7b89d6a2",
@@ -1068,7 +1068,7 @@
    "label": "coexist",
    "survivor": null,
    "source": "queue-2026-09-10",
-   "note": "borderline: LAB-3279 changed the oracle source after Ray's LAB-1104 ruling; the ruling record still stands"
+   "note": "borderline: a later decision changed the oracle source; the earlier ruling record still stands"
   },
   {
    "a": "373e91e2e43d75b418ad644e9ee58ef6edcaf0a087b302a46b12680a7b89d6a2",

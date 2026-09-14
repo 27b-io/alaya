@@ -73,8 +73,10 @@ struct Config {
     summary_url: Option<String>,
     summary_api_key: Option<String>,
     summary_model: String,
-    /// Contradiction judge (LAB-3283). Each falls back to the SUMMARY_*
-    /// counterpart; with neither set the engine is disabled.
+    /// Contradiction judge (LAB-3283). URL and key fall back to the
+    /// SUMMARY_* counterpart; with neither set the engine is disabled. The
+    /// model has its own default: summaries are priced for volume, verdicts
+    /// for precision on the golden set.
     judge_url: Option<String>,
     judge_api_key: Option<String>,
     judge_model: String,
@@ -85,7 +87,6 @@ struct Config {
 
 impl Config {
     fn from_env() -> Self {
-        let summary_model = env_or("SUMMARY_MODEL", "claude-haiku-4-5-20251001");
         let cfg = Self {
             qdrant_url: env_required("QDRANT_URL"),
             qdrant_collection: env_or("QDRANT_COLLECTION", "memories_arctic1024"),
@@ -115,10 +116,10 @@ impl Config {
                 .eq_ignore_ascii_case("true"),
             summary_url: env_opt("SUMMARY_URL"),
             summary_api_key: env_opt("SUMMARY_API_KEY"),
-            summary_model: summary_model.clone(),
+            summary_model: env_or("SUMMARY_MODEL", "claude-haiku-4-5-20251001"),
             judge_url: env_opt("JUDGE_URL").or_else(|| env_opt("SUMMARY_URL")),
             judge_api_key: env_opt("JUDGE_API_KEY").or_else(|| env_opt("SUMMARY_API_KEY")),
-            judge_model: env_opt("JUDGE_MODEL").unwrap_or(summary_model),
+            judge_model: env_opt("JUDGE_MODEL").unwrap_or_else(|| "claude-sonnet-5".into()),
             rerank_url: env_opt("RERANK_URL"),
             rerank_api_key: env_opt("RERANK_API_KEY"),
             rerank_top_n: env_or("RERANK_TOP_N", "20")
