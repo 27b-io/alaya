@@ -38,6 +38,9 @@ services:
     environment:
       REDIS_URL: redis://falkordb:6379
       GRAPH_NAME: bench_memory
+      # Bridge is fail-closed (panics with no key). Ephemeral loopback-only
+      # bench, same rationale as the alaya service's opt-in below.
+      DANGEROUSLY_ALLOW_UNAUTHENTICATED: "true"
       RUST_LOG: warn
     ports: ["127.0.0.1:18080:8080"]
     depends_on:
