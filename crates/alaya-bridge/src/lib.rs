@@ -11,6 +11,7 @@ pub mod routes;
 mod auth;
 pub mod queue;
 
+pub use auth::BridgeAuth;
 pub use handlers::exec_query;
 pub use handlers::value_to_cypher_literal;
 pub use resp::FalkorResult;
@@ -19,4 +20,6 @@ pub use resp::FalkorResult;
 pub struct AppState {
     pub redis: redis::aio::ConnectionManager,
     pub graph_name: String,
+    /// Resolved once at startup; see `auth::BridgeAuth`.
+    pub auth: BridgeAuth,
 }

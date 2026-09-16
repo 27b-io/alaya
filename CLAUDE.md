@@ -36,7 +36,7 @@ crates/
 │   ├── lib.rs           # Library target (re-exports for integration tests)
 │   ├── main.rs          # Binary entry — reads REDIS_URL/GRAPH_NAME, starts axum + queue
 │   ├── routes.rs        # HTTP endpoints, auth middleware on API routes
-│   ├── auth.rs          # Bearer token middleware (GRAPH_API_KEY env)
+│   ├── auth.rs          # Fail-closed bearer auth (GRAPH_API_KEY read once at startup)
 │   ├── cypher.rs        # Typed Cypher query builders (all parameterized)
 │   ├── resp.rs          # FalkorDB RESP parser (compact + non-compact modes)
 │   ├── queue.rs         # Hebbian write queue (LPUSH/BRPOP, rate-limited 100 ops/sec)
@@ -119,7 +119,8 @@ CI pushes to ghcr.io on every main push. Network policies restrict egress to nam
 ```bash
 REDIS_URL=redis://falkordb.recsys.svc:6379
 GRAPH_NAME=memory
-GRAPH_API_KEY=               # empty = no auth
+GRAPH_API_KEY=                     # required; bridge refuses to boot when empty...
+DANGEROUSLY_ALLOW_UNAUTHENTICATED= # ...unless this is `true` (dev only, warns at startup)
 RUST_LOG=alaya_bridge=info
 ```
 
@@ -131,7 +132,7 @@ EMBEDDING_URL=http://tei:80              # required
 EMBEDDING_MODEL=Snowflake/snowflake-arctic-embed-l-v2.0
 EMBEDDING_DIMENSIONS=1024
 GRAPH_URL=http://alaya-bridge:3000       # required
-GRAPH_API_KEY=
+GRAPH_API_KEY=                           # must match the bridge's key
 ALAYA_API_KEY=                           # fail-closed: boot refused when this, the readonly key, and OIDC are all empty (unless dev open mode)
 ALAYA_READONLY_API_KEY=                  # optional read-only bearer (pure reads; must differ from ALAYA_API_KEY)
 LISTEN_ADDR=0.0.0.0:3001
@@ -209,3 +210,9 @@ These were discovered during integration testing and are NOT documented in Falko
 7. **OTLP tracing** — Wired but degraded (reqwest async client issue in container, falls back to stderr)
 8. **Prajna integration** — Replace writer.rs qdrant-client with Ālaya HTTP calls
 9. **cachekit-rs integration** — Embedding cache for edge performance (immutable, content-addressed)
+
+## Agent skills
+
+### Domain docs
+
+Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.

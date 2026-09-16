@@ -18,3 +18,8 @@ docs/superpowers/
 scripts/judge_tune/runs/
 .venv/
 __pycache__/
+
+# Per-developer agent config. Tracker and triage docs are workspace-internal; keep them out of the public tree.
+CLAUDE.local.md
+docs/agents/issue-tracker.md
+docs/agents/triage-labels.md

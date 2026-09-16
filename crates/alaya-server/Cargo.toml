@@ -29,7 +29,7 @@ futures = { workspace = true }
 # instead of rust_crypto: keeps the vulnerable pure-Rust `rsa` crate
 # (RUSTSEC-2023-0071) out of the tree. Requires cmake in the build image.
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
-subtle = "2"
+subtle = { workspace = true }
 
 # OpenTelemetry (optional — enabled when OTEL_ENDPOINT is set)
 opentelemetry = "0.29"
