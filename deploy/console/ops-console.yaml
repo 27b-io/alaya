@@ -28,7 +28,6 @@
 #   - image digest-pinned with the flux-system:alaya imagepolicy marker, so the
 #     console rolls with alaya-server (same image, same CI push) and is never
 #     stale against the API it fronts.
-#   - imagePullSecrets ghcr-creds — ghcr.io/27b-io/alaya is a private package.
 #   - Reloader annotation — updating the ops-console-env Secret (e.g. adding a
 #     subject to CONSOLE_ALLOWED_SUBJECTS) restarts the pod; no manual rollout.
 #   - CONSOLE_PUBLIC_URL / CONSOLE_OIDC_ISSUER are plain env, exactly as
@@ -73,8 +72,6 @@ spec:
       securityContext:
         seccompProfile:
           type: RuntimeDefault
-      imagePullSecrets:
-        - name: ghcr-creds
       containers:
         - name: ops-console
           image: ghcr.io/27b-io/alaya:main # lab: :main@sha256:<digest> + flux-system:alaya imagepolicy marker
