@@ -13,3 +13,8 @@ docs/superpowers/
 
 # Local dev — docker compose env overrides
 .env
+
+# Per-developer agent config. Tracker and triage docs are workspace-internal; keep them out of the public tree.
+CLAUDE.local.md
+docs/agents/issue-tracker.md
+docs/agents/triage-labels.md

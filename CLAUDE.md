@@ -197,3 +197,9 @@ These were discovered during integration testing and are NOT documented in Falko
 7. **OTLP tracing** — Wired but degraded (reqwest async client issue in container, falls back to stderr)
 8. **Prajna integration** — Replace writer.rs qdrant-client with Ālaya HTTP calls
 9. **cachekit-rs integration** — Embedding cache for edge performance (immutable, content-addressed)
+
+## Agent skills
+
+### Domain docs
+
+Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
