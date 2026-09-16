@@ -384,8 +384,34 @@ impl MemoryService {
             summary_embedding: None,
         };
 
-        // Store in vector DB
+        // A read-only principal's store is additive only. Re-storing content
+        // that already exists would replace the record's caller-owned fields
+        // (tags, metadata, summary, memory_type) — the effect of patch /
+        // supersede, which read-only is denied. `exists` judges presence
+        // exactly as `store` does (raw point, not parseability), so guard and
+        // write cannot disagree; it runs immediately before the write to keep
+        // the window against concurrent writers minimal. Fails closed on a
+        // lookup error.
+        if read_only && self.vectors.exists(&content_hash).await? {
+            return Err(AlayaError::Validation(format!(
+                "memory {content_hash} already exists; read-only principals may only add new memories"
+            )));
+        }
+
+        // Store in vector DB. `created == false` means a point with this
+        // content_hash already existed: the backend carried its created_at,
+        // access history and supersession marker over (see
+        // VectorStorage::store), while the caller-supplied fields above — and
+        // provenance — replaced the stored ones. Who owns provenance when two
+        // callers store the same content is LAB-1084's decision; today's
+        // replace semantics stand until then.
         let (created, _) = self.vectors.store(&memory).await?;
+        if !created {
+            tracing::info!(
+                hash = %content_hash,
+                "re-store of existing memory: payload replaced, access history preserved"
+            );
+        }
 
         // The memory itself was stored unconditionally above, so its tags are
         // now in Qdrant. Always invalidate the in-process tag cache so the
@@ -539,6 +565,78 @@ impl MemoryService {
         }
 
         Ok(result)
+    }
+
+    // ─── Background enrichment ──────────────────────────────────────────
+
+    /// Generate and commit a summary (plus its embedding) for a memory stored
+    /// without one. This runs detached from the request, so by the time the
+    /// providers return a caller may have supplied a summary of their own.
+    /// The commit is therefore conditional and decided by the backend under
+    /// its write lock (`VectorStorage::set_generated_summary`): a caller's
+    /// summary always wins. Returns whether the generated summary was
+    /// applied. Failures are logged and swallowed; enrichment is best-effort
+    /// by design.
+    pub async fn enrich_summary(&self, hash: &str, content: &str) -> bool {
+        // Guard before anything else: the hash may come from a stored payload
+        // (backfill), and both the log prefix below and the backend's
+        // point-id derivation byte-slice it. A malformed value must be a
+        // logged skip, never a panic that kills the detached task.
+        if !alaya_types::memory::validate_content_hash(hash) {
+            tracing::warn!(
+                hash_len = hash.len(),
+                "enrich_summary: invalid content_hash, skipping"
+            );
+            return false;
+        }
+        let Some(ref summarizer) = self.summary else {
+            return false;
+        };
+        let h = &hash[..8.min(hash.len())];
+        let summary = match summarizer.summarize(content).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(hash = h, "summary generation failed (non-fatal): {e}");
+                return false;
+            }
+        };
+        // Embed the summary for the search boost (non-fatal if it fails).
+        let embedding = match self
+            .embeddings
+            .embed_batch(&[summary.as_str()], PromptName::Passage)
+            .await
+        {
+            Ok(mut embs) if !embs.is_empty() => Some(embs.remove(0)),
+            Ok(_) => {
+                tracing::warn!(hash = h, "summary embedding returned empty (non-fatal)");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(hash = h, "summary embedding failed (non-fatal): {e}");
+                None
+            }
+        };
+        match self
+            .vectors
+            .set_generated_summary(hash, &summary, embedding)
+            .await
+        {
+            Ok(true) => {
+                tracing::debug!(hash = h, "auto-summary + embedding applied");
+                true
+            }
+            Ok(false) => {
+                tracing::debug!(
+                    hash = h,
+                    "auto-summary skipped: a caller summary landed first"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(hash = h, "summary commit failed (non-fatal): {e}");
+                false
+            }
+        }
     }
 
     // ─── Tool 2: search ─────────────────────────────────────────────────
@@ -2009,7 +2107,8 @@ mod tests {
     // ─── Mock backends for tag cache tests ─────────────────────────────
 
     use alaya_backends::{
-        ConsolidationService, EmbeddingProvider, GraphService, HebbianService, VectorStorage,
+        ConsolidationService, EmbeddingProvider, GraphService, HebbianService, SummaryProvider,
+        VectorStorage,
     };
     use alaya_types::{
         AlayaError,
@@ -2067,6 +2166,17 @@ mod tests {
         }
         async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
             Ok(None)
+        }
+        async fn exists(&self, _h: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn set_generated_summary(
+            &self,
+            _h: &str,
+            _s: &str,
+            _e: Option<Vec<f32>>,
+        ) -> Result<bool> {
+            Ok(false)
         }
         async fn get_batch(&self, _h: &[&str]) -> Result<Vec<Memory>> {
             Ok(vec![])
@@ -2531,6 +2641,17 @@ mod tests {
         async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
             Ok(None)
         }
+        async fn exists(&self, _h: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn set_generated_summary(
+            &self,
+            _h: &str,
+            _s: &str,
+            _e: Option<Vec<f32>>,
+        ) -> Result<bool> {
+            Ok(false)
+        }
         async fn get_batch(&self, _h: &[&str]) -> Result<Vec<Memory>> {
             Ok(vec![])
         }
@@ -2872,6 +2993,17 @@ mod tests {
         async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
             Ok(None)
         }
+        async fn exists(&self, _h: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn set_generated_summary(
+            &self,
+            _h: &str,
+            _s: &str,
+            _e: Option<Vec<f32>>,
+        ) -> Result<bool> {
+            Ok(false)
+        }
         async fn get_batch(&self, _h: &[&str]) -> Result<Vec<Memory>> {
             Ok(vec![])
         }
@@ -3187,6 +3319,421 @@ mod tests {
         );
     }
 
+    /// In-memory VectorStorage honouring the `store` contract: an existing
+    /// point keeps its server-maintained history and reports `created=false`.
+    struct MockVectorsPersisting {
+        stored: Rc<RefCell<HashMap<String, Memory>>>,
+        /// Hashes present as raw points whose payload no longer parses as a
+        /// `Memory` (e.g. left by the legacy writer): `exists` sees them,
+        /// `get_by_hash` does not.
+        raw_only: std::collections::HashSet<String>,
+    }
+
+    #[async_trait(?Send)]
+    impl VectorStorage for MockVectorsPersisting {
+        async fn store(&self, m: &Memory) -> Result<(bool, String)> {
+            let mut stored = self.stored.borrow_mut();
+            let mut next = m.clone();
+            let created = match stored.get(&m.content_hash) {
+                Some(prev) => {
+                    next.created_at = prev.created_at;
+                    next.access_count = prev.access_count;
+                    next.access_timestamps = prev.access_timestamps.clone();
+                    false
+                }
+                None => !self.raw_only.contains(&m.content_hash),
+            };
+            stored.insert(m.content_hash.clone(), next);
+            Ok((created, m.content_hash.clone()))
+        }
+        async fn get_by_hash(&self, h: &str) -> Result<Option<Memory>> {
+            Ok(self.stored.borrow().get(h).cloned())
+        }
+        async fn exists(&self, h: &str) -> Result<bool> {
+            Ok(self.raw_only.contains(h) || self.stored.borrow().contains_key(h))
+        }
+        async fn set_generated_summary(
+            &self,
+            h: &str,
+            summary: &str,
+            embedding: Option<Vec<f32>>,
+        ) -> Result<bool> {
+            let mut stored = self.stored.borrow_mut();
+            let Some(m) = stored.get_mut(h) else {
+                return Err(AlayaError::NotFound(h.into()));
+            };
+            if m.summary.is_some() {
+                return Ok(false);
+            }
+            m.summary = Some(summary.into());
+            m.summary_embedding = embedding;
+            Ok(true)
+        }
+        async fn get_batch(&self, _h: &[&str]) -> Result<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn delete(&self, _h: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn update_metadata(&self, _h: &str, _u: MetadataUpdate) -> Result<()> {
+            Ok(())
+        }
+        async fn patch_memory(&self, h: &str, p: &PatchMemoryRequest) -> Result<Memory> {
+            let mut stored = self.stored.borrow_mut();
+            let Some(m) = stored.get_mut(h) else {
+                return Err(AlayaError::NotFound(h.into()));
+            };
+            if let Some(ref s) = p.summary {
+                if p.summary_embedding.is_none() && m.summary.as_deref() != Some(s.as_str()) {
+                    m.summary_embedding = None;
+                }
+                m.summary = Some(s.clone());
+            }
+            if let Some(ref e) = p.summary_embedding {
+                m.summary_embedding = Some(e.clone());
+            }
+            if let Some(ref t) = p.tags {
+                m.tags = t.clone();
+            }
+            Ok(m.clone())
+        }
+        async fn search_by_vector(
+            &self,
+            _e: &[f32],
+            _l: usize,
+            _f: Option<PayloadFilter>,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(vec![])
+        }
+        async fn search_by_tags(
+            &self,
+            _t: &[&str],
+            _m: bool,
+            _l: usize,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(vec![])
+        }
+        async fn search_similar_tags(&self, _e: &[f32], _l: usize) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
+            Ok(())
+        }
+        async fn get_all(&self, _l: usize, _o: Option<&str>) -> Result<ScrollResult> {
+            Ok(ScrollResult {
+                memories: vec![],
+                next_offset: None,
+            })
+        }
+        async fn get_recent(
+            &self,
+            _l: usize,
+            _s: Option<f64>,
+            _t: Option<&str>,
+        ) -> Result<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn count(&self) -> Result<usize> {
+            Ok(self.stored.borrow().len())
+        }
+        async fn get_all_tags(&self) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn increment_access_count(&self, _h: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            Ok(HealthStatus {
+                status: "ok".into(),
+                backend: "mock".into(),
+                details: None,
+            })
+        }
+    }
+
+    /// alaya#86: a second `store_memory` of identical content, with no
+    /// `dedup_threshold`, must report `created: false` / "Memory updated" and
+    /// leave the record's server-maintained history intact.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restore_of_existing_content_preserves_history_and_reports_updated() {
+        let stored = Rc::new(RefCell::new(HashMap::new()));
+        let svc = MemoryService::with_clock(
+            Box::new(MockVectorsPersisting {
+                stored: stored.clone(),
+                raw_only: Default::default(),
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            mock_clock,
+        );
+        let params = || StoreParams {
+            content: "the same fact, stored twice".into(),
+            tags: None,
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: None,
+        };
+
+        let first_now = mock_clock();
+        let first = svc.store_memory(params()).await.expect("first store");
+        assert_eq!(first.get("created"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            first.get("message"),
+            Some(&serde_json::json!("Memory stored successfully"))
+        );
+        let hash = first["content_hash"].as_str().unwrap().to_string();
+
+        // Searches accrue access history on the record between the two stores.
+        {
+            let mut s = stored.borrow_mut();
+            let m = s.get_mut(&hash).unwrap();
+            m.access_count = 7;
+            m.access_timestamps = vec![first_now + 1.0, first_now + 2.0];
+        }
+        advance_clock(3600.0);
+
+        let second = svc.store_memory(params()).await.expect("second store");
+        assert_eq!(second.get("created"), Some(&serde_json::json!(false)));
+        assert_eq!(
+            second.get("message"),
+            Some(&serde_json::json!("Memory updated"))
+        );
+
+        let m = stored.borrow().get(&hash).cloned().unwrap();
+        assert_eq!(m.created_at, first_now, "created_at must survive re-store");
+        assert_eq!(m.access_count, 7, "access_count must survive re-store");
+        assert_eq!(m.access_timestamps, vec![first_now + 1.0, first_now + 2.0]);
+        assert_eq!(m.updated_at, first_now + 3600.0, "updated_at moves to now");
+    }
+
+    /// A read-only principal may add memories but never reshape an existing
+    /// record by re-storing its content (panel finding on alaya#86).
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_only_restore_of_existing_content_is_refused() {
+        let stored = Rc::new(RefCell::new(HashMap::new()));
+        let svc = MemoryService::with_clock(
+            Box::new(MockVectorsPersisting {
+                stored: stored.clone(),
+                raw_only: Default::default(),
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            mock_clock,
+        );
+        let params = |tag: &str| StoreParams {
+            content: "shared fact".into(),
+            tags: Some(vec![tag.into()]),
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: None,
+        };
+
+        let first = svc
+            .store_memory_with(params("original"), true)
+            .await
+            .expect("read-only may add a new memory");
+        assert_eq!(first.get("created"), Some(&serde_json::json!(true)));
+        let hash = first["content_hash"].as_str().unwrap().to_string();
+
+        let err = svc
+            .store_memory_with(params("hijack"), true)
+            .await
+            .expect_err("read-only re-store of existing content must be refused");
+        assert!(matches!(err, AlayaError::Validation(_)), "got {err:?}");
+        assert_eq!(
+            stored.borrow()[&hash].tags,
+            vec!["original".to_string()],
+            "nothing on the existing record may be rewritten"
+        );
+    }
+
+    /// The read-only guard must judge existence exactly as `store` does: a
+    /// point whose payload no longer parses as a `Memory` still exists, so a
+    /// read-only re-store of its content is refused and nothing is written.
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_only_guard_uses_raw_existence_not_parseability() {
+        let content = "shared fact";
+        let hash = generate_content_hash(content);
+        let stored = Rc::new(RefCell::new(HashMap::new()));
+        let svc = MemoryService::with_clock(
+            Box::new(MockVectorsPersisting {
+                stored: stored.clone(),
+                raw_only: std::iter::once(hash.clone()).collect(),
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            mock_clock,
+        );
+        let params = StoreParams {
+            content: content.into(),
+            tags: Some(vec!["hijack".into()]),
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: None,
+        };
+
+        let err = svc
+            .store_memory_with(params, true)
+            .await
+            .expect_err("present-but-unparseable point must still refuse a read-only re-store");
+        assert!(matches!(err, AlayaError::Validation(_)), "got {err:?}");
+        assert!(
+            !stored.borrow().contains_key(&hash),
+            "the write must not have been reached"
+        );
+    }
+
+    /// Summary provider that parks until released, so a caller's re-store can
+    /// land between enrichment starting and its commit.
+    struct BlockingSummary(RefCell<Option<tokio::sync::oneshot::Receiver<()>>>);
+
+    #[async_trait(?Send)]
+    impl SummaryProvider for BlockingSummary {
+        async fn summarize(&self, _content: &str) -> Result<String> {
+            let gate = self.0.borrow_mut().take();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            Ok("generated A".into())
+        }
+    }
+
+    fn enrichment_service(
+        stored: Rc<RefCell<HashMap<String, Memory>>>,
+        gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> MemoryService {
+        MemoryService::new(
+            Box::new(MockVectorsPersisting {
+                stored,
+                raw_only: Default::default(),
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            Some(Box::new(BlockingSummary(RefCell::new(gate)))),
+        )
+    }
+
+    fn fact_h(summary: Option<&str>) -> StoreParams {
+        StoreParams {
+            content: "fact H".into(),
+            tags: None,
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: summary.map(Into::into),
+            dedup_threshold: None,
+        }
+    }
+
+    /// Helly R's sixth finding: enrichment sampled "no summary" at request
+    /// time and committed unconditionally after provider latency, so a
+    /// caller's summary written in between was overwritten. The commit is now
+    /// decided by the backend under its write lock: the caller's summary wins.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_enrichment_cannot_overwrite_a_newer_caller_summary() {
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let stored = Rc::new(RefCell::new(HashMap::new()));
+        let svc = enrichment_service(stored.clone(), Some(gate));
+
+        let first = svc.store_memory(fact_h(None)).await.expect("first store");
+        let hash = first["content_hash"].as_str().unwrap().to_string();
+
+        // Enrichment starts and parks in the provider; the caller re-stores
+        // with an explicit summary; then the stale job is released.
+        let enrichment = svc.enrich_summary(&hash, "fact H");
+        let caller = async {
+            svc.store_memory(fact_h(Some("caller B")))
+                .await
+                .expect("re-store with a caller summary");
+            assert_eq!(stored.borrow()[&hash].summary.as_deref(), Some("caller B"));
+            release.send(()).expect("enrichment is parked on the gate");
+        };
+        let (applied, ()) = tokio::join!(enrichment, caller);
+
+        assert!(
+            !applied,
+            "stale enrichment must not commit over a caller summary"
+        );
+        let m = stored.borrow()[&hash].clone();
+        assert_eq!(m.summary.as_deref(), Some("caller B"));
+        assert!(
+            m.summary_embedding.is_none(),
+            "no generated vector may accompany the caller's summary"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enrichment_applies_when_no_caller_summary_exists() {
+        let stored = Rc::new(RefCell::new(HashMap::new()));
+        let svc = enrichment_service(stored.clone(), None);
+
+        let first = svc.store_memory(fact_h(None)).await.expect("first store");
+        let hash = first["content_hash"].as_str().unwrap().to_string();
+
+        assert!(svc.enrich_summary(&hash, "fact H").await);
+        let m = stored.borrow()[&hash].clone();
+        assert_eq!(m.summary.as_deref(), Some("generated A"));
+        assert!(
+            m.summary_embedding.is_some(),
+            "generated summary carries its vector"
+        );
+    }
+
+    /// Summary provider that must never be reached.
+    struct UnreachableSummary;
+
+    #[async_trait(?Send)]
+    impl SummaryProvider for UnreachableSummary {
+        async fn summarize(&self, _content: &str) -> Result<String> {
+            unreachable!("provider must not be called for a malformed hash")
+        }
+    }
+
+    /// Helly R's seventh finding: backfill forwards stored `content_hash`
+    /// values, and a 64-byte value with a multibyte character panicked the
+    /// byte slices in the log prefix and in the point-id derivation, killing
+    /// the detached backfill task. Malformed hashes are now a logged skip
+    /// before any provider or storage call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn enrich_summary_skips_malformed_hash_without_panicking() {
+        let svc = MemoryService::new(
+            Box::new(MockVectorsPersisting {
+                stored: Rc::new(RefCell::new(HashMap::new())),
+                raw_only: Default::default(),
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            Some(Box::new(UnreachableSummary)),
+        );
+        // 'é' is two bytes: across byte 8 (the log prefix slice) and across
+        // byte 32 (the point-id slice). Both values are exactly 64 bytes.
+        let across_8 = format!("abcdefgé{}", "a".repeat(55));
+        let across_32 = format!("{}é{}", "a".repeat(31), "a".repeat(31));
+        for hash in [across_8, across_32] {
+            assert_eq!(hash.len(), 64);
+            assert!(
+                !svc.enrich_summary(&hash, "content").await,
+                "a malformed hash must be a skip, not a panic"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn patch_memory_invalidates_tag_cache_when_tags_present() {
         let (svc, counter) = build_mock_service(vec!["rust".into()]);
@@ -3375,6 +3922,17 @@ mod tests {
         }
         async fn get_by_hash(&self, h: &str) -> Result<Option<Memory>> {
             Ok(self.injectable_memories.get(h).cloned())
+        }
+        async fn exists(&self, h: &str) -> Result<bool> {
+            Ok(self.injectable_memories.contains_key(h))
+        }
+        async fn set_generated_summary(
+            &self,
+            _h: &str,
+            _s: &str,
+            _e: Option<Vec<f32>>,
+        ) -> Result<bool> {
+            Ok(false)
         }
         async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>> {
             Ok(hashes
@@ -4037,6 +4595,17 @@ mod tests {
                 .set(self.0.get_by_hash_calls.get() + 1);
             Ok(self.0.memories.borrow().get(h).cloned())
         }
+        async fn exists(&self, h: &str) -> Result<bool> {
+            Ok(self.0.memories.borrow().contains_key(h))
+        }
+        async fn set_generated_summary(
+            &self,
+            _h: &str,
+            _s: &str,
+            _e: Option<Vec<f32>>,
+        ) -> Result<bool> {
+            Ok(false)
+        }
         async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>> {
             self.0.get_batch_calls.set(self.0.get_batch_calls.get() + 1);
             let mems = self.0.memories.borrow();
@@ -4445,6 +5014,17 @@ mod tests {
         }
         async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
             Ok(None)
+        }
+        async fn exists(&self, _h: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn set_generated_summary(
+            &self,
+            _h: &str,
+            _s: &str,
+            _e: Option<Vec<f32>>,
+        ) -> Result<bool> {
+            Ok(false)
         }
         async fn get_batch(&self, _h: &[&str]) -> Result<Vec<Memory>> {
             Ok(vec![])

@@ -46,7 +46,6 @@ use alaya_backends::{
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{MemoryService, OutputMode, RelationParams, SearchParams, StoreParams};
 use alaya_types::memory::PatchMemoryRequest;
-use alaya_types::search::PromptName;
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -63,6 +62,7 @@ struct Config {
     graph_api_key: String,
     listen_addr: String,
     api_key: String,
+    readonly_api_key: String,
     oidc_issuer: Option<String>,
     public_base_url: String,
     allow_unauthenticated: bool,
@@ -95,6 +95,7 @@ impl Config {
             graph_api_key: env_or("GRAPH_API_KEY", ""),
             listen_addr: env_or("LISTEN_ADDR", "0.0.0.0:3001"),
             api_key: env_or("ALAYA_API_KEY", ""),
+            readonly_api_key: env_or("ALAYA_READONLY_API_KEY", ""),
             oidc_issuer: std::env::var("OIDC_ISSUER").ok().filter(|s| !s.is_empty()),
             public_base_url: normalize_public_base_url(&env_or(
                 "PUBLIC_BASE_URL",
@@ -914,7 +915,7 @@ async fn service_worker(
                             let hash_owned = full_hash.to_string();
                             let svc = svc.clone();
                             tokio::task::spawn_local(async move {
-                                enrich_summary(&svc, &hash_owned, &content).await;
+                                svc.enrich_summary(&hash_owned, &content).await;
                             });
                         }
 
@@ -1294,7 +1295,7 @@ async fn service_worker(
 
                         // Generate summaries sequentially (avoid API rate limits)
                         for (hash, content) in &targets {
-                            enrich_summary(&svc, hash, content).await;
+                            svc.enrich_summary(hash, content).await;
                         }
                         tracing::info!(queued, "backfill summaries complete");
                     }
@@ -1312,47 +1313,6 @@ async fn service_worker(
 /// Fire-and-forget summary generation helper.
 /// Called from spawn_local — logs errors, never panics.
 /// Generates summary text AND its embedding for search boosting.
-async fn enrich_summary(svc: &MemoryService, hash: &str, content: &str) {
-    let Some(ref summarizer) = svc.summary else {
-        return;
-    };
-    let h = &hash[..8.min(hash.len())];
-    match summarizer.summarize(content).await {
-        Ok(summary) => {
-            // Embed the summary for search boost (non-fatal if it fails)
-            let summary_embedding = match svc
-                .embeddings
-                .embed_batch(&[summary.as_str()], PromptName::Passage)
-                .await
-            {
-                Ok(mut embs) if !embs.is_empty() => Some(embs.remove(0)),
-                Ok(_) => {
-                    tracing::warn!(hash = h, "summary embedding returned empty (non-fatal)");
-                    None
-                }
-                Err(e) => {
-                    tracing::warn!(hash = h, "summary embedding failed (non-fatal): {e}");
-                    None
-                }
-            };
-
-            let patch = PatchMemoryRequest {
-                summary: Some(summary),
-                summary_embedding,
-                ..Default::default()
-            };
-            if let Err(e) = svc.patch_memory(hash, &patch).await {
-                tracing::warn!(hash = h, "summary patch failed (non-fatal): {e}");
-            } else {
-                tracing::debug!(hash = h, "auto-summary + embedding applied");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(hash = h, "summary generation failed (non-fatal): {e}");
-        }
-    }
-}
-
 fn ms(start: std::time::Instant) -> u64 {
     start.elapsed().as_millis() as u64
 }
@@ -1374,7 +1334,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn truncate_hash(s: &str) -> String {
-    s[..8.min(s.len())].to_string()
+    s[..s.floor_char_boundary(8.min(s.len()))].to_string()
 }
 
 fn log_err(op: &str, e: &alaya_types::AlayaError, start: std::time::Instant) {
@@ -1392,6 +1352,19 @@ fn build_auth_state(config: &Config) -> AuthState {
     } else {
         Some(config.api_key.clone())
     };
+    let readonly_api_key = if config.readonly_api_key.is_empty() {
+        None
+    } else {
+        Some(config.readonly_api_key.clone())
+    };
+
+    // Fail-closed: `authenticate` checks the full key first, so equal keys
+    // would silently resolve the "read-only" bearer to Full. Refuse to start.
+    if let (Some(full), Some(ro)) = (&api_key, &readonly_api_key)
+        && full == ro
+    {
+        panic!("ALAYA_READONLY_API_KEY must differ from ALAYA_API_KEY");
+    }
 
     let oidc = config.oidc_issuer.as_ref().map(|issuer| {
         let audience = format!("{}/mcp", config.public_base_url);
@@ -1404,11 +1377,12 @@ fn build_auth_state(config: &Config) -> AuthState {
     });
 
     // Fail-closed: refuse to start with no auth unless the dev flag is set.
-    if api_key.is_none() && oidc.is_none() {
+    // A readonly key alone counts as configured auth (reads-only deployment).
+    if api_key.is_none() && readonly_api_key.is_none() && oidc.is_none() {
         if !config.allow_unauthenticated {
             panic!(
-                "no auth configured: set ALAYA_API_KEY or OIDC_ISSUER, or \
-                 DANGEROUSLY_ALLOW_UNAUTHENTICATED=true for dev"
+                "no auth configured: set ALAYA_API_KEY, ALAYA_READONLY_API_KEY, \
+                 or OIDC_ISSUER, or DANGEROUSLY_ALLOW_UNAUTHENTICATED=true for dev"
             );
         }
         // The dev-only open mode must never run on a public origin.
@@ -1423,8 +1397,13 @@ fn build_auth_state(config: &Config) -> AuthState {
         tracing::warn!("DANGEROUSLY_ALLOW_UNAUTHENTICATED ignored — auth is configured");
     }
 
+    if readonly_api_key.is_some() {
+        tracing::info!("read-only static bearer enabled (ALAYA_READONLY_API_KEY)");
+    }
+
     AuthState {
         api_key,
+        readonly_api_key,
         allow_unauthenticated: config.allow_unauthenticated,
         oidc,
         public_base_url: config.public_base_url.clone(),
@@ -1763,7 +1742,7 @@ async fn store(
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(params): Json<StoreParams>,
 ) -> (StatusCode, Json<Value>) {
-    let read_only = WritePolicy::for_principal(principal) == WritePolicy::ReadOnly;
+    let read_only = WritePolicy::read_only_for(principal);
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::Store {
@@ -1781,7 +1760,7 @@ async fn search(
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(params): Json<SearchParams>,
 ) -> (StatusCode, Json<Value>) {
-    let read_only = WritePolicy::for_principal(principal) == WritePolicy::ReadOnly;
+    let read_only = WritePolicy::read_only_for(principal);
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::Search {
@@ -2123,6 +2102,20 @@ mod wedge_tests {
     };
     use alaya_types::memory::ScoredMemory;
 
+    /// The log-prefix helper sees caller-supplied hashes before validation
+    /// (get_memory, delete, relation), so it must never byte-slice into a
+    /// multibyte character.
+    #[test]
+    fn truncate_hash_is_char_boundary_safe() {
+        assert_eq!(truncate_hash("abcdefgh0123"), "abcdefgh");
+        assert_eq!(truncate_hash("abc"), "abc");
+        // 'é' spans bytes 7-8: the cut must fall back to the boundary before it.
+        assert_eq!(
+            truncate_hash(&format!("abcdefgé{}", "a".repeat(55))),
+            "abcdefg"
+        );
+    }
+
     /// VectorStorage whose `delete` blackholes — models a backend whose pod
     /// IP vanished without an RST. Every other method panics: the test only
     /// exercises the delete path and the no-op ping.
@@ -2134,6 +2127,17 @@ mod wedge_tests {
             unimplemented!()
         }
         async fn get_by_hash(&self, _content_hash: &str) -> Result<Option<Memory>> {
+            unimplemented!()
+        }
+        async fn exists(&self, _content_hash: &str) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn set_generated_summary(
+            &self,
+            _content_hash: &str,
+            _summary: &str,
+            _summary_embedding: Option<Vec<f32>>,
+        ) -> Result<bool> {
             unimplemented!()
         }
         async fn get_batch(&self, _hashes: &[&str]) -> Result<Vec<Memory>> {
@@ -2482,6 +2486,7 @@ mod wedge_tests {
     fn test_auth_state() -> AuthState {
         AuthState {
             api_key: Some(TEST_KEY.into()),
+            readonly_api_key: None,
             allow_unauthenticated: false,
             oidc: None,
             public_base_url: "http://localhost:3001".into(),
