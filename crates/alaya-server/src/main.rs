@@ -1391,6 +1391,23 @@ fn cors_layer() -> CorsLayer {
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
 }
 
+/// Run the service worker under a supervisor that takes the process down
+/// if it panics. Left to unwind, a panic ends only that thread: the listener
+/// stays bound, every worker-backed request answers 503, and /health reads
+/// progress 0 as "starting" forever, so nothing restarts the pod (#97).
+/// Exiting non-zero needs no probe to act and turns the outage into
+/// CrashLoopBackOff instead of Running 0/1. The shutdown path joins the
+/// returned handle, which returns once the worker has drained normally.
+fn supervise(worker: std::thread::JoinHandle<()>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        if worker.join().is_err() {
+            // The panic hook has already written the reason to stderr.
+            tracing::error!("service worker thread panicked — exiting so the pod restarts");
+            std::process::exit(101);
+        }
+    })
+}
+
 fn main() {
     let config = Config::from_env();
 
@@ -1416,10 +1433,17 @@ fn main() {
         let worker_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let progress_for_worker = worker_progress.clone();
 
+        // Built here, on the main thread, so bad bearer material is a
+        // fail-closed startup panic (non-zero exit) like the auth invariants
+        // below — not a panic inside the worker thread (#97). The value is
+        // the secret being rejected: name the env var, never log it.
+        let graph = GraphHttpClient::new(config.graph_url.clone(), &config.graph_api_key)
+            .expect("GRAPH_API_KEY rejected — must be a single line of visible ASCII");
+
         // Spawn MemoryService on a dedicated thread with LocalSet
         let cfg_clone = config.clone();
 
-        let worker_handle = std::thread::spawn(move || {
+        let worker_handle = supervise(std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1450,10 +1474,7 @@ fn main() {
                     10_000, // L1 max cached embeddings (~40 MB at 1024 dims)
                     l2_cache,
                 );
-                let graph = std::rc::Rc::new(GraphHttpClient::new(
-                    cfg_clone.graph_url,
-                    &cfg_clone.graph_api_key,
-                ));
+                let graph = std::rc::Rc::new(graph);
 
                 let summary: Option<Box<dyn alaya_backends::SummaryProvider>> =
                     if let Some(url) = &cfg_clone.summary_url {
@@ -1500,7 +1521,7 @@ fn main() {
 
                 service_worker(rx, svc, progress_for_worker, WorkerLimits::default()).await;
             });
-        });
+        }));
 
         // Axum on the main multi-threaded runtime
         let handle = ServiceHandle { tx };
@@ -2425,6 +2446,36 @@ mod wedge_tests {
         assert_eq!(v["status"], "degraded");
         assert_eq!(v["worker"]["state"], "starting");
         assert_eq!(v["worker"]["stalled"], false);
+    }
+
+    /// #97: `process::exit` cannot be observed in-process, so the test re-runs
+    /// itself as a child. The child exits 0 if the supervisor merely returns,
+    /// so a broken supervisor cannot masquerade as libtest's own 101.
+    #[test]
+    fn supervisor_exits_process_when_worker_panics() {
+        const CHILD: &str = "ALAYA_SUPERVISOR_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let worker = std::thread::spawn(|| panic!("bootstrap failed before the command loop"));
+            let _ = supervise(worker).join();
+            std::process::exit(0);
+        }
+
+        // A worker that drains normally must NOT take the process down.
+        supervise(std::thread::spawn(|| ())).join().unwrap();
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("wedge_tests::supervisor_exits_process_when_worker_panics")
+            .arg("--exact")
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(101),
+            "supervisor must exit 101 on worker panic"
+        );
     }
 
     // ─── /health split (#77) ────────────────────────────────────────────────
