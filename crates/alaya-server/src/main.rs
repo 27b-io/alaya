@@ -630,28 +630,32 @@ impl HealthChecker {
     async fn check_status(&self) -> Value {
         let start = std::time::Instant::now();
 
-        // Worker stall check first: if stalled, status is "unhealthy"
-        // regardless of Qdrant — skip the network call entirely so k8s
-        // sees the 503 in microseconds, not after a 10s Qdrant timeout.
+        // Skip the Qdrant round trip when the worker is already stalled:
+        // status is "unhealthy" regardless, and k8s should see the 503 in
+        // microseconds, not after a 10s Qdrant timeout.
+        let (_, pre_stalled, _) = self.worker_state();
+        let qdrant_ok = !pre_stalled && self.check_qdrant().await.is_ok();
+        // Re-read after the await: the worker can cross the stall threshold
+        // while Qdrant is slow, and reusing `pre_stalled` would 200 a wedged
+        // pod for one more probe period. (A worker that recovers between the
+        // two reads reports "degraded" without Qdrant probed — 200 either way.)
         let (_, worker_stalled, progress_age) = self.worker_state();
+        let status = Self::status_from(worker_stalled, qdrant_ok);
+
         if worker_stalled {
             tracing::error!(
                 progress_age_s = progress_age,
                 threshold_s = self.stall_threshold.as_secs(),
                 "service worker stalled — reporting unhealthy so the pod gets restarted"
             );
-            return json!({ "status": "unhealthy" });
+        } else {
+            tracing::debug!(
+                op = "health",
+                elapsed_ms = start.elapsed().as_millis(),
+                status,
+                "ok (probe)"
+            );
         }
-
-        let qdrant_health = self.check_qdrant().await;
-        let status = Self::status_from(false, qdrant_health.is_ok());
-
-        tracing::debug!(
-            op = "health",
-            elapsed_ms = start.elapsed().as_millis(),
-            status,
-            "ok (probe)"
-        );
         json!({ "status": status })
     }
 
@@ -2477,6 +2481,39 @@ mod wedge_tests {
         let v = test_checker(0).check_status().await;
         assert_eq!(v["status"], "degraded");
         assert_eq!(v.as_object().unwrap().len(), 1);
+    }
+
+    /// A stall that lands *while* the Qdrant request is in flight must still
+    /// 503: the pre-await worker_state() read (which skips Qdrant when already
+    /// stalled) must not be reused for the verdict.
+    #[tokio::test]
+    async fn bare_probe_rechecks_worker_after_qdrant_await() {
+        let base = test_checker(epoch_secs());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let qdrant_url = format!("http://{}", listener.local_addr().unwrap());
+
+        // Loopback Qdrant wedges the worker while serving the probe's request.
+        // Same bound-then-serve shape as oidc::tests::spawn_idp — no sleep.
+        let wedge = base.worker_progress.clone();
+        let app = Router::new().route(
+            "/collections/test",
+            get(move || {
+                wedge.store(epoch_secs() - 3600, std::sync::atomic::Ordering::Relaxed);
+                std::future::ready(Json(json!({
+                    "result": { "status": "green", "points_count": 0 }
+                })))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let checker = HealthChecker { qdrant_url, ..base };
+        let v = checker.check_status().await;
+
+        assert_eq!(
+            v["status"], "unhealthy",
+            "stall during Qdrant await went unreported"
+        );
+        assert_eq!(v.as_object().unwrap().len(), 1, "bare probe leaked fields");
     }
 
     // ─── /health split (#77) ────────────────────────────────────────────────
