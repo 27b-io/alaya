@@ -73,13 +73,15 @@ struct Config {
     summary_url: Option<String>,
     summary_api_key: Option<String>,
     summary_model: String,
-    /// Contradiction judge (LAB-3283). URL and key fall back to the
+    /// Contradiction judge (LAB-3283, LAB-3895). URL and key fall back to the
     /// SUMMARY_* counterpart; with neither set the engine is disabled. The
     /// model has its own default: summaries are priced for volume, verdicts
-    /// for precision on the golden set.
+    /// for precision on the golden set. `judge_daily_cap` bounds store-path
+    /// judge spend per UTC day (default 1000).
     judge_url: Option<String>,
     judge_api_key: Option<String>,
     judge_model: String,
+    judge_daily_cap: usize,
     rerank_url: Option<String>,
     rerank_api_key: Option<String>,
     rerank_top_n: usize,
@@ -121,6 +123,8 @@ impl Config {
             judge_url: env_opt("JUDGE_URL").or_else(|| env_opt("SUMMARY_URL")),
             judge_api_key: env_opt("JUDGE_API_KEY").or_else(|| env_opt("SUMMARY_API_KEY")),
             judge_model: env_opt("JUDGE_MODEL").unwrap_or_else(|| "claude-sonnet-5".into()),
+            judge_daily_cap: parse_judge_daily_cap(env_opt("JUDGE_DAILY_CAP"))
+                .unwrap_or_else(|e| panic!("{e}")),
             rerank_url: env_opt("RERANK_URL"),
             rerank_api_key: env_opt("RERANK_API_KEY"),
             rerank_top_n: env_or("RERANK_TOP_N", "20")
@@ -844,11 +848,12 @@ impl HealthChecker {
 
 // ─── Service worker ─────────────────────────────────────────────────────────
 
-/// Deadlines the worker applies per command. A struct only so tests can
+/// Deadlines and limits the worker applies per command. A struct only so tests can
 /// shrink them — production always uses `Default` (the consts above).
 struct WorkerLimits {
     cmd: std::time::Duration,
     long: std::time::Duration,
+    judge_daily_cap: usize,
 }
 
 impl Default for WorkerLimits {
@@ -856,6 +861,7 @@ impl Default for WorkerLimits {
         Self {
             cmd: CMD_DEADLINE,
             long: LONG_CMD_DEADLINE,
+            judge_daily_cap: JUDGE_DAILY_CAP_DEFAULT,
         }
     }
 }
@@ -903,6 +909,7 @@ async fn service_worker(
     // deadline cannot run a second pass over the same unjudged pairs.
     let judge_gate = std::rc::Rc::new(tokio::sync::Semaphore::new(JUDGE_CONCURRENCY));
     let backfill_running = std::rc::Rc::new(std::cell::Cell::new(false));
+    let mut judge_limiter = JudgeDailyCap::new(limits.judge_daily_cap);
 
     // First heartbeat: bootstrap is done and the loop is live. Until this
     // stamp the health checker reports the worker as "starting" (progress
@@ -1007,24 +1014,14 @@ async fn service_worker(
                         // Only a genuinely new memory: a re-store re-runs
                         // interference but its edges (and verdicts) already
                         // exist — re-judging would churn and re-bill them.
-                        if !read_only
-                            && svc.judge.is_some()
-                            && !skipped
-                            && r.get("created").and_then(Value::as_bool) == Some(true)
-                            && let Some(new_hash) = r.get("content_hash").and_then(|v| v.as_str())
-                        {
-                            for dst in contradicted_hashes(&r) {
-                                let src = new_hash.to_string();
-                                let svc = svc.clone();
-                                let gate = judge_gate.clone();
-                                tokio::task::spawn_local(async move {
-                                    let Ok(_permit) = gate.acquire().await else {
-                                        return;
-                                    };
-                                    svc.judge_contradiction(&src, &dst).await;
-                                });
-                            }
-                        }
+                        // LAB-3895: store-path judge spend is capped per UTC day.
+                        spawn_store_contradiction_judges(
+                            &svc,
+                            &judge_gate,
+                            &mut judge_limiter,
+                            &r,
+                            read_only,
+                        );
 
                         json!(r)
                     }
@@ -1521,6 +1518,144 @@ fn contradicted_hashes(store_result: &std::collections::HashMap<String, Value>) 
     hashes
 }
 
+/// Default daily cap for store-path judge calls (LAB-3895).
+const JUDGE_DAILY_CAP_DEFAULT: usize = 1000;
+
+fn parse_judge_daily_cap(raw: Option<String>) -> Result<usize, String> {
+    match raw {
+        None => Ok(JUDGE_DAILY_CAP_DEFAULT),
+        Some(s) if s.trim().is_empty() => Ok(JUDGE_DAILY_CAP_DEFAULT),
+        Some(s) => s.trim().parse::<usize>().map_err(|e| {
+            format!("JUDGE_DAILY_CAP must be a non-negative integer (e.g. 1000): {s} ({e})")
+        }),
+    }
+}
+
+/// Returns (year, month, day) in UTC for a given Unix timestamp in seconds.
+/// Implements Howard Hinnant's civil calendar algorithm (pure integer math).
+fn utc_date(epoch_secs: u64) -> (i32, u32, u32) {
+    let days = (epoch_secs / 86400) as i64;
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d)
+}
+
+fn utc_date_str(epoch_secs: u64) -> String {
+    let (y, m, d) = utc_date(epoch_secs);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Tracks store-path contradiction judge calls per UTC day (LAB-3895).
+/// When daily calls reach `cap`, subsequent store-path judge spawns are
+/// skipped so spend is bounded. Operator backfill is not subject to this cap.
+#[derive(Debug, PartialEq, Eq)]
+struct JudgeDailyCap {
+    cap: usize,
+    current_date: String,
+    count: usize,
+    warned: bool,
+}
+
+impl JudgeDailyCap {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            current_date: String::new(),
+            count: 0,
+            warned: false,
+        }
+    }
+
+    /// Try to admit one pair to be judged off the store path at the current system time.
+    fn try_admit(&mut self) -> bool {
+        self.try_admit_at(epoch_secs())
+    }
+
+    /// Try to admit one pair to be judged off the store path at the given unix timestamp (seconds).
+    fn try_admit_at(&mut self, now_secs: u64) -> bool {
+        let today = utc_date_str(now_secs);
+        if self.current_date != today {
+            self.current_date = today;
+            self.count = 0;
+            self.warned = false;
+        }
+
+        if self.count < self.cap {
+            self.count += 1;
+            true
+        } else {
+            if !self.warned {
+                tracing::warn!(
+                    cap = self.cap,
+                    date = %self.current_date,
+                    "judge daily cap of {} reached for {}; skipping store-path contradiction judge spawn",
+                    self.cap,
+                    self.current_date,
+                );
+                self.warned = true;
+            } else {
+                tracing::debug!(
+                    cap = self.cap,
+                    date = %self.current_date,
+                    "judge daily cap reached; skipping store-path contradiction judge spawn"
+                );
+            }
+            false
+        }
+    }
+}
+
+/// Spawns background contradiction judge tasks for new CONTRADICTS signals from a store result,
+/// subject to the daily cap (LAB-3895). Returns the number of judge calls spawned.
+fn spawn_store_contradiction_judges(
+    svc: &std::rc::Rc<MemoryService>,
+    judge_gate: &std::rc::Rc<tokio::sync::Semaphore>,
+    limiter: &mut JudgeDailyCap,
+    result: &std::collections::HashMap<String, Value>,
+    read_only: bool,
+) -> usize {
+    let skipped = result
+        .get("duplicate")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if read_only
+        || svc.judge.is_none()
+        || skipped
+        || result.get("created").and_then(Value::as_bool) != Some(true)
+    {
+        return 0;
+    }
+    let Some(new_hash) = result.get("content_hash").and_then(|v| v.as_str()) else {
+        return 0;
+    };
+
+    let mut spawned = 0;
+    for dst in contradicted_hashes(result) {
+        if !limiter.try_admit() {
+            continue;
+        }
+        let src = new_hash.to_string();
+        let svc = svc.clone();
+        let gate = judge_gate.clone();
+        tokio::task::spawn_local(async move {
+            let Ok(_permit) = gate.acquire().await else {
+                return;
+            };
+            svc.judge_contradiction(&src, &dst).await;
+        });
+        spawned += 1;
+    }
+    spawned
+}
+
 /// In-flight judge calls during a backfill (LAB-3283 AC-5).
 const JUDGE_CONCURRENCY: usize = 4;
 /// Retries on 429 before a pair is counted unjudged (AC-9).
@@ -1903,6 +2038,7 @@ fn main() {
                 origin = log_safe_origin(url).as_str(),
                 model = config.judge_model.as_str(),
                 has_api_key = config.judge_api_key.is_some(),
+                daily_cap = config.judge_daily_cap,
                 "contradiction judge enabled (advisory: annotates CONTRADICTS edges, never writes memories)"
             );
             Some(
@@ -1968,7 +2104,11 @@ fn main() {
                     svc = svc.with_reranker(Box::new(rerank));
                 }
 
-                service_worker(rx, svc, progress_for_worker, WorkerLimits::default()).await;
+                let limits = WorkerLimits {
+                    judge_daily_cap: cfg_clone.judge_daily_cap,
+                    ..WorkerLimits::default()
+                };
+                service_worker(rx, svc, progress_for_worker, limits).await;
             });
         }));
 
@@ -2698,6 +2838,171 @@ mod tests {
         assert_eq!(calls.get(), 1);
     }
 
+    // ─── Daily judge spend cap (LAB-3895 Stage 1b) ─────────────────────────
+
+    #[test]
+    fn parse_judge_daily_cap_defaults_and_validates() {
+        assert_eq!(parse_judge_daily_cap(None).unwrap(), 1000);
+        assert_eq!(parse_judge_daily_cap(Some("".into())).unwrap(), 1000);
+        assert_eq!(parse_judge_daily_cap(Some("  ".into())).unwrap(), 1000);
+        assert_eq!(parse_judge_daily_cap(Some("1000".into())).unwrap(), 1000);
+        assert_eq!(parse_judge_daily_cap(Some("50".into())).unwrap(), 50);
+        assert_eq!(parse_judge_daily_cap(Some("0".into())).unwrap(), 0);
+
+        let err = parse_judge_daily_cap(Some("foo".into())).unwrap_err();
+        assert!(err.contains("JUDGE_DAILY_CAP must be a non-negative integer"));
+        assert!(err.contains("foo"));
+
+        let err = parse_judge_daily_cap(Some("-10".into())).unwrap_err();
+        assert!(err.contains("JUDGE_DAILY_CAP must be a non-negative integer"));
+
+        let err = parse_judge_daily_cap(Some("12.5".into())).unwrap_err();
+        assert!(err.contains("JUDGE_DAILY_CAP must be a non-negative integer"));
+    }
+
+    #[test]
+    fn utc_date_str_computes_civil_calendar_correctly() {
+        // Unix epoch start
+        assert_eq!(utc_date_str(0), "1970-01-01");
+        assert_eq!(utc_date_str(86399), "1970-01-01");
+        assert_eq!(utc_date_str(86400), "1970-01-02");
+        // Leap year 2024-02-29 (1709164800 is 2024-02-29 00:00:00 UTC)
+        assert_eq!(utc_date_str(1709164800), "2024-02-29");
+        assert_eq!(utc_date_str(1709251199), "2024-02-29");
+        assert_eq!(utc_date_str(1709251200), "2024-03-01");
+        // Known date: 2026-09-18
+        assert_eq!(utc_date_str(1789733949), "2026-09-18");
+    }
+
+    #[test]
+    fn judge_daily_cap_cap_reached_and_rollover() {
+        let mut limiter = JudgeDailyCap::new(2);
+        let day1 = 1789733949; // 2026-09-18
+        let day2 = day1 + 86400; // 2026-09-19
+
+        // Day 1: admit 2 items
+        assert!(limiter.try_admit_at(day1));
+        assert_eq!(limiter.count, 1);
+        assert!(!limiter.warned);
+
+        assert!(limiter.try_admit_at(day1));
+        assert_eq!(limiter.count, 2);
+        assert!(!limiter.warned);
+
+        // Day 1: 3rd item hits cap, sets warned = true
+        assert!(!limiter.try_admit_at(day1));
+        assert_eq!(limiter.count, 2);
+        assert!(limiter.warned);
+
+        // Day 1: 4th item is silent, still refused
+        assert!(!limiter.try_admit_at(day1));
+        assert_eq!(limiter.count, 2);
+        assert!(limiter.warned);
+
+        // Day 2 (rollover): counter and warning reset!
+        assert!(limiter.try_admit_at(day2));
+        assert_eq!(limiter.count, 1);
+        assert!(!limiter.warned);
+        assert_eq!(limiter.current_date, "2026-09-19");
+
+        assert!(limiter.try_admit_at(day2));
+        assert_eq!(limiter.count, 2);
+        assert!(!limiter.warned);
+
+        // Day 2: cap reached again, warned fires once for day 2
+        assert!(!limiter.try_admit_at(day2));
+        assert_eq!(limiter.count, 2);
+        assert!(limiter.warned);
+
+        assert!(!limiter.try_admit_at(day2));
+        assert_eq!(limiter.count, 2);
+        assert!(limiter.warned);
+    }
+
+    #[test]
+    fn judge_daily_cap_zero_cap_refuses_immediately() {
+        let mut limiter = JudgeDailyCap::new(0);
+        let now = 1789733949;
+        assert!(!limiter.try_admit_at(now));
+        assert!(limiter.warned);
+        assert!(!limiter.try_admit_at(now));
+    }
+
+    struct StubJudge;
+
+    #[async_trait::async_trait(?Send)]
+    impl alaya_backends::ContradictionJudge for StubJudge {
+        async fn judge(
+            &self,
+            _a: &alaya_types::memory::Memory,
+            _b: &alaya_types::memory::Memory,
+        ) -> alaya_types::Result<alaya_backends::Judgement> {
+            unimplemented!()
+        }
+        fn model_name(&self) -> &str {
+            "stub-judge"
+        }
+    }
+
+    #[tokio::test]
+    async fn store_contradiction_judge_spawn_capped_and_skips_when_exhausted() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let svc = std::rc::Rc::new(
+                    wedge_tests::hanging_service().with_judge(Box::new(StubJudge)),
+                );
+                let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(4));
+                let mut limiter = JudgeDailyCap::new(2);
+
+                let mut r = std::collections::HashMap::new();
+                r.insert("created".to_string(), json!(true));
+                r.insert("content_hash".to_string(), json!("a".repeat(64)));
+                r.insert(
+                    "interference".to_string(),
+                    json!({"contradictions": [
+                        {"existing_hash": "b".repeat(64), "signal_type": "Negation"},
+                        {"existing_hash": "c".repeat(64), "signal_type": "Temporal"}
+                    ]}),
+                );
+
+                // 1. First store: 2 contradicted hashes, cap is 2 -> both admitted and spawned
+                let spawned =
+                    spawn_store_contradiction_judges(&svc, &gate, &mut limiter, &r, false);
+                assert_eq!(spawned, 2);
+                assert_eq!(limiter.count, 2);
+                assert!(!limiter.warned);
+
+                // 2. Second store: cap is now reached -> spawns skipped, pair stays unjudged
+                let spawned2 =
+                    spawn_store_contradiction_judges(&svc, &gate, &mut limiter, &r, false);
+                assert_eq!(spawned2, 0);
+                assert_eq!(limiter.count, 2);
+                assert!(limiter.warned);
+
+                // 3. Under read_only: nothing is ever spawned
+                let mut fresh_limiter = JudgeDailyCap::new(10);
+                let spawned_ro =
+                    spawn_store_contradiction_judges(&svc, &gate, &mut fresh_limiter, &r, true);
+                assert_eq!(spawned_ro, 0);
+                assert_eq!(fresh_limiter.count, 0);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn backfill_ignores_daily_cap() {
+        // Daily cap is 0 (or exhausted)
+        let mut limiter = JudgeDailyCap::new(0);
+        assert!(!limiter.try_admit());
+
+        // Backfill path does not check JudgeDailyCap; backfill_judge processes pairs via the gate alone
+        let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(JUDGE_CONCURRENCY));
+        let svc = wedge_tests::hanging_service();
+        let totals = backfill_judge(&svc, &gate, vec![]).await;
+        assert_eq!(totals, BackfillTotals::default());
+    }
+
     #[test]
     fn cluster_local_accepts_service_dns_and_private_hosts_only() {
         let parse = |u: &str| reqwest::Url::parse(u).unwrap();
@@ -3131,7 +3436,7 @@ mod wedge_tests {
         }
     }
 
-    fn hanging_service() -> MemoryService {
+    pub(super) fn hanging_service() -> MemoryService {
         MemoryService::new(
             Box::new(HangVectors),
             Box::new(StubEmbeddings),
@@ -3157,6 +3462,7 @@ mod wedge_tests {
                 let limits = WorkerLimits {
                     cmd: Duration::from_millis(100),
                     long: Duration::from_millis(200),
+                    ..WorkerLimits::default()
                 };
                 tokio::task::spawn_local(service_worker(
                     rx,

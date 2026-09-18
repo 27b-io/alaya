@@ -121,7 +121,7 @@ Every knob lives in `.env`. The interesting ones:
 | `RERANK_TIMEOUT_MS` | `5000` | Budget per rerank call. Past it the search falls back to RRF order and logs `rerank timed out`; raise it for a CPU reranker. |
 | `OIDC_ISSUER` | empty | Set to your IdP's issuer URL to enable OAuth Resource Server mode. See [MCP quickstart → OAuth](./quickstart-mcp.md#oauth-optional). |
 | `SUMMARY_URL` | empty | Anthropic API origin (`https://api.anthropic.com`, no path — the client appends `/v1/messages`). Set + provide `SUMMARY_API_KEY` to auto-generate one-line summaries. Plain `http://` is accepted only for a cluster-local proxy; anything else is refused at boot. |
-| `JUDGE_URL` / `JUDGE_API_KEY` / `JUDGE_MODEL` | the `SUMMARY_*` values | Contradiction judge: annotates every flagged `CONTRADICTS` pair with an advisory verdict (`contradiction` / `supersession` / `coexist` / `unrelated`). Each falls back to its `SUMMARY_*` counterpart, so setting `SUMMARY_URL` enables both. |
+| `JUDGE_URL` / `JUDGE_API_KEY` / `JUDGE_MODEL` / `JUDGE_DAILY_CAP` | the `SUMMARY_*` values (cap defaults to `1000`) | Contradiction judge: annotates every flagged `CONTRADICTS` pair with an advisory verdict (`contradiction` / `supersession` / `coexist` / `unrelated`). Each endpoint setting falls back to its `SUMMARY_*` counterpart; `JUDGE_DAILY_CAP` caps store-path judge pairs per UTC day (overflow fails closed to `unjudged`, resets on restart). |
 
 The complete list — including the bridge-side variables — lives in `CLAUDE.md` under "Environment Variables".
 

@@ -148,6 +148,7 @@ JUDGE_URL=                               # contradiction judge; URL and key fall
 JUDGE_API_KEY=                           #   (so SUMMARY_URL alone enables the judge). Both unset = judge disabled.
 JUDGE_MODEL=claude-sonnet-5              #   Own default, not SUMMARY_MODEL: Haiku fails the golden-set precision bar.
                                          #   Advisory: verdicts annotate CONTRADICTS edges, never memory payloads.
+JUDGE_DAILY_CAP=1000                     # max store-path judge pairs per UTC day; overflow fails closed to unjudged (resets on restart)
 RERANK_URL=                              # optional — empty disables cross-encoder rerank
 RERANK_API_KEY=                          # optional
 RERANK_TOP_N=20                          # how many RRF candidates to rerank
