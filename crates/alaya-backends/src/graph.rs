@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
@@ -13,7 +14,8 @@ use alaya_types::{
     AlayaError, Result,
     graph::{
         CoAccessPair, Contradiction, ContradictionQuery, ContradictionRef, Direction, Edge,
-        EdgeMeta, EdgeVerdict, GraphStats, Neighbor, SystemRelationType, UserRelationType,
+        EdgeMeta, EdgeVerdict, GraphStats, Neighbor, Resolution, SystemRelationType,
+        UserRelationType,
     },
 };
 
@@ -244,6 +246,15 @@ struct SetVerdictReq<'a> {
     verdict: &'a EdgeVerdict,
 }
 
+#[derive(Serialize)]
+struct SetResolutionReq<'a> {
+    source: &'a str,
+    target: &'a str,
+    resolution: Option<Resolution>,
+    resolved_via: &'a str,
+    resolved_at: f64,
+}
+
 #[derive(Deserialize)]
 struct UpdatedResp {
     updated: bool,
@@ -419,6 +430,16 @@ impl GraphService for GraphHttpClient {
             .await
             .map_err(|e| AlayaError::Graph(e.to_string()))?;
 
+        // The bridge refuses to delete a CONTRADICTS edge that carries a
+        // verdict or a resolution (LAB-3885 AC-6); name the way out so the
+        // server log is actionable (the caller only sees `safe_message`).
+        if resp.status() == StatusCode::CONFLICT {
+            return Err(AlayaError::Validation(
+                "CONTRADICTS edge carries a verdict or resolution and is the queue item's audit \
+                 trail; resolve it (resolve_contradiction / memory_supersede) instead of deleting"
+                    .into(),
+            ));
+        }
         let body: DeletedResp = handle_response(resp).await?;
         Ok(body.deleted)
     }
@@ -507,6 +528,32 @@ impl GraphService for GraphHttpClient {
                 source: src,
                 target: dst,
                 verdict,
+            })
+            .send()
+            .await
+            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+
+        let body: UpdatedResp = handle_response(resp).await?;
+        Ok(body.updated)
+    }
+
+    async fn set_contradiction_resolution(
+        &self,
+        src: &str,
+        dst: &str,
+        resolution: Option<Resolution>,
+        resolved_via: &str,
+        resolved_at: f64,
+    ) -> Result<bool> {
+        let resp = self
+            .client
+            .post(format!("{}/contradictions/resolution", self.base_url))
+            .json(&SetResolutionReq {
+                source: src,
+                target: dst,
+                resolution,
+                resolved_via,
+                resolved_at,
             })
             .send()
             .await

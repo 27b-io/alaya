@@ -23,6 +23,7 @@ Almost every tool below either returns or takes a `content_hash`. Two rules that
 | [`relation`](#relation) | Create / read / delete typed edges between memories | ✓ (`create`/`delete`) |
 | [`memory_supersede`](#memory_supersede) | Mark old memory as superseded by new | ✓ |
 | [`memory_contradictions`](#memory_contradictions) | List contradiction pairs with judge verdicts | |
+| [`resolve_contradiction`](#resolve_contradiction) | Keep both memories of a contradiction pair — non-destructive, reversible | ✓ (edge stamp only) |
 | [`find_duplicates`](#find_duplicates) | Scan for near-duplicate memories | |
 | [`merge_duplicates`](#merge_duplicates) | Supersede a cluster of duplicates in favour of one canonical | ✓ |
 
@@ -171,7 +172,7 @@ Manage typed edges between two memories in the knowledge graph. One tool with th
 |:--|:--|
 | `RELATES_TO` | Generic association. Used by spreading-activation to boost search results. |
 | `PRECEDES` | Temporal ordering — `A PRECEDES B` means A happened before B. |
-| `CONTRADICTS` | Explicit contradiction. Surfaces in `memory_contradictions`. Use `memory_supersede` to resolve. |
+| `CONTRADICTS` | Explicit contradiction. Surfaces in `memory_contradictions`. Resolve with `resolve_contradiction` (keep both) or `memory_supersede` (one memory misleads). `delete` refuses a `CONTRADICTS` edge that already carries a judge verdict or a resolution — it is the queue item and its audit trail. |
 
 **Example (create):**
 
@@ -191,7 +192,7 @@ Manage typed edges between two memories in the knowledge graph. One tool with th
 
 ## `memory_supersede`
 
-Mark `old_id` as superseded by `new_id`. The old memory stays in storage (so the history is auditable) but is filtered out of default `search` results. Use this to resolve a contradiction without losing the old answer.
+Mark `old_id` as superseded by `new_id`. The old memory stays in storage (so the history is auditable) but is filtered out of default `search` results, and every contradiction pair it is in leaves the queue. Use this to resolve a contradiction when one memory misleads. It is the destructive option — there is no un-supersede — so when both memories are true (verdict `coexist`) or the pair is detector noise (`unrelated`), use [`resolve_contradiction`](#resolve_contradiction) instead.
 
 | Param | Type | Required | Default |
 |:--|:--|:-:|:--|
@@ -221,13 +222,13 @@ See [REST: `POST /supersede`](rest-api.md#post-supersede) for the REST equivalen
 
 ## `memory_contradictions`
 
-List pairs of memories the contradiction detector has flagged (via negation, antonym, or temporal cues), each with the LLM judge's advisory verdict. The lexical detector over-fires on same-project progress notes, so triage on `verdict`: `contradiction` and `supersession` are worth a look, `coexist` / `unrelated` are detector noise. Pairs already resolved with `memory_supersede` are hidden by default.
+List pairs of memories the contradiction detector has flagged (via negation, antonym, or temporal cues), each with the LLM judge's advisory verdict. The lexical detector over-fires on same-project progress notes, so triage on `verdict`: `contradiction` and `supersession` are worth a look, `coexist` / `unrelated` are detector noise. Pairs already resolved — by `memory_supersede` or by `resolve_contradiction` — are hidden by default.
 
 | Param | Type | Default | Notes |
 |:--|:--|:--|:--|
 | `limit` | int | `20` | Page size (1–500), newest first. |
 | `offset` | int | `0` | Page cursor — pass back the previous response's `next_offset` until it is `null`. |
-| `include_resolved` | bool | `false` | `true` also returns pairs where one memory is already superseded. Filtered in the graph, so paging always reaches the unresolved pairs. |
+| `include_resolved` | bool | `false` | `true` also returns resolved pairs: one memory superseded, or the pair stamped `keep_both`. Filtered in the graph, so paging always reaches the unresolved pairs. |
 | `verdicts` | string[] | `["contradiction","supersession","unjudged"]` | Only pairs whose verdict is in the list. `unjudged` = not judged yet, or a pair the judge could not classify (`verdict_reason` says why). |
 
 **Returns:** `{ success, pairs: [ ... ], total, next_offset }` where each pair is:
@@ -242,8 +243,44 @@ List pairs of memories the contradiction detector has flagged (via negation, ant
 | `verdict_reason` | One line from the judge; `null` when never judged, `unjudged: <error>` when the judge failed on this pair. |
 | `survivor` | `content_hash` the judge recommends keeping, or `null`. Advisory — pass it to `memory_supersede` yourself. |
 | `verdict_confidence`, `verdict_model`, `judged_at` | Judge self-reported confidence (0–1), model id, epoch seconds. |
+| `resolution`, `resolved_at`, `resolved_via` | `keep_both` stamp from `resolve_contradiction`, when it was set (epoch seconds, server clock) and by whom (`operator:mcp`, `operator:console`, …). All `null` on an unresolved pair. Only visible with `include_resolved: true`. |
 
-The judge never writes to a memory: verdicts live on the graph edge, and resolution stays a human/agent call via `memory_supersede`.
+The judge never writes to a memory: verdicts live on the graph edge, and resolution stays a human/agent call. A pair leaves the default page one of three ways:
+
+| Exit | Verb | Destructive? | Reverse |
+|:--|:--|:-:|:--|
+| Supersede | `memory_supersede` — the loser leaves default search, a `SUPERSEDES` edge is written | yes (audit trail kept) | none — store the memory again |
+| Keep both | `resolve_contradiction` `keep_both` — stamps the edge, both memories stay live | no | `resolve_contradiction` with `resolution: null` |
+| Hidden by filter | default `verdicts` omit `coexist` / `unrelated` — nothing is written | no | pass `verdicts` including them |
+
+---
+
+## `resolve_contradiction`
+
+Resolve a pair from `memory_contradictions` **without superseding or deleting anything**. `resolution: "keep_both"` stamps the pair as settled — both memories are true, or the pair is detector noise — so it leaves the default queue while both memories stay searchable and the judge's verdict stays on the edge. `resolution: null` clears the stamp and the pair returns to the queue. This is the only way to write the stamp: `relation` cannot set it and the judge never touches it, so no agent's ordinary graph write can retire a pair from the human queue.
+
+| Param | Type | Required | Notes |
+|:--|:--|:-:|:--|
+| `memory_a_hash` | string | ✓ | Verbatim from the `memory_contradictions` row — the edge is directed, so the order matters. |
+| `memory_b_hash` | string | ✓ | Verbatim from the same row. |
+| `resolution` | `"keep_both"` \| `null` | ✓ | The key must be present: an omitted key is an invalid-params error, never a silent clear. |
+
+The stamp is recorded as `resolved_via: "operator:mcp"` with a server-set `resolved_at`; the MCP surface does not accept a caller-supplied `resolved_via`. Prefer this over `memory_supersede` for verdict `coexist` or `unrelated`.
+
+**Returns:** `{ success, memory_a_hash, memory_b_hash, resolution, resolved_at, resolved_via }` — the last three `null` after a clear. A pair with no `CONTRADICTS` edge in that direction is a not-found error; nothing is created.
+
+**Example:**
+
+```json
+{
+  "name": "resolve_contradiction",
+  "arguments": {
+    "memory_a_hash": "a3f4...e891",
+    "memory_b_hash": "c0de...beef",
+    "resolution": "keep_both"
+  }
+}
+```
 
 ---
 

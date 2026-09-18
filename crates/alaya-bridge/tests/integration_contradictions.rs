@@ -1,5 +1,6 @@
-//! Integration tests for the contradiction-pair selection Cypher against a
-//! real FalkorDB (LAB-3283 AC-5/AC-6 as amended after review). Skipped when
+//! Integration tests for the contradiction-pair selection and resolution
+//! Cypher against a real FalkorDB (LAB-3283 AC-5/AC-6 as amended after
+//! review; LAB-3885 AC-7 keep_both). Skipped when
 //! `REDIS_URL` is unset. Run locally with a throwaway FalkorDB, e.g.
 //! `podman run -d -p 16380:6379 falkordb/falkordb:v4.18.6` then
 //! `REDIS_URL=redis://localhost:16380 cargo test -p alaya-bridge --test integration_contradictions`.
@@ -8,8 +9,9 @@ mod common;
 
 use alaya_bridge::cypher;
 use alaya_types::graph::{
-    ContradictionQuery, EdgeVerdict, SystemRelationType, UserRelationType, Verdict,
+    ContradictionQuery, EdgeVerdict, Resolution, SystemRelationType, UserRelationType, Verdict,
 };
+use serde_json::{Value, json};
 
 fn hash(i: usize) -> String {
     format!("{i:064x}")
@@ -296,6 +298,218 @@ async fn paging_over_created_at_ties_is_stable_and_complete() -> anyhow::Result<
             "page size {page_size} must reach every edge once"
         );
     }
+
+    ctx.cleanup().await;
+    Ok(())
+}
+
+/// The default queue: `exclude_resolved`, one page of 10.
+async fn default_queue(ctx: &common::TestContext) -> alaya_bridge::FalkorResult {
+    ctx.exec_tuple(cypher::get_all_contradictions(&ContradictionQuery {
+        limit: 10,
+        exclude_resolved: true,
+        ..Default::default()
+    }))
+    .await
+}
+
+/// Every pair (`include_resolved`), one page of 10.
+async fn everything(ctx: &common::TestContext) -> alaya_bridge::FalkorResult {
+    ctx.exec_tuple(cypher::get_all_contradictions(&ContradictionQuery {
+        limit: 10,
+        ..Default::default()
+    }))
+    .await
+}
+
+/// Cells 10..=12 (`e.resolution, e.resolved_at, e.resolved_via`) of the row
+/// whose `a.content_hash` is `a`.
+fn resolution_cells(result: &alaya_bridge::FalkorResult, a: &str) -> (Value, Value, Value) {
+    let row = result
+        .result_set
+        .iter()
+        .find(|r| r[0].as_str() == Some(a))
+        .unwrap_or_else(|| panic!("no row for {a}"));
+    (row[10].clone(), row[11].clone(), row[12].clone())
+}
+
+/// LAB-3885 AC-7: `keep_both` stamps the edge, the default queue drops the
+/// pair, `include_resolved` still lists it with its stamp, and clearing
+/// puts it back. The stamp survives what the store path does to the edge —
+/// a re-store of either endpoint re-runs the detector, which `MERGE`s the
+/// same CONTRADICTS edge (`ON CREATE SET` only) — and a later verdict write
+/// on the same edge. The spec could not prove the MERGE claim on paper;
+/// this is the proof.
+#[tokio::test]
+async fn keep_both_leaves_the_default_queue_survives_merge_and_is_reversible() -> anyhow::Result<()>
+{
+    let Some(ctx) = common::TestContext::new().await else {
+        return Ok(());
+    };
+    seed_pairs(&ctx, 3, 0).await;
+    let (a, b) = (hash(1001), hash(2001));
+
+    // Unresolved: the pair is in the default queue, cells are null.
+    assert_eq!(
+        a_hashes(&default_queue(&ctx).await),
+        [hash(1000), hash(1001), hash(1002)]
+    );
+    assert_eq!(
+        resolution_cells(&everything(&ctx).await, &a),
+        (Value::Null, Value::Null, Value::Null)
+    );
+
+    // Set: MATCH-only, one edge.
+    let r = ctx
+        .exec_tuple(cypher::set_contradiction_resolution(
+            &a,
+            &b,
+            Some(Resolution::KeepBoth),
+            "operator:console",
+            42.0,
+        ))
+        .await;
+    assert_eq!(r.count(), Some(1));
+    assert_eq!(
+        a_hashes(&default_queue(&ctx).await),
+        [hash(1000), hash(1002)],
+        "a kept pair leaves the default queue"
+    );
+    let all = everything(&ctx).await;
+    assert_eq!(
+        a_hashes(&all),
+        [hash(1000), hash(1001), hash(1002)],
+        "include_resolved still lists it"
+    );
+    assert_eq!(
+        resolution_cells(&all, &a),
+        (json!("keep_both"), json!(42.0), json!("operator:console"))
+    );
+    assert_eq!(
+        resolution_cells(&all, &hash(1000)),
+        (Value::Null, Value::Null, Value::Null),
+        "the stamp is per edge"
+    );
+
+    // No-create: stamping a pair with no edge matches nothing and makes nothing.
+    let r = ctx
+        .exec_tuple(cypher::set_contradiction_resolution(
+            &hash(1009),
+            &hash(2009),
+            Some(Resolution::KeepBoth),
+            "operator:console",
+            42.0,
+        ))
+        .await;
+    assert_eq!(r.count(), Some(0));
+    assert_eq!(everything(&ctx).await.result_set.len(), 3);
+
+    // MERGE preservation: the store path re-detects the pair on a re-store
+    // and MERGEs the edge with ON CREATE SET. The stamp — and the original
+    // created_at / confidence — must survive.
+    let r = ctx
+        .exec_tuple(cypher::create_typed_edge(
+            &a,
+            &b,
+            UserRelationType::Contradicts,
+            99.0,
+            Some(0.8),
+        ))
+        .await;
+    assert_eq!(r.count(), Some(1), "MERGE matched the existing edge");
+    let all = everything(&ctx).await;
+    assert_eq!(all.result_set.len(), 3, "MERGE created no second edge");
+    assert_eq!(
+        resolution_cells(&all, &a),
+        (json!("keep_both"), json!(42.0), json!("operator:console")),
+        "re-store MERGE preserves e.resolution*"
+    );
+    let row = all
+        .result_set
+        .iter()
+        .find(|r| r[0].as_str() == Some(a.as_str()))
+        .unwrap();
+    assert_eq!(
+        row[2],
+        json!(0.7),
+        "ON CREATE SET did not fire: confidence kept"
+    );
+    assert_eq!(
+        row[3],
+        json!(1_800_000_000.0 - 1.0),
+        "ON CREATE SET did not fire: created_at kept"
+    );
+
+    // A verdict written after the stamp touches its own namespace only.
+    let r = ctx
+        .exec_tuple(cypher::set_contradiction_verdict(
+            &a,
+            &b,
+            &EdgeVerdict {
+                verdict: Verdict::Coexist,
+                verdict_survivor: None,
+                verdict_reason: "both true".into(),
+                verdict_confidence: 0.9,
+                verdict_model: "model-x".into(),
+                judged_at: 50.0,
+            },
+        ))
+        .await;
+    assert_eq!(r.count(), Some(1));
+    let all = everything(&ctx).await;
+    assert_eq!(
+        resolution_cells(&all, &a),
+        (json!("keep_both"), json!(42.0), json!("operator:console"))
+    );
+    let row = all
+        .result_set
+        .iter()
+        .find(|r| r[0].as_str() == Some(a.as_str()))
+        .unwrap();
+    assert_eq!(row[4], json!("coexist"));
+    assert_eq!(
+        a_hashes(&default_queue(&ctx).await),
+        [hash(1000), hash(1002)],
+        "still resolved after the verdict"
+    );
+
+    // AC-6: the delete guard sees a verdict or a resolution; the bare pair
+    // (1000) is free to delete.
+    let locked = ctx
+        .exec_tuple(cypher::count_locked_contradiction(&a, &b))
+        .await;
+    assert_eq!(locked.count(), Some(1));
+    let free = ctx
+        .exec_tuple(cypher::count_locked_contradiction(&hash(1000), &hash(2000)))
+        .await;
+    assert_eq!(free.count(), Some(0));
+
+    // Clear: all three cells null, the pair is back in the default queue,
+    // the verdict is untouched — and the guard still holds on the verdict.
+    let r = ctx
+        .exec_tuple(cypher::set_contradiction_resolution(&a, &b, None, "", 0.0))
+        .await;
+    assert_eq!(r.count(), Some(1));
+    assert_eq!(
+        a_hashes(&default_queue(&ctx).await),
+        [hash(1000), hash(1001), hash(1002)],
+        "clearing is the reverse path"
+    );
+    let all = everything(&ctx).await;
+    assert_eq!(
+        resolution_cells(&all, &a),
+        (Value::Null, Value::Null, Value::Null)
+    );
+    let row = all
+        .result_set
+        .iter()
+        .find(|r| r[0].as_str() == Some(a.as_str()))
+        .unwrap();
+    assert_eq!(row[4], json!("coexist"), "clear does not touch the verdict");
+    let locked = ctx
+        .exec_tuple(cypher::count_locked_contradiction(&a, &b))
+        .await;
+    assert_eq!(locked.count(), Some(1), "a judged edge stays guarded");
 
     ctx.cleanup().await;
     Ok(())

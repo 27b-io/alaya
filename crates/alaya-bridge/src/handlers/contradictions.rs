@@ -1,4 +1,4 @@
-//! Contradiction handlers — POST /contradictions/{all,for,verdict}
+//! Contradiction handlers — POST /contradictions/{all,for,verdict,resolution}
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use alaya_types::{
-    graph::{Contradiction, ContradictionQuery, EdgeVerdict, Verdict},
+    graph::{Contradiction, ContradictionQuery, EdgeVerdict, Resolution, Verdict},
     memory::validate_content_hash,
 };
 
@@ -31,6 +31,20 @@ pub struct SetVerdictRequest {
     pub target: String,
     #[serde(flatten)]
     pub verdict: EdgeVerdict,
+}
+
+/// `resolution: null` (or absent) clears the stamp; `resolved_via` and
+/// `resolved_at` are then ignored. Explicit fields, not a flattened struct:
+/// a flattened `Option` would read a malformed set as a clear.
+#[derive(Debug, Deserialize)]
+pub struct SetResolutionRequest {
+    pub source: String,
+    pub target: String,
+    pub resolution: Option<Resolution>,
+    #[serde(default)]
+    pub resolved_via: String,
+    #[serde(default)]
+    pub resolved_at: f64,
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -60,12 +74,16 @@ pub async fn all(
         }
         let confidence = row.get(2).and_then(Value::as_f64);
         let created_at = row.get(3).and_then(Value::as_f64);
+        let (resolution, resolved_at, resolved_via) = parse_resolution(row);
         contradictions.push(Contradiction {
             memory_a_hash,
             memory_b_hash,
             confidence,
             created_at,
             verdict: parse_verdict(row),
+            resolution,
+            resolved_at,
+            resolved_via,
         });
     }
 
@@ -95,6 +113,24 @@ fn parse_verdict(row: &[Value]) -> Option<EdgeVerdict> {
     })
 }
 
+/// Columns 10..=12 of a `CONTRADICTION_COLUMNS` row. An unrecognised
+/// `resolution` string reads as unresolved (with its companions dropped),
+/// so a corrupt value puts the pair back in the queue rather than hiding it.
+fn parse_resolution(row: &[Value]) -> (Option<Resolution>, Option<f64>, Option<String>) {
+    let Some(resolution) = row
+        .get(10)
+        .and_then(Value::as_str)
+        .and_then(Resolution::parse)
+    else {
+        return (None, None, None);
+    };
+    (
+        Some(resolution),
+        row.get(11).and_then(Value::as_f64),
+        row.get(12).and_then(Value::as_str).map(str::to_string),
+    )
+}
+
 /// POST /contradictions/verdict
 ///
 /// Annotate an existing `source -> target` CONTRADICTS edge with the judge's
@@ -119,6 +155,39 @@ pub async fn set_verdict(
 
     let (cypher, params, readonly) =
         cypher::set_contradiction_verdict(&req.source, &req.target, &req.verdict);
+    let result = exec_query(&state, &cypher, params, readonly).await?;
+
+    let count = result.count().unwrap_or(0);
+    Ok(Json(json!({ "updated": count > 0 })))
+}
+
+/// POST /contradictions/resolution
+///
+/// Stamp (or clear) the operator's resolution on an existing
+/// `source -> target` CONTRADICTS edge (LAB-3885). MATCH-only: the edge is
+/// never created or deleted, no Memory node and no verdict property is
+/// touched. A set requires a non-empty `resolved_via` and a finite
+/// `resolved_at`. `updated: false` means no such edge exists.
+pub async fn set_resolution(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SetResolutionRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    if !validate_content_hash(&req.source) || !validate_content_hash(&req.target) {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    if req.resolution.is_some()
+        && (req.resolved_via.trim().is_empty() || !req.resolved_at.is_finite())
+    {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let (cypher, params, readonly) = cypher::set_contradiction_resolution(
+        &req.source,
+        &req.target,
+        req.resolution,
+        req.resolved_via.trim(),
+        req.resolved_at,
+    );
     let result = exec_query(&state, &cypher, params, readonly).await?;
 
     let count = result.count().unwrap_or(0);

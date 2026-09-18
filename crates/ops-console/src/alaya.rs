@@ -124,6 +124,26 @@ impl AlayaClient {
         .await
     }
 
+    /// Stamp a CONTRADICTS pair `keep_both` (LAB-3885): non-destructive,
+    /// reversible, leaves the default queue. `resolved_via` is fixed to the
+    /// console's tag — the server records it verbatim.
+    pub async fn keep_both(
+        &self,
+        memory_a_hash: &str,
+        memory_b_hash: &str,
+    ) -> Result<Value, AppError> {
+        self.post(
+            "/contradictions/resolution",
+            json!({
+                "memory_a_hash": memory_a_hash,
+                "memory_b_hash": memory_b_hash,
+                "resolution": "keep_both",
+                "resolved_via": "operator:console",
+            }),
+        )
+        .await
+    }
+
     /// `verdicts = None` lets the server apply its default filter
     /// (contradiction, supersession, unjudged).
     pub async fn contradictions(

@@ -146,6 +146,35 @@ pub struct EdgeVerdict {
     pub judged_at: f64,
 }
 
+/// Operator resolution of a `CONTRADICTS` pair that leaves both memories in
+/// place (LAB-3885). Lives as `e.resolution` / `e.resolved_at` /
+/// `e.resolved_via` on the edge and is written by the dedicated resolution
+/// verb only — never by `relation`, never by the judge — so no open write
+/// path can retire a pair from the human queue. Wire form is snake_case
+/// (`"keep_both"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Resolution {
+    /// Both memories are true and stay searchable; the pair leaves the
+    /// default queue without a supersession. Reversed by clearing.
+    KeepBoth,
+}
+
+impl Resolution {
+    /// Every value an edge may carry.
+    pub const ALL: [Resolution; 1] = [Resolution::KeepBoth];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::KeepBoth => "keep_both",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == s)
+    }
+}
+
 /// Selection for `GraphService::get_all_contradictions` (bridge
 /// `POST /contradictions/all`). Every filter is applied in Cypher, so a
 /// page is a page of *matching* edges — the fix for the LAB-3283 review's
@@ -201,6 +230,16 @@ pub struct Contradiction {
     /// `#[serde(default)]`, or judged pairs silently read as unjudged.
     #[serde(default, flatten, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<EdgeVerdict>,
+    /// Operator resolution (LAB-3885); `None` = unresolved. Plain fields,
+    /// not a flattened struct: a flattened `Option` swallows every
+    /// deserialize error into `None`, which would read a resolved pair as
+    /// unresolved and put it back in the queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<Resolution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_via: Option<String>,
 }
 
 #[cfg(test)]
@@ -236,6 +275,30 @@ mod verdict_wire_tests {
                 .verdict
                 .is_none()
         );
+    }
+
+    #[test]
+    fn resolution_fields_round_trip_beside_the_flattened_verdict() {
+        let bare = pair("");
+        assert_eq!(bare.resolution, None);
+        assert!(!serde_json::to_string(&bare).unwrap().contains("resolution"));
+
+        let kept = pair(
+            r#","verdict":"coexist","resolution":"keep_both","resolved_at":3.0,"resolved_via":"operator:mcp""#,
+        );
+        assert_eq!(kept.resolution, Some(Resolution::KeepBoth));
+        assert_eq!(kept.resolved_at, Some(3.0));
+        assert_eq!(kept.resolved_via.as_deref(), Some("operator:mcp"));
+        assert_eq!(
+            kept.verdict.as_ref().map(|v| v.verdict),
+            Some(Verdict::Coexist)
+        );
+        let back: Contradiction =
+            serde_json::from_str(&serde_json::to_string(&kept).unwrap()).unwrap();
+        assert_eq!(back.resolution, kept.resolution);
+        assert_eq!(back.resolved_via, kept.resolved_via);
+        assert_eq!(Resolution::parse("keep_both"), Some(Resolution::KeepBoth));
+        assert_eq!(Resolution::parse("keep-both"), None);
     }
 }
 
