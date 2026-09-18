@@ -30,6 +30,7 @@ async fn creates_absent_collections_with_cosine_config() {
         .await;
 
     QdrantClient::new(server.uri(), "memories".into(), None)
+        .unwrap()
         .ensure_collection(1024)
         .await
         .expect("ensure succeeds");
@@ -64,6 +65,7 @@ async fn idempotent_when_collection_exists() {
         .await;
 
     QdrantClient::new(server.uri(), "memories".into(), None)
+        .unwrap()
         .ensure_collection(1024)
         .await
         .expect("ensure succeeds");
@@ -84,6 +86,7 @@ async fn main_collection_create_error_propagates() {
         .await;
 
     let result = QdrantClient::new(server.uri(), "memories".into(), None)
+        .unwrap()
         .ensure_collection(1024)
         .await;
     assert!(
@@ -109,6 +112,7 @@ async fn non_404_probe_error_propagates_without_creating() {
         .await;
 
     let result = QdrantClient::new(server.uri(), "memories".into(), None)
+        .unwrap()
         .ensure_collection(1024)
         .await;
     assert!(

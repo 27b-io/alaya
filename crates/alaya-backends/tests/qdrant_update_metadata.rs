@@ -15,7 +15,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const PAYLOAD_PATH: &str = "/collections/memories/points/payload";
 
 fn client_for(server: &MockServer) -> QdrantClient {
-    QdrantClient::new(server.uri(), "memories".into(), None)
+    QdrantClient::new(server.uri(), "memories".into(), None).unwrap()
 }
 
 fn supersede_with_aux() -> MetadataUpdate {

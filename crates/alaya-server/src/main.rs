@@ -1430,6 +1430,53 @@ fn main() {
         let graph = GraphHttpClient::new(config.graph_url.clone(), &config.graph_api_key)
             .expect("GRAPH_API_KEY rejected — must be a single line of visible ASCII");
 
+        let qdrant = QdrantClient::new(
+            config.qdrant_url.clone(),
+            config.qdrant_collection.clone(),
+            config.qdrant_api_key.clone(),
+        )
+        .expect("QDRANT_API_KEY rejected — must be a single line of visible ASCII");
+
+        let summary: Option<SummaryClient> = if let Some(url) = &config.summary_url {
+            tracing::info!(
+                url = url.as_str(),
+                model = config.summary_model.as_str(),
+                has_api_key = config.summary_api_key.is_some(),
+                "summary provider enabled"
+            );
+            Some(
+                SummaryClient::new(
+                    url.clone(),
+                    config.summary_model.clone(),
+                    config.summary_api_key.clone(),
+                )
+                .expect("SUMMARY_API_KEY rejected — must be a single line of visible ASCII"),
+            )
+        } else {
+            tracing::info!("SUMMARY_URL not set — auto-summary disabled");
+            None
+        };
+
+        let rerank: Option<RerankClient> = if let Some(url) = &config.rerank_url {
+            tracing::info!(
+                url = url.as_str(),
+                top_n = config.rerank_top_n,
+                has_api_key = config.rerank_api_key.is_some(),
+                "cross-encoder reranker enabled"
+            );
+            Some(
+                RerankClient::new(
+                    url.clone(),
+                    config.rerank_top_n,
+                    config.rerank_api_key.clone(),
+                )
+                .expect("RERANK_API_KEY rejected — must be a single line of visible ASCII"),
+            )
+        } else {
+            tracing::info!("RERANK_URL not set — cross-encoder rerank disabled");
+            None
+        };
+
         // Spawn MemoryService on a dedicated thread with LocalSet
         let cfg_clone = config.clone();
 
@@ -1441,11 +1488,6 @@ fn main() {
 
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                let qdrant = QdrantClient::new(
-                    cfg_clone.qdrant_url,
-                    cfg_clone.qdrant_collection,
-                    cfg_clone.qdrant_api_key,
-                );
                 // Fresh-deploy bootstrap: create the memory collection if it is
                 // absent so the first write doesn't 404 (#31).
                 ensure_qdrant_collection(&qdrant, cfg_clone.embedding_dimensions).await;
@@ -1467,22 +1509,7 @@ fn main() {
                 let graph = std::rc::Rc::new(graph);
 
                 let summary: Option<Box<dyn alaya_backends::SummaryProvider>> =
-                    if let Some(url) = &cfg_clone.summary_url {
-                        tracing::info!(
-                            url = url.as_str(),
-                            model = cfg_clone.summary_model.as_str(),
-                            has_api_key = cfg_clone.summary_api_key.is_some(),
-                            "summary provider enabled"
-                        );
-                        Some(Box::new(SummaryClient::new(
-                            url.clone(),
-                            cfg_clone.summary_model.clone(),
-                            cfg_clone.summary_api_key.clone(),
-                        )))
-                    } else {
-                        tracing::info!("SUMMARY_URL not set — auto-summary disabled");
-                        None
-                    };
+                    summary.map(|s| Box::new(s) as Box<dyn alaya_backends::SummaryProvider>);
 
                 let mut svc = MemoryService::new(
                     Box::new(qdrant),
@@ -1493,20 +1520,8 @@ fn main() {
                     summary,
                 );
 
-                if let Some(url) = &cfg_clone.rerank_url {
-                    tracing::info!(
-                        url = url.as_str(),
-                        top_n = cfg_clone.rerank_top_n,
-                        has_api_key = cfg_clone.rerank_api_key.is_some(),
-                        "cross-encoder reranker enabled"
-                    );
-                    svc = svc.with_reranker(Box::new(RerankClient::new(
-                        url.clone(),
-                        cfg_clone.rerank_top_n,
-                        cfg_clone.rerank_api_key.clone(),
-                    )));
-                } else {
-                    tracing::info!("RERANK_URL not set — cross-encoder rerank disabled");
+                if let Some(rerank) = rerank {
+                    svc = svc.with_reranker(Box::new(rerank));
                 }
 
                 service_worker(rx, svc, progress_for_worker, WorkerLimits::default()).await;
