@@ -170,6 +170,25 @@ fn host_of(url: &str) -> Option<String> {
     Some(host.to_ascii_lowercase())
 }
 
+/// Scheme + host (+ non-default port) of a provider URL, for startup logs.
+/// Env-supplied URLs may carry credentials in the userinfo
+/// (`https://user:key@host`) or query (`?api_key=…`); logging the raw value
+/// writes them to the log sink (CWE-532). Goes through the WHATWG parser so
+/// userinfo, path, query and fragment are dropped by construction, and keeps
+/// scheme + port so an operator can tell an in-cluster provider from an
+/// external one.
+fn log_safe_origin(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(u) if u.origin().is_tuple() => u.origin().ascii_serialization(),
+        // Parses, but has no scheme://host — e.g. `tei.mcp.svc:8080` with the
+        // scheme forgotten. `null` (the WHATWG opaque-origin serialisation)
+        // would read as "no origin configured".
+        Ok(_) => "<no host>".to_string(),
+        // `url::ParseError` variants are unit-like; Display never echoes input.
+        Err(e) => format!("<unparseable: {e}>"),
+    }
+}
+
 /// True for hosts that are not publicly routable: loopback, RFC1918, or
 /// cluster-internal (`.svc`, `.internal`). Used to forbid the dev-only open
 /// mode on a public origin. Real IP-literal parsing prevents confusable
@@ -1439,7 +1458,7 @@ fn main() {
 
         let summary: Option<SummaryClient> = if let Some(url) = &config.summary_url {
             tracing::info!(
-                url = url.as_str(),
+                origin = log_safe_origin(url).as_str(),
                 model = config.summary_model.as_str(),
                 has_api_key = config.summary_api_key.is_some(),
                 "summary provider enabled"
@@ -1459,7 +1478,7 @@ fn main() {
 
         let rerank: Option<RerankClient> = if let Some(url) = &config.rerank_url {
             tracing::info!(
-                url = url.as_str(),
+                origin = log_safe_origin(url).as_str(),
                 top_n = config.rerank_top_n,
                 has_api_key = config.rerank_api_key.is_some(),
                 "cross-encoder reranker enabled"
@@ -2040,6 +2059,26 @@ mod tests {
         assert_eq!(host_of("http://[::1]:3001/foo"), Some("::1".into()));
         assert_eq!(host_of("http://localhost:8080"), Some("localhost".into()));
         assert_eq!(host_of("not-a-url"), None);
+    }
+
+    #[test]
+    fn log_safe_origin_drops_userinfo_path_and_query() {
+        assert_eq!(
+            log_safe_origin("https://user:s3cret@tei.mcp.svc:8443/v1/rerank?api_key=k3y#f"),
+            "https://tei.mcp.svc:8443"
+        );
+        assert_eq!(
+            log_safe_origin("http://localhost:8080/v1"),
+            "http://localhost:8080"
+        );
+        assert_eq!(
+            log_safe_origin("https://api.openai.com/v1"),
+            "https://api.openai.com"
+        );
+        assert_eq!(log_safe_origin("tei.mcp.svc:8080"), "<no host>");
+        let err = log_safe_origin("not-a-url");
+        assert!(err.starts_with("<unparseable: "), "{err}");
+        assert!(!err.contains("not-a-url"), "{err}");
     }
 
     #[test]
