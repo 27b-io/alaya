@@ -27,7 +27,8 @@ fn skip_unless_backends() -> Option<(String, String)> {
 }
 
 fn build_service(qdrant_url: &str, embedding_url: &str) -> MemoryService {
-    let qdrant = QdrantClient::new(qdrant_url.into(), TEST_COLLECTION.into(), None);
+    let qdrant = QdrantClient::new(qdrant_url.into(), TEST_COLLECTION.into(), None)
+        .expect("no api key is always valid header material");
 
     let embeddings = EmbeddingClient::new(
         embedding_url.into(),

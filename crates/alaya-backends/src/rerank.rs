@@ -15,14 +15,20 @@ pub struct RerankClient {
 }
 
 impl RerankClient {
-    pub fn new(base_url: String, top_n: usize, api_key: Option<String>) -> Self {
+    /// Fails with `Config` on bearer material that is not a valid header
+    /// value (e.g. a trailing newline, #97) or on a client build error. The
+    /// error must never echo `api_key`: `InvalidHeaderValue` carries no
+    /// payload and neither message below interpolates the key.
+    pub fn new(base_url: String, top_n: usize, api_key: Option<String>) -> Result<Self> {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(key) = api_key {
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
-                    .expect("invalid API key characters"),
-            );
+            let val =
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).map_err(|e| {
+                    AlayaError::Config(format!(
+                        "rerank api key is not valid HTTP header material: {e}"
+                    ))
+                })?;
+            headers.insert(reqwest::header::AUTHORIZATION, val);
         }
 
         let builder = Client::builder().default_headers(headers);
@@ -32,13 +38,15 @@ impl RerankClient {
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30));
 
-        let client = builder.build().expect("failed to build reqwest client");
+        let client = builder
+            .build()
+            .map_err(|e| AlayaError::Config(format!("rerank HTTP client: {e}")))?;
 
-        Self {
+        Ok(Self {
             client,
             base_url,
             top_n,
-        }
+        })
     }
 }
 
@@ -127,6 +135,18 @@ struct RerankItem {
 mod tests {
     use super::*;
 
+    /// #97 repro shape: a control character in the bearer. Must be `Config`,
+    /// and the message must not echo the key it is rejecting.
+    #[test]
+    fn new_rejects_control_chars_without_echoing_the_key() {
+        let Err(err) = RerankClient::new("http://tei".into(), 20, Some("abc\n".into())) else {
+            panic!("a control character in the bearer must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(matches!(err, AlayaError::Config(_)), "{msg}");
+        assert!(!msg.contains("abc"), "error echoed the key: {msg}");
+    }
+
     #[test]
     fn parse_rerank_response_remaps_indices() {
         let json = r#"[
@@ -147,7 +167,7 @@ mod tests {
 
     #[test]
     fn top_n_is_returned() {
-        let client = RerankClient::new("http://localhost:8089".to_string(), 20, None);
+        let client = RerankClient::new("http://localhost:8089".to_string(), 20, None).unwrap();
         assert_eq!(client.top_n(), 20);
     }
 
