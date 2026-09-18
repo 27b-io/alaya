@@ -46,7 +46,6 @@ use alaya_backends::{
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{MemoryService, OutputMode, RelationParams, SearchParams, StoreParams};
 use alaya_types::memory::PatchMemoryRequest;
-use alaya_types::search::PromptName;
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -63,6 +62,7 @@ struct Config {
     graph_api_key: String,
     listen_addr: String,
     api_key: String,
+    readonly_api_key: String,
     oidc_issuer: Option<String>,
     public_base_url: String,
     allow_unauthenticated: bool,
@@ -95,6 +95,7 @@ impl Config {
             graph_api_key: env_or("GRAPH_API_KEY", ""),
             listen_addr: env_or("LISTEN_ADDR", "0.0.0.0:3001"),
             api_key: env_or("ALAYA_API_KEY", ""),
+            readonly_api_key: env_or("ALAYA_READONLY_API_KEY", ""),
             oidc_issuer: std::env::var("OIDC_ISSUER").ok().filter(|s| !s.is_empty()),
             public_base_url: normalize_public_base_url(&env_or(
                 "PUBLIC_BASE_URL",
@@ -883,7 +884,7 @@ async fn service_worker(
                             let hash_owned = full_hash.to_string();
                             let svc = svc.clone();
                             tokio::task::spawn_local(async move {
-                                enrich_summary(&svc, &hash_owned, &content).await;
+                                svc.enrich_summary(&hash_owned, &content).await;
                             });
                         }
 
@@ -1263,7 +1264,7 @@ async fn service_worker(
 
                         // Generate summaries sequentially (avoid API rate limits)
                         for (hash, content) in &targets {
-                            enrich_summary(&svc, hash, content).await;
+                            svc.enrich_summary(hash, content).await;
                         }
                         tracing::info!(queued, "backfill summaries complete");
                     }
@@ -1281,47 +1282,6 @@ async fn service_worker(
 /// Fire-and-forget summary generation helper.
 /// Called from spawn_local — logs errors, never panics.
 /// Generates summary text AND its embedding for search boosting.
-async fn enrich_summary(svc: &MemoryService, hash: &str, content: &str) {
-    let Some(ref summarizer) = svc.summary else {
-        return;
-    };
-    let h = &hash[..8.min(hash.len())];
-    match summarizer.summarize(content).await {
-        Ok(summary) => {
-            // Embed the summary for search boost (non-fatal if it fails)
-            let summary_embedding = match svc
-                .embeddings
-                .embed_batch(&[summary.as_str()], PromptName::Passage)
-                .await
-            {
-                Ok(mut embs) if !embs.is_empty() => Some(embs.remove(0)),
-                Ok(_) => {
-                    tracing::warn!(hash = h, "summary embedding returned empty (non-fatal)");
-                    None
-                }
-                Err(e) => {
-                    tracing::warn!(hash = h, "summary embedding failed (non-fatal): {e}");
-                    None
-                }
-            };
-
-            let patch = PatchMemoryRequest {
-                summary: Some(summary),
-                summary_embedding,
-                ..Default::default()
-            };
-            if let Err(e) = svc.patch_memory(hash, &patch).await {
-                tracing::warn!(hash = h, "summary patch failed (non-fatal): {e}");
-            } else {
-                tracing::debug!(hash = h, "auto-summary + embedding applied");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(hash = h, "summary generation failed (non-fatal): {e}");
-        }
-    }
-}
-
 fn ms(start: std::time::Instant) -> u64 {
     start.elapsed().as_millis() as u64
 }
@@ -1343,7 +1303,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn truncate_hash(s: &str) -> String {
-    s[..8.min(s.len())].to_string()
+    s[..s.floor_char_boundary(8.min(s.len()))].to_string()
 }
 
 fn log_err(op: &str, e: &alaya_types::AlayaError, start: std::time::Instant) {
@@ -1361,6 +1321,19 @@ fn build_auth_state(config: &Config) -> AuthState {
     } else {
         Some(config.api_key.clone())
     };
+    let readonly_api_key = if config.readonly_api_key.is_empty() {
+        None
+    } else {
+        Some(config.readonly_api_key.clone())
+    };
+
+    // Fail-closed: `authenticate` checks the full key first, so equal keys
+    // would silently resolve the "read-only" bearer to Full. Refuse to start.
+    if let (Some(full), Some(ro)) = (&api_key, &readonly_api_key)
+        && full == ro
+    {
+        panic!("ALAYA_READONLY_API_KEY must differ from ALAYA_API_KEY");
+    }
 
     let oidc = config.oidc_issuer.as_ref().map(|issuer| {
         let audience = format!("{}/mcp", config.public_base_url);
@@ -1373,11 +1346,12 @@ fn build_auth_state(config: &Config) -> AuthState {
     });
 
     // Fail-closed: refuse to start with no auth unless the dev flag is set.
-    if api_key.is_none() && oidc.is_none() {
+    // A readonly key alone counts as configured auth (reads-only deployment).
+    if api_key.is_none() && readonly_api_key.is_none() && oidc.is_none() {
         if !config.allow_unauthenticated {
             panic!(
-                "no auth configured: set ALAYA_API_KEY or OIDC_ISSUER, or \
-                 DANGEROUSLY_ALLOW_UNAUTHENTICATED=true for dev"
+                "no auth configured: set ALAYA_API_KEY, ALAYA_READONLY_API_KEY, \
+                 or OIDC_ISSUER, or DANGEROUSLY_ALLOW_UNAUTHENTICATED=true for dev"
             );
         }
         // The dev-only open mode must never run on a public origin.
@@ -1392,8 +1366,13 @@ fn build_auth_state(config: &Config) -> AuthState {
         tracing::warn!("DANGEROUSLY_ALLOW_UNAUTHENTICATED ignored — auth is configured");
     }
 
+    if readonly_api_key.is_some() {
+        tracing::info!("read-only static bearer enabled (ALAYA_READONLY_API_KEY)");
+    }
+
     AuthState {
         api_key,
+        readonly_api_key,
         allow_unauthenticated: config.allow_unauthenticated,
         oidc,
         public_base_url: config.public_base_url.clone(),
@@ -1410,6 +1389,23 @@ fn cors_layer() -> CorsLayer {
         )
         .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::OPTIONS])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+}
+
+/// Run the service worker under a supervisor that takes the process down
+/// if it panics. Left to unwind, a panic ends only that thread: the listener
+/// stays bound, every worker-backed request answers 503, and /health reads
+/// progress 0 as "starting" forever, so nothing restarts the pod (#97).
+/// Exiting non-zero needs no probe to act and turns the outage into
+/// CrashLoopBackOff instead of Running 0/1. The shutdown path joins the
+/// returned handle, which returns once the worker has drained normally.
+fn supervise(worker: std::thread::JoinHandle<()>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        if worker.join().is_err() {
+            // The panic hook has already written the reason to stderr.
+            tracing::error!("service worker thread panicked — exiting so the pod restarts");
+            std::process::exit(101);
+        }
+    })
 }
 
 fn main() {
@@ -1437,10 +1433,17 @@ fn main() {
         let worker_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let progress_for_worker = worker_progress.clone();
 
+        // Built here, on the main thread, so bad bearer material is a
+        // fail-closed startup panic (non-zero exit) like the auth invariants
+        // below — not a panic inside the worker thread (#97). The value is
+        // the secret being rejected: name the env var, never log it.
+        let graph = GraphHttpClient::new(config.graph_url.clone(), &config.graph_api_key)
+            .expect("GRAPH_API_KEY rejected — must be a single line of visible ASCII");
+
         // Spawn MemoryService on a dedicated thread with LocalSet
         let cfg_clone = config.clone();
 
-        let worker_handle = std::thread::spawn(move || {
+        let worker_handle = supervise(std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1471,10 +1474,7 @@ fn main() {
                     10_000, // L1 max cached embeddings (~40 MB at 1024 dims)
                     l2_cache,
                 );
-                let graph = std::rc::Rc::new(GraphHttpClient::new(
-                    cfg_clone.graph_url,
-                    &cfg_clone.graph_api_key,
-                ));
+                let graph = std::rc::Rc::new(graph);
 
                 let summary: Option<Box<dyn alaya_backends::SummaryProvider>> =
                     if let Some(url) = &cfg_clone.summary_url {
@@ -1521,7 +1521,7 @@ fn main() {
 
                 service_worker(rx, svc, progress_for_worker, WorkerLimits::default()).await;
             });
-        });
+        }));
 
         // Axum on the main multi-threaded runtime
         let handle = ServiceHandle { tx };
@@ -1732,7 +1732,7 @@ async fn store(
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(params): Json<StoreParams>,
 ) -> (StatusCode, Json<Value>) {
-    let read_only = WritePolicy::for_principal(principal) == WritePolicy::ReadOnly;
+    let read_only = WritePolicy::read_only_for(principal);
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::Store {
@@ -1750,7 +1750,7 @@ async fn search(
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(params): Json<SearchParams>,
 ) -> (StatusCode, Json<Value>) {
-    let read_only = WritePolicy::for_principal(principal) == WritePolicy::ReadOnly;
+    let read_only = WritePolicy::read_only_for(principal);
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::Search {
@@ -2092,6 +2092,20 @@ mod wedge_tests {
     };
     use alaya_types::memory::ScoredMemory;
 
+    /// The log-prefix helper sees caller-supplied hashes before validation
+    /// (get_memory, delete, relation), so it must never byte-slice into a
+    /// multibyte character.
+    #[test]
+    fn truncate_hash_is_char_boundary_safe() {
+        assert_eq!(truncate_hash("abcdefgh0123"), "abcdefgh");
+        assert_eq!(truncate_hash("abc"), "abc");
+        // 'é' spans bytes 7-8: the cut must fall back to the boundary before it.
+        assert_eq!(
+            truncate_hash(&format!("abcdefgé{}", "a".repeat(55))),
+            "abcdefg"
+        );
+    }
+
     /// VectorStorage whose `delete` blackholes — models a backend whose pod
     /// IP vanished without an RST. Every other method panics: the test only
     /// exercises the delete path and the no-op ping.
@@ -2103,6 +2117,17 @@ mod wedge_tests {
             unimplemented!()
         }
         async fn get_by_hash(&self, _content_hash: &str) -> Result<Option<Memory>> {
+            unimplemented!()
+        }
+        async fn exists(&self, _content_hash: &str) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn set_generated_summary(
+            &self,
+            _content_hash: &str,
+            _summary: &str,
+            _summary_embedding: Option<Vec<f32>>,
+        ) -> Result<bool> {
             unimplemented!()
         }
         async fn get_batch(&self, _hashes: &[&str]) -> Result<Vec<Memory>> {
@@ -2423,6 +2448,36 @@ mod wedge_tests {
         assert_eq!(v["worker"]["stalled"], false);
     }
 
+    /// #97: `process::exit` cannot be observed in-process, so the test re-runs
+    /// itself as a child. The child exits 0 if the supervisor merely returns,
+    /// so a broken supervisor cannot masquerade as libtest's own 101.
+    #[test]
+    fn supervisor_exits_process_when_worker_panics() {
+        const CHILD: &str = "ALAYA_SUPERVISOR_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let worker = std::thread::spawn(|| panic!("bootstrap failed before the command loop"));
+            let _ = supervise(worker).join();
+            std::process::exit(0);
+        }
+
+        // A worker that drains normally must NOT take the process down.
+        supervise(std::thread::spawn(|| ())).join().unwrap();
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("wedge_tests::supervisor_exits_process_when_worker_panics")
+            .arg("--exact")
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(101),
+            "supervisor must exit 101 on worker panic"
+        );
+    }
+
     // ─── /health split (#77) ────────────────────────────────────────────────
 
     const TEST_KEY: &str = "test-api-key";
@@ -2430,6 +2485,7 @@ mod wedge_tests {
     fn test_auth_state() -> AuthState {
         AuthState {
             api_key: Some(TEST_KEY.into()),
+            readonly_api_key: None,
             allow_unauthenticated: false,
             oidc: None,
             public_base_url: "http://localhost:3001".into(),

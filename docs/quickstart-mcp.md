@@ -5,7 +5,7 @@ Point a Model Context Protocol client (Claude Code, Claude Desktop, etc.) at a r
 ## You need
 
 - A running Ālaya server reachable at some URL (e.g. `http://localhost:3001` for local docker compose, or `https://alaya.example.com` for a hosted deployment).
-- The `ALAYA_API_KEY` for that server. Auth is fail-closed: the dev Compose opts into open mode on `localhost` (`DANGEROUSLY_ALLOW_UNAUTHENTICATED=true`, refused on any non-private origin), so a local dev box needs no key. Set `ALAYA_API_KEY` before exposing the server — that enables `Authorization: Bearer` auth and disables the dev-open flag.
+- The `ALAYA_API_KEY` for that server — required for mutating tools, and for every tool when `OIDC_ISSUER` is not configured. OAuth-only clients (see Codex below) get the read/additive tool subset without it. Auth is fail-closed: the dev Compose opts into open mode on `localhost` (`DANGEROUSLY_ALLOW_UNAUTHENTICATED=true`, refused on any non-private origin), so a local dev box needs no key. Set `ALAYA_API_KEY` before exposing the server — that enables `Authorization: Bearer` auth and disables the dev-open flag.
 - An MCP client. The examples below are for Claude Code and Claude Desktop.
 
 ## Claude Code
@@ -65,6 +65,20 @@ MCP clients that support OAuth (claude.ai's hosted MCP, for example) will:
 3. Attach the resulting access token as `Authorization: Bearer <token>` on every request.
 
 When `OIDC_ISSUER` is **unset**, the well-known endpoints return `404` and clients fall back to whatever bearer token you give them — typically a fixed `ALAYA_API_KEY`.
+
+### Codex
+
+The [Codex CLI](https://github.com/openai/codex) drives the whole flow itself — point it at the server and it discovers the IdP, registers a client (RFC 7591), and opens the browser login:
+
+```bash
+codex mcp add alaya --url https://your-alaya-host/mcp   # detects OAuth, starts login
+codex mcp login alaya                                   # re-run when the token expires
+```
+
+Two things to get right:
+
+- The URL must use the server's `PUBLIC_BASE_URL` origin. Access tokens are audience-bound to `{PUBLIC_BASE_URL}/mcp` (RFC 8707), so the same server reached via any other hostname rejects the token with `401`.
+- OAuth principals get the read/additive tool subset only: `search`, `get_memory`, `store_memory`, `check_database_health`, `memory_contradictions`, `find_duplicates`. Mutating tools (delete, supersede, merge, …) are denied with a "forbidden for this principal" error — they require the static `ALAYA_API_KEY` bearer.
 
 ## Verify
 
