@@ -39,7 +39,9 @@ fn build_service(qdrant_url: &str, embedding_url: &str) -> MemoryService {
 
     // Graph client — use a stub that returns errors (non-fatal in MemoryService)
     let graph_url = std::env::var("GRAPH_URL").unwrap_or_else(|_| "http://localhost:9999".into());
-    let graph = std::rc::Rc::new(GraphHttpClient::new(graph_url, ""));
+    let graph = std::rc::Rc::new(
+        GraphHttpClient::new(graph_url, "").expect("empty api key is always valid header material"),
+    );
 
     MemoryService::new(
         Box::new(qdrant),
