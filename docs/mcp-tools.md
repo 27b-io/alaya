@@ -172,7 +172,7 @@ Manage typed edges between two memories in the knowledge graph. One tool with th
 |:--|:--|
 | `RELATES_TO` | Generic association. Used by spreading-activation to boost search results. |
 | `PRECEDES` | Temporal ordering — `A PRECEDES B` means A happened before B. |
-| `CONTRADICTS` | Explicit contradiction. Surfaces in `memory_contradictions`. Resolve with `resolve_contradiction` (keep both) or `memory_supersede` (one memory misleads). `delete` refuses a `CONTRADICTS` edge that already carries a judge verdict or a resolution — it is the queue item and its audit trail. |
+| `CONTRADICTS` | Explicit contradiction. Surfaces in `memory_contradictions`. Resolve with `resolve_contradiction` (keep both) or `memory_supersede` (one memory misleads). `delete` refuses a `CONTRADICTS` edge that already carries a judge verdict or a resolution — it is the queue item and its audit trail (`Edge carries a verdict or resolution; resolve it (keep_both / supersede) instead of deleting`). |
 
 **Example (create):**
 
@@ -267,7 +267,7 @@ Resolve a pair from `memory_contradictions` **without superseding or deleting an
 
 The stamp is recorded as `resolved_via: "operator:mcp"` with a server-set `resolved_at`; the MCP surface does not accept a caller-supplied `resolved_via`. Prefer this over `memory_supersede` for verdict `coexist` or `unrelated`.
 
-**Returns:** `{ success, memory_a_hash, memory_b_hash, resolution, resolved_at, resolved_via }` — the last three `null` after a clear. A pair with no `CONTRADICTS` edge in that direction is a not-found error; nothing is created.
+**Returns:** `{ success, memory_a_hash, memory_b_hash, resolution, resolved_at, resolved_via }` — the last three `null` after a clear. A pair with no `CONTRADICTS` edge in that direction returns `{ "success": false, "error": "Resource not found" }`; nothing is created. The stamp sits on the directed edge you named, but the queue treats the pair as resolved when either direction carries one (a re-store of the older memory re-detects the pair the other way round).
 
 **Example:**
 

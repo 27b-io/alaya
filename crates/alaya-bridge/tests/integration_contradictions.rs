@@ -322,14 +322,19 @@ async fn everything(ctx: &common::TestContext) -> alaya_bridge::FalkorResult {
     .await
 }
 
-/// Cells 10..=12 (`e.resolution, e.resolved_at, e.resolved_via`) of the row
-/// whose `a.content_hash` is `a`.
-fn resolution_cells(result: &alaya_bridge::FalkorResult, a: &str) -> (Value, Value, Value) {
-    let row = result
+/// The row whose `a.content_hash` is `a`.
+fn row_for<'r>(result: &'r alaya_bridge::FalkorResult, a: &str) -> &'r [Value] {
+    result
         .result_set
         .iter()
         .find(|r| r[0].as_str() == Some(a))
-        .unwrap_or_else(|| panic!("no row for {a}"));
+        .unwrap_or_else(|| panic!("no row for {a}"))
+}
+
+/// Cells 10..=12 (`e.resolution, e.resolved_at, e.resolved_via`) of the row
+/// whose `a.content_hash` is `a`.
+fn resolution_cells(result: &alaya_bridge::FalkorResult, a: &str) -> (Value, Value, Value) {
+    let row = row_for(result, a);
     (row[10].clone(), row[11].clone(), row[12].clone())
 }
 
@@ -424,11 +429,7 @@ async fn keep_both_leaves_the_default_queue_survives_merge_and_is_reversible() -
         (json!("keep_both"), json!(42.0), json!("operator:console")),
         "re-store MERGE preserves e.resolution*"
     );
-    let row = all
-        .result_set
-        .iter()
-        .find(|r| r[0].as_str() == Some(a.as_str()))
-        .unwrap();
+    let row = row_for(&all, &a);
     assert_eq!(
         row[2],
         json!(0.7),
@@ -461,11 +462,7 @@ async fn keep_both_leaves_the_default_queue_survives_merge_and_is_reversible() -
         resolution_cells(&all, &a),
         (json!("keep_both"), json!(42.0), json!("operator:console"))
     );
-    let row = all
-        .result_set
-        .iter()
-        .find(|r| r[0].as_str() == Some(a.as_str()))
-        .unwrap();
+    let row = row_for(&all, &a);
     assert_eq!(row[4], json!("coexist"));
     assert_eq!(
         a_hashes(&default_queue(&ctx).await),
@@ -473,16 +470,44 @@ async fn keep_both_leaves_the_default_queue_survives_merge_and_is_reversible() -
         "still resolved after the verdict"
     );
 
-    // AC-6: the delete guard sees a verdict or a resolution; the bare pair
-    // (1000) is free to delete.
-    let locked = ctx
-        .exec_tuple(cypher::count_locked_contradiction(&a, &b))
+    // A re-store of the OLDER endpoint re-detects the pair the other way
+    // round: the store path MERGEs a fresh, unstamped (b)->(a) edge. The
+    // pair is settled, so it must stay out of the default queue (panel).
+    let r = ctx
+        .exec_tuple(cypher::create_typed_edge(
+            &b,
+            &a,
+            UserRelationType::Contradicts,
+            99.0,
+            Some(0.7),
+        ))
         .await;
-    assert_eq!(locked.count(), Some(1));
-    let free = ctx
-        .exec_tuple(cypher::count_locked_contradiction(&hash(1000), &hash(2000)))
+    assert_eq!(r.count(), Some(1));
+    let all = everything(&ctx).await;
+    assert_eq!(all.result_set.len(), 4, "the reverse edge exists");
+    assert_eq!(
+        resolution_cells(&all, &b),
+        (Value::Null, Value::Null, Value::Null),
+        "the stamp is per directed edge"
+    );
+    assert_eq!(
+        a_hashes(&default_queue(&ctx).await),
+        [hash(1000), hash(1002)],
+        "a stamp in either direction settles the pair"
+    );
+
+    // AC-6: the delete guard sees a verdict or a resolution; the bare pairs
+    // (1000 -> 2000, and the fresh reverse edge) are free to delete.
+    let guarded = ctx
+        .exec_tuple(cypher::count_judged_or_resolved_contradiction(&a, &b))
         .await;
-    assert_eq!(free.count(), Some(0));
+    assert_eq!(guarded.count(), Some(1));
+    for (s, d) in [(hash(1000), hash(2000)), (b.clone(), a.clone())] {
+        let free = ctx
+            .exec_tuple(cypher::count_judged_or_resolved_contradiction(&s, &d))
+            .await;
+        assert_eq!(free.count(), Some(0), "{s} -> {d}");
+    }
 
     // Clear: all three cells null, the pair is back in the default queue,
     // the verdict is untouched — and the guard still holds on the verdict.
@@ -492,24 +517,20 @@ async fn keep_both_leaves_the_default_queue_survives_merge_and_is_reversible() -
     assert_eq!(r.count(), Some(1));
     assert_eq!(
         a_hashes(&default_queue(&ctx).await),
-        [hash(1000), hash(1001), hash(1002)],
-        "clearing is the reverse path"
+        [hash(1000), hash(1001), hash(1002), hash(2001)],
+        "clearing is the reverse path; the reverse edge (oldest) comes back too"
     );
     let all = everything(&ctx).await;
     assert_eq!(
         resolution_cells(&all, &a),
         (Value::Null, Value::Null, Value::Null)
     );
-    let row = all
-        .result_set
-        .iter()
-        .find(|r| r[0].as_str() == Some(a.as_str()))
-        .unwrap();
+    let row = row_for(&all, &a);
     assert_eq!(row[4], json!("coexist"), "clear does not touch the verdict");
-    let locked = ctx
-        .exec_tuple(cypher::count_locked_contradiction(&a, &b))
+    let guarded = ctx
+        .exec_tuple(cypher::count_judged_or_resolved_contradiction(&a, &b))
         .await;
-    assert_eq!(locked.count(), Some(1), "a judged edge stays guarded");
+    assert_eq!(guarded.count(), Some(1), "a judged edge stays guarded");
 
     ctx.cleanup().await;
     Ok(())

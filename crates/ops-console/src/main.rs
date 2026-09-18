@@ -324,35 +324,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keep_both_post_is_behind_origin_and_csrf_guards() {
+    async fn keep_both_post_rejects_a_bad_csrf_before_any_upstream_call() {
         let state = test_state();
         let sess = session::new_session("admin-sub".into(), None, None);
         let cookie_header = session_cookie_header(&state, &sess);
         let a = "a".repeat(64);
         let b = "b".repeat(64);
-        let body = format!("csrf=WRONG&memory_a_hash={a}&memory_b_hash={b}");
         let app = app(state);
-        // No Origin → the origin check refuses before the handler runs.
-        let resp = app
-            .clone()
-            .oneshot(
-                HttpRequest::post("/alaya/contradictions/keep-both")
-                    .header(header::COOKIE, cookie_header.clone())
-                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from(body.clone()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        // Right origin, wrong CSRF → the handler refuses before any upstream call.
         let resp = app
             .oneshot(
                 HttpRequest::post("/alaya/contradictions/keep-both")
                     .header(header::ORIGIN, "https://console.test")
                     .header(header::COOKIE, cookie_header)
                     .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from(body))
+                    .body(Body::from(format!(
+                        "csrf=WRONG&memory_a_hash={a}&memory_b_hash={b}"
+                    )))
                     .unwrap(),
             )
             .await

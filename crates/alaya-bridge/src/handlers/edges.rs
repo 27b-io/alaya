@@ -255,9 +255,9 @@ pub async fn delete(
     // DELETE that also tells "absent" from "locked" apart.
     if rel == UserRelationType::Contradicts {
         let (cypher, params, readonly) =
-            cypher::count_locked_contradiction(&req.source, &req.target);
-        let locked = exec_query(&state, &cypher, params, readonly).await?;
-        if locked.count().unwrap_or(0) > 0 {
+            cypher::count_judged_or_resolved_contradiction(&req.source, &req.target);
+        let guarded = exec_query(&state, &cypher, params, readonly).await?;
+        if guarded.count().unwrap_or(0) > 0 {
             return Err(StatusCode::CONFLICT);
         }
     }

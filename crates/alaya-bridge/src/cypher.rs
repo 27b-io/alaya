@@ -201,6 +201,22 @@ const CONTRADICTION_COLUMNS: &str = "a.content_hash, b.content_hash, e.confidenc
 /// queue (LAB-3283 review). WHERE fragments are constant strings; every
 /// value travels as a parameter.
 pub fn get_all_contradictions(q: &ContradictionQuery) -> CypherQuery {
+    // The keep_both stamp sits on one directed edge, but a re-store of the
+    // OLDER endpoint re-detects the pair the other way round and MERGEs a
+    // fresh, unstamped (b)->(a) edge (panel, LAB-3885). The pair is settled
+    // either way, so a stamp in either direction keeps it out of the queue.
+    // Compile-time enum constants interpolated, like `cypher_label()` —
+    // never a caller value.
+    let reverse_stamped: String = Resolution::ALL
+        .iter()
+        .map(|r| {
+            format!(
+                "NOT (b)-[:CONTRADICTS {{resolution: '{}'}}]->(a)",
+                r.as_str()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
     let mut clauses: Vec<&str> = Vec::new();
     let mut p = params(&[
         (
@@ -247,6 +263,7 @@ pub fn get_all_contradictions(q: &ContradictionQuery) -> CypherQuery {
         clauses.push(
             "NOT (a)<-[:SUPERSEDES]-() AND NOT (b)<-[:SUPERSEDES]-() AND e.resolution IS NULL",
         );
+        clauses.push(&reverse_stamped);
     }
     let filter = if clauses.is_empty() {
         String::new()
@@ -335,11 +352,11 @@ pub fn set_contradiction_resolution(
     )
 }
 
-/// Count `src -> dst` CONTRADICTS edges that carry a verdict or a
-/// resolution (LAB-3885 AC-6). `POST /edges/delete` refuses such an edge:
-/// it is the queue item and its audit trail, so it is resolved (keep_both
-/// or supersede), never deleted.
-pub fn count_locked_contradiction(src: &str, dst: &str) -> CypherQuery {
+/// Count `src -> dst` CONTRADICTS edges that carry a judge verdict or an
+/// operator resolution (LAB-3885 AC-6). `POST /edges/delete` refuses such
+/// an edge: it is the queue item and its audit trail, so it is resolved
+/// (keep_both or supersede), never deleted.
+pub fn count_judged_or_resolved_contradiction(src: &str, dst: &str) -> CypherQuery {
     let q = "MATCH (a:Memory {content_hash: $src})-[e:CONTRADICTS]->(b:Memory {content_hash: $dst}) \
              WHERE e.verdict IS NOT NULL OR e.resolution IS NOT NULL \
              RETURN count(e)";
@@ -645,11 +662,13 @@ mod tests {
         });
         assert!(c.contains(
             "WHERE e.verdict IN $verdicts AND NOT (a)<-[:SUPERSEDES]-() AND NOT (b)<-[:SUPERSEDES]-() \
-             AND e.resolution IS NULL "
+             AND e.resolution IS NULL AND NOT (b)-[:CONTRADICTS {resolution: 'keep_both'}]->(a) "
         ));
-        // Without the flag neither resolved form is filtered.
+        // Without the flag neither resolved form is filtered (the columns
+        // still carry e.resolution*, so test the clauses, not the word).
         let (c, _, _) = get_all_contradictions(&cq(20));
-        assert!(!c.contains("SUPERSEDES") && !c.contains("e.resolution IS NULL"));
+        assert!(!c.contains("WHERE"));
+        assert!(!c.contains("SUPERSEDES") && !c.contains("{resolution:"));
     }
 
     // resolution operations (LAB-3885)
@@ -699,8 +718,8 @@ mod tests {
     }
 
     #[test]
-    fn count_locked_contradiction_is_a_read_over_verdict_or_resolution() {
-        let (q, p, ro) = count_locked_contradiction(&"a".repeat(64), &"b".repeat(64));
+    fn count_judged_or_resolved_contradiction_is_a_read_over_verdict_or_resolution() {
+        let (q, p, ro) = count_judged_or_resolved_contradiction(&"a".repeat(64), &"b".repeat(64));
         assert!(q.starts_with("MATCH"));
         assert!(q.contains("[e:CONTRADICTS]->"));
         assert!(q.contains("WHERE e.verdict IS NOT NULL OR e.resolution IS NOT NULL"));

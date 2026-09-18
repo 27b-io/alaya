@@ -215,7 +215,7 @@ pub const SHADOW_LOG_TARGET: &str = "alaya::judge";
 
 /// Upper bound on `resolved_via` (LAB-3885): a short principal tag, not a
 /// free-text reason — the reason for a resolution is the verdict's.
-pub const MAX_RESOLVED_VIA_LEN: usize = 128;
+const MAX_RESOLVED_VIA_LEN: usize = 128;
 
 /// Verdict filter applied by `memory_contradictions` when the caller passes
 /// none: genuine conflicts plus pairs the judge has not seen yet. Callers

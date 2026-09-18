@@ -342,7 +342,7 @@ Each pair carries the lexical detector's `confidence` plus the judge's advisory 
 
 ## `POST /contradictions/resolution`
 
-Resolve a pair from `POST /contradictions` **without superseding or deleting anything**. `"keep_both"` stamps the `memory_a_hash -> memory_b_hash` `CONTRADICTS` edge so the pair leaves the default queue while both memories stay searchable and the judge's verdict stays put; `null` clears the stamp and the pair returns. This route is the only writer of the stamp — `POST /relation` cannot set it and the judge never touches it. A `CONTRADICTS` edge carrying a verdict or a resolution also cannot be deleted through `POST /relation` (`delete`): it is the queue item and its audit trail.
+Resolve a pair from `POST /contradictions` **without superseding or deleting anything**. `"keep_both"` stamps the `memory_a_hash -> memory_b_hash` `CONTRADICTS` edge so the pair leaves the default queue while both memories stay searchable and the judge's verdict stays put; `null` clears the stamp and the pair returns. This route is the only writer of the stamp — `POST /relation` cannot set it and the judge never touches it. A `CONTRADICTS` edge carrying a verdict or a resolution also cannot be deleted through `POST /relation` (`delete`): it is the queue item and its audit trail, and the call fails with `Edge carries a verdict or resolution; resolve it (keep_both / supersede) instead of deleting`.
 
 ```http
 POST /contradictions/resolution
@@ -354,10 +354,10 @@ Content-Type: application/json
 | Field | Required | Notes |
 |:--|:-:|:--|
 | `memory_a_hash`, `memory_b_hash` | ✓ | Verbatim from the `POST /contradictions` row — the edge is directed. |
-| `resolution` | ✓ | `"keep_both"` to resolve, `null` to undo. The key must be present: an absent key is a `400`, never a silent clear. |
+| `resolution` | ✓ | `"keep_both"` to resolve, `null` to undo. The key must be present: an absent key is rejected (`422`), never read as a clear. |
 | `resolved_via` | ✓ | Who resolved, recorded verbatim (1–128 chars): `operator:console`, `engine:<run-id>`, … The MCP tool fixes this to `operator:mcp`. |
 
-`resolved_at` is set by the server. Returns `{ "success": true, "memory_a_hash", "memory_b_hash", "resolution", "resolved_at", "resolved_via" }` — the last three `null` after a clear. No `CONTRADICTS` edge in that direction is a not-found error; nothing is created. Mutating — static bearer only.
+`resolved_at` is set by the server. Returns `{ "success": true, "memory_a_hash", "memory_b_hash", "resolution", "resolved_at", "resolved_via" }` — the last three `null` after a clear. No `CONTRADICTS` edge in that direction returns `{ "success": false, "error": "Resource not found" }` (same shape as `/supersede`); nothing is created. The stamp sits on the directed edge you named, but the queue treats the pair as resolved when either direction carries one — a re-store of the older memory re-detects the pair the other way round, and that fresh edge must not undo the operator's call. Mutating — static bearer only.
 
 ## `POST /duplicates/find`
 

@@ -1267,7 +1267,6 @@ async fn service_worker(
                 let _ = reply.send(result);
             }
 
-            // ── Long-running ops: spawned as local tasks to avoid blocking ──
             CmdInner::ResolveContradiction {
                 memory_a_hash,
                 memory_b_hash,
@@ -1319,6 +1318,8 @@ async fn service_worker(
                 };
                 let _ = reply.send(result);
             }
+
+            // ── Long-running ops: spawned as local tasks to avoid blocking ──
             CmdInner::FindDuplicates {
                 threshold,
                 limit,

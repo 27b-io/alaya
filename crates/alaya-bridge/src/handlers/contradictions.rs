@@ -34,16 +34,15 @@ pub struct SetVerdictRequest {
 }
 
 /// `resolution: null` (or absent) clears the stamp; `resolved_via` and
-/// `resolved_at` are then ignored. Explicit fields, not a flattened struct:
-/// a flattened `Option` would read a malformed set as a clear.
+/// `resolved_at` are then ignored but still sent (the server always has
+/// them). Explicit fields, not a flattened struct: a flattened `Option`
+/// would read a malformed set as a clear.
 #[derive(Debug, Deserialize)]
 pub struct SetResolutionRequest {
     pub source: String,
     pub target: String,
     pub resolution: Option<Resolution>,
-    #[serde(default)]
     pub resolved_via: String,
-    #[serde(default)]
     pub resolved_at: f64,
 }
 
@@ -114,8 +113,10 @@ fn parse_verdict(row: &[Value]) -> Option<EdgeVerdict> {
 }
 
 /// Columns 10..=12 of a `CONTRADICTION_COLUMNS` row. An unrecognised
-/// `resolution` string reads as unresolved (with its companions dropped),
-/// so a corrupt value puts the pair back in the queue rather than hiding it.
+/// `resolution` string (only reachable by a direct graph write — every API
+/// path goes through the enum) reads as unresolved here with its companions
+/// dropped; the graph-side queue filter still hides that edge, so it shows
+/// only under `include_resolved`, as `resolution: null`.
 fn parse_resolution(row: &[Value]) -> (Option<Resolution>, Option<f64>, Option<String>) {
     let Some(resolution) = row
         .get(10)
@@ -166,8 +167,8 @@ pub async fn set_verdict(
 /// Stamp (or clear) the operator's resolution on an existing
 /// `source -> target` CONTRADICTS edge (LAB-3885). MATCH-only: the edge is
 /// never created or deleted, no Memory node and no verdict property is
-/// touched. A set requires a non-empty `resolved_via` and a finite
-/// `resolved_at`. `updated: false` means no such edge exists.
+/// touched. A set requires a non-empty `resolved_via`. `updated: false`
+/// means no such edge exists.
 pub async fn set_resolution(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SetResolutionRequest>,
@@ -175,9 +176,7 @@ pub async fn set_resolution(
     if !validate_content_hash(&req.source) || !validate_content_hash(&req.target) {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
-    if req.resolution.is_some()
-        && (req.resolved_via.trim().is_empty() || !req.resolved_at.is_finite())
-    {
+    if req.resolution.is_some() && req.resolved_via.trim().is_empty() {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
 

@@ -431,14 +431,15 @@ impl GraphService for GraphHttpClient {
             .map_err(|e| AlayaError::Graph(e.to_string()))?;
 
         // The bridge refuses to delete a CONTRADICTS edge that carries a
-        // verdict or a resolution (LAB-3885 AC-6); name the way out so the
-        // server log is actionable (the caller only sees `safe_message`).
+        // verdict or a resolution (LAB-3885 AC-6). `Conflict` has its own
+        // safe message, so the caller — not just the log — is told to resolve
+        // the pair instead of deleting it.
         if resp.status() == StatusCode::CONFLICT {
-            return Err(AlayaError::Validation(
-                "CONTRADICTS edge carries a verdict or resolution and is the queue item's audit \
-                 trail; resolve it (resolve_contradiction / memory_supersede) instead of deleting"
-                    .into(),
-            ));
+            return Err(AlayaError::Conflict(format!(
+                "CONTRADICTS {}.. -> {}.. carries a verdict or resolution",
+                &src[..8.min(src.len())],
+                &dst[..8.min(dst.len())]
+            )));
         }
         let body: DeletedResp = handle_response(resp).await?;
         Ok(body.deleted)
