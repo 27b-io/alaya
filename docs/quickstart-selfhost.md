@@ -111,7 +111,7 @@ Every knob lives in `.env`. The interesting ones:
 |:--|:--|:--|
 | `ALAYA_API_KEY` | empty | Bearer token clients must send. Fail-closed: with no credential at all (this, `ALAYA_READONLY_API_KEY`, and `OIDC_ISSUER` empty) the server won't boot unless the dev Compose sets `DANGEROUSLY_ALLOW_UNAUTHENTICATED=true` (localhost only). **Set a static key for any non-local deployment** — a read-only deployment may set just `ALAYA_READONLY_API_KEY`. |
 | `ALAYA_READONLY_API_KEY` | empty | Optional second bearer for headless read-only consumers — pure reads only, `403` on every mutating route (incl. `/store`). Must differ from `ALAYA_API_KEY`. |
-| `GRAPH_API_KEY` | empty | Bridge bearer token. Set if exposing the bridge port. |
+| `GRAPH_API_KEY` | empty | Bridge bearer token. Empty → bridge won't boot unless `DANGEROUSLY_ALLOW_UNAUTHENTICATED=true` (the dev Compose sets it). |
 | `QDRANT_COLLECTION` | `memories_arctic1024` | Name of the collection the server auto-creates at startup. |
 | `TEI_MODEL` | `Snowflake/snowflake-arctic-embed-l-v2.0` | Embedding model. Change this and you'll need a new collection with the matching dimensionality. |
 | `EMBEDDING_DIMENSIONS` | `1024` | Must match `TEI_MODEL`'s output. |
@@ -119,7 +119,8 @@ Every knob lives in `.env`. The interesting ones:
 | `RERANK_URL` | empty | Set to `http://tei-rerank:80` to enable rerank (requires `--profile rerank`). |
 | `RERANK_TOP_N` | `20` | How many top RRF candidates to re-score. |
 | `OIDC_ISSUER` | empty | Set to your IdP's issuer URL to enable OAuth Resource Server mode. See [MCP quickstart → OAuth](./quickstart-mcp.md#oauth-optional). |
-| `SUMMARY_URL` | empty | Set + provide `SUMMARY_API_KEY` to auto-generate one-line summaries via Anthropic's Messages API. |
+| `SUMMARY_URL` | empty | Anthropic API origin (`https://api.anthropic.com`, no path — the client appends `/v1/messages`). Set + provide `SUMMARY_API_KEY` to auto-generate one-line summaries. Plain `http://` is accepted only for a cluster-local proxy; anything else is refused at boot. |
+| `JUDGE_URL` / `JUDGE_API_KEY` / `JUDGE_MODEL` | the `SUMMARY_*` values | Contradiction judge: annotates every flagged `CONTRADICTS` pair with an advisory verdict (`contradiction` / `supersession` / `coexist` / `unrelated`). Each falls back to its `SUMMARY_*` counterpart, so setting `SUMMARY_URL` enables both. |
 
 The complete list — including the bridge-side variables — lives in `CLAUDE.md` under "Environment Variables".
 

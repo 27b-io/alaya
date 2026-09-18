@@ -99,11 +99,17 @@ services:
         BUILT_AT: ${BUILT_AT:-}
     entrypoint: ["/usr/local/bin/alaya-bridge"]
     ports:
-      - "${BRIDGE_PORT:-8080}:8080"
+      # Loopback-only: the bridge runs DANGEROUSLY_ALLOW_UNAUTHENTICATED below.
+      - "127.0.0.1:${BRIDGE_PORT:-8080}:8080"
     environment:
       REDIS_URL: redis://falkordb:6379
       GRAPH_NAME: ${GRAPH_NAME:-memory_graph}
       GRAPH_API_KEY: ${GRAPH_API_KEY:-}
+      # The bridge is FAIL-CLOSED like the server: it refuses to boot with an
+      # empty GRAPH_API_KEY unless this opt-in is set. Local dev only. Set
+      # GRAPH_API_KEY above to a real token to enable auth (which auto-disables
+      # this flag; the server block passes the same key).
+      DANGEROUSLY_ALLOW_UNAUTHENTICATED: ${DANGEROUSLY_ALLOW_UNAUTHENTICATED:-true}
       RUST_LOG: ${RUST_LOG_BRIDGE:-alaya_bridge=info}
     depends_on:
       falkordb:
@@ -119,7 +125,8 @@ services:
     restart: unless-stopped
     entrypoint: ["/usr/local/bin/alaya-server"]
     ports:
-      - "${SERVER_PORT:-3001}:3001"
+      # Loopback-only: the server runs DANGEROUSLY_ALLOW_UNAUTHENTICATED below.
+      - "127.0.0.1:${SERVER_PORT:-3001}:3001"
     environment:
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-memories_arctic1024}
@@ -147,10 +154,17 @@ services:
       RERANK_URL: ${RERANK_URL:-}
       RERANK_API_KEY: ${RERANK_API_KEY:-}
       RERANK_TOP_N: ${RERANK_TOP_N:-20}
-      # Uncomment for auto-summary (requires Anthropic API key):
-      # SUMMARY_URL: https://api.anthropic.com/v1/messages
+      # Uncomment for auto-summary (requires Anthropic API key). Origin only:
+      # the client appends /v1/messages itself.
+      # SUMMARY_URL: https://api.anthropic.com
       # SUMMARY_API_KEY: ${SUMMARY_API_KEY:-}
       # SUMMARY_MODEL: ${SUMMARY_MODEL:-claude-haiku-4-5-20251001}
+      # Contradiction judge (LAB-3283) — URL and key default to their SUMMARY_*
+      # twin, so SUMMARY_URL + SUMMARY_API_KEY enable it too. The model does
+      # not: the judge needs Sonnet-class precision, summaries do not.
+      # JUDGE_URL: ${JUDGE_URL:-}
+      # JUDGE_API_KEY: ${JUDGE_API_KEY:-}
+      # JUDGE_MODEL: ${JUDGE_MODEL:-claude-sonnet-5}
       # OAuth Resource Server (delegated auth via OIDC) — empty disables.
       # See README.md → OAuth section.
       # OIDC_ISSUER: ${OIDC_ISSUER:-}

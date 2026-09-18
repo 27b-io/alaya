@@ -31,6 +31,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/hebbian/strengthen", post(handlers::hebbian::strengthen))
         .route("/contradictions/all", post(handlers::contradictions::all))
         .route(
+            "/contradictions/verdict",
+            post(handlers::contradictions::set_verdict),
+        )
+        .route(
             "/contradictions/for",
             post(handlers::contradictions::for_hashes),
         )
@@ -47,7 +51,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/consolidation/orphans",
             post(handlers::consolidation::orphans),
         )
-        .layer(middleware::from_fn(auth::require_bearer));
+        .layer(middleware::from_fn_with_state(
+            state.auth.clone(),
+            auth::require_bearer,
+        ));
 
     // /health is unauthenticated — merge after auth layer
     Router::new()
