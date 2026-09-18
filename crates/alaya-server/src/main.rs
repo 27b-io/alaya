@@ -849,7 +849,7 @@ impl HealthChecker {
 // ─── Service worker ─────────────────────────────────────────────────────────
 
 /// Deadlines and limits the worker applies per command. A struct only so tests can
-/// shrink them — production always uses `Default` (the consts above).
+/// shrink them — in production, deadlines use Default and judge_daily_cap is passed from Config.
 struct WorkerLimits {
     cmd: std::time::Duration,
     long: std::time::Duration,
@@ -1536,7 +1536,7 @@ fn parse_judge_daily_cap(raw: Option<String>) -> Result<usize, String> {
 fn utc_date(epoch_secs: u64) -> (i32, u32, u32) {
     let days = (epoch_secs / 86400) as i64;
     let z = days + 719468;
-    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let era = z / 146097;
     let doe = (z - era * 146097) as u32;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = (yoe as i64) + era * 400;
@@ -1559,7 +1559,7 @@ fn utc_date_str(epoch_secs: u64) -> String {
 #[derive(Debug, PartialEq, Eq)]
 struct JudgeDailyCap {
     cap: usize,
-    current_date: String,
+    current_day: u64,
     count: usize,
     warned: bool,
 }
@@ -1568,7 +1568,7 @@ impl JudgeDailyCap {
     fn new(cap: usize) -> Self {
         Self {
             cap,
-            current_date: String::new(),
+            current_day: u64::MAX,
             count: 0,
             warned: false,
         }
@@ -1581,9 +1581,9 @@ impl JudgeDailyCap {
 
     /// Try to admit one pair to be judged off the store path at the given unix timestamp (seconds).
     fn try_admit_at(&mut self, now_secs: u64) -> bool {
-        let today = utc_date_str(now_secs);
-        if self.current_date != today {
-            self.current_date = today;
+        let day = now_secs / 86400;
+        if self.current_day != day {
+            self.current_day = day;
             self.count = 0;
             self.warned = false;
         }
@@ -1592,19 +1592,20 @@ impl JudgeDailyCap {
             self.count += 1;
             true
         } else {
+            let date = utc_date_str(now_secs);
             if !self.warned {
                 tracing::warn!(
                     cap = self.cap,
-                    date = %self.current_date,
+                    date = %date,
                     "judge daily cap of {} reached for {}; skipping store-path contradiction judge spawn",
                     self.cap,
-                    self.current_date,
+                    date,
                 );
                 self.warned = true;
             } else {
                 tracing::debug!(
                     cap = self.cap,
-                    date = %self.current_date,
+                    date = %date,
                     "judge daily cap reached; skipping store-path contradiction judge spawn"
                 );
             }
@@ -2903,7 +2904,7 @@ mod tests {
         assert!(limiter.try_admit_at(day2));
         assert_eq!(limiter.count, 1);
         assert!(!limiter.warned);
-        assert_eq!(limiter.current_date, "2026-09-19");
+        assert_eq!(limiter.current_day, day2 / 86400);
 
         assert!(limiter.try_admit_at(day2));
         assert_eq!(limiter.count, 2);
