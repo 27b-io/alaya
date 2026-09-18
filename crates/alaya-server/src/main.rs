@@ -40,7 +40,7 @@ use alaya_backends::{
     graph::GraphHttpClient,
     graph_ref::{ConsolidationRef, GraphRef, HebbianRef},
     qdrant::QdrantClient,
-    rerank::RerankClient,
+    rerank::{HostedRerankClient, RerankClient},
     summary::SummaryClient,
 };
 use alaya_core::deduplication::CanonicalStrategy;
@@ -72,6 +72,8 @@ struct Config {
     rerank_url: Option<String>,
     rerank_api_key: Option<String>,
     rerank_top_n: usize,
+    rerank_provider: String,
+    rerank_model: Option<String>,
 }
 
 impl Config {
@@ -115,6 +117,8 @@ impl Config {
             rerank_top_n: env_or("RERANK_TOP_N", "20")
                 .parse()
                 .expect("RERANK_TOP_N must be a number"),
+            rerank_provider: env_or("RERANK_PROVIDER", "tei"),
+            rerank_model: std::env::var("RERANK_MODEL").ok().filter(|s| !s.is_empty()),
         }
     }
 }
@@ -1506,15 +1510,37 @@ fn main() {
                 if let Some(url) = &cfg_clone.rerank_url {
                     tracing::info!(
                         url = url.as_str(),
+                        provider = cfg_clone.rerank_provider.as_str(),
                         top_n = cfg_clone.rerank_top_n,
                         has_api_key = cfg_clone.rerank_api_key.is_some(),
                         "cross-encoder reranker enabled"
                     );
-                    svc = svc.with_reranker(Box::new(RerankClient::new(
-                        url.clone(),
-                        cfg_clone.rerank_top_n,
-                        cfg_clone.rerank_api_key.clone(),
-                    )));
+                    let reranker: Box<dyn alaya_backends::RerankingService> =
+                        match cfg_clone.rerank_provider.as_str() {
+                            // LAB-3831 throwaway A/B arm: Cohere-family hosted vendor
+                            // (Voyage / Cohere / Jina / LiteLLM). RERANK_URL is the full
+                            // endpoint, e.g. https://api.voyageai.com/v1/rerank.
+                            "hosted" => Box::new(HostedRerankClient::new(
+                                url.clone(),
+                                cfg_clone
+                                    .rerank_model
+                                    .clone()
+                                    .expect("RERANK_MODEL is required when RERANK_PROVIDER=hosted"),
+                                cfg_clone.rerank_top_n,
+                                cfg_clone.rerank_api_key.as_deref().expect(
+                                    "RERANK_API_KEY is required when RERANK_PROVIDER=hosted",
+                                ),
+                            )),
+                            "tei" => Box::new(RerankClient::new(
+                                url.clone(),
+                                cfg_clone.rerank_top_n,
+                                cfg_clone.rerank_api_key.clone(),
+                            )),
+                            other => {
+                                panic!("RERANK_PROVIDER must be 'tei' or 'hosted', got {other:?}")
+                            }
+                        };
+                    svc = svc.with_reranker(reranker);
                 } else {
                     tracing::info!("RERANK_URL not set — cross-encoder rerank disabled");
                 }
