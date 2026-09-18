@@ -20,7 +20,7 @@ const PAYLOAD_DELETE_PATH: &str = "/collections/memories/points/payload/delete";
 const POINTS_DELETE_PATH: &str = "/collections/memories/points/delete";
 
 fn client_for(server: &MockServer) -> QdrantClient {
-    QdrantClient::new(server.uri(), "memories".into(), None)
+    QdrantClient::new(server.uri(), "memories".into(), None).unwrap()
 }
 
 /// The caller's view of the memory on (re-)store: fresh history, new

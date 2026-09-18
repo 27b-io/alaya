@@ -202,20 +202,22 @@ fn host_of(url: &str) -> Option<String> {
     Some(host.to_ascii_lowercase())
 }
 
-/// `url` reduced to scheme, host, port and path for log lines: userinfo, query
-/// and fragment are dropped, since a configured endpoint may carry a credential
-/// in any of them. Something that does not parse cannot be redacted, so it is
-/// not echoed either.
-fn redact_url(url: &str) -> String {
+/// Scheme + host (+ non-default port) of a provider URL, for startup logs.
+/// Env-supplied URLs may carry credentials in the userinfo
+/// (`https://user:key@host`) or query (`?api_key=…`); logging the raw value
+/// writes them to the log sink (CWE-532). Goes through the WHATWG parser so
+/// userinfo, path, query and fragment are dropped by construction, and keeps
+/// scheme + port so an operator can tell an in-cluster provider from an
+/// external one.
+fn log_safe_origin(url: &str) -> String {
     match reqwest::Url::parse(url) {
-        Ok(mut u) => {
-            let _ = u.set_username("");
-            let _ = u.set_password(None);
-            u.set_query(None);
-            u.set_fragment(None);
-            u.to_string()
-        }
-        Err(_) => "<unparseable>".to_string(),
+        Ok(u) if u.origin().is_tuple() => u.origin().ascii_serialization(),
+        // Parses, but has no scheme://host — e.g. `tei.mcp.svc:8080` with the
+        // scheme forgotten. `null` (the WHATWG opaque-origin serialisation)
+        // would read as "no origin configured".
+        Ok(_) => "<no host>".to_string(),
+        // `url::ParseError` variants are unit-like; Display never echoes input.
+        Err(e) => format!("<unparseable: {e}>"),
     }
 }
 
@@ -379,17 +381,7 @@ async fn init_l2_cache() -> Option<cachekit::CacheKit> {
     };
     match init {
         Ok(ck) => {
-            // Key-cutover announcement (LAB-372): interop/v1 keys replaced the
-            // legacy SHA-256 keys on 2026-08-08, invalidating the warm cache.
-            // Legacy entries (namespaced `alaya:embed:<model>:<dims>:<sha256>`)
-            // are orphaned and expire via their 30-day TTL; flush them to
-            // reclaim memory sooner (command in CLAUDE.md). One-time re-embed
-            // cost until the cache re-warms. Log removable after 2026-09-08.
-            tracing::info!(
-                backend = %backend,
-                "L2 embedding cache enabled — keys are cross-SDK interop/v1; legacy \
-                 SHA-256 entries are orphaned and expire via TTL (cutover 2026-08-08, LAB-372)"
-            );
+            tracing::info!(backend = %backend, "L2 embedding cache enabled");
             Some(ck)
         }
         Err(e) => {
@@ -1743,6 +1735,23 @@ fn cors_layer() -> CorsLayer {
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
 }
 
+/// Run the service worker under a supervisor that takes the process down
+/// if it panics. Left to unwind, a panic ends only that thread: the listener
+/// stays bound, every worker-backed request answers 503, and /health reads
+/// progress 0 as "starting" forever, so nothing restarts the pod (#97).
+/// Exiting non-zero needs no probe to act and turns the outage into
+/// CrashLoopBackOff instead of Running 0/1. The shutdown path joins the
+/// returned handle, which returns once the worker has drained normally.
+fn supervise(worker: std::thread::JoinHandle<()>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        if worker.join().is_err() {
+            // The panic hook has already written the reason to stderr.
+            tracing::error!("service worker thread panicked — exiting so the pod restarts");
+            std::process::exit(101);
+        }
+    })
+}
+
 fn main() {
     let config = Config::from_env();
 
@@ -1768,10 +1777,84 @@ fn main() {
         let worker_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let progress_for_worker = worker_progress.clone();
 
+        // Built here, on the main thread, so bad bearer material is a
+        // fail-closed startup panic (non-zero exit) like the auth invariants
+        // below — not a panic inside the worker thread (#97). The value is
+        // the secret being rejected: name the env var, never log it.
+        let graph = GraphHttpClient::new(config.graph_url.clone(), &config.graph_api_key)
+            .expect("GRAPH_API_KEY rejected — must be a single line of visible ASCII");
+
+        let qdrant = QdrantClient::new(
+            config.qdrant_url.clone(),
+            config.qdrant_collection.clone(),
+            config.qdrant_api_key.clone(),
+        )
+        .expect("QDRANT_API_KEY rejected — must be a single line of visible ASCII");
+
+        let summary: Option<SummaryClient> = if let Some(url) = &config.summary_url {
+            tracing::info!(
+                origin = log_safe_origin(url).as_str(),
+                model = config.summary_model.as_str(),
+                has_api_key = config.summary_api_key.is_some(),
+                "summary provider enabled"
+            );
+            Some(
+                SummaryClient::new(
+                    url.clone(),
+                    config.summary_model.clone(),
+                    config.summary_api_key.clone(),
+                )
+                .expect("SUMMARY_API_KEY rejected — must be a single line of visible ASCII"),
+            )
+        } else {
+            tracing::info!("SUMMARY_URL not set — auto-summary disabled");
+            None
+        };
+
+        let rerank: Option<RerankClient> = if let Some(url) = &config.rerank_url {
+            tracing::info!(
+                origin = log_safe_origin(url).as_str(),
+                top_n = config.rerank_top_n,
+                has_api_key = config.rerank_api_key.is_some(),
+                "cross-encoder reranker enabled"
+            );
+            Some(
+                RerankClient::new(
+                    url.clone(),
+                    config.rerank_top_n,
+                    config.rerank_api_key.clone(),
+                )
+                .expect("RERANK_API_KEY rejected — must be a single line of visible ASCII"),
+            )
+        } else {
+            tracing::info!("RERANK_URL not set — cross-encoder rerank disabled");
+            None
+        };
+
+        let judge: Option<JudgeClient> = if let Some(url) = &config.judge_url {
+            tracing::info!(
+                origin = log_safe_origin(url).as_str(),
+                model = config.judge_model.as_str(),
+                has_api_key = config.judge_api_key.is_some(),
+                "contradiction judge enabled (advisory: annotates CONTRADICTS edges, never writes memories)"
+            );
+            Some(
+                JudgeClient::new(
+                    url.clone(),
+                    config.judge_model.clone(),
+                    config.judge_api_key.clone(),
+                )
+                .expect("JUDGE_API_KEY rejected — must be a single line of visible ASCII"),
+            )
+        } else {
+            tracing::info!("JUDGE_URL/SUMMARY_URL not set — contradiction judge disabled");
+            None
+        };
+
         // Spawn MemoryService on a dedicated thread with LocalSet
         let cfg_clone = config.clone();
 
-        let worker_handle = std::thread::spawn(move || {
+        let worker_handle = supervise(std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1779,11 +1862,6 @@ fn main() {
 
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                let qdrant = QdrantClient::new(
-                    cfg_clone.qdrant_url,
-                    cfg_clone.qdrant_collection,
-                    cfg_clone.qdrant_api_key,
-                );
                 // Fresh-deploy bootstrap: create the memory collection if it is
                 // absent so the first write doesn't 404 (#31).
                 ensure_qdrant_collection(&qdrant, cfg_clone.embedding_dimensions).await;
@@ -1802,28 +1880,10 @@ fn main() {
                     10_000, // L1 max cached embeddings (~40 MB at 1024 dims)
                     l2_cache,
                 );
-                let graph = std::rc::Rc::new(GraphHttpClient::new(
-                    cfg_clone.graph_url,
-                    &cfg_clone.graph_api_key,
-                ));
+                let graph = std::rc::Rc::new(graph);
 
                 let summary: Option<Box<dyn alaya_backends::SummaryProvider>> =
-                    if let Some(url) = &cfg_clone.summary_url {
-                        tracing::info!(
-                            url = %redact_url(url),
-                            model = cfg_clone.summary_model.as_str(),
-                            has_api_key = cfg_clone.summary_api_key.is_some(),
-                            "summary provider enabled"
-                        );
-                        Some(Box::new(SummaryClient::new(
-                            url.clone(),
-                            cfg_clone.summary_model.clone(),
-                            cfg_clone.summary_api_key.clone(),
-                        )))
-                    } else {
-                        tracing::info!("SUMMARY_URL not set — auto-summary disabled");
-                        None
-                    };
+                    summary.map(|s| Box::new(s) as Box<dyn alaya_backends::SummaryProvider>);
 
                 let mut svc = MemoryService::new(
                     Box::new(qdrant),
@@ -1834,52 +1894,16 @@ fn main() {
                     summary,
                 );
 
-                if let Some(url) = &cfg_clone.judge_url {
-                    tracing::info!(
-                        url = %redact_url(url),
-                        model = cfg_clone.judge_model.as_str(),
-                        has_api_key = cfg_clone.judge_api_key.is_some(),
-                        "contradiction judge enabled (advisory: annotates CONTRADICTS edges, never writes memories)"
-                    );
-                    svc = svc.with_judge(Box::new(JudgeClient::new(
-                        url.clone(),
-                        cfg_clone.judge_model.clone(),
-                        cfg_clone.judge_api_key.clone(),
-                    )));
-                } else {
-                    tracing::info!("JUDGE_URL/SUMMARY_URL not set — contradiction judge disabled");
+                if let Some(judge) = judge {
+                    svc = svc.with_judge(Box::new(judge));
                 }
-
-                if let Some(url) = &cfg_clone.rerank_url {
-                    tracing::info!(
-                        url = %redact_url(url),
-                        top_n = cfg_clone.rerank_top_n,
-                        has_api_key = cfg_clone.rerank_api_key.is_some(),
-                        "cross-encoder reranker enabled"
-                    );
-                    svc = svc.with_reranker(Box::new(RerankClient::new(
-                        url.clone(),
-                        cfg_clone.rerank_top_n,
-                        cfg_clone.rerank_api_key.clone(),
-                    )));
-                } else {
-                    tracing::info!("RERANK_URL not set — cross-encoder rerank disabled");
+                if let Some(rerank) = rerank {
+                    svc = svc.with_reranker(Box::new(rerank));
                 }
 
                 service_worker(rx, svc, progress_for_worker, WorkerLimits::default()).await;
             });
-        });
-
-        // A worker panic must take the process down. Left to unwind, it ends
-        // only that thread: the listener stays bound, every worker-backed
-        // request answers 503, and /health reads progress 0 as "starting"
-        // forever, so nothing restarts the pod. The shutdown path joins this
-        // supervisor, which returns once the worker has drained.
-        let worker_handle = std::thread::spawn(move || {
-            if worker_handle.join().is_err() {
-                std::process::exit(101);
-            }
-        });
+        }));
 
         // Axum on the main multi-threaded runtime
         let handle = ServiceHandle { tx };
@@ -2610,25 +2634,32 @@ mod tests {
     }
 
     #[test]
-    fn redact_url_keeps_scheme_host_port_path_only() {
-        assert_eq!(
-            redact_url("http://u:p@anthropic-lb:8082/v1?api_key=s3cret#tok"),
-            "http://anthropic-lb:8082/v1"
-        );
-        assert_eq!(
-            redact_url("HTTPS://api.anthropic.com"),
-            "https://api.anthropic.com/"
-        );
-        assert_eq!(redact_url("not a url"), "<unparseable>");
-    }
-
-    #[test]
     fn host_of_strips_port_and_unwraps_ipv6_brackets() {
         assert_eq!(host_of("https://id.27b.io"), Some("id.27b.io".into()));
         assert_eq!(host_of("https://id.27b.io:8443"), Some("id.27b.io".into()));
         assert_eq!(host_of("http://[::1]:3001/foo"), Some("::1".into()));
         assert_eq!(host_of("http://localhost:8080"), Some("localhost".into()));
         assert_eq!(host_of("not-a-url"), None);
+    }
+
+    #[test]
+    fn log_safe_origin_drops_userinfo_path_and_query() {
+        assert_eq!(
+            log_safe_origin("https://user:s3cret@tei.mcp.svc:8443/v1/rerank?api_key=k3y#f"),
+            "https://tei.mcp.svc:8443"
+        );
+        assert_eq!(
+            log_safe_origin("http://localhost:8080/v1"),
+            "http://localhost:8080"
+        );
+        assert_eq!(
+            log_safe_origin("https://api.openai.com/v1"),
+            "https://api.openai.com"
+        );
+        assert_eq!(log_safe_origin("tei.mcp.svc:8080"), "<no host>");
+        let err = log_safe_origin("not-a-url");
+        assert!(err.starts_with("<unparseable: "), "{err}");
+        assert!(!err.contains("not-a-url"), "{err}");
     }
 
     #[test]
@@ -3051,6 +3082,36 @@ mod wedge_tests {
         assert_eq!(v["status"], "degraded");
         assert_eq!(v["worker"]["state"], "starting");
         assert_eq!(v["worker"]["stalled"], false);
+    }
+
+    /// #97: `process::exit` cannot be observed in-process, so the test re-runs
+    /// itself as a child. The child exits 0 if the supervisor merely returns,
+    /// so a broken supervisor cannot masquerade as libtest's own 101.
+    #[test]
+    fn supervisor_exits_process_when_worker_panics() {
+        const CHILD: &str = "ALAYA_SUPERVISOR_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let worker = std::thread::spawn(|| panic!("bootstrap failed before the command loop"));
+            let _ = supervise(worker).join();
+            std::process::exit(0);
+        }
+
+        // A worker that drains normally must NOT take the process down.
+        supervise(std::thread::spawn(|| ())).join().unwrap();
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("wedge_tests::supervisor_exits_process_when_worker_panics")
+            .arg("--exact")
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(101),
+            "supervisor must exit 101 on worker panic"
+        );
     }
 
     // ─── /health split (#77) ────────────────────────────────────────────────

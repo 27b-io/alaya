@@ -27,11 +27,18 @@ pub struct GraphHttpClient {
 }
 
 impl GraphHttpClient {
-    pub fn new(base_url: String, api_key: &str) -> Self {
+    /// Fails with `Config` on bearer material that is not a valid header
+    /// value (e.g. a trailing newline, #97) or on a client build error. The
+    /// error must never echo `api_key`: `InvalidHeaderValue` carries no
+    /// payload and neither message below interpolates the key.
+    pub fn new(base_url: String, api_key: &str) -> Result<Self> {
         let mut headers = HeaderMap::new();
         if !api_key.is_empty() {
-            let val = HeaderValue::from_str(&format!("Bearer {api_key}"))
-                .expect("invalid api_key for HTTP header");
+            let val = HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
+                AlayaError::Config(format!(
+                    "graph api key is not valid HTTP header material: {e}"
+                ))
+            })?;
             headers.insert(AUTHORIZATION, val);
         }
 
@@ -42,9 +49,11 @@ impl GraphHttpClient {
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30));
 
-        let client = builder.build().expect("failed to build reqwest client");
+        let client = builder
+            .build()
+            .map_err(|e| AlayaError::Config(format!("graph HTTP client: {e}")))?;
 
-        Self { client, base_url }
+        Ok(Self { client, base_url })
     }
 }
 
@@ -722,5 +731,28 @@ impl ConsolidationService for GraphHttpClient {
 
         let body: OrphansResp = handle_response(resp).await?;
         Ok(body.orphans)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #97 repro shape: a control character in the bearer. Must be `Config`,
+    /// and the message must not echo the key it is rejecting.
+    #[test]
+    fn new_rejects_control_chars_without_echoing_the_key() {
+        let Err(err) = GraphHttpClient::new("http://bridge".into(), "abc\n") else {
+            panic!("a control character in the bearer must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(matches!(err, AlayaError::Config(_)), "{msg}");
+        assert!(!msg.contains("abc"), "error echoed the key: {msg}");
+    }
+
+    #[test]
+    fn new_accepts_empty_and_plain_keys() {
+        assert!(GraphHttpClient::new("http://bridge".into(), "").is_ok());
+        assert!(GraphHttpClient::new("http://bridge".into(), "abc").is_ok());
     }
 }

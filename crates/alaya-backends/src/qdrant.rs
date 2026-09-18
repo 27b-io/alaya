@@ -41,14 +41,19 @@ pub struct QdrantClient {
 }
 
 impl QdrantClient {
-    pub fn new(base_url: String, collection: String, api_key: Option<String>) -> Self {
+    /// Fails with `Config` on bearer material that is not a valid header
+    /// value (e.g. a trailing newline, #97) or on a client build error. The
+    /// error must never echo `api_key`: `InvalidHeaderValue` carries no
+    /// payload and neither message below interpolates the key.
+    pub fn new(base_url: String, collection: String, api_key: Option<String>) -> Result<Self> {
         let mut headers = HeaderMap::new();
         if let Some(key) = api_key {
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {key}"))
-                    .expect("invalid API key characters"),
-            );
+            let val = HeaderValue::from_str(&format!("Bearer {key}")).map_err(|e| {
+                AlayaError::Config(format!(
+                    "qdrant api key is not valid HTTP header material: {e}"
+                ))
+            })?;
+            headers.insert(AUTHORIZATION, val);
         }
 
         let builder = reqwest::Client::builder().default_headers(headers);
@@ -58,16 +63,18 @@ impl QdrantClient {
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30));
 
-        let client = builder.build().expect("failed to build reqwest client");
+        let client = builder
+            .build()
+            .map_err(|e| AlayaError::Config(format!("qdrant HTTP client: {e}")))?;
 
         let tag_collection = format!("{collection}_tags");
-        Self {
+        Ok(Self {
             client,
             base_url,
             collection,
             tag_collection,
             write_lock: futures::lock::Mutex::new(()),
-        }
+        })
     }
 
     /// POST a set-payload request body to the memories collection.
@@ -1387,6 +1394,22 @@ struct CountResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #97 repro shape: a control character in the bearer. Must be `Config`,
+    /// and the message must not echo the key it is rejecting.
+    #[test]
+    fn new_rejects_control_chars_without_echoing_the_key() {
+        let Err(err) = QdrantClient::new(
+            "http://qdrant".into(),
+            "memories".into(),
+            Some("abc\n".into()),
+        ) else {
+            panic!("a control character in the bearer must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(matches!(err, AlayaError::Config(_)), "{msg}");
+        assert!(!msg.contains("abc"), "error echoed the key: {msg}");
+    }
 
     #[test]
     fn hash_to_uuid_matches_python() {

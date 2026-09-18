@@ -80,7 +80,8 @@ async fn golden_set_precision_recall() {
     let alaya_url = env("ALAYA_URL");
     let alaya_key = env("ALAYA_API_KEY");
     let model = env("JUDGE_MODEL");
-    let judge = JudgeClient::new(env("JUDGE_URL"), model.clone(), Some(env("JUDGE_API_KEY")));
+    let judge = JudgeClient::new(env("JUDGE_URL"), model.clone(), Some(env("JUDGE_API_KEY")))
+        .expect("JUDGE_API_KEY rejected — must be a single line of visible ASCII");
     // Test harness: a transport failure is a failed run, so `expect` is the
     // right shape here; the timeout keeps a dead endpoint from hanging it.
     let http = reqwest::Client::builder()

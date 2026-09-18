@@ -35,18 +35,26 @@ pub(crate) struct MessagesTransport {
 
 impl MessagesTransport {
     /// `request_timeout` only applies natively; reqwest-wasm has no timeouts.
+    ///
+    /// Fails with `Config` on key material that is not a valid header value
+    /// (e.g. a trailing newline, #97) or on a client build error, so a bad
+    /// secret is a fail-closed startup error rather than a worker-thread
+    /// panic. Never echoes `api_key`: `InvalidHeaderValue` carries no payload
+    /// and neither message interpolates the key.
     pub(crate) fn new(
         base_url: String,
         api_key: Option<String>,
         #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
         request_timeout: std::time::Duration,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(key) = api_key {
-            headers.insert(
-                "x-api-key",
-                reqwest::header::HeaderValue::from_str(&key).expect("invalid API key characters"),
-            );
+            let val = reqwest::header::HeaderValue::from_str(&key).map_err(|e| {
+                AlayaError::Config(format!(
+                    "anthropic api key is not valid HTTP header material: {e}"
+                ))
+            })?;
+            headers.insert("x-api-key", val);
         }
         headers.insert(
             "anthropic-version",
@@ -66,9 +74,11 @@ impl MessagesTransport {
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(request_timeout);
 
-        let client = builder.build().expect("failed to build reqwest client");
+        let client = builder
+            .build()
+            .map_err(|e| AlayaError::Config(format!("anthropic HTTP client: {e}")))?;
 
-        Self { client, base_url }
+        Ok(Self { client, base_url })
     }
 
     /// POST `/v1/messages`. Failures are classified so callers can tell a

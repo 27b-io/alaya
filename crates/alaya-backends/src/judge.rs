@@ -62,11 +62,14 @@ pub struct JudgeClient {
 }
 
 impl JudgeClient {
-    pub fn new(base_url: String, model: String, api_key: Option<String>) -> Self {
-        Self {
-            transport: MessagesTransport::new(base_url, api_key, JUDGE_REQUEST_TIMEOUT),
+    /// Fails with `Config` on key material that is not a valid header value
+    /// or on a client build error; never echoes the key (see
+    /// `MessagesTransport::new`).
+    pub fn new(base_url: String, model: String, api_key: Option<String>) -> Result<Self> {
+        Ok(Self {
+            transport: MessagesTransport::new(base_url, api_key, JUDGE_REQUEST_TIMEOUT)?,
             model,
-        }
+        })
     }
 }
 
@@ -345,7 +348,8 @@ mod tests {
                     server.uri(),
                     Some("k".into()),
                     std::time::Duration::from_millis(300),
-                ),
+                )
+                .expect("test transport"),
                 model: "test-model".into(),
             }
         }
