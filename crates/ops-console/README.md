@@ -70,11 +70,11 @@ Deployed from the lab repo: `27b-io/lab` `k8s/mcp/ops-console.yaml` +
 `ops-console-externalsecret.yaml` (LAB-2712). `deploy/console/ops-console.yaml`
 here is a mirror of that manifest — keep them in sync. Shape: Deployment +
 Service + NetworkPolicy — own label, egress pinned to alaya-server + IdP :443
-(DNS via the namespace `allow-dns` policy), **no dragonfly egress**,
-`imagePullSecrets: ghcr-creds` (the package is private), image digest-pinned
-via the `flux-system:alaya` imagepolicy marker so the console rolls with
-alaya-server. The binary ships in the existing `ghcr.io/27b-io/alaya` image
-(`command: ["ops-console"]`).
+(DNS via the namespace `allow-dns` policy), **no dragonfly egress**, image
+digest-pinned via the `flux-system:alaya` imagepolicy marker so the console
+rolls with alaya-server. The binary ships in the existing public
+`ghcr.io/27b-io/alaya` image (`command: ["ops-console"]`), pulled anonymously
+since LAB-3719 — no pull secret.
 
 Config split: `CONSOLE_PUBLIC_URL`, `CONSOLE_OIDC_ISSUER`, `ALAYA_URL` are plain
 env in the manifest; `CONSOLE_OIDC_CLIENT_ID`, `CONSOLE_OIDC_CLIENT_SECRET`,
