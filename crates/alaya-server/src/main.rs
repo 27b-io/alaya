@@ -190,16 +190,13 @@ fn host_is_loopback(host: &str) -> bool {
 /// Host (authority without port) of an absolute URL, lowercased.
 /// Handles IPv6 bracketed literals (`[::1]:8443` → `::1`).
 fn host_of(url: &str) -> Option<String> {
-    let rest = url.split("://").nth(1)?;
-    let authority = rest.split('/').next()?;
-    let host = if let Some(inner) = authority.strip_prefix('[') {
-        // IPv6 literal: take everything up to the closing bracket.
-        let end = inner.find(']')?;
-        &inner[..end]
-    } else {
-        authority.split(':').next()?
-    };
-    Some(host.to_ascii_lowercase())
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let h = parsed.host_str()?;
+    Some(
+        h.trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase(),
+    )
 }
 
 /// Scheme + host (+ non-default port) of a provider URL, for startup logs.
@@ -2640,6 +2637,15 @@ mod tests {
         assert_eq!(host_of("http://[::1]:3001/foo"), Some("::1".into()));
         assert_eq!(host_of("http://localhost:8080"), Some("localhost".into()));
         assert_eq!(host_of("not-a-url"), None);
+        assert_eq!(
+            host_of("http://127.0.0.1:@evil.com"),
+            Some("evil.com".into())
+        );
+        assert_eq!(
+            host_of("http://localhost:@evil.com"),
+            Some("evil.com".into())
+        );
+        assert_eq!(host_of("https://secret@host"), Some("host".into()));
     }
 
     #[test]
