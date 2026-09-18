@@ -1310,9 +1310,10 @@ impl VectorStorage for QdrantClient {
                     );
                 }
                 Err(e) => {
+                    let message = crate::redact_reqwest_error(e);
                     tracing::warn!(
                         hash = %memory.content_hash,
-                        error = %e,
+                        error = %message,
                         "batch increment_access_count set-payload error"
                     );
                 }
