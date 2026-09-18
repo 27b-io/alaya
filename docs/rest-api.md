@@ -53,10 +53,11 @@ Failed auth returns `401 Unauthorized` with a `WWW-Authenticate: Bearer …` hea
 | `POST` | `/delete` | Hard-delete a memory | yes |
 | `POST` | `/relation` | Manage graph edges | yes |
 | `POST` | `/supersede` | Mark old → new | yes |
-| `POST` | `/contradictions` | List unresolved contradictions | yes |
+| `POST` | `/contradictions` | List contradiction pairs with judge verdicts | yes |
 | `POST` | `/duplicates/find` | Scan for near-duplicates | yes |
 | `POST` | `/duplicates/merge` | Supersede a duplicate cluster | yes |
 | `POST` | `/backfill/summaries` | Generate missing summaries | yes |
+| `POST` | `/backfill/contradictions` | Judge unjudged contradiction pairs | yes |
 | `POST` | `/mcp` | MCP JSON-RPC entry point | yes |
 | `GET`  | `/.well-known/oauth-protected-resource[/mcp]` | OAuth resource metadata (404 unless `OIDC_ISSUER` set) | no |
 
@@ -293,10 +294,45 @@ Content-Type: application/json
 POST /contradictions
 Content-Type: application/json
 
-{"limit": 20}
+{"limit": 20, "offset": 0, "include_resolved": false, "verdicts": ["contradiction", "supersession", "unjudged"]}
 ```
 
-Returns up to `limit` unresolved contradiction pairs.
+| Field | Default | Notes |
+|:--|:--|:--|
+| `limit` | `20` | Page size (1–500), newest edge first. |
+| `offset` | `0` | Page cursor: pass back the previous response's `next_offset`. |
+| `include_resolved` | `false` | `false` hides pairs where either memory is already superseded. The filter runs in the graph (an incoming `SUPERSEDES` edge is the resolved state), so a run of resolved pairs at the top of the queue never hides the rest. |
+| `verdicts` | `["contradiction","supersession","unjudged"]` | Only pairs whose judge verdict is in the list. `unjudged` = no verdict yet, or a pair the judge could not classify (see `verdict_reason`). Add `coexist` / `unrelated` to see everything. Unknown values are a `400`. |
+
+Each pair carries the lexical detector's `confidence` plus the judge's advisory verdict (LAB-3283). A verdict never mutates a memory; `survivor` is a recommendation for `POST /supersede`.
+
+```json
+{
+  "success": true,
+  "pairs": [
+    {
+      "memory_a_hash": "a3f4...",
+      "memory_b_hash": "c0de...",
+      "confidence": 0.7,
+      "created_at": 1786288228.58,
+      "memory_a_content": "Switched to pnpm — lockfile churn was killing CI cache.",
+      "memory_b_content": "We use npm; pnpm was reverted.",
+      "memory_a_superseded": false,
+      "memory_b_superseded": false,
+      "verdict": "supersession",
+      "verdict_reason": "B records the pnpm rollback that replaces A's switch.",
+      "survivor": "c0de...",
+      "verdict_confidence": 0.91,
+      "verdict_model": "claude-haiku-4-5-20251001",
+      "judged_at": 1789000000.0
+    }
+  ],
+  "total": 1,
+  "next_offset": null
+}
+```
+
+`verdict` is one of `contradiction`, `supersession`, `coexist`, `unrelated`, or `unjudged`. An edge the judge has never seen has `null` for the other verdict fields; an edge the judge failed on deterministically (unparseable or empty answer, request rejected, endpoint missing) is `unjudged` with `verdict_reason` starting `unjudged:` and `verdict_model` set. `next_offset` is set whenever the graph page was full (an exactly-full last page yields a cursor to an empty page) and `null` once the server knows nothing follows. A page can hold fewer than `limit` pairs when Qdrant marks a memory superseded that the graph does not yet know about; the cursor still advances. Pure read — the read-only bearer may call it.
 
 ## `POST /duplicates/find`
 
@@ -343,6 +379,35 @@ Content-Type: application/json
 ```
 
 `limit` defaults to `100`. Use sparingly — this calls your summary provider once per memory.
+
+## `POST /backfill/contradictions`
+
+Judge `CONTRADICTS` pairs that have no verdict yet (LAB-3283). Operator-only, same auth class as `/backfill/summaries` — the read-only bearer gets `403`.
+
+```http
+POST /backfill/contradictions
+Content-Type: application/json
+
+{"limit": 100, "rejudge": false}
+```
+
+Blocks until the pass completes and returns what happened:
+
+```json
+{"queued": 100, "judged": 95, "persisted": 95, "marked": 2, "unjudged": 3, "input_tokens": 231044, "output_tokens": 7112}
+```
+
+`limit` defaults to `100` (max 500 per call). At most 4 judge calls are in flight — a cap shared with the judging that runs after each `POST /store` — and a `429` from the provider is retried with backoff (honouring `retry-after`). Resolved pairs (an endpoint with a `SUPERSEDES` edge) are not judged.
+
+Failures are classified so one poison pair cannot stall the pass or re-bill forever:
+
+- **deterministic** (unparseable or empty answer, request rejected with 400/413/422) → the edge is marked `verdict = unjudged` with `verdict_reason = "unjudged: <error>"` and the configured model; counted in `marked`, skipped by later passes, visible on `POST /contradictions` under `verdicts: ["unjudged"]`.
+- **transient** (timeout, 5xx, 429 after retries, upstream misconfiguration, endpoint missing) → nothing is written; counted in `unjudged`, retried next pass.
+- `judged - persisted` is verdicts produced that did not land on an edge (graph blip); they are retried next pass.
+
+Re-running is idempotent: only edges with no verdict at all are selected. **Switching `JUDGE_MODEL`** does not touch existing verdicts; run with `"rejudge": true` to also re-annotate every edge whose `verdict_model` differs from the configured model **and every `unjudged` marker** (the operator's way to retry deterministic failures after a fix), paging with `limit` until `queued` is `0`. A marker never overwrites a real verdict — if a re-judge fails on a pair that already has one, the old verdict stands. Verdicts are written onto the graph edge only; no memory record is modified.
+
+One pass at a time: a second call while one is running returns `{"success": false, "error": "backfill already running"}`. The HTTP reply waits at most 630 s, so keep `limit` around 200 per call; a pass that outlives the reply still runs to completion and the next call is refused until it finishes.
 
 ## `POST /mcp`
 

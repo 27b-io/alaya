@@ -22,7 +22,7 @@ Almost every tool below either returns or takes a `content_hash`. Two rules that
 | [`check_database_health`](#check_database_health) | Backend health + storage stats | |
 | [`relation`](#relation) | Create / read / delete typed edges between memories | ✓ (`create`/`delete`) |
 | [`memory_supersede`](#memory_supersede) | Mark old memory as superseded by new | ✓ |
-| [`memory_contradictions`](#memory_contradictions) | List unresolved contradiction pairs | |
+| [`memory_contradictions`](#memory_contradictions) | List contradiction pairs with judge verdicts | |
 | [`find_duplicates`](#find_duplicates) | Scan for near-duplicate memories | |
 | [`merge_duplicates`](#merge_duplicates) | Supersede a cluster of duplicates in favour of one canonical | ✓ |
 
@@ -221,13 +221,29 @@ See [REST: `POST /supersede`](rest-api.md#post-supersede) for the REST equivalen
 
 ## `memory_contradictions`
 
-List pairs of memories the contradiction detector has flagged (via negation, antonym, or temporal cues) and that haven't been resolved with `memory_supersede`. Use this to triage what to reconcile.
+List pairs of memories the contradiction detector has flagged (via negation, antonym, or temporal cues), each with the LLM judge's advisory verdict. The lexical detector over-fires on same-project progress notes, so triage on `verdict`: `contradiction` and `supersession` are worth a look, `coexist` / `unrelated` are detector noise. Pairs already resolved with `memory_supersede` are hidden by default.
 
 | Param | Type | Default | Notes |
 |:--|:--|:--|:--|
-| `limit` | int | `20` | Max number of pairs to return. |
+| `limit` | int | `20` | Page size (1–500), newest first. |
+| `offset` | int | `0` | Page cursor — pass back the previous response's `next_offset` until it is `null`. |
+| `include_resolved` | bool | `false` | `true` also returns pairs where one memory is already superseded. Filtered in the graph, so paging always reaches the unresolved pairs. |
+| `verdicts` | string[] | `["contradiction","supersession","unjudged"]` | Only pairs whose verdict is in the list. `unjudged` = not judged yet, or a pair the judge could not classify (`verdict_reason` says why). |
 
-**Returns:** array of `{ a: <memory>, b: <memory>, reason: string, ... }`.
+**Returns:** `{ success, pairs: [ ... ], total, next_offset }` where each pair is:
+
+| Field | Notes |
+|:--|:--|
+| `memory_a_hash`, `memory_b_hash` | The flagged pair (`a` is the newer memory that triggered detection). |
+| `confidence` | Lexical detector confidence (`0.8` antonym, `0.7` negation/temporal). |
+| `memory_a_content`, `memory_b_content` | Summary, or the first 200 chars of content. |
+| `memory_a_superseded`, `memory_b_superseded` | Whether that memory is already superseded. |
+| `verdict` | `contradiction` \| `supersession` \| `coexist` \| `unrelated` \| `unjudged`. |
+| `verdict_reason` | One line from the judge; `null` when never judged, `unjudged: <error>` when the judge failed on this pair. |
+| `survivor` | `content_hash` the judge recommends keeping, or `null`. Advisory — pass it to `memory_supersede` yourself. |
+| `verdict_confidence`, `verdict_model`, `judged_at` | Judge self-reported confidence (0–1), model id, epoch seconds. |
+
+The judge never writes to a memory: verdicts live on the graph edge, and resolution stays a human/agent call via `memory_supersede`.
 
 ---
 

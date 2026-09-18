@@ -31,6 +31,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/hebbian/strengthen", post(handlers::hebbian::strengthen))
         .route("/contradictions/all", post(handlers::contradictions::all))
         .route(
+            "/contradictions/verdict",
+            post(handlers::contradictions::set_verdict),
+        )
+        .route(
             "/contradictions/for",
             post(handlers::contradictions::for_hashes),
         )
