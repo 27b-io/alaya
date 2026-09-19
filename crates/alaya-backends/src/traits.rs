@@ -367,7 +367,10 @@ pub trait RerankingService {
     fn top_n(&self) -> usize;
 
     /// Budget for one `rerank()` call. Native callers enforce it with
-    /// `tokio::time::timeout`; implementations must also bound their own
-    /// transport with it, since that is the sole bound on wasm32.
+    /// `tokio::time::timeout`, and implementations must NOT add a transport
+    /// timer of their own there: a second timer is checked before the socket
+    /// on a late poll, discarding a response that already arrived and
+    /// reporting real errors as timeouts. On wasm32 there is no tokio timer,
+    /// so the implementation bounds its own transport with this value.
     fn timeout(&self) -> std::time::Duration;
 }

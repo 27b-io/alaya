@@ -10,11 +10,6 @@ use alaya_types::{AlayaError, Result};
 
 use crate::RerankingService;
 
-/// Headroom the native per-request deadline sits above the call-site budget,
-/// so the client's own timer does not fire first under normal scheduling.
-#[cfg(not(target_arch = "wasm32"))]
-const CALL_SITE_MARGIN: Duration = Duration::from_secs(1);
-
 pub struct RerankClient {
     client: Client,
     base_url: String,
@@ -44,10 +39,10 @@ impl RerankClient {
             headers.insert(reqwest::header::AUTHORIZATION, val);
         }
 
-        // No connect_timeout: any value <= the budget fires in the same tick
-        // as the call-site tokio timer on a blackholed connect and steals its
-        // log line. The per-request total timeout in `rerank()` bounds the
-        // connect phase too.
+        // No client-side timers on native (see `rerank()`): a connect_timeout
+        // at or below the budget fires in the same tick as the call-site
+        // tokio timer on a blackholed connect and steals its log line, and
+        // the call-site timer bounds the connect phase anyway.
         let client = Client::builder()
             .default_headers(headers)
             .build()
@@ -83,24 +78,21 @@ impl RerankingService for RerankClient {
             "raw_scores": false,
         });
 
-        // Native: the call-site `tokio::time::timeout` in service.rs is the
-        // bound — dropping this future on elapse aborts the request and
-        // closes its connection. This per-request deadline sits one margin
-        // above it so the two timers do not race under normal scheduling;
-        // when a late poll lets reqwest's fire first anyway, the call site
-        // classifies the error by elapsed time. wasm32 has no tokio timer,
-        // so this deadline (a fetch abort timer) is the sole bound — no
-        // margin there.
-        #[cfg(not(target_arch = "wasm32"))]
-        let deadline = self.timeout + CALL_SITE_MARGIN;
+        let req = self.client.post(url.as_str()).json(&body);
+        // Native deliberately sets NO client-side timer: the call-site
+        // `tokio::time::timeout` in service.rs is the bound. It polls this
+        // future before its own deadline, so a response that has already
+        // arrived is used even on a late poll, and dropping the future on
+        // elapse aborts the request and closes its connection. A second
+        // timer inside reqwest is checked *before* the socket
+        // (`PendingRequest::poll`), so on a late poll it would discard a
+        // completed response and report real errors as timeouts. wasm32 has
+        // no tokio timer, so there this per-request deadline (a fetch abort
+        // timer) is the sole bound.
         #[cfg(target_arch = "wasm32")]
-        let deadline = self.timeout;
+        let req = req.timeout(self.timeout);
 
-        let resp = self
-            .client
-            .post(url.as_str())
-            .json(&body)
-            .timeout(deadline)
+        let resp = req
             .send()
             .await
             .map_err(|e| AlayaError::Rerank(crate::redact_reqwest_error(e)))?;

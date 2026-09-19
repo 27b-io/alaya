@@ -1022,7 +1022,7 @@ impl MemoryService {
                     );
                     break 'rerank HashMap::new();
                 }
-                Some(Err(e)) if elapsed < budget => {
+                Some(Err(e)) => {
                     tracing::warn!(
                         error = %e,
                         budget_ms = budget.as_millis() as u64,
@@ -1031,13 +1031,7 @@ impl MemoryService {
                     );
                     break 'rerank HashMap::new();
                 }
-                // `None` is the call-site timer. `Some(Err)` at or past the
-                // budget is the client's own per-request timer winning the
-                // tie, which it does when this task is polled late: both
-                // timers have expired and reqwest checks its deadline before
-                // `tokio::time::timeout` checks its own. One overrun, one log
-                // line — the post-deploy check and the benchmark gate grep it.
-                Some(Err(_)) | None => {
+                None => {
                     tracing::warn!(
                         budget_ms = budget.as_millis() as u64,
                         elapsed_ms = elapsed.as_millis() as u64,
@@ -2329,10 +2323,15 @@ impl MemoryService {
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /// Runs `fut` under [`RerankingService::timeout`]; `None` means the budget
-/// expired. Native builds (alaya-server, production) race it against
-/// `tokio::time::timeout`. wasm32 (`alaya-worker`, deferred) has no tokio
-/// timer and awaits directly — there the per-request reqwest timeout in
-/// `RerankClient::rerank` is the bound and surfaces as `Some(Err)`.
+/// expired. Native builds (alaya-server, production) bound it with
+/// `tokio::time::timeout` and nothing else: it polls `fut` before its own
+/// deadline, so a response that has already arrived is used even on a late
+/// poll, and dropping `fut` on elapse aborts the request. That makes the two
+/// outcomes exact — `None` is "nothing arrived within the budget", `Some(Err)`
+/// is a real transport or HTTP error with its detail intact. wasm32
+/// (`alaya-worker`, deferred) has no tokio timer and awaits directly — there
+/// the per-request reqwest timeout in `RerankClient::rerank` is the bound and
+/// surfaces as `Some(Err)`.
 #[cfg(not(target_arch = "wasm32"))]
 async fn rerank_with_budget(
     budget: std::time::Duration,
