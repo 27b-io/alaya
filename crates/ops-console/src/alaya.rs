@@ -52,8 +52,19 @@ impl AlayaClient {
         if !status.is_success() {
             return Err(upstream_error(status, &text));
         }
-        serde_json::from_str(&text)
-            .map_err(|_| AppError::Upstream("alaya-server returned non-JSON".into()))
+        let body: Value = serde_json::from_str(&text)
+            .map_err(|_| AppError::Upstream("alaya-server returned non-JSON".into()))?;
+        // Op-level failures come back `200 {"success": false, "error": …}`.
+        // Surface them, or the operator gets a green flash for a write that
+        // never happened (panel, LAB-3885).
+        if body.get("success").and_then(Value::as_bool) == Some(false) {
+            let detail = body
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("operation failed");
+            return Err(AppError::Upstream(format!("alaya-server: {detail}")));
+        }
+        Ok(body)
     }
 
     async fn get(&self, path: &str) -> Result<Value, AppError> {
@@ -119,6 +130,26 @@ impl AlayaClient {
                 "content_hash": content_hash,
                 "target_hash": target_hash,
                 "relation_type": relation_type,
+            }),
+        )
+        .await
+    }
+
+    /// Stamp a CONTRADICTS pair `keep_both` (LAB-3885): non-destructive,
+    /// reversible, leaves the default queue. `resolved_via` is fixed to the
+    /// console's tag — the server records it verbatim.
+    pub async fn keep_both(
+        &self,
+        memory_a_hash: &str,
+        memory_b_hash: &str,
+    ) -> Result<Value, AppError> {
+        self.post(
+            "/contradictions/resolution",
+            json!({
+                "memory_a_hash": memory_a_hash,
+                "memory_b_hash": memory_b_hash,
+                "resolution": "keep_both",
+                "resolved_via": "operator:console",
             }),
         )
         .await

@@ -1191,9 +1191,11 @@ pub async fn contradictions(
         .cloned()
         .unwrap_or_default();
 
+    let csrf = session.csrf.clone();
     let cards = pairs
         .iter()
         .map(|p| {
+            let csrf = csrf.clone();
             let a = vs(p, "memory_a_hash");
             let b = vs(p, "memory_b_hash");
             let a_text = vs(p, "memory_a_content");
@@ -1217,6 +1219,7 @@ pub async fn contradictions(
             };
             let recommend_a = !survivor.is_empty() && survivor == a;
             let recommend_b = !survivor.is_empty() && survivor == b;
+            let recommend_keep_both = matches!(verdict.as_str(), "coexist" | "unrelated");
             let keep = |href: String, label: &'static str, recommended: bool| {
                 let class = btn_sm(if recommended { Btn::Default } else { Btn::Outline });
                 view! {
@@ -1252,7 +1255,19 @@ pub async fn contradictions(
                             {side(a.clone(), a_text, a_sup, "A")}
                             {side(b.clone(), b_text, b_sup, "B")}
                         </div>
-                        <div class="flex gap-3">
+                        <div class="flex flex-wrap items-center gap-3">
+                            // Non-destructive first (LAB-3885): one click, no
+                            // reason — the verdict already carries it. Supersede
+                            // stays two-step with a reason.
+                            <form method="post" action="/alaya/contradictions/keep-both" class="inline">
+                                <input type="hidden" name="csrf" value=csrf />
+                                <input type="hidden" name="memory_a_hash" value=a.clone() />
+                                <input type="hidden" name="memory_b_hash" value=b.clone() />
+                                <button type="submit" class=btn_sm(if recommend_keep_both { Btn::Default } else { Btn::Outline })>
+                                    "Keep both"
+                                    {recommend_keep_both.then_some(" — recommended")}
+                                </button>
+                            </form>
                             {keep(keep_a, "Keep A (supersede B)…", recommend_a)}
                             {keep(keep_b, "Keep B (supersede A)…", recommend_b)}
                         </div>
@@ -1265,7 +1280,7 @@ pub async fn contradictions(
     let intro = if pairs.is_empty() {
         "No unresolved contradictions."
     } else {
-        "Verdicts are advisory: the judge recommends a survivor, you decide. Resolve by choosing which memory survives — the loser is superseded with a reason, never dropped."
+        "Verdicts are advisory: the judge recommends a survivor, you decide. Keep both when both memories are true or the pair is detector noise — nothing is superseded and it is reversible. Otherwise choose which memory survives — the loser is superseded with a reason, never dropped."
     };
     let toggle = if show_all {
         view! { <a class="text-sm text-primary underline-offset-4 hover:underline" href="/alaya/contradictions">"Hide coexist / unrelated"</a> }
@@ -1293,6 +1308,44 @@ pub async fn contradictions(
             flash,
             content,
         )),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct KeepBothForm {
+    #[serde(default)]
+    csrf: String,
+    memory_a_hash: String,
+    memory_b_hash: String,
+}
+
+/// "Keep both" (LAB-3885): stamp the pair resolved without superseding
+/// either memory. POST-redirect-GET back to the queue, which no longer
+/// lists the pair.
+pub async fn keep_both_submit(
+    State(state): State<AppState>,
+    session: Session,
+    jar: PrivateCookieJar,
+    axum::Form(form): axum::Form<KeepBothForm>,
+) -> Result<Response, AppError> {
+    session.verify_csrf(&form.csrf)?;
+    validate_hash(&form.memory_a_hash)?;
+    validate_hash(&form.memory_b_hash)?;
+    state
+        .alaya
+        .keep_both(&form.memory_a_hash, &form.memory_b_hash)
+        .await?;
+    tracing::info!(sub = %session.sub, a = %form.memory_a_hash, b = %form.memory_b_hash, "contradiction kept both");
+    Ok(flash_redirect(
+        jar,
+        state.secure_cookies(),
+        "ok",
+        format!(
+            "Kept both {} and {} — pair resolved, nothing superseded.",
+            short_hash(&form.memory_a_hash),
+            short_hash(&form.memory_b_hash)
+        ),
+        "/alaya/contradictions",
     ))
 }
 

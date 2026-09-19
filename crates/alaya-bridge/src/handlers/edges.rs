@@ -248,6 +248,19 @@ pub async fn delete(
     }
 
     let rel = parse_user_relation(&req.relation_type)?;
+    // A CONTRADICTS edge that carries a verdict or a resolution is the
+    // queue item and its audit trail (LAB-3885 AC-6): refuse, mirroring the
+    // SUPERSEDES refusal on the user-relation parser. Resolve it instead.
+    // Read-then-delete, not one statement: Cypher has no conditional
+    // DELETE that also tells "absent" from "locked" apart.
+    if rel == UserRelationType::Contradicts {
+        let (cypher, params, readonly) =
+            cypher::count_judged_or_resolved_contradiction(&req.source, &req.target);
+        let guarded = exec_query(&state, &cypher, params, readonly).await?;
+        if guarded.count().unwrap_or(0) > 0 {
+            return Err(StatusCode::CONFLICT);
+        }
+    }
     let (cypher, params, readonly) = cypher::delete_typed_edge(&req.source, &req.target, rel);
     let result = exec_query(&state, &cypher, params, readonly).await?;
 

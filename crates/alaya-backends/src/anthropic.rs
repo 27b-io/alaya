@@ -74,9 +74,12 @@ impl MessagesTransport {
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(request_timeout);
 
-        let client = builder
-            .build()
-            .map_err(|e| AlayaError::Config(format!("anthropic HTTP client: {e}")))?;
+        let client = builder.build().map_err(|e| {
+            AlayaError::Config(format!(
+                "anthropic HTTP client: {}",
+                crate::redact_reqwest_error(e)
+            ))
+        })?;
 
         Ok(Self { client, base_url })
     }
@@ -101,7 +104,7 @@ impl MessagesTransport {
             .json(body)
             .send()
             .await
-            .map_err(|e| AlayaError::Unavailable(e.to_string()))?;
+            .map_err(|e| AlayaError::Unavailable(crate::redact_reqwest_error(e)))?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -126,9 +129,15 @@ impl MessagesTransport {
         // mid-read (reset, idle timeout after the 2xx headers) is not.
         resp.json::<MessagesResponse>().await.map_err(|e| {
             if e.is_decode() {
-                err(format!("failed to parse response: {e}"))
+                err(format!(
+                    "failed to parse response: {}",
+                    crate::redact_reqwest_error(e)
+                ))
             } else {
-                AlayaError::Unavailable(format!("response body: {e}"))
+                AlayaError::Unavailable(format!(
+                    "response body: {}",
+                    crate::redact_reqwest_error(e)
+                ))
             }
         })
     }

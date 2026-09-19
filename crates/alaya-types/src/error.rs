@@ -45,6 +45,12 @@ pub enum AlayaError {
 
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    /// Refused because the write would destroy audit state: today, deleting
+    /// a `CONTRADICTS` edge that carries a judge verdict or an operator
+    /// resolution (LAB-3885 AC-6). The safe message names the way out.
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
 
 impl AlayaError {
@@ -63,6 +69,7 @@ impl AlayaError {
             Self::RateLimited { .. } => -32008,
             Self::Unavailable(_) => -32009,
             Self::Serialization(_) => -32600,
+            Self::Conflict(_) => -32010,
         }
     }
 
@@ -82,6 +89,9 @@ impl AlayaError {
             Self::RateLimited { .. } => "Upstream rate limited",
             Self::Unavailable(_) => "Upstream temporarily unavailable",
             Self::Serialization(_) => "Invalid request format",
+            Self::Conflict(_) => {
+                "Edge carries a verdict or resolution; resolve it (keep_both / supersede) instead of deleting"
+            }
         }
     }
 }

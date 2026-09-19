@@ -63,9 +63,12 @@ impl QdrantClient {
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30));
 
-        let client = builder
-            .build()
-            .map_err(|e| AlayaError::Config(format!("qdrant HTTP client: {e}")))?;
+        let client = builder.build().map_err(|e| {
+            AlayaError::Config(format!(
+                "qdrant HTTP client: {}",
+                crate::redact_reqwest_error(e)
+            ))
+        })?;
 
         let tag_collection = format!("{collection}_tags");
         Ok(Self {
@@ -88,7 +91,7 @@ impl QdrantClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
         if !resp.status().is_success() {
             return Err(qdrant_error(resp).await);
         }
@@ -106,7 +109,7 @@ impl QdrantClient {
             .json(&json!({ "keys": keys, "points": [point_id] }))
             .send()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
         if !resp.status().is_success() {
             return Err(qdrant_error(resp).await);
         }
@@ -184,7 +187,7 @@ impl QdrantClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         if !resp.status().is_success() {
             return Err(qdrant_error(resp).await);
@@ -227,7 +230,7 @@ impl QdrantClient {
             .get(format!("{}/collections/{}", self.base_url, collection))
             .send()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         if resp.status().is_success() {
             tracing::debug!(collection = %collection, "Qdrant collection present");
@@ -245,7 +248,7 @@ impl QdrantClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         if !resp.status().is_success() {
             return Err(qdrant_error(resp).await);
@@ -518,7 +521,7 @@ impl QdrantClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         if !resp.status().is_success() {
             return Err(qdrant_error(resp).await);
@@ -527,7 +530,7 @@ impl QdrantClient {
         let data: QdrantResponse<Vec<Value>> = resp
             .json()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         // `result: []` is the only legitimate "absent". A 2xx whose `result`
         // is missing or null is a protocol violation; treating it as absent
@@ -613,7 +616,7 @@ impl VectorStorage for QdrantClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         if !resp.status().is_success() {
             return Err(qdrant_error(resp).await);
@@ -661,7 +664,7 @@ impl VectorStorage for QdrantClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         if !resp.status().is_success() {
             return Err(qdrant_error(resp).await);
@@ -670,7 +673,7 @@ impl VectorStorage for QdrantClient {
         let data: QdrantResponse<Vec<Value>> = resp
             .json()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         Ok(data
             .result
@@ -699,7 +702,7 @@ impl VectorStorage for QdrantClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         if !resp.status().is_success() {
             return Err(qdrant_error(resp).await);
@@ -838,7 +841,7 @@ impl VectorStorage for QdrantClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         if !resp.status().is_success() {
             return Err(qdrant_error(resp).await);
@@ -847,7 +850,7 @@ impl VectorStorage for QdrantClient {
         let data: QdrantResponse<Vec<Value>> = resp
             .json()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         Ok(data
             .result
@@ -894,7 +897,7 @@ impl VectorStorage for QdrantClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         if !resp.status().is_success() {
             return Err(qdrant_error(resp).await);
@@ -903,7 +906,7 @@ impl VectorStorage for QdrantClient {
         let data: QdrantResponse<ScrollResponse> = resp
             .json()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         let points = data.result.map(|r| r.points).unwrap_or_default();
 
@@ -940,7 +943,7 @@ impl VectorStorage for QdrantClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         if !resp.status().is_success() {
             return Err(qdrant_error(resp).await);
@@ -949,7 +952,7 @@ impl VectorStorage for QdrantClient {
         let data: QdrantResponse<Vec<Value>> = resp
             .json()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         Ok(data
             .result
@@ -998,7 +1001,7 @@ impl VectorStorage for QdrantClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         if !resp.status().is_success() {
             return Err(qdrant_error(resp).await);
@@ -1031,7 +1034,7 @@ impl VectorStorage for QdrantClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         if !resp.status().is_success() {
             return Err(qdrant_error(resp).await);
@@ -1040,7 +1043,7 @@ impl VectorStorage for QdrantClient {
         let data: QdrantResponse<ScrollResponse> = resp
             .json()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         let result = data.result.unwrap_or_default();
         let memories = result.points.iter().filter_map(point_to_memory).collect();
@@ -1092,7 +1095,7 @@ impl VectorStorage for QdrantClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         if !resp.status().is_success() {
             return Err(qdrant_error(resp).await);
@@ -1101,7 +1104,7 @@ impl VectorStorage for QdrantClient {
         let data: QdrantResponse<ScrollResponse> = resp
             .json()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         let points = data.result.map(|r| r.points).unwrap_or_default();
 
@@ -1121,7 +1124,7 @@ impl VectorStorage for QdrantClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         if !resp.status().is_success() {
             return Err(qdrant_error(resp).await);
@@ -1130,7 +1133,7 @@ impl VectorStorage for QdrantClient {
         let data: QdrantResponse<CountResponse> = resp
             .json()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         Ok(data.result.map(|r| r.count).unwrap_or(0))
     }
@@ -1161,7 +1164,7 @@ impl VectorStorage for QdrantClient {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| AlayaError::Storage(e.to_string()))?;
+                .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
             if !resp.status().is_success() {
                 return Err(qdrant_error(resp).await);
@@ -1170,7 +1173,7 @@ impl VectorStorage for QdrantClient {
             let data: QdrantResponse<ScrollResponse> = resp
                 .json()
                 .await
-                .map_err(|e| AlayaError::Storage(e.to_string()))?;
+                .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
             let result = data.result.unwrap_or_default();
             for point in &result.points {
@@ -1233,7 +1236,7 @@ impl VectorStorage for QdrantClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         if !resp.status().is_success() {
             return Err(qdrant_error(resp).await);
@@ -1307,9 +1310,10 @@ impl VectorStorage for QdrantClient {
                     );
                 }
                 Err(e) => {
+                    let message = crate::redact_reqwest_error(e);
                     tracing::warn!(
                         hash = %memory.content_hash,
-                        error = %e,
+                        error = %message,
                         "batch increment_access_count set-payload error"
                     );
                 }
@@ -1327,7 +1331,7 @@ impl VectorStorage for QdrantClient {
             .get(format!("{}/collections/{}", self.base_url, self.collection))
             .send()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         if !resp.status().is_success() {
             return Ok(HealthStatus {
@@ -1340,7 +1344,7 @@ impl VectorStorage for QdrantClient {
         let data: Value = resp
             .json()
             .await
-            .map_err(|e| AlayaError::Storage(e.to_string()))?;
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
 
         let status = data
             .pointer("/result/status")

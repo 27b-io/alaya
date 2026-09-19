@@ -54,6 +54,7 @@ Failed auth returns `401 Unauthorized` with a `WWW-Authenticate: Bearer …` hea
 | `POST` | `/relation` | Manage graph edges | yes |
 | `POST` | `/supersede` | Mark old → new | yes |
 | `POST` | `/contradictions` | List contradiction pairs with judge verdicts | yes |
+| `POST` | `/contradictions/resolution` | Keep both memories of a pair, or undo that | yes |
 | `POST` | `/duplicates/find` | Scan for near-duplicates | yes |
 | `POST` | `/duplicates/merge` | Supersede a duplicate cluster | yes |
 | `POST` | `/backfill/summaries` | Generate missing summaries | yes |
@@ -301,7 +302,7 @@ Content-Type: application/json
 |:--|:--|:--|
 | `limit` | `20` | Page size (1–500), newest edge first. |
 | `offset` | `0` | Page cursor: pass back the previous response's `next_offset`. |
-| `include_resolved` | `false` | `false` hides pairs where either memory is already superseded. The filter runs in the graph (an incoming `SUPERSEDES` edge is the resolved state), so a run of resolved pairs at the top of the queue never hides the rest. |
+| `include_resolved` | `false` | `false` hides resolved pairs: either memory superseded, or the pair stamped `keep_both` via [`POST /contradictions/resolution`](#post-contradictionsresolution). The filter runs in the graph (an incoming `SUPERSEDES` edge or `e.resolution` is the resolved state), so a run of resolved pairs at the top of the queue never hides the rest. |
 | `verdicts` | `["contradiction","supersession","unjudged"]` | Only pairs whose judge verdict is in the list. `unjudged` = no verdict yet, or a pair the judge could not classify (see `verdict_reason`). Add `coexist` / `unrelated` to see everything. Unknown values are a `400`. |
 
 Each pair carries the lexical detector's `confidence` plus the judge's advisory verdict (LAB-3283). A verdict never mutates a memory; `survivor` is a recommendation for `POST /supersede`.
@@ -324,7 +325,10 @@ Each pair carries the lexical detector's `confidence` plus the judge's advisory 
       "survivor": "c0de...",
       "verdict_confidence": 0.91,
       "verdict_model": "claude-haiku-4-5-20251001",
-      "judged_at": 1789000000.0
+      "judged_at": 1789000000.0,
+      "resolution": null,
+      "resolved_at": null,
+      "resolved_via": null
     }
   ],
   "total": 1,
@@ -333,6 +337,27 @@ Each pair carries the lexical detector's `confidence` plus the judge's advisory 
 ```
 
 `verdict` is one of `contradiction`, `supersession`, `coexist`, `unrelated`, or `unjudged`. An edge the judge has never seen has `null` for the other verdict fields; an edge the judge failed on deterministically (unparseable or empty answer, request rejected, endpoint missing) is `unjudged` with `verdict_reason` starting `unjudged:` and `verdict_model` set. `next_offset` is set whenever the graph page was full (an exactly-full last page yields a cursor to an empty page) and `null` once the server knows nothing follows. A page can hold fewer than `limit` pairs when Qdrant marks a memory superseded that the graph does not yet know about; the cursor still advances. Pure read — the read-only bearer may call it.
+
+`resolution` / `resolved_at` / `resolved_via` carry the `keep_both` stamp written by `POST /contradictions/resolution` (all `null` when unresolved; only visible with `include_resolved: true`). A pair leaves the default page one of three ways: **supersede** (`POST /supersede` — destructive with an audit trail, no un-supersede), **keep both** (`POST /contradictions/resolution` — non-destructive, reversed by the same route with `resolution: null`), or **hidden by the verdict filter** (the default `verdicts` omit `coexist` / `unrelated`; nothing is written).
+
+## `POST /contradictions/resolution`
+
+Resolve a pair from `POST /contradictions` **without superseding or deleting anything**. `"keep_both"` stamps the `memory_a_hash -> memory_b_hash` `CONTRADICTS` edge so the pair leaves the default queue while both memories stay searchable and the judge's verdict stays put; `null` clears the stamp and the pair returns. This route is the only writer of the stamp — `POST /relation` cannot set it and the judge never touches it. A `CONTRADICTS` edge carrying a verdict or a resolution also cannot be deleted through `POST /relation` (`delete`): it is the queue item and its audit trail, and the call fails with `Edge carries a verdict or resolution; resolve it (keep_both / supersede) instead of deleting`.
+
+```http
+POST /contradictions/resolution
+Content-Type: application/json
+
+{"memory_a_hash": "a3f4...", "memory_b_hash": "c0de...", "resolution": "keep_both", "resolved_via": "operator:console"}
+```
+
+| Field | Required | Notes |
+|:--|:-:|:--|
+| `memory_a_hash`, `memory_b_hash` | ✓ | Verbatim from the `POST /contradictions` row — the edge is directed. |
+| `resolution` | ✓ | `"keep_both"` to resolve, `null` to undo. The key must be present: an absent key is rejected (`422`), never read as a clear. |
+| `resolved_via` | ✓ | Who resolved, recorded verbatim (1–128 chars): `operator:console`, `engine:<run-id>`, … The MCP tool fixes this to `operator:mcp`. |
+
+`resolved_at` is set by the server. Returns `{ "success": true, "memory_a_hash", "memory_b_hash", "resolution", "resolved_at", "resolved_via" }` — the last three `null` after a clear. No `CONTRADICTS` edge in that direction returns `{ "success": false, "error": "Resource not found" }` (same shape as `/supersede`); nothing is created. The stamp sits on the directed edge you named, but the queue treats the pair as resolved when either direction carries one — a re-store of the older memory re-detects the pair the other way round, and that fresh edge must not undo the operator's call. Mutating — static bearer only.
 
 ## `POST /duplicates/find`
 
@@ -433,7 +458,7 @@ REST endpoints use HTTP status codes plus a JSON body:
 |:--|:--|
 | `400` | Malformed JSON, invalid `content_hash`, missing required field. Body: `{"error": "..."}`. |
 | `401` | Missing or wrong bearer token. |
-| `403` | Authenticated, but the principal is not authorized for this endpoint: the `ALAYA_READONLY_API_KEY` bearer on anything but a pure read, or an OIDC bearer on a mutating route (delete / supersede / merge / relation / patch / backfill). OAuth scopes are not evaluated. |
+| `403` | Authenticated, but the principal is not authorized for this endpoint: the `ALAYA_READONLY_API_KEY` bearer on anything but a pure read, or an OIDC bearer on a mutating route (delete / supersede / contradictions/resolution / merge / relation / patch / backfill). OAuth scopes are not evaluated. |
 | `404` | Memory doesn't exist (`get_memory`, `patch_memory`). |
 | `413` | Request body over 1 MB. |
 | `429` | Rate limited (only when running behind a rate-limiting proxy). |
