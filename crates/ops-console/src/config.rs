@@ -62,9 +62,27 @@ impl LbConfig {
         api_key: Option<String>,
         metrics_url: Option<String>,
     ) -> Result<Option<Self>, String> {
+        // Keyless does not mean unchecked. `ftp://…` parses fine as a URL,
+        // so without a scheme check METRICS_URL boots clean and fails at the
+        // first render as a blank history section — which reads as an LB
+        // outage, sending the operator after the wrong system. AC10 is
+        // refuse-at-startup.
+        //
+        // And METRICS_URL's exemption from the credential rule holds only
+        // while it really is keyless: userinfo IS a credential, and `join`
+        // bakes it into every request URL, so one carrying userinfo goes
+        // back through `validate_keyed_url` like any other keyed URL.
         let parse = |key: &str, v: String| {
-            v.parse::<url::Url>()
-                .map_err(|e| format!("{key} is not a valid URL: {e}"))
+            let url: url::Url = v
+                .parse()
+                .map_err(|e| format!("{key} is not a valid URL: {e}"))?;
+            if !matches!(url.scheme(), "http" | "https") {
+                return Err(format!("{key} must be an http(s) URL"));
+            }
+            if !url.username().is_empty() || url.password().is_some() {
+                validate_keyed_url(key, &url)?;
+            }
+            Ok(url)
         };
         match (url, api_key, metrics_url) {
             (None, None, None) => Ok(None),
@@ -143,7 +161,14 @@ fn validate_public_url(public_url: &url::Url) -> Result<(), String> {
 /// SUMMARY_URL / JUDGE_URL: DNS-only cluster names, or a real loopback /
 /// private IP literal — `127.0.0.1.evil.com` parses as neither.
 fn host_is_private(h: &str) -> bool {
-    if h == "localhost" || h.ends_with(".svc") || h.ends_with(".internal") {
+    // Both suffixes are END-anchored: that is what stops
+    // `evil.svc.attacker.com` matching, so neither may become a substring
+    // test. A non-default cluster domain needs its literal added here.
+    if h == "localhost"
+        || h.ends_with(".svc")
+        || h.ends_with(".svc.cluster.local")
+        || h.ends_with(".internal")
+    {
         return true;
     }
     match h.parse::<std::net::IpAddr>() {
@@ -298,6 +323,14 @@ mod tests {
         let ok = |u: &str| validate_keyed_url("LB_URL", &u.parse().unwrap()).is_ok();
         assert!(ok("https://lb.example.com"));
         assert!(ok("http://anthropic-lb.mcp.svc:8082"));
+        // The fully-qualified Service name is the form most k8s docs show.
+        assert!(ok("http://anthropic-lb.mcp.svc.cluster.local:8082"));
+        // Still end-anchored: a public domain wearing an `svc` label is not
+        // cluster-local.
+        assert!(!ok("http://evil.svc.attacker.com:8082"));
+        assert!(!ok(
+            "http://anthropic-lb.mcp.svc.cluster.local.evil.com:8082"
+        ));
         assert!(ok("http://anthropic-lb:8082"));
         assert!(ok("http://10.0.0.5:8082"));
         assert!(ok("http://localhost:8082"));
@@ -381,5 +414,37 @@ mod tests {
         assert!(err.ends_with("(missing: LB_URL, METRICS_URL)"), "{err}");
         // A present-but-garbage URL is an error, not a silent disable.
         assert!(LbConfig::from_parts(Some("not a url".into()), k(), m()).is_err());
+        // METRICS_URL carries no key, but it still has to be fetchable —
+        // `ftp://` would otherwise boot clean and blank the history section.
+        let err = LbConfig::from_parts(u(), k(), Some("ftp://metrics.test".into()))
+            .err()
+            .expect("ftp METRICS_URL must be refused");
+        assert!(
+            err.starts_with("METRICS_URL must be an http(s) URL"),
+            "{err}"
+        );
+        // The keyless exemption holds only while it IS keyless: `join` bakes
+        // userinfo into every request URL, so plaintext to a public host is
+        // a credential on the wire whatever the variable is called.
+        let err = LbConfig::from_parts(
+            u(),
+            k(),
+            Some("http://ops:hunter2@metrics.example.com:9090".into()),
+        )
+        .err()
+        .expect("userinfo over plaintext to a public host must be refused");
+        assert!(
+            err.contains("metrics.example.com") && !err.contains("hunter2"),
+            "{err}"
+        );
+        // Same credential over TLS, or to a cluster-local host, is fine.
+        assert!(
+            LbConfig::from_parts(u(), k(), Some("https://ops:h@metrics.example.com".into()))
+                .is_ok()
+        );
+        assert!(
+            LbConfig::from_parts(u(), k(), Some("http://ops:h@metrics.mcp.svc:8428".into()))
+                .is_ok()
+        );
     }
 }

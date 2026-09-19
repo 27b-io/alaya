@@ -237,8 +237,17 @@ fn is_private_host(url: &str) -> bool {
 // direction only: a stale copy is the NARROWER one, so it refuses a boot its
 // sibling allows, loudly, in the deploy that introduced it.
 fn host_is_private(h: &str) -> bool {
-    // DNS-only special names — these can't be IP literals.
-    if h == "localhost" || h.ends_with(".svc") || h.ends_with(".internal") {
+    // DNS-only special names — these can't be IP literals. Both the short
+    // Service form and the fully-qualified one: `.svc.cluster.local` is what
+    // most k8s docs show, and it ends with `.local`, so `.svc` alone refuses
+    // a correct config. Both suffixes stay END-anchored — that is what stops
+    // `evil.svc.attacker.com` matching, so neither may become a substring
+    // test. A non-default cluster domain needs its literal added here.
+    if h == "localhost"
+        || h.ends_with(".svc")
+        || h.ends_with(".svc.cluster.local")
+        || h.ends_with(".internal")
+    {
         return true;
     }
     // Anything else must parse as an actual IP literal to qualify as private.
@@ -2755,6 +2764,10 @@ mod tests {
             // IP, so it never reaches the single-label fallback.
             "http://[::ffff:93.184.216.34]:8082",
             "http://[2606:4700::1111]:8082",
+            // End-anchored: a public domain wearing an `svc` label is not
+            // cluster-local, however much it looks like one.
+            "http://evil.svc.attacker.com",
+            "http://alaya-bridge.mcp.svc.cluster.local.evil.com",
             "htps://api.anthropic.com",
             "api.anthropic.com:443",
             "not a url",
@@ -2771,6 +2784,7 @@ mod tests {
             "http://anthropic-lb:8082",
             "HTTP://Anthropic-LB:8082",
             "http://alaya-bridge.mcp.svc:3000",
+            "http://alaya-bridge.mcp.svc.cluster.local:3000",
             "http://localhost:8082",
             // IPv6 literals: loopback, ULA and IPv4-mapped private addresses
             // are as cluster-local as their v4 spellings.
