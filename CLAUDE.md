@@ -70,7 +70,7 @@ crates/
 │   ├── provenance.rs    # Trust scoring, provenance building
 │   └── encoding_context.rs  # Context capture + similarity
 ├── alaya-oidc/src/
-│   └── lib.rs           # Provider (discovery + JWKS cache), origin_of, same_origin_https, validation(); `test-seams` feature for consumer tests
+│   └── lib.rs           # Provider (discovery + JWKS cache + verify<C>), origin_of, same_origin_https; `test-seams` feature for consumer tests
 └── alaya-server/src/
     ├── main.rs          # Native REST + MCP server (axum, channel-based)
     ├── mcp.rs           # MCP Streamable HTTP (JSON-RPC 2.0, SSE, protocol 2025-03-26)

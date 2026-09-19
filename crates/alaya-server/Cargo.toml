@@ -25,9 +25,6 @@ mini-moka = { workspace = true }
 cachekit-rs = { workspace = true }
 futures = { workspace = true }
 
-# Auth — claim decoding over the key alaya-oidc resolves (crypto backend
-# rationale lives on the workspace entry).
-jsonwebtoken = { workspace = true }
 subtle = { workspace = true }
 
 # OpenTelemetry (optional — enabled when OTEL_ENDPOINT is set)
@@ -37,9 +34,11 @@ opentelemetry-otlp = { version = "0.29", default-features = false, features = ["
 tracing-opentelemetry = "0.30"
 
 [dev-dependencies]
-# Pre-seed the JWKS/discovery caches so `oidc`, `auth` and `wellknown` tests
-# verify real signed tokens without a network. Dev-only by construction.
+# Pre-seed the JWKS cache so `oidc`, `auth` and `wellknown` tests verify real
+# signed tokens without a network. Dev-only by construction.
 alaya-oidc = { path = "../alaya-oidc", features = ["test-seams"] }
+# Token minting for testkit — verification itself lives in alaya-oidc.
+jsonwebtoken = { workspace = true }
 # test-util enables tokio's paused clock (start_paused) for the wedge
 # regression tests (#63) — deliberately dev-only.
 tokio = { workspace = true, features = ["test-util"] }

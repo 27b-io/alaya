@@ -8,24 +8,27 @@
 //! - issuer normalisation (one trailing slash) and RFC 6454 origin parsing
 //! - discovery over a redirect-disabled, timeout-bounded client; the document's
 //!   `issuer` must echo the configured one (OIDC Core §4.3)
-//! - every advertised endpoint we model must be same-origin with the issuer and
-//!   https (http only for a loopback issuer, so local dev works)
+//! - `jwks_uri` must be same-origin with the issuer and https (http only for a
+//!   loopback issuer, so local dev works); the relying party applies the same
+//!   rule to its own endpoints through [`same_origin_https`]
 //! - JWKS cache with single-flight refetch and a per-provider cooldown that is
 //!   extended *before* the fetch, so an unknown-`kid` flood or a down IdP can't
 //!   turn either binary into an outbound-fetch amplifier
-//! - alg allowlist {RS256, ES256} enforced before any key lookup; JWK → key
-//!   refuses alg/key-type mismatches (RS256 header against an EC key, etc.)
-//! - one [`validation`] policy: `exp` + `aud` required, 60 s leeway; `iss` is
-//!   compared normalised via [`Provider::check_issuer`], never by jsonwebtoken
+//! - one [`Provider::verify`] pipeline: alg allowlist {RS256, ES256} before any
+//!   key lookup, JWK → key refusing alg/key-type mismatches, signature plus
+//!   `exp` and `aud` with 60 s leeway, then `iss` compared trailing-slash
+//!   normalised — never delegated to jsonwebtoken's exact match
 //!
-//! What stays with the consumer is role-specific: audience/resource binding and
+//! What stays with the consumer is role-specific: the audience it binds to and
 //! the max-token-age cap (server); PKCE, nonce, token exchange (console).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode_header};
+use jsonwebtoken::errors::ErrorKind;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use tokio::sync::{Mutex, RwLock};
 
 /// Minimum interval between JWKS refetches per provider. An unknown-`kid` flood
@@ -53,6 +56,12 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Claims a [`Provider::verify`] caller decodes into. The one field the shared
+/// pipeline must read is `iss`; everything else is the consumer's.
+pub trait IssuedClaims: DeserializeOwned {
+    fn iss(&self) -> &str;
+}
+
 /// The subset of the OIDC discovery document both roles read.
 #[derive(Deserialize, Clone)]
 pub struct Discovery {
@@ -60,7 +69,8 @@ pub struct Discovery {
     pub issuer: String,
     pub jwks_uri: String,
     /// Optional because a resource server never uses them and its test IdP
-    /// omits them; a relying party requires both at use time.
+    /// omits them. Only `jwks_uri` is origin-checked here — a relying party
+    /// requires both of these at use time and checks them itself.
     pub authorization_endpoint: Option<String>,
     pub token_endpoint: Option<String>,
 }
@@ -81,7 +91,7 @@ struct Jwks {
 }
 
 /// Strip a single trailing slash for issuer comparison.
-pub fn normalize_issuer(s: &str) -> &str {
+fn normalize_issuer(s: &str) -> &str {
     s.strip_suffix('/').unwrap_or(s)
 }
 
@@ -127,13 +137,18 @@ pub fn is_loopback_origin(origin: &(String, String, u16)) -> bool {
 
 /// `endpoint` must be same-origin with `issuer` and https. http is accepted
 /// only when the issuer itself is loopback, so local dev against a local IdP
-/// works.
+/// works. A URL with no parseable origin has no origin to match, so it fails
+/// the same way. Callers name the endpoint in their own rejection reason.
 pub fn same_origin_https(issuer: &str, endpoint: &str) -> Result<(), Error> {
-    let issuer_origin = origin_of(issuer).ok_or(Error::Invalid("issuer form"))?;
-    let ep_origin = origin_of(endpoint).ok_or(Error::Invalid("endpoint form"))?;
-    let scheme_ok =
-        ep_origin.0 == "https" || (is_loopback_origin(&issuer_origin) && ep_origin.0 == "http");
-    if !scheme_ok || ep_origin != issuer_origin {
+    let same_origin = match (origin_of(issuer), origin_of(endpoint)) {
+        (Some(issuer_origin), Some(ep_origin)) => {
+            let scheme_ok = ep_origin.0 == "https"
+                || (is_loopback_origin(&issuer_origin) && ep_origin.0 == "http");
+            scheme_ok && ep_origin == issuer_origin
+        }
+        _ => false,
+    };
+    if !same_origin {
         return Err(Error::Invalid("endpoint not same-origin with issuer"));
     }
     Ok(())
@@ -141,8 +156,8 @@ pub fn same_origin_https(issuer: &str, endpoint: &str) -> Result<(), Error> {
 
 /// The one validation policy: signature over `alg`, exact `audience`, `exp`
 /// and `aud` required, clock-skew leeway. `iss` is deliberately left to
-/// [`Provider::check_issuer`] so the comparison is trailing-slash normalised.
-pub fn validation(alg: Algorithm, audience: &str) -> Validation {
+/// [`Provider::verify`] so the comparison is trailing-slash normalised.
+fn validation(alg: Algorithm, audience: &str) -> Validation {
     let mut v = Validation::new(alg);
     v.set_audience(&[audience]);
     v.validate_aud = true;
@@ -202,16 +217,10 @@ impl Provider {
         &self.http
     }
 
-    /// Reject a token whose `iss` (normalised) is not this provider.
-    pub fn check_issuer(&self, iss: &str) -> Result<(), Error> {
-        if normalize_issuer(iss) != self.issuer {
-            return Err(Error::Invalid("iss mismatch"));
-        }
-        Ok(())
-    }
-
     /// Fetch (once) and cache the discovery document, enforcing the issuer
-    /// echo and same-origin-https on every advertised endpoint we model.
+    /// echo and same-origin-https on `jwks_uri` — the one endpoint both roles
+    /// fetch. A resource server never calls the other endpoints, so it must
+    /// not reject an IdP (e.g. a split-origin one) over them.
     pub async fn discovery(&self) -> Result<Discovery, Error> {
         if let Some(d) = self.discovery.read().await.clone() {
             return Ok(d);
@@ -236,34 +245,44 @@ impl Provider {
         if normalize_issuer(&disc.issuer) != self.issuer {
             return Err(Error::Invalid("discovery issuer mismatch"));
         }
-        // Rejection reasons name the endpoint so one log line pins the defect.
         same_origin_https(&self.issuer, &disc.jwks_uri)
             .map_err(|_| Error::Invalid("jwks_uri not same-origin"))?;
-        if let Some(ep) = &disc.token_endpoint {
-            same_origin_https(&self.issuer, ep)
-                .map_err(|_| Error::Invalid("token_endpoint not same-origin"))?;
-        }
-        if let Some(ep) = &disc.authorization_endpoint {
-            same_origin_https(&self.issuer, ep)
-                .map_err(|_| Error::Invalid("authorization_endpoint not same-origin"))?;
-        }
 
         *self.discovery.write().await = Some(disc.clone());
         Ok(disc)
     }
 
-    /// Header gate + key resolution for a compact JWS: alg allowlist (rejects
-    /// `none`/HS* before any key lookup), `kid` required, cache → single-flight
-    /// refetch on miss, JWK → key refusing alg/key-type mismatches. Returns the
-    /// header alg so the caller builds [`validation`] for exactly that alg.
-    pub async fn key_for_token(&self, token: &str) -> Result<(Algorithm, DecodingKey), Error> {
+    /// Verify a compact JWS against this provider and decode its claims:
+    /// header gate (alg allowlist rejects `none`/HS* before any key lookup,
+    /// `kid` required), key from the cache or a single-flight refetch, JWK →
+    /// key refusing alg/key-type mismatches, signature + registered claims
+    /// under [`validation`] for `audience`, then the normalised `iss` check.
+    /// Rejection reasons are server-safe literals: `aud mismatch`, `expired`,
+    /// `bad signature`, `iss mismatch`, or `invalid token` for anything else.
+    /// Role-specific checks (nonce, max-age cap) are the caller's, on the
+    /// returned claims.
+    pub async fn verify<C: IssuedClaims>(&self, token: &str, audience: &str) -> Result<C, Error> {
         let header = decode_header(token).map_err(|_| Error::Invalid("bad header"))?;
         if !matches!(header.alg, Algorithm::RS256 | Algorithm::ES256) {
             return Err(Error::Invalid("alg not allowed"));
         }
         let kid = header.kid.ok_or(Error::Invalid("missing kid"))?;
         let jwk = self.key_for_kid(&kid).await?;
-        Ok((header.alg, build_decoding_key(&jwk, header.alg)?))
+        let decoding_key = build_decoding_key(&jwk, header.alg)?;
+
+        let data =
+            decode::<C>(token, &decoding_key, &validation(header.alg, audience)).map_err(|e| {
+                match e.kind() {
+                    ErrorKind::InvalidAudience => Error::Invalid("aud mismatch"),
+                    ErrorKind::ExpiredSignature => Error::Invalid("expired"),
+                    ErrorKind::InvalidSignature => Error::Invalid("bad signature"),
+                    _ => Error::Invalid("invalid token"),
+                }
+            })?;
+        if normalize_issuer(data.claims.iss()) != self.issuer {
+            return Err(Error::Invalid("iss mismatch"));
+        }
+        Ok(data.claims)
     }
 
     /// Look up a key by `kid`; on a miss, single-flight refetch subject to the

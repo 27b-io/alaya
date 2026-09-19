@@ -1,14 +1,15 @@
 //! OIDC token verification — provider-agnostic OAuth Resource Server side.
 //!
-//! Discovery, same-origin/HTTPS enforcement, the JWKS cache + cooldown, the
-//! alg allowlist and JWK → key live in `alaya-oidc` (shared with ops-console's
-//! relying party). This module keeps what only a resource server decides:
+//! Discovery, same-origin/HTTPS enforcement, the JWKS cache + cooldown and the
+//! whole verify pipeline (alg allowlist → key → signature/`exp`/`aud` →
+//! normalised `iss`) live in `alaya-oidc` (shared with ops-console's relying
+//! party). This module keeps what only a resource server decides:
 //! - the issuer must be https:// (loopback excepted) or startup aborts
 //! - `aud` is the canonical resource (`{public_base_url}/mcp`)
 //! - a hard max-token-age cap — there is no revocation, so this bounds the
 //!   compromise window
-//! - fine-grained rejection reasons for operator logs; the client always sees
-//!   a generic 401
+//! - rejection reasons reach operator logs only; the client always sees a
+//!   generic 401
 //!
 //! The verifier lives on the axum side (Send+Sync); it never runs behind the
 //! service-worker channel.
@@ -16,9 +17,9 @@
 use std::sync::Arc;
 
 use alaya_oidc::{
-    CLOCK_SKEW_LEEWAY_SECS, Error as OidcError, Provider, is_loopback_origin, origin_of, validation,
+    CLOCK_SKEW_LEEWAY_SECS, Error as OidcError, IssuedClaims, Provider, is_loopback_origin,
+    origin_of,
 };
-use jsonwebtoken::decode;
 use serde::Deserialize;
 
 /// Hard cap on accepted token lifetime (`exp - iat`), regardless of issuer.
@@ -31,6 +32,12 @@ struct Claims {
     /// Optional per RFC 7519 §4.1.6 — `None` means the IdP omitted it.
     iat: Option<u64>,
     exp: u64,
+}
+
+impl IssuedClaims for Claims {
+    fn iss(&self) -> &str {
+        &self.iss
+    }
 }
 
 struct Inner {
@@ -76,26 +83,14 @@ impl OidcVerifier {
     /// Validate a bearer token. Returns Ok on a fully-valid token; any failure
     /// is `OidcError::Invalid` and must surface to the client as a generic 401.
     pub async fn validate(&self, token: &str) -> Result<(), OidcError> {
-        // 1–2. Header allowlist + kid, then the signing key (cache →
-        // single-flight refetch on miss). Rejects `none`/HS* before key lookup.
-        let (alg, decoding_key) = self.inner.provider.key_for_token(token).await?;
+        // Shared pipeline: header allowlist + kid, key (cache → single-flight
+        // refetch), signature + `exp`/`aud` for our audience, normalised `iss`.
+        let claims: Claims = self
+            .inner
+            .provider
+            .verify(token, &self.inner.audience)
+            .await?;
 
-        // 3. Validate signature + registered claims.
-        let validation = validation(alg, &self.inner.audience);
-        let data =
-            decode::<Claims>(token, &decoding_key, &validation).map_err(|e| match e.kind() {
-                jsonwebtoken::errors::ErrorKind::InvalidAudience => {
-                    OidcError::Invalid("aud mismatch")
-                }
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature => OidcError::Invalid("expired"),
-                jsonwebtoken::errors::ErrorKind::InvalidSignature => {
-                    OidcError::Invalid("bad signature")
-                }
-                _ => OidcError::Invalid("invalid token"),
-            })?;
-
-        // 4. Issuer (normalized) + hard max-age cap.
-        self.inner.provider.check_issuer(&data.claims.iss)?;
         // Cap the lifetime regardless of issuer (no revocation, so this bounds
         // the compromise window). RFC 7519 §4.1.6 makes `iat` OPTIONAL.
         // Compute `now` once and use it on both branches; if `iat` is present
@@ -105,14 +100,14 @@ impl OidcVerifier {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let cap_exceeded = match data.claims.iat {
+        let cap_exceeded = match claims.iat {
             Some(iat) => {
                 if iat > now.saturating_add(CLOCK_SKEW_LEEWAY_SECS) {
                     return Err(OidcError::Invalid("iat in the future"));
                 }
-                data.claims.exp.saturating_sub(iat) > MAX_TOKEN_AGE_SECS
+                claims.exp.saturating_sub(iat) > MAX_TOKEN_AGE_SECS
             }
-            None => data.claims.exp.saturating_sub(now) > MAX_TOKEN_AGE_SECS,
+            None => claims.exp.saturating_sub(now) > MAX_TOKEN_AGE_SECS,
         };
         if cap_exceeded {
             return Err(OidcError::Invalid("token lifetime exceeds cap"));
@@ -123,17 +118,11 @@ impl OidcVerifier {
 
 #[cfg(test)]
 impl OidcVerifier {
-    /// Build a verifier with a signing key pre-cached, bypassing network
-    /// discovery/JWKS. Shared by the `oidc`, `auth`, and `wellknown` tests so
-    /// the key-injection logic lives in one place.
+    /// Build a verifier with a signing key pre-cached so no test reaches the
+    /// network. Shared by the `oidc`, `auth`, and `wellknown` tests so the
+    /// key-injection logic lives in one place.
     fn test_with_key(jwk: alaya_oidc::Jwk) -> Self {
         let provider = Provider::new(crate::testkit::ISSUER);
-        provider.seed_discovery(alaya_oidc::Discovery {
-            issuer: crate::testkit::ISSUER.into(),
-            jwks_uri: format!("{}/jwks", crate::testkit::ISSUER),
-            authorization_endpoint: None,
-            token_endpoint: None,
-        });
         provider.seed_keys([jwk]);
         Self {
             inner: Arc::new(Inner {
@@ -408,7 +397,7 @@ mod tests {
     #[tokio::test]
     async fn live_cross_origin_jwks_uri_is_rejected() {
         // discovery `issuer` matches, but `jwks_uri` points at another origin —
-        // the key-substitution vector the same-origin check at jwks_uri() blocks.
+        // the key-substitution vector the same-origin check in Provider::discovery() blocks.
         let base = spawn_idp(IdpFault::JwksOrigin).await;
         let v = OidcVerifier::new(base.clone(), testkit::AUDIENCE.to_string());
         let mut c = TestClaims::valid();

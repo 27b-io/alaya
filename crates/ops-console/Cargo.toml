@@ -27,10 +27,6 @@ leptos = { version = "0.8", features = ["ssr"] }
 # `form` adds multi-value form support (serde_html_form) for checkbox groups.
 axum-extra = { version = "0.10", features = ["cookie-private", "form"] }
 
-# ID-token claim decoding over the key alaya-oidc resolves (crypto backend
-# rationale lives on the workspace entry).
-jsonwebtoken = { workspace = true }
-
 base64 = "0.22"
 rand = "0.9"
 url = "2"

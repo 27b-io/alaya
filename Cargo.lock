@@ -2201,7 +2201,6 @@ dependencies = [
  "base64",
  "cookie",
  "http-body-util",
- "jsonwebtoken",
  "leptos",
  "rand 0.9.5",
  "reqwest",

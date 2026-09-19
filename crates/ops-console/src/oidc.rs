@@ -1,20 +1,22 @@
 //! OIDC Relying Party — authorization-code flow with PKCE (S256) against
 //! id.27b.io.
 //!
-//! Discovery, same-origin/HTTPS enforcement, the JWKS cache + cooldown, the
-//! alg allowlist and JWK → key live in `alaya-oidc` (shared with alaya-server's
-//! resource-side verifier). This module keeps what only a relying party
-//! decides:
+//! Discovery, same-origin/HTTPS enforcement, the JWKS cache + cooldown and the
+//! whole ID-token verify pipeline live in `alaya-oidc` (shared with
+//! alaya-server's resource-side verifier). This module keeps what only a
+//! relying party decides:
 //! - PKCE S256 challenge; `state` and `nonce` are supplied by the login flow
 //! - `redirect_uri` is pinned from config; never derived from request headers
+//! - `authorization_endpoint` and `token_endpoint` must be present and pass
+//!   the same same-origin-https rule as `jwks_uri` (the shared layer checks
+//!   only `jwks_uri`, because a resource server never calls the other two)
 //! - token exchange with `client_secret_basic` (RFC 6749 §2.3.1 — the scheme
 //!   servers MUST support), over the provider's redirect-disabled client
 //! - ID-token `aud` is this `client_id` (OIDC Core §3.1.3.7 #3); `nonce` must
 //!   match the flow (replay defence)
 
-use alaya_oidc::{Error as OidcError, Provider, validation};
+use alaya_oidc::{Error as OidcError, IssuedClaims, Provider, same_origin_https};
 use base64::Engine;
-use jsonwebtoken::decode;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -32,6 +34,12 @@ pub struct IdClaims {
     pub email: Option<String>,
     pub name: Option<String>,
     pub preferred_username: Option<String>,
+}
+
+impl IssuedClaims for IdClaims {
+    fn iss(&self) -> &str {
+        &self.iss
+    }
 }
 
 pub fn pkce_challenge_s256(verifier: &str) -> String {
@@ -61,6 +69,25 @@ impl OidcRp {
         }
     }
 
+    /// `(authorization_endpoint, token_endpoint)` from discovery, both required
+    /// and both same-origin-https with the issuer. Checked together on every
+    /// use so a bad `token_endpoint` is refused when the login starts, before
+    /// the user is ever redirected.
+    async fn endpoints(&self) -> Result<(String, String), OidcError> {
+        let disc = self.provider.discovery().await?;
+        let authorization = disc.authorization_endpoint.ok_or(OidcError::Invalid(
+            "discovery missing authorization_endpoint",
+        ))?;
+        let token = disc
+            .token_endpoint
+            .ok_or(OidcError::Invalid("discovery missing token_endpoint"))?;
+        same_origin_https(self.provider.issuer(), &authorization)
+            .map_err(|_| OidcError::Invalid("authorization_endpoint not same-origin"))?;
+        same_origin_https(self.provider.issuer(), &token)
+            .map_err(|_| OidcError::Invalid("token_endpoint not same-origin"))?;
+        Ok((authorization, token))
+    }
+
     /// Build the authorization redirect for a fresh login flow.
     pub async fn authorize_url(
         &self,
@@ -68,15 +95,8 @@ impl OidcRp {
         nonce: &str,
         pkce_verifier: &str,
     ) -> Result<String, OidcError> {
-        let endpoint = self
-            .provider
-            .discovery()
-            .await?
-            .authorization_endpoint
-            .ok_or(OidcError::Invalid(
-                "discovery missing authorization_endpoint",
-            ))?;
-        let mut u: url::Url = endpoint
+        let (authorization_endpoint, _) = self.endpoints().await?;
+        let mut u: url::Url = authorization_endpoint
             .parse()
             .map_err(|_| OidcError::Invalid("authorization_endpoint form"))?;
         u.query_pairs_mut()
@@ -99,12 +119,7 @@ impl OidcRp {
         pkce_verifier: &str,
         expected_nonce: &str,
     ) -> Result<IdClaims, OidcError> {
-        let token_endpoint = self
-            .provider
-            .discovery()
-            .await?
-            .token_endpoint
-            .ok_or(OidcError::Invalid("discovery missing token_endpoint"))?;
+        let (_, token_endpoint) = self.endpoints().await?;
         let resp = self
             .provider
             .http()
@@ -127,22 +142,16 @@ impl OidcRp {
             .await
             .map_err(|_| OidcError::Invalid("token response parse"))?;
 
-        let claims = self.verify_id_token(&tokens.id_token).await?;
+        // ID token audience is the RP's client_id (OIDC Core §3.1.3.7 #3).
+        let claims: IdClaims = self
+            .provider
+            .verify(&tokens.id_token, &self.client_id)
+            .await?;
         // Nonce binds the ID token to this login flow (replay defense).
         if claims.nonce.as_deref() != Some(expected_nonce) {
             return Err(OidcError::Invalid("nonce mismatch"));
         }
         Ok(claims)
-    }
-
-    async fn verify_id_token(&self, token: &str) -> Result<IdClaims, OidcError> {
-        let (alg, decoding_key) = self.provider.key_for_token(token).await?;
-        // ID token audience is the RP's client_id (OIDC Core §3.1.3.7 #3).
-        let validation = validation(alg, &self.client_id);
-        let data = decode::<IdClaims>(token, &decoding_key, &validation)
-            .map_err(|_| OidcError::Invalid("id_token invalid"))?;
-        self.provider.check_issuer(&data.claims.iss)?;
-        Ok(data.claims)
     }
 }
 
