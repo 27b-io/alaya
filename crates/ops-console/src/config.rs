@@ -32,9 +32,66 @@ pub struct Config {
     pub session_secret: Vec<u8>,
     pub alaya_url: url::Url,
     pub alaya_api_key: String,
+    /// anthropic-lb monitoring module; `None` = module disabled.
+    pub lb: Option<LbConfig>,
 }
 
-// Never derive Debug for Config — it holds two credentials.
+/// anthropic-lb read-only module. Optional as a GROUP: a
+/// deploy-ordering gap (the image rolls before the Secret carries the key,
+/// or the reverse) leaves the Ālaya module up and the LB card reading "not
+/// configured" instead of taking the whole console down. A half-set group
+/// is a misconfiguration and refuses startup like any other credential.
+pub struct LbConfig {
+    /// e.g. `http://anthropic-lb.mcp.svc:8082`
+    pub url: url::Url,
+    /// Operator client key, sent server-side as `x-api-key` — the LB admin
+    /// gate does not accept `Authorization: Bearer`. Never reaches the
+    /// browser.
+    pub api_key: String,
+    /// Prometheus-compatible query API for the 7-day budget-burn history,
+    /// read off the LB's own fleet-wide gauges; the console keeps no history
+    /// of its own.
+    pub metrics_url: url::Url,
+}
+
+impl LbConfig {
+    /// All three set → enabled; none set → disabled; anything else → error
+    /// naming the missing variables.
+    pub fn from_parts(
+        url: Option<String>,
+        api_key: Option<String>,
+        metrics_url: Option<String>,
+    ) -> Result<Option<Self>, String> {
+        let parse = |key: &str, v: String| {
+            v.parse::<url::Url>()
+                .map_err(|e| format!("{key} is not a valid URL: {e}"))
+        };
+        match (url, api_key, metrics_url) {
+            (None, None, None) => Ok(None),
+            (Some(u), Some(k), Some(m)) => Ok(Some(LbConfig {
+                url: parse("LB_URL", u)?,
+                api_key: k,
+                metrics_url: parse("METRICS_URL", m)?,
+            })),
+            (u, k, m) => {
+                let missing: Vec<&str> = [
+                    ("LB_URL", u.is_none()),
+                    ("LB_API_KEY", k.is_none()),
+                    ("METRICS_URL", m.is_none()),
+                ]
+                .into_iter()
+                .filter_map(|(name, absent)| absent.then_some(name))
+                .collect();
+                Err(format!(
+                    "anthropic-lb module is half-configured — set all of LB_URL, LB_API_KEY, METRICS_URL or none (missing: {})",
+                    missing.join(", ")
+                ))
+            }
+        }
+    }
+}
+
+// Never derive Debug for Config — it holds three credentials.
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
@@ -44,6 +101,11 @@ impl fmt::Debug for Config {
             .field("oidc_client_id", &self.oidc_client_id)
             .field("allowed_subjects", &self.allowed_subjects)
             .field("alaya_url", &self.alaya_url.as_str())
+            .field("lb_url", &self.lb.as_ref().map(|l| l.url.as_str()))
+            .field(
+                "metrics_url",
+                &self.lb.as_ref().map(|l| l.metrics_url.as_str()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -77,6 +139,14 @@ fn required(key: &str) -> Result<String, String> {
         Ok(v) if !v.trim().is_empty() => Ok(v.trim().to_string()),
         _ => Err(format!("{key} is required and must be non-empty")),
     }
+}
+
+/// Unset and empty are the same thing: absent.
+fn optional(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 impl Config {
@@ -136,6 +206,11 @@ impl Config {
             session_secret,
             alaya_url,
             alaya_api_key: required("ALAYA_API_KEY")?,
+            lb: LbConfig::from_parts(
+                optional("LB_URL"),
+                optional("LB_API_KEY"),
+                optional("METRICS_URL"),
+            )?,
         })
     }
 }
@@ -178,9 +253,38 @@ mod tests {
             session_secret: b"0123456789abcdef0123456789abcdef".to_vec(),
             alaya_url: "http://alaya-server.mcp.svc:3001".parse().unwrap(),
             alaya_api_key: "BEARER_VALUE".into(),
+            lb: Some(LbConfig {
+                url: "http://anthropic-lb.mcp.svc:8082".parse().unwrap(),
+                api_key: "LB_KEY_VALUE".into(),
+                metrics_url: "http://metrics.test:8428".parse().unwrap(),
+            }),
         };
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("SECRET_VALUE"));
         assert!(!dbg.contains("BEARER_VALUE"));
+        assert!(!dbg.contains("LB_KEY_VALUE"));
+        assert!(dbg.contains("anthropic-lb.mcp.svc"));
+    }
+
+    #[test]
+    fn lb_config_is_all_or_nothing() {
+        let u = || Some("http://lb:8082".to_string());
+        let k = || Some("k".repeat(40));
+        let m = || Some("http://vm:8428".to_string());
+        assert!(LbConfig::from_parts(None, None, None).unwrap().is_none());
+        assert!(LbConfig::from_parts(u(), k(), m()).unwrap().is_some());
+        // Half-configured refuses startup and names what is missing.
+        // (`.err()` rather than `unwrap_err()`: LbConfig deliberately has no
+        // Debug impl — it holds the operator key.)
+        let err = LbConfig::from_parts(u(), None, m())
+            .err()
+            .expect("half-configured must refuse");
+        assert!(err.ends_with("(missing: LB_API_KEY)"), "{err}");
+        let err = LbConfig::from_parts(None, k(), None)
+            .err()
+            .expect("half-configured must refuse");
+        assert!(err.ends_with("(missing: LB_URL, METRICS_URL)"), "{err}");
+        // A present-but-garbage URL is an error, not a silent disable.
+        assert!(LbConfig::from_parts(Some("not a url".into()), k(), m()).is_err());
     }
 }
