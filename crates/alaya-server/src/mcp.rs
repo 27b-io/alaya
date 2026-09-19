@@ -12,8 +12,10 @@ use tokio::sync::oneshot;
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{OutputMode, RelationParams, SearchParams, StoreParams};
 
+use alaya_types::graph::Resolution;
+
 use crate::auth::{AuthPrincipal, WritePolicy};
-use crate::{CmdInner, ServiceHandle};
+use crate::{CmdInner, ServiceHandle, require_present};
 
 // ─── Typed param structs for MCP dispatch ───────────────────────────────────
 
@@ -41,9 +43,25 @@ struct SupersedeParams {
 struct ContradictionsParams {
     #[serde(default = "default_contradictions_limit")]
     limit: usize,
+    #[serde(default)]
+    include_resolved: bool,
+    #[serde(default)]
+    verdicts: Option<Vec<String>>,
+    #[serde(default)]
+    offset: usize,
 }
 fn default_contradictions_limit() -> usize {
     20
+}
+
+/// `resolution` is required on the wire: `"keep_both"` stamps, explicit
+/// `null` clears; an absent key is a -32602, never a silent clear.
+#[derive(Deserialize)]
+struct ResolveContradictionParams {
+    memory_a_hash: String,
+    memory_b_hash: String,
+    #[serde(deserialize_with = "require_present")]
+    resolution: Option<Resolution>,
 }
 
 #[derive(Deserialize)]
@@ -426,6 +444,29 @@ async fn dispatch_tool(
                 .call_rpc(
                     CmdInner::Contradictions {
                         limit: p.limit,
+                        offset: p.offset,
+                        include_resolved: p.include_resolved,
+                        verdicts: p.verdicts,
+                        reply: tx,
+                    },
+                    rx,
+                )
+                .await
+        }
+        "resolve_contradiction" => {
+            let p: ResolveContradictionParams = serde_json::from_value(args)
+                .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
+            let (tx, rx) = oneshot::channel();
+            handle
+                .call_rpc(
+                    CmdInner::ResolveContradiction {
+                        memory_a_hash: p.memory_a_hash,
+                        memory_b_hash: p.memory_b_hash,
+                        resolution: p.resolution,
+                        // The MCP surface is the operator's: fixed tag, not
+                        // caller-supplied, so a tool call cannot impersonate
+                        // the console or an engine run.
+                        resolved_via: "operator:mcp".to_string(),
                         reply: tx,
                     },
                     rx,
@@ -581,7 +622,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "memory_supersede",
-            "description": "Mark one memory as superseded by another, resolving a contradiction.",
+            "description": "Mark one memory as superseded by another, resolving a contradiction destructively: the old memory leaves default search results (it stays retrievable with an audit trail) and every pair it is in leaves the contradiction queue. Use only when one memory misleads. When both are true (verdict coexist) or the pair is detector noise (verdict unrelated), call resolve_contradiction with resolution keep_both instead — nothing is superseded and it is reversible.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -606,12 +647,46 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "memory_contradictions",
-            "description": "List unresolved contradiction pairs for review and resolution.",
+            "description": "List CONTRADICTS pairs with the judge's verdict per pair (contradiction | supersession | coexist | unrelated | unjudged), the recommended survivor hash and a one-line reason. Pairs with a superseded endpoint, or stamped keep_both by resolve_contradiction, are hidden unless include_resolved is true. Returns {pairs: [{memory_a_hash, memory_b_hash, confidence, created_at, memory_a_content, memory_b_content, memory_a_superseded, memory_b_superseded, verdict, verdict_reason, survivor, verdict_confidence, verdict_model, judged_at, resolution, resolved_at, resolved_via}], total, next_offset}. Page with offset = next_offset until it is null. To act on a pair: memory_supersede when one memory misleads (verdict supersession/contradiction); resolve_contradiction keep_both when both are true or the pair is noise (verdict coexist/unrelated) — non-destructive and reversible.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "limit": { "type": "integer", "default": 20, "description": "Max contradiction pairs to return" }
+                    "limit": { "type": "integer", "default": 20, "description": "Max contradiction pairs to fetch (1-500)" },
+                    "offset": { "type": "integer", "default": 0, "description": "Pairs to skip; pass the previous response's next_offset to page" },
+                    "include_resolved": { "type": "boolean", "default": false, "description": "Also return resolved pairs: one endpoint superseded, or the pair stamped keep_both" },
+                    "verdicts": { "type": "array", "items": { "type": "string", "enum": alaya_types::graph::Verdict::ALL.map(|v| v.as_str()) }, "description": "Only pairs with these verdicts. Default: contradiction, supersession, unjudged" }
                 }
+            }
+        },
+        {
+            "name": "resolve_contradiction",
+            "description": "Resolve a CONTRADICTS pair from memory_contradictions without superseding or deleting anything. resolution keep_both stamps the pair as settled (both memories are true, or the pair is detector noise): it leaves the default queue, both memories stay searchable, the judge's verdict stays on the edge. resolution null clears the stamp and the pair returns to the queue. Recorded as resolved_via operator:mcp with a server-set resolved_at. Pass memory_a_hash and memory_b_hash exactly as memory_contradictions returned them (the edge is directed). Prefer this over memory_supersede for verdict coexist or unrelated.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_a_hash": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "memory_a_hash of the pair, verbatim from memory_contradictions. Do not pass truncated display/log prefixes."
+                    },
+                    "memory_b_hash": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "memory_b_hash of the pair, verbatim from memory_contradictions. Do not pass truncated display/log prefixes."
+                    },
+                    "resolution": {
+                        "anyOf": [
+                            { "type": "string", "enum": alaya_types::graph::Resolution::ALL.map(|r| r.as_str()) },
+                            { "type": "null" }
+                        ],
+                        "description": "keep_both to resolve; null to undo a previous keep_both. Required — an omitted key is rejected, never treated as a clear."
+                    }
+                },
+                "required": ["memory_a_hash", "memory_b_hash", "resolution"]
             }
         },
         {
@@ -709,11 +784,11 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_10_tools() {
+    fn tools_list_returns_11_tools() {
         let resp = handle_tools_list(json!(2));
         let v = serde_json::to_value(&resp).unwrap();
         let tools = v["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
     }
 
     #[test]
@@ -733,8 +808,71 @@ mod tests {
         assert!(names.contains(&"relation"));
         assert!(names.contains(&"memory_supersede"));
         assert!(names.contains(&"memory_contradictions"));
+        assert!(names.contains(&"resolve_contradiction"));
         assert!(names.contains(&"find_duplicates"));
         assert!(names.contains(&"merge_duplicates"));
+    }
+
+    #[test]
+    fn resolve_contradiction_params_require_resolution_key_and_list_it_required() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let set: ResolveContradictionParams = serde_json::from_value(
+            json!({"memory_a_hash": a, "memory_b_hash": b, "resolution": "keep_both"}),
+        )
+        .unwrap();
+        assert_eq!(set.resolution, Some(Resolution::KeepBoth));
+        let clear: ResolveContradictionParams = serde_json::from_value(
+            json!({"memory_a_hash": a, "memory_b_hash": b, "resolution": null}),
+        )
+        .unwrap();
+        assert_eq!(clear.resolution, None);
+        assert!(
+            serde_json::from_value::<ResolveContradictionParams>(
+                json!({"memory_a_hash": a, "memory_b_hash": b})
+            )
+            .is_err(),
+            "an absent key must not read as a clear"
+        );
+        assert!(
+            serde_json::from_value::<ResolveContradictionParams>(
+                json!({"memory_a_hash": a, "memory_b_hash": b, "resolution": "keep_both", "resolved_via": "engine:x"})
+            )
+            .is_ok(),
+            "an unknown key is ignored; the MCP surface fixes resolved_via itself"
+        );
+
+        let schema = tool_schemas()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "resolve_contradiction")
+            .cloned()
+            .unwrap();
+        assert!(
+            schema["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("resolution"))
+        );
+        assert_eq!(
+            schema["inputSchema"]["properties"]["resolution"]["anyOf"][0]["enum"],
+            json!(["keep_both"])
+        );
+        // The two tool descriptions name the non-destructive path.
+        for name in ["memory_contradictions", "memory_supersede"] {
+            let d = tool_schemas()
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap()["description"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(d.contains("resolve_contradiction"), "{name}: {d}");
+            assert!(d.contains("keep_both"), "{name}: {d}");
+        }
     }
 
     #[test]
@@ -832,6 +970,8 @@ mod tests {
             ("relation", "content_hash"),
             ("memory_supersede", "old_id"),
             ("memory_supersede", "new_id"),
+            ("resolve_contradiction", "memory_a_hash"),
+            ("resolve_contradiction", "memory_b_hash"),
         ] {
             let schema = by_name(tool);
             let prop = &schema["inputSchema"]["properties"][field];

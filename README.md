@@ -9,7 +9,7 @@ A single Rust service over Qdrant (vectors) and FalkorDB (knowledge graph). It s
 Vector search alone gives an agent a fuzzy lookup table. It returns whatever is closest in embedding space — including stale facts, near-duplicates, and statements that flatly contradict each other — with no notion of which memory superseded which, or how the memories relate. Ālaya is built to be the memory layer you can actually trust over months of writes: it retrieves by meaning, notices when two memories disagree, lets you resolve the conflict while keeping an audit trail, and reasons over the relationships between memories instead of treating each one as an island.
 
 - **It finds the right memory even when your words don't match** — hybrid retrieval fuses semantic vectors with keyword signal (Reciprocal Rank Fusion), so "why did we switch package managers" finds the note that says "migrated to pnpm." *(hybrid RRF retrieval)*
-- **It catches when your memories disagree** — conflicting facts are flagged automatically on write; you resolve them with one call and the old answer stays auditable instead of silently vanishing. *(contradiction detection — negation, antonym, temporal cues — plus supersede)*
+- **It catches when your memories disagree** — conflicting facts are flagged automatically on write; you resolve them with one call — supersede the stale one (it stays auditable instead of silently vanishing) or keep both when both are true — and the pair leaves the queue. *(contradiction detection — negation, antonym, temporal cues — plus supersede / keep-both)*
 - **Related memories pull each other up** — a relationship graph (RELATES_TO / PRECEDES / CONTRADICTS) lets one strong hit surface its neighbors, so retrieving one fact brings back the context around it. *(Hebbian spreading-activation)*
 - **What you mark important, and what you revisit, ranks higher** — relevance is weighted by how important a memory is and how often it's accessed, not just raw cosine distance. *(salience + spaced-repetition boosts)*
 - **It knows where a memory came from and how much to trust it** — provenance and a trust score let you filter out low-confidence sources at query time. *(provenance / trust scoring)*
@@ -106,7 +106,8 @@ Connect any MCP client to `http://localhost:3001/mcp` (Streamable HTTP with SSE)
 | `delete_memory` | Delete by content hash |
 | `relation` | Create / get / delete typed edges (RELATES_TO, PRECEDES, CONTRADICTS) |
 | `memory_supersede` | Mark one memory as superseded by another |
-| `memory_contradictions` | List unresolved contradiction pairs |
+| `memory_contradictions` | List unresolved contradiction pairs with judge verdicts |
+| `resolve_contradiction` | Keep both memories of a contradiction pair — non-destructive, reversible |
 | `find_duplicates` | Cosine similarity scan for near-duplicate memories |
 | `merge_duplicates` | Supersede duplicates in favour of a canonical memory |
 | `check_database_health` | Backend health and storage stats |
@@ -123,6 +124,7 @@ All endpoints accept/return JSON. Auth via `Authorization: Bearer` with either s
 | POST | `/relation` | Manage graph edges |
 | POST | `/supersede` | Supersede a memory |
 | POST | `/contradictions` | List contradictions |
+| POST | `/contradictions/resolution` | Keep both memories of a contradiction pair (or undo it) |
 | POST | `/duplicates/find` | Find duplicates |
 | POST | `/duplicates/merge` | Merge duplicates |
 | PATCH | `/memories/{hash}` | Update memory metadata |
@@ -149,11 +151,14 @@ Copy `.env.example` to `.env`. All settings have sensible defaults for local dev
 | `ALAYA_READONLY_API_KEY` | — | Read-only bearer for headless consumers (optional). Pure reads only (`search`, `get_memory`, contradictions, duplicate-find, health); 403 on every mutating route incl. `store`. Must differ from `ALAYA_API_KEY` |
 | `LISTEN_ADDR` | `0.0.0.0:3001` | Server bind address |
 | `REDIS_CACHE_URL` | — | L2 embedding cache (optional) |
-| `SUMMARY_URL` | — | Anthropic Messages API URL (optional) |
+| `SUMMARY_URL` | — | Anthropic API origin, e.g. `https://api.anthropic.com` or an in-cluster proxy such as `http://anthropic-lb:8082` (optional). The client appends `/v1/messages` — do not include the path. With a key set, plain `http://` to any host that is not cluster-local is refused at boot |
 | `SUMMARY_API_KEY` | — | Required if `SUMMARY_URL` is set |
 | `SUMMARY_MODEL` | `claude-haiku-4-5-20251001` | Summary model |
+| `JUDGE_URL` | `SUMMARY_URL` | Contradiction judge API origin, same format as `SUMMARY_URL` (optional). Falls back to `SUMMARY_URL`; unset both to disable the judge |
+| `JUDGE_API_KEY` | `SUMMARY_API_KEY` | Falls back to `SUMMARY_API_KEY` |
+| `JUDGE_MODEL` | `claude-sonnet-5` | Model that judges `CONTRADICTS` pairs (advisory verdicts on the edge; never writes memories). Not inherited from `SUMMARY_MODEL`: Haiku misses the judge's precision bar on the golden set |
 | `RERANK_URL` | — | TEI `/rerank` endpoint (empty = rerank disabled) |
-| `RERANK_API_KEY` | — | Optional bearer token for `RERANK_URL` |
+| `RERANK_API_KEY` | — | Optional bearer token for `RERANK_URL`. With it set, plain `http://` to a host that is not cluster-local is refused at boot, as for `SUMMARY_URL` |
 | `RERANK_TOP_N` | `20` | How many top RRF candidates to rerank |
 | `OIDC_ISSUER` | — | OAuth Resource Server issuer URL (empty = no OAuth) |
 

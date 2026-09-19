@@ -19,7 +19,7 @@ Rust rewrite of the mcp-memory-service API layer. Deployed on k3s as a native se
 | **alaya-types** | wasm32 + native | Done | Shared types: Memory, Edge, SearchMode, AlayaError, PayloadFilter |
 | **alaya-bridge** | native only | Done | FalkorDB typed RPC bridge (axum + redis), 18 endpoints |
 | **alaya-backends** | wasm32 + native | Done | Trait definitions + HTTP clients (Qdrant, Embedding, Graph) |
-| **alaya-core** | wasm32 + native | Done | MemoryService orchestration (all 10 MCP tools), 5 integration tests |
+| **alaya-core** | wasm32 + native | Done | MemoryService orchestration (all 11 MCP tools), 5 integration tests |
 | **alaya-server** | native only | Done | REST API + MCP Streamable HTTP (axum, channel-based, 9 endpoints + /mcp) |
 | **ops-console** | native only | Done | OIDC-gated admin console (Leptos SSR + vendored Rust/UI, LAB-1684) — memory curation UI over alaya-server's REST API; see `crates/ops-console/README.md` |
 | **alaya-worker** | wasm32 | Deferred | CF Worker entry point (reqwest-wasm unreliable on Workers, native server sufficient) |
@@ -28,16 +28,16 @@ Rust rewrite of the mcp-memory-service API layer. Deployed on k3s as a native se
 crates/
 ├── alaya-types/src/
 │   ├── lib.rs          # Re-exports
-│   ├── error.rs        # AlayaError (6 variants, JSON-RPC codes, safe_message())
+│   ├── error.rs        # AlayaError (JSON-RPC codes, safe_message())
 │   ├── graph.rs        # UserRelationType, SystemRelationType, Edge, Neighbor, etc.
 │   ├── memory.rs       # Memory (15 fields), ScoredMemory, ScrollResult, MetadataUpdate
 │   └── search.rs       # SearchMode (5 modes), PromptName, PayloadFilter
 ├── alaya-bridge/src/
 │   ├── lib.rs           # Library target (re-exports for integration tests)
 │   ├── main.rs          # Binary entry — reads REDIS_URL/GRAPH_NAME, starts axum + queue
-│   ├── routes.rs        # 18 HTTP endpoints, auth middleware on API routes
+│   ├── routes.rs        # HTTP endpoints, auth middleware on API routes
 │   ├── auth.rs          # Fail-closed bearer auth (GRAPH_API_KEY read once at startup)
-│   ├── cypher.rs        # Typed Cypher query builders (17 functions, all parameterized)
+│   ├── cypher.rs        # Typed Cypher query builders (all parameterized)
 │   ├── resp.rs          # FalkorDB RESP parser (compact + non-compact modes)
 │   ├── queue.rs         # Hebbian write queue (LPUSH/BRPOP, rate-limited 100 ops/sec)
 │   └── handlers/
@@ -46,17 +46,20 @@ crates/
 │       ├── edges.rs     # POST /edges/create, /edges/get, /edges/delete, /edges/create-system
 │       ├── health.rs    # GET /health (unauth), GET /stats
 │       ├── hebbian.rs   # POST /hebbian/{neighbors,spreading,boosts-within,strengthen}
-│       ├── contradictions.rs  # POST /contradictions/{all,for}
+│       ├── contradictions.rs  # POST /contradictions/{all,for,verdict,resolution}
 │       └── consolidation.rs   # POST /consolidation/{decay-all,decay-stale,prune,orphans}
 ├── alaya-backends/src/
 │   ├── lib.rs           # Re-exports
-│   ├── traits.rs        # VectorStorage, EmbeddingProvider, GraphService, HebbianService, ConsolidationService
+│   ├── traits.rs        # VectorStorage, EmbeddingProvider, GraphService, HebbianService, ConsolidationService, SummaryProvider, ContradictionJudge
 │   ├── qdrant.rs        # QdrantClient — Qdrant REST API (WASM-compat)
 │   ├── embedding.rs     # EmbeddingClient — OpenAI-compat /v1/embeddings
+│   ├── anthropic.rs     # Shared raw-HTTP Anthropic Messages transport (no SDK; 429 → RateLimited)
+│   ├── summary.rs       # SummaryClient — one-line summaries over anthropic.rs
+│   ├── judge.rs         # JudgeClient — CONTRADICTS pair verdicts via structured output (LAB-3283)
 │   └── graph.rs         # GraphHttpClient — bridge HTTP wrapper (3 trait impls)
 ├── alaya-core/src/
 │   ├── lib.rs           # Re-exports
-│   ├── service.rs       # MemoryService — all 10 MCP tools orchestrated
+│   ├── service.rs       # MemoryService — all 11 MCP tools orchestrated
 │   ├── hashing.rs       # SHA-256 content hashing
 │   ├── hybrid_search.rs # RRF, adaptive alpha, keyword extraction, recency decay
 │   ├── interference.rs  # Contradiction detection (negation, antonym, temporal)
@@ -136,6 +139,15 @@ LISTEN_ADDR=0.0.0.0:3001
 RUST_LOG=alaya_server=info
 OTEL_EXPORTER_OTLP_ENDPOINT=http://phoenix-svc.recsys.svc:6006  # optional
 OTEL_SERVICE_NAME=alaya-server
+SUMMARY_URL=                             # optional — Anthropic API origin; client appends /v1/messages. https:// required off-cluster
+                                         #   (https://api.anthropic.com); plain http only for a cluster-local proxy (http://anthropic-lb:8082).
+                                         #   Boot is refused when a key would go over http to any other host (applies to JUDGE_URL too)
+SUMMARY_API_KEY=
+SUMMARY_MODEL=claude-haiku-4-5-20251001
+JUDGE_URL=                               # contradiction judge; URL and key fall back to their SUMMARY_* twin
+JUDGE_API_KEY=                           #   (so SUMMARY_URL alone enables the judge). Both unset = judge disabled.
+JUDGE_MODEL=claude-sonnet-5              #   Own default, not SUMMARY_MODEL: Haiku fails the golden-set precision bar.
+                                         #   Advisory: verdicts annotate CONTRADICTS edges, never memory payloads.
 RERANK_URL=                              # optional — empty disables cross-encoder rerank
 RERANK_API_KEY=                          # optional
 RERANK_TOP_N=20                          # how many RRF candidates to rerank
@@ -147,15 +159,7 @@ CACHEKIT_API_URL=                        # saas backend — default https://api.
 
 **L2 cache keys are cross-SDK interop/v1** (`alaya:embed:{blake2b256-hex}` over
 `[model, dims, prompt_name, text]`, un-namespaced client — a client namespace
-silently prefixes keys and breaks conformance). Cutover from legacy SHA-256
-keys 2026-08-08 (LAB-372): legacy `alaya:embed:<model>:<dims>:*` entries are
-orphaned and expire via their 30-day TTL; flush to reclaim memory sooner:
-`redis-cli --scan --pattern 'alaya:embed:*:*' | xargs -r redis-cli del`
-(the extra `:*` spares new interop keys, which have no colon after `embed:`;
-safe either way — worst case is a one-time re-embed). The flush command is
-Redis-backend only; with `CACHE_BACKEND=saas` rely on TTL expiry or
-provider-side cleanup (moot in practice — the SaaS backend shipped with the
-cutover, so it never held legacy keys).
+silently prefixes keys and breaks conformance).
 
 ## Key Design Decisions
 
@@ -163,6 +167,8 @@ cutover, so it never held legacy keys).
 - **UUID from content_hash** — `Uuid::parse_str(&hash[..32])` — takes first 32 hex chars, NOT uuid5. Must match Python `uuid.UUID(hash[:32])` for data compatibility.
 - **Superseded filtering** — Done at application layer, NOT Qdrant filter level. Qdrant's `is_null` on nested payload fields is unreliable without explicit indexes.
 - **Graph operations are non-fatal** — All graph calls (spreading activation, Hebbian, interference) use `unwrap_or_default()`. Service degrades gracefully when FalkorDB is down.
+- **Contradiction judge is advisory (LAB-3283 Phase 1)** — an LLM judge (`ContradictionJudge`, `claude-sonnet-5` by default; prompt tuned with `scripts/judge_tune/`) classifies every `CONTRADICTS` pair as `contradiction` / `supersession` / `coexist` / `unrelated`, off the store path (`spawn_local` after store, plus `POST /backfill/contradictions`). Verdicts are written onto the edge via the bridge (`POST /contradictions/verdict`, MATCH-only) and one `tracing` event on target `alaya::judge` records `would_supersede` per verdict — the shadow log Phase 2 is promoted on. Failures are classified: transient (429/5xx/timeout/misconfig) write nothing and are retried; deterministic (schema/parse/empty/400) persist `verdict = unjudged` + the error as reason so the backfill's NULL selection skips the pair (`rejudge: true` re-selects edges judged by another model). Never a vector write, never a panic. `memory_contradictions` filters entirely in Cypher (`ContradictionQuery`: verdicts, `exclude_resolved` via incoming `SUPERSEDES` edges or an `e.resolution` stamp, `SKIP`/`LIMIT`) and pages with `offset`/`next_offset` — app-side filtering over a LIMIT-only read starved the queue (review, 2026-09-10).
+- **Three exits from the contradiction queue (LAB-3885)** — a `CONTRADICTS` pair leaves the default `memory_contradictions` page by (1) **supersede** (`memory_supersede` / console *Keep A / Keep B*): destructive with an audit trail, reversed only by storing again; (2) **keep both** (`resolve_contradiction` / `POST /contradictions/resolution` / console *Keep both*): non-destructive — stamps `e.resolution` / `e.resolved_at` / `e.resolved_via` on the edge, both memories stay live, reversed by the same verb with `resolution: null`; (3) **hidden by the verdict filter** (default `verdicts` omit `coexist` / `unrelated`): nothing written. The resolution verb is the ONLY writer of `e.resolution*` (`relation` cannot set it; the judge writes the verdict namespace only), a stamp in either direction settles the pair (a re-store of the older endpoint MERGEs a fresh reverse edge), and `relation delete` refuses a `CONTRADICTS` edge carrying a verdict or a resolution (`AlayaError::Conflict`). Re-store `MERGE` preserving the stamp is proven in `crates/alaya-bridge/tests/integration_contradictions.rs`. Full tables: `docs/mcp-tools.md#resolve_contradiction`, `docs/rest-api.md`.
 - **reqwest default-features = false** — Workspace-level and per-crate. Uses `rustls-tls` on native, bare `json` on wasm32. Prevents OpenSSL dependency in containers.
 - **MCP protocol 2025-03-26** — SSE response format (`event: message\ndata: {...}\n\n`) when client sends `Accept: text/event-stream`. Plain JSON otherwise.
 - **Cross-encoder rerank** — Optional second-stage reranker (TEI `/rerank` endpoint, default model `BAAI/bge-reranker-v2-m3`). When `RERANK_URL` is set, `search_hybrid` re-scores the top-N RRF candidates as (query, doc) pairs and reorders them; the rerank score replaces the RRF+cosine blend for those entries. Validated on LongMemEval (2026-05-23, cached embeddings + Python re-impl, 500q): R@5 0.936 → 0.990 with top_n=20. Graceful degradation: rerank failures log and fall back to RRF order, never break the search.
@@ -192,7 +198,7 @@ These were discovered during integration testing and are NOT documented in Falko
 2. ~~**alaya-core**~~ — Done (MemoryService: all 10 tools, 7 algorithm modules)
 3. ~~**Native REST server**~~ — Done (alaya-server: 9 REST endpoints, channel-based axum)
 4. ~~**Integration testing**~~ — Done (5 tests against real Qdrant + TEI on lab k3s)
-5. ~~**MCP transport**~~ — Done (JSON-RPC 2.0 + SSE, protocol 2025-03-26, 10 tool schemas)
+5. ~~**MCP transport**~~ — Done (JSON-RPC 2.0 + SSE, protocol 2025-03-26, 11 tool schemas)
 6. ~~**Deployment**~~ — Done (k3s manifests, CI → ghcr.io, network policies)
 7. **OTLP tracing** — Wired but degraded (reqwest async client issue in container, falls back to stderr)
 8. **Prajna integration** — Replace writer.rs qdrant-client with Ālaya HTTP calls

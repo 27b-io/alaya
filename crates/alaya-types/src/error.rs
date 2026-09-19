@@ -28,8 +28,29 @@ pub enum AlayaError {
     #[error("rerank error: {0}")]
     Rerank(String),
 
+    #[error("contradiction judge error: {0}")]
+    Judge(String),
+
+    /// Upstream returned 429. `retry_after_secs` is the server's hint, when
+    /// it sent one; callers that retry own the backoff.
+    #[error("upstream rate limited (retry-after: {retry_after_secs:?}s)")]
+    RateLimited { retry_after_secs: Option<u64> },
+
+    /// Transient upstream failure — connect/timeout, 5xx, or an auth/model
+    /// misconfiguration (401/403/404) that is not the request's fault.
+    /// Nothing about the input caused it, so callers must not record a
+    /// per-item failure; retry later.
+    #[error("upstream unavailable: {0}")]
+    Unavailable(String),
+
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    /// Refused because the write would destroy audit state: today, deleting
+    /// a `CONTRADICTS` edge that carries a judge verdict or an operator
+    /// resolution (LAB-3885 AC-6). The safe message names the way out.
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
 
 impl AlayaError {
@@ -44,7 +65,11 @@ impl AlayaError {
             Self::NotFound(_) => -32004,
             Self::Summary(_) => -32005,
             Self::Rerank(_) => -32006,
+            Self::Judge(_) => -32007,
+            Self::RateLimited { .. } => -32008,
+            Self::Unavailable(_) => -32009,
             Self::Serialization(_) => -32600,
+            Self::Conflict(_) => -32010,
         }
     }
 
@@ -60,7 +85,13 @@ impl AlayaError {
             Self::NotFound(_) => "Resource not found",
             Self::Summary(_) => "Summary generation failed",
             Self::Rerank(_) => "Rerank operation failed",
+            Self::Judge(_) => "Contradiction judge failed",
+            Self::RateLimited { .. } => "Upstream rate limited",
+            Self::Unavailable(_) => "Upstream temporarily unavailable",
             Self::Serialization(_) => "Invalid request format",
+            Self::Conflict(_) => {
+                "Edge carries a verdict or resolution; resolve it (keep_both / supersede) instead of deleting"
+            }
         }
     }
 }
