@@ -10,6 +10,14 @@ use alaya_types::{AlayaError, Result};
 
 use crate::RerankingService;
 
+/// TEI `/rerank`-backed [`RerankingService`].
+///
+/// On native, `rerank()` sets no client-side timer and is unbounded on its
+/// own — see the call-site comment there for why a second timer would steal
+/// the wrong log line on a late poll. Every call MUST be wrapped by the
+/// caller in `tokio::time::timeout(self.timeout(), …)`; see
+/// [`RerankingService::timeout`] for the budget. wasm32 has no tokio timer
+/// and bounds its own transport instead.
 pub struct RerankClient {
     client: Client,
     base_url: String,
