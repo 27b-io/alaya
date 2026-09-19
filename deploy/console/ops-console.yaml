@@ -1,6 +1,8 @@
 # MIRROR of the private infra repo's k8s/mcp/ops-console.yaml — the deployed manifest is the
-# truth; keep this copy in sync (LAB-2712). Only the image line differs: lab
-# pins :main@sha256:<digest> with the flux-system:alaya imagepolicy marker.
+# truth; keep this copy in sync (LAB-2712). The image line and the placeholder
+# hostname differ: lab pins :main@sha256:<digest> with the flux-system:alaya
+# imagepolicy marker, and CONSOLE_PUBLIC_URL below carries the real tailnet
+# hostname (this file uses a placeholder to avoid publishing it).
 #
 # ops-console — Ālaya curation console (LAB-2712 go-live; code + template shipped
 # by alaya#81 / LAB-1684).
