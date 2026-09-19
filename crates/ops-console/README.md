@@ -119,8 +119,10 @@ Config split: `CONSOLE_PUBLIC_URL`, `CONSOLE_OIDC_ISSUER`, `ALAYA_URL`,
 `CONSOLE_ALLOWED_SUBJECTS`, `CONSOLE_SESSION_SECRET`, `ALAYA_API_KEY` and
 `LB_API_KEY` come from a secret manager, rendered by ESO into Secret
 `ops-console-env`. Editing the Secret rolls the pod (Reloader annotation).
-Because the LB group is all-or-nothing, the manifest and the image can roll
-in either order without taking the console down.
+`LB_URL`, `METRICS_URL` (manifest) and `LB_API_KEY` (Secret) are one
+all-or-nothing group: land all three in the same change — a half-set group
+refuses startup by design (see the `LB_URL` comment in
+`deploy/console/ops-console.yaml`).
 
 Tailnet HTTPS — order matters: define `svc:ops` in the Tailscale admin
 console **first**, then on the lab node run `tailscale serve --bg --service

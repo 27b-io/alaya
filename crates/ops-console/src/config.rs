@@ -37,7 +37,7 @@ pub struct Config {
 }
 
 /// anthropic-lb read-only module. Optional as a GROUP: a
-/// deploy-ordering gap (the image rolls before the Secret carries the key,
+/// deploy-ordering gap (the image rolls before the three variables are set,
 /// or the reverse) leaves the Ālaya module up and the LB card reading "not
 /// configured" instead of taking the whole console down. A half-set group
 /// is a misconfiguration and refuses startup like any other credential.
@@ -68,11 +68,15 @@ impl LbConfig {
         };
         match (url, api_key, metrics_url) {
             (None, None, None) => Ok(None),
-            (Some(u), Some(k), Some(m)) => Ok(Some(LbConfig {
-                url: parse("LB_URL", u)?,
-                api_key: k,
-                metrics_url: parse("METRICS_URL", m)?,
-            })),
+            (Some(u), Some(k), Some(m)) => {
+                let url = parse("LB_URL", u)?;
+                validate_keyed_url("LB_URL", &url)?;
+                Ok(Some(LbConfig {
+                    url,
+                    api_key: k,
+                    metrics_url: parse("METRICS_URL", m)?,
+                }))
+            }
             (u, k, m) => {
                 let missing: Vec<&str> = [
                     ("LB_URL", u.is_none()),
@@ -91,20 +95,21 @@ impl LbConfig {
     }
 }
 
-// Never derive Debug for Config — it holds three credentials.
+// Never derive Debug for Config — it holds credentials. Upstream URLs render
+// as origin only: userinfo and query strings can carry more.
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
             .field("listen_addr", &self.listen_addr)
-            .field("public_url", &self.public_url.as_str())
+            .field("public_url", &origin_of(&self.public_url))
             .field("oidc_issuer", &self.oidc_issuer)
             .field("oidc_client_id", &self.oidc_client_id)
             .field("allowed_subjects", &self.allowed_subjects)
-            .field("alaya_url", &self.alaya_url.as_str())
-            .field("lb_url", &self.lb.as_ref().map(|l| l.url.as_str()))
+            .field("alaya_url", &origin_of(&self.alaya_url))
+            .field("lb_url", &self.lb.as_ref().map(|l| origin_of(&l.url)))
             .field(
                 "metrics_url",
-                &self.lb.as_ref().map(|l| l.metrics_url.as_str()),
+                &self.lb.as_ref().map(|l| origin_of(&l.metrics_url)),
             )
             .finish_non_exhaustive()
     }
@@ -131,6 +136,44 @@ fn validate_public_url(public_url: &url::Url) -> Result<(), String> {
             Err("CONSOLE_PUBLIC_URL must be https (http is allowed only for loopback dev)".into())
         }
         _ => Err("CONSOLE_PUBLIC_URL must be http(s)".into()),
+    }
+}
+
+/// Hosts a key may reach over plain http. Mirrors alaya-server's rule for
+/// SUMMARY_URL / JUDGE_URL: DNS-only cluster names, or a real loopback /
+/// private IP literal — `127.0.0.1.evil.com` parses as neither.
+fn host_is_private(h: &str) -> bool {
+    if h == "localhost" || h.ends_with(".svc") || h.ends_with(".internal") {
+        return true;
+    }
+    match h.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private(),
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+fn is_cluster_local(url: &url::Url) -> bool {
+    let Some(h) = url.host_str() else {
+        return false;
+    };
+    let h = h.trim_start_matches('[').trim_end_matches(']');
+    host_is_private(h) || (h.parse::<std::net::IpAddr>().is_err() && !h.contains('.'))
+}
+
+/// A URL a credential travels to (ALAYA_URL bearer, LB_URL x-api-key): https
+/// anywhere, plain http only cluster-local — otherwise refuse startup.
+/// METRICS_URL carries no key and is exempt. The refusal names the host,
+/// never the value (it may carry userinfo).
+fn validate_keyed_url(var: &str, url: &url::Url) -> Result<(), String> {
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_cluster_local(url) => Ok(()),
+        scheme => Err(format!(
+            "{var}: {scheme}://{} is neither https nor a cluster-local http endpoint; \
+             a key must not travel in the clear",
+            url.host_str().unwrap_or("")
+        )),
     }
 }
 
@@ -194,6 +237,7 @@ impl Config {
         let alaya_url: url::Url = required("ALAYA_URL")?
             .parse()
             .map_err(|e| format!("ALAYA_URL is not a valid URL: {e}"))?;
+        validate_keyed_url("ALAYA_URL", &alaya_url)?;
 
         Ok(Config {
             listen_addr: std::env::var("CONSOLE_LISTEN_ADDR")
@@ -242,6 +286,31 @@ mod tests {
     }
 
     #[test]
+    fn keyed_urls_refuse_plaintext_off_cluster() {
+        let ok = |u: &str| validate_keyed_url("LB_URL", &u.parse().unwrap()).is_ok();
+        assert!(ok("https://lb.example.com"));
+        assert!(ok("http://anthropic-lb.mcp.svc:8082"));
+        assert!(ok("http://anthropic-lb:8082"));
+        assert!(ok("http://10.0.0.5:8082"));
+        assert!(ok("http://localhost:8082"));
+        assert!(!ok("http://lb.example.com:8082"));
+        assert!(!ok("http://127.0.0.1.evil.com:8082"));
+        assert!(!ok("ftp://anthropic-lb"));
+        // The refusal goes to pod logs: name the host, never the userinfo.
+        let err = validate_keyed_url("LB_URL", &"http://u:s3cret@lb.example.com".parse().unwrap())
+            .unwrap_err();
+        assert!(
+            err.contains("lb.example.com") && !err.contains("s3cret"),
+            "{err}"
+        );
+        // Through the group: the keyed URL is checked, the keyless one is not.
+        let k = || Some("k".repeat(40));
+        let off = || Some("http://metrics.example.com:8428".to_string());
+        assert!(LbConfig::from_parts(Some("http://lb.example.com".into()), k(), off()).is_err());
+        assert!(LbConfig::from_parts(Some("http://lb:8082".into()), k(), off()).is_ok());
+    }
+
+    #[test]
     fn debug_never_prints_credentials() {
         let cfg = Config {
             listen_addr: "0.0.0.0:3002".into(),
@@ -251,19 +320,28 @@ mod tests {
             oidc_client_secret: "SECRET_VALUE".into(),
             allowed_subjects: vec!["sub1".into()],
             session_secret: b"0123456789abcdef0123456789abcdef".to_vec(),
-            alaya_url: "http://alaya-server.mcp.svc:3001".parse().unwrap(),
+            // Userinfo and query strings are part of `Url::as_str()` —
+            // Debug must not print them either.
+            alaya_url: "http://svc:URL_USERINFO_VALUE@alaya-server.mcp.svc:3001"
+                .parse()
+                .unwrap(),
             alaya_api_key: "BEARER_VALUE".into(),
             lb: Some(LbConfig {
                 url: "http://anthropic-lb.mcp.svc:8082".parse().unwrap(),
                 api_key: "LB_KEY_VALUE".into(),
-                metrics_url: "http://metrics.test:8428".parse().unwrap(),
+                metrics_url: "http://metrics.test:8428/select?token=URL_QUERY_VALUE"
+                    .parse()
+                    .unwrap(),
             }),
         };
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("SECRET_VALUE"));
         assert!(!dbg.contains("BEARER_VALUE"));
         assert!(!dbg.contains("LB_KEY_VALUE"));
+        assert!(!dbg.contains("URL_USERINFO_VALUE"), "{dbg}");
+        assert!(!dbg.contains("URL_QUERY_VALUE"), "{dbg}");
         assert!(dbg.contains("anthropic-lb.mcp.svc"));
+        assert!(dbg.contains("metrics.test:8428"));
     }
 
     #[test]

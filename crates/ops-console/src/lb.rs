@@ -39,10 +39,10 @@ fn join(base: &url::Url, path: &str) -> String {
 }
 
 /// Send and read a JSON body. Transport errors collapse to a one-phrase kind
-/// (they can embed the request URL); error bodies are surfaced as plain text
-/// (the page renders them as text nodes, never markup), truncated. Query
-/// errors arrive as non-2xx on the Prometheus API, so this is the only error
-/// path a caller needs.
+/// (they can embed the request URL); of a non-2xx body only a JSON `error`
+/// field is surfaced (`AppError::non_success`). Query errors arrive as
+/// non-2xx on the Prometheus API, so this is the only error path a caller
+/// needs.
 async fn json_body(what: &str, req: reqwest::RequestBuilder) -> Result<Value, AppError> {
     let resp = req
         .send()
@@ -54,8 +54,7 @@ async fn json_body(what: &str, req: reqwest::RequestBuilder) -> Result<Value, Ap
         .await
         .map_err(|e| AppError::transport(what, &e))?;
     if !status.is_success() {
-        let detail: String = text.chars().take(160).collect();
-        return Err(AppError::Upstream(format!("{what} {status}: {detail}")));
+        return Err(AppError::non_success(what, status, &text));
     }
     serde_json::from_str(&text).map_err(|_| AppError::Upstream(format!("{what} returned non-JSON")))
 }

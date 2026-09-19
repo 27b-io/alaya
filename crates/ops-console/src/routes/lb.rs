@@ -295,6 +295,10 @@ fn status_of(e: &Value) -> (String, String) {
         );
     }
     let (s5, s7) = (vs(e, "status_5h"), vs(e, "status_7d"));
+    // Neither window reported: say so, never a fictitious "allowed".
+    if s5.is_empty() && s7.is_empty() {
+        return (badge(BadgeKind::Muted), "unknown".into());
+    }
     let throttled = |s: &str| !s.is_empty() && s != "allowed";
     if throttled(&s5) || throttled(&s7) {
         return (badge(BadgeKind::Warning), format!("{s5} / {s7}"));
@@ -507,6 +511,8 @@ mod tests {
         assert_eq!(t, "allowed_warning / allowed");
         let (_, t) = status_of(&json!({"status_5h": "allowed", "status_7d": null}));
         assert_eq!(t, "allowed");
+        let (_, t) = status_of(&json!({"name": "acct-new"}));
+        assert_eq!(t, "unknown");
     }
 
     #[test]

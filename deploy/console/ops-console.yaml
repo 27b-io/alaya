@@ -59,11 +59,11 @@ spec:
             - name: ALAYA_URL
               value: "http://alaya-server.mcp.svc:3001"
             # anthropic-lb read-only pane. Plain http, pod-to-pod — the same
-            # trust boundary as ALAYA_URL. The pane is enabled only when
-            # LB_URL, LB_API_KEY (Secret) and METRICS_URL are ALL set: the
-            # console refuses to start on a partial set and runs Ālaya-only
-            # when none is set, so this manifest and the image can roll in
-            # either order without taking the console down.
+            # trust boundary as ALAYA_URL (a keyed URL that is plain http
+            # off-cluster refuses startup). LB_URL, METRICS_URL (here) and
+            # LB_API_KEY (Secret) are ONE all-or-nothing group: land all three
+            # in the same change. None set → Ālaya-only; a half-set group
+            # refuses startup by design.
             - name: LB_URL
               value: "http://anthropic-lb.mcp.svc:8082"
             # Prometheus-compatible query API for the 7-day budget-burn

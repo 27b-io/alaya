@@ -83,4 +83,39 @@ impl AppError {
         };
         AppError::Upstream(format!("{what}: {kind}"))
     }
+
+    /// Non-2xx from a named upstream. Only the `error` field of a JSON error
+    /// body is surfaced, bounded; an arbitrary body (a proxy's HTML page, a
+    /// stack trace) never reaches a page.
+    pub fn non_success(what: &str, status: StatusCode, body: &str) -> Self {
+        let detail: String = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")?
+                    .as_str()
+                    .map(|s| s.chars().take(160).collect())
+            })
+            .unwrap_or_else(|| "unrecognized error body".to_string());
+        AppError::Upstream(format!("{what} {status}: {detail}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_success_surfaces_only_a_bounded_json_error_field() {
+        let status = StatusCode::UNAUTHORIZED;
+        let e = AppError::non_success("lb", status, r#"{"error":"bad key"}"#);
+        assert_eq!(e.detail(), "lb 401 Unauthorized: bad key");
+        // A proxy's HTML page or a plain-text body never reaches a page.
+        let e = AppError::non_success("lb", status, "<html><body>nginx 502</body></html>");
+        assert_eq!(e.detail(), "lb 401 Unauthorized: unrecognized error body");
+        let long = format!(r#"{{"error":"{}"}}"#, "x".repeat(500));
+        assert_eq!(
+            AppError::non_success("lb", status, &long).detail().len(),
+            "lb 401 Unauthorized: ".len() + 160
+        );
+    }
 }
