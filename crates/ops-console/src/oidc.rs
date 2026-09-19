@@ -8,6 +8,8 @@
 //!   issuer (loopback issuer may use http for local dev)
 //! - alg allowlist {RS256, ES256}; `none`/HS* rejected before key lookup
 //! - JWKS cooldown so an unknown-`kid` flood can't drive unbounded fetches
+//! - every IdP body read through `http::body_text`, so an unauthenticated
+//!   caller cannot make a hostile IdP response OOM the console
 //! - `redirect_uri` is pinned from config; never derived from request headers
 //!
 //! Client authentication at the token endpoint is `client_secret_basic`
@@ -139,12 +141,10 @@ impl OidcRp {
         client_secret: String,
         redirect_uri: String,
     ) -> Self {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("failed to build OIDC http client");
+        // Same builder as every other upstream: a hardening knob added to
+        // `http::client` must not miss the IdP, which is the one upstream an
+        // unauthenticated caller can make the console reach.
+        let http = crate::http::client(Duration::from_secs(10));
         let seeded = Instant::now()
             .checked_sub(JWKS_COOLDOWN * 2)
             .unwrap_or_else(Instant::now);
@@ -174,10 +174,11 @@ impl OidcRp {
         if !resp.status().is_success() {
             return Err(OidcRpError("discovery status"));
         }
-        let disc: Discovery = resp
-            .json()
+        let body = crate::http::body_text("oidc discovery", resp)
             .await
-            .map_err(|_| OidcRpError("discovery parse"))?;
+            .map_err(|_| OidcRpError("discovery read"))?;
+        let disc: Discovery =
+            serde_json::from_str(&body).map_err(|_| OidcRpError("discovery parse"))?;
         if normalize_issuer(&disc.issuer) != self.issuer {
             return Err(OidcRpError("discovery issuer mismatch"));
         }
@@ -237,10 +238,11 @@ impl OidcRp {
         if !resp.status().is_success() {
             return Err(OidcRpError("token exchange rejected"));
         }
-        let tokens: TokenResponse = resp
-            .json()
+        let body = crate::http::body_text("oidc token response", resp)
             .await
-            .map_err(|_| OidcRpError("token response parse"))?;
+            .map_err(|_| OidcRpError("token response read"))?;
+        let tokens: TokenResponse =
+            serde_json::from_str(&body).map_err(|_| OidcRpError("token response parse"))?;
 
         let claims = self.verify_id_token(&tokens.id_token).await?;
         // Nonce binds the ID token to this login flow (replay defense).
@@ -300,7 +302,10 @@ impl OidcRp {
         if !resp.status().is_success() {
             return Err(OidcRpError("jwks status"));
         }
-        let jwks: Jwks = resp.json().await.map_err(|_| OidcRpError("jwks parse"))?;
+        let body = crate::http::body_text("oidc jwks", resp)
+            .await
+            .map_err(|_| OidcRpError("jwks read"))?;
+        let jwks: Jwks = serde_json::from_str(&body).map_err(|_| OidcRpError("jwks parse"))?;
         let mut map = HashMap::new();
         for jwk in jwks.keys {
             if let Some(k) = jwk.kid.clone() {

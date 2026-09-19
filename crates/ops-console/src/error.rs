@@ -84,6 +84,18 @@ impl AppError {
         AppError::Upstream(format!("{what}: {kind}"))
     }
 
+    /// A body read that failed part-way or ran past the cap. Overrun is not
+    /// a transport fault and must not read as one: an operator told
+    /// "connection failed" chases a network that is fine.
+    pub fn body(what: &str, e: crate::http::BodyError) -> Self {
+        match e {
+            crate::http::BodyError::Transport(e) => AppError::transport(what, &e),
+            crate::http::BodyError::TooLarge => {
+                AppError::Upstream(format!("{what}: response too large"))
+            }
+        }
+    }
+
     /// Non-2xx from a named upstream. Only the `error` field of a JSON error
     /// body is surfaced, bounded; an arbitrary body (a proxy's HTML page, a
     /// stack trace) never reaches a page.

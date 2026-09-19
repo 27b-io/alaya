@@ -232,6 +232,10 @@ fn is_private_host(url: &str) -> bool {
     host_of(url).is_some_and(|h| host_is_private(&h))
 }
 
+// Duplicated verbatim in ops-console/src/config.rs (no shared crate between
+// a Leptos console and the server) — edit both. Drift is safe in one
+// direction only: a stale copy is the NARROWER one, so it refuses a boot its
+// sibling allows, loudly, in the deploy that introduced it.
 fn host_is_private(h: &str) -> bool {
     // DNS-only special names — these can't be IP literals.
     if h == "localhost" || h.ends_with(".svc") || h.ends_with(".internal") {
@@ -240,7 +244,15 @@ fn host_is_private(h: &str) -> bool {
     // Anything else must parse as an actual IP literal to qualify as private.
     match h.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private(),
-        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        // An IPv4-mapped literal (`::ffff:10.0.0.1`) is the v4 address it
+        // wraps — `Ipv6Addr::is_loopback` is false for `::ffff:127.0.0.1`,
+        // so judge the mapped address or a mapped loopback reads as public.
+        // ULA (`fc00::/7`) is v6's private range; without it a v6-native
+        // cluster is pushed onto DNS names for no security gain.
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.is_loopback() || v4.is_private(),
+            None => v6.is_loopback() || v6.is_unique_local(),
+        },
         Err(_) => false,
     }
 }
@@ -2739,6 +2751,10 @@ mod tests {
             "HTTP://api.anthropic.com",
             "Http://API.Anthropic.com:80",
             "http://user:pass@api.anthropic.com",
+            // A mapped PUBLIC v4, and a global v6 — the latter parses as an
+            // IP, so it never reaches the single-label fallback.
+            "http://[::ffff:93.184.216.34]:8082",
+            "http://[2606:4700::1111]:8082",
             "htps://api.anthropic.com",
             "api.anthropic.com:443",
             "not a url",
@@ -2756,6 +2772,11 @@ mod tests {
             "HTTP://Anthropic-LB:8082",
             "http://alaya-bridge.mcp.svc:3000",
             "http://localhost:8082",
+            // IPv6 literals: loopback, ULA and IPv4-mapped private addresses
+            // are as cluster-local as their v4 spellings.
+            "http://[::1]:8082",
+            "http://[fd00::1]:8082",
+            "http://[::ffff:10.0.0.5]:8082",
         ] {
             assert!(
                 check_credential_transport("SUMMARY_URL", ok, true).is_ok(),
@@ -2825,6 +2846,14 @@ mod tests {
         assert!(is_private_host("http://172.20.0.1"));
         assert!(is_private_host("http://alaya-server.mcp.svc"));
         assert!(is_private_host("http://kube-api.internal"));
+        // Widened with `host_is_private`: this gate decides whether the
+        // dev-only open mode may run, so the v6 spellings of a private
+        // address need their own fence, not inherited coverage from the
+        // credential-transport test.
+        assert!(is_private_host("http://[fd00::1]:3001"));
+        assert!(is_private_host("http://[::ffff:10.0.0.1]:3001"));
+        assert!(!is_private_host("http://[::ffff:93.184.216.34]:3001"));
+        assert!(!is_private_host("http://[2606:4700::1111]:3001"));
 
         // DNS-name look-alikes must NOT count — the bug fix is this:
         assert!(!is_private_host("http://127.0.0.1.evil.com"));

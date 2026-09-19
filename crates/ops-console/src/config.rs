@@ -148,7 +148,15 @@ fn host_is_private(h: &str) -> bool {
     }
     match h.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private(),
-        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        // An IPv4-mapped literal (`::ffff:10.0.0.1`) is the v4 address it
+        // wraps — `Ipv6Addr::is_loopback` is false for `::ffff:127.0.0.1`,
+        // so judge the mapped address or a mapped loopback reads as public.
+        // ULA (`fc00::/7`) is v6's private range; without it a v6-native
+        // cluster is pushed onto DNS names for no security gain.
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.is_loopback() || v4.is_private(),
+            None => v6.is_loopback() || v6.is_unique_local(),
+        },
         Err(_) => false,
     }
 }
@@ -293,6 +301,15 @@ mod tests {
         assert!(ok("http://anthropic-lb:8082"));
         assert!(ok("http://10.0.0.5:8082"));
         assert!(ok("http://localhost:8082"));
+        // IPv6 literals: loopback, ULA and IPv4-mapped private addresses are
+        // as cluster-local as their v4 spellings. A mapped PUBLIC v4 is not,
+        // and a global v6 parses as an IP so it never reaches the
+        // single-label fallback.
+        assert!(ok("http://[::1]:8082"));
+        assert!(ok("http://[fd00::1]:8082"));
+        assert!(ok("http://[::ffff:10.0.0.5]:8082"));
+        assert!(!ok("http://[::ffff:93.184.216.34]:8082"));
+        assert!(!ok("http://[2606:4700::1111]:8082"));
         assert!(!ok("http://lb.example.com:8082"));
         assert!(!ok("http://127.0.0.1.evil.com:8082"));
         assert!(!ok("ftp://anthropic-lb"));

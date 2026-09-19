@@ -36,10 +36,9 @@ impl AlayaClient {
             .await
             .map_err(|e| AppError::transport("alaya-server", &e))?;
         let status = resp.status();
-        let text = resp
-            .text()
+        let text = crate::http::body_text("alaya-server", resp)
             .await
-            .map_err(|e| AppError::transport("alaya-server", &e))?;
+            .map_err(|e| AppError::body("alaya-server", e))?;
         if !status.is_success() {
             return Err(AppError::non_success("alaya-server", status, &text));
         }
@@ -70,10 +69,9 @@ impl AlayaClient {
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(AppError::NotFound("memory not found".into()));
         }
-        let text = resp
-            .text()
+        let text = crate::http::body_text("alaya-server", resp)
             .await
-            .map_err(|e| AppError::transport("alaya-server", &e))?;
+            .map_err(|e| AppError::body("alaya-server", e))?;
         if !status.is_success() {
             return Err(AppError::non_success("alaya-server", status, &text));
         }
