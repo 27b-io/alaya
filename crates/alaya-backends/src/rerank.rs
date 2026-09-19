@@ -38,9 +38,12 @@ impl RerankClient {
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30));
 
-        let client = builder
-            .build()
-            .map_err(|e| AlayaError::Config(format!("rerank HTTP client: {e}")))?;
+        let client = builder.build().map_err(|e| {
+            AlayaError::Config(format!(
+                "rerank HTTP client: {}",
+                crate::redact_reqwest_error(e)
+            ))
+        })?;
 
         Ok(Self {
             client,
@@ -72,7 +75,7 @@ impl RerankingService for RerankClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AlayaError::Rerank(e.to_string()))?;
+            .map_err(|e| AlayaError::Rerank(crate::redact_reqwest_error(e)))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -82,10 +85,12 @@ impl RerankingService for RerankClient {
             )));
         }
 
-        let parsed: Vec<RerankItem> = resp
-            .json()
-            .await
-            .map_err(|e| AlayaError::Rerank(format!("failed to parse response: {e}")))?;
+        let parsed: Vec<RerankItem> = resp.json().await.map_err(|e| {
+            AlayaError::Rerank(format!(
+                "failed to parse response: {}",
+                crate::redact_reqwest_error(e)
+            ))
+        })?;
 
         // TEI returns items sorted by score desc; remap to input order.
         if parsed.len() != texts.len() {

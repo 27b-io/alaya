@@ -51,9 +51,12 @@ impl GraphHttpClient {
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30));
 
-        let client = builder
-            .build()
-            .map_err(|e| AlayaError::Config(format!("graph HTTP client: {e}")))?;
+        let client = builder.build().map_err(|e| {
+            AlayaError::Config(format!(
+                "graph HTTP client: {}",
+                crate::redact_reqwest_error(e)
+            ))
+        })?;
 
         Ok(Self { client, base_url })
     }
@@ -65,7 +68,7 @@ async fn handle_response<T: serde::de::DeserializeOwned>(resp: reqwest::Response
     if resp.status().is_success() {
         resp.json::<T>()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))
     } else {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -313,7 +316,7 @@ impl GraphService for GraphHttpClient {
             })
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         check_success(resp).await
     }
@@ -325,7 +328,7 @@ impl GraphService for GraphHttpClient {
             .json(&DeleteNodeReq { content_hash })
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         check_success(resp).await
     }
@@ -349,7 +352,7 @@ impl GraphService for GraphHttpClient {
             })
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         let body: CreatedResp = handle_response(resp).await?;
         Ok(body.created)
@@ -381,7 +384,7 @@ impl GraphService for GraphHttpClient {
             .json(&BatchCreateEdgeReq { edges: edge_reqs })
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         let body: BatchCreatedResp = handle_response(resp).await?;
         Ok(body.created)
@@ -411,7 +414,7 @@ impl GraphService for GraphHttpClient {
             })
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         let body: EdgesResp = handle_response(resp).await?;
         Ok(body.edges)
@@ -428,7 +431,7 @@ impl GraphService for GraphHttpClient {
             })
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         // The bridge refuses to delete a CONTRADICTS edge that carries a
         // verdict or a resolution (LAB-3885 AC-6). `Conflict` has its own
@@ -463,7 +466,7 @@ impl GraphService for GraphHttpClient {
             })
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         let body: CreatedResp = handle_response(resp).await?;
         Ok(body.created)
@@ -494,7 +497,7 @@ impl GraphService for GraphHttpClient {
             .json(&BatchCreateSystemEdgeReq { edges: edge_reqs })
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         let body: BatchCreatedResp = handle_response(resp).await?;
         Ok(body.created)
@@ -510,7 +513,7 @@ impl GraphService for GraphHttpClient {
             .json(query)
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         let body: ContradictionsResp = handle_response(resp).await?;
         Ok(body.contradictions)
@@ -532,7 +535,7 @@ impl GraphService for GraphHttpClient {
             })
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         let body: UpdatedResp = handle_response(resp).await?;
         Ok(body.updated)
@@ -574,7 +577,7 @@ impl GraphService for GraphHttpClient {
             .json(&HashesReq { hashes })
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         let body: ContradictionsForResp = handle_response(resp).await?;
 
@@ -623,7 +626,7 @@ impl GraphService for GraphHttpClient {
             })
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         let body: NeighborsResp = handle_response(resp).await?;
         Ok(body.neighbors)
@@ -650,7 +653,7 @@ impl GraphService for GraphHttpClient {
             })
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         let body: ActivationsResp = handle_response(resp).await?;
         Ok(body.activations)
@@ -664,7 +667,7 @@ impl GraphService for GraphHttpClient {
             .json(&HashesReq { hashes })
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         let body: BoostsResp = handle_response(resp).await?;
         Ok(body.boosts)
@@ -677,7 +680,7 @@ impl GraphService for GraphHttpClient {
             .get(format!("{}/stats", self.base_url))
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         handle_response(resp).await
     }
@@ -694,7 +697,7 @@ impl HebbianService for GraphHttpClient {
             .json(&StrengthenReq { pairs })
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         check_accepted(resp).await
     }
@@ -714,7 +717,7 @@ impl ConsolidationService for GraphHttpClient {
             })
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         // Bridge returns {"decayed": N}
         #[derive(Deserialize)]
@@ -741,7 +744,7 @@ impl ConsolidationService for GraphHttpClient {
             })
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         #[derive(Deserialize)]
         struct R {
@@ -758,7 +761,7 @@ impl ConsolidationService for GraphHttpClient {
             .json(&PruneReq { threshold, limit })
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         #[derive(Deserialize)]
         struct R {
@@ -775,7 +778,7 @@ impl ConsolidationService for GraphHttpClient {
             .json(&LimitReq { limit })
             .send()
             .await
-            .map_err(|e| AlayaError::Graph(e.to_string()))?;
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         let body: OrphansResp = handle_response(resp).await?;
         Ok(body.orphans)
