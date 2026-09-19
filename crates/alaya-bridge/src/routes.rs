@@ -35,6 +35,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(handlers::contradictions::set_verdict),
         )
         .route(
+            "/contradictions/resolution",
+            post(handlers::contradictions::set_resolution),
+        )
+        .route(
             "/contradictions/for",
             post(handlers::contradictions::for_hashes),
         )

@@ -48,7 +48,7 @@ use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{
     JudgeOutcome, MemoryService, OutputMode, RelationParams, SearchParams, StoreParams,
 };
-use alaya_types::graph::{Contradiction, ContradictionQuery};
+use alaya_types::graph::{Contradiction, ContradictionQuery, Resolution};
 use alaya_types::memory::PatchMemoryRequest;
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -508,6 +508,15 @@ pub(crate) enum CmdInner {
         verdicts: Option<Vec<String>>,
         reply: oneshot::Sender<Value>,
     },
+    /// Stamp (`Some`) or clear (`None`) the operator's resolution on a
+    /// CONTRADICTS pair (LAB-3885). The only write path to `e.resolution*`.
+    ResolveContradiction {
+        memory_a_hash: String,
+        memory_b_hash: String,
+        resolution: Option<Resolution>,
+        resolved_via: String,
+        reply: oneshot::Sender<Value>,
+    },
     FindDuplicates {
         threshold: f64,
         limit: usize,
@@ -565,6 +574,7 @@ impl Cmd {
             CmdInner::Relation { .. } => "relation",
             CmdInner::Supersede { .. } => "supersede",
             CmdInner::Contradictions { .. } => "contradictions",
+            CmdInner::ResolveContradiction { .. } => "resolve_contradiction",
             CmdInner::FindDuplicates { .. } => "find_duplicates",
             CmdInner::MergeDuplicates { .. } => "merge_duplicates",
             CmdInner::Patch { .. } => "patch",
@@ -1254,6 +1264,58 @@ async fn service_worker(
                         }
                         Err(_) => deadline_exceeded(op, limits.cmd, start),
                     };
+                let _ = reply.send(result);
+            }
+
+            CmdInner::ResolveContradiction {
+                memory_a_hash,
+                memory_b_hash,
+                resolution,
+                resolved_via,
+                reply,
+            } => {
+                let span = tracing::info_span!(parent: &ps, "resolve_contradiction");
+                let a = truncate_hash(&memory_a_hash);
+                let b = truncate_hash(&memory_b_hash);
+                let stamp = resolution.map(|r| r.as_str()).unwrap_or("clear");
+                let result = match timeout(
+                    limits.cmd,
+                    svc.resolve_contradiction(
+                        &memory_a_hash,
+                        &memory_b_hash,
+                        resolution,
+                        &resolved_via,
+                    )
+                    .instrument(span),
+                )
+                .await
+                {
+                    Ok(Ok(r)) => {
+                        tracing::info!(
+                            op,
+                            a = a.as_str(),
+                            b = b.as_str(),
+                            resolution = stamp,
+                            via = resolved_via.as_str(),
+                            elapsed_ms = ms(start),
+                            "ok"
+                        );
+                        r
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(
+                            op,
+                            error = %e,
+                            a = a.as_str(),
+                            b = b.as_str(),
+                            resolution = stamp,
+                            elapsed_ms = ms(start),
+                            "failed"
+                        );
+                        json!({"success": false, "error": e.safe_message()})
+                    }
+                    Err(_) => deadline_exceeded(op, limits.cmd, start),
+                };
                 let _ = reply.send(result);
             }
 
@@ -1950,6 +2012,7 @@ fn main() {
             .route("/relation", post(relation))
             .route("/supersede", post(supersede))
             .route("/contradictions", post(contradictions))
+            .route("/contradictions/resolution", post(resolve_contradiction))
             .route("/duplicates/find", post(find_duplicates))
             .route("/duplicates/merge", post(merge_duplicates))
             .route(
@@ -2235,6 +2298,46 @@ async fn contradictions(
     .await
 }
 
+/// `resolution` must be present: `"keep_both"` stamps, explicit `null`
+/// clears. A missing key is a 4xx, never a silent clear.
+#[derive(Deserialize)]
+struct ResolveContradictionReq {
+    memory_a_hash: String,
+    memory_b_hash: String,
+    #[serde(deserialize_with = "require_present")]
+    resolution: Option<Resolution>,
+    /// Who resolved, recorded verbatim (`operator:console`, `engine:<run-id>`).
+    resolved_via: String,
+}
+
+/// `Option<T>` that rejects an absent key (serde's default reads absent as
+/// `None`, which for a set-or-clear field turns a typo into a clear).
+pub(crate) fn require_present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d)
+}
+
+async fn resolve_contradiction(
+    axum::extract::State(h): axum::extract::State<ServiceHandle>,
+    Json(req): Json<ResolveContradictionReq>,
+) -> (StatusCode, Json<Value>) {
+    let (tx, rx) = oneshot::channel();
+    h.call(
+        CmdInner::ResolveContradiction {
+            memory_a_hash: req.memory_a_hash,
+            memory_b_hash: req.memory_b_hash,
+            resolution: req.resolution,
+            resolved_via: req.resolved_via,
+            reply: tx,
+        },
+        rx,
+    )
+    .await
+}
+
 #[derive(Deserialize)]
 struct FindDupReq {
     #[serde(default = "default_threshold")]
@@ -2451,6 +2554,41 @@ async fn backfill_contradictions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── resolve_contradiction wire shape (LAB-3885 AC-4) ─────────────────
+
+    #[test]
+    fn resolve_contradiction_req_requires_resolution_key_but_accepts_null() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let set: ResolveContradictionReq = serde_json::from_value(json!({
+            "memory_a_hash": a, "memory_b_hash": b,
+            "resolution": "keep_both", "resolved_via": "operator:console"
+        }))
+        .unwrap();
+        assert_eq!(set.resolution, Some(Resolution::KeepBoth));
+
+        let clear: ResolveContradictionReq = serde_json::from_value(json!({
+            "memory_a_hash": a, "memory_b_hash": b,
+            "resolution": null, "resolved_via": "operator:console"
+        }))
+        .unwrap();
+        assert_eq!(clear.resolution, None);
+
+        let missing = serde_json::from_value::<ResolveContradictionReq>(json!({
+            "memory_a_hash": a, "memory_b_hash": b, "resolved_via": "operator:console"
+        }));
+        assert!(missing.is_err(), "an absent key must not read as a clear");
+        let bogus = serde_json::from_value::<ResolveContradictionReq>(json!({
+            "memory_a_hash": a, "memory_b_hash": b,
+            "resolution": "keep-both", "resolved_via": "operator:console"
+        }));
+        assert!(bogus.is_err());
+        let no_via = serde_json::from_value::<ResolveContradictionReq>(json!({
+            "memory_a_hash": a, "memory_b_hash": b, "resolution": "keep_both"
+        }));
+        assert!(no_via.is_err(), "resolved_via is required on REST");
+    }
 
     // ─── Contradiction judge plumbing (LAB-3283 AC-4, AC-5, AC-9) ─────────
 
@@ -2901,6 +3039,16 @@ mod wedge_tests {
             _src: &str,
             _dst: &str,
             _verdict: &alaya_types::graph::EdgeVerdict,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn set_contradiction_resolution(
+            &self,
+            _src: &str,
+            _dst: &str,
+            _resolution: Option<Resolution>,
+            _via: &str,
+            _at: f64,
         ) -> Result<bool> {
             unimplemented!()
         }
