@@ -1713,15 +1713,11 @@ fn spawn_store_contradiction_judges(
                 return;
             };
             let outcome = svc.judge_contradiction(&src, &dst).await;
-            // Give the unit back when nothing was sent to the judge: a bad pair,
-            // a vector-store fetch failure, an unavailable endpoint or a 429 all
-            // cost zero tokens, and a graph or vector blip mid-import must not
-            // spend the day's budget on no-ops. A judged pair stays billed even
-            // if the edge write failed — the tokens went out either way.
-            if matches!(
-                outcome,
-                JudgeOutcome::Unjudged { marked: false } | JudgeOutcome::RateLimited { .. }
-            ) {
+            // Give the unit back when nothing was billed: a graph or vector blip
+            // mid-import must not spend the day's budget on no-ops. `spent()`
+            // owns which paths are free; a judged pair stays billed even if the
+            // edge write failed — the tokens went out either way.
+            if !outcome.spent() {
                 limiter.borrow_mut().refund(day);
             }
         });
@@ -1829,7 +1825,10 @@ async fn backfill_judge(
             // (four sleeping pairs would stall the pass and the store path).
             with_backoff(|| async {
                 let Ok(_permit) = gate.acquire().await else {
-                    return JudgeOutcome::Unjudged { marked: false };
+                    return JudgeOutcome::Unjudged {
+                        marked: false,
+                        spent: false,
+                    };
                 };
                 svc.judge_contradiction(&p.memory_a_hash, &p.memory_b_hash)
                     .await
@@ -1853,9 +1852,9 @@ async fn backfill_judge(
                 t.input_tokens += judgement.input_tokens;
                 t.output_tokens += judgement.output_tokens;
             }
-            JudgeOutcome::Unjudged { marked: true } => t.marked += 1,
+            JudgeOutcome::Unjudged { marked: true, .. } => t.marked += 1,
             // `with_backoff` never returns RateLimited; treat it as transient.
-            JudgeOutcome::Unjudged { marked: false } | JudgeOutcome::RateLimited { .. } => {
+            JudgeOutcome::Unjudged { marked: false, .. } | JudgeOutcome::RateLimited { .. } => {
                 t.unjudged += 1
             }
         }
@@ -1883,7 +1882,10 @@ where
                         retries = n,
                         "backfill: still rate limited, giving up on pair"
                     );
-                    return JudgeOutcome::Unjudged { marked: false };
+                    return JudgeOutcome::Unjudged {
+                        marked: false,
+                        spent: false,
+                    };
                 }
                 let wait = retry_after_secs
                     .map(std::time::Duration::from_secs)
@@ -1899,7 +1901,10 @@ where
             }
         }
     }
-    JudgeOutcome::Unjudged { marked: false }
+    JudgeOutcome::Unjudged {
+        marked: false,
+        spent: false,
+    }
 }
 
 /// Fire-and-forget summary generation helper.
@@ -2890,7 +2895,13 @@ mod tests {
         })
         .await;
         assert!(
-            matches!(out, JudgeOutcome::Unjudged { marked: false }),
+            matches!(
+                out,
+                JudgeOutcome::Unjudged {
+                    marked: false,
+                    spent: false
+                }
+            ),
             "{out:?}"
         );
         assert_eq!(calls.get(), JUDGE_MAX_RETRIES + 1);
@@ -2907,11 +2918,22 @@ mod tests {
         let calls = std::cell::Cell::new(0u32);
         let out = with_backoff(|| {
             calls.set(calls.get() + 1);
-            async { JudgeOutcome::Unjudged { marked: true } }
+            async {
+                JudgeOutcome::Unjudged {
+                    marked: true,
+                    spent: true,
+                }
+            }
         })
         .await;
         assert!(
-            matches!(out, JudgeOutcome::Unjudged { marked: true }),
+            matches!(
+                out,
+                JudgeOutcome::Unjudged {
+                    marked: true,
+                    spent: true
+                }
+            ),
             "{out:?}"
         );
         assert_eq!(calls.get(), 1);
@@ -3037,12 +3059,14 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl alaya_backends::ContradictionJudge for StubJudge {
+        /// Answers like a model that returned garbage: deterministic, and the
+        /// tokens went out. Tests behind a hanging store never get this far.
         async fn judge(
             &self,
             _a: &alaya_types::memory::Memory,
             _b: &alaya_types::memory::Memory,
         ) -> alaya_types::Result<alaya_backends::Judgement> {
-            unimplemented!()
+            Err(alaya_types::AlayaError::Judge("malformed verdict".into()))
         }
         fn model_name(&self) -> &str {
             "stub-judge"
@@ -3069,6 +3093,22 @@ mod tests {
     /// parks holding its gate permit and slot, as against a stalled endpoint.
     fn judged_hanging_service() -> std::rc::Rc<MemoryService> {
         std::rc::Rc::new(wedge_tests::hanging_service().with_judge(Box::new(StubJudge)))
+    }
+
+    /// A judge-enabled service whose store answers `get_batch` with `batch`,
+    /// so a spawned task runs to completion and the limiter can be read after.
+    fn judged_service_with_batch(
+        batch: Vec<alaya_types::memory::Memory>,
+    ) -> std::rc::Rc<MemoryService> {
+        std::rc::Rc::new(wedge_tests::stub_service(Some(batch)).with_judge(Box::new(StubJudge)))
+    }
+
+    fn mem(hash: &str) -> alaya_types::memory::Memory {
+        serde_json::from_value(json!({
+            "content": "c", "content_hash": hash, "tags": [], "memory_type": "note",
+            "created_at": 0.0, "updated_at": 0.0,
+        }))
+        .expect("memory")
     }
 
     /// A `created` store result whose new memory contradicts `n` existing ones.
@@ -3304,6 +3344,51 @@ mod tests {
             .await;
     }
 
+    /// The refund keys on `spent`, not `marked` (LAB-3901): a pair whose other
+    /// endpoint is missing from the store is marked (so the backfill skips it)
+    /// yet sent nothing, so its unit comes back; a malformed verdict is marked
+    /// too, but the tokens went out, so it stays billed.
+    #[tokio::test]
+    async fn store_contradiction_judge_refunds_by_spend_not_by_marker() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(4));
+                let r = store_result_contradicting(1);
+                let (src, dst) = ("a".repeat(64), "0".repeat(64));
+                FAKE_NOW.set(DAY1);
+
+                // Endpoint missing: only the new memory is in the store.
+                let svc = judged_service_with_batch(vec![mem(&src)]);
+                let limiter = capped(1);
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    1
+                );
+                settle().await;
+                assert_eq!(
+                    limiter.borrow().count,
+                    0,
+                    "marked, but nothing was sent: refunded"
+                );
+
+                // Malformed verdict: both endpoints present, the stub judge errs.
+                let svc = judged_service_with_batch(vec![mem(&src), mem(&dst)]);
+                let limiter = capped(1);
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    1
+                );
+                settle().await;
+                assert_eq!(
+                    limiter.borrow().count,
+                    1,
+                    "marked and paid for: stays billed"
+                );
+            })
+            .await;
+    }
+
     /// AC-4: the operator backfill is not subject to the daily cap. The proof
     /// is structural — `backfill_judge` takes no limiter — so the test drives a
     /// pair through it with the budget exhausted and asserts the pair was
@@ -3523,10 +3608,13 @@ mod wedge_tests {
         );
     }
 
-    /// VectorStorage whose `delete` blackholes — models a backend whose pod
-    /// IP vanished without an RST. Every other method panics: the test only
-    /// exercises the delete path and the no-op ping.
-    struct HangVectors;
+    /// VectorStorage whose `delete` and `get_batch` blackhole — models a
+    /// backend whose pod IP vanished without an RST. `get_batch` can instead
+    /// answer a fixed batch, so a judge task can run to completion. Every
+    /// other method panics: no test exercises them.
+    struct HangVectors {
+        batch: Option<Vec<Memory>>,
+    }
 
     #[async_trait(?Send)]
     impl VectorStorage for HangVectors {
@@ -3548,7 +3636,10 @@ mod wedge_tests {
             unimplemented!()
         }
         async fn get_batch(&self, _hashes: &[&str]) -> Result<Vec<Memory>> {
-            std::future::pending().await
+            match &self.batch {
+                Some(b) => Ok(b.clone()),
+                None => std::future::pending().await,
+            }
         }
         async fn delete(&self, _content_hash: &str) -> Result<bool> {
             std::future::pending().await
@@ -3694,7 +3785,8 @@ mod wedge_tests {
             _dst: &str,
             _verdict: &alaya_types::graph::EdgeVerdict,
         ) -> Result<bool> {
-            unimplemented!()
+            // The marker write lands, so a judge task can finish `marked: true`.
+            Ok(true)
         }
         async fn set_contradiction_resolution(
             &self,
@@ -3772,8 +3864,13 @@ mod wedge_tests {
     }
 
     pub(super) fn hanging_service() -> MemoryService {
+        stub_service(None)
+    }
+
+    /// `hanging_service`, with `get_batch` answering `batch` when given.
+    pub(super) fn stub_service(batch: Option<Vec<Memory>>) -> MemoryService {
         MemoryService::new(
-            Box::new(HangVectors),
+            Box::new(HangVectors { batch }),
             Box::new(StubEmbeddings),
             Box::new(StubGraph),
             Box::new(StubHebbian),

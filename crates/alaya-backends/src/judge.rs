@@ -414,7 +414,13 @@ mod tests {
                     .judge(&mem("a", 1.0), &mem("b", 2.0))
                     .await
                     .unwrap_err();
-                assert!(matches!(e, AlayaError::Unavailable(_)), "{status}: {e:?}");
+                // A 5xx may have been served upstream before a proxy gave up,
+                // so it stays billed; an auth/model reject is free.
+                let billed = status >= 500;
+                assert!(
+                    matches!(e, AlayaError::Unavailable { spent, .. } if spent == billed),
+                    "{status}: {e:?}"
+                );
             }
         }
 
@@ -455,7 +461,38 @@ mod tests {
                 .judge(&mem("a", 1.0), &mem("b", 2.0))
                 .await
                 .unwrap_err();
-            assert!(matches!(e, AlayaError::Unavailable(_)), "{e:?}");
+            // The request was on the wire: a slow model still generated and billed.
+            assert!(
+                matches!(e, AlayaError::Unavailable { spent: true, .. }),
+                "{e:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn refused_connect_is_transient_and_free() {
+            // Bind, take the port, drop: nothing listens there now.
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("bind")
+                .local_addr()
+                .expect("addr")
+                .port();
+            let client = JudgeClient {
+                transport: MessagesTransport::new(
+                    format!("http://127.0.0.1:{port}"),
+                    Some("k".into()),
+                    std::time::Duration::from_millis(300),
+                )
+                .expect("test transport"),
+                model: "test-model".into(),
+            };
+            let e = client
+                .judge(&mem("a", 1.0), &mem("b", 2.0))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(e, AlayaError::Unavailable { spent: false, .. }),
+                "nothing left the box: {e:?}"
+            );
         }
 
         #[tokio::test]
