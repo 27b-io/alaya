@@ -5,8 +5,9 @@ use async_trait::async_trait;
 use alaya_types::{
     Result,
     graph::{
-        CoAccessPair, Contradiction, ContradictionRef, Direction, Edge, EdgeMeta, GraphStats,
-        Neighbor, SystemRelationType, UserRelationType,
+        CoAccessPair, Contradiction, ContradictionQuery, ContradictionRef, Direction, Edge,
+        EdgeMeta, EdgeVerdict, GraphStats, Neighbor, Resolution, SystemRelationType,
+        UserRelationType, Verdict,
     },
     memory::{
         HealthStatus, Memory, MetadataUpdate, PatchMemoryRequest, ScoredMemory, ScrollResult,
@@ -206,7 +207,32 @@ pub trait GraphService {
     }
 
     // Contradiction queries
-    async fn get_all_contradictions(&self, limit: usize) -> Result<Vec<Contradiction>>;
+    /// One page of CONTRADICTS pairs, newest first, with every filter in
+    /// `query` applied graph-side (see `ContradictionQuery`).
+    async fn get_all_contradictions(
+        &self,
+        query: &ContradictionQuery,
+    ) -> Result<Vec<Contradiction>>;
+    /// Write the judge's verdict onto the existing `src -> dst` CONTRADICTS
+    /// edge. Never creates or deletes an edge; returns whether one matched.
+    async fn set_contradiction_verdict(
+        &self,
+        src: &str,
+        dst: &str,
+        verdict: &EdgeVerdict,
+    ) -> Result<bool>;
+    /// Stamp (`Some`) or clear (`None`) the operator's resolution on the
+    /// existing `src -> dst` CONTRADICTS edge (LAB-3885). The only write
+    /// path to `e.resolution*`. Never creates or deletes an edge; returns
+    /// whether one matched.
+    async fn set_contradiction_resolution(
+        &self,
+        src: &str,
+        dst: &str,
+        resolution: Option<Resolution>,
+        resolved_via: &str,
+        resolved_at: f64,
+    ) -> Result<bool>;
     async fn get_contradictions_for_hashes(
         &self,
         hashes: &[&str],
@@ -280,6 +306,50 @@ pub trait SummaryProvider {
     async fn summarize(&self, content: &str) -> Result<String>;
 }
 
+/// Which side of a judged pair should survive, in the judge's own frame
+/// (`a` = the first memory passed to `judge`, `b` = the second). Wire form
+/// is the lowercase letter the verdict schema asks the model for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Survivor {
+    A,
+    B,
+}
+
+/// A judge's verdict on one pair, plus what it cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Judgement {
+    pub verdict: Verdict,
+    pub survivor: Option<Survivor>,
+    /// One line, ≤200 chars.
+    pub reason: String,
+    /// 0.0–1.0.
+    pub confidence: f64,
+    /// Model id that produced the verdict.
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// Pairwise contradiction judge (LAB-3283). Pluggable via env in the server;
+/// the one production impl is `JudgeClient` (Anthropic Messages API).
+///
+/// Optional — when absent, CONTRADICTS edges are never annotated and the
+/// read surfaces report every pair as `unjudged`.
+#[async_trait(?Send)]
+pub trait ContradictionJudge {
+    /// Judge whether `a` and `b` conflict. Errors are classified: `Judge`
+    /// means this pair will fail the same way again (schema / parse / empty
+    /// answer / 4xx request fault) and the caller persists an `unjudged`
+    /// marker; `RateLimited` and `Unavailable` are transient and the caller
+    /// writes nothing so the pair is retried.
+    async fn judge(&self, a: &Memory, b: &Memory) -> Result<Judgement>;
+
+    /// Model id stamped on verdicts (and on failure markers) — the value a
+    /// re-judge compares `verdict_model` against.
+    fn model_name(&self) -> &str;
+}
+
 /// Cross-encoder reranking backend (TEI `/rerank` endpoint).
 ///
 /// Optional — when absent, hybrid search returns RRF-fused results without
@@ -295,4 +365,12 @@ pub trait RerankingService {
 
     /// Number of candidates to rerank per query.
     fn top_n(&self) -> usize;
+
+    /// Budget for one `rerank()` call. Native callers enforce it with
+    /// `tokio::time::timeout`, and implementations must NOT add a transport
+    /// timer of their own there: a second timer is checked before the socket
+    /// on a late poll, discarding a response that already arrived and
+    /// reporting real errors as timeouts. On wasm32 there is no tokio timer,
+    /// so the implementation bounds its own transport with this value.
+    fn timeout(&self) -> std::time::Duration;
 }

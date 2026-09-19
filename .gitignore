@@ -14,6 +14,11 @@ docs/superpowers/
 # Local dev — docker compose env overrides
 .env
 
+# Judge prompt tune runs (model output about memory contents) and local venvs
+scripts/judge_tune/runs/
+.venv/
+__pycache__/
+
 # Per-developer agent config. Tracker and triage docs are workspace-internal; keep them out of the public tree.
 CLAUDE.local.md
 docs/agents/issue-tracker.md

@@ -5,7 +5,10 @@
 
 use std::collections::HashMap;
 
-use alaya_types::graph::{Direction, SystemRelationType, UserRelationType};
+use alaya_types::graph::{
+    ContradictionQuery, Direction, EdgeVerdict, Resolution, SystemRelationType, UserRelationType,
+    Verdict,
+};
 use serde_json::{Value, json};
 
 /// A fully-constructed Cypher query ready to dispatch.
@@ -182,14 +185,186 @@ pub fn create_system_edge(src: &str, dst: &str, rel: SystemRelationType, ts: f64
 
 // ─── contradiction operations ─────────────────────────────────────────────────
 
-/// Fetch all CONTRADICTS pairs ordered by `created_at DESC`.
-pub fn get_all_contradictions(limit: u32) -> CypherQuery {
-    let q = "MATCH (a:Memory)-[e:CONTRADICTS]->(b:Memory) \
-             RETURN a.content_hash, b.content_hash, e.confidence, e.created_at \
-             ORDER BY e.created_at DESC \
-             LIMIT $lim"
-        .to_string();
-    (q, params(&[("lim", json!(limit))]), true)
+/// Row layout of `get_all_contradictions`, in this order.
+/// `handlers::contradictions::parse_verdict` indexes columns 4..=9 and
+/// `parse_resolution` columns 10..=12 by position, so keep the three in
+/// lock-step. (`get_contradictions_for_hashes` deliberately returns no
+/// verdict or resolution columns.)
+const CONTRADICTION_COLUMNS: &str = "a.content_hash, b.content_hash, e.confidence, e.created_at, \
+     e.verdict, e.verdict_survivor, e.verdict_reason, e.verdict_confidence, \
+     e.verdict_model, e.judged_at, \
+     e.resolution, e.resolved_at, e.resolved_via";
+
+/// One page of CONTRADICTS pairs ordered by `created_at DESC`, every filter
+/// applied in Cypher (see `ContradictionQuery`), so `SKIP`/`LIMIT` page over
+/// *matching* edges — app-side filtering over a LIMIT-only read starved the
+/// queue (LAB-3283 review). WHERE fragments are constant strings; every
+/// value travels as a parameter.
+pub fn get_all_contradictions(q: &ContradictionQuery) -> CypherQuery {
+    // The keep_both stamp sits on one directed edge, but a re-store of the
+    // OLDER endpoint re-detects the pair the other way round and MERGEs a
+    // fresh, unstamped (b)->(a) edge (panel, LAB-3885). The pair is settled
+    // either way, so a stamp in either direction keeps it out of the queue.
+    // Compile-time enum constants interpolated, like `cypher_label()` —
+    // never a caller value.
+    let reverse_stamped: String = Resolution::ALL
+        .iter()
+        .map(|r| {
+            format!(
+                "NOT (b)-[:CONTRADICTS {{resolution: '{}'}}]->(a)",
+                r.as_str()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let mut clauses: Vec<&str> = Vec::new();
+    let mut p = params(&[
+        (
+            "lim",
+            json!(q.limit.clamp(1, ContradictionQuery::MAX_LIMIT)),
+        ),
+        ("skip", json!(q.skip)),
+    ]);
+    if let Some(v) = &q.verdicts {
+        clauses.push(if v.iter().any(|s| s == Verdict::UNJUDGED) {
+            // Absent verdict and the persisted failure marker both read as
+            // "unjudged" on the read surface.
+            "(e.verdict IS NULL OR e.verdict IN $verdicts)"
+        } else {
+            "e.verdict IN $verdicts"
+        });
+        p.insert("verdicts".to_string(), json!(v));
+    }
+    if q.selects_unjudged() {
+        match &q.rejudge_model {
+            // A persisted `unjudged` marker has a verdict, so it does NOT
+            // match: a deterministic failure is skipped, not retried forever.
+            None => clauses.push("e.verdict IS NULL"),
+            Some(m) => {
+                // Operator opt-in: everything not judged by the current model,
+                // markers included (they carry the current model's id, so the
+                // model test alone would never retry them).
+                clauses.push(
+                    "(e.verdict IS NULL OR e.verdict = $marker OR e.verdict_model IS NULL \
+                     OR e.verdict_model <> $model)",
+                );
+                p.insert("model".to_string(), json!(m));
+                p.insert("marker".to_string(), json!(Verdict::UNJUDGED));
+            }
+        }
+    }
+    if q.exclude_resolved {
+        // Graph-side resolved state, two forms. `mark_superseded` writes
+        // (new)-[:SUPERSEDES]->(old), so an endpoint with an incoming
+        // SUPERSEDES edge is superseded (measured complete against Qdrant
+        // on 2026-09-10: 299 superseded memories, 0 without the edge). The
+        // resolution verb stamps `e.resolution` (LAB-3885, keep_both): the
+        // pair is settled with both memories live.
+        clauses.push(
+            "NOT (a)<-[:SUPERSEDES]-() AND NOT (b)<-[:SUPERSEDES]-() AND e.resolution IS NULL",
+        );
+        clauses.push(&reverse_stamped);
+    }
+    let filter = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {} ", clauses.join(" AND "))
+    };
+    // Tiebreak on the pair: every edge from one `store` shares `created_at`,
+    // and FalkorDB orders ties differently per SKIP/LIMIT window, which
+    // duplicated and dropped rows across pages (panel, 2026-09-10).
+    let cypher = format!(
+        "MATCH (a:Memory)-[e:CONTRADICTS]->(b:Memory) \
+         {filter}\
+         RETURN {CONTRADICTION_COLUMNS} \
+         ORDER BY e.created_at DESC, a.content_hash, b.content_hash \
+         SKIP $skip LIMIT $lim"
+    );
+    (cypher, p, true)
+}
+
+/// SET the judge's verdict on an existing `src -> dst` CONTRADICTS edge.
+/// MATCH-only: never creates or deletes the edge. A `None` survivor is
+/// written as `null`, which clears the property. An `unjudged` marker only
+/// lands on an edge with no real verdict (NULL or an older marker): a failed
+/// re-judge, or a store-path spawn racing a backfill, must never replace a
+/// verdict with a failure.
+pub fn set_contradiction_verdict(src: &str, dst: &str, v: &EdgeVerdict) -> CypherQuery {
+    let guard = if v.verdict == Verdict::Unjudged {
+        "WHERE e.verdict IS NULL OR e.verdict = $verdict "
+    } else {
+        ""
+    };
+    let q = format!(
+        "MATCH (a:Memory {{content_hash: $src}})-[e:CONTRADICTS]->(b:Memory {{content_hash: $dst}}) \
+         {guard}\
+         SET e.verdict = $verdict, e.verdict_survivor = $survivor, \
+             e.verdict_reason = $reason, e.verdict_confidence = $conf, \
+             e.verdict_model = $model, e.judged_at = $ts \
+         RETURN count(e)"
+    );
+    (
+        q,
+        params(&[
+            ("src", json!(src)),
+            ("dst", json!(dst)),
+            ("verdict", json!(v.verdict.as_str())),
+            ("survivor", json!(v.verdict_survivor)),
+            ("reason", json!(v.verdict_reason)),
+            ("conf", json!(v.verdict_confidence)),
+            ("model", json!(v.verdict_model)),
+            ("ts", json!(v.judged_at)),
+        ]),
+        false,
+    )
+}
+
+/// SET (or clear) the operator's resolution on an existing `src -> dst`
+/// CONTRADICTS edge (LAB-3885). MATCH-only, like the verdict: never creates
+/// or deletes the edge, never touches a Memory node or the verdict
+/// properties. `None` writes `null` to all three properties, which clears
+/// them — the pair is back in the default queue. `resolved_via` and
+/// `resolved_at` are ignored on clear.
+pub fn set_contradiction_resolution(
+    src: &str,
+    dst: &str,
+    resolution: Option<Resolution>,
+    resolved_via: &str,
+    resolved_at: f64,
+) -> CypherQuery {
+    let (res, via, ts) = match resolution {
+        Some(r) => (json!(r.as_str()), json!(resolved_via), json!(resolved_at)),
+        None => (Value::Null, Value::Null, Value::Null),
+    };
+    let q = "MATCH (a:Memory {content_hash: $src})-[e:CONTRADICTS]->(b:Memory {content_hash: $dst}) \
+             SET e.resolution = $resolution, e.resolved_at = $ts, e.resolved_via = $via \
+             RETURN count(e)";
+    (
+        q.to_string(),
+        params(&[
+            ("src", json!(src)),
+            ("dst", json!(dst)),
+            ("resolution", res),
+            ("via", via),
+            ("ts", ts),
+        ]),
+        false,
+    )
+}
+
+/// Count `src -> dst` CONTRADICTS edges that carry a judge verdict or an
+/// operator resolution (LAB-3885 AC-6). `POST /edges/delete` refuses such
+/// an edge: it is the queue item and its audit trail, so it is resolved
+/// (keep_both or supersede), never deleted.
+pub fn count_judged_or_resolved_contradiction(src: &str, dst: &str) -> CypherQuery {
+    let q = "MATCH (a:Memory {content_hash: $src})-[e:CONTRADICTS]->(b:Memory {content_hash: $dst}) \
+             WHERE e.verdict IS NOT NULL OR e.resolution IS NOT NULL \
+             RETURN count(e)";
+    (
+        q.to_string(),
+        params(&[("src", json!(src)), ("dst", json!(dst))]),
+        true,
+    )
 }
 
 /// Fetch CONTRADICTS pairs touching any of the supplied hashes.
@@ -397,6 +572,227 @@ pub fn get_graph_stats_union() -> CypherQuery {
 mod tests {
     use super::*;
 
+    // contradiction operations (LAB-3283)
+
+    fn cq(limit: usize) -> ContradictionQuery {
+        ContradictionQuery {
+            limit,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn get_all_contradictions_unfiltered_pages_with_skip_and_limit() {
+        let (q, p, ro) = get_all_contradictions(&ContradictionQuery { skip: 40, ..cq(20) });
+        assert!(!q.contains("WHERE"));
+        assert!(q.contains("e.verdict, e.verdict_survivor"));
+        assert!(q.contains("e.judged_at, e.resolution, e.resolved_at, e.resolved_via"));
+        assert!(q.ends_with(
+            "ORDER BY e.created_at DESC, a.content_hash, b.content_hash SKIP $skip LIMIT $lim"
+        ));
+        assert_eq!(p["skip"], json!(40));
+        assert_eq!(p["lim"], json!(20));
+        assert!(!p.contains_key("verdicts"));
+        assert!(ro);
+    }
+
+    #[test]
+    fn get_all_contradictions_clamps_limit_to_page_cap() {
+        let (_, p, _) = get_all_contradictions(&cq(0));
+        assert_eq!(p["lim"], json!(1));
+        let (_, p, _) = get_all_contradictions(&cq(10_000));
+        assert_eq!(p["lim"], json!(ContradictionQuery::MAX_LIMIT));
+    }
+
+    #[test]
+    fn get_all_contradictions_verdict_filter_is_parameterised() {
+        let q = ContradictionQuery {
+            verdicts: Some(vec!["contradiction".into(), "supersession".into()]),
+            ..cq(20)
+        };
+        let (c, p, _) = get_all_contradictions(&q);
+        assert!(c.contains("WHERE e.verdict IN $verdicts "));
+        assert!(!c.contains("IS NULL"));
+        assert!(
+            !c.contains("contradiction"),
+            "verdict text must not be interpolated"
+        );
+        assert_eq!(p["verdicts"], json!(["contradiction", "supersession"]));
+    }
+
+    #[test]
+    fn get_all_contradictions_unjudged_sentinel_matches_null_and_marker() {
+        let q = ContradictionQuery {
+            verdicts: Some(vec!["unjudged".into()]),
+            ..cq(20)
+        };
+        let (c, _, _) = get_all_contradictions(&q);
+        assert!(c.contains("WHERE (e.verdict IS NULL OR e.verdict IN $verdicts) "));
+    }
+
+    #[test]
+    fn get_all_contradictions_needs_judging_selects_null_only_unless_rejudging() {
+        let (c, p, _) = get_all_contradictions(&ContradictionQuery {
+            needs_judging: true,
+            ..cq(20)
+        });
+        assert!(c.contains("WHERE e.verdict IS NULL "));
+        assert!(!p.contains_key("model"));
+
+        let (c, p, _) = get_all_contradictions(&ContradictionQuery {
+            rejudge_model: Some("claude-sonnet-5".into()),
+            ..cq(20)
+        });
+        assert!(c.contains(
+            "WHERE (e.verdict IS NULL OR e.verdict = $marker OR e.verdict_model IS NULL \
+             OR e.verdict_model <> $model) "
+        ));
+        assert!(!c.contains("sonnet"), "model id must not be interpolated");
+        assert_eq!(p["model"], json!("claude-sonnet-5"));
+        assert_eq!(p["marker"], json!("unjudged"));
+    }
+
+    #[test]
+    fn get_all_contradictions_exclude_resolved_uses_supersedes_edges_and_resolution_and_ands_clauses()
+     {
+        let (c, _, _) = get_all_contradictions(&ContradictionQuery {
+            exclude_resolved: true,
+            verdicts: Some(vec!["coexist".into()]),
+            ..cq(20)
+        });
+        assert!(c.contains(
+            "WHERE e.verdict IN $verdicts AND NOT (a)<-[:SUPERSEDES]-() AND NOT (b)<-[:SUPERSEDES]-() \
+             AND e.resolution IS NULL AND NOT (b)-[:CONTRADICTS {resolution: 'keep_both'}]->(a) "
+        ));
+        // Without the flag neither resolved form is filtered (the columns
+        // still carry e.resolution*, so test the clauses, not the word).
+        let (c, _, _) = get_all_contradictions(&cq(20));
+        assert!(!c.contains("WHERE"));
+        assert!(!c.contains("SUPERSEDES") && !c.contains("{resolution:"));
+    }
+
+    // resolution operations (LAB-3885)
+
+    #[test]
+    fn set_contradiction_resolution_matches_never_merges() {
+        let (q, p, ro) = set_contradiction_resolution(
+            &"a".repeat(64),
+            &"b".repeat(64),
+            Some(Resolution::KeepBoth),
+            "operator:console",
+            1.0,
+        );
+        assert!(q.starts_with("MATCH"));
+        assert!(!q.contains("MERGE") && !q.contains("CREATE") && !q.contains("DELETE"));
+        assert!(
+            !q.contains("WHERE"),
+            "the operator verb overwrites unconditionally"
+        );
+        assert!(q.contains(
+            "SET e.resolution = $resolution, e.resolved_at = $ts, e.resolved_via = $via"
+        ));
+        assert!(!q.contains("verdict"), "the verdict namespace is untouched");
+        assert_eq!(p["resolution"], json!("keep_both"));
+        assert_eq!(p["via"], json!("operator:console"));
+        assert_eq!(p["ts"], json!(1.0));
+        assert!(
+            !q.contains("operator"),
+            "resolved_via must be a parameter, not interpolated"
+        );
+        assert!(!ro);
+    }
+
+    #[test]
+    fn set_contradiction_resolution_none_clears_all_three() {
+        let (q, p, _) = set_contradiction_resolution("a", "b", None, "operator:console", 1.0);
+        assert!(q.contains(
+            "SET e.resolution = $resolution, e.resolved_at = $ts, e.resolved_via = $via"
+        ));
+        assert_eq!(p["resolution"], Value::Null);
+        assert_eq!(
+            p["via"],
+            Value::Null,
+            "who cleared is not recorded: the stamp is gone"
+        );
+        assert_eq!(p["ts"], Value::Null);
+    }
+
+    #[test]
+    fn count_judged_or_resolved_contradiction_is_a_read_over_verdict_or_resolution() {
+        let (q, p, ro) = count_judged_or_resolved_contradiction(&"a".repeat(64), &"b".repeat(64));
+        assert!(q.starts_with("MATCH"));
+        assert!(q.contains("[e:CONTRADICTS]->"));
+        assert!(q.contains("WHERE e.verdict IS NOT NULL OR e.resolution IS NOT NULL"));
+        assert!(q.ends_with("RETURN count(e)"));
+        assert!(!q.contains("DELETE"));
+        assert_eq!(p["src"], json!("a".repeat(64)));
+        assert!(ro);
+    }
+
+    #[test]
+    fn set_contradiction_verdict_matches_never_merges() {
+        let v = EdgeVerdict {
+            verdict: Verdict::Supersession,
+            verdict_survivor: Some("b".repeat(64)),
+            verdict_reason: "it's newer".into(),
+            verdict_confidence: 0.9,
+            verdict_model: "m".into(),
+            judged_at: 1.0,
+        };
+        let (q, p, ro) = set_contradiction_verdict(&"a".repeat(64), &"b".repeat(64), &v);
+        assert!(q.starts_with("MATCH"));
+        assert!(!q.contains("MERGE") && !q.contains("CREATE") && !q.contains("DELETE"));
+        assert!(
+            !q.contains("WHERE"),
+            "a real verdict overwrites unconditionally"
+        );
+        assert!(q.contains("SET e.verdict = $verdict"));
+        assert_eq!(p["verdict"], json!("supersession"));
+        assert_eq!(p["survivor"], json!("b".repeat(64)));
+        assert!(
+            !q.contains("it's"),
+            "reason must be a parameter, not interpolated"
+        );
+        assert!(!ro);
+    }
+
+    #[test]
+    fn set_contradiction_verdict_null_survivor_clears_property() {
+        let v = EdgeVerdict {
+            verdict: Verdict::Coexist,
+            verdict_survivor: None,
+            verdict_reason: String::new(),
+            verdict_confidence: 0.5,
+            verdict_model: "m".into(),
+            judged_at: 1.0,
+        };
+        let (_, p, _) = set_contradiction_verdict("a", "b", &v);
+        assert_eq!(p["survivor"], Value::Null);
+    }
+
+    #[test]
+    fn get_all_contradictions_orders_with_a_pair_tiebreak() {
+        let (q, _, _) = get_all_contradictions(&cq(20));
+        assert!(q.contains(
+            "ORDER BY e.created_at DESC, a.content_hash, b.content_hash SKIP $skip LIMIT $lim"
+        ));
+    }
+
+    #[test]
+    fn set_contradiction_verdict_marker_never_clobbers_a_real_verdict() {
+        let v = EdgeVerdict {
+            verdict: Verdict::Unjudged,
+            verdict_survivor: None,
+            verdict_reason: "unjudged: boom".into(),
+            verdict_confidence: 0.0,
+            verdict_model: "m".into(),
+            judged_at: 1.0,
+        };
+        let (q, p, _) = set_contradiction_verdict("a", "b", &v);
+        assert!(q.contains("WHERE e.verdict IS NULL OR e.verdict = $verdict SET e.verdict"));
+        assert_eq!(p["verdict"], json!("unjudged"));
+    }
+
     // node operations
 
     #[test]
@@ -494,7 +890,7 @@ mod tests {
 
     #[test]
     fn get_all_contradictions_shape() {
-        let (q, p, ro) = get_all_contradictions(20);
+        let (q, p, ro) = get_all_contradictions(&cq(20));
         assert!(q.contains("CONTRADICTS"));
         assert!(q.contains("ORDER BY e.created_at DESC"));
         assert!(p.contains_key("lim"));

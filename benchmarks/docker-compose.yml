@@ -76,6 +76,7 @@ services:
       #   RERANK_URL= docker compose up -d alaya
       RERANK_URL: ${RERANK_URL-http://tei-rerank:80}
       RERANK_TOP_N: "20"
+      RERANK_TIMEOUT_MS: ${RERANK_TIMEOUT_MS:-5000}
       # Server is fail-closed (panics with no auth). This is an ephemeral,
       # localhost-only bench, so opt into the dev-open mode AND give it a
       # private origin (the open mode is refused on a public PUBLIC_BASE_URL).

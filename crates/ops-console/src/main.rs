@@ -157,6 +157,10 @@ fn app(state: AppState) -> Router {
         .route("/alaya/duplicates", get(routes::alaya::duplicates))
         .route("/alaya/duplicates/merge", post(routes::alaya::merge_submit))
         .route("/alaya/contradictions", get(routes::alaya::contradictions))
+        .route(
+            "/alaya/contradictions/keep-both",
+            post(routes::alaya::keep_both_submit),
+        )
         .route("/alaya/auth", get(routes::alaya::auth_view))
         .layer(middleware::from_fn_with_state(state.clone(), origin_check))
         .layer(middleware::from_fn_with_state(
@@ -312,6 +316,30 @@ mod tests {
                     .header(header::ORIGIN, "https://evil.test")
                     .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                     .body(Body::from("csrf=x&old_hash=a&new_hash=b"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn keep_both_post_rejects_a_bad_csrf_before_any_upstream_call() {
+        let state = test_state();
+        let sess = session::new_session("admin-sub".into(), None, None);
+        let cookie_header = session_cookie_header(&state, &sess);
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let app = app(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::post("/alaya/contradictions/keep-both")
+                    .header(header::ORIGIN, "https://console.test")
+                    .header(header::COOKIE, cookie_header)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf=WRONG&memory_a_hash={a}&memory_b_hash={b}"
+                    )))
                     .unwrap(),
             )
             .await

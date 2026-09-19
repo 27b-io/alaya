@@ -14,6 +14,12 @@ tracing = { workspace = true }
 futures = { workspace = true }
 regex = { workspace = true }
 
-[dev-dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true }
+
+[dev-dependencies]
+# test-util: `start_paused` for the rerank-budget tests (exact, zero wall-clock).
+tokio = { workspace = true, features = ["test-util"] }
 reqwest = { workspace = true }
+# Captures the contradiction-judge shadow-log events in tests (LAB-3283 AC-4b).
+tracing-subscriber = { workspace = true }

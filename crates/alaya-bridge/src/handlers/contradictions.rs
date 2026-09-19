@@ -1,4 +1,4 @@
-//! Contradiction handlers — POST /contradictions/all, POST /contradictions/for
+//! Contradiction handlers — POST /contradictions/{all,for,verdict,resolution}
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -7,38 +7,60 @@ use axum::{Json, extract::State, http::StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use alaya_types::graph::Contradiction;
+use alaya_types::{
+    graph::{Contradiction, ContradictionQuery, EdgeVerdict, Resolution, Verdict},
+    memory::validate_content_hash,
+};
 
 use crate::{AppState, cypher, handlers::exec_query};
 
 // ─── Request types ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-pub struct AllContradictionsRequest {
-    /// Max results (default 20)
-    pub limit: Option<i64>,
-}
+/// `POST /contradictions/for` refuses oversized hash lists — an accidental
+/// 10k-hash `IN` list is a FalkorDB DoS (LAB-3283 review).
+pub const MAX_FOR_HASHES: usize = 500;
 
 #[derive(Debug, Deserialize)]
 pub struct ContradictionsForRequest {
     pub hashes: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SetVerdictRequest {
+    pub source: String,
+    pub target: String,
+    #[serde(flatten)]
+    pub verdict: EdgeVerdict,
+}
+
+/// `resolution: null` (or absent) clears the stamp; `resolved_via` and
+/// `resolved_at` are then ignored but still sent (the server always has
+/// them). Explicit fields, not a flattened struct: a flattened `Option`
+/// would read a malformed set as a clear.
+#[derive(Debug, Deserialize)]
+pub struct SetResolutionRequest {
+    pub source: String,
+    pub target: String,
+    pub resolution: Option<Resolution>,
+    pub resolved_via: String,
+    pub resolved_at: f64,
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 /// POST /contradictions/all
 ///
-/// Return all CONTRADICTS pairs ordered by `created_at DESC`.
+/// One page of CONTRADICTS pairs ordered by `created_at DESC`, every filter
+/// in the body applied in Cypher (see `ContradictionQuery`; `limit` is
+/// clamped to 1..=500), each carrying its persisted verdict (if any).
 pub async fn all(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<AllContradictionsRequest>,
+    Json(query): Json<ContradictionQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    let limit = req.limit.unwrap_or(20).clamp(1, 500) as u32;
-
-    let (cypher, params, readonly) = cypher::get_all_contradictions(limit);
+    let (cypher, params, readonly) = cypher::get_all_contradictions(&query);
     let result = exec_query(&state, &cypher, params, readonly).await?;
 
-    // Row: [a.content_hash, b.content_hash, e.confidence, e.created_at]
+    // Row layout: cypher::CONTRADICTION_COLUMNS
     let mut contradictions: Vec<Contradiction> = Vec::with_capacity(result.result_set.len());
     for row in &result.result_set {
         if row.len() < 2 {
@@ -51,15 +73,124 @@ pub async fn all(
         }
         let confidence = row.get(2).and_then(Value::as_f64);
         let created_at = row.get(3).and_then(Value::as_f64);
+        let (resolution, resolved_at, resolved_via) = parse_resolution(row);
         contradictions.push(Contradiction {
             memory_a_hash,
             memory_b_hash,
             confidence,
             created_at,
+            verdict: parse_verdict(row),
+            resolution,
+            resolved_at,
+            resolved_via,
         });
     }
 
     Ok(Json(json!({ "contradictions": contradictions })))
+}
+
+/// Columns 4.. of a `CONTRADICTION_COLUMNS` row. `None` when the edge has
+/// no (recognised) verdict — an unknown verdict string reads as unjudged so
+/// the backfill re-judges it rather than trusting a corrupt value.
+fn parse_verdict(row: &[Value]) -> Option<EdgeVerdict> {
+    let verdict = Verdict::parse(row.get(4)?.as_str()?)?;
+    Some(EdgeVerdict {
+        verdict,
+        verdict_survivor: row.get(5).and_then(Value::as_str).map(str::to_string),
+        verdict_reason: row
+            .get(6)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        verdict_confidence: row.get(7).and_then(Value::as_f64).unwrap_or_default(),
+        verdict_model: row
+            .get(8)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        judged_at: row.get(9).and_then(Value::as_f64).unwrap_or_default(),
+    })
+}
+
+/// Columns 10..=12 of a `CONTRADICTION_COLUMNS` row. An unrecognised
+/// `resolution` string (only reachable by a direct graph write — every API
+/// path goes through the enum) reads as unresolved here with its companions
+/// dropped; the graph-side queue filter still hides that edge, so it shows
+/// only under `include_resolved`, as `resolution: null`.
+fn parse_resolution(row: &[Value]) -> (Option<Resolution>, Option<f64>, Option<String>) {
+    let Some(resolution) = row
+        .get(10)
+        .and_then(Value::as_str)
+        .and_then(Resolution::parse)
+    else {
+        return (None, None, None);
+    };
+    (
+        Some(resolution),
+        row.get(11).and_then(Value::as_f64),
+        row.get(12).and_then(Value::as_str).map(str::to_string),
+    )
+}
+
+/// POST /contradictions/verdict
+///
+/// Annotate an existing `source -> target` CONTRADICTS edge with the judge's
+/// verdict. MATCH-only (LAB-3283 AC-3): the edge is never created or
+/// deleted, and no Memory node is touched. `updated: false` means no such
+/// edge exists.
+pub async fn set_verdict(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SetVerdictRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    if !validate_content_hash(&req.source) || !validate_content_hash(&req.target) {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    if let Some(s) = &req.verdict.verdict_survivor
+        && !validate_content_hash(s)
+    {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    if !(0.0..=1.0).contains(&req.verdict.verdict_confidence) {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let (cypher, params, readonly) =
+        cypher::set_contradiction_verdict(&req.source, &req.target, &req.verdict);
+    let result = exec_query(&state, &cypher, params, readonly).await?;
+
+    let count = result.count().unwrap_or(0);
+    Ok(Json(json!({ "updated": count > 0 })))
+}
+
+/// POST /contradictions/resolution
+///
+/// Stamp (or clear) the operator's resolution on an existing
+/// `source -> target` CONTRADICTS edge (LAB-3885). MATCH-only: the edge is
+/// never created or deleted, no Memory node and no verdict property is
+/// touched. A set requires a non-empty `resolved_via`. `updated: false`
+/// means no such edge exists.
+pub async fn set_resolution(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SetResolutionRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    if !validate_content_hash(&req.source) || !validate_content_hash(&req.target) {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    if req.resolution.is_some() && req.resolved_via.trim().is_empty() {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let (cypher, params, readonly) = cypher::set_contradiction_resolution(
+        &req.source,
+        &req.target,
+        req.resolution,
+        req.resolved_via.trim(),
+        req.resolved_at,
+    );
+    let result = exec_query(&state, &cypher, params, readonly).await?;
+
+    let count = result.count().unwrap_or(0);
+    Ok(Json(json!({ "updated": count > 0 })))
 }
 
 /// POST /contradictions/for
@@ -71,6 +202,9 @@ pub async fn for_hashes(
 ) -> Result<Json<Value>, StatusCode> {
     if req.hashes.is_empty() {
         return Ok(Json(json!({ "contradictions": {} })));
+    }
+    if req.hashes.len() > MAX_FOR_HASHES {
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     let hashes_ref: Vec<&str> = req.hashes.iter().map(String::as_str).collect();

@@ -39,12 +39,16 @@ use alaya_backends::{
     embedding::EmbeddingClient,
     graph::GraphHttpClient,
     graph_ref::{ConsolidationRef, GraphRef, HebbianRef},
+    judge::JudgeClient,
     qdrant::QdrantClient,
     rerank::RerankClient,
     summary::SummaryClient,
 };
 use alaya_core::deduplication::CanonicalStrategy;
-use alaya_core::service::{MemoryService, OutputMode, RelationParams, SearchParams, StoreParams};
+use alaya_core::service::{
+    JudgeOutcome, MemoryService, OutputMode, RelationParams, SearchParams, StoreParams,
+};
+use alaya_types::graph::{Contradiction, ContradictionQuery, Resolution};
 use alaya_types::memory::PatchMemoryRequest;
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -69,14 +73,22 @@ struct Config {
     summary_url: Option<String>,
     summary_api_key: Option<String>,
     summary_model: String,
+    /// Contradiction judge (LAB-3283). URL and key fall back to the
+    /// SUMMARY_* counterpart; with neither set the engine is disabled. The
+    /// model has its own default: summaries are priced for volume, verdicts
+    /// for precision on the golden set.
+    judge_url: Option<String>,
+    judge_api_key: Option<String>,
+    judge_model: String,
     rerank_url: Option<String>,
     rerank_api_key: Option<String>,
     rerank_top_n: usize,
+    rerank_timeout_ms: std::num::NonZeroU64,
 }
 
 impl Config {
     fn from_env() -> Self {
-        Self {
+        let cfg = Self {
             qdrant_url: env_required("QDRANT_URL"),
             qdrant_collection: env_or("QDRANT_COLLECTION", "memories_arctic1024"),
             qdrant_api_key: std::env::var("QDRANT_API_KEY").ok(),
@@ -96,26 +108,47 @@ impl Config {
             listen_addr: env_or("LISTEN_ADDR", "0.0.0.0:3001"),
             api_key: env_or("ALAYA_API_KEY", ""),
             readonly_api_key: env_or("ALAYA_READONLY_API_KEY", ""),
-            oidc_issuer: std::env::var("OIDC_ISSUER").ok().filter(|s| !s.is_empty()),
+            oidc_issuer: env_opt("OIDC_ISSUER"),
             public_base_url: normalize_public_base_url(&env_or(
                 "PUBLIC_BASE_URL",
                 "https://alaya.27b.io",
             )),
             allow_unauthenticated: env_or("DANGEROUSLY_ALLOW_UNAUTHENTICATED", "")
                 .eq_ignore_ascii_case("true"),
-            summary_url: std::env::var("SUMMARY_URL").ok().filter(|s| !s.is_empty()),
-            summary_api_key: std::env::var("SUMMARY_API_KEY")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            summary_url: env_opt("SUMMARY_URL"),
+            summary_api_key: env_opt("SUMMARY_API_KEY"),
             summary_model: env_or("SUMMARY_MODEL", "claude-haiku-4-5-20251001"),
-            rerank_url: std::env::var("RERANK_URL").ok().filter(|s| !s.is_empty()),
-            rerank_api_key: std::env::var("RERANK_API_KEY")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            judge_url: env_opt("JUDGE_URL").or_else(|| env_opt("SUMMARY_URL")),
+            judge_api_key: env_opt("JUDGE_API_KEY").or_else(|| env_opt("SUMMARY_API_KEY")),
+            judge_model: env_opt("JUDGE_MODEL").unwrap_or_else(|| "claude-sonnet-5".into()),
+            rerank_url: env_opt("RERANK_URL"),
+            rerank_api_key: env_opt("RERANK_API_KEY"),
             rerank_top_n: env_or("RERANK_TOP_N", "20")
                 .parse()
                 .expect("RERANK_TOP_N must be a number"),
+            // NonZeroU64: a zero budget would time out every rerank and warn
+            // on every search — refuse to start instead.
+            rerank_timeout_ms: env_or("RERANK_TIMEOUT_MS", "5000")
+                .parse()
+                .expect("RERANK_TIMEOUT_MS must be a positive integer (ms)"),
+        };
+        // Every credential-bearing endpoint, checked on the main thread before
+        // the runtime, the worker thread or the listener exist: a refused
+        // endpoint means the process never starts.
+        for (var, url, has_api_key) in [
+            (
+                "SUMMARY_URL",
+                &cfg.summary_url,
+                cfg.summary_api_key.is_some(),
+            ),
+            ("JUDGE_URL", &cfg.judge_url, cfg.judge_api_key.is_some()),
+            ("RERANK_URL", &cfg.rerank_url, cfg.rerank_api_key.is_some()),
+        ] {
+            if let Some(url) = url {
+                check_credential_transport(var, url, has_api_key).unwrap_or_else(|e| panic!("{e}"));
+            }
         }
+        cfg
     }
 }
 
@@ -125,6 +158,11 @@ fn env_required(key: &str) -> String {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Set and non-empty, else `None`.
+fn env_opt(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
 /// Normalize the single origin source-of-truth: strip a trailing slash and
@@ -158,16 +196,32 @@ fn host_is_loopback(host: &str) -> bool {
 /// Host (authority without port) of an absolute URL, lowercased.
 /// Handles IPv6 bracketed literals (`[::1]:8443` → `::1`).
 fn host_of(url: &str) -> Option<String> {
-    let rest = url.split("://").nth(1)?;
-    let authority = rest.split('/').next()?;
-    let host = if let Some(inner) = authority.strip_prefix('[') {
-        // IPv6 literal: take everything up to the closing bracket.
-        let end = inner.find(']')?;
-        &inner[..end]
-    } else {
-        authority.split(':').next()?
-    };
-    Some(host.to_ascii_lowercase())
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let h = parsed.host_str()?;
+    Some(
+        h.trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase(),
+    )
+}
+
+/// Scheme + host (+ non-default port) of a provider URL, for startup logs.
+/// Env-supplied URLs may carry credentials in the userinfo
+/// (`https://user:key@host`) or query (`?api_key=…`); logging the raw value
+/// writes them to the log sink (CWE-532). Goes through the WHATWG parser so
+/// userinfo, path, query and fragment are dropped by construction, and keeps
+/// scheme + port so an operator can tell an in-cluster provider from an
+/// external one.
+fn log_safe_origin(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(u) if u.origin().is_tuple() => u.origin().ascii_serialization(),
+        // Parses, but has no scheme://host — e.g. `tei.mcp.svc:8080` with the
+        // scheme forgotten. `null` (the WHATWG opaque-origin serialisation)
+        // would read as "no origin configured".
+        Ok(_) => "<no host>".to_string(),
+        // `url::ParseError` variants are unit-like; Display never echoes input.
+        Err(e) => format!("<unparseable: {e}>"),
+    }
 }
 
 /// True for hosts that are not publicly routable: loopback, RFC1918, or
@@ -175,9 +229,10 @@ fn host_of(url: &str) -> Option<String> {
 /// mode on a public origin. Real IP-literal parsing prevents confusable
 /// hostnames like `127.0.0.1.evil.com` from masquerading as loopback.
 fn is_private_host(url: &str) -> bool {
-    let Some(h) = host_of(url) else {
-        return false;
-    };
+    host_of(url).is_some_and(|h| host_is_private(&h))
+}
+
+fn host_is_private(h: &str) -> bool {
     // DNS-only special names — these can't be IP literals.
     if h == "localhost" || h.ends_with(".svc") || h.ends_with(".internal") {
         return true;
@@ -187,6 +242,43 @@ fn is_private_host(url: &str) -> bool {
         Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private(),
         Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
         Err(_) => false,
+    }
+}
+
+/// Cluster-local or private: `host_is_private`, plus single-label hostnames
+/// (`http://anthropic-lb:8082`) — Kubernetes service DNS that never resolves
+/// off the cluster. Decides whether plain HTTP with a credential is refused at
+/// boot; the auth gates use `is_private_host` alone. Classifies the host as
+/// reqwest parsed it, so userinfo cannot pose as the host and an IPv6 literal
+/// (no dots) is never mistaken for a single-label service name.
+fn is_cluster_local(url: &reqwest::Url) -> bool {
+    let Some(h) = url.host_str() else {
+        return false;
+    };
+    let h = h.trim_start_matches('[').trim_end_matches(']');
+    host_is_private(h) || (h.parse::<std::net::IpAddr>().is_err() && !h.contains('.'))
+}
+
+/// A key sent in the clear to a host that is not cluster-local is a
+/// credential on the wire. Fail closed at boot (Ray on LAB-3283, 2026-09-11):
+/// `https://` anywhere, plain `http://` only to a cluster-local proxy such as
+/// `http://anthropic-lb:8082`, anything else refused. Classified on the URL
+/// as reqwest parses it (lowercased scheme, real host), so the check and the
+/// transport cannot disagree about where the key goes. Messages name the host,
+/// never the raw value: a URL may carry userinfo.
+fn check_credential_transport(var: &str, url: &str, has_api_key: bool) -> Result<(), String> {
+    if !has_api_key {
+        return Ok(());
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("{var} is not a valid URL ({e})"))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if is_cluster_local(&parsed) => Ok(()),
+        scheme => Err(format!(
+            "{var}: {scheme}://{} is neither https nor a cluster-local http proxy; \
+             an API key must not travel in the clear",
+            parsed.host_str().unwrap_or("")
+        )),
     }
 }
 
@@ -292,17 +384,7 @@ async fn init_l2_cache() -> Option<cachekit::CacheKit> {
     };
     match init {
         Ok(ck) => {
-            // Key-cutover announcement (LAB-372): interop/v1 keys replaced the
-            // legacy SHA-256 keys on 2026-08-08, invalidating the warm cache.
-            // Legacy entries (namespaced `alaya:embed:<model>:<dims>:<sha256>`)
-            // are orphaned and expire via their 30-day TTL; flush them to
-            // reclaim memory sooner (command in CLAUDE.md). One-time re-embed
-            // cost until the cache re-warms. Log removable after 2026-09-08.
-            tracing::info!(
-                backend = %backend,
-                "L2 embedding cache enabled — keys are cross-SDK interop/v1; legacy \
-                 SHA-256 entries are orphaned and expire via TTL (cutover 2026-08-08, LAB-372)"
-            );
+            tracing::info!(backend = %backend, "L2 embedding cache enabled");
             Some(ck)
         }
         Err(e) => {
@@ -424,6 +506,18 @@ pub(crate) enum CmdInner {
     },
     Contradictions {
         limit: usize,
+        offset: usize,
+        include_resolved: bool,
+        verdicts: Option<Vec<String>>,
+        reply: oneshot::Sender<Value>,
+    },
+    /// Stamp (`Some`) or clear (`None`) the operator's resolution on a
+    /// CONTRADICTS pair (LAB-3885). The only write path to `e.resolution*`.
+    ResolveContradiction {
+        memory_a_hash: String,
+        memory_b_hash: String,
+        resolution: Option<Resolution>,
+        resolved_via: String,
         reply: oneshot::Sender<Value>,
     },
     FindDuplicates {
@@ -448,6 +542,13 @@ pub(crate) enum CmdInner {
         limit: usize,
         reply: oneshot::Sender<Value>,
     },
+    /// Judge up to `limit` CONTRADICTS pairs with no verdict (LAB-3283 AC-5);
+    /// `rejudge` also re-annotates pairs judged by a different model.
+    BackfillContradictions {
+        limit: usize,
+        rejudge: bool,
+        reply: oneshot::Sender<Value>,
+    },
 }
 
 impl CmdInner {
@@ -457,7 +558,8 @@ impl CmdInner {
         match self {
             CmdInner::FindDuplicates { .. }
             | CmdInner::MergeDuplicates { .. }
-            | CmdInner::BackfillSummaries { .. } => LONG_CMD_DEADLINE,
+            | CmdInner::BackfillSummaries { .. }
+            | CmdInner::BackfillContradictions { .. } => LONG_CMD_DEADLINE,
             _ => CMD_DEADLINE,
         }
     }
@@ -475,10 +577,12 @@ impl Cmd {
             CmdInner::Relation { .. } => "relation",
             CmdInner::Supersede { .. } => "supersede",
             CmdInner::Contradictions { .. } => "contradictions",
+            CmdInner::ResolveContradiction { .. } => "resolve_contradiction",
             CmdInner::FindDuplicates { .. } => "find_duplicates",
             CmdInner::MergeDuplicates { .. } => "merge_duplicates",
             CmdInner::Patch { .. } => "patch",
             CmdInner::BackfillSummaries { .. } => "backfill_summaries",
+            CmdInner::BackfillContradictions { .. } => "backfill_contradictions",
         }
     }
 }
@@ -828,6 +932,13 @@ async fn service_worker(
 
     let svc = std::rc::Rc::new(svc);
 
+    // LAB-3283: one cap on in-flight judge calls shared by store-path spawns
+    // and the backfill (a bulk import must not fan thousands of calls at the
+    // LB), and a single-flight guard so an operator retry after the reply
+    // deadline cannot run a second pass over the same unjudged pairs.
+    let judge_gate = std::rc::Rc::new(tokio::sync::Semaphore::new(JUDGE_CONCURRENCY));
+    let backfill_running = std::rc::Rc::new(std::cell::Cell::new(false));
+
     // First heartbeat: bootstrap is done and the loop is live. Until this
     // stamp the health checker reports the worker as "starting" (progress
     // sentinel 0), never stalled — see the seed in main().
@@ -921,6 +1032,33 @@ async fn service_worker(
                             tokio::task::spawn_local(async move {
                                 svc.enrich_summary(&hash_owned, &content).await;
                             });
+                        }
+
+                        // Fire-and-forget (LAB-3283 AC-4): judge each new
+                        // CONTRADICTS signal off the store path. Suppressed
+                        // under read_only — no edges were written — and when
+                        // no judge is configured. The edge direction is
+                        // (new) -> (existing), matching the batch write above.
+                        // Only a genuinely new memory: a re-store re-runs
+                        // interference but its edges (and verdicts) already
+                        // exist — re-judging would churn and re-bill them.
+                        if !read_only
+                            && svc.judge.is_some()
+                            && !skipped
+                            && r.get("created").and_then(Value::as_bool) == Some(true)
+                            && let Some(new_hash) = r.get("content_hash").and_then(|v| v.as_str())
+                        {
+                            for dst in contradicted_hashes(&r) {
+                                let src = new_hash.to_string();
+                                let svc = svc.clone();
+                                let gate = judge_gate.clone();
+                                tokio::task::spawn_local(async move {
+                                    let Ok(_permit) = gate.acquire().await else {
+                                        return;
+                                    };
+                                    svc.judge_contradiction(&src, &dst).await;
+                                });
+                            }
                         }
 
                         json!(r)
@@ -1100,17 +1238,25 @@ async fn service_worker(
                 };
                 let _ = reply.send(result);
             }
-            CmdInner::Contradictions { limit, reply } => {
-                let span = tracing::info_span!(parent: &ps, "contradictions");
+            CmdInner::Contradictions {
+                limit,
+                offset,
+                include_resolved,
+                verdicts,
+                reply,
+            } => {
+                let span =
+                    tracing::info_span!(parent: &ps, "contradictions", offset, include_resolved);
                 let result = match timeout(
                     limits.cmd,
-                    svc.memory_contradictions(limit).instrument(span),
+                    svc.memory_contradictions(limit, offset, include_resolved, verdicts.as_deref())
+                        .instrument(span),
                 )
                 .await
                 {
                     Ok(Ok(r)) => {
                         let pairs = r
-                            .get("contradictions")
+                            .get("pairs")
                             .and_then(|v| v.as_array())
                             .map(|a| a.len())
                             .unwrap_or(0);
@@ -1156,6 +1302,58 @@ async fn service_worker(
                         }
                         Err(_) => deadline_exceeded(op, limits.cmd, start),
                     };
+                let _ = reply.send(result);
+            }
+
+            CmdInner::ResolveContradiction {
+                memory_a_hash,
+                memory_b_hash,
+                resolution,
+                resolved_via,
+                reply,
+            } => {
+                let span = tracing::info_span!(parent: &ps, "resolve_contradiction");
+                let a = truncate_hash(&memory_a_hash);
+                let b = truncate_hash(&memory_b_hash);
+                let stamp = resolution.map(|r| r.as_str()).unwrap_or("clear");
+                let result = match timeout(
+                    limits.cmd,
+                    svc.resolve_contradiction(
+                        &memory_a_hash,
+                        &memory_b_hash,
+                        resolution,
+                        &resolved_via,
+                    )
+                    .instrument(span),
+                )
+                .await
+                {
+                    Ok(Ok(r)) => {
+                        tracing::info!(
+                            op,
+                            a = a.as_str(),
+                            b = b.as_str(),
+                            resolution = stamp,
+                            via = resolved_via.as_str(),
+                            elapsed_ms = ms(start),
+                            "ok"
+                        );
+                        r
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(
+                            op,
+                            error = %e,
+                            a = a.as_str(),
+                            b = b.as_str(),
+                            resolution = stamp,
+                            elapsed_ms = ms(start),
+                            "failed"
+                        );
+                        json!({"success": false, "error": e.safe_message()})
+                    }
+                    Err(_) => deadline_exceeded(op, limits.cmd, start),
+                };
                 let _ = reply.send(result);
             }
 
@@ -1306,12 +1504,223 @@ async fn service_worker(
                     .instrument(span),
                 );
             }
+            CmdInner::BackfillContradictions {
+                limit,
+                rejudge,
+                reply,
+            } => {
+                if backfill_running.replace(true) {
+                    let _ = reply.send(json!({
+                        "success": false,
+                        "error": "backfill already running"
+                    }));
+                } else {
+                    let span = tracing::info_span!(parent: &ps, "backfill_contradictions");
+                    let svc = svc.clone();
+                    let gate = judge_gate.clone();
+                    let running = backfill_running.clone();
+                    tokio::task::spawn_local(
+                        async move {
+                            run_backfill_contradictions(&svc, &gate, limit, rejudge, reply).await;
+                            running.set(false);
+                        }
+                        .instrument(span),
+                    );
+                }
+            }
         }
 
         // Watchdog heartbeat: the loop just finished (or spawned) a command.
         // Stops advancing exactly when the worker stops draining.
         progress.store(epoch_secs(), std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// `existing_hash` of every contradiction signal in a store result, deduped
+/// (negation and temporal cues can both fire on one neighbour).
+fn contradicted_hashes(store_result: &std::collections::HashMap<String, Value>) -> Vec<String> {
+    let mut hashes: Vec<String> = store_result
+        .get("interference")
+        .and_then(|i| i.get("contradictions"))
+        .and_then(Value::as_array)
+        .map(|signals| {
+            signals
+                .iter()
+                .filter_map(|s| s.get("existing_hash").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    hashes.sort();
+    hashes.dedup();
+    hashes
+}
+
+/// In-flight judge calls during a backfill (LAB-3283 AC-5).
+const JUDGE_CONCURRENCY: usize = 4;
+/// Retries on 429 before a pair is counted unjudged (AC-9).
+const JUDGE_MAX_RETRIES: u32 = 5;
+const JUDGE_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Default, Debug, PartialEq)]
+struct BackfillTotals {
+    judged: usize,
+    /// Judged verdicts that actually landed on an edge.
+    persisted: usize,
+    /// Deterministic failures persisted as an `unjudged` marker (skipped next pass).
+    marked: usize,
+    /// Transient failures: nothing written, retried next pass.
+    unjudged: usize,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+/// One backfill pass: fetch unjudged pairs, judge them, reply with totals.
+/// Runs detached; every exit path replies exactly once.
+async fn run_backfill_contradictions(
+    svc: &MemoryService,
+    gate: &std::rc::Rc<tokio::sync::Semaphore>,
+    limit: usize,
+    rejudge: bool,
+    reply: oneshot::Sender<Value>,
+) {
+    let Some(judge) = svc.judge.as_ref() else {
+        let _ = reply.send(json!({
+            "success": false,
+            "error": "contradiction judge not configured"
+        }));
+        return;
+    };
+    // Only edges with no verdict at all: a persisted `unjudged` marker is a
+    // deterministic failure and is skipped, so re-running is idempotent and
+    // never re-spends (AC-5). `rejudge` widens the selection to edges judged
+    // by a different model — the recovery path for a model switch. Resolved
+    // pairs are hidden from the read surface, so judging them is waste.
+    let query = ContradictionQuery {
+        limit,
+        needs_judging: true,
+        rejudge_model: rejudge.then(|| judge.model_name().to_string()),
+        exclude_resolved: true,
+        ..Default::default()
+    };
+    let pairs = match svc.graph.get_all_contradictions(&query).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("backfill: fetching unjudged pairs failed: {e}");
+            let _ = reply.send(json!({"success": false, "error": e.safe_message()}));
+            return;
+        }
+    };
+    let queued = pairs.len();
+    tracing::info!(queued, rejudge, "backfill: judging contradictions");
+    let t = backfill_judge(svc, gate, pairs).await;
+    tracing::info!(
+        queued,
+        judged = t.judged,
+        persisted = t.persisted,
+        marked = t.marked,
+        unjudged = t.unjudged,
+        input_tokens = t.input_tokens,
+        output_tokens = t.output_tokens,
+        "backfill contradictions complete"
+    );
+    let _ = reply.send(json!({
+        "queued": queued,
+        "judged": t.judged,
+        "persisted": t.persisted,
+        "marked": t.marked,
+        "unjudged": t.unjudged,
+        "input_tokens": t.input_tokens,
+        "output_tokens": t.output_tokens,
+    }));
+}
+
+/// Judge `pairs` with at most `JUDGE_CONCURRENCY` calls in flight (the
+/// semaphore is shared with store-path spawns, so the cap is global).
+async fn backfill_judge(
+    svc: &MemoryService,
+    gate: &std::rc::Rc<tokio::sync::Semaphore>,
+    pairs: Vec<Contradiction>,
+) -> BackfillTotals {
+    use futures::StreamExt;
+    let outcomes: Vec<JudgeOutcome> = futures::stream::iter(pairs)
+        .map(|p| async move {
+            // Permit per attempt, not per pair: a rate-limit sleep inside
+            // `with_backoff` must not hold one of the four shared permits
+            // (four sleeping pairs would stall the pass and the store path).
+            with_backoff(|| async {
+                let Ok(_permit) = gate.acquire().await else {
+                    return JudgeOutcome::Unjudged { marked: false };
+                };
+                svc.judge_contradiction(&p.memory_a_hash, &p.memory_b_hash)
+                    .await
+            })
+            .await
+        })
+        .buffer_unordered(JUDGE_CONCURRENCY)
+        .collect()
+        .await;
+    let mut t = BackfillTotals::default();
+    for o in outcomes {
+        match o {
+            JudgeOutcome::Judged {
+                judgement,
+                persisted,
+            } => {
+                t.judged += 1;
+                if persisted {
+                    t.persisted += 1;
+                }
+                t.input_tokens += judgement.input_tokens;
+                t.output_tokens += judgement.output_tokens;
+            }
+            JudgeOutcome::Unjudged { marked: true } => t.marked += 1,
+            // `with_backoff` never returns RateLimited; treat it as transient.
+            JudgeOutcome::Unjudged { marked: false } | JudgeOutcome::RateLimited { .. } => {
+                t.unjudged += 1
+            }
+        }
+    }
+    t
+}
+
+/// Retry one judge attempt on 429, honouring `retry-after` when the LB
+/// sends it and doubling from 1s (capped) when it doesn't. Any other
+/// outcome is final; exhausted retries count as a transient unjudged.
+async fn with_backoff<F, Fut>(mut attempt: F) -> JudgeOutcome
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = JudgeOutcome>,
+{
+    let mut backoff = std::time::Duration::from_secs(1);
+    for n in 0..=JUDGE_MAX_RETRIES {
+        match attempt().await {
+            outcome @ (JudgeOutcome::Judged { .. } | JudgeOutcome::Unjudged { .. }) => {
+                return outcome;
+            }
+            JudgeOutcome::RateLimited { retry_after_secs } => {
+                if n == JUDGE_MAX_RETRIES {
+                    tracing::warn!(
+                        retries = n,
+                        "backfill: still rate limited, giving up on pair"
+                    );
+                    return JudgeOutcome::Unjudged { marked: false };
+                }
+                let wait = retry_after_secs
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or(backoff)
+                    .min(JUDGE_MAX_BACKOFF);
+                tracing::info!(
+                    attempt = n + 1,
+                    wait_s = wait.as_secs(),
+                    "backfill: rate limited, backing off"
+                );
+                tokio::time::sleep(wait).await;
+                backoff = (backoff * 2).min(JUDGE_MAX_BACKOFF);
+            }
+        }
+    }
+    JudgeOutcome::Unjudged { marked: false }
 }
 
 /// Fire-and-forget summary generation helper.
@@ -1475,6 +1884,75 @@ fn main() {
         let graph = GraphHttpClient::new(config.graph_url.clone(), &config.graph_api_key)
             .expect("GRAPH_API_KEY rejected — must be a single line of visible ASCII");
 
+        let qdrant = QdrantClient::new(
+            config.qdrant_url.clone(),
+            config.qdrant_collection.clone(),
+            config.qdrant_api_key.clone(),
+        )
+        .expect("QDRANT_API_KEY rejected — must be a single line of visible ASCII");
+
+        let summary: Option<SummaryClient> = if let Some(url) = &config.summary_url {
+            tracing::info!(
+                origin = log_safe_origin(url).as_str(),
+                model = config.summary_model.as_str(),
+                has_api_key = config.summary_api_key.is_some(),
+                "summary provider enabled"
+            );
+            Some(
+                SummaryClient::new(
+                    url.clone(),
+                    config.summary_model.clone(),
+                    config.summary_api_key.clone(),
+                )
+                .expect("SUMMARY_API_KEY rejected — must be a single line of visible ASCII"),
+            )
+        } else {
+            tracing::info!("SUMMARY_URL not set — auto-summary disabled");
+            None
+        };
+
+        let rerank: Option<RerankClient> = if let Some(url) = &config.rerank_url {
+            tracing::info!(
+                origin = log_safe_origin(url).as_str(),
+                top_n = config.rerank_top_n,
+                timeout_ms = config.rerank_timeout_ms.get(),
+                has_api_key = config.rerank_api_key.is_some(),
+                "cross-encoder reranker enabled"
+            );
+            Some(
+                RerankClient::new(
+                    url.clone(),
+                    config.rerank_top_n,
+                    config.rerank_api_key.clone(),
+                    std::time::Duration::from_millis(config.rerank_timeout_ms.get()),
+                )
+                .expect("RERANK_API_KEY rejected — must be a single line of visible ASCII"),
+            )
+        } else {
+            tracing::info!("RERANK_URL not set — cross-encoder rerank disabled");
+            None
+        };
+
+        let judge: Option<JudgeClient> = if let Some(url) = &config.judge_url {
+            tracing::info!(
+                origin = log_safe_origin(url).as_str(),
+                model = config.judge_model.as_str(),
+                has_api_key = config.judge_api_key.is_some(),
+                "contradiction judge enabled (advisory: annotates CONTRADICTS edges, never writes memories)"
+            );
+            Some(
+                JudgeClient::new(
+                    url.clone(),
+                    config.judge_model.clone(),
+                    config.judge_api_key.clone(),
+                )
+                .expect("JUDGE_API_KEY rejected — must be a single line of visible ASCII"),
+            )
+        } else {
+            tracing::info!("JUDGE_URL/SUMMARY_URL not set — contradiction judge disabled");
+            None
+        };
+
         // Spawn MemoryService on a dedicated thread with LocalSet
         let cfg_clone = config.clone();
 
@@ -1486,11 +1964,6 @@ fn main() {
 
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                let qdrant = QdrantClient::new(
-                    cfg_clone.qdrant_url,
-                    cfg_clone.qdrant_collection,
-                    cfg_clone.qdrant_api_key,
-                );
                 // Fresh-deploy bootstrap: create the memory collection if it is
                 // absent so the first write doesn't 404 (#31).
                 ensure_qdrant_collection(&qdrant, cfg_clone.embedding_dimensions).await;
@@ -1512,22 +1985,7 @@ fn main() {
                 let graph = std::rc::Rc::new(graph);
 
                 let summary: Option<Box<dyn alaya_backends::SummaryProvider>> =
-                    if let Some(url) = &cfg_clone.summary_url {
-                        tracing::info!(
-                            url = url.as_str(),
-                            model = cfg_clone.summary_model.as_str(),
-                            has_api_key = cfg_clone.summary_api_key.is_some(),
-                            "summary provider enabled"
-                        );
-                        Some(Box::new(SummaryClient::new(
-                            url.clone(),
-                            cfg_clone.summary_model.clone(),
-                            cfg_clone.summary_api_key.clone(),
-                        )))
-                    } else {
-                        tracing::info!("SUMMARY_URL not set — auto-summary disabled");
-                        None
-                    };
+                    summary.map(|s| Box::new(s) as Box<dyn alaya_backends::SummaryProvider>);
 
                 let mut svc = MemoryService::new(
                     Box::new(qdrant),
@@ -1538,20 +1996,11 @@ fn main() {
                     summary,
                 );
 
-                if let Some(url) = &cfg_clone.rerank_url {
-                    tracing::info!(
-                        url = url.as_str(),
-                        top_n = cfg_clone.rerank_top_n,
-                        has_api_key = cfg_clone.rerank_api_key.is_some(),
-                        "cross-encoder reranker enabled"
-                    );
-                    svc = svc.with_reranker(Box::new(RerankClient::new(
-                        url.clone(),
-                        cfg_clone.rerank_top_n,
-                        cfg_clone.rerank_api_key.clone(),
-                    )));
-                } else {
-                    tracing::info!("RERANK_URL not set — cross-encoder rerank disabled");
+                if let Some(judge) = judge {
+                    svc = svc.with_judge(Box::new(judge));
+                }
+                if let Some(rerank) = rerank {
+                    svc = svc.with_reranker(Box::new(rerank));
                 }
 
                 service_worker(rx, svc, progress_for_worker, WorkerLimits::default()).await;
@@ -1603,6 +2052,7 @@ fn main() {
             .route("/relation", post(relation))
             .route("/supersede", post(supersede))
             .route("/contradictions", post(contradictions))
+            .route("/contradictions/resolution", post(resolve_contradiction))
             .route("/duplicates/find", post(find_duplicates))
             .route("/duplicates/merge", post(merge_duplicates))
             .route(
@@ -1610,6 +2060,7 @@ fn main() {
                 get(get_memory).patch(patch_memory),
             )
             .route("/backfill/summaries", post(backfill_summaries))
+            .route("/backfill/contradictions", post(backfill_contradictions))
             .layer(middleware::from_fn_with_state(
                 auth_state.clone(),
                 auth::require_auth,
@@ -1855,6 +2306,15 @@ async fn supersede(
 struct ContradictionsReq {
     #[serde(default = "default_limit")]
     limit: usize,
+    /// Show pairs where an endpoint is already superseded (default hidden).
+    #[serde(default)]
+    include_resolved: bool,
+    /// Verdict filter; omitted = `contradiction,supersession,unjudged`.
+    #[serde(default)]
+    verdicts: Option<Vec<String>>,
+    /// Pairs to skip (page cursor: pass back the previous `next_offset`).
+    #[serde(default)]
+    offset: usize,
 }
 fn default_limit() -> usize {
     20
@@ -1868,6 +2328,49 @@ async fn contradictions(
     h.call(
         CmdInner::Contradictions {
             limit: req.limit,
+            offset: req.offset,
+            include_resolved: req.include_resolved,
+            verdicts: req.verdicts,
+            reply: tx,
+        },
+        rx,
+    )
+    .await
+}
+
+/// `resolution` must be present: `"keep_both"` stamps, explicit `null`
+/// clears. A missing key is a 4xx, never a silent clear.
+#[derive(Deserialize)]
+struct ResolveContradictionReq {
+    memory_a_hash: String,
+    memory_b_hash: String,
+    #[serde(deserialize_with = "require_present")]
+    resolution: Option<Resolution>,
+    /// Who resolved, recorded verbatim (`operator:console`, `engine:<run-id>`).
+    resolved_via: String,
+}
+
+/// `Option<T>` that rejects an absent key (serde's default reads absent as
+/// `None`, which for a set-or-clear field turns a typo into a clear).
+pub(crate) fn require_present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d)
+}
+
+async fn resolve_contradiction(
+    axum::extract::State(h): axum::extract::State<ServiceHandle>,
+    Json(req): Json<ResolveContradictionReq>,
+) -> (StatusCode, Json<Value>) {
+    let (tx, rx) = oneshot::channel();
+    h.call(
+        CmdInner::ResolveContradiction {
+            memory_a_hash: req.memory_a_hash,
+            memory_b_hash: req.memory_b_hash,
+            resolution: req.resolution,
+            resolved_via: req.resolved_via,
             reply: tx,
         },
         rx,
@@ -2059,9 +2562,254 @@ async fn backfill_summaries(
     .await
 }
 
+#[derive(Deserialize)]
+struct BackfillContradictionsParams {
+    #[serde(default = "default_backfill_limit")]
+    limit: usize,
+    /// Also re-judge edges whose `verdict_model` differs from the configured
+    /// judge model (recovery path for a model switch).
+    #[serde(default)]
+    rejudge: bool,
+}
+
+/// Operator-only (same auth class as `/backfill/summaries`, enforced in
+/// `auth::rest_route_op`). Blocks until the pass completes and returns
+/// `{queued, judged, persisted, marked, unjudged, input_tokens, output_tokens}`.
+async fn backfill_contradictions(
+    axum::extract::State(h): axum::extract::State<ServiceHandle>,
+    Json(params): Json<BackfillContradictionsParams>,
+) -> (StatusCode, Json<Value>) {
+    let (tx, rx) = oneshot::channel();
+    h.call(
+        CmdInner::BackfillContradictions {
+            limit: params.limit,
+            rejudge: params.rejudge,
+            reply: tx,
+        },
+        rx,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── resolve_contradiction wire shape (LAB-3885 AC-4) ─────────────────
+
+    #[test]
+    fn resolve_contradiction_req_requires_resolution_key_but_accepts_null() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let set: ResolveContradictionReq = serde_json::from_value(json!({
+            "memory_a_hash": a, "memory_b_hash": b,
+            "resolution": "keep_both", "resolved_via": "operator:console"
+        }))
+        .unwrap();
+        assert_eq!(set.resolution, Some(Resolution::KeepBoth));
+
+        let clear: ResolveContradictionReq = serde_json::from_value(json!({
+            "memory_a_hash": a, "memory_b_hash": b,
+            "resolution": null, "resolved_via": "operator:console"
+        }))
+        .unwrap();
+        assert_eq!(clear.resolution, None);
+
+        let missing = serde_json::from_value::<ResolveContradictionReq>(json!({
+            "memory_a_hash": a, "memory_b_hash": b, "resolved_via": "operator:console"
+        }));
+        assert!(missing.is_err(), "an absent key must not read as a clear");
+        let bogus = serde_json::from_value::<ResolveContradictionReq>(json!({
+            "memory_a_hash": a, "memory_b_hash": b,
+            "resolution": "keep-both", "resolved_via": "operator:console"
+        }));
+        assert!(bogus.is_err());
+        let no_via = serde_json::from_value::<ResolveContradictionReq>(json!({
+            "memory_a_hash": a, "memory_b_hash": b, "resolution": "keep_both"
+        }));
+        assert!(no_via.is_err(), "resolved_via is required on REST");
+    }
+
+    // ─── Contradiction judge plumbing (LAB-3283 AC-4, AC-5, AC-9) ─────────
+
+    #[test]
+    fn contradicted_hashes_dedups_signals_and_tolerates_missing_key() {
+        let mut r = std::collections::HashMap::new();
+        assert!(contradicted_hashes(&r).is_empty());
+        r.insert(
+            "interference".to_string(),
+            json!({"contradictions": [
+                {"existing_hash": "b", "signal_type": "Negation"},
+                {"existing_hash": "a", "signal_type": "Temporal"},
+                {"existing_hash": "b", "signal_type": "Antonym"},
+                {"signal_type": "Bogus"}
+            ]}),
+        );
+        assert_eq!(
+            contradicted_hashes(&r),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    fn judged() -> JudgeOutcome {
+        JudgeOutcome::Judged {
+            persisted: true,
+            judgement: alaya_backends::Judgement {
+                verdict: alaya_types::graph::Verdict::Coexist,
+                survivor: None,
+                reason: String::new(),
+                confidence: 0.5,
+                model: "m".into(),
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_backoff_honours_retry_after_then_succeeds() {
+        let calls = std::cell::Cell::new(0u32);
+        let start = tokio::time::Instant::now();
+        let out = with_backoff(|| {
+            let n = calls.get();
+            calls.set(n + 1);
+            async move {
+                if n < 2 {
+                    JudgeOutcome::RateLimited {
+                        retry_after_secs: Some(3),
+                    }
+                } else {
+                    judged()
+                }
+            }
+        })
+        .await;
+        assert!(matches!(out, JudgeOutcome::Judged { .. }), "{out:?}");
+        assert_eq!(calls.get(), 3);
+        assert!(
+            start.elapsed() >= std::time::Duration::from_secs(6),
+            "two 3s waits"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_backoff_doubles_without_a_hint_and_gives_up() {
+        let calls = std::cell::Cell::new(0u32);
+        let start = tokio::time::Instant::now();
+        let out = with_backoff(|| {
+            calls.set(calls.get() + 1);
+            async {
+                JudgeOutcome::RateLimited {
+                    retry_after_secs: None,
+                }
+            }
+        })
+        .await;
+        assert!(
+            matches!(out, JudgeOutcome::Unjudged { marked: false }),
+            "{out:?}"
+        );
+        assert_eq!(calls.get(), JUDGE_MAX_RETRIES + 1);
+        // 1+2+4+8+16 s of doubling before the final attempt gives up.
+        assert!(start.elapsed() >= std::time::Duration::from_secs(31));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(63),
+            "no wait after the last attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_backoff_unjudged_is_final() {
+        let calls = std::cell::Cell::new(0u32);
+        let out = with_backoff(|| {
+            calls.set(calls.get() + 1);
+            async { JudgeOutcome::Unjudged { marked: true } }
+        })
+        .await;
+        assert!(
+            matches!(out, JudgeOutcome::Unjudged { marked: true }),
+            "{out:?}"
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn cluster_local_accepts_service_dns_and_private_hosts_only() {
+        let parse = |u: &str| reqwest::Url::parse(u).unwrap();
+        for ok in [
+            "http://anthropic-lb:8082",
+            "http://alaya-bridge:3000",
+            "http://alaya-server.mcp.svc:3001",
+            "http://localhost:8082",
+            "http://10.43.144.201:8082",
+            "http://[::1]:8082",
+            // Userinfo bound for a cluster-local proxy is that proxy's business.
+            "http://user:pass@anthropic-lb:8082",
+        ] {
+            assert!(is_cluster_local(&parse(ok)), "{ok}");
+        }
+        for no in [
+            "http://api.anthropic.com",
+            "http://proxy.example.net:8082",
+            "http://1.2.3.4",
+            // The host is what reqwest connects to, not what precedes the `@`.
+            "http://user:pass@api.anthropic.com",
+            "http://anthropic-lb:8082@api.anthropic.com",
+            // An IPv6 literal has no dots but is not a service name.
+            "http://[2606:4700::1111]",
+            "http://[::ffff:1.2.3.4]",
+        ] {
+            assert!(!is_cluster_local(&parse(no)), "{no}");
+        }
+    }
+
+    #[test]
+    fn credential_transport_fails_closed_off_cluster() {
+        // Refused with a key: plain http to a non-cluster host whatever the
+        // scheme's case (the transport parses it case-insensitively), a
+        // scheme that is not https at all, or a value that does not parse.
+        for bad in [
+            "http://api.anthropic.com",
+            "http://proxy.example.net:8082",
+            "HTTP://api.anthropic.com",
+            "Http://API.Anthropic.com:80",
+            "http://user:pass@api.anthropic.com",
+            "htps://api.anthropic.com",
+            "api.anthropic.com:443",
+            "not a url",
+        ] {
+            assert!(
+                check_credential_transport("JUDGE_URL", bad, true).is_err(),
+                "{bad}"
+            );
+        }
+        // Allowed: https anywhere, cluster-local plaintext, or no key at all.
+        for ok in [
+            "https://api.anthropic.com",
+            "HTTPS://api.anthropic.com",
+            "http://anthropic-lb:8082",
+            "HTTP://Anthropic-LB:8082",
+            "http://alaya-bridge.mcp.svc:3000",
+            "http://localhost:8082",
+        ] {
+            assert!(
+                check_credential_transport("SUMMARY_URL", ok, true).is_ok(),
+                "{ok}"
+            );
+        }
+        for keyless in ["http://api.anthropic.com", "not a url"] {
+            assert!(check_credential_transport("SUMMARY_URL", keyless, false).is_ok());
+        }
+        // The refusal goes to pod logs: name the host, never echo a value
+        // that may carry userinfo.
+        let err =
+            check_credential_transport("JUDGE_URL", "http://user:s3cret@api.anthropic.com", true)
+                .unwrap_err();
+        assert!(
+            err.contains("api.anthropic.com") && !err.contains("s3cret"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn host_of_strips_port_and_unwraps_ipv6_brackets() {
@@ -2070,6 +2818,35 @@ mod tests {
         assert_eq!(host_of("http://[::1]:3001/foo"), Some("::1".into()));
         assert_eq!(host_of("http://localhost:8080"), Some("localhost".into()));
         assert_eq!(host_of("not-a-url"), None);
+        assert_eq!(
+            host_of("http://127.0.0.1:@evil.com"),
+            Some("evil.com".into())
+        );
+        assert_eq!(
+            host_of("http://localhost:@evil.com"),
+            Some("evil.com".into())
+        );
+        assert_eq!(host_of("https://secret@host"), Some("host".into()));
+    }
+
+    #[test]
+    fn log_safe_origin_drops_userinfo_path_and_query() {
+        assert_eq!(
+            log_safe_origin("https://user:s3cret@tei.mcp.svc:8443/v1/rerank?api_key=k3y#f"),
+            "https://tei.mcp.svc:8443"
+        );
+        assert_eq!(
+            log_safe_origin("http://localhost:8080/v1"),
+            "http://localhost:8080"
+        );
+        assert_eq!(
+            log_safe_origin("https://api.openai.com/v1"),
+            "https://api.openai.com"
+        );
+        assert_eq!(log_safe_origin("tei.mcp.svc:8080"), "<no host>");
+        let err = log_safe_origin("not-a-url");
+        assert!(err.starts_with("<unparseable: "), "{err}");
+        assert!(!err.contains("not-a-url"), "{err}");
     }
 
     #[test]
@@ -2300,7 +3077,28 @@ mod wedge_tests {
         ) -> Result<bool> {
             unimplemented!()
         }
-        async fn get_all_contradictions(&self, _limit: usize) -> Result<Vec<Contradiction>> {
+        async fn get_all_contradictions(
+            &self,
+            _query: &alaya_types::graph::ContradictionQuery,
+        ) -> Result<Vec<Contradiction>> {
+            unimplemented!()
+        }
+        async fn set_contradiction_verdict(
+            &self,
+            _src: &str,
+            _dst: &str,
+            _verdict: &alaya_types::graph::EdgeVerdict,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn set_contradiction_resolution(
+            &self,
+            _src: &str,
+            _dst: &str,
+            _resolution: Option<Resolution>,
+            _via: &str,
+            _at: f64,
+        ) -> Result<bool> {
             unimplemented!()
         }
         async fn get_contradictions_for_hashes(

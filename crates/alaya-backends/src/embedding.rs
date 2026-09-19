@@ -96,7 +96,7 @@ impl EmbeddingProvider for EmbeddingClient {
                     .json(&body)
                     .send()
                     .await
-                    .map_err(|e| AlayaError::Embedding(e.to_string()))?;
+                    .map_err(|e| AlayaError::Embedding(crate::redact_reqwest_error(e)))?;
 
                 if !resp.status().is_success() {
                     let status = resp.status();
@@ -106,10 +106,12 @@ impl EmbeddingProvider for EmbeddingClient {
                     )));
                 }
 
-                let parsed: EmbeddingResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| AlayaError::Embedding(format!("failed to parse response: {e}")))?;
+                let parsed: EmbeddingResponse = resp.json().await.map_err(|e| {
+                    AlayaError::Embedding(format!(
+                        "failed to parse response: {}",
+                        crate::redact_reqwest_error(e)
+                    ))
+                })?;
 
                 let mut items = parsed.data;
                 items.sort_by_key(|d| d.index);
