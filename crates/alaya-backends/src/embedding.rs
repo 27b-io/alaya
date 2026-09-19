@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
 
-use alaya_types::{AlayaError, Result, search::PromptName};
+use alaya_types::{AlayaError, Result, memory::HealthStatus, search::PromptName};
 
 use crate::EmbeddingProvider;
 
@@ -129,6 +129,31 @@ impl EmbeddingProvider for EmbeddingClient {
 
     fn model_name(&self) -> &str {
         &self.model
+    }
+
+    /// `GET {base_url}/health` — the TEI / vLLM readiness endpoint: 200 once
+    /// the model is loaded, 503 until then. Reachability only — it spends no
+    /// embedding, so a dashboard poll costs the endpoint nothing.
+    async fn health(&self) -> Result<HealthStatus> {
+        let resp = self
+            .client
+            .get(format!("{}/health", self.base_url))
+            .send()
+            .await
+            .map_err(|e| AlayaError::Embedding(crate::redact_reqwest_error(e)))?;
+
+        if !resp.status().is_success() {
+            return Err(AlayaError::Embedding(format!(
+                "embedding health returned {}",
+                resp.status()
+            )));
+        }
+
+        Ok(HealthStatus {
+            status: "healthy".into(),
+            backend: "embedding".into(),
+            details: None,
+        })
     }
 }
 
