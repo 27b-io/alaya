@@ -6,7 +6,8 @@ use alaya_types::{
     Result,
     graph::{
         CoAccessPair, Contradiction, ContradictionQuery, ContradictionRef, Direction, Edge,
-        EdgeMeta, EdgeVerdict, GraphStats, Neighbor, SystemRelationType, UserRelationType, Verdict,
+        EdgeMeta, EdgeVerdict, GraphStats, Neighbor, Resolution, SystemRelationType,
+        UserRelationType, Verdict,
     },
     memory::{
         HealthStatus, Memory, MetadataUpdate, PatchMemoryRequest, ScoredMemory, ScrollResult,
@@ -219,6 +220,18 @@ pub trait GraphService {
         src: &str,
         dst: &str,
         verdict: &EdgeVerdict,
+    ) -> Result<bool>;
+    /// Stamp (`Some`) or clear (`None`) the operator's resolution on the
+    /// existing `src -> dst` CONTRADICTS edge (LAB-3885). The only write
+    /// path to `e.resolution*`. Never creates or deletes an edge; returns
+    /// whether one matched.
+    async fn set_contradiction_resolution(
+        &self,
+        src: &str,
+        dst: &str,
+        resolution: Option<Resolution>,
+        resolved_via: &str,
+        resolved_at: f64,
     ) -> Result<bool>;
     async fn get_contradictions_for_hashes(
         &self,

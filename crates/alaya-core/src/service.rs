@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use alaya_backends::judge::sanitize_reason;
 use alaya_backends::{ContradictionJudge, Judgement, Survivor};
-use alaya_types::graph::{ContradictionQuery, EdgeVerdict, Verdict};
+use alaya_types::graph::{ContradictionQuery, EdgeVerdict, Resolution, Verdict};
 
 // ─── Tag deserialization ───────────────────────────────────────────────────────
 
@@ -212,6 +212,10 @@ const RRF_BLEND_WEIGHT: f64 = 0.4;
 /// here. Phase 2 promotion is decided on these events — the field set is a
 /// contract.
 pub const SHADOW_LOG_TARGET: &str = "alaya::judge";
+
+/// Upper bound on `resolved_via` (LAB-3885): a short principal tag, not a
+/// free-text reason — the reason for a resolution is the verdict's.
+const MAX_RESOLVED_VIA_LEN: usize = 128;
 
 /// Verdict filter applied by `memory_contradictions` when the caller passes
 /// none: genuine conflicts plus pairs the judge has not seen yet. Callers
@@ -1932,7 +1936,8 @@ impl MemoryService {
     /// top of the queue can never hide the rest (LAB-3283 review).
     /// `include_resolved = false` excludes pairs whose endpoint carries an
     /// incoming `SUPERSEDES` edge — the graph-side twin of Qdrant's
-    /// `superseded_by`, measured complete on 2026-09-10. The Qdrant flag is
+    /// `superseded_by`, measured complete on 2026-09-10 — and pairs stamped
+    /// `keep_both` by `resolve_contradiction` (LAB-3885). The Qdrant flag is
     /// still applied per pair as a guard against a failed edge write (graph
     /// writes are non-fatal); that can only shorten a page, never hide the
     /// next one. `verdicts = None` applies `DEFAULT_VERDICT_FILTER`.
@@ -2015,6 +2020,9 @@ impl MemoryService {
                 "verdict_confidence": v.map(|v| v.verdict_confidence),
                 "verdict_model": v.map(|v| v.verdict_model.as_str()),
                 "judged_at": v.map(|v| v.judged_at),
+                "resolution": pair.resolution.map(|r| r.as_str()),
+                "resolved_at": pair.resolved_at,
+                "resolved_via": pair.resolved_via,
             }));
         }
 
@@ -2023,6 +2031,66 @@ impl MemoryService {
             "pairs": enriched,
             "total": enriched.len(),
             "next_offset": next_offset,
+        }))
+    }
+
+    // ─── Tool: resolve_contradiction (LAB-3885) ──────────────────────────
+
+    /// Resolve a `memory_a -> memory_b` CONTRADICTS pair as "keep both"
+    /// (`Some(KeepBoth)`) — or reverse that (`None`) — without touching
+    /// either memory. The stamp lives on the edge; the default queue skips
+    /// stamped pairs and `include_resolved` still shows them. This is the
+    /// only write path to `e.resolution*`: `relation` cannot set it, and the
+    /// judge writes the verdict namespace only. Unlike `persist_verdict`
+    /// this is an operator verb, so a missing edge or a graph failure is an
+    /// error, not a warning. `resolved_via` is recorded verbatim
+    /// (`operator:console`, `operator:mcp`, later `engine:<run-id>`);
+    /// `resolved_at` is server-set.
+    #[tracing::instrument(skip(self))]
+    pub async fn resolve_contradiction(
+        &self,
+        memory_a_hash: &str,
+        memory_b_hash: &str,
+        resolution: Option<Resolution>,
+        resolved_via: &str,
+    ) -> Result<Value> {
+        for h in [memory_a_hash, memory_b_hash] {
+            if !alaya_types::memory::validate_content_hash(h) {
+                return Err(AlayaError::Validation(
+                    "invalid content_hash: expected 64-char lowercase SHA-256 hex".into(),
+                ));
+            }
+        }
+        if memory_a_hash == memory_b_hash {
+            return Err(AlayaError::Validation(
+                "memory_a_hash and memory_b_hash must differ".into(),
+            ));
+        }
+        let via = resolved_via.trim();
+        if via.is_empty() || via.len() > MAX_RESOLVED_VIA_LEN {
+            return Err(AlayaError::Validation(format!(
+                "resolved_via is required (1..={MAX_RESOLVED_VIA_LEN} chars, e.g. operator:console)"
+            )));
+        }
+
+        let now = (self.clock)();
+        let matched = self
+            .graph
+            .set_contradiction_resolution(memory_a_hash, memory_b_hash, resolution, via, now)
+            .await?;
+        if !matched {
+            return Err(AlayaError::NotFound(format!(
+                "no CONTRADICTS edge {memory_a_hash} -> {memory_b_hash}"
+            )));
+        }
+
+        Ok(serde_json::json!({
+            "success": true,
+            "memory_a_hash": memory_a_hash,
+            "memory_b_hash": memory_b_hash,
+            "resolution": resolution.map(|r| r.as_str()),
+            "resolved_at": resolution.map(|_| now),
+            "resolved_via": resolution.map(|_| via),
         }))
     }
 
@@ -2632,6 +2700,17 @@ mod tests {
             _s: &str,
             _d: &str,
             _v: &alaya_types::graph::EdgeVerdict,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn set_contradiction_resolution(
+            &self,
+            _s: &str,
+            _d: &str,
+            _r: Option<Resolution>,
+            _v: &str,
+            _t: f64,
         ) -> Result<bool> {
             Ok(true)
         }
@@ -3272,6 +3351,17 @@ mod tests {
             _s: &str,
             _d: &str,
             _v: &alaya_types::graph::EdgeVerdict,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn set_contradiction_resolution(
+            &self,
+            _s: &str,
+            _d: &str,
+            _r: Option<Resolution>,
+            _v: &str,
+            _t: f64,
         ) -> Result<bool> {
             Ok(true)
         }
@@ -4400,6 +4490,17 @@ mod tests {
         ) -> Result<bool> {
             Ok(true)
         }
+
+        async fn set_contradiction_resolution(
+            &self,
+            _s: &str,
+            _d: &str,
+            _r: Option<Resolution>,
+            _v: &str,
+            _t: f64,
+        ) -> Result<bool> {
+            Ok(true)
+        }
         async fn get_contradictions_for_hashes(
             &self,
             _h: &[&str],
@@ -5235,6 +5336,17 @@ mod tests {
         ) -> Result<bool> {
             Ok(true)
         }
+
+        async fn set_contradiction_resolution(
+            &self,
+            _s: &str,
+            _d: &str,
+            _r: Option<Resolution>,
+            _v: &str,
+            _t: f64,
+        ) -> Result<bool> {
+            Ok(true)
+        }
         async fn get_contradictions_for_hashes(
             &self,
             _h: &[&str],
@@ -5686,7 +5798,7 @@ mod tests {
         use super::*;
         use crate::service::{JudgeOutcome, SHADOW_LOG_TARGET};
         use alaya_backends::{ContradictionJudge, Judgement, Survivor};
-        use alaya_types::graph::{EdgeVerdict, Verdict};
+        use alaya_types::graph::{EdgeVerdict, Resolution, Verdict};
         use std::rc::Rc;
         use std::sync::{Arc, Mutex};
         use tracing::instrument::WithSubscriber;
@@ -5930,6 +6042,17 @@ mod tests {
                 self.verdicts
                     .borrow_mut()
                     .push((s.to_string(), d.to_string(), v.clone()));
+                Ok(self.matched)
+            }
+
+            async fn set_contradiction_resolution(
+                &self,
+                _s: &str,
+                _d: &str,
+                _r: Option<Resolution>,
+                _v: &str,
+                _t: f64,
+            ) -> Result<bool> {
                 Ok(self.matched)
             }
             async fn get_contradictions_for_hashes(
@@ -6183,6 +6306,10 @@ mod tests {
             for i in 0..60usize {
                 let (a, b) = (hash(1000 + i), hash(2000 + i));
                 let ts = 100_000.0 - i as f64; // i = 0 is the newest
+                // Pair #0 is resolved by a keep_both stamp (LAB-3885); the
+                // rest of the resolved run by SUPERSEDES. Both leave the
+                // default queue; both show under include_resolved.
+                let kept = i == 0;
                 edges.push((
                     Contradiction {
                         memory_a_hash: a.clone(),
@@ -6190,6 +6317,9 @@ mod tests {
                         confidence: Some(0.7),
                         created_at: Some(ts),
                         verdict: None,
+                        resolution: kept.then_some(Resolution::KeepBoth),
+                        resolved_at: kept.then_some(77.0),
+                        resolved_via: kept.then(|| "operator:console".to_string()),
                     },
                     i < 50,
                 ));
@@ -6254,15 +6384,107 @@ mod tests {
             assert_eq!(page3["total"], 0);
             assert_eq!(page3["next_offset"], Value::Null);
 
-            // include_resolved shows the resolved run again.
+            // include_resolved shows the resolved run again, each row
+            // carrying its resolution stamp (or null).
             let all = svc.memory_contradictions(5, 0, true, None).await.unwrap();
             assert_eq!(all["pairs"][0]["memory_a_hash"], hash(1000));
             assert_eq!(all["pairs"][0]["memory_a_superseded"], false);
+            assert_eq!(all["pairs"][0]["resolution"], "keep_both");
+            assert_eq!(all["pairs"][0]["resolved_at"], 77.0);
+            assert_eq!(all["pairs"][0]["resolved_via"], "operator:console");
+            assert_eq!(all["pairs"][1]["resolution"], Value::Null);
+            assert_eq!(all["pairs"][1]["resolved_via"], Value::Null);
 
             assert!(
                 verdicts.borrow().is_empty(),
                 "the read surface never writes"
             );
+        }
+
+        // ─── resolve_contradiction (LAB-3885) ────────────────────────────
+
+        fn resolver(matched: bool) -> MemoryService {
+            MemoryService::with_clock(
+                Box::new(PairVectors(vec![])),
+                Box::new(MockEmbeddings),
+                Box::new(RecordingGraph {
+                    verdicts: Rc::new(RefCell::new(Vec::new())),
+                    matched,
+                    edges: vec![],
+                }),
+                Box::new(MockHebbian),
+                Box::new(MockConsolidation),
+                || 4_242.0,
+            )
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn resolve_contradiction_stamps_with_server_clock_and_verbatim_via() {
+            let svc = resolver(true);
+            let r = svc
+                .resolve_contradiction(
+                    &src(),
+                    &dst(),
+                    Some(Resolution::KeepBoth),
+                    "  operator:console ",
+                )
+                .await
+                .unwrap();
+            assert_eq!(r["success"], true);
+            assert_eq!(r["memory_a_hash"], src());
+            assert_eq!(r["memory_b_hash"], dst());
+            assert_eq!(r["resolution"], "keep_both");
+            assert_eq!(r["resolved_at"], 4_242.0, "resolved_at is server-set");
+            assert_eq!(
+                r["resolved_via"], "operator:console",
+                "trimmed, otherwise verbatim"
+            );
+
+            // Clear reports the cleared state, not a stale stamp.
+            let r = svc
+                .resolve_contradiction(&src(), &dst(), None, "operator:mcp")
+                .await
+                .unwrap();
+            assert_eq!(r["success"], true);
+            assert_eq!(r["resolution"], Value::Null);
+            assert_eq!(r["resolved_at"], Value::Null);
+            assert_eq!(r["resolved_via"], Value::Null);
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn resolve_contradiction_is_an_error_when_no_edge_matches() {
+            let e = resolver(false)
+                .resolve_contradiction(&src(), &dst(), Some(Resolution::KeepBoth), "operator:mcp")
+                .await
+                .unwrap_err();
+            assert!(matches!(e, AlayaError::NotFound(_)), "{e}");
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn resolve_contradiction_validates_hashes_and_via() {
+            let svc = resolver(true);
+            for (a, b, via) in [
+                ("short", dst().as_str(), "operator:mcp"),
+                (src().as_str(), "SHORT", "operator:mcp"),
+                (src().as_str(), src().as_str(), "operator:mcp"),
+                (src().as_str(), dst().as_str(), ""),
+                (src().as_str(), dst().as_str(), "   "),
+            ] {
+                let e = svc
+                    .resolve_contradiction(a, b, Some(Resolution::KeepBoth), via)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(e, AlayaError::Validation(_)),
+                    "{a} {b} {via:?}: {e}"
+                );
+            }
+            let long = "x".repeat(MAX_RESOLVED_VIA_LEN + 1);
+            let e = svc
+                .resolve_contradiction(&src(), &dst(), Some(Resolution::KeepBoth), &long)
+                .await
+                .unwrap_err();
+            assert!(matches!(e, AlayaError::Validation(_)), "{e}");
         }
 
         #[tokio::test(flavor = "current_thread")]
