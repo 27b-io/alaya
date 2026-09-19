@@ -10,6 +10,11 @@ use alaya_types::{AlayaError, Result};
 
 use crate::RerankingService;
 
+/// Headroom the native per-request deadline sits above the call-site budget,
+/// so the client's own timer does not fire first under normal scheduling.
+#[cfg(not(target_arch = "wasm32"))]
+const CALL_SITE_MARGIN: Duration = Duration::from_secs(1);
+
 pub struct RerankClient {
     client: Client,
     base_url: String,
@@ -78,13 +83,16 @@ impl RerankingService for RerankClient {
             "raw_scores": false,
         });
 
-        // Native: +1s margin so the call-site `tokio::time::timeout` in
-        // service.rs fires first and logs "rerank timed out" — the ticket's
-        // post-deploy check greps for that line; reqwest is the backstop that
-        // releases the socket. wasm32 has no tokio timer, so this per-request
-        // timeout (a fetch abort timer) is the sole bound — no margin there.
+        // Native: the call-site `tokio::time::timeout` in service.rs is the
+        // bound — dropping this future on elapse aborts the request and
+        // closes its connection. This per-request deadline sits one margin
+        // above it so the two timers do not race under normal scheduling;
+        // when a late poll lets reqwest's fire first anyway, the call site
+        // classifies the error by elapsed time. wasm32 has no tokio timer,
+        // so this deadline (a fetch abort timer) is the sole bound — no
+        // margin there.
         #[cfg(not(target_arch = "wasm32"))]
-        let deadline = self.timeout + Duration::from_secs(1);
+        let deadline = self.timeout + CALL_SITE_MARGIN;
         #[cfg(target_arch = "wasm32")]
         let deadline = self.timeout;
 

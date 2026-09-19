@@ -154,6 +154,7 @@ services:
       RERANK_URL: ${RERANK_URL:-}
       RERANK_API_KEY: ${RERANK_API_KEY:-}
       RERANK_TOP_N: ${RERANK_TOP_N:-20}
+      RERANK_TIMEOUT_MS: ${RERANK_TIMEOUT_MS:-5000}
       # Uncomment for auto-summary (requires Anthropic API key). Origin only:
       # the client appends /v1/messages itself.
       # SUMMARY_URL: https://api.anthropic.com
