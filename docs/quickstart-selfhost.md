@@ -122,7 +122,7 @@ Every knob lives in `.env`. The interesting ones:
 | `OIDC_ISSUER` | empty | Set to your IdP's issuer URL to enable OAuth Resource Server mode. See [MCP quickstart → OAuth](./quickstart-mcp.md#oauth-optional). |
 | `SUMMARY_URL` | empty | Anthropic API origin (`https://api.anthropic.com`, no path — the client appends `/v1/messages`). Set + provide `SUMMARY_API_KEY` to auto-generate one-line summaries. Plain `http://` is accepted only for a cluster-local proxy; anything else is refused at boot. |
 | `JUDGE_URL` / `JUDGE_API_KEY` / `JUDGE_MODEL` | the `SUMMARY_*` values | Contradiction judge: annotates every flagged `CONTRADICTS` pair with an advisory verdict (`contradiction` / `supersession` / `coexist` / `unrelated`). Each falls back to its `SUMMARY_*` counterpart, so setting `SUMMARY_URL` enables both. |
-| `JUDGE_DAILY_CAP` | `1000` | Max contradiction pairs to judge per UTC day from the store path. When exhausted, new pairs fail closed to `unjudged` (drained later by operator backfill); one WARN is logged per UTC day. In-process counter resets at UTC midnight and on process restart. |
+| `JUDGE_DAILY_CAP` | `1000` | Max contradiction pairs to judge per UTC day from the store path — a spend budget only, not a concurrency limit. When exhausted, new pairs fail closed to `unjudged` (drained later by operator backfill); one WARN is logged per UTC day, and a pair that never reached the judge (fetch failure, unavailable endpoint, 429) is refunded rather than billed. In-process counter resets at UTC midnight and on process restart. |
 
 The complete list — including the bridge-side variables — lives in `CLAUDE.md` under "Environment Variables".
 
