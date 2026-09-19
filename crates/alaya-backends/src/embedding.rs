@@ -135,9 +135,15 @@ impl EmbeddingProvider for EmbeddingClient {
     /// the model is loaded, 503 until then. Reachability only — it spends no
     /// embedding, so a dashboard poll costs the endpoint nothing.
     async fn health(&self) -> Result<HealthStatus> {
-        let resp = self
-            .client
-            .get(format!("{}/health", self.base_url))
+        let req = self.client.get(format!("{}/health", self.base_url));
+        // wasm32: no tokio timer, so the call-site `with_budget` awaits
+        // directly and the builder timeout above is cfg'd out — this
+        // per-request fetch-abort deadline is the sole bound there (same
+        // shape as `RerankClient::rerank`; mirrors the native 5s budget).
+        #[cfg(target_arch = "wasm32")]
+        let req = req.timeout(std::time::Duration::from_secs(5));
+
+        let resp = req
             .send()
             .await
             .map_err(|e| AlayaError::Embedding(crate::redact_reqwest_error(e)))?;
