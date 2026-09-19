@@ -75,9 +75,12 @@ curl http://localhost:3001/health
 { "status": "healthy" }
 ```
 
-`status` is `healthy` when every backend is reachable, `degraded` (HTTP 200) when
-a backend is down — restarting the pod won't fix Qdrant — and `unhealthy`
-(HTTP 503) when the service worker has stalled, so a liveness probe restarts it.
+`status` is `healthy` when the service worker is live and Qdrant is reachable,
+`degraded` (HTTP 200) when Qdrant is down — restarting the pod won't fix Qdrant —
+and `unhealthy` (HTTP 503) when the service worker has stalled, so a liveness
+probe restarts it. The bare probe's verdict ignores the graph and it never
+probes the embedding endpoint; both verdicts are reported only on
+`/health/detail`.
 
 Probers read the HTTP code, so a k8s `httpGet` probe and `curl -sf .../health`
 both work against this endpoint unchanged.
@@ -102,11 +105,25 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" \
   "worker": { "state": "ok", "stalled": false, "last_progress_age_s": 3 },
   "vector_health": { "status": "green" },
   "graph_health": { "status": "healthy" },
+  "embedding_health": { "status": "healthy" },
   "total_memories": 1247
 }
 ```
 
-Same status and HTTP-code mapping as `/health`.
+Same HTTP-code mapping as `/health`. `status` additionally folds in the
+embedding probe: with the embedding endpoint down, `/health/detail` reports
+`degraded` and `embedding_health` carries the reason —
+
+```json
+  "status": "degraded",
+  "embedding_health": {
+    "status": "unhealthy",
+    "error": "error sending request for url (http://embeddings/health)"
+  }
+```
+
+A stalled worker still reports `unhealthy` (503) regardless: an embedding
+outage is not fixed by a restart, a wedged worker is.
 
 > [!NOTE]
 > These fields were served by the unauthenticated `/health` in earlier builds.

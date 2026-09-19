@@ -153,6 +153,21 @@ No params. Returns backend status and per-backend stats — vector count, graph 
 { "name": "check_database_health", "arguments": {} }
 ```
 
+**Response** (embedding endpoint down):
+
+```json
+{
+  "status": "degraded",
+  "backend": "qdrant",
+  "total_memories": 12007,
+  "vector_health": { "status": "green", "backend": "qdrant", "details": { "points_count": 12007 } },
+  "graph_health": { "status": "healthy", "node_count": 18110, "edge_count": 137550 },
+  "embedding_health": { "status": "unhealthy", "error": "Embedding generation failed" }
+}
+```
+
+`status` is `healthy` only when the vector store **and** the embedding endpoint both answer; either one down is `degraded` — with the embedding endpoint down every `store_memory` and every semantic `search` fails, while tag-mode search and reads keep working. `graph_health` is informational: graph calls are non-fatal by design, so a graph outage is reported but does not change `status`. Errors are sanitised (`safe_message`) — no hostnames or connection strings.
+
 ---
 
 ## `relation`
