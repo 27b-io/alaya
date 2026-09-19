@@ -17,6 +17,18 @@ pub enum AppError {
 }
 
 impl AppError {
+    /// Human-readable detail, for pages that render an upstream failure
+    /// inline (one dark section) instead of failing the whole page.
+    pub fn detail(&self) -> &str {
+        match self {
+            AppError::LoginRedirect => "login required",
+            AppError::Forbidden(d)
+            | AppError::BadRequest(d)
+            | AppError::NotFound(d)
+            | AppError::Upstream(d) => d,
+        }
+    }
+
     fn status(&self) -> StatusCode {
         match self {
             AppError::LoginRedirect => StatusCode::SEE_OTHER,
@@ -56,17 +68,20 @@ impl IntoResponse for AppError {
     }
 }
 
+/// Safe one-phrase summary of a transport error. reqwest errors can embed
+/// the full request URL, so they never reach a page verbatim.
+pub fn reqwest_kind(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connection failed"
+    } else {
+        "request failed"
+    }
+}
+
 impl From<reqwest::Error> for AppError {
     fn from(e: reqwest::Error) -> Self {
-        // reqwest errors can embed the full request URL; strip to a safe
-        // summary so credentials-adjacent detail never reaches the page.
-        let kind = if e.is_timeout() {
-            "timeout"
-        } else if e.is_connect() {
-            "connection failed"
-        } else {
-            "request failed"
-        };
-        AppError::Upstream(format!("alaya-server: {kind}"))
+        AppError::Upstream(format!("alaya-server: {}", reqwest_kind(&e)))
     }
 }

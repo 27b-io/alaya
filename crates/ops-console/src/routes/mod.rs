@@ -1,6 +1,7 @@
 pub mod alaya;
 pub mod auth;
 pub mod home;
+pub mod lb;
 
 use crate::error::AppError;
 

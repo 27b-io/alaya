@@ -10,16 +10,21 @@
 # Deploy shape is BINDING per the LAB-1694 panel:
 #   - own Deployment + own label (app: ops-console) — never colocated behind
 #     `app: alaya-server`
-#   - own NetworkPolicy; egress pinned to alaya-server (module upstream) + the
-#     OIDC IdP (external :443); DNS comes from the namespace-wide allow-dns
-#     policy (lab network-policies.yaml). Explicitly NO egress to dragonfly:6379
-#     — the allowlist below simply does not include it. Verify from the live pod
+#   - own NetworkPolicy; egress pinned to the module upstreams — alaya-server
+#     :3001 (Ālaya module), anthropic-lb :8082 + the metrics store vmsingle
+#     :8428 (anthropic-lb read-only pane, LAB-1964) — plus the OIDC IdP
+#     (external :443); DNS comes from the namespace-wide allow-dns policy
+#     (lab network-policies.yaml). Explicitly NO egress to dragonfly:6379 — the
+#     allowlist below simply does not include it. Verify from the live pod
 #     after rollout (the image has curl, not nc; k3s netpol REJECTS, so expect
-#     "Connection refused" / exit 7 on both probes and alaya=200):
+#     "Connection refused" / exit 7 on the dragonfly + bridge probes, then
+#     alaya=200, lb=401 (reachable; the probe carries no key) and vm=200):
 #       kubectl -n mcp exec deploy/ops-console -- sh -c '
 #         curl -sS -m3 telnet://dragonfly.mcp.svc:6379; echo dragonfly_exit=$?;
 #         curl -sS -m3 telnet://alaya-bridge.mcp.svc:3000; echo bridge_exit=$?;
-#         curl -sS -m3 -o /dev/null -w "alaya=%{http_code}\n" http://alaya-server.mcp.svc:3001/health'
+#         curl -sS -m3 -o /dev/null -w "alaya=%{http_code}\n" http://alaya-server.mcp.svc:3001/health;
+#         curl -sS -m3 -o /dev/null -w "lb=%{http_code}\n" "$LB_URL/_stats";
+#         curl -sS -m3 -o /dev/null -w "vm=%{http_code}\n" "$METRICS_URL/health"'
 #     (Since LAB-2974 alaya-bridge-policy admits only alaya-server, and
 #     dragonfly-policy already admits only its named clients, a refusal on
 #     either probe is enforced by BOTH the target's ingress rule and THIS
@@ -90,6 +95,20 @@ spec:
             # pins this traffic to alaya-server pods only.
             - name: ALAYA_URL
               value: "http://alaya-server.mcp.svc:3001"
+            # anthropic-lb read-only pane (LAB-1964). Plain http, pod-to-pod —
+            # the same namespace trust boundary as ALAYA_URL. The pane is
+            # enabled only when LB_URL, LB_API_KEY (Secret) and METRICS_URL are
+            # ALL set: the console refuses to start on a partial set and runs
+            # Ālaya-only when none is set, so this manifest and the image can
+            # roll in either order without taking the console down.
+            - name: LB_URL
+              value: "http://anthropic-lb.mcp.svc:8082"
+            # Prometheus-compatible query API (VictoriaMetrics vmsingle) for the
+            # 7-day budget-burn history off anthropic_cluster_budget_used — the
+            # LB's own fleet-wide gauge, already scraped. No bespoke history
+            # store, no dashboard embeds.
+            - name: METRICS_URL
+              value: "http://<vmsingle-service>.monitoring.svc:8428" # lab: the real Service name
             # OIDC relying party against id.27b.io. redirect_uri is derived as
             # {CONSOLE_PUBLIC_URL}/auth/callback and must match the client
             # registration on the IdP exactly.
@@ -101,8 +120,10 @@ spec:
               value: "ops_console=info,tower_http=info"
           # Credentials come from the Secret (1Password → ESO):
           #   CONSOLE_OIDC_CLIENT_ID, CONSOLE_OIDC_CLIENT_SECRET,
-          #   CONSOLE_ALLOWED_SUBJECTS, CONSOLE_SESSION_SECRET, ALAYA_API_KEY
-          # The console is fail-closed: it refuses to start if any is missing.
+          #   CONSOLE_ALLOWED_SUBJECTS, CONSOLE_SESSION_SECRET, ALAYA_API_KEY,
+          #   LB_API_KEY (anthropic-lb operator key, sent as x-api-key)
+          # The console is fail-closed: it refuses to start if any of the first
+          # five is missing, or if the LB_* group is only partially set.
           envFrom:
             - secretRef:
                 name: ops-console-env
@@ -166,7 +187,8 @@ spec:
           protocol: TCP
   egress:
     # DNS: granted namespace-wide by allow-dns (lab network-policies.yaml).
-    # Module upstream: alaya-server ONLY (LAB-1694 binding). No dragonfly,
+    # Module upstreams only: alaya-server for the Ālaya
+    # module, anthropic-lb + the metrics store for the LB pane. No dragonfly,
     # no other mcp services.
     - to:
         - podSelector:
@@ -174,6 +196,28 @@ spec:
               app: alaya-server
       ports:
         - port: 3001
+          protocol: TCP
+    # anthropic-lb read-only pane (LAB-1964): GET /_stats with the operator
+    # key. The LB's own NetworkPolicy admits this pod on its ingress side.
+    # The LB has no admin write route to reach.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: anthropic-lb
+      ports:
+        - port: 8082
+          protocol: TCP
+    # Metrics store for the 7-day burn history (LAB-1964) — pinned to the
+    # vmsingle pod, not the namespace.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: vmsingle
+      ports:
+        - port: 8428
           protocol: TCP
     # OIDC IdP (id.27b.io) — discovery, JWKS, token exchange. This rule is
     # "any public IPv4 on :443", NOT id.27b.io: netpol ipBlock is IP-only and
