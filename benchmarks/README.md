@@ -185,20 +185,24 @@ uv run longmemeval_bench.py --stratified 24 \
 # VERIFY rerank actually EXECUTED: the reranker TEI's request counter must climb
 # during the run (rerank success is silent in alaya's logs; only failures warn).
 docker compose exec tei-rerank curl -s http://localhost:80/metrics | grep '^te_predict_count'
-docker compose logs alaya | grep -c "rerank failed"   # must be 0
+docker compose logs alaya | grep -cE "rerank failed|rerank timed out"   # must be 0
 ```
 
 **Why verification is not optional.** Rerank runs only if the *server* has
 `RERANK_URL` set; the harness cannot read the server's environment. A rerank
-*failure* logs `rerank failed (non-fatal); using RRF order` and silently falls
-back to RRF — so a misconfigured "ON" arm can look identical to OFF. And rerank
+*failure* logs `rerank failed (non-fatal); using RRF order`, a call past
+`RERANK_TIMEOUT_MS` logs `rerank timed out (non-fatal); using RRF order`, and
+both silently fall back to RRF — so a misconfigured or too-slow "ON" arm can
+look identical to OFF. And rerank
 *success* is **silent** in alaya's logs (only failures warn), so the authoritative
 proof it executed is the reranker TEI's own request counter:
 
 - `cross-encoder reranker enabled` in the alaya startup log proves it is *configured*.
 - The reranker TEI's `te_predict_count` (`/metrics`) **climbing during the run**
   proves it *executed*; it stays flat on the OFF arm.
-- **Zero** `rerank failed` lines in the alaya log proves it never silently degraded.
+- **Zero** `rerank failed` / `rerank timed out` lines in the alaya log proves it
+  never silently degraded. A CPU reranker over 20 pairs can exceed the 5 s default;
+  raise `RERANK_TIMEOUT_MS` rather than publish a run that fell back to RRF.
 
 Do not trust an A/B delta whose "rerank ON" arm can't show the counter climb.
 `--rerank-note` records your operator-verified config verbatim in the summary.
@@ -240,6 +244,7 @@ docker compose down -v
 | `--out` | timestamped | Output JSONL (`*_summary.json` written alongside). |
 | server `RERANK_URL` | unset | Set on the **server** to enable the cross-encoder reranker; verify in logs. |
 | server `RERANK_TOP_N` | `20` | How many RRF candidates the cross-encoder re-scores. |
+| server `RERANK_TIMEOUT_MS` | `5000` | Budget per rerank call (ms). Past it the query falls back to RRF and logs `rerank timed out` — the validity gate above must count zero. |
 
 ---
 

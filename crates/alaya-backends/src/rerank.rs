@@ -1,5 +1,7 @@
 // RerankClient — RerankingService implementation (TEI `/rerank` endpoint)
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
@@ -12,6 +14,7 @@ pub struct RerankClient {
     client: Client,
     base_url: String,
     top_n: usize,
+    timeout: Duration,
 }
 
 impl RerankClient {
@@ -19,7 +22,12 @@ impl RerankClient {
     /// value (e.g. a trailing newline, #97) or on a client build error. The
     /// error must never echo `api_key`: `InvalidHeaderValue` carries no
     /// payload and neither message below interpolates the key.
-    pub fn new(base_url: String, top_n: usize, api_key: Option<String>) -> Result<Self> {
+    pub fn new(
+        base_url: String,
+        top_n: usize,
+        api_key: Option<String>,
+        timeout: Duration,
+    ) -> Result<Self> {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(key) = api_key {
             let val =
@@ -31,24 +39,25 @@ impl RerankClient {
             headers.insert(reqwest::header::AUTHORIZATION, val);
         }
 
-        let builder = Client::builder().default_headers(headers);
-
-        #[cfg(not(target_arch = "wasm32"))]
-        let builder = builder
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(30));
-
-        let client = builder.build().map_err(|e| {
-            AlayaError::Config(format!(
-                "rerank HTTP client: {}",
-                crate::redact_reqwest_error(e)
-            ))
-        })?;
+        // No client-side timers on native (see `rerank()`): a connect_timeout
+        // at or below the budget fires in the same tick as the call-site
+        // tokio timer on a blackholed connect and steals its log line, and
+        // the call-site timer bounds the connect phase anyway.
+        let client = Client::builder()
+            .default_headers(headers)
+            .build()
+            .map_err(|e| {
+                AlayaError::Config(format!(
+                    "rerank HTTP client: {}",
+                    crate::redact_reqwest_error(e)
+                ))
+            })?;
 
         Ok(Self {
             client,
             base_url,
             top_n,
+            timeout,
         })
     }
 }
@@ -69,10 +78,21 @@ impl RerankingService for RerankClient {
             "raw_scores": false,
         });
 
-        let resp = self
-            .client
-            .post(url.as_str())
-            .json(&body)
+        let req = self.client.post(url.as_str()).json(&body);
+        // Native deliberately sets NO client-side timer: the call-site
+        // `tokio::time::timeout` in service.rs is the bound. It polls this
+        // future before its own deadline, so a response that has already
+        // arrived is used even on a late poll, and dropping the future on
+        // elapse aborts the request and closes its connection. A second
+        // timer inside reqwest is checked *before* the socket
+        // (`PendingRequest::poll`), so on a late poll it would discard a
+        // completed response and report real errors as timeouts. wasm32 has
+        // no tokio timer, so there this per-request deadline (a fetch abort
+        // timer) is the sole bound.
+        #[cfg(target_arch = "wasm32")]
+        let req = req.timeout(self.timeout);
+
+        let resp = req
             .send()
             .await
             .map_err(|e| AlayaError::Rerank(crate::redact_reqwest_error(e)))?;
@@ -126,6 +146,10 @@ impl RerankingService for RerankClient {
     fn top_n(&self) -> usize {
         self.top_n
     }
+
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
 }
 
 // --- Response types (private) ---
@@ -144,7 +168,12 @@ mod tests {
     /// and the message must not echo the key it is rejecting.
     #[test]
     fn new_rejects_control_chars_without_echoing_the_key() {
-        let Err(err) = RerankClient::new("http://tei".into(), 20, Some("abc\n".into())) else {
+        let Err(err) = RerankClient::new(
+            "http://tei".into(),
+            20,
+            Some("abc\n".into()),
+            std::time::Duration::from_secs(5),
+        ) else {
             panic!("a control character in the bearer must be rejected");
         };
         let msg = err.to_string();
@@ -172,7 +201,13 @@ mod tests {
 
     #[test]
     fn top_n_is_returned() {
-        let client = RerankClient::new("http://localhost:8089".to_string(), 20, None).unwrap();
+        let client = RerankClient::new(
+            "http://localhost:8089".to_string(),
+            20,
+            None,
+            std::time::Duration::from_millis(5000),
+        )
+        .unwrap();
         assert_eq!(client.top_n(), 20);
     }
 

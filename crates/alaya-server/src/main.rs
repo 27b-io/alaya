@@ -83,6 +83,7 @@ struct Config {
     rerank_url: Option<String>,
     rerank_api_key: Option<String>,
     rerank_top_n: usize,
+    rerank_timeout_ms: std::num::NonZeroU64,
 }
 
 impl Config {
@@ -125,6 +126,11 @@ impl Config {
             rerank_top_n: env_or("RERANK_TOP_N", "20")
                 .parse()
                 .expect("RERANK_TOP_N must be a number"),
+            // NonZeroU64: a zero budget would time out every rerank and warn
+            // on every search — refuse to start instead.
+            rerank_timeout_ms: env_or("RERANK_TIMEOUT_MS", "5000")
+                .parse()
+                .expect("RERANK_TIMEOUT_MS must be a positive integer (ms)"),
         };
         // Every credential-bearing endpoint, checked on the main thread before
         // the runtime, the worker thread or the listener exist: a refused
@@ -1874,6 +1880,7 @@ fn main() {
             tracing::info!(
                 origin = log_safe_origin(url).as_str(),
                 top_n = config.rerank_top_n,
+                timeout_ms = config.rerank_timeout_ms.get(),
                 has_api_key = config.rerank_api_key.is_some(),
                 "cross-encoder reranker enabled"
             );
@@ -1882,6 +1889,7 @@ fn main() {
                     url.clone(),
                     config.rerank_top_n,
                     config.rerank_api_key.clone(),
+                    std::time::Duration::from_millis(config.rerank_timeout_ms.get()),
                 )
                 .expect("RERANK_API_KEY rejected — must be a single line of visible ASCII"),
             )

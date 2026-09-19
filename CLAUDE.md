@@ -151,6 +151,7 @@ JUDGE_MODEL=claude-sonnet-5              #   Own default, not SUMMARY_MODEL: Hai
 RERANK_URL=                              # optional — empty disables cross-encoder rerank
 RERANK_API_KEY=                          # optional
 RERANK_TOP_N=20                          # how many RRF candidates to rerank
+RERANK_TIMEOUT_MS=5000                   # budget per rerank call; falls back to RRF order past this
 CACHE_BACKEND=redis                      # L2 embedding cache backend: redis (default) | saas
 REDIS_CACHE_URL=                         # redis backend — empty disables L2 (L1-only)
 CACHEKIT_API_KEY=                        # saas backend — required when CACHE_BACKEND=saas

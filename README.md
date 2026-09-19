@@ -160,6 +160,7 @@ Copy `.env.example` to `.env`. All settings have sensible defaults for local dev
 | `RERANK_URL` | — | TEI `/rerank` endpoint (empty = rerank disabled) |
 | `RERANK_API_KEY` | — | Optional bearer token for `RERANK_URL`. With it set, plain `http://` to a host that is not cluster-local is refused at boot, as for `SUMMARY_URL` |
 | `RERANK_TOP_N` | `20` | How many top RRF candidates to rerank |
+| `RERANK_TIMEOUT_MS` | `5000` | Budget for the rerank call; a slower or unreachable reranker falls back to RRF order after this many ms |
 | `OIDC_ISSUER` | — | OAuth Resource Server issuer URL (empty = no OAuth) |
 
 ## Development
