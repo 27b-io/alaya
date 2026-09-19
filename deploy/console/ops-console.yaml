@@ -1,4 +1,4 @@
-# MIRROR of 27b-io/lab k8s/mcp/ops-console.yaml — the deployed manifest is the
+# MIRROR of the private infra repo's k8s/mcp/ops-console.yaml — the deployed manifest is the
 # truth; keep this copy in sync (LAB-2712). Only the image line differs: lab
 # pins :main@sha256:<digest> with the flux-system:alaya imagepolicy marker.
 #
@@ -92,7 +92,7 @@ spec:
             # {CONSOLE_PUBLIC_URL}/auth/callback and must match the client
             # registration on the IdP exactly.
             - name: CONSOLE_PUBLIC_URL
-              value: "https://ops.lobster-python.ts.net"
+              value: "https://ops.<tailnet>.ts.net"
             - name: CONSOLE_OIDC_ISSUER
               value: "https://id.27b.io"
             - name: RUST_LOG
@@ -175,10 +175,8 @@ spec:
           protocol: TCP
     # OIDC IdP (id.27b.io) — discovery, JWKS, token exchange. This rule is
     # "any public IPv4 on :443", NOT id.27b.io: netpol ipBlock is IP-only and
-    # the IdP resolves to Cloudflare anycast, not a fixed host. Same shape as
-    # every other public-egress rule in mcp; pinning to Cloudflare's published
-    # CIDRs is a namespace-wide decision tracked with the cloudflared rules
-    # (LAB-2451). The OIDC RP is the only caller meant for this path, and it
+    # the IdP resolves to Cloudflare anycast, not a fixed host. The OIDC RP
+    # is the only caller meant for this path, and it
     # follows no redirects and refuses discovery endpoints that are not https
     # and same-origin with the https-only issuer (crates/ops-console/src/oidc.rs).
     # RFC1918 (cluster), CGNAT (tailnet VIPs + hosts) and link-local excluded.

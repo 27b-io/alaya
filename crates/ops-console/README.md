@@ -66,9 +66,9 @@ CSP (`default-src 'none'`).
 
 ## Deploy
 
-Deployed from the lab repo: `27b-io/lab` `k8s/mcp/ops-console.yaml` +
-`ops-console-externalsecret.yaml` (LAB-2712). `deploy/console/ops-console.yaml`
-here is a mirror of that manifest — keep them in sync. Shape: Deployment +
+Deployed from the private infra repo's Kubernetes manifests (LAB-2712).
+`deploy/console/ops-console.yaml` here is a mirror of the deployed manifest —
+keep them in sync. Shape: Deployment +
 Service + NetworkPolicy — own label, egress pinned to alaya-server + IdP :443
 (DNS via the namespace `allow-dns` policy), **no dragonfly egress**, image
 digest-pinned via the `flux-system:alaya` imagepolicy marker so the console
@@ -78,10 +78,8 @@ since LAB-3719 — no pull secret.
 
 Config split: `CONSOLE_PUBLIC_URL`, `CONSOLE_OIDC_ISSUER`, `ALAYA_URL` are plain
 env in the manifest; `CONSOLE_OIDC_CLIENT_ID`, `CONSOLE_OIDC_CLIENT_SECRET`,
-`CONSOLE_ALLOWED_SUBJECTS`, `CONSOLE_SESSION_SECRET` come from the 1Password
-item `ops-console` (fields `oidc-client-id`, `oidc-client-secret`,
-`allowed-subjects`, `session-secret`) and `ALAYA_API_KEY` from
-`alaya-config/credential`, rendered by ESO into Secret `ops-console-env`.
+`CONSOLE_ALLOWED_SUBJECTS`, `CONSOLE_SESSION_SECRET`, and `ALAYA_API_KEY` come
+from a secret manager, rendered by ESO into Secret `ops-console-env`.
 Editing the Secret rolls the pod (Reloader annotation).
 
 Tailnet HTTPS — order matters: define `svc:ops` in the Tailscale admin
