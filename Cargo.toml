@@ -15,6 +15,11 @@ thiserror = "2"
 sha2 = "0.10"
 # Constant-time bearer compare (server + bridge auth)
 subtle = "2"
+# JWT verification (alaya-oidc + its two consumers). Native-only — must never
+# reach WASM-targeted crates. v10 made the crypto backend pluggable: aws_lc_rs
+# (BoringSSL-derived, C) instead of rust_crypto keeps the vulnerable pure-Rust
+# `rsa` crate (RUSTSEC-2023-0071) out of the tree. Requires cmake in the build image.
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 
 # WASM-compat deps (backends + core)
 async-trait = "0.1"

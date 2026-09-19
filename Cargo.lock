@@ -101,11 +101,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "alaya-oidc"
+version = "0.1.0"
+dependencies = [
+ "jsonwebtoken",
+ "reqwest",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "alaya-server"
 version = "0.1.0"
 dependencies = [
  "alaya-backends",
  "alaya-core",
+ "alaya-oidc",
  "alaya-types",
  "async-trait",
  "axum",
@@ -2184,12 +2195,12 @@ dependencies = [
 name = "ops-console"
 version = "0.1.0"
 dependencies = [
+ "alaya-oidc",
  "axum",
  "axum-extra",
  "base64",
  "cookie",
  "http-body-util",
- "jsonwebtoken",
  "leptos",
  "rand 0.9.5",
  "reqwest",

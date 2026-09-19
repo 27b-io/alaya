@@ -12,7 +12,7 @@ Rust rewrite of the mcp-memory-service API layer. Deployed on k3s as a native se
 
 ## Architecture
 
-6-crate workspace (5 implemented, 1 deferred):
+8-crate workspace (7 implemented, 1 deferred):
 
 | Crate | Target | Status | Purpose |
 |:------|:-------|:-------|:--------|
@@ -20,6 +20,7 @@ Rust rewrite of the mcp-memory-service API layer. Deployed on k3s as a native se
 | **alaya-bridge** | native only | Done | FalkorDB typed RPC bridge (axum + redis), 18 endpoints |
 | **alaya-backends** | wasm32 + native | Done | Trait definitions + HTTP clients (Qdrant, Embedding, Graph) |
 | **alaya-core** | wasm32 + native | Done | MemoryService orchestration (all 11 MCP tools), 5 integration tests |
+| **alaya-oidc** | native only | Done | Shared OIDC discovery + JWKS hardening (issuer echo, same-origin-https, cooldown-before-fetch, alg allowlist) consumed by alaya-server (RS) and ops-console (RP) — #82 |
 | **alaya-server** | native only | Done | REST API + MCP Streamable HTTP (axum, channel-based, 9 endpoints + /mcp) |
 | **ops-console** | native only | Done | OIDC-gated admin console (Leptos SSR + vendored Rust/UI, LAB-1684) — memory curation UI over alaya-server's REST API; see `crates/ops-console/README.md` |
 | **alaya-worker** | wasm32 | Deferred | CF Worker entry point (reqwest-wasm unreliable on Workers, native server sufficient) |
@@ -68,9 +69,12 @@ crates/
 │   ├── spaced_repetition.rs # Spacing quality + boost
 │   ├── provenance.rs    # Trust scoring, provenance building
 │   └── encoding_context.rs  # Context capture + similarity
+├── alaya-oidc/src/
+│   └── lib.rs           # Provider (discovery + JWKS cache + verify<C>), origin_of, same_origin_https; `test-seams` feature for consumer tests
 └── alaya-server/src/
     ├── main.rs          # Native REST + MCP server (axum, channel-based)
     ├── mcp.rs           # MCP Streamable HTTP (JSON-RPC 2.0, SSE, protocol 2025-03-26)
+    ├── oidc.rs          # OidcVerifier — RS side over alaya-oidc: https-issuer abort, aud binding, max-age cap
     └── telemetry.rs     # OTLP tracing to Phoenix (optional, graceful fallback)
 ```
 
