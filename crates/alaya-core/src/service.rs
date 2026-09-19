@@ -232,15 +232,32 @@ pub enum JudgeOutcome {
         judgement: Judgement,
         persisted: bool,
     },
-    /// No verdict. `marked` = a *deterministic* failure (schema / parse /
-    /// empty answer / request fault) was persisted as `verdict = unjudged`
-    /// with the error class as reason, so the backfill's NULL filter skips
-    /// the pair instead of re-billing it forever. `marked = false` =
-    /// transient (judge disabled, endpoint missing, fetch failed, upstream
-    /// unavailable): nothing written, the pair is retried later.
-    Unjudged { marked: bool },
+    /// No verdict. `marked` = the failure was persisted as `verdict =
+    /// unjudged` with its cause as reason, so the backfill's NULL filter
+    /// skips the pair instead of re-selecting it forever: a deterministic
+    /// judge error (schema / parse / empty answer / request fault) or an
+    /// endpoint missing from the vector store. `marked = false` = nothing
+    /// written, the pair is retried later: transient (judge disabled, fetch
+    /// failed, upstream unavailable) or a marker write that did not land.
+    /// `spent` = a request reached the judge, so tokens may have been
+    /// billed. Independent of `marked`: a missing endpoint is marked but
+    /// free; a malformed verdict is marked and paid for. Conservative on
+    /// purpose — a request the API rejected (400), or one that timed out
+    /// after leaving the box, still counts: a spend ceiling must err high.
+    Unjudged { marked: bool, spent: bool },
     /// Upstream 429. Nothing was written; the caller owns any backoff.
     RateLimited { retry_after_secs: Option<u64> },
+}
+
+impl JudgeOutcome {
+    /// Whether tokens may have been billed: a spend budget charges exactly these.
+    pub fn spent(&self) -> bool {
+        match self {
+            Self::Judged { .. } => true,
+            Self::Unjudged { spent, .. } => *spent,
+            Self::RateLimited { .. } => false,
+        }
+    }
 }
 
 pub struct MemoryService {
@@ -1765,7 +1782,10 @@ impl MemoryService {
     /// this runs detached from any request.
     pub async fn judge_contradiction(&self, src: &str, dst: &str) -> JudgeOutcome {
         let Some(ref judge) = self.judge else {
-            return JudgeOutcome::Unjudged { marked: false };
+            return JudgeOutcome::Unjudged {
+                marked: false,
+                spent: false,
+            };
         };
         if !alaya_types::memory::validate_content_hash(src)
             || !alaya_types::memory::validate_content_hash(dst)
@@ -1776,7 +1796,10 @@ impl MemoryService {
                 dst_len = dst.len(),
                 "judge_contradiction: invalid pair, skipping"
             );
-            return JudgeOutcome::Unjudged { marked: false };
+            return JudgeOutcome::Unjudged {
+                marked: false,
+                spent: false,
+            };
         }
         let (sa, sd) = (&src[..8], &dst[..8]);
 
@@ -1784,7 +1807,10 @@ impl MemoryService {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(a = sa, b = sd, "judge_contradiction: fetch failed: {e}");
-                return JudgeOutcome::Unjudged { marked: false };
+                return JudgeOutcome::Unjudged {
+                    marked: false,
+                    spent: false,
+                };
             }
         };
         let a = batch.iter().find(|m| m.content_hash == src);
@@ -1805,7 +1831,10 @@ impl MemoryService {
                     "endpoint missing from vector store",
                 )
                 .await;
-            return JudgeOutcome::Unjudged { marked };
+            return JudgeOutcome::Unjudged {
+                marked,
+                spent: false,
+            };
         };
 
         let j = match judge.judge(a, b).await {
@@ -1814,15 +1843,19 @@ impl MemoryService {
                 tracing::warn!(a = sa, b = sd, retry_after_secs, "judge rate limited");
                 return JudgeOutcome::RateLimited { retry_after_secs };
             }
-            Err(AlayaError::Unavailable(e)) => {
+            Err(AlayaError::Unavailable { message, spent }) => {
                 tracing::warn!(
                     memory_a = src,
                     memory_b = dst,
                     verdict = Verdict::UNJUDGED,
-                    error = ?e,
+                    error = ?message,
+                    spent,
                     "contradiction unjudged (transient; will retry)"
                 );
-                return JudgeOutcome::Unjudged { marked: false };
+                return JudgeOutcome::Unjudged {
+                    marked: false,
+                    spent,
+                };
             }
             Err(e) => {
                 // Deterministic: this pair fails the same way every time, so
@@ -1840,7 +1873,10 @@ impl MemoryService {
                 let marked = self
                     .mark_unjudged(src, dst, judge.model_name(), &e.to_string())
                     .await;
-                return JudgeOutcome::Unjudged { marked };
+                return JudgeOutcome::Unjudged {
+                    marked,
+                    spent: true,
+                };
             }
         };
 
@@ -6146,6 +6182,7 @@ mod tests {
                     ),
                     "{verdict:?}: {outcome:?}"
                 );
+                assert!(outcome.spent(), "a verdict was paid for");
 
                 // Persisted through the graph trait; survivor resolved to a hash.
                 let recorded = verdicts.borrow();
@@ -6201,8 +6238,14 @@ mod tests {
             );
             let (outcome, events) = captured(svc.judge_contradiction(&src(), &dst())).await;
             assert!(
-                matches!(outcome, JudgeOutcome::Unjudged { marked: true }),
-                "{outcome:?}"
+                matches!(
+                    outcome,
+                    JudgeOutcome::Unjudged {
+                        marked: true,
+                        spent: true
+                    }
+                ),
+                "the request went out, so it stays billed: {outcome:?}"
             );
             let recorded = verdicts.borrow();
             assert_eq!(recorded.len(), 1, "the marker is the only graph write");
@@ -6228,27 +6271,68 @@ mod tests {
             );
         }
 
-        /// A transient failure (upstream down, 5xx, timeout) writes nothing so
-        /// the pair is retried by the next pass.
+        /// A deterministic failure whose marker write did not land is still
+        /// billed: the marker is about what the backfill re-selects, the bill
+        /// about what left the box. A marker-keyed refund would credit this.
         #[tokio::test(flavor = "current_thread")]
-        async fn transient_failure_is_unjudged_and_writes_nothing() {
-            let (svc, verdicts) = service(
+        async fn deterministic_failure_stays_billed_when_the_marker_does_not_land() {
+            let (svc, _) = service(
                 Some(Script::Err(|| {
-                    AlayaError::Unavailable("502 from the LB".into())
+                    AlayaError::Judge("verdict is not valid JSON".into())
                 })),
                 pair(),
-                true,
+                false,
             );
-            let (outcome, events) = captured(svc.judge_contradiction(&src(), &dst())).await;
+            let outcome = svc.judge_contradiction(&src(), &dst()).await;
             assert!(
-                matches!(outcome, JudgeOutcome::Unjudged { marked: false }),
+                matches!(
+                    outcome,
+                    JudgeOutcome::Unjudged {
+                        marked: false,
+                        spent: true
+                    }
+                ),
                 "{outcome:?}"
             );
-            assert!(
-                verdicts.borrow().is_empty(),
-                "no graph write on a transient failure"
-            );
-            assert!(events.is_empty(), "{events:?}");
+        }
+
+        /// A transient failure (upstream down, 5xx, timeout) writes nothing so
+        /// the pair is retried by the next pass. Whether it was billed is the
+        /// transport's call — a 504 after forwarding may have been, a refused
+        /// connect was not — and is carried through unchanged.
+        #[tokio::test(flavor = "current_thread")]
+        async fn transient_failure_is_unjudged_and_writes_nothing() {
+            fn billed() -> AlayaError {
+                AlayaError::Unavailable {
+                    message: "504 from the LB".into(),
+                    spent: true,
+                }
+            }
+            fn free() -> AlayaError {
+                AlayaError::Unavailable {
+                    message: "connection refused".into(),
+                    spent: false,
+                }
+            }
+            for (err, spent) in [(billed as fn() -> AlayaError, true), (free, false)] {
+                let (svc, verdicts) = service(Some(Script::Err(err)), pair(), true);
+                let (outcome, events) = captured(svc.judge_contradiction(&src(), &dst())).await;
+                assert!(
+                    matches!(
+                        outcome,
+                        JudgeOutcome::Unjudged {
+                            marked: false,
+                            spent: s
+                        } if s == spent
+                    ),
+                    "spent={spent}: {outcome:?}"
+                );
+                assert!(
+                    verdicts.borrow().is_empty(),
+                    "no graph write on a transient failure"
+                );
+                assert!(events.is_empty(), "{events:?}");
+            }
         }
 
         fn hash(i: usize) -> String {
@@ -6484,6 +6568,7 @@ mod tests {
                 ),
                 "{outcome:?}"
             );
+            assert!(!outcome.spent(), "a 429 is refunded");
             assert!(verdicts.borrow().is_empty());
         }
 
@@ -6496,10 +6581,18 @@ mod tests {
                 vec![mem(&src(), 1.0)],
                 true,
             );
-            assert!(matches!(
-                svc.judge_contradiction(&src(), &dst()).await,
-                JudgeOutcome::Unjudged { marked: true }
-            ));
+            let outcome = svc.judge_contradiction(&src(), &dst()).await;
+            assert!(
+                matches!(
+                    outcome,
+                    JudgeOutcome::Unjudged {
+                        marked: true,
+                        spent: false
+                    }
+                ),
+                "marked so the backfill skips it, but no request went out: {outcome:?}"
+            );
+            assert!(!outcome.spent(), "a marked pair is not a paid pair");
             {
                 let recorded = verdicts.borrow();
                 assert_eq!(recorded.len(), 1);
@@ -6512,18 +6605,27 @@ mod tests {
             // Malformed hash and self-pair never reach the judge or the graph.
             assert!(matches!(
                 svc.judge_contradiction("nope", &dst()).await,
-                JudgeOutcome::Unjudged { marked: false }
+                JudgeOutcome::Unjudged {
+                    marked: false,
+                    spent: false
+                }
             ));
             assert!(matches!(
                 svc.judge_contradiction(&src(), &src()).await,
-                JudgeOutcome::Unjudged { marked: false }
+                JudgeOutcome::Unjudged {
+                    marked: false,
+                    spent: false
+                }
             ));
             assert_eq!(verdicts.borrow().len(), 1);
             // Judge not configured.
             let (svc, verdicts) = service(None, pair(), true);
             assert!(matches!(
                 svc.judge_contradiction(&src(), &dst()).await,
-                JudgeOutcome::Unjudged { marked: false }
+                JudgeOutcome::Unjudged {
+                    marked: false,
+                    spent: false
+                }
             ));
             assert!(verdicts.borrow().is_empty());
         }
