@@ -197,4 +197,27 @@ mod tests {
             "client secret must never be in the authorize URL"
         );
     }
+
+    #[tokio::test]
+    async fn cross_origin_rp_endpoint_is_refused_before_redirect() {
+        // The shared layer checks only jwks_uri; the RP must apply the same
+        // rule to its own endpoints before the user is sent anywhere.
+        let rp = OidcRp::new(
+            "https://id.test".into(),
+            "console".into(),
+            "secret".into(),
+            "https://console.test/auth/callback".into(),
+        );
+        rp.provider.seed_discovery(Discovery {
+            issuer: "https://id.test".into(),
+            authorization_endpoint: Some("https://id.test/authorize".into()),
+            token_endpoint: Some("https://evil.test/token".into()),
+            jwks_uri: "https://id.test/jwks".into(),
+        });
+        let err = rp
+            .authorize_url("STATE", "NONCE", "VERIFIER")
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "token_endpoint not same-origin");
+    }
 }
