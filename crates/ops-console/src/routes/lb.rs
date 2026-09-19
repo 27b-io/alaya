@@ -6,8 +6,13 @@
 //! There is no edit flow here by design and the LB exposes no admin write
 //! route — the console has no write route to the LB and this module must
 //! not grow one.
+//!
+//! Only fleet-wide numbers are rendered. `/_stats` also carries
+//! process-local counters (per-consumer request rates, per-endpoint burn
+//! rates and token totals); through a Service with several replicas those
+//! describe one random pod, so they are deliberately left out.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use axum::extract::State;
 use axum::response::Html;
@@ -17,9 +22,9 @@ use leptos::prelude::*;
 use serde_json::Value;
 
 use crate::error::AppError;
-use crate::lb::{DailyBurn, fmt_tokens};
-use crate::routes::fmt_epoch;
-use crate::session::{Session, now_epoch, take_flash};
+use crate::lb::{DailyBurn, fmt_tokens, live_budgets};
+use crate::routes::{fmt_epoch, vf, vs};
+use crate::session::{Session, take_flash};
 use crate::state::AppState;
 use crate::ui::*;
 
@@ -48,8 +53,7 @@ pub async fn pane(
 
     // Sections are independent: a dark metrics store must not hide live
     // headroom, and an LB outage must not hide the burn history.
-    let now = now_epoch();
-    let (stats, burn) = tokio::join!(lb.client.stats(), lb.metrics.daily_burn(now));
+    let (stats, burn) = tokio::join!(lb.client.stats(), lb.metrics.daily_burn());
 
     let content = view! {
         <div class="space-y-6">
@@ -61,28 +65,13 @@ pub async fn pane(
     Ok((jar, Html(page(TITLE, &session, flash, content))))
 }
 
-// ─── Value helpers (defensive rendering over upstream JSON) ────────────────
+// ─── Rendering helpers ──────────────────────────────────────────────────────
 
-fn num(v: &Value, key: &str) -> f64 {
-    v.get(key).and_then(Value::as_f64).unwrap_or(0.0)
-}
-
-fn text<'a>(v: &'a Value, key: &str) -> &'a str {
-    v.get(key).and_then(Value::as_str).unwrap_or("")
-}
-
-fn count(v: Option<&Value>) -> String {
+/// Optional integer for a cell, or a dash — never a fictitious zero.
+fn int_or_dash(v: Option<&Value>) -> String {
     v.and_then(Value::as_u64)
         .map(|n| n.to_string())
         .unwrap_or_else(|| "—".into())
-}
-
-fn pct(num: f64, den: f64) -> String {
-    if den > 0.0 {
-        format!("{:.0}%", num / den * 100.0)
-    } else {
-        "—".into()
-    }
 }
 
 fn ratio_pct(r: Option<f64>) -> String {
@@ -108,15 +97,15 @@ fn unavailable(what: &str, e: &AppError) -> impl IntoView + use<> {
     }
 }
 
-// ─── Fleet: strategy, replicas, shared state, consumers ────────────────────
+// ─── Fleet: strategy, replicas, shared state ────────────────────────────────
 
 fn fleet_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
     let body = match stats {
         Err(e) => Either::Left(unavailable("anthropic-lb /_stats", e)),
         Ok(s) => {
-            let strategy = text(s, "strategy").to_string();
+            let strategy = vs(s, "strategy");
             let cluster = s.get("cluster");
-            let replicas = count(cluster.and_then(|c| c.get("replicas_seen")));
+            let replicas = int_or_dash(cluster.and_then(|c| c.get("replicas_seen")));
             let (redis_class, redis_text) = match cluster
                 .and_then(|c| c.get("redis_connected"))
                 .and_then(Value::as_bool)
@@ -125,46 +114,22 @@ fn fleet_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                 Some(false) => (badge(BadgeKind::Destructive), "disconnected"),
                 None => (badge(BadgeKind::Muted), "no cluster info"),
             };
-            let headroom = count(s.pointer("/aggregate/total_headroom_requests"));
+            let headroom = int_or_dash(s.pointer("/aggregate/total_headroom_requests"));
+            // serde_json maps iterate in key order — no sort needed.
             let transport = cluster
                 .and_then(|c| c.get("transport_errors"))
                 .and_then(Value::as_object)
                 .map(|m| {
-                    let mut parts: Vec<String> = m
-                        .iter()
+                    m.iter()
                         .map(|(k, v)| format!("{k} {}", v.as_u64().unwrap_or(0)))
-                        .collect();
-                    parts.sort();
-                    parts.join(" · ")
+                        .collect::<Vec<_>>()
+                        .join(" · ")
                 })
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| "—".into());
 
-            let mut consumers: Vec<(String, f64, f64)> = s
-                .pointer("/aggregate/consumers")
-                .and_then(Value::as_object)
-                .map(|m| {
-                    m.iter()
-                        .map(|(k, v)| (k.clone(), num(v, "requests_per_minute"), num(v, "share")))
-                        .collect()
-                })
-                .unwrap_or_default();
-            consumers.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            let rows = consumers
-                .into_iter()
-                .map(|(name, rpm, share)| {
-                    view! {
-                        <TableRow>
-                            <TableCell><span class="font-mono text-xs">{name}</span></TableCell>
-                            <TableCell><span class="tabular-nums">{format!("{rpm:.2}")}</span></TableCell>
-                            <TableCell><span class="tabular-nums">{format!("{:.1}%", share * 100.0)}</span></TableCell>
-                        </TableRow>
-                    }
-                })
-                .collect_view();
-
             Either::Right(view! {
-                <dl class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm mb-4">
+                <dl class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
                     <div>
                         <dt class="text-muted-foreground text-xs">"Strategy"</dt>
                         <dd>{strategy}</dd>
@@ -186,16 +151,6 @@ fn fleet_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                         <dd>{transport}</dd>
                     </div>
                 </dl>
-                <TableWrapper><Table>
-                    <TableHeader>
-                        <TableRow>
-                            <TableHead>"Consumer"</TableHead>
-                            <TableHead>"Requests / min"</TableHead>
-                            <TableHead>"Share"</TableHead>
-                        </TableRow>
-                    </TableHeader>
-                    <TableBody>{rows}</TableBody>
-                </Table></TableWrapper>
             })
         }
     };
@@ -204,7 +159,7 @@ fn fleet_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
             <CardHeader>
                 <CardTitle>"Fleet"</CardTitle>
                 <CardDescription>
-                    "Live from anthropic-lb /_stats, fetched server-side with the operator credential. Read-only: routing strategy and limits are TOML, GitOps."
+                    "Live from anthropic-lb /_stats, fetched server-side with the operator credential; fleet-wide values only. Read-only: routing strategy and limits are TOML, GitOps."
                 </CardDescription>
             </CardHeader>
             <CardContent>{body}</CardContent>
@@ -218,29 +173,12 @@ fn budgets_card(
     stats: &Result<Value, AppError>,
     burn: &Result<DailyBurn, AppError>,
 ) -> impl IntoView + use<> {
-    // Live: prefer the fleet-true Redis aggregate; the replica-local mirror
-    // is the fallback when the LB has no cluster info (Redis down at boot).
-    let live: HashMap<String, (f64, f64)> = match stats {
-        Ok(s) => s
-            .pointer("/cluster/budget_usage")
-            .and_then(Value::as_object)
-            .map(|m| {
-                m.iter()
-                    .map(|(k, v)| (k.clone(), (num(v, "used"), num(v, "limit"))))
-                    .collect()
-            })
-            .or_else(|| {
-                s.get("client_budgets").and_then(Value::as_object).map(|m| {
-                    m.iter()
-                        .map(|(k, v)| (k.clone(), (num(v, "used_today"), num(v, "daily_limit"))))
-                        .collect()
-                })
-            })
-            .unwrap_or_default(),
-        Err(_) => HashMap::new(),
+    let (live, fleet_true) = match stats {
+        Ok(s) => live_budgets(s),
+        Err(_) => (BTreeMap::new(), true),
     };
     let history = burn.as_ref().ok();
-    let days: Vec<i64> = history.map(|b| b.days.clone()).unwrap_or_default();
+    let day_starts: Vec<i64> = history.map(|b| b.day_starts.clone()).unwrap_or_default();
     // Union: a client de-budgeted this week keeps its history columns.
     let clients: BTreeSet<String> = live
         .keys()
@@ -253,7 +191,7 @@ fn budgets_card(
         .collect();
 
     // Component children are boxed 'static closures: hand them owned values.
-    let day_heads = days
+    let day_heads = day_starts
         .iter()
         .map(|d| {
             let label = fmt_day(*d);
@@ -265,20 +203,23 @@ fn budgets_card(
         .iter()
         .map(|c| {
             let live_cell = match live.get(c) {
-                Some(&(used, limit)) => Either::Left(view! {
-                    <div class="flex items-center gap-2 whitespace-nowrap">
-                        <progress class="h-2 w-24" value=format!("{used:.0}") max=format!("{limit:.0}")></progress>
-                        <span class="tabular-nums" title=format!("{used:.0} / {limit:.0} tokens")>
-                            {fmt_tokens(used)}" / "{fmt_tokens(limit)}" ("{pct(used, limit)}")"
-                        </span>
-                    </div>
-                }),
+                Some(&(used, limit)) => {
+                    let pct = ratio_pct((limit > 0.0).then(|| used / limit));
+                    Either::Left(view! {
+                        <div class="flex items-center gap-2 whitespace-nowrap">
+                            <progress class="h-2 w-24" value=format!("{used:.0}") max=format!("{limit:.0}")></progress>
+                            <span class="tabular-nums" title=format!("{used:.0} / {limit:.0} tokens")>
+                                {fmt_tokens(used)}" / "{fmt_tokens(limit)}" ("{pct}")"
+                            </span>
+                        </div>
+                    })
+                }
                 None => Either::Right(view! { <span class="text-muted-foreground">"—"</span> }),
             };
             let series = history
                 .and_then(|b| b.by_client.get(c))
                 .cloned()
-                .unwrap_or_else(|| vec![None; days.len()]);
+                .unwrap_or_else(|| vec![None; day_starts.len()]);
             let cells = series
                 .into_iter()
                 .map(|v| {
@@ -304,6 +245,14 @@ fn budgets_card(
         .as_ref()
         .err()
         .map(|e| unavailable("live budgets (anthropic-lb /_stats)", e));
+    let mirror_note = (!fleet_true).then(|| {
+        view! {
+            <p class="text-sm mb-4">
+                <span class=badge(BadgeKind::Warning)>"replica-local"</span>
+                " Live numbers come from one replica's mirror (fleet aggregate unavailable): they reset on pod restart and undercount the fleet."
+            </p>
+        }
+    });
     let history_note = burn
         .as_ref()
         .err()
@@ -314,11 +263,12 @@ fn budgets_card(
             <CardHeader>
                 <CardTitle>"Per-client budget burn"</CardTitle>
                 <CardDescription>
-                    "Live: today's fleet-true burn vs daily limit (anthropic-lb /_stats, Redis aggregate). History: daily peak of anthropic_cluster_budget_used per UTC day from the metrics store; today's column is running. Limits are TOML, GitOps — nothing here edits them."
+                    "Live: today's fleet-wide burn vs daily limit (anthropic-lb /_stats, Redis aggregate). History: daily peak of anthropic_cluster_budget_used per UTC day from the metrics store; today's column is running. Limits are TOML, GitOps — nothing here edits them."
                 </CardDescription>
             </CardHeader>
             <CardContent>
                 {live_note}
+                {mirror_note}
                 {history_note}
                 <TableWrapper><Table>
                     <TableHeader>
@@ -344,9 +294,9 @@ fn status_of(e: &Value) -> (String, String) {
             format!("hard-limited {secs}s"),
         );
     }
-    let (s5, s7) = (text(e, "status_5h"), text(e, "status_7d"));
+    let (s5, s7) = (vs(e, "status_5h"), vs(e, "status_7d"));
     let throttled = |s: &str| !s.is_empty() && s != "allowed";
-    if throttled(s5) || throttled(s7) {
+    if throttled(&s5) || throttled(&s7) {
         return (badge(BadgeKind::Warning), format!("{s5} / {s7}"));
     }
     (badge(BadgeKind::Success), "allowed".into())
@@ -363,15 +313,15 @@ fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                 .unwrap_or_default();
             // Hottest first, then by name for a stable order.
             endpoints.sort_by(|a, b| {
-                num(b, "utilization_7d")
-                    .total_cmp(&num(a, "utilization_7d"))
-                    .then_with(|| text(a, "name").cmp(text(b, "name")))
+                vf(b, "utilization_7d")
+                    .total_cmp(&vf(a, "utilization_7d"))
+                    .then_with(|| vs(a, "name").cmp(&vs(b, "name")))
             });
             let rows = endpoints
                 .into_iter()
                 .map(|e| {
-                    let name = text(e, "name").to_string();
-                    let protocol = text(e, "protocol").to_string();
+                    let name = vs(e, "name");
+                    let protocol = vs(e, "protocol");
                     let passthrough = e
                         .get("passthrough")
                         .and_then(Value::as_bool)
@@ -379,16 +329,11 @@ fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                         .then(
                             || view! { <span class=badge(BadgeKind::Muted)>"passthrough"</span> },
                         );
-                    let priority = count(e.get("priority"));
+                    let priority = int_or_dash(e.get("priority"));
                     let u5 = ratio_pct(e.get("utilization_5h").and_then(Value::as_f64));
                     let u7 = ratio_pct(e.get("utilization_7d").and_then(Value::as_f64));
                     let (status_class, status_text) = status_of(e);
-                    let headroom = count(e.get("headroom_requests"));
-                    let burn_1h = e
-                        .pointer("/burn_rate/last_1h")
-                        .and_then(Value::as_f64)
-                        .map(|b| format!("{b:.2}"))
-                        .unwrap_or_else(|| "—".into());
+                    let headroom = int_or_dash(e.get("headroom_requests"));
                     let reset_5h = e
                         .get("reset_5h")
                         .and_then(Value::as_f64)
@@ -408,7 +353,6 @@ fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                             <TableCell><span class="tabular-nums">{u7}</span></TableCell>
                             <TableCell><span class=status_class>{status_text}</span></TableCell>
                             <TableCell><span class="tabular-nums">{headroom}</span></TableCell>
-                            <TableCell><span class="tabular-nums">{burn_1h}</span></TableCell>
                             <TableCell><span class="whitespace-nowrap">{reset_5h}</span></TableCell>
                         </TableRow>
                     }
@@ -425,7 +369,6 @@ fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                             <TableHead>"7d util"</TableHead>
                             <TableHead>"Status"</TableHead>
                             <TableHead>"Headroom (req)"</TableHead>
-                            <TableHead>"Burn / h"</TableHead>
                             <TableHead>"5h reset (UTC)"</TableHead>
                         </TableRow>
                     </TableHeader>
@@ -449,8 +392,6 @@ fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
     use serde_json::json;
 
@@ -460,13 +401,10 @@ mod tests {
             "strategy": "sticky-weighted-v2",
             "aggregate": {
                 "total_headroom_requests": null,
-                "consumers": {
-                    "multica-runtime": {"requests_per_minute": 6.83, "share": 0.991},
-                    "_operator": {"requests_per_minute": 0.06, "share": 0.009}
-                }
+                "consumers": {"multica-runtime": {"requests_per_minute": 6.83, "share": 0.991}}
             },
             // Replica-local mirror: deliberately stale (1 token) so the test
-            // proves the fleet-true aggregate below wins.
+            // proves the fleet-wide aggregate below wins.
             "client_budgets": {"kody": {"daily_limit": 50000000, "used_today": 1, "remaining": 49999999}},
             "cluster": {
                 "redis_connected": true,
@@ -491,20 +429,22 @@ mod tests {
         })
     }
 
-    #[test]
-    fn budgets_card_prefers_fleet_true_usage_and_renders_history() {
-        let stats = Ok(sample_stats());
+    fn sample_burn() -> DailyBurn {
         let mut by_client = BTreeMap::new();
         by_client.insert(
             "kody".to_string(),
             vec![Some(22_030_571.0), None, Some(17_913_067.0)],
         );
-        let burn = Ok(DailyBurn {
-            days: vec![1_789_603_200, 1_789_689_600, 1_789_776_000],
+        DailyBurn {
+            day_starts: vec![1_789_603_200, 1_789_689_600, 1_789_776_000],
             by_client,
-        });
-        let html = budgets_card(&stats, &burn).to_html();
-        // Fleet-true 17.9M, not the replica-local mirror's 1 token. (Adjacent
+        }
+    }
+
+    #[test]
+    fn budgets_card_prefers_fleet_wide_usage_and_renders_history() {
+        let html = budgets_card(&Ok(sample_stats()), &Ok(sample_burn())).to_html();
+        // Fleet-wide 17.9M, not the replica-local mirror's 1 token. (Adjacent
         // text nodes carry SSR markers between them — assert per fragment.)
         assert!(html.contains("17913067 / 50000000 tokens"), "{html}");
         assert!(html.contains("17.9M") && html.contains("50.0M") && html.contains("36%"));
@@ -512,12 +452,29 @@ mod tests {
             html.contains("<progress value=\"17913067\" max=\"50000000\""),
             "{html}"
         );
+        assert!(!html.contains("replica-local"));
         // Union of live + history clients; a gap renders as a dash.
         assert!(html.contains("alaya"));
         assert!(html.contains("22.0M") && html.contains(">—<"), "{html}");
         assert!(html.contains("09-17") && html.contains("09-19"), "{html}");
         assert!(html.contains("TOML, GitOps"));
         assert!(!html.contains("<form"));
+    }
+
+    /// The LB emits `budget_usage: {}` when its Redis read failed: the card
+    /// must fall back to the mirror AND say so, never render blanks under a
+    /// "fleet-wide" heading.
+    #[test]
+    fn budgets_card_falls_back_to_the_mirror_and_flags_it() {
+        let mut stats = sample_stats();
+        stats["cluster"]["budget_usage"] = json!({});
+        stats["cluster"]["redis_connected"] = json!(false);
+        let html = budgets_card(&Ok(stats), &Ok(sample_burn())).to_html();
+        assert!(html.contains("replica-local"), "{html}");
+        assert!(
+            html.contains("<progress value=\"1\" max=\"50000000\""),
+            "{html}"
+        );
     }
 
     #[test]
@@ -531,14 +488,15 @@ mod tests {
         assert!(html.contains("97%"));
     }
 
+    /// Process-local counters (consumers, burn rates) must not render: through
+    /// a multi-replica Service they describe one random pod.
     #[test]
-    fn fleet_card_renders_cluster_state_and_consumers() {
+    fn fleet_card_renders_only_fleet_wide_state() {
         let html = fleet_card(&Ok(sample_stats())).to_html();
         assert!(html.contains("sticky-weighted-v2"));
         assert!(html.contains(">connected<"), "{html}");
         assert!(html.contains("other 4103 · timeout 706"), "{html}");
-        assert!(html.contains("multica-runtime"));
-        assert!(html.contains("99.1%"));
+        assert!(!html.contains("multica-runtime"), "{html}");
     }
 
     #[test]
@@ -552,15 +510,9 @@ mod tests {
     }
 
     #[test]
-    fn percentages_never_divide_by_zero() {
-        assert_eq!(pct(5.0, 0.0), "—");
-        assert_eq!(pct(25.0, 100.0), "25%");
+    fn ratio_pct_never_invents_a_number() {
         assert_eq!(ratio_pct(None), "—");
         assert_eq!(ratio_pct(Some(0.29)), "29%");
-    }
-
-    #[test]
-    fn fmt_day_is_month_day_utc() {
-        assert_eq!(fmt_day(1_789_776_000), "09-19");
+        assert_eq!(ratio_pct((0.0_f64 > 0.0).then(|| 5.0 / 0.0)), "—");
     }
 }

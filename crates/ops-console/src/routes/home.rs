@@ -1,6 +1,6 @@
 //! Console home: one card per module. Two-tenant from day one (LAB-1641
 //! constraint A): the Ālaya curation module and the anthropic-lb read-only
-//! monitoring pane (LAB-1964).
+//! monitoring pane.
 
 use axum::extract::State;
 use axum::response::Html;
@@ -10,6 +10,7 @@ use leptos::prelude::*;
 use serde_json::Value;
 
 use crate::error::AppError;
+use crate::lb::live_budgets;
 use crate::session::{Session, take_flash};
 use crate::state::AppState;
 use crate::ui::*;
@@ -68,11 +69,7 @@ pub async fn home(
                         .get("endpoints")
                         .and_then(Value::as_array)
                         .map_or(0, Vec::len);
-                    let budgeted = s
-                        .pointer("/cluster/budget_usage")
-                        .or_else(|| s.get("client_budgets"))
-                        .and_then(Value::as_object)
-                        .map_or(0, |m| m.len());
+                    let budgeted = live_budgets(s).0.len();
                     (
                         badge(BadgeKind::Success),
                         "reachable",

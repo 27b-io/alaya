@@ -43,7 +43,7 @@ CSP (`default-src 'none'`).
 | `ALAYA_URL` | `http://alaya-server.mcp.svc:3001` |
 | `ALAYA_API_KEY` | Static bearer (full write) — server-side only. |
 | `CONSOLE_LISTEN_ADDR` | Optional, default `0.0.0.0:3002`. |
-| `LB_URL` / `LB_API_KEY` / `METRICS_URL` | anthropic-lb module — **all three or none**. None: the module is disabled and the home card says so. A partial set refuses startup. `LB_URL` = `http://anthropic-lb.mcp.svc:8082`; `LB_API_KEY` = an LB **operator** client key, sent server-side as `x-api-key` (the LB rejects `Authorization: Bearer` on `/_stats`); `METRICS_URL` = the Prometheus-compatible query API (VictoriaMetrics vmsingle) for the 7-day history. |
+| `LB_URL` / `LB_API_KEY` / `METRICS_URL` | anthropic-lb module — **all three or none**. None: the module is disabled and the home card says so. A partial set refuses startup. `LB_URL` = the LB's base URL; `LB_API_KEY` = an LB **operator** client key, sent server-side as `x-api-key` (the LB rejects `Authorization: Bearer` on `/_stats`); `METRICS_URL` = a Prometheus-compatible query API for the 7-day history — the console only ever calls `/api/v1/query_range` on it, so point it at a route that exposes nothing else. |
 
 ### Allowlisting an admin
 
@@ -65,7 +65,7 @@ CSP (`default-src 'none'`).
 - **Auth state** — read-only view of alaya-server's `GET /auth/config`:
   principal × operation matrix + OIDC issuer/audience/allowlist.
 
-## anthropic-lb module (read-only — LAB-1964)
+## anthropic-lb module (read-only)
 
 Scope: the console **renders** LB state; budgets, limits, endpoints and
 client identities change through GitOps only. The console has **no write
@@ -74,36 +74,42 @@ not grow one. Values render with their provenance; limits are
 "TOML, GitOps".
 
 - **Fleet** — routing strategy, replicas seen, shared-state (Redis) health,
-  pooled headroom, cumulative upstream transport errors, per-consumer
-  request rate + share. Source: `GET /_stats`.
-- **Per-client budget burn** — today's fleet-true used / limit with a
-  progress bar (`/_stats` → `cluster.budget_usage`, the Redis aggregate;
-  falls back to the replica-local `client_budgets` mirror), plus a 7-column
-  history: the daily peak of `anthropic_cluster_budget_used` per UTC day,
-  today's column running. History is one `query_range` against
+  pooled headroom, cumulative upstream transport errors. Source:
+  `GET /_stats`. Only fleet-wide values render: `/_stats` also carries
+  process-local counters (per-consumer request rates, per-endpoint burn
+  rates) that describe one random replica behind a Service, so they are
+  deliberately left out.
+- **Per-client budget burn** — today's fleet-wide used / limit with a
+  progress bar (`/_stats` → `cluster.budget_usage`, the Redis aggregate).
+  When that aggregate is absent or empty the card falls back to the
+  replica-local `client_budgets` mirror and says so with a "replica-local"
+  badge — that mirror resets on pod restart and undercounts the fleet. Plus
+  a 7-column history: the daily peak of `anthropic_cluster_budget_used` per
+  UTC day, today's column running. History is one `query_range` against
   `METRICS_URL` (`max by (client) (max_over_time(…[23h58m]))` at 23:59 UTC
   of each day — the trimmed window keeps the first post-midnight scrape,
   which can still carry yesterday's total, out of today's peak). No history
   store in the console, no dashboard embeds.
 - **Upstream accounts** — per endpoint: 5-hour / 7-day window utilisation,
-  hard-limit / throttle status, remaining requests, burn rate, next 5h
-  reset; hottest first.
+  hard-limit / throttle status, remaining requests, next 5h reset; hottest
+  first.
 
 Each card degrades on its own: a dark metrics store leaves live headroom
-up, an LB outage leaves the burn history up. Both upstream clients refuse
-redirects (no credential ever rides a 3xx off-host).
+up, an LB outage leaves the burn history up. Every upstream client in the
+console refuses redirects (no credential ever rides a 3xx off-host).
 
 ## Deploy
 
 Deployed from the private infra repo's Kubernetes manifests (LAB-2712).
-`deploy/console/ops-console.yaml` here is a mirror of the deployed manifest —
-keep them in sync. Shape: Deployment + Service + NetworkPolicy — own label,
-egress pinned to the module upstreams (alaya-server :3001, anthropic-lb
-:8082, the metrics store vmsingle :8428 in the monitoring namespace) + IdP
-:443 (DNS via the namespace `allow-dns` policy), **no dragonfly egress**,
+`deploy/console/ops-console.yaml` here is the runtime-contract template
+(Deployment + Service: image, command, env, probes, security context). The
+deployed manifest — including the NetworkPolicy / egress allowlist, real
+hostnames and the digest pin — lives in the private infra repo and is the
+truth; cluster topology is not published from this repository. Binding
+shape wherever this binary runs: own label, own NetworkPolicy with egress
+pinned to the module upstreams + IdP :443 only, **no dragonfly egress**,
 image digest-pinned via the `flux-system:alaya` imagepolicy marker so the
-console rolls with alaya-server. The LB's own NetworkPolicy must admit the
-console pod on :8082. The binary ships in the existing public
+console rolls with alaya-server. The binary ships in the existing public
 `ghcr.io/27b-io/alaya` image (`command: ["ops-console"]`), pulled anonymously
 since LAB-3719 — no pull secret.
 
@@ -122,17 +128,17 @@ svc:ops --https 443 http://ops-console.mcp.svc.cluster.local:3002`.
 CLI-first exits 0 but the service never appears in the console for approval.
 
 Post-rollout egress check (the image has `curl`, not `nc`; k3s netpol rejects,
-so expect "Connection refused" on the first two, then `alaya=200`, `lb=401`
-— reachable, the probe carries no key — and `vm=200`):
+so expect "Connection refused" on the first two and `alaya=200`):
 
 ```bash
 kubectl -n mcp exec deploy/ops-console -- sh -c '
   curl -sS -m3 telnet://dragonfly.mcp.svc:6379; echo dragonfly_exit=$?;
   curl -sS -m3 telnet://alaya-bridge.mcp.svc:3000; echo bridge_exit=$?;
-  curl -sS -m3 -o /dev/null -w "alaya=%{http_code}\n" http://alaya-server.mcp.svc:3001/health;
-  curl -sS -m3 -o /dev/null -w "lb=%{http_code}\n" "$LB_URL/_stats";
-  curl -sS -m3 -o /dev/null -w "vm=%{http_code}\n" "$METRICS_URL/health"'
+  curl -sS -m3 -o /dev/null -w "alaya=%{http_code}\n" http://alaya-server.mcp.svc:3001/health'
 ```
+
+The equivalent probes for the LB pane's two upstreams live with the deployed
+manifest.
 
 ## Development
 

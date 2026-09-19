@@ -32,11 +32,11 @@ pub struct Config {
     pub session_secret: Vec<u8>,
     pub alaya_url: url::Url,
     pub alaya_api_key: String,
-    /// anthropic-lb monitoring module (LAB-1964); `None` = module disabled.
+    /// anthropic-lb monitoring module; `None` = module disabled.
     pub lb: Option<LbConfig>,
 }
 
-/// anthropic-lb read-only module (LAB-1964). Optional as a GROUP: a
+/// anthropic-lb read-only module. Optional as a GROUP: a
 /// deploy-ordering gap (the image rolls before the Secret carries the key,
 /// or the reverse) leaves the Ālaya module up and the LB card reading "not
 /// configured" instead of taking the whole console down. A half-set group
@@ -256,7 +256,7 @@ mod tests {
             lb: Some(LbConfig {
                 url: "http://anthropic-lb.mcp.svc:8082".parse().unwrap(),
                 api_key: "LB_KEY_VALUE".into(),
-                metrics_url: "http://vmsingle.monitoring.svc:8428".parse().unwrap(),
+                metrics_url: "http://metrics.test:8428".parse().unwrap(),
             }),
         };
         let dbg = format!("{cfg:?}");

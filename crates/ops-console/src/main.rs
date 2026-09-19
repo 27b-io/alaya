@@ -1,8 +1,8 @@
 //! ops-console — OIDC-gated web console for the 27b workspace (LAB-1684).
 //!
 //! Two-tenant console (LAB-1641 constraint A): the Ālaya memory-curation
-//! module and the anthropic-lb read-only monitoring pane (LAB-1964) as a
-//! second route module. Trust model (D2, ratified 2026-08-15): the browser
+//! module and the anthropic-lb read-only monitoring pane as a second route
+//! module. Trust model (D2, ratified 2026-08-15): the browser
 //! authenticates with an OIDC session; every upstream call (alaya-server
 //! bearer, anthropic-lb operator key) happens server-side. No credential
 //! reaches the browser.
@@ -14,6 +14,7 @@
 mod alaya;
 mod config;
 mod error;
+mod http;
 mod lb;
 mod oidc;
 mod routes;
@@ -164,8 +165,8 @@ fn app(state: AppState) -> Router {
             post(routes::alaya::keep_both_submit),
         )
         .route("/alaya/auth", get(routes::alaya::auth_view))
-        // anthropic-lb module (LAB-1964): GET only, by design. No POST
-        // route to the LB exists and none may be added here.
+        // anthropic-lb module: GET only, by design. No POST route to the LB
+        // exists and none may be added here.
         .route("/lb", get(routes::lb::pane))
         .layer(middleware::from_fn_with_state(state.clone(), origin_check))
         .layer(middleware::from_fn_with_state(

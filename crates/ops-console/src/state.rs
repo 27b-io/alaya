@@ -12,8 +12,9 @@ use crate::config::Config;
 use crate::lb::{LbClient, MetricsClient};
 use crate::oidc::OidcRp;
 
-/// anthropic-lb monitoring module upstreams (LAB-1964), present only when
-/// the module is configured — see `LbConfig`.
+/// anthropic-lb monitoring module upstreams, present only when the module
+/// is configured — see `LbConfig`. One value, not two `Option`s: the
+/// all-or-nothing group is encoded in the type.
 #[derive(Clone)]
 pub struct LbModule {
     pub client: LbClient,

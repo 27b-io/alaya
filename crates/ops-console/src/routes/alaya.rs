@@ -12,23 +12,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::AppError;
-use crate::routes::{fmt_epoch, short_hash, validate_hash};
+use crate::routes::{fmt_epoch, short_hash, validate_hash, vf, vs};
 use crate::session::{Flash, Session, flash_cookie, take_flash};
 use crate::state::AppState;
 use crate::ui::*;
 
 // ─── Value helpers (defensive rendering over upstream JSON) ────────────────
-
-fn vs(v: &Value, key: &str) -> String {
-    v.get(key)
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string()
-}
-
-fn vf(v: &Value, key: &str) -> f64 {
-    v.get(key).and_then(|x| x.as_f64()).unwrap_or(0.0)
-}
 
 fn excerpt(v: &Value, max: usize) -> String {
     let text = v

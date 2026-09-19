@@ -68,20 +68,19 @@ impl IntoResponse for AppError {
     }
 }
 
-/// Safe one-phrase summary of a transport error. reqwest errors can embed
-/// the full request URL, so they never reach a page verbatim.
-pub fn reqwest_kind(e: &reqwest::Error) -> &'static str {
-    if e.is_timeout() {
-        "timeout"
-    } else if e.is_connect() {
-        "connection failed"
-    } else {
-        "request failed"
-    }
-}
-
-impl From<reqwest::Error> for AppError {
-    fn from(e: reqwest::Error) -> Self {
-        AppError::Upstream(format!("alaya-server: {}", reqwest_kind(&e)))
+impl AppError {
+    /// Transport failure against a named upstream. reqwest errors can embed
+    /// the full request URL, so only a one-phrase kind ever reaches a page.
+    /// Deliberately not a `From` impl: a bare `?` would have to guess which
+    /// upstream failed.
+    pub fn transport(what: &str, e: &reqwest::Error) -> Self {
+        let kind = if e.is_timeout() {
+            "timeout"
+        } else if e.is_connect() {
+            "connection failed"
+        } else {
+            "request failed"
+        };
+        AppError::Upstream(format!("{what}: {kind}"))
     }
 }

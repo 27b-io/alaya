@@ -31,6 +31,19 @@ pub fn validate_hash(hash: &str) -> Result<&str, AppError> {
     }
 }
 
+/// Defensive readers over upstream JSON: a missing or mistyped field renders
+/// as empty / zero instead of failing the page. Shared by both modules.
+pub fn vs(v: &serde_json::Value, key: &str) -> String {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+pub fn vf(v: &serde_json::Value, key: &str) -> f64 {
+    v.get(key).and_then(|x| x.as_f64()).unwrap_or(0.0)
+}
+
 /// Short display prefix for a content hash.
 pub fn short_hash(hash: &str) -> String {
     hash.chars().take(12).collect()

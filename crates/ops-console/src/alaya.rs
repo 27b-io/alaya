@@ -27,11 +27,7 @@ fn upstream_error(status: reqwest::StatusCode, body: &str) -> AppError {
 
 impl AlayaClient {
     pub fn new(base: url::Url, bearer: String) -> Self {
-        let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .expect("failed to build alaya http client");
+        let http = crate::http::client(std::time::Duration::from_secs(60));
         AlayaClient { base, bearer, http }
     }
 
@@ -46,9 +42,13 @@ impl AlayaClient {
             .bearer_auth(&self.bearer)
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(|e| AppError::transport("alaya-server", &e))?;
         let status = resp.status();
-        let text = resp.text().await?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| AppError::transport("alaya-server", &e))?;
         if !status.is_success() {
             return Err(upstream_error(status, &text));
         }
@@ -73,12 +73,16 @@ impl AlayaClient {
             .get(self.url(path))
             .bearer_auth(&self.bearer)
             .send()
-            .await?;
+            .await
+            .map_err(|e| AppError::transport("alaya-server", &e))?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(AppError::NotFound("memory not found".into()));
         }
-        let text = resp.text().await?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| AppError::transport("alaya-server", &e))?;
         if !status.is_success() {
             return Err(upstream_error(status, &text));
         }

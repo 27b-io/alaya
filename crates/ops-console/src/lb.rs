@@ -18,10 +18,11 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::error::{AppError, reqwest_kind};
+use crate::error::AppError;
+use crate::http;
 
 /// Columns in the burn history: today plus the six preceding UTC days.
-pub const DAYS: usize = 7;
+const DAYS: usize = 7;
 
 /// Daily peak of the fleet-wide budget gauge, collapsed across scrape
 /// sources: every LB replica publishes the same shared aggregate, so their
@@ -33,29 +34,25 @@ pub const DAYS: usize = 7;
 /// peak to today.
 const BURN_QUERY: &str = "max by (client) (max_over_time(anthropic_cluster_budget_used[23h58m]))";
 
-fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(20))
-        // Never follow a redirect with the operator key attached: a 3xx must
-        // not be able to carry the credential off-host.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("failed to build anthropic-lb http client")
-}
-
 fn join(base: &url::Url, path: &str) -> String {
     format!("{}{path}", base.as_str().trim_end_matches('/'))
 }
 
-/// JSON body of a successful response. Error bodies are surfaced as plain
-/// text (the page renders them as text nodes, never markup), truncated.
-async fn json_body(what: &str, resp: reqwest::Response) -> Result<Value, AppError> {
+/// Send and read a JSON body. Transport errors collapse to a one-phrase kind
+/// (they can embed the request URL); error bodies are surfaced as plain text
+/// (the page renders them as text nodes, never markup), truncated. Query
+/// errors arrive as non-2xx on the Prometheus API, so this is the only error
+/// path a caller needs.
+async fn json_body(what: &str, req: reqwest::RequestBuilder) -> Result<Value, AppError> {
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| AppError::transport(what, &e))?;
     let status = resp.status();
     let text = resp
         .text()
         .await
-        .map_err(|e| AppError::Upstream(format!("{what}: {}", reqwest_kind(&e))))?;
+        .map_err(|e| AppError::transport(what, &e))?;
     if !status.is_success() {
         let detail: String = text.chars().take(160).collect();
         return Err(AppError::Upstream(format!("{what} {status}: {detail}")));
@@ -75,23 +72,48 @@ impl LbClient {
         LbClient {
             base,
             api_key,
-            http: http_client(),
+            http: http::client(Duration::from_secs(20)),
         }
     }
 
     /// `GET /_stats`: endpoints (upstream accounts), per-client budgets
-    /// (replica-local mirror plus the fleet-true `cluster.budget_usage`),
+    /// (replica-local mirror plus the fleet-wide `cluster.budget_usage`),
     /// consumers and sessions.
     pub async fn stats(&self) -> Result<Value, AppError> {
-        let resp = self
+        let req = self
             .http
             .get(join(&self.base, "/_stats"))
-            .header("x-api-key", &self.api_key)
-            .send()
-            .await
-            .map_err(|e| AppError::Upstream(format!("anthropic-lb: {}", reqwest_kind(&e))))?;
-        json_body("anthropic-lb", resp).await
+            .header("x-api-key", &self.api_key);
+        json_body("anthropic-lb", req).await
     }
+}
+
+fn f64_of(v: &Value, key: &str) -> f64 {
+    v.get(key).and_then(Value::as_f64).unwrap_or(0.0)
+}
+
+/// Today's per-client `(used, limit)` from a `/_stats` body. Prefers the
+/// fleet-wide Redis aggregate; falls back to this replica's local mirror —
+/// which resets on pod restart and sees one replica's traffic — when the
+/// aggregate is absent OR empty (the LB emits `budget_usage: {}` when its
+/// Redis read failed). The flag is `true` when the numbers are fleet-wide;
+/// callers must say so when it is not.
+pub fn live_budgets(stats: &Value) -> (BTreeMap<String, (f64, f64)>, bool) {
+    let pairs = |v: Option<&Value>, used: &str, limit: &str| -> BTreeMap<String, (f64, f64)> {
+        v.and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .map(|(k, b)| (k.clone(), (f64_of(b, used), f64_of(b, limit))))
+            .collect()
+    };
+    let fleet = pairs(stats.pointer("/cluster/budget_usage"), "used", "limit");
+    if !fleet.is_empty() {
+        return (fleet, true);
+    }
+    let local = pairs(stats.get("client_budgets"), "used_today", "daily_limit");
+    // Nothing budgeted anywhere is not a degraded state — no warning to raise.
+    let fleet_true = local.is_empty();
+    (local, fleet_true)
 }
 
 #[derive(Clone)]
@@ -102,8 +124,8 @@ pub struct MetricsClient {
 
 /// Daily budget burn per client, oldest day first.
 pub struct DailyBurn {
-    /// UTC midnight (epoch seconds) of each column's day.
-    pub days: Vec<i64>,
+    /// UTC midnight (epoch seconds) that starts each column's day.
+    pub day_starts: Vec<i64>,
     /// client → one value per day; `None` = no sample in that day's window.
     pub by_client: BTreeMap<String, Vec<Option<f64>>>,
 }
@@ -111,7 +133,7 @@ pub struct DailyBurn {
 /// Evaluation instants for `BURN_QUERY`: 23:59:00 UTC of each of the last
 /// `DAYS` days, today last. Today's instant lies in the future; the store
 /// evaluates the window up to "now", which yields today's running total.
-pub fn burn_evals(now: i64) -> Vec<i64> {
+fn burn_evals(now: i64) -> Vec<i64> {
     let today = now.div_euclid(86_400) * 86_400;
     (0..DAYS as i64)
         .rev()
@@ -122,7 +144,7 @@ pub fn burn_evals(now: i64) -> Vec<i64> {
 /// Align a `query_range` result to the evaluation instants. Sample values
 /// arrive as strings (Prometheus wire format); a missing instant stays
 /// `None` rather than becoming a fictitious zero.
-pub fn parse_daily_burn(body: &Value, evals: &[i64]) -> BTreeMap<String, Vec<Option<f64>>> {
+fn parse_daily_burn(body: &Value, evals: &[i64]) -> BTreeMap<String, Vec<Option<f64>>> {
     let mut out = BTreeMap::new();
     let series = body
         .pointer("/data/result")
@@ -156,14 +178,14 @@ impl MetricsClient {
     pub fn new(base: url::Url) -> Self {
         MetricsClient {
             base,
-            http: http_client(),
+            http: http::client(Duration::from_secs(20)),
         }
     }
 
-    pub async fn daily_burn(&self, now: i64) -> Result<DailyBurn, AppError> {
-        let evals = burn_evals(now);
+    pub async fn daily_burn(&self) -> Result<DailyBurn, AppError> {
+        let evals = burn_evals(crate::session::now_epoch());
         let (start, end) = (evals[0], evals[DAYS - 1]);
-        let resp = self
+        let req = self
             .http
             .get(join(&self.base, "/api/v1/query_range"))
             .query(&[
@@ -171,20 +193,10 @@ impl MetricsClient {
                 ("start", start.to_string()),
                 ("end", end.to_string()),
                 ("step", "86400".to_string()),
-            ])
-            .send()
-            .await
-            .map_err(|e| AppError::Upstream(format!("metrics: {}", reqwest_kind(&e))))?;
-        let body = json_body("metrics", resp).await?;
-        if body.get("status").and_then(Value::as_str) != Some("success") {
-            let err = body
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("query failed");
-            return Err(AppError::Upstream(format!("metrics: {err}")));
-        }
+            ]);
+        let body = json_body("metrics", req).await?;
         Ok(DailyBurn {
-            days: evals.iter().map(|t| t + 60 - 86_400).collect(),
+            day_starts: evals.iter().map(|t| t + 60 - 86_400).collect(),
             by_client: parse_daily_burn(&body, &evals),
         })
     }
@@ -208,8 +220,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Pinned against a live VictoriaMetrics run (2026-09-19): now 08:09Z →
-    /// instants 23:59Z of 09-13 … 09-19, and every column day is a midnight.
+    /// Pinned against a live run (2026-09-19): now 08:09Z → instants 23:59Z
+    /// of 09-13 … 09-19, and every column day is a midnight.
     #[test]
     fn burn_evals_are_seven_consecutive_2359_utc_instants() {
         let evals = burn_evals(1_789_826_976);
@@ -248,11 +260,37 @@ mod tests {
     }
 
     #[test]
+    fn live_budgets_prefers_fleet_and_falls_back_on_absent_or_empty_aggregate() {
+        let mirror = json!({"kody": {"daily_limit": 50000000, "used_today": 1}});
+        // Fleet aggregate present: it wins over the mirror.
+        let (m, fleet) = live_budgets(&json!({
+            "client_budgets": mirror,
+            "cluster": {"budget_usage": {"kody": {"limit": 50000000, "used": 17913067}}}
+        }));
+        assert!(fleet);
+        assert_eq!(m["kody"], (17_913_067.0, 50_000_000.0));
+        // Redis read failed: the LB emits an EMPTY aggregate — fall back.
+        let (m, fleet) = live_budgets(&json!({
+            "client_budgets": mirror,
+            "cluster": {"redis_connected": false, "budget_usage": {}}
+        }));
+        assert!(!fleet);
+        assert_eq!(m["kody"], (1.0, 50_000_000.0));
+        // No cluster info at all (Redis unconfigured / before first tick).
+        let (m, fleet) = live_budgets(&json!({"client_budgets": mirror}));
+        assert!(!fleet && m.len() == 1);
+        // Nothing budgeted anywhere is not a degraded state.
+        let (m, fleet) = live_budgets(&json!({"client_budgets": null}));
+        assert!(fleet && m.is_empty());
+    }
+
+    #[test]
     fn fmt_tokens_humanises() {
         assert_eq!(fmt_tokens(0.0), "0");
         assert_eq!(fmt_tokens(999.0), "999");
         assert_eq!(fmt_tokens(460_214.0), "460K");
         assert_eq!(fmt_tokens(17_913_067.0), "17.9M");
+        // The largest configured daily limit is in the billions.
         assert_eq!(fmt_tokens(15_000_000_000.0), "15.00B");
     }
 }
