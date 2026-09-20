@@ -280,24 +280,32 @@ fn is_cluster_local(url: &reqwest::Url) -> bool {
     host_is_private(h) || (h.parse::<std::net::IpAddr>().is_err() && !h.contains('.'))
 }
 
-/// A key sent in the clear to a host that is not cluster-local is a
+/// A credential sent in the clear to a host that is not cluster-local is a
 /// credential on the wire. Fail closed at boot (Ray on LAB-3283, 2026-09-11):
 /// `https://` anywhere, plain `http://` only to a cluster-local proxy such as
-/// `http://anthropic-lb:8082`, anything else refused. Classified on the URL
-/// as reqwest parses it (lowercased scheme, real host), so the check and the
-/// transport cannot disagree about where the key goes. Messages name the host,
-/// never the raw value: a URL may carry userinfo.
+/// `http://anthropic-lb:8082`, anything else refused. The credential is the
+/// API key when one is set, or URL userinfo (`http://user:secret@host`) which
+/// reqwest sends as Basic auth on every request. Classified on the URL as
+/// reqwest parses it (lowercased scheme, real host), so the check and the
+/// transport cannot disagree about where the credential goes. Messages name
+/// the host, never the raw value: a URL may carry userinfo.
 fn check_credential_transport(var: &str, url: &str, has_api_key: bool) -> Result<(), String> {
-    if !has_api_key {
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(parsed) => parsed,
+        // Keyless and unparseable: nothing to protect; the client reports it.
+        Err(_) if !has_api_key => return Ok(()),
+        Err(e) => return Err(format!("{var} is not a valid URL ({e})")),
+    };
+    let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
+    if !has_api_key && !has_userinfo {
         return Ok(());
     }
-    let parsed = reqwest::Url::parse(url).map_err(|e| format!("{var} is not a valid URL ({e})"))?;
     match parsed.scheme() {
         "https" => Ok(()),
         "http" if is_cluster_local(&parsed) => Ok(()),
         scheme => Err(format!(
             "{var}: {scheme}://{} is neither https nor a cluster-local http proxy; \
-             an API key must not travel in the clear",
+             an API key or URL userinfo must not travel in the clear",
             parsed.host_str().unwrap_or("")
         )),
     }
@@ -2759,7 +2767,6 @@ mod tests {
             "http://proxy.example.net:8082",
             "HTTP://api.anthropic.com",
             "Http://API.Anthropic.com:80",
-            "http://user:pass@api.anthropic.com",
             // A mapped PUBLIC v4, and a global v6 — the latter parses as an
             // IP, so it never reaches the single-label fallback.
             "http://[::ffff:93.184.216.34]:8082",
@@ -2777,7 +2784,8 @@ mod tests {
                 "{bad}"
             );
         }
-        // Allowed: https anywhere, cluster-local plaintext, or no key at all.
+        // Allowed: https anywhere, cluster-local plaintext, or nothing to
+        // protect (no key and no userinfo).
         for ok in [
             "https://api.anthropic.com",
             "HTTPS://api.anthropic.com",
@@ -2797,18 +2805,32 @@ mod tests {
                 "{ok}"
             );
         }
-        for keyless in ["http://api.anthropic.com", "not a url"] {
-            assert!(check_credential_transport("SUMMARY_URL", keyless, false).is_ok());
+        for keyless in [
+            "http://api.anthropic.com",
+            "not a url",
+            "http://user:pass@anthropic-lb:8082",
+        ] {
+            assert!(
+                check_credential_transport("SUMMARY_URL", keyless, false).is_ok(),
+                "{keyless}"
+            );
         }
-        // The refusal goes to pod logs: name the host, never echo a value
-        // that may carry userinfo.
-        let err =
-            check_credential_transport("JUDGE_URL", "http://user:s3cret@api.anthropic.com", true)
-                .unwrap_err();
-        assert!(
-            err.contains("api.anthropic.com") && !err.contains("s3cret"),
-            "{err}"
-        );
+        // Userinfo is a credential too: reqwest sends it as Basic auth on
+        // every request, so it faces the same policy with or without a key.
+        for (bad, has_key) in [
+            ("http://user:s3cret@api.anthropic.com", true),
+            ("http://user:s3cret@api.anthropic.com", false),
+            ("http://user@api.anthropic.com", false),
+            ("http://:s3cret@api.anthropic.com", false),
+        ] {
+            // The refusal goes to pod logs: name the host, never echo a
+            // value that carries userinfo.
+            let err = check_credential_transport("JUDGE_URL", bad, has_key).unwrap_err();
+            assert!(
+                err.contains("api.anthropic.com") && !err.contains("s3cret"),
+                "{bad} {has_key}: {err}"
+            );
+        }
     }
 
     #[test]
