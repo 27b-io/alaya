@@ -48,7 +48,17 @@ pub fn client(timeout: Duration) -> reqwest::Client {
 /// `routes/home.rs`) drop the error, so without this it is invisible.
 pub async fn body_text(what: &str, mut resp: reqwest::Response) -> Result<String, BodyError> {
     let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(BodyError::Transport)? {
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        // `AppError::transport` only builds a string and the per-card
+        // degrade in `routes/home.rs` drops the error outright, so without
+        // this a body that dies mid-stream is recorded nowhere.
+        tracing::warn!(
+            upstream = what,
+            timeout = e.is_timeout(),
+            "upstream body read failed mid-stream"
+        );
+        BodyError::Transport(e)
+    })? {
         if buf.len() + chunk.len() > MAX_BODY_BYTES {
             tracing::warn!(
                 upstream = what,
@@ -69,15 +79,24 @@ pub async fn body_text(what: &str, mut resp: reqwest::Response) -> Result<String
 mod tests {
     use super::*;
 
-    /// Serve `len` bytes on loopback and read them back through `body_text`.
-    async fn read_body_of(len: usize) -> Result<String, BodyError> {
+    /// Serve `app` on an ephemeral loopback port (`:0` — the kernel picks,
+    /// so nothing here is port-dependent). Abort the handle when done.
+    async fn serve(app: axum::Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, handle)
+    }
+
+    /// Serve `len` bytes on loopback and read them back through `body_text`.
+    async fn read_body_of(len: usize) -> Result<String, BodyError> {
         let app = axum::Router::new().route(
             "/",
             axum::routing::get(move || async move { "x".repeat(len) }),
         );
-        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let (addr, server) = serve(app).await;
         let resp = client(Duration::from_secs(10))
             .get(format!("http://{addr}/"))
             .send()
@@ -86,6 +105,38 @@ mod tests {
         let out = body_text("test", resp).await;
         server.abort();
         out
+    }
+
+    /// The SSRF guard the three OIDC fetches lean on: `client()` must refuse
+    /// to follow a 3xx. reqwest already strips `Authorization` on a
+    /// cross-host hop, so the exposure is not header replay — it is that a
+    /// 307/308 replays the REQUEST BODY, and the token POST's body carries
+    /// the authorization `code` and the PKCE `code_verifier`, a one-shot
+    /// credential redeemable for an id_token. A hostile or compromised IdP
+    /// answering the token endpoint with a redirect would receive both.
+    ///
+    /// It also keeps every fetch on the origin `same_origin_https` just
+    /// validated; a followed 3xx would move it off one.
+    ///
+    /// `client()` is the only `Client::builder()` in the crate, so this one
+    /// assertion covers all four upstreams. Nothing else pins the policy.
+    #[tokio::test]
+    async fn client_refuses_to_follow_redirects() {
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::get(|| async { axum::response::Redirect::temporary("/followed") }),
+            )
+            .route("/followed", axum::routing::get(|| async { "FOLLOWED" }));
+        let (addr, server) = serve(app).await;
+        let resp = client(Duration::from_secs(10))
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap();
+        server.abort();
+        // Following it would return 200 from /followed instead.
+        assert_eq!(resp.status().as_u16(), 307);
     }
 
     #[tokio::test]

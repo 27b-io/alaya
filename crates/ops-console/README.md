@@ -45,6 +45,8 @@ CSP (`default-src 'none'`).
 | `CONSOLE_LISTEN_ADDR` | Optional, default `0.0.0.0:3002`. |
 | `LB_URL` / `LB_API_KEY` / `METRICS_URL` | anthropic-lb module — **all three or none**. None: the module is disabled and the home card says so. A partial set refuses startup. `LB_URL` = the LB's base URL; `LB_API_KEY` = an LB **operator** client key, sent server-side as `x-api-key` (the LB rejects `Authorization: Bearer` on `/_stats`); `METRICS_URL` = a Prometheus-compatible query API for the 7-day history — the console only ever calls `/api/v1/query_range` on it, so point it at a route that exposes nothing else. |
 
+Every upstream URL (`ALAYA_URL`, `LB_URL`, `METRICS_URL`) must be https, or plain http to a cluster-local host (`*.svc`, `*.svc.cluster.local`, `*.internal`, a single-label name, or a loopback/private IP literal), and must carry no query string or fragment. Anything else refuses startup — `METRICS_URL` included, keyless or not: off-cluster plaintext leaves the budget history both readable and rewritable in flight. `CONSOLE_OIDC_ISSUER` is stricter still: https only, no cluster-local exemption, and no userinfo (it is printed verbatim in the startup config log).
+
 ### Allowlisting an admin
 
 1. Have them log in once (they'll get a 403 page); the rejected `sub` is in

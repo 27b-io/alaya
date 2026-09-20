@@ -160,6 +160,32 @@ impl OidcRp {
         }
     }
 
+    /// Log an IdP failure, then flatten it into the opaque `OidcRpError`
+    /// that reaches the page. Named for the side effect: every call emits a
+    /// warning. The page deliberately says only "discovery failed"; the pod
+    /// log said nothing at all, so a login outage arrived with no issuer, no
+    /// operation and no cause to triage from.
+    ///
+    /// Never the body — a token-endpoint body holds the id_token. A
+    /// `serde_json::Error` does embed the *unexpected* value on a type
+    /// mismatch, which is safe here only because every IdP-sourced field of
+    /// `Discovery` / `Jwks` / `TokenResponse` is typed `String` (or a
+    /// collection of them): a real token deserializes, so it never becomes
+    /// the unexpected value. Add a non-`String` field and that stops
+    /// holding.
+    ///
+    /// `issuer` is safe to print because `Config::from_env` refuses an
+    /// issuer carrying userinfo.
+    fn warn_idp_failure(&self, op: &'static str, cause: impl std::fmt::Display) -> OidcRpError {
+        tracing::warn!(
+            op,
+            issuer = %self.issuer,
+            cause = %cause,
+            "oidc: identity provider request failed"
+        );
+        OidcRpError(op)
+    }
+
     async fn discovery(&self) -> Result<Discovery, OidcRpError> {
         if let Some(d) = self.discovery.read().await.clone() {
             return Ok(d);
@@ -170,21 +196,34 @@ impl OidcRp {
             .get(&url)
             .send()
             .await
-            .map_err(|_| OidcRpError("discovery failed"))?;
+            .map_err(|e| self.warn_idp_failure("discovery failed", e))?;
         if !resp.status().is_success() {
-            return Err(OidcRpError("discovery status"));
+            return Err(self.warn_idp_failure("discovery status", resp.status()));
         }
         let body = crate::http::body_text("oidc discovery", resp)
             .await
             .map_err(|_| OidcRpError("discovery read"))?;
         let disc: Discovery =
-            serde_json::from_str(&body).map_err(|_| OidcRpError("discovery parse"))?;
+            serde_json::from_str(&body).map_err(|e| self.warn_idp_failure("discovery parse", e))?;
         if normalize_issuer(&disc.issuer) != self.issuer {
-            return Err(OidcRpError("discovery issuer mismatch"));
+            return Err(self.warn_idp_failure("discovery issuer mismatch", &disc.issuer));
         }
-        same_origin_https(&self.issuer, &disc.jwks_uri)?;
-        same_origin_https(&self.issuer, &disc.token_endpoint)?;
-        same_origin_https(&self.issuer, &disc.authorization_endpoint)?;
+        // A discovery document pointing an endpoint off the issuer's origin
+        // is the substituted-IdP signal (OIDC Core §4.3). Name which one:
+        // the bare error cannot say, and this is the rejection an operator
+        // most needs a record of.
+        for (which, endpoint) in [
+            ("jwks_uri", &disc.jwks_uri),
+            ("token_endpoint", &disc.token_endpoint),
+            ("authorization_endpoint", &disc.authorization_endpoint),
+        ] {
+            same_origin_https(&self.issuer, endpoint).map_err(|_| {
+                self.warn_idp_failure(
+                    "endpoint not same-origin with issuer",
+                    format!("{which}={endpoint}"),
+                )
+            })?;
+        }
         *self.discovery.write().await = Some(disc.clone());
         Ok(disc)
     }
@@ -234,15 +273,15 @@ impl OidcRp {
             ])
             .send()
             .await
-            .map_err(|_| OidcRpError("token exchange failed"))?;
+            .map_err(|e| self.warn_idp_failure("token exchange failed", e))?;
         if !resp.status().is_success() {
-            return Err(OidcRpError("token exchange rejected"));
+            return Err(self.warn_idp_failure("token exchange rejected", resp.status()));
         }
         let body = crate::http::body_text("oidc token response", resp)
             .await
             .map_err(|_| OidcRpError("token response read"))?;
-        let tokens: TokenResponse =
-            serde_json::from_str(&body).map_err(|_| OidcRpError("token response parse"))?;
+        let tokens: TokenResponse = serde_json::from_str(&body)
+            .map_err(|e| self.warn_idp_failure("token response parse", e))?;
 
         let claims = self.verify_id_token(&tokens.id_token).await?;
         // Nonce binds the ID token to this login flow (replay defense).
@@ -298,14 +337,15 @@ impl OidcRp {
             .get(&disc.jwks_uri)
             .send()
             .await
-            .map_err(|_| OidcRpError("jwks fetch failed"))?;
+            .map_err(|e| self.warn_idp_failure("jwks fetch failed", e))?;
         if !resp.status().is_success() {
-            return Err(OidcRpError("jwks status"));
+            return Err(self.warn_idp_failure("jwks status", resp.status()));
         }
         let body = crate::http::body_text("oidc jwks", resp)
             .await
             .map_err(|_| OidcRpError("jwks read"))?;
-        let jwks: Jwks = serde_json::from_str(&body).map_err(|_| OidcRpError("jwks parse"))?;
+        let jwks: Jwks =
+            serde_json::from_str(&body).map_err(|e| self.warn_idp_failure("jwks parse", e))?;
         let mut map = HashMap::new();
         for jwk in jwks.keys {
             if let Some(k) = jwk.kid.clone() {

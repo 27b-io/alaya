@@ -62,39 +62,32 @@ impl LbConfig {
         api_key: Option<String>,
         metrics_url: Option<String>,
     ) -> Result<Option<Self>, String> {
-        // Keyless does not mean unchecked. `ftp://…` parses fine as a URL,
-        // so without a scheme check METRICS_URL boots clean and fails at the
-        // first render as a blank history section — which reads as an LB
-        // outage, sending the operator after the wrong system. AC10 is
-        // refuse-at-startup.
-        //
-        // And METRICS_URL's exemption from the credential rule holds only
-        // while it really is keyless: userinfo IS a credential, and `join`
-        // bakes it into every request URL, so one carrying userinfo goes
-        // back through `validate_keyed_url` like any other keyed URL.
+        // One gate for both URLs, keyless included. Everything it refuses
+        // would otherwise boot clean and fail at the first render as a blank
+        // history section — which reads as an LB outage, sending the
+        // operator after the wrong system. AC10 is refuse-at-startup.
         let parse = |key: &str, v: String| {
             let url: url::Url = v
                 .parse()
                 .map_err(|e| format!("{key} is not a valid URL: {e}"))?;
-            if !matches!(url.scheme(), "http" | "https") {
-                return Err(format!("{key} must be an http(s) URL"));
-            }
-            if !url.username().is_empty() || url.password().is_some() {
-                validate_keyed_url(key, &url)?;
+            validate_upstream_url(key, &url)?;
+            // `join` (lb.rs) appends the endpoint path to `Url::as_str()`,
+            // which carries any query and fragment with it — a base of
+            // `…/select?token=x` would request `/select?token=x/api/v1/…`
+            // and leave the card permanently dark behind a non-2xx. Refuse
+            // at boot rather than defer it to the first render.
+            if url.query().is_some() || url.fragment().is_some() {
+                return Err(format!("{key} must have no query string or fragment"));
             }
             Ok(url)
         };
         match (url, api_key, metrics_url) {
             (None, None, None) => Ok(None),
-            (Some(u), Some(k), Some(m)) => {
-                let url = parse("LB_URL", u)?;
-                validate_keyed_url("LB_URL", &url)?;
-                Ok(Some(LbConfig {
-                    url,
-                    api_key: k,
-                    metrics_url: parse("METRICS_URL", m)?,
-                }))
-            }
+            (Some(u), Some(k), Some(m)) => Ok(Some(LbConfig {
+                url: parse("LB_URL", u)?,
+                api_key: k,
+                metrics_url: parse("METRICS_URL", m)?,
+            })),
             (u, k, m) => {
                 let missing: Vec<&str> = [
                     ("LB_URL", u.is_none()),
@@ -194,20 +187,60 @@ fn is_cluster_local(url: &url::Url) -> bool {
     host_is_private(h) || (h.parse::<std::net::IpAddr>().is_err() && !h.contains('.'))
 }
 
-/// A URL a credential travels to (ALAYA_URL bearer, LB_URL x-api-key): https
-/// anywhere, plain http only cluster-local — otherwise refuse startup.
-/// METRICS_URL carries no key and is exempt. The refusal names the host,
-/// never the value (it may carry userinfo).
-fn validate_keyed_url(var: &str, url: &url::Url) -> Result<(), String> {
+/// Transport rule for the console's data upstreams (ALAYA_URL bearer,
+/// LB_URL x-api-key, METRICS_URL): https anywhere, plain http only
+/// cluster-local — otherwise refuse startup. Deliberately STRICTER than
+/// alaya-server's `check_credential_transport`, which still returns early
+/// for a keyless URL: the two gates agree on every keyed URL and diverge
+/// only here, on purpose.
+///
+/// METRICS_URL is in scope despite carrying no key. A credential is not the
+/// only thing worth a TLS hop: off-cluster plaintext leaves the budget
+/// history readable AND rewritable in flight, and a monitoring chart an
+/// on-path attacker can rewrite is worse than no chart — the operator acts
+///
+/// The IdP is NOT on this path — `validate_issuer` holds it to https with
+/// no cluster-local exemption at all.
+///
+/// The refusal names the host, never the value (it may carry userinfo).
+fn validate_upstream_url(var: &str, url: &url::Url) -> Result<(), String> {
     match url.scheme() {
         "https" => Ok(()),
         "http" if is_cluster_local(url) => Ok(()),
-        scheme => Err(format!(
-            "{var}: {scheme}://{} is neither https nor a cluster-local http endpoint; \
-             a key must not travel in the clear",
+        // Two different operator mistakes, two different remedies. Telling
+        // someone who typed `vmselect.monitoring` to "use TLS" sends them
+        // after a certificate when they needed the `.svc` suffix.
+        "http" => Err(format!(
+            "{var}: http://{} is not cluster-local; use https, or the \
+             in-cluster form <service>.<namespace>.svc",
             url.host_str().unwrap_or("")
         )),
+        scheme => Err(format!("{var} must be an http(s) URL (got {scheme})")),
     }
+}
+
+/// The IdP is stricter than every other upstream: https only, with no
+/// cluster-local exemption — and no userinfo.
+///
+/// The userinfo rule is what keeps a credential out of the logs. The issuer
+/// is the one credential-shaped value that reaches a log verbatim: `Config`'s
+/// Debug prints it (`?config` at startup, unconditionally) and `OidcRp` logs
+/// it on every IdP failure. Refusing the shape at boot is one check;
+/// redacting at each log site is a list that grows and will miss one.
+///
+/// Parsed, not string-matched — '@' is legal in a path, and only the parser
+/// decides which bytes are userinfo.
+fn validate_issuer(issuer: &str) -> Result<(), String> {
+    if !issuer.starts_with("https://") {
+        return Err("CONSOLE_OIDC_ISSUER must be https".into());
+    }
+    let url: url::Url = issuer
+        .parse()
+        .map_err(|e| format!("CONSOLE_OIDC_ISSUER is not a valid URL: {e}"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("CONSOLE_OIDC_ISSUER must not carry userinfo".into());
+    }
+    Ok(())
 }
 
 fn required(key: &str) -> Result<String, String> {
@@ -249,9 +282,7 @@ impl Config {
         validate_public_url(&public_url)?;
 
         let oidc_issuer = required("CONSOLE_OIDC_ISSUER")?;
-        if !oidc_issuer.starts_with("https://") {
-            return Err("CONSOLE_OIDC_ISSUER must be https".into());
-        }
+        validate_issuer(&oidc_issuer)?;
 
         let allowed_subjects: Vec<String> = required("CONSOLE_ALLOWED_SUBJECTS")?
             .split(',')
@@ -270,7 +301,7 @@ impl Config {
         let alaya_url: url::Url = required("ALAYA_URL")?
             .parse()
             .map_err(|e| format!("ALAYA_URL is not a valid URL: {e}"))?;
-        validate_keyed_url("ALAYA_URL", &alaya_url)?;
+        validate_upstream_url("ALAYA_URL", &alaya_url)?;
 
         Ok(Config {
             listen_addr: std::env::var("CONSOLE_LISTEN_ADDR")
@@ -319,8 +350,8 @@ mod tests {
     }
 
     #[test]
-    fn keyed_urls_refuse_plaintext_off_cluster() {
-        let ok = |u: &str| validate_keyed_url("LB_URL", &u.parse().unwrap()).is_ok();
+    fn upstream_urls_refuse_plaintext_off_cluster() {
+        let ok = |u: &str| validate_upstream_url("LB_URL", &u.parse().unwrap()).is_ok();
         assert!(ok("https://lb.example.com"));
         assert!(ok("http://anthropic-lb.mcp.svc:8082"));
         // The fully-qualified Service name is the form most k8s docs show.
@@ -347,17 +378,36 @@ mod tests {
         assert!(!ok("http://127.0.0.1.evil.com:8082"));
         assert!(!ok("ftp://anthropic-lb"));
         // The refusal goes to pod logs: name the host, never the userinfo.
-        let err = validate_keyed_url("LB_URL", &"http://u:s3cret@lb.example.com".parse().unwrap())
-            .unwrap_err();
+        let err =
+            validate_upstream_url("LB_URL", &"http://u:s3cret@lb.example.com".parse().unwrap())
+                .unwrap_err();
         assert!(
             err.contains("lb.example.com") && !err.contains("s3cret"),
             "{err}"
         );
-        // Through the group: the keyed URL is checked, the keyless one is not.
+        // Through the group: BOTH URLs are gated, keyless included. One
+        // shared gate in `parse` — the lines differ only in which key
+        // reaches it, so each pins a different variable.
         let k = || Some("k".repeat(40));
         let off = || Some("http://metrics.example.com:8428".to_string());
-        assert!(LbConfig::from_parts(Some("http://lb.example.com".into()), k(), off()).is_err());
-        assert!(LbConfig::from_parts(Some("http://lb:8082".into()), k(), off()).is_ok());
+        let on = || Some("http://vm.mcp.svc:8428".to_string());
+        assert!(LbConfig::from_parts(Some("http://lb.example.com".into()), k(), on()).is_err());
+        assert!(LbConfig::from_parts(Some("http://lb:8082".into()), k(), off()).is_err());
+        assert!(LbConfig::from_parts(Some("http://lb:8082".into()), k(), on()).is_ok());
+    }
+
+    #[test]
+    fn issuer_refuses_userinfo_and_plaintext() {
+        assert!(validate_issuer("https://id.test").is_ok());
+        assert!(validate_issuer("https://id.test/realms/ops").is_ok());
+        assert!(validate_issuer("http://id.test").is_err());
+        // The refusal exists so a credential never reaches `?config` at boot
+        // or an IdP warning; both print the issuer verbatim.
+        let err = validate_issuer("https://console:s3cret@id.test").unwrap_err();
+        assert!(err.contains("userinfo") && !err.contains("s3cret"), "{err}");
+        assert!(validate_issuer("https://console@id.test").is_err());
+        // '@' in a path is not userinfo — only the parser can tell.
+        assert!(validate_issuer("https://id.test/a@b").is_ok());
     }
 
     #[test]
@@ -415,7 +465,7 @@ mod tests {
         // A present-but-garbage URL is an error, not a silent disable.
         assert!(LbConfig::from_parts(Some("not a url".into()), k(), m()).is_err());
         // METRICS_URL carries no key, but it still has to be fetchable —
-        // `ftp://` would otherwise boot clean and blank the history section.
+        // a non-http(s) scheme would otherwise blank the history section.
         let err = LbConfig::from_parts(u(), k(), Some("ftp://metrics.test".into()))
             .err()
             .expect("ftp METRICS_URL must be refused");
@@ -423,28 +473,25 @@ mod tests {
             err.starts_with("METRICS_URL must be an http(s) URL"),
             "{err}"
         );
-        // The keyless exemption holds only while it IS keyless: `join` bakes
-        // userinfo into every request URL, so plaintext to a public host is
-        // a credential on the wire whatever the variable is called.
+        // A refused URL carrying userinfo names the host and never the
+        // credential — the refusal goes to pod logs.
         let err = LbConfig::from_parts(
             u(),
             k(),
             Some("http://ops:hunter2@metrics.example.com:9090".into()),
         )
         .err()
-        .expect("userinfo over plaintext to a public host must be refused");
+        .expect("plaintext METRICS_URL to a public host must be refused");
         assert!(
             err.contains("metrics.example.com") && !err.contains("hunter2"),
             "{err}"
         );
-        // Same credential over TLS, or to a cluster-local host, is fine.
-        assert!(
-            LbConfig::from_parts(u(), k(), Some("https://ops:h@metrics.example.com".into()))
-                .is_ok()
-        );
-        assert!(
-            LbConfig::from_parts(u(), k(), Some("http://ops:h@metrics.mcp.svc:8428".into()))
-                .is_ok()
-        );
+        // `join` appends the endpoint path to `as_str()`, so a base carrying
+        // a query would request `/select?token=x/api/v1/query_range` and
+        // leave the card dark behind a non-2xx. Refused at boot instead.
+        let err = LbConfig::from_parts(u(), k(), Some("http://vm:8428/select?token=x".into()))
+            .err()
+            .expect("METRICS_URL with a query must be refused");
+        assert!(err.contains("query string or fragment"), "{err}");
     }
 }

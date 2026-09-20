@@ -59,8 +59,9 @@ spec:
             - name: ALAYA_URL
               value: "http://alaya-server.mcp.svc:3001"
             # anthropic-lb read-only pane. Plain http, pod-to-pod — the same
-            # trust boundary as ALAYA_URL (a keyed URL that is plain http
-            # off-cluster refuses startup). LB_URL, METRICS_URL (here) and
+            # trust boundary as ALAYA_URL (any console upstream that is
+            # plain http off-cluster refuses startup, METRICS_URL included).
+            # LB_URL, METRICS_URL (here) and
             # LB_API_KEY (Secret) are ONE all-or-nothing group: land all three
             # in the same change. None set → Ālaya-only; a half-set group
             # refuses startup by design.
