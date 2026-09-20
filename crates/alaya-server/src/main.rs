@@ -148,6 +148,12 @@ impl Config {
                 check_credential_transport(var, url, has_api_key).unwrap_or_else(|e| panic!("{e}"));
             }
         }
+        check_credential_transport("QDRANT_URL", &cfg.qdrant_url, cfg.qdrant_api_key.is_some())
+            .unwrap_or_else(|e| panic!("{e}"));
+        if let Some(url) = env_opt("REDIS_CACHE_URL") {
+            check_credential_transport("REDIS_CACHE_URL", &url, false)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
         cfg
     }
 }
@@ -280,10 +286,10 @@ fn check_credential_transport(var: &str, url: &str, has_api_key: bool) -> Result
         return Ok(());
     }
     match parsed.scheme() {
-        "https" => Ok(()),
-        "http" if is_cluster_local(&parsed) => Ok(()),
+        "https" | "rediss" => Ok(()),
+        "http" | "redis" if is_cluster_local(&parsed) => Ok(()),
         scheme => Err(format!(
-            "{var}: {scheme}://{} is neither https nor a cluster-local http proxy; \
+            "{var}: {scheme}://{} is neither https/rediss nor a cluster-local http/redis proxy; \
              an API key or URL userinfo must not travel in the clear",
             parsed.host_str().unwrap_or("")
         )),
@@ -2796,6 +2802,35 @@ mod tests {
                 "{bad} {has_key}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn credential_transport_covers_qdrant_and_redis_schemes() {
+        // QDRANT_URL: http with an API key to a non-cluster host is refused.
+        assert!(check_credential_transport("QDRANT_URL", "http://qdrant.cloud.io", true).is_err());
+        assert!(check_credential_transport("QDRANT_URL", "https://qdrant.cloud.io", true).is_ok());
+        assert!(check_credential_transport("QDRANT_URL", "http://qdrant:6333", true).is_ok());
+        // No key, no userinfo → nothing to protect.
+        assert!(check_credential_transport("QDRANT_URL", "http://qdrant.cloud.io", false).is_ok());
+
+        // REDIS_CACHE_URL: rediss (TLS) accepted anywhere, redis (plaintext)
+        // only to cluster-local when credentials are present.
+        assert!(
+            check_credential_transport("REDIS_CACHE_URL", "rediss://user:pw@redis.cloud.io", false)
+                .is_ok()
+        );
+        assert!(
+            check_credential_transport("REDIS_CACHE_URL", "redis://user:pw@redis.cloud.io", false)
+                .is_err()
+        );
+        assert!(
+            check_credential_transport("REDIS_CACHE_URL", "redis://user:pw@redis-svc:6379", false)
+                .is_ok()
+        );
+        // redis:// with no credentials → fine anywhere.
+        assert!(
+            check_credential_transport("REDIS_CACHE_URL", "redis://redis.cloud.io", false).is_ok()
+        );
     }
 
     #[test]
