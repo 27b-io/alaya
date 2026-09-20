@@ -91,7 +91,7 @@ impl Config {
         let cfg = Self {
             qdrant_url: env_required("QDRANT_URL"),
             qdrant_collection: env_or("QDRANT_COLLECTION", "memories_arctic1024"),
-            qdrant_api_key: std::env::var("QDRANT_API_KEY").ok(),
+            qdrant_api_key: env_opt("QDRANT_API_KEY"),
             embedding_url: env_required("EMBEDDING_URL"),
             embedding_model: env_or("EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-l-v2.0"),
             embedding_dimensions: env_or("EMBEDDING_DIMENSIONS", "1024")
@@ -149,6 +149,8 @@ impl Config {
             }
         }
         check_credential_transport("QDRANT_URL", &cfg.qdrant_url, cfg.qdrant_api_key.is_some())
+            .unwrap_or_else(|e| panic!("{e}"));
+        check_credential_transport("GRAPH_URL", &cfg.graph_url, !cfg.graph_api_key.is_empty())
             .unwrap_or_else(|e| panic!("{e}"));
         if let Some(url) = env_opt("REDIS_CACHE_URL") {
             check_credential_transport("REDIS_CACHE_URL", &url, false)
@@ -261,19 +263,27 @@ fn is_cluster_local(url: &reqwest::Url) -> bool {
     let Some(h) = url.host_str() else {
         return false;
     };
-    let h = h.trim_start_matches('[').trim_end_matches(']');
+    // Lowercase: the url crate only normalises special-scheme hosts (http/https);
+    // non-special schemes (redis, rediss) preserve case from the input.
+    let h = h
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let h = h.as_str();
     host_is_private(h) || (h.parse::<std::net::IpAddr>().is_err() && !h.contains('.'))
 }
 
 /// A credential sent in the clear to a host that is not cluster-local is a
 /// credential on the wire. Fail closed at boot (Ray on LAB-3283, 2026-09-11):
-/// `https://` anywhere, plain `http://` only to a cluster-local proxy such as
-/// `http://anthropic-lb:8082`, anything else refused. The credential is the
-/// API key when one is set, or URL userinfo (`http://user:secret@host`) which
-/// reqwest sends as Basic auth on every request. Classified on the URL as
-/// reqwest parses it (lowercased scheme, real host), so the check and the
-/// transport cannot disagree about where the credential goes. Messages name
-/// the host, never the raw value: a URL may carry userinfo.
+/// `https://` anywhere, plaintext schemes (`http`, `redis`, `rediss` — fred is
+/// built without TLS) only to a cluster-local endpoint such as
+/// `http://anthropic-lb:8082` or `redis://redis-svc:6379`, anything else
+/// refused. The credential is the API key when one is set, or URL-embedded
+/// credentials (`http://user:secret@host` sent as Basic auth by reqwest,
+/// `redis://user:pw@host` sent as `AUTH` by fred). Classified on the URL as
+/// the `url` crate parses it (lowercased scheme, real host), so the check and
+/// the transport cannot disagree about where the credential goes. Messages name
+/// the host, never the raw value: a URL may carry credentials.
 fn check_credential_transport(var: &str, url: &str, has_api_key: bool) -> Result<(), String> {
     let parsed = match reqwest::Url::parse(url) {
         Ok(parsed) => parsed,
@@ -286,11 +296,13 @@ fn check_credential_transport(var: &str, url: &str, has_api_key: bool) -> Result
         return Ok(());
     }
     match parsed.scheme() {
-        "https" | "rediss" => Ok(()),
-        "http" | "redis" if is_cluster_local(&parsed) => Ok(()),
+        "https" => Ok(()),
+        // fred is built without TLS (`enable-rustls`/`enable-native-tls` not
+        // compiled), so `rediss://` opens plain TCP despite the scheme name.
+        "http" | "redis" | "rediss" if is_cluster_local(&parsed) => Ok(()),
         scheme => Err(format!(
-            "{var}: {scheme}://{} is neither https/rediss nor a cluster-local http/redis proxy; \
-             an API key or URL userinfo must not travel in the clear",
+            "{var}: {scheme}://{} is not https and not a cluster-local plaintext endpoint; \
+             an API key or URL credential must not travel in the clear",
             parsed.host_str().unwrap_or("")
         )),
     }
@@ -2724,6 +2736,9 @@ mod tests {
             "http://[::1]:8082",
             // Userinfo bound for a cluster-local proxy is that proxy's business.
             "http://user:pass@anthropic-lb:8082",
+            // Non-special schemes preserve host case; lowercasing fixes this.
+            "redis://user:pw@redis.mcp.SVC:6379",
+            "rediss://user:pw@Redis-Svc:6379",
         ] {
             assert!(is_cluster_local(&parse(ok)), "{ok}");
         }
@@ -2805,31 +2820,32 @@ mod tests {
     }
 
     #[test]
-    fn credential_transport_covers_qdrant_and_redis_schemes() {
-        // QDRANT_URL: http with an API key to a non-cluster host is refused.
-        assert!(check_credential_transport("QDRANT_URL", "http://qdrant.cloud.io", true).is_err());
-        assert!(check_credential_transport("QDRANT_URL", "https://qdrant.cloud.io", true).is_ok());
+    fn credential_transport_covers_qdrant_graph_and_redis() {
+        // QDRANT_URL with API key: cluster-local ok, off-cluster refused.
         assert!(check_credential_transport("QDRANT_URL", "http://qdrant:6333", true).is_ok());
-        // No key, no userinfo → nothing to protect.
-        assert!(check_credential_transport("QDRANT_URL", "http://qdrant.cloud.io", false).is_ok());
+        assert!(check_credential_transport("QDRANT_URL", "http://qdrant.cloud.io", true).is_err());
 
-        // REDIS_CACHE_URL: rediss (TLS) accepted anywhere, redis (plaintext)
-        // only to cluster-local when credentials are present.
-        assert!(
-            check_credential_transport("REDIS_CACHE_URL", "rediss://user:pw@redis.cloud.io", false)
-                .is_ok()
-        );
+        // GRAPH_URL with API key: same policy.
+        assert!(check_credential_transport("GRAPH_URL", "http://alaya-bridge:3000", true).is_ok());
+        assert!(check_credential_transport("GRAPH_URL", "http://graph.cloud.io", true).is_err());
+
+        // redis:// — fred has no TLS, so rediss:// off-cluster is refused too.
         assert!(
             check_credential_transport("REDIS_CACHE_URL", "redis://user:pw@redis.cloud.io", false)
                 .is_err()
         );
         assert!(
+            check_credential_transport("REDIS_CACHE_URL", "rediss://user:pw@redis.cloud.io", false)
+                .is_err()
+        );
+        // Cluster-local: both redis and rediss are fine.
+        assert!(
             check_credential_transport("REDIS_CACHE_URL", "redis://user:pw@redis-svc:6379", false)
                 .is_ok()
         );
-        // redis:// with no credentials → fine anywhere.
         assert!(
-            check_credential_transport("REDIS_CACHE_URL", "redis://redis.cloud.io", false).is_ok()
+            check_credential_transport("REDIS_CACHE_URL", "rediss://user:pw@redis-svc:6379", false)
+                .is_ok()
         );
     }
 
