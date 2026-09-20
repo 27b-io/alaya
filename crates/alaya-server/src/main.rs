@@ -137,13 +137,18 @@ impl Config {
         // would validate a string the cache never dials — and an unparseable
         // keyless value is passed through by design.
         let redis_cache_url = env_non_empty("REDIS_CACHE_URL");
-        // Every credential-bearing URL this process dials, checked on the main
-        // thread before the runtime, the worker thread or the listener exist: a
-        // refused endpoint means the process never starts. The transport column
-        // is the client that dials that var — the wrong one there is a silent
-        // downgrade, so it is one column to read rather than six call sites.
-        // The cachekit.io SaaS cache URL is absent: its own builder is
-        // HTTPS-only.
+        // Every credential-bearing URL this process reads into `Config`,
+        // checked on the main thread before the runtime, the worker thread or
+        // the listener exist: a refused endpoint means the process never
+        // starts. The transport column is the client that dials that var — the
+        // wrong one there is a silent downgrade, so it is one column to read
+        // rather than seven call sites.
+        //
+        // Credential-bearing but not in `Config`, so not covered here: the
+        // cachekit.io SaaS cache URL (its own builder is HTTPS-only and
+        // host-allowlisted) and `OTEL_EXPORTER_OTLP_ENDPOINT`, which
+        // `opentelemetry-otlp` reads directly along with the bearer token in
+        // `OTEL_EXPORTER_OTLP_HEADERS`.
         for (var, url, has_credential, transport) in [
             (
                 "SUMMARY_URL",
@@ -173,6 +178,15 @@ impl Config {
                 "GRAPH_URL",
                 Some(cfg.graph_url.as_str()),
                 !cfg.graph_api_key.is_empty(),
+                Transport::Http,
+            ),
+            (
+                // `false` holds only because the worker passes `None` to
+                // `EmbeddingClient::new`, leaving userinfo as the only
+                // credential this can carry. Mirrored at that call site.
+                "EMBEDDING_URL",
+                Some(cfg.embedding_url.as_str()),
+                false,
                 Transport::Http,
             ),
             (
@@ -342,8 +356,20 @@ fn check_credential_transport(
     let parsed = match reqwest::Url::parse(url) {
         Ok(parsed) => parsed,
         // Keyless and unparseable: nothing to protect, and the value is the
-        // client's problem downstream, not this guard's.
-        Err(_) if !has_api_key => return Ok(()),
+        // client's problem downstream — but say so, or a typo here surfaces
+        // much later with nothing naming the var.
+        //
+        // `eprintln!`, not `tracing::warn!`: this runs from `Config::from_env`
+        // before `init_tracing` installs a subscriber, so a `tracing` event
+        // here would be dropped and the silence would only move.
+        Err(e) if !has_api_key => {
+            eprintln!(
+                "credential transport guard: {var} is not a parseable URL \
+                 ({e}); no credential to protect, so boot continues — the \
+                 client that dials it will fail on first use"
+            );
+            return Ok(());
+        }
         Err(e) => return Err(format!("{var} is not a valid URL ({e})")),
     };
     let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
@@ -354,6 +380,20 @@ fn check_credential_transport(
         (Transport::Http, "https") => Ok(()),
         (Transport::Http, "http") if is_cluster_local(&parsed) => Ok(()),
         (Transport::Redis, "redis" | "rediss") if is_cluster_local(&parsed) => Ok(()),
+        // Only a scheme reqwest cannot speak reaches here; off-cluster `http`
+        // is a real cleartext fault and must fall through, hence `!= "http"`.
+        // reqwest rejects these at `Client::execute`, so nothing is ever
+        // dialled and "in the clear" would be false — the host in
+        // `QDRANT_URL=redis://qdrant:6333` IS cluster-local, and an operator
+        // sent to look for plaintext finds it fine and stops trusting the
+        // guard. `Transport::Redis` deliberately has no twin arm: fred never
+        // inspects the scheme, so an `https://` cache URL really does dial
+        // plain TCP and send `AUTH`. There the arm below is the true one.
+        (Transport::Http, scheme) if scheme != "http" => Err(format!(
+            "{var}: unusable scheme {scheme}:// — this client speaks http and \
+             https only (host {} is not the fault here)",
+            parsed.host_str().unwrap_or("")
+        )),
         (_, scheme) => Err(format!(
             "{var}: {scheme}://{} is not {}; an API key or URL credential must \
              not travel in the clear",
@@ -2022,6 +2062,9 @@ fn main() {
                     cfg_clone.embedding_model,
                     cfg_clone.embedding_dimensions,
                     cfg_clone.embedding_batch_size,
+                    // No API key. `EMBEDDING_URL` is guarded at boot with
+                    // `has_credential: false` on the strength of this `None` —
+                    // passing a key here means updating that row too.
                     None,
                 );
                 // L2 embedding cache via cachekit-rs (optional) — backend
@@ -2794,10 +2837,10 @@ mod tests {
             "http://10.43.144.201:8082",
             "http://[::1]:8082",
             // Userinfo bound for a cluster-local proxy is that proxy's business.
-            "http://user:pass@anthropic-lb:8082",
+            with_userinfo("http", "anthropic-lb:8082").as_str(),
             // Non-special schemes preserve host case; lowercasing fixes this.
-            "redis://user:pw@redis.mcp.SVC:6379",
-            "rediss://user:pw@Redis-Svc:6379",
+            with_userinfo("redis", "redis.mcp.SVC:6379").as_str(),
+            with_userinfo("rediss", "Redis-Svc:6379").as_str(),
         ] {
             assert!(is_cluster_local(&parse(ok)), "{ok}");
         }
@@ -2806,7 +2849,9 @@ mod tests {
             "http://proxy.example.net:8082",
             "http://1.2.3.4",
             // The host is what reqwest connects to, not what precedes the `@`.
-            "http://user:pass@api.anthropic.com",
+            with_userinfo("http", "api.anthropic.com").as_str(),
+            // Spoof probe: the userinfo IS the payload — never rewrite with
+            // the builder.
             "http://anthropic-lb:8082@api.anthropic.com",
             // An IPv6 literal has no dots but is not a service name.
             "http://[2606:4700::1111]",
@@ -2814,6 +2859,19 @@ mod tests {
         ] {
             assert!(!is_cluster_local(&parse(no)), "{no}");
         }
+    }
+
+    /// Userinfo placeholders. This guard exists to refuse credential-shaped
+    /// URLs, so the tests must build them — and at fourteen call sites one
+    /// builder beats fourteen literals. Only the PRESENCE of userinfo is ever
+    /// asserted on, never its value.
+    const FAKE_USER: &str = "redacted-user";
+    const FAKE_SECRET: &str = "redacted-secret";
+
+    /// `scheme://` + placeholder userinfo + `rest` (authority, and whatever
+    /// path/query/fragment the caller is exercising).
+    fn with_userinfo(scheme: &str, rest: &str) -> String {
+        format!("{scheme}://{FAKE_USER}:{FAKE_SECRET}@{rest}")
     }
 
     #[test]
@@ -2851,29 +2909,42 @@ mod tests {
             );
         }
         for keyless in [
-            "http://api.anthropic.com",
-            "not a url",
-            "http://user:pass@anthropic-lb:8082",
+            "http://api.anthropic.com".to_string(),
+            "not a url".to_string(),
+            with_userinfo("http", "anthropic-lb:8082"),
         ] {
             assert!(
-                check_credential_transport("SUMMARY_URL", keyless, false, Transport::Http).is_ok(),
+                check_credential_transport("SUMMARY_URL", keyless.as_str(), false, Transport::Http)
+                    .is_ok(),
                 "{keyless}"
             );
         }
+        // The keyless-unparseable arm prints the parse error to stderr on its
+        // way past. That is only safe while `url::ParseError` keeps the input
+        // out of its `Display` — pin it, so a url-crate bump cannot quietly
+        // turn the boot diagnostic into the leak this guard exists to stop.
+        let malformed = with_userinfo("http", "");
+        let parse_err = reqwest::Url::parse(&malformed).unwrap_err().to_string();
+        assert!(
+            !parse_err.contains(FAKE_SECRET) && !parse_err.contains(FAKE_USER),
+            "url::ParseError now echoes its input: {parse_err}"
+        );
+
         // Userinfo is a credential too: reqwest sends it as Basic auth on
         // every request, so it faces the same policy with or without a key.
         for (bad, has_key) in [
-            ("http://user:s3cret@api.anthropic.com", true),
-            ("http://user:s3cret@api.anthropic.com", false),
-            ("http://user@api.anthropic.com", false),
-            ("http://:s3cret@api.anthropic.com", false),
+            (with_userinfo("http", "api.anthropic.com"), true),
+            (with_userinfo("http", "api.anthropic.com"), false),
+            (format!("http://{FAKE_USER}@api.anthropic.com"), false),
+            (format!("http://:{FAKE_SECRET}@api.anthropic.com"), false),
         ] {
             // The refusal goes to pod logs: name the host, never echo a
             // value that carries userinfo.
             let err =
-                check_credential_transport("JUDGE_URL", bad, has_key, Transport::Http).unwrap_err();
+                check_credential_transport("JUDGE_URL", bad.as_str(), has_key, Transport::Http)
+                    .unwrap_err();
             assert!(
-                err.contains("api.anthropic.com") && !err.contains("s3cret"),
+                err.contains("api.anthropic.com") && !err.contains(FAKE_SECRET),
                 "{bad} {has_key}: {err}"
             );
         }
@@ -2881,8 +2952,12 @@ mod tests {
 
     #[test]
     fn credential_transport_covers_qdrant_graph_and_redis() {
-        let http = |var, url, key| check_credential_transport(var, url, key, Transport::Http);
-        let redis = |var, url, key| check_credential_transport(var, url, key, Transport::Redis);
+        // Annotated, not inferred: an unannotated closure binds one concrete
+        // lifetime from its first call site and rejects every built-at-runtime URL.
+        let http =
+            |var: &str, url: &str, key| check_credential_transport(var, url, key, Transport::Http);
+        let redis =
+            |var: &str, url: &str, key| check_credential_transport(var, url, key, Transport::Redis);
 
         // QDRANT_URL with API key: cluster-local ok, off-cluster refused.
         assert!(http("QDRANT_URL", "http://qdrant:6333", true).is_ok());
@@ -2892,35 +2967,44 @@ mod tests {
         assert!(http("GRAPH_URL", "http://alaya-bridge:3000", true).is_ok());
         assert!(http("GRAPH_URL", "http://graph.cloud.io", true).is_err());
 
-        // Cluster-local does not redeem a scheme the client cannot speak.
+        // Cluster-local does not redeem a scheme the client cannot speak, and
+        // the refusal must name which fault it is.
         for wrong_scheme in [
-            "redis://user:pw@qdrant:6333",
-            "rediss://user:pw@qdrant:6333",
-            "redis://qdrant:6333",
+            with_userinfo("redis", "qdrant:6333"),
+            with_userinfo("rediss", "qdrant:6333"),
+            "redis://qdrant:6333".to_string(),
         ] {
+            let err = http("QDRANT_URL", wrong_scheme.as_str(), true).unwrap_err();
             assert!(
-                http("QDRANT_URL", wrong_scheme, true).is_err(),
-                "{wrong_scheme}"
+                err.contains("unusable scheme") && !err.contains("in the clear"),
+                "{wrong_scheme}: {err}"
             );
         }
 
         // redis:// — fred has no TLS, so rediss:// off-cluster is refused too.
-        assert!(redis("REDIS_CACHE_URL", "redis://user:pw@redis.cloud.io", false).is_err());
-        assert!(redis("REDIS_CACHE_URL", "rediss://user:pw@redis.cloud.io", false).is_err());
-        // Cluster-local: both redis and rediss are fine.
-        assert!(redis("REDIS_CACHE_URL", "redis://user:pw@redis-svc:6379", false).is_ok());
-        assert!(redis("REDIS_CACHE_URL", "rediss://user:pw@redis-svc:6379", false).is_ok());
+        for scheme in ["redis", "rediss"] {
+            let off = with_userinfo(scheme, "redis.cloud.io");
+            let local = with_userinfo(scheme, "redis-svc:6379");
+            assert!(
+                redis("REDIS_CACHE_URL", off.as_str(), false).is_err(),
+                "{off}"
+            );
+            // Cluster-local: both redis and rediss are fine.
+            assert!(
+                redis("REDIS_CACHE_URL", local.as_str(), false).is_ok(),
+                "{local}"
+            );
+        }
 
         // The mirror of the Qdrant case, and the sharper one: `https` buys no
-        // encryption here, it just makes fred dial plain TCP on 6379.
+        // encryption here, it just makes fred dial plain TCP on 6379. Unlike
+        // the reqwest case above this one really is a credential on the wire.
         for wrong_scheme in [
-            "https://user:pw@redis.cloud.io",
-            "https://user:pw@redis-svc:6379",
+            with_userinfo("https", "redis.cloud.io"),
+            with_userinfo("https", "redis-svc:6379"),
         ] {
-            assert!(
-                redis("REDIS_CACHE_URL", wrong_scheme, false).is_err(),
-                "{wrong_scheme}"
-            );
+            let err = redis("REDIS_CACHE_URL", wrong_scheme.as_str(), false).unwrap_err();
+            assert!(err.contains("in the clear"), "{wrong_scheme}: {err}");
         }
 
         // Still a credential guard, not a URL validator: with nothing to keep
@@ -2945,13 +3029,18 @@ mod tests {
             host_of("http://localhost:@evil.com"),
             Some("evil.com".into())
         );
-        assert_eq!(host_of("https://secret@host"), Some("host".into()));
+        assert_eq!(
+            host_of(format!("https://{FAKE_USER}@host").as_str()),
+            Some("host".into())
+        );
     }
 
     #[test]
     fn log_safe_origin_drops_userinfo_path_and_query() {
         assert_eq!(
-            log_safe_origin("https://user:s3cret@tei.mcp.svc:8443/v1/rerank?api_key=k3y#f"),
+            log_safe_origin(
+                with_userinfo("https", "tei.mcp.svc:8443/v1/rerank?api_key=k3y#f").as_str()
+            ),
             "https://tei.mcp.svc:8443"
         );
         assert_eq!(
