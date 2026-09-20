@@ -346,7 +346,7 @@ mod tests {
             JudgeClient {
                 transport: MessagesTransport::new(
                     server.uri(),
-                    Some("k".into()),
+                    Some("test-key".into()),
                     std::time::Duration::from_millis(300),
                 )
                 .expect("test transport"),
@@ -364,7 +364,7 @@ mod tests {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/v1/messages"))
-                .and(header("x-api-key", "k"))
+                .and(header("x-api-key", "test-key"))
                 .and(header("anthropic-version", "2023-06-01"))
                 .and(wiremock::matchers::body_partial_json(json!({
                     "model": "test-model",
@@ -479,7 +479,7 @@ mod tests {
             let client = JudgeClient {
                 transport: MessagesTransport::new(
                     format!("http://127.0.0.1:{port}"),
-                    Some("k".into()),
+                    Some("test-key".into()),
                     std::time::Duration::from_millis(300),
                 )
                 .expect("test transport"),
