@@ -91,7 +91,11 @@ impl Config {
         let cfg = Self {
             qdrant_url: env_required("QDRANT_URL"),
             qdrant_collection: env_or("QDRANT_COLLECTION", "memories_arctic1024"),
-            qdrant_api_key: env_opt("QDRANT_API_KEY"),
+            // `env_non_empty`, not `env_opt`: the latter filters only the
+            // exact empty string, so a whitespace-only value survives as
+            // `Some` and `HeaderValue::from_str` accepts it — a `Bearer   `
+            // header on every Qdrant request, and on the health checker's.
+            qdrant_api_key: env_non_empty("QDRANT_API_KEY"),
             embedding_url: env_required("EMBEDDING_URL"),
             embedding_model: env_or("EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-l-v2.0"),
             embedding_dimensions: env_or("EMBEDDING_DIMENSIONS", "1024")
