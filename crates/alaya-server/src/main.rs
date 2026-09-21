@@ -483,10 +483,14 @@ fn init_l2_saas() -> std::result::Result<cachekit::CacheKit, Box<dyn std::error:
 /// trimming one end alone would break the match. They are trimmed in the
 /// ExternalSecret template instead, where both ends see it.
 fn env_non_empty(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    non_empty_trimmed(std::env::var(key).ok())
+}
+
+/// The transformation above, split from the read so it can be pinned by a
+/// test: `set_var` is `unsafe` in edition 2024 and races every other test in
+/// the binary. Same shape as `parse_judge_daily_cap`, for the same reason.
+fn non_empty_trimmed(raw: Option<String>) -> Option<String> {
+    raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
 /// L2 embedding cache init, dispatched on `CACHE_BACKEND` (default `redis`).
@@ -3076,6 +3080,32 @@ mod tests {
             "{out:?}"
         );
         assert_eq!(calls.get(), 1);
+    }
+
+    // ─── Optional config reads ─────────────────────────────────────────────
+
+    /// `env_non_empty` replaced an untrimmed `env_opt` at every optional call
+    /// site, so a whitespace-only value now reads as absent rather than set.
+    /// Two live consequences, both silent before: `OIDC_ISSUER="   "` used to
+    /// reach the fail-closed boot check as `Some`, satisfying "some auth is
+    /// configured" with an issuer that resolves nothing; and a whitespace-only
+    /// `JUDGE_URL` used to win its own `or_else` and suppress the `SUMMARY_URL`
+    /// fallback, disabling the judge instead of falling back to it.
+    ///
+    /// Pins the helper, not the wiring: nothing here can catch a call site
+    /// that stops using it. A test that rebuilt the `or_else` chain in its own
+    /// body was cut for exactly that — it asserted `Option::or_else`.
+    #[test]
+    fn non_empty_trimmed_treats_blank_as_absent() {
+        assert_eq!(non_empty_trimmed(None), None);
+        assert_eq!(non_empty_trimmed(Some("".into())), None);
+        assert_eq!(non_empty_trimmed(Some("   ".into())), None);
+        assert_eq!(non_empty_trimmed(Some("\t\n ".into())), None);
+        // Trimmed, not merely accepted — the value reaching a client is clean.
+        assert_eq!(
+            non_empty_trimmed(Some("  https://api.anthropic.com  ".into())),
+            Some("https://api.anthropic.com".into())
+        );
     }
 
     // ─── Daily judge spend cap (LAB-3895) ──────────────────────────────────
