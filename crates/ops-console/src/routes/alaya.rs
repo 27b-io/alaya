@@ -592,7 +592,7 @@ pub async fn delete_memory(
     session.verify_csrf(&form.csrf)?;
     validate_hash(&hash)?;
     state.alaya.delete(&hash).await?;
-    tracing::info!(sub = %session.sub, hash = %hash, "memory deleted");
+    tracing::info!(sub = ?session.sub, hash = %hash, "memory deleted");
     Ok(flash_redirect(
         jar,
         state.secure_cookies(),
@@ -714,7 +714,7 @@ pub async fn supersede_submit(
         .alaya
         .supersede(&form.old_hash, &form.new_hash, form.reason.trim())
         .await?;
-    tracing::info!(sub = %session.sub, old = %form.old_hash, new = %form.new_hash, "memory superseded");
+    tracing::info!(sub = ?session.sub, old = %form.old_hash, new = %form.new_hash, "memory superseded");
     Ok(flash_redirect(
         jar,
         state.secure_cookies(),
@@ -785,7 +785,7 @@ pub async fn correct_and_supersede(
         .supersede(&hash, &new_hash, form.reason.trim())
         .await
     {
-        tracing::error!(sub = %session.sub, old = %hash, new = %new_hash, "correction stored but supersede failed");
+        tracing::error!(sub = ?session.sub, old = %hash, new = %new_hash, "correction stored but supersede failed");
         let detail = match e {
             AppError::Upstream(d) => d,
             _ => "supersede failed".to_string(),
@@ -797,7 +797,7 @@ pub async fn correct_and_supersede(
             short_hash(&hash),
         )));
     }
-    tracing::info!(sub = %session.sub, old = %hash, new = %new_hash, "corrected + superseded");
+    tracing::info!(sub = ?session.sub, old = %hash, new = %new_hash, "corrected + superseded");
     Ok(flash_redirect(
         jar,
         state.secure_cookies(),
@@ -862,7 +862,7 @@ async fn relation_action(
             Some(&form.relation_type),
         )
         .await?;
-    tracing::info!(sub = %session.sub, action = %action, source = %form.content_hash, target = %form.target_hash, rel = %form.relation_type, "relation changed");
+    tracing::info!(sub = ?session.sub, action = %action, source = %form.content_hash, target = %form.target_hash, rel = %form.relation_type, "relation changed");
     let back = crate::routes::safe_next(&form.back);
     Ok(flash_redirect(
         jar,
@@ -1114,7 +1114,7 @@ pub async fn merge_submit(
         .and_then(|e| e.as_array())
         .map(|a| a.len())
         .unwrap_or(0);
-    tracing::info!(sub = %session.sub, canonical = %form.canonical_hash, merged, errors, "duplicates merged");
+    tracing::info!(sub = ?session.sub, canonical = %form.canonical_hash, merged, errors, "duplicates merged");
     let msg = if errors > 0 {
         format!(
             "Merged {merged} duplicates into {} ({errors} errors — see server logs).",
@@ -1324,7 +1324,7 @@ pub async fn keep_both_submit(
         .alaya
         .keep_both(&form.memory_a_hash, &form.memory_b_hash)
         .await?;
-    tracing::info!(sub = %session.sub, a = %form.memory_a_hash, b = %form.memory_b_hash, "contradiction kept both");
+    tracing::info!(sub = ?session.sub, a = %form.memory_a_hash, b = %form.memory_b_hash, "contradiction kept both");
     Ok(flash_redirect(
         jar,
         state.secure_cookies(),

@@ -71,15 +71,22 @@ pub async fn callback(
         .await
         .map_err(|e| AppError::Forbidden(format!("login failed: {e}")))?;
 
+    // `sub` is recorded with `?`, not `%`, here and everywhere it is logged.
+    // It is an unvalidated string straight out of the id_token, this line
+    // runs BEFORE the allowlist check on an unauthenticated route, and the
+    // plain-text subscriber writes a `Display`-recorded field verbatim — so
+    // `%` would let a substituted IdP forge whole log records by putting a
+    // newline in the subject. `oidc.rs` pins the mechanism with a test.
+    //
     // Default-deny subject allowlist (AC1): explicit 403, nothing minted.
     if !state.config.subject_allowed(&claims.sub) {
-        tracing::warn!(sub = %claims.sub, "login rejected: subject not allowlisted");
+        tracing::warn!(sub = ?claims.sub, "login rejected: subject not allowlisted");
         return Err(AppError::Forbidden(
             "this account is not authorized for the console".into(),
         ));
     }
 
-    tracing::info!(sub = %claims.sub, "console login");
+    tracing::info!(sub = ?claims.sub, "console login");
     let sess = new_session(
         claims.sub,
         claims.email,

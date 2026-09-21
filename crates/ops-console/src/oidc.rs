@@ -42,9 +42,11 @@ impl std::fmt::Display for OidcRpError {
 /// so the set is enumerated rather than left open as `impl Display`. The
 /// type this exists to exclude is `serde_json::Error`: it renders the
 /// offending input into its own message, and for a token-endpoint body that
-/// input can be a live id_token. It has no impl here, so sending a parse
-/// failure to the wrong helper is a compile error instead of something the
-/// next reviewer has to notice — `warn_idp_parse_failure` is the only route.
+/// input can be a live id_token. It has no impl here, so routing a parse
+/// failure to the wrong helper stops compiling. That catches the accident,
+/// not the act: `String` has an impl — `format!("{which}={endpoint}")` needs
+/// one — so `warn_idp_failure(op, e.to_string())` would still build. The
+/// claim is that nobody reaches the leak by reflex, not that it is sealed.
 trait SafeCause: std::fmt::Display {}
 impl SafeCause for reqwest::Error {}
 impl SafeCause for reqwest::StatusCode {}
@@ -190,8 +192,10 @@ impl OidcRp {
     /// Two callers do pass a PARSED field of the discovery document — the
     /// echoed issuer, and each endpoint that fails the origin check. Those
     /// are attacker-chosen text, which is what the recording below is about.
-    /// `self.issuer` is a different thing and is safe: it is config, and
-    /// `Config::from_env` refuses one carrying userinfo.
+    /// `self.issuer` is config rather than IdP-supplied, but it is recorded
+    /// the same way regardless: `validate_issuer` refuses userinfo and a
+    /// non-https scheme, and says nothing about control characters, so the
+    /// old "it is config, therefore safe" argument did not hold up.
     fn warn_idp_failure(&self, op: &'static str, cause: impl SafeCause) -> OidcRpError {
         // Recorded with `?`, not `%`, and that is not cosmetic. Two callers
         // pass a string lifted straight out of the discovery document. The
@@ -201,10 +205,15 @@ impl OidcRp {
         // string is escaped and quoted onto one line. Capped because the only
         // other bound on it is the 8 MiB body cap, which is a log-flood lever
         // — by chars, since a byte split could land mid-codepoint and panic.
-        let cause: String = cause.to_string().chars().take(256).collect();
+        let full = cause.to_string();
+        let mut cause: String = full.chars().take(256).collect();
+        if cause.chars().count() < full.chars().count() {
+            // Marked, because a cut URL renders as a complete-looking wrong one.
+            cause.push('…');
+        }
         tracing::warn!(
             op,
-            issuer = %self.issuer,
+            issuer = ?self.issuer,
             cause = ?cause,
             "oidc: identity provider request failed"
         );
@@ -235,7 +244,7 @@ impl OidcRp {
     fn warn_idp_parse_failure(&self, op: &'static str, e: &serde_json::Error) -> OidcRpError {
         tracing::warn!(
             op,
-            issuer = %self.issuer,
+            issuer = ?self.issuer,
             category = ?e.classify(),
             line = e.line(),
             column = e.column(),
@@ -481,7 +490,7 @@ mod tests {
     /// neutralises nothing in a field recorded as `Display`. The `?` in
     /// `warn_idp_failure` is the whole guard; this is what holds it there.
     #[test]
-    fn a_newline_in_an_idp_cause_cannot_forge_a_log_line() {
+    fn no_separator_in_an_idp_cause_can_forge_a_log_line() {
         #[derive(Clone, Default)]
         struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Buf {
@@ -507,8 +516,13 @@ mod tests {
             "https://console.test/auth/callback".into(),
         );
         // What a hostile discovery document puts in `issuer`: a plausible
-        // value, then a newline, then a complete forged record.
-        let hostile = "https://id.test\n  WARN ops_console: all clear".to_string();
+        // value, then every separator a log reader might break on, then a
+        // complete forged record. `\n` splits a line-oriented ingester,
+        // U+2028/U+2029/NEL split a Unicode-aware one, ESC drives a terminal.
+        // The oracle below only catches what the input actually carries.
+        let hostile =
+            "https://id.test\n\r\u{2028}\u{2029}\u{85}\u{1b}[31m  WARN ops_console: all clear"
+                .to_string();
         let buf = Buf::default();
         let sub = tracing_subscriber::fmt()
             .with_writer(buf.clone())
@@ -519,14 +533,22 @@ mod tests {
         });
 
         let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        assert_eq!(
-            logged.lines().count(),
-            1,
-            "one event must render as exactly one line: {logged}"
-        );
         assert!(
-            logged.contains("\\n") && !logged.contains("WARN ops_console: all clear\n"),
-            "the newline must be escaped, not emitted: {logged}"
+            logged.contains("\\n"),
+            "the newline must appear escaped: {logged}"
+        );
+        // `lines()` splits on `\n` alone, so asserting one line would pin the
+        // instance and miss the class: a Unicode-aware ingester also breaks on
+        // U+2028/U+2029/NEL, and a terminal on ESC. `str`'s `Debug` escapes
+        // every one of them, and this is the assertion that keeps it doing so.
+        let leaked: Vec<char> = logged
+            .trim_end_matches('\n')
+            .chars()
+            .filter(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "no separator or control char may reach the log raw: {leaked:?} in {logged}"
         );
     }
 
