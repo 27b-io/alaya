@@ -176,7 +176,6 @@ fn app(state: AppState) -> Router {
                     "request",
                     method = %req.method(),
                     path = %req.uri().path(),
-                    version = ?req.version(),
                 )
             }),
         )
@@ -611,10 +610,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// The request span records the path, never the full URI: the query
-    /// string is not a safe thing to log. Asserted on the formatted log at
-    /// `tower_http=debug` (the level that enables the span), with positive
-    /// controls so a broken capture fails instead of passing vacuously.
+    /// Asserted on the formatted log at `tower_http=debug` (the level that
+    /// enables the request span), with positive controls so a broken capture
+    /// fails instead of passing vacuously.
     ///
     /// The subscriber is installed process-wide, not scoped to this future:
     /// every test here drives the same tower-http callsites, and tracing
@@ -627,8 +625,8 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         #[derive(Clone, Default)]
-        struct Sink(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
+        struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for LogBuffer {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
                 self.0.lock().unwrap().extend_from_slice(buf);
                 Ok(buf.len())
@@ -638,7 +636,7 @@ mod tests {
             }
         }
 
-        let sink = Sink::default();
+        let sink = LogBuffer::default();
         let writer = sink.clone();
         let subscriber = tracing_subscriber::fmt()
             .with_env_filter("ops_console=debug,tower_http=debug")
