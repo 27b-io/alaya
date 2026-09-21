@@ -477,7 +477,7 @@ fn init_l2_saas() -> std::result::Result<cachekit::CacheKit, Box<dyn std::error:
 /// Deliberately not the bearer vars (`ALAYA_API_KEY`, `ALAYA_READONLY_API_KEY`,
 /// `GRAPH_API_KEY`): both ends of those compare the bytes they were given, so
 /// trimming one end alone would break the match. They are trimmed in the
-/// ExternalSecret template instead, where both ends see it (LAB-371).
+/// ExternalSecret template instead, where both ends see it.
 fn env_non_empty(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
