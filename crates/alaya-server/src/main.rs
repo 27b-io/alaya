@@ -73,13 +73,15 @@ struct Config {
     summary_url: Option<String>,
     summary_api_key: Option<String>,
     summary_model: String,
-    /// Contradiction judge (LAB-3283). URL and key fall back to the
+    /// Contradiction judge (LAB-3283, LAB-3895). URL and key fall back to the
     /// SUMMARY_* counterpart; with neither set the engine is disabled. The
     /// model has its own default: summaries are priced for volume, verdicts
-    /// for precision on the golden set.
+    /// for precision on the golden set. `judge_daily_cap` bounds store-path
+    /// judge spend per UTC day (default 1000).
     judge_url: Option<String>,
     judge_api_key: Option<String>,
     judge_model: String,
+    judge_daily_cap: usize,
     rerank_url: Option<String>,
     rerank_api_key: Option<String>,
     rerank_top_n: usize,
@@ -121,6 +123,8 @@ impl Config {
             judge_url: env_opt("JUDGE_URL").or_else(|| env_opt("SUMMARY_URL")),
             judge_api_key: env_opt("JUDGE_API_KEY").or_else(|| env_opt("SUMMARY_API_KEY")),
             judge_model: env_opt("JUDGE_MODEL").unwrap_or_else(|| "claude-sonnet-5".into()),
+            judge_daily_cap: parse_judge_daily_cap(env_opt("JUDGE_DAILY_CAP"))
+                .unwrap_or_else(|e| panic!("{e}")),
             rerank_url: env_opt("RERANK_URL"),
             rerank_api_key: env_opt("RERANK_API_KEY"),
             rerank_top_n: env_or("RERANK_TOP_N", "20")
@@ -852,11 +856,12 @@ impl HealthChecker {
 
 // ─── Service worker ─────────────────────────────────────────────────────────
 
-/// Deadlines the worker applies per command. A struct only so tests can
-/// shrink them — production always uses `Default` (the consts above).
+/// Deadlines and limits the worker applies per command. A struct only so tests can
+/// shrink them — in production, deadlines use Default and judge_daily_cap is passed from Config.
 struct WorkerLimits {
     cmd: std::time::Duration,
     long: std::time::Duration,
+    judge_daily_cap: usize,
 }
 
 impl Default for WorkerLimits {
@@ -864,6 +869,7 @@ impl Default for WorkerLimits {
         Self {
             cmd: CMD_DEADLINE,
             long: LONG_CMD_DEADLINE,
+            judge_daily_cap: JUDGE_DAILY_CAP_DEFAULT,
         }
     }
 }
@@ -911,6 +917,9 @@ async fn service_worker(
     // deadline cannot run a second pass over the same unjudged pairs.
     let judge_gate = std::rc::Rc::new(tokio::sync::Semaphore::new(JUDGE_CONCURRENCY));
     let backfill_running = std::rc::Rc::new(std::cell::Cell::new(false));
+    let judge_limiter = std::rc::Rc::new(std::cell::RefCell::new(JudgeDailyCap::new(
+        limits.judge_daily_cap,
+    )));
 
     // First heartbeat: bootstrap is done and the loop is live. Until this
     // stamp the health checker reports the worker as "starting" (progress
@@ -1015,24 +1024,14 @@ async fn service_worker(
                         // Only a genuinely new memory: a re-store re-runs
                         // interference but its edges (and verdicts) already
                         // exist — re-judging would churn and re-bill them.
-                        if !read_only
-                            && svc.judge.is_some()
-                            && !skipped
-                            && r.get("created").and_then(Value::as_bool) == Some(true)
-                            && let Some(new_hash) = r.get("content_hash").and_then(|v| v.as_str())
-                        {
-                            for dst in contradicted_hashes(&r) {
-                                let src = new_hash.to_string();
-                                let svc = svc.clone();
-                                let gate = judge_gate.clone();
-                                tokio::task::spawn_local(async move {
-                                    let Ok(_permit) = gate.acquire().await else {
-                                        return;
-                                    };
-                                    svc.judge_contradiction(&src, &dst).await;
-                                });
-                            }
-                        }
+                        // LAB-3895: store-path judge spend is capped per UTC day.
+                        spawn_store_contradiction_judges(
+                            &svc,
+                            &judge_gate,
+                            &judge_limiter,
+                            &r,
+                            read_only,
+                        );
 
                         json!(r)
                     }
@@ -1529,8 +1528,219 @@ fn contradicted_hashes(store_result: &std::collections::HashMap<String, Value>) 
     hashes
 }
 
+/// Default daily cap for store-path judge calls (LAB-3895).
+const JUDGE_DAILY_CAP_DEFAULT: usize = 1000;
+
+fn parse_judge_daily_cap(raw: Option<String>) -> Result<usize, String> {
+    match raw {
+        None => Ok(JUDGE_DAILY_CAP_DEFAULT),
+        Some(s) if s.trim().is_empty() => Ok(JUDGE_DAILY_CAP_DEFAULT),
+        Some(s) => s.trim().parse::<usize>().map_err(|e| {
+            format!("JUDGE_DAILY_CAP must be a non-negative integer (e.g. 1000): {s} ({e})")
+        }),
+    }
+}
+
+/// Returns (year, month, day) in UTC for a given Unix timestamp in seconds.
+/// Implements Howard Hinnant's civil calendar algorithm (pure integer math).
+fn utc_date(epoch_secs: u64) -> (i32, u32, u32) {
+    let days = (epoch_secs / 86400) as i64;
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d)
+}
+
+fn utc_date_str(epoch_secs: u64) -> String {
+    let (y, m, d) = utc_date(epoch_secs);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Bounds store-path contradiction judging (LAB-3895) on two independent axes:
+/// `cap` judge calls per UTC day (the spend budget, `JUDGE_DAILY_CAP`) and
+/// `JUDGE_STORE_BACKLOG_MAX` tasks outstanding (queued on the gate or in
+/// flight), so a stalled judge endpoint cannot back up one task per
+/// contradicted pair without limit. Separate knobs on purpose: raising the
+/// day's budget for a bulk import must not raise the number of live tasks by
+/// the same factor. A pair refused by either bound stays unjudged for operator
+/// backfill, which is subject to neither.
+struct JudgeDailyCap {
+    cap: usize,
+    current_day: u64,
+    count: usize,
+    /// One WARN per reason per UTC day. Budget and backlog are latched
+    /// separately because they ask the operator for different things — raise
+    /// the cap or drain the queue, versus the judge endpoint is not answering —
+    /// and a shared latch would hide whichever fired second for the rest of the
+    /// day.
+    warned_budget: bool,
+    warned_backlog: bool,
+    /// One permit per outstanding task, held until the task ends. `Arc`, not
+    /// `Rc`: `try_acquire_owned` needs it; the worker is single-threaded anyway.
+    slots: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Clock, so tests can queue calls across a UTC-day boundary.
+    clock: fn() -> u64,
+}
+
+impl JudgeDailyCap {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            current_day: u64::MAX,
+            count: 0,
+            warned_budget: false,
+            warned_backlog: false,
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(JUDGE_STORE_BACKLOG_MAX)),
+            clock: epoch_secs,
+        }
+    }
+
+    /// Start a new UTC day when `now_secs` has crossed into one: fresh budget,
+    /// fresh warnings. Returns the day key `now_secs` falls in.
+    fn roll_day(&mut self, now_secs: u64) -> u64 {
+        let day = now_secs / 86400;
+        if self.current_day != day {
+            self.current_day = day;
+            self.count = 0;
+            self.warned_budget = false;
+            self.warned_backlog = false;
+        }
+        day
+    }
+
+    /// Reserve a slot for one store-path task; `None` once
+    /// `JUDGE_STORE_BACKLOG_MAX` tasks are outstanding.
+    ///
+    /// This refusal warns rather than leaving it to `try_admit`: it happens
+    /// *before* a task exists to consult the budget, so against a stalled judge
+    /// endpoint it is the only skip an operator would ever see.
+    fn try_slot(&mut self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if let Ok(permit) = self.slots.clone().try_acquire_owned() {
+            return Some(permit);
+        }
+        let now = (self.clock)();
+        self.roll_day(now);
+        let date = utc_date_str(now);
+        const MSG: &str = "store-path judge backlog full; pair left unjudged for backfill";
+        if !self.warned_backlog {
+            tracing::warn!(reason = "backlog", max = JUDGE_STORE_BACKLOG_MAX, date = %date, MSG);
+            self.warned_backlog = true;
+        } else {
+            tracing::debug!(reason = "backlog", max = JUDGE_STORE_BACKLOG_MAX, date = %date, MSG);
+        }
+        None
+    }
+
+    /// Try to admit one pair to be judged off the store path at the current time.
+    fn try_admit(&mut self) -> Option<u64> {
+        self.try_admit_at((self.clock)())
+    }
+
+    /// Try to admit one pair at the given unix timestamp (seconds). `Some(day)`
+    /// has billed the day's budget; hand that day back to `refund` if the call
+    /// turns out to have spent nothing.
+    fn try_admit_at(&mut self, now_secs: u64) -> Option<u64> {
+        let day = self.roll_day(now_secs);
+        if self.count < self.cap {
+            self.count += 1;
+            return Some(day);
+        }
+        let date = utc_date_str(now_secs);
+        const MSG: &str = "judge daily cap reached; skipping store-path contradiction judge call";
+        if !self.warned_budget {
+            tracing::warn!(reason = "budget", cap = self.cap, date = %date, MSG);
+            self.warned_budget = true;
+        } else {
+            tracing::debug!(reason = "budget", cap = self.cap, date = %date, MSG);
+        }
+        None
+    }
+
+    /// Give back a unit billed by `try_admit` for a call that spent nothing.
+    /// Ignored once the UTC day has rolled: that unit was drawn on a budget
+    /// that has already reset, and refunding it would credit the wrong day.
+    fn refund(&mut self, day: u64) {
+        if self.current_day == day && self.count > 0 {
+            self.count -= 1;
+        }
+    }
+}
+
+/// Spawns background contradiction judge tasks for new CONTRADICTS signals from a store result
+/// (LAB-3895). Returns the number of tasks spawned; a pair is skipped (left unjudged for
+/// backfill) once `JUDGE_STORE_BACKLOG_MAX` tasks are outstanding. The daily cap itself is
+/// applied inside each task, once it holds a gate permit and just before the call: a pair
+/// queued before UTC midnight is billed to the day it actually runs, so a process's calls in
+/// any UTC day never exceed the cap.
+fn spawn_store_contradiction_judges(
+    svc: &std::rc::Rc<MemoryService>,
+    judge_gate: &std::rc::Rc<tokio::sync::Semaphore>,
+    limiter: &std::rc::Rc<std::cell::RefCell<JudgeDailyCap>>,
+    result: &std::collections::HashMap<String, Value>,
+    read_only: bool,
+) -> usize {
+    let skipped = result
+        .get("duplicate")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if read_only
+        || svc.judge.is_none()
+        || skipped
+        || result.get("created").and_then(Value::as_bool) != Some(true)
+    {
+        return 0;
+    }
+    let Some(new_hash) = result.get("content_hash").and_then(|v| v.as_str()) else {
+        return 0;
+    };
+
+    let mut spawned = 0;
+    for dst in contradicted_hashes(result) {
+        // Bound the borrow to this statement: `try_slot` warns, so it needs `&mut`.
+        let slot = limiter.borrow_mut().try_slot();
+        let Some(slot) = slot else { continue };
+        let src = new_hash.to_string();
+        let svc = svc.clone();
+        let gate = judge_gate.clone();
+        let limiter = limiter.clone();
+        tokio::task::spawn_local(async move {
+            let _slot = slot; // released when this task ends, refused or judged
+            let Ok(_permit) = gate.acquire().await else {
+                return;
+            };
+            // Synchronous, so the borrow ends before the await below.
+            let admitted = limiter.borrow_mut().try_admit();
+            let Some(day) = admitted else {
+                return;
+            };
+            let outcome = svc.judge_contradiction(&src, &dst).await;
+            // Give the unit back when nothing was billed: a graph or vector blip
+            // mid-import must not spend the day's budget on no-ops. `spent()`
+            // owns which paths are free; a judged pair stays billed even if the
+            // edge write failed — the tokens went out either way.
+            if !outcome.spent() {
+                limiter.borrow_mut().refund(day);
+            }
+        });
+        spawned += 1;
+    }
+    spawned
+}
+
 /// In-flight judge calls during a backfill (LAB-3283 AC-5).
 const JUDGE_CONCURRENCY: usize = 4;
+/// Store-path judge tasks that may be outstanding at once — queued on the gate
+/// or in flight (LAB-3895). Bounds how far a stalled judge endpoint can back up
+/// behind `JUDGE_CONCURRENCY`; deliberately *not* `JUDGE_DAILY_CAP`, which is a
+/// spend budget and would otherwise double as a throughput limit.
+const JUDGE_STORE_BACKLOG_MAX: usize = 64;
 /// Retries on 429 before a pair is counted unjudged (AC-9).
 const JUDGE_MAX_RETRIES: u32 = 5;
 const JUDGE_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
@@ -1623,7 +1833,10 @@ async fn backfill_judge(
             // (four sleeping pairs would stall the pass and the store path).
             with_backoff(|| async {
                 let Ok(_permit) = gate.acquire().await else {
-                    return JudgeOutcome::Unjudged { marked: false };
+                    return JudgeOutcome::Unjudged {
+                        marked: false,
+                        spent: false,
+                    };
                 };
                 svc.judge_contradiction(&p.memory_a_hash, &p.memory_b_hash)
                     .await
@@ -1647,9 +1860,9 @@ async fn backfill_judge(
                 t.input_tokens += judgement.input_tokens;
                 t.output_tokens += judgement.output_tokens;
             }
-            JudgeOutcome::Unjudged { marked: true } => t.marked += 1,
+            JudgeOutcome::Unjudged { marked: true, .. } => t.marked += 1,
             // `with_backoff` never returns RateLimited; treat it as transient.
-            JudgeOutcome::Unjudged { marked: false } | JudgeOutcome::RateLimited { .. } => {
+            JudgeOutcome::Unjudged { marked: false, .. } | JudgeOutcome::RateLimited { .. } => {
                 t.unjudged += 1
             }
         }
@@ -1677,7 +1890,10 @@ where
                         retries = n,
                         "backfill: still rate limited, giving up on pair"
                     );
-                    return JudgeOutcome::Unjudged { marked: false };
+                    return JudgeOutcome::Unjudged {
+                        marked: false,
+                        spent: false,
+                    };
                 }
                 let wait = retry_after_secs
                     .map(std::time::Duration::from_secs)
@@ -1693,7 +1909,10 @@ where
             }
         }
     }
-    JudgeOutcome::Unjudged { marked: false }
+    JudgeOutcome::Unjudged {
+        marked: false,
+        spent: false,
+    }
 }
 
 /// Fire-and-forget summary generation helper.
@@ -1911,6 +2130,7 @@ fn main() {
                 origin = log_safe_origin(url).as_str(),
                 model = config.judge_model.as_str(),
                 has_api_key = config.judge_api_key.is_some(),
+                daily_cap = config.judge_daily_cap,
                 "contradiction judge enabled (advisory: annotates CONTRADICTS edges, never writes memories)"
             );
             Some(
@@ -1976,7 +2196,11 @@ fn main() {
                     svc = svc.with_reranker(Box::new(rerank));
                 }
 
-                service_worker(rx, svc, progress_for_worker, WorkerLimits::default()).await;
+                let limits = WorkerLimits {
+                    judge_daily_cap: cfg_clone.judge_daily_cap,
+                    ..WorkerLimits::default()
+                };
+                service_worker(rx, svc, progress_for_worker, limits).await;
             });
         }));
 
@@ -2679,7 +2903,13 @@ mod tests {
         })
         .await;
         assert!(
-            matches!(out, JudgeOutcome::Unjudged { marked: false }),
+            matches!(
+                out,
+                JudgeOutcome::Unjudged {
+                    marked: false,
+                    spent: false
+                }
+            ),
             "{out:?}"
         );
         assert_eq!(calls.get(), JUDGE_MAX_RETRIES + 1);
@@ -2696,14 +2926,509 @@ mod tests {
         let calls = std::cell::Cell::new(0u32);
         let out = with_backoff(|| {
             calls.set(calls.get() + 1);
-            async { JudgeOutcome::Unjudged { marked: true } }
+            async {
+                JudgeOutcome::Unjudged {
+                    marked: true,
+                    spent: true,
+                }
+            }
         })
         .await;
         assert!(
-            matches!(out, JudgeOutcome::Unjudged { marked: true }),
+            matches!(
+                out,
+                JudgeOutcome::Unjudged {
+                    marked: true,
+                    spent: true
+                }
+            ),
             "{out:?}"
         );
         assert_eq!(calls.get(), 1);
+    }
+
+    // ─── Daily judge spend cap (LAB-3895) ──────────────────────────────────
+
+    #[test]
+    fn parse_judge_daily_cap_defaults_and_validates() {
+        assert_eq!(parse_judge_daily_cap(None).unwrap(), 1000);
+        assert_eq!(parse_judge_daily_cap(Some("".into())).unwrap(), 1000);
+        assert_eq!(parse_judge_daily_cap(Some("  ".into())).unwrap(), 1000);
+        assert_eq!(parse_judge_daily_cap(Some("1000".into())).unwrap(), 1000);
+        assert_eq!(parse_judge_daily_cap(Some("50".into())).unwrap(), 50);
+        assert_eq!(parse_judge_daily_cap(Some("0".into())).unwrap(), 0);
+
+        let err = parse_judge_daily_cap(Some("foo".into())).unwrap_err();
+        assert!(err.contains("JUDGE_DAILY_CAP must be a non-negative integer"));
+        assert!(err.contains("foo"));
+
+        let err = parse_judge_daily_cap(Some("-10".into())).unwrap_err();
+        assert!(err.contains("JUDGE_DAILY_CAP must be a non-negative integer"));
+
+        let err = parse_judge_daily_cap(Some("12.5".into())).unwrap_err();
+        assert!(err.contains("JUDGE_DAILY_CAP must be a non-negative integer"));
+    }
+
+    const DAY1: u64 = 1789733949; // 2026-09-18
+
+    #[test]
+    fn utc_date_str_computes_civil_calendar_correctly() {
+        // Unix epoch start
+        assert_eq!(utc_date_str(0), "1970-01-01");
+        assert_eq!(utc_date_str(86399), "1970-01-01");
+        assert_eq!(utc_date_str(86400), "1970-01-02");
+        // Leap year 2024-02-29 (1709164800 is 2024-02-29 00:00:00 UTC)
+        assert_eq!(utc_date_str(1709164800), "2024-02-29");
+        assert_eq!(utc_date_str(1709251199), "2024-02-29");
+        assert_eq!(utc_date_str(1709251200), "2024-03-01");
+        // Known date: 2026-09-18
+        assert_eq!(utc_date_str(DAY1), "2026-09-18");
+    }
+
+    #[test]
+    fn judge_daily_cap_cap_reached_and_rollover() {
+        let mut limiter = JudgeDailyCap::new(2);
+        let day1 = DAY1;
+        let day2 = day1 + 86400; // 2026-09-19
+
+        // Day 1: admit 2 items, each billed to day 1.
+        assert_eq!(limiter.try_admit_at(day1), Some(day1 / 86400));
+        assert_eq!(limiter.count, 1);
+        assert!(!limiter.warned_budget);
+
+        assert_eq!(limiter.try_admit_at(day1), Some(day1 / 86400));
+        assert_eq!(limiter.count, 2);
+        assert!(!limiter.warned_budget);
+
+        // Day 1: 3rd item hits cap, sets warned_budget = true
+        assert_eq!(limiter.try_admit_at(day1), None);
+        assert_eq!(limiter.count, 2);
+        assert!(limiter.warned_budget);
+
+        // Day 1: 4th item is silent, still refused
+        assert_eq!(limiter.try_admit_at(day1), None);
+        assert_eq!(limiter.count, 2);
+        assert!(limiter.warned_budget);
+
+        // Day 2 (rollover): counter and warning reset!
+        assert_eq!(limiter.try_admit_at(day2), Some(day2 / 86400));
+        assert_eq!(limiter.count, 1);
+        assert!(!limiter.warned_budget);
+        assert_eq!(limiter.current_day, day2 / 86400);
+
+        assert_eq!(limiter.try_admit_at(day2), Some(day2 / 86400));
+        assert_eq!(limiter.count, 2);
+        assert!(!limiter.warned_budget);
+
+        // Day 2: cap reached again, warned fires once for day 2
+        assert_eq!(limiter.try_admit_at(day2), None);
+        assert_eq!(limiter.count, 2);
+        assert!(limiter.warned_budget);
+
+        assert_eq!(limiter.try_admit_at(day2), None);
+        assert_eq!(limiter.count, 2);
+        assert!(limiter.warned_budget);
+    }
+
+    /// A unit is returned only to the day that was billed for it, and only for
+    /// a call that spent nothing. After a UTC rollover the refund is dropped:
+    /// crediting it would hand the new day free budget it never used.
+    #[test]
+    fn judge_daily_cap_refund_is_day_scoped() {
+        let mut limiter = JudgeDailyCap::new(2);
+        let day1 = DAY1 / 86400;
+
+        let billed = limiter.try_admit_at(DAY1).expect("admitted");
+        assert_eq!(limiter.count, 1);
+        limiter.refund(billed);
+        assert_eq!(limiter.count, 0, "the unit is back for reuse today");
+
+        // A refund for a day that has rolled is ignored, and never underflows.
+        assert_eq!(limiter.try_admit_at(DAY1), Some(day1));
+        assert_eq!(limiter.try_admit_at(DAY1 + 86400), Some(day1 + 1));
+        assert_eq!(limiter.count, 1, "rollover reset the count");
+        limiter.refund(day1);
+        assert_eq!(limiter.count, 1, "yesterday's refund does not credit today");
+        limiter.refund(day1 + 1);
+        limiter.refund(day1 + 1);
+        assert_eq!(limiter.count, 0, "saturates at zero");
+    }
+
+    #[test]
+    fn judge_daily_cap_zero_cap_refuses_immediately() {
+        let mut limiter = JudgeDailyCap::new(0);
+        let now = DAY1;
+        assert_eq!(limiter.try_admit_at(now), None);
+        assert!(limiter.warned_budget);
+        assert_eq!(limiter.try_admit_at(now), None);
+    }
+
+    struct StubJudge;
+
+    #[async_trait::async_trait(?Send)]
+    impl alaya_backends::ContradictionJudge for StubJudge {
+        /// Answers like a model that returned garbage: deterministic, and the
+        /// tokens went out. Tests behind a hanging store never get this far.
+        async fn judge(
+            &self,
+            _a: &alaya_types::memory::Memory,
+            _b: &alaya_types::memory::Memory,
+        ) -> alaya_types::Result<alaya_backends::Judgement> {
+            Err(alaya_types::AlayaError::Judge("malformed verdict".into()))
+        }
+        fn model_name(&self) -> &str {
+            "stub-judge"
+        }
+    }
+
+    thread_local! {
+        static FAKE_NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    fn fake_now() -> u64 {
+        FAKE_NOW.get()
+    }
+
+    /// A limiter on the test clock, shared the way `service_worker` shares it.
+    fn capped(cap: usize) -> std::rc::Rc<std::cell::RefCell<JudgeDailyCap>> {
+        std::rc::Rc::new(std::cell::RefCell::new(JudgeDailyCap {
+            clock: fake_now,
+            ..JudgeDailyCap::new(cap)
+        }))
+    }
+
+    /// A judge-enabled service whose backend never answers: an admitted call
+    /// parks holding its gate permit and slot, as against a stalled endpoint.
+    fn judged_hanging_service() -> std::rc::Rc<MemoryService> {
+        std::rc::Rc::new(wedge_tests::hanging_service().with_judge(Box::new(StubJudge)))
+    }
+
+    /// A judge-enabled service whose store answers `get_batch` with `batch`,
+    /// so a spawned task runs to completion and the limiter can be read after.
+    fn judged_service_with_batch(
+        batch: Vec<alaya_types::memory::Memory>,
+    ) -> std::rc::Rc<MemoryService> {
+        std::rc::Rc::new(wedge_tests::stub_service(Some(batch)).with_judge(Box::new(StubJudge)))
+    }
+
+    fn mem(hash: &str) -> alaya_types::memory::Memory {
+        serde_json::from_value(json!({
+            "content": "c", "content_hash": hash, "tags": [], "memory_type": "note",
+            "created_at": 0.0, "updated_at": 0.0,
+        }))
+        .expect("memory")
+    }
+
+    /// A `created` store result whose new memory contradicts `n` existing ones.
+    fn store_result_contradicting(n: usize) -> std::collections::HashMap<String, Value> {
+        let contradictions: Vec<Value> = (0..n)
+            .map(|i| json!({"existing_hash": format!("{i:064x}"), "signal_type": "Negation"}))
+            .collect();
+        let mut r = std::collections::HashMap::new();
+        r.insert("created".to_string(), json!(true));
+        r.insert("content_hash".to_string(), json!("a".repeat(64)));
+        r.insert(
+            "interference".to_string(),
+            json!({"contradictions": contradictions}),
+        );
+        r
+    }
+
+    /// Run the spawned local tasks: `run_until` polls every ready local task
+    /// each time the inner future returns Pending, so one yield is one tick.
+    async fn settle() {
+        tokio::task::yield_now().await;
+    }
+
+    #[tokio::test]
+    async fn store_contradiction_judge_admits_at_call_time_and_bounds_backlog() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let svc = judged_hanging_service();
+                let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(4));
+                let limiter = capped(2);
+                FAKE_NOW.set(DAY1);
+                let r = store_result_contradicting(2);
+
+                // 1. Two pairs: queued, then admitted once each holds a permit.
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    2
+                );
+                settle().await;
+                assert_eq!(limiter.borrow().count, 2);
+                assert!(!limiter.borrow().warned_budget);
+
+                // 2. The budget is spent but the backlog is not: the pairs are still
+                //    queued, and refused inside the task rather than at the slot gate.
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    2
+                );
+                settle().await;
+                assert_eq!(limiter.borrow().count, 2, "budget holds at the cap");
+                assert!(limiter.borrow().warned_budget, "and the operator is told");
+
+                // 3. Under read_only: nothing is ever queued.
+                let fresh = capped(10);
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &fresh, &r, true),
+                    0
+                );
+                assert_eq!(fresh.borrow().count, 0);
+            })
+            .await;
+    }
+
+    /// With the day's budget spent, a queued pair is refused when its call would
+    /// start. The task exits without calling the judge, so its slot frees.
+    #[tokio::test]
+    async fn store_contradiction_judge_refused_at_call_time_stays_unjudged() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let svc = judged_hanging_service();
+                let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(4));
+                let limiter = capped(1);
+                FAKE_NOW.set(DAY1);
+                assert!(
+                    limiter.borrow_mut().try_admit().is_some(),
+                    "spend today's budget"
+                );
+                let r = store_result_contradicting(1);
+
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    1
+                );
+                settle().await;
+                assert_eq!(limiter.borrow().count, 1);
+                assert!(limiter.borrow().warned_budget, "refused at call time");
+                // Its slot is free again: the refused task never reached the stalled call.
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    1
+                );
+            })
+            .await;
+    }
+
+    /// A pair queued on the judge gate before UTC midnight is billed to the
+    /// day the call runs. Billing at spawn time let the new day's calls exceed
+    /// the cap by the size of the overnight backlog.
+    #[tokio::test]
+    async fn store_contradiction_judge_bills_the_day_the_call_runs() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let svc = judged_hanging_service();
+                // No permits: every spawned task queues on the gate.
+                let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(0));
+                let limiter = capped(2);
+                let r = store_result_contradicting(2);
+
+                let midnight = (DAY1 / 86400 + 1) * 86400;
+                FAKE_NOW.set(midnight - 1);
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    2
+                );
+                settle().await;
+                // Queued, not admitted: day 1 has been billed nothing.
+                assert_eq!(limiter.borrow().count, 0);
+                assert_eq!(limiter.borrow().current_day, u64::MAX);
+
+                // Midnight passes while the pairs are still queued.
+                FAKE_NOW.set(midnight);
+                gate.add_permits(2);
+                settle().await;
+                let l = limiter.borrow();
+                assert_eq!(l.current_day, midnight / 86400);
+                assert_eq!(l.count, 2, "the queued calls draw on day 2's quota");
+            })
+            .await;
+    }
+
+    /// The refusal an operator actually meets first when the judge endpoint
+    /// stalls: the backlog fills, so pairs are turned away at the slot gate
+    /// before any task exists to consult the day's budget. That path must warn
+    /// on its own — `debug!` is invisible under the `alaya_server=info` filter
+    /// both the crate default and the compose file pin.
+    #[tokio::test]
+    async fn store_contradiction_judge_warns_when_the_backlog_refuses() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let svc = judged_hanging_service();
+                let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(4));
+                // Budget far above the backlog: the backlog is what refuses.
+                let limiter = capped(100_000);
+                FAKE_NOW.set(DAY1);
+                let r = store_result_contradicting(JUDGE_STORE_BACKLOG_MAX + 1);
+
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    JUDGE_STORE_BACKLOG_MAX,
+                    "one pair over the backlog is refused"
+                );
+                assert!(
+                    limiter.borrow().warned_backlog,
+                    "and the operator is told, at WARN"
+                );
+                assert!(
+                    !limiter.borrow().warned_budget,
+                    "the budget was never the reason"
+                );
+
+                // Subsequent refusals that day are silent, and the backlog stays shut.
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    0
+                );
+            })
+            .await;
+    }
+
+    /// `JUDGE_DAILY_CAP=0` disables store-path judging. It must say so: the
+    /// whole point of the cap is that the guard trips loudly.
+    #[tokio::test]
+    async fn store_contradiction_judge_zero_cap_warns_through_the_spawn_path() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let svc = judged_hanging_service();
+                let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(4));
+                let limiter = capped(0);
+                FAKE_NOW.set(DAY1);
+                let r = store_result_contradicting(1);
+
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    1,
+                    "a zero budget still reserves a slot, so the task can report it"
+                );
+                settle().await;
+                assert_eq!(limiter.borrow().count, 0);
+                assert!(limiter.borrow().warned_budget);
+            })
+            .await;
+    }
+
+    /// A call that never reached the judge costs nothing, so it must not cost
+    /// budget either — otherwise a vector-store blip mid-import spends the
+    /// day's ceiling on no-ops. An invalid pair is rejected inside
+    /// `judge_contradiction` before any request goes out.
+    #[tokio::test]
+    async fn store_contradiction_judge_refunds_a_call_that_spent_nothing() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let svc = judged_hanging_service();
+                let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(4));
+                let limiter = capped(1);
+                FAKE_NOW.set(DAY1);
+
+                let mut r = std::collections::HashMap::new();
+                r.insert("created".to_string(), json!(true));
+                r.insert("content_hash".to_string(), json!("a".repeat(64)));
+                r.insert(
+                    "interference".to_string(),
+                    json!({"contradictions": [{"existing_hash": "not-a-hash"}]}),
+                );
+
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    1
+                );
+                settle().await;
+                assert_eq!(
+                    limiter.borrow().count,
+                    0,
+                    "the unit is back: nothing was sent to the judge"
+                );
+                assert!(!limiter.borrow().warned_budget);
+            })
+            .await;
+    }
+
+    /// The refund keys on `spent`, not `marked` (LAB-3901): a pair whose other
+    /// endpoint is missing from the store is marked (so the backfill skips it)
+    /// yet sent nothing, so its unit comes back; a malformed verdict is marked
+    /// too, but the tokens went out, so it stays billed.
+    #[tokio::test]
+    async fn store_contradiction_judge_refunds_by_spend_not_by_marker() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(4));
+                let r = store_result_contradicting(1);
+                let (src, dst) = ("a".repeat(64), "0".repeat(64));
+                FAKE_NOW.set(DAY1);
+
+                // Endpoint missing: only the new memory is in the store.
+                let svc = judged_service_with_batch(vec![mem(&src)]);
+                let limiter = capped(1);
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    1
+                );
+                settle().await;
+                assert_eq!(
+                    limiter.borrow().count,
+                    0,
+                    "marked, but nothing was sent: refunded"
+                );
+
+                // Malformed verdict: both endpoints present, the stub judge errs.
+                let svc = judged_service_with_batch(vec![mem(&src), mem(&dst)]);
+                let limiter = capped(1);
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    1
+                );
+                settle().await;
+                assert_eq!(
+                    limiter.borrow().count,
+                    1,
+                    "marked and paid for: stays billed"
+                );
+            })
+            .await;
+    }
+
+    /// AC-4: the operator backfill is not subject to the daily cap. The proof
+    /// is structural — `backfill_judge` takes no limiter — so the test drives a
+    /// pair through it with the budget exhausted and asserts the pair was
+    /// actually processed. A vacuous `vec![]` would pass even if it were capped.
+    #[tokio::test]
+    async fn backfill_ignores_daily_cap() {
+        let mut limiter = JudgeDailyCap::new(0);
+        assert_eq!(limiter.try_admit(), None, "no budget left today");
+
+        // Invalid hashes: judged without a request going out, so the pass
+        // completes without a live judge backend.
+        let pair = alaya_types::graph::Contradiction {
+            memory_a_hash: "not-a-hash".into(),
+            memory_b_hash: "also-not-a-hash".into(),
+            confidence: None,
+            created_at: None,
+            verdict: None,
+            resolution: None,
+            resolved_at: None,
+            resolved_via: None,
+        };
+        let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(JUDGE_CONCURRENCY));
+        let svc = wedge_tests::hanging_service().with_judge(Box::new(StubJudge));
+        let totals = backfill_judge(&svc, &gate, vec![pair]).await;
+        assert_eq!(
+            totals,
+            BackfillTotals {
+                unjudged: 1,
+                ..Default::default()
+            },
+            "the backfill processed the pair despite the exhausted cap"
+        );
     }
 
     #[test]
@@ -2905,10 +3630,13 @@ mod wedge_tests {
         );
     }
 
-    /// VectorStorage whose `delete` blackholes — models a backend whose pod
-    /// IP vanished without an RST. Every other method panics: the test only
-    /// exercises the delete path and the no-op ping.
-    struct HangVectors;
+    /// VectorStorage whose `delete` and `get_batch` blackhole — models a
+    /// backend whose pod IP vanished without an RST. `get_batch` can instead
+    /// answer a fixed batch, so a judge task can run to completion. Every
+    /// other method panics: no test exercises them.
+    struct HangVectors {
+        batch: Option<Vec<Memory>>,
+    }
 
     #[async_trait(?Send)]
     impl VectorStorage for HangVectors {
@@ -2930,7 +3658,10 @@ mod wedge_tests {
             unimplemented!()
         }
         async fn get_batch(&self, _hashes: &[&str]) -> Result<Vec<Memory>> {
-            unimplemented!()
+            match &self.batch {
+                Some(b) => Ok(b.clone()),
+                None => std::future::pending().await,
+            }
         }
         async fn delete(&self, _content_hash: &str) -> Result<bool> {
             std::future::pending().await
@@ -3076,7 +3807,8 @@ mod wedge_tests {
             _dst: &str,
             _verdict: &alaya_types::graph::EdgeVerdict,
         ) -> Result<bool> {
-            unimplemented!()
+            // The marker write lands, so a judge task can finish `marked: true`.
+            Ok(true)
         }
         async fn set_contradiction_resolution(
             &self,
@@ -3153,9 +3885,14 @@ mod wedge_tests {
         }
     }
 
-    fn hanging_service() -> MemoryService {
+    pub(super) fn hanging_service() -> MemoryService {
+        stub_service(None)
+    }
+
+    /// `hanging_service`, with `get_batch` answering `batch` when given.
+    pub(super) fn stub_service(batch: Option<Vec<Memory>>) -> MemoryService {
         MemoryService::new(
-            Box::new(HangVectors),
+            Box::new(HangVectors { batch }),
             Box::new(StubEmbeddings),
             Box::new(StubGraph),
             Box::new(StubHebbian),
@@ -3179,6 +3916,7 @@ mod wedge_tests {
                 let limits = WorkerLimits {
                     cmd: Duration::from_millis(100),
                     long: Duration::from_millis(200),
+                    ..WorkerLimits::default()
                 };
                 tokio::task::spawn_local(service_worker(
                     rx,
