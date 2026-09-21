@@ -181,7 +181,10 @@ impl Config {
             (
                 "GRAPH_URL",
                 Some(cfg.graph_url.as_str()),
-                !cfg.graph_api_key.is_empty(),
+                // HealthChecker puts QDRANT_API_KEY in the shared client's
+                // default_headers; check_graph overrides only when graph_api_key
+                // is non-empty, so the Qdrant key leaks to graph probes.
+                !cfg.graph_api_key.is_empty() || cfg.qdrant_api_key.is_some(),
                 Transport::Http,
             ),
             (
@@ -383,20 +386,25 @@ fn check_credential_transport(
     match (transport, parsed.scheme()) {
         (Transport::Http, "https") => Ok(()),
         (Transport::Http, "http") if is_cluster_local(&parsed) => Ok(()),
-        (Transport::Redis, "redis" | "rediss") if is_cluster_local(&parsed) => Ok(()),
-        // Only a scheme reqwest cannot speak reaches here; off-cluster `http`
-        // is a real cleartext fault and must fall through, hence `!= "http"`.
-        // reqwest rejects these at `Client::execute`, so nothing is ever
-        // dialled and "in the clear" would be false — the host in
-        // `QDRANT_URL=redis://qdrant:6333` IS cluster-local, and an operator
-        // sent to look for plaintext finds it fine and stops trusting the
-        // guard. `Transport::Redis` deliberately has no twin arm: fred never
-        // inspects the scheme, so an `https://` cache URL really does dial
-        // plain TCP and send `AUTH`. There the arm below is the true one.
+        // fred dispatches on scheme suffix (`redis-cluster`, `rediss-cluster`,
+        // `redis-sentinel`), all plaintext (no TLS compiled).
+        (Transport::Redis, scheme) if scheme.starts_with("redis") && is_cluster_local(&parsed) => {
+            Ok(())
+        }
+        // Unusable scheme: reqwest rejects non-http at `Client::execute`, so
+        // nothing is ever dialled and "in the clear" would be false — the host
+        // in `QDRANT_URL=redis://qdrant:6333` IS cluster-local. Off-cluster
+        // `http` is a real cleartext fault and must fall through (hence
+        // `!= "http"`).
         (Transport::Http, scheme) if scheme != "http" => Err(format!(
-            "{var}: unusable scheme {scheme}:// — this client speaks http and \
-             https only (host {} is not the fault here)",
-            parsed.host_str().unwrap_or("")
+            "{var}: unusable scheme {scheme}:// — this client speaks http and https only",
+        )),
+        // fred opens plain TCP regardless of scheme, so `https://` buys no
+        // encryption — it just makes fred dial port 6379 and send `AUTH` in
+        // the clear.
+        (Transport::Redis, scheme) if !scheme.starts_with("redis") => Err(format!(
+            "{var}: unusable scheme {scheme}:// — this client speaks redis:// \
+             variants only (fred opens plain TCP regardless of scheme)",
         )),
         (_, scheme) => Err(format!(
             "{var}: {scheme}://{} is not {}; an API key or URL credential must \
@@ -3000,15 +3008,18 @@ mod tests {
             );
         }
 
-        // The mirror of the Qdrant case, and the sharper one: `https` buys no
-        // encryption here, it just makes fred dial plain TCP on 6379. Unlike
-        // the reqwest case above this one really is a credential on the wire.
+        // Non-redis scheme with Redis transport: fred opens plain TCP
+        // regardless, so `https` buys no encryption. The refusal must name
+        // the scheme as the fault, not the host.
         for wrong_scheme in [
             with_userinfo("https", "redis.cloud.io"),
             with_userinfo("https", "redis-svc:6379"),
         ] {
             let err = redis("REDIS_CACHE_URL", wrong_scheme.as_str(), false).unwrap_err();
-            assert!(err.contains("in the clear"), "{wrong_scheme}: {err}");
+            assert!(
+                err.contains("unusable scheme") && !err.contains("in the clear"),
+                "{wrong_scheme}: {err}"
+            );
         }
 
         // Still a credential guard, not a URL validator: with nothing to keep
