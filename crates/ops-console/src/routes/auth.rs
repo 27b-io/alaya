@@ -54,8 +54,10 @@ pub async fn callback(
         // IdP-reported error (user denied, etc). Rendered escaped, but this
         // route is unauthenticated and runs before the state check, so any
         // free text here is attacker-chosen prose on our origin (CWE-451).
-        // The raw value goes to the log, where it is diagnosable but not spoofable.
-        tracing::warn!(error = %err, "idp callback error");
+        // The raw value goes to the log, where it is diagnosable but not
+        // spoofable. Debug-formatted so control characters are escaped and an
+        // attacker cannot forge log records with embedded newlines (CWE-117).
+        tracing::warn!(error = ?err, "idp callback error");
         return Err(AppError::Forbidden(format!(
             "identity provider: {}",
             idp_error_detail(&err)
