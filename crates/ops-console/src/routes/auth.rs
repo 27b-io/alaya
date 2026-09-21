@@ -51,8 +51,13 @@ pub async fn callback(
     jar: PrivateCookieJar,
 ) -> Result<Response, AppError> {
     if let Some(err) = q.error {
-        // IdP-reported error (user denied, etc). `err` renders escaped.
-        return Err(AppError::Forbidden(format!("identity provider: {err}")));
+        // IdP-reported error (user denied, etc). Rendered escaped, but this
+        // route is unauthenticated and runs before the state check, so any
+        // free text here is attacker-chosen prose on our origin (CWE-451).
+        return Err(AppError::Forbidden(format!(
+            "identity provider: {}",
+            idp_error_detail(&err)
+        )));
     }
     let (code, cb_state) = match (q.code, q.state) {
         (Some(c), Some(s)) => (c, s),
@@ -119,4 +124,45 @@ pub async fn logout(
         state.secure_cookies(),
     );
     Ok((jar, Redirect::to("/auth/login")).into_response())
+}
+
+/// RFC 6749 §4.1.2.1 error codes. Anything else collapses to a fixed string so
+/// `/auth/callback?error=…` cannot put arbitrary prose on the 403 page.
+pub fn idp_error_detail(err: &str) -> &str {
+    match err {
+        "access_denied"
+        | "invalid_request"
+        | "unauthorized_client"
+        | "unsupported_response_type"
+        | "invalid_scope"
+        | "server_error"
+        | "temporarily_unavailable" => err,
+        _ => "login refused",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::idp_error_detail;
+
+    #[test]
+    fn idp_error_detail_passes_spec_codes_and_fixes_everything_else() {
+        for code in [
+            "access_denied",
+            "invalid_request",
+            "unauthorized_client",
+            "unsupported_response_type",
+            "invalid_scope",
+            "server_error",
+            "temporarily_unavailable",
+        ] {
+            assert_eq!(idp_error_detail(code), code);
+        }
+        assert_eq!(
+            idp_error_detail("your session expired, sign in again at evil.example"),
+            "login refused"
+        );
+        assert_eq!(idp_error_detail(""), "login refused");
+        assert_eq!(idp_error_detail("Access_Denied"), "login refused");
+    }
 }
