@@ -36,6 +36,21 @@ impl std::fmt::Display for OidcRpError {
     }
 }
 
+/// The closed set of causes `warn_idp_failure` may print verbatim.
+///
+/// The cause reaches the pod log, and on these paths it is IdP-influenced,
+/// so the set is enumerated rather than left open as `impl Display`. The
+/// type this exists to exclude is `serde_json::Error`: it renders the
+/// offending input into its own message, and for a token-endpoint body that
+/// input can be a live id_token. It has no impl here, so sending a parse
+/// failure to the wrong helper is a compile error instead of something the
+/// next reviewer has to notice — `warn_idp_parse_failure` is the only route.
+trait SafeCause: std::fmt::Display {}
+impl SafeCause for reqwest::Error {}
+impl SafeCause for reqwest::StatusCode {}
+impl SafeCause for String {}
+impl SafeCause for &'_ String {}
+
 #[derive(Deserialize, Clone)]
 struct Discovery {
     issuer: String,
@@ -166,17 +181,31 @@ impl OidcRp {
     /// log said nothing at all, so a login outage arrived with no issuer, no
     /// operation and no cause to triage from.
     ///
-    /// Never the body — a token-endpoint body holds the id_token. Deserialize
-    /// failures never reach this method at all: they carry the input inside
-    /// their message, so they go through `warn_idp_parse_failure` instead.
+    /// Never the raw body — a token-endpoint body holds the id_token — and
+    /// never a deserialize error, which cannot reach this method at all:
+    /// `SafeCause` has no impl for `serde_json::Error`, because that error
+    /// carries the input inside its own message. Parse failures go through
+    /// `warn_idp_parse_failure` instead.
     ///
-    /// `issuer` is safe to print because `Config::from_env` refuses an
-    /// issuer carrying userinfo.
-    fn warn_idp_failure(&self, op: &'static str, cause: impl std::fmt::Display) -> OidcRpError {
+    /// Two callers do pass a PARSED field of the discovery document — the
+    /// echoed issuer, and each endpoint that fails the origin check. Those
+    /// are attacker-chosen text, which is what the recording below is about.
+    /// `self.issuer` is a different thing and is safe: it is config, and
+    /// `Config::from_env` refuses one carrying userinfo.
+    fn warn_idp_failure(&self, op: &'static str, cause: impl SafeCause) -> OidcRpError {
+        // Recorded with `?`, not `%`, and that is not cosmetic. Two callers
+        // pass a string lifted straight out of the discovery document. The
+        // plain-text subscriber writes a field recorded as `Display`
+        // verbatim, so one `\n` in it emits a second, wholly attacker-authored
+        // line that reads like a real record; recorded as `Debug` the same
+        // string is escaped and quoted onto one line. Capped because the only
+        // other bound on it is the 8 MiB body cap, which is a log-flood lever
+        // — by chars, since a byte split could land mid-codepoint and panic.
+        let cause: String = cause.to_string().chars().take(256).collect();
         tracing::warn!(
             op,
             issuer = %self.issuer,
-            cause = %cause,
+            cause = ?cause,
             "oidc: identity provider request failed"
         );
         OidcRpError(op)
@@ -194,8 +223,15 @@ impl OidcRp {
     /// Typing every IdP-sourced field as `String` does not save it: that
     /// argument covers the fields, not the top-level value.
     ///
-    /// `classify` / `line` / `column` keep what triage actually needs —
-    /// syntax vs data vs early EOF, and where — with no input in any of them.
+    /// `classify` / `line` / `column` keep syntax vs data vs early EOF, and
+    /// where. None of them can carry input: `Category` is a fieldless enum
+    /// and the other two are `usize`, so the types are the proof, not a test.
+    ///
+    /// It is not free. The commonest real failure — the token endpoint
+    /// answering `{"error":"invalid_grant"}` — used to log ``missing field
+    /// `id_token` ``, which names the problem and is built from the derive's
+    /// `&'static str`, so it was never unsafe. `serde_json` offers no way to
+    /// tell that arm from the input-bearing ones, so the safe arms lose too.
     fn warn_idp_parse_failure(&self, op: &'static str, e: &serde_json::Error) -> OidcRpError {
         tracing::warn!(
             op,
@@ -414,14 +450,18 @@ mod tests {
         );
     }
 
-    /// Why `warn_idp_parse_failure` logs `classify`/`line`/`column` and never
-    /// the error itself. A token endpoint answering with a bare JSON string
-    /// (`"<id_token>"` instead of `{"id_token": "…"}`) makes the WHOLE string
-    /// the unexpected value, so the error's `Display` carries a live token.
-    /// Both halves are asserted: the hazard is real, and what we log instead
-    /// is clean.
+    /// The upstream fact `warn_idp_parse_failure` is built on: `serde_json`
+    /// renders the offending input into the error's `Display`, whole and
+    /// untruncated. A token endpoint answering with a bare JSON string
+    /// (`"<id_token>"` instead of `{"id_token": "…"}`) therefore makes a live
+    /// token the unexpected value. Pinned here because it is someone else's
+    /// behaviour: if a `serde_json` bump ever stopped echoing the input, this
+    /// goes red and the helper is paying for a hazard that no longer exists.
+    ///
+    /// The converse needs no test — see `warn_idp_parse_failure`, where the
+    /// logged fields are a fieldless enum and two `usize`.
     #[test]
-    fn parse_error_display_carries_the_input_but_the_logged_fields_do_not() {
+    fn parse_error_display_carries_the_input() {
         let token = "eyJhbGciOiJSUzI1NiJ9.SECRET-TOKEN-PAYLOAD.signature";
         // `.err()`, not `unwrap_err()`: `TokenResponse` deliberately has no
         // `Debug` impl — it holds the id_token.
@@ -432,10 +472,61 @@ mod tests {
             e.to_string().contains(token),
             "the hazard this method exists for: {e}"
         );
-        let logged = format!("{:?} line={} column={}", e.classify(), e.line(), e.column());
+    }
+
+    /// A substituted IdP must not be able to write its own log records.
+    /// `cause` is the one field on this path that carries IdP text — the
+    /// discovery `issuer` at the mismatch branch, and the three endpoints
+    /// below it — and the plain-text subscriber this binary installs
+    /// neutralises nothing in a field recorded as `Display`. The `?` in
+    /// `warn_idp_failure` is the whole guard; this is what holds it there.
+    #[test]
+    fn a_newline_in_an_idp_cause_cannot_forge_a_log_line() {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let rp = OidcRp::new(
+            "https://id.test".into(),
+            "console".into(),
+            "secret".into(),
+            "https://console.test/auth/callback".into(),
+        );
+        // What a hostile discovery document puts in `issuer`: a plausible
+        // value, then a newline, then a complete forged record.
+        let hostile = "https://id.test\n  WARN ops_console: all clear".to_string();
+        let buf = Buf::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            rp.warn_idp_failure("discovery issuer mismatch", &hostile);
+        });
+
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            logged.lines().count(),
+            1,
+            "one event must render as exactly one line: {logged}"
+        );
         assert!(
-            !logged.contains(token),
-            "logged fields must carry no input: {logged}"
+            logged.contains("\\n") && !logged.contains("WARN ops_console: all clear\n"),
+            "the newline must be escaped, not emitted: {logged}"
         );
     }
 

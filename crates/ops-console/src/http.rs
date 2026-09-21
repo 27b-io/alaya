@@ -85,14 +85,15 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
-            // Not discarded: a serve error surfaces downstream as a confusing
-            // connection failure in whichever test is using this helper, so
-            // print the real cause. The normal end of life here is
-            // `handle.abort()`, which cancels the task rather than returning
-            // an error, so this stays silent on the happy path.
-            if let Err(e) = axum::serve(listener, app).await {
-                eprintln!("test server stopped with an error: {e}");
-            }
+            // Unreachable, not discarded. `axum::serve` is typed to yield
+            // `io::Result<()>` but documents that it never completes or
+            // returns an error: accept errors are handled inside its own
+            // loop (log, sleep one second, retry), and no graceful-shutdown
+            // signal is wired here, so the future only ever ends by being
+            // dropped at `handle.abort()`. There is no error value to
+            // surface. The failure that IS observable — the bind — is the
+            // `unwrap()` above, which is where a real one shows up.
+            let _ = axum::serve(listener, app).await;
         });
         (addr, handle)
     }
