@@ -166,13 +166,9 @@ impl OidcRp {
     /// log said nothing at all, so a login outage arrived with no issuer, no
     /// operation and no cause to triage from.
     ///
-    /// Never the body — a token-endpoint body holds the id_token. A
-    /// `serde_json::Error` does embed the *unexpected* value on a type
-    /// mismatch, which is safe here only because every IdP-sourced field of
-    /// `Discovery` / `Jwks` / `TokenResponse` is typed `String` (or a
-    /// collection of them): a real token deserializes, so it never becomes
-    /// the unexpected value. Add a non-`String` field and that stops
-    /// holding.
+    /// Never the body — a token-endpoint body holds the id_token. Deserialize
+    /// failures never reach this method at all: they carry the input inside
+    /// their message, so they go through `warn_idp_parse_failure` instead.
     ///
     /// `issuer` is safe to print because `Config::from_env` refuses an
     /// issuer carrying userinfo.
@@ -182,6 +178,32 @@ impl OidcRp {
             issuer = %self.issuer,
             cause = %cause,
             "oidc: identity provider request failed"
+        );
+        OidcRpError(op)
+    }
+
+    /// The parse-failure twin of `warn_idp_failure`: logs the SHAPE of the
+    /// error — category and position — and never its `Display`.
+    ///
+    /// `serde_json` renders the unexpected value into its message, and the
+    /// bodies parsed here are the token endpoint's and the JWKS. A body that
+    /// is a bare JSON string — a broken or hostile IdP answering
+    /// `"<id_token>"` instead of `{"id_token": "…"}` — makes the WHOLE
+    /// string the unexpected value, so `Display` would put a live token in
+    /// the pod log (`parse_error_display_carries_the_input` pins this).
+    /// Typing every IdP-sourced field as `String` does not save it: that
+    /// argument covers the fields, not the top-level value.
+    ///
+    /// `classify` / `line` / `column` keep what triage actually needs —
+    /// syntax vs data vs early EOF, and where — with no input in any of them.
+    fn warn_idp_parse_failure(&self, op: &'static str, e: &serde_json::Error) -> OidcRpError {
+        tracing::warn!(
+            op,
+            issuer = %self.issuer,
+            category = ?e.classify(),
+            line = e.line(),
+            column = e.column(),
+            "oidc: identity provider response did not parse"
         );
         OidcRpError(op)
     }
@@ -203,8 +225,8 @@ impl OidcRp {
         let body = crate::http::body_text("oidc discovery", resp)
             .await
             .map_err(|_| OidcRpError("discovery read"))?;
-        let disc: Discovery =
-            serde_json::from_str(&body).map_err(|e| self.warn_idp_failure("discovery parse", e))?;
+        let disc: Discovery = serde_json::from_str(&body)
+            .map_err(|e| self.warn_idp_parse_failure("discovery parse", &e))?;
         if normalize_issuer(&disc.issuer) != self.issuer {
             return Err(self.warn_idp_failure("discovery issuer mismatch", &disc.issuer));
         }
@@ -281,7 +303,7 @@ impl OidcRp {
             .await
             .map_err(|_| OidcRpError("token response read"))?;
         let tokens: TokenResponse = serde_json::from_str(&body)
-            .map_err(|e| self.warn_idp_failure("token response parse", e))?;
+            .map_err(|e| self.warn_idp_parse_failure("token response parse", &e))?;
 
         let claims = self.verify_id_token(&tokens.id_token).await?;
         // Nonce binds the ID token to this login flow (replay defense).
@@ -344,8 +366,8 @@ impl OidcRp {
         let body = crate::http::body_text("oidc jwks", resp)
             .await
             .map_err(|_| OidcRpError("jwks read"))?;
-        let jwks: Jwks =
-            serde_json::from_str(&body).map_err(|e| self.warn_idp_failure("jwks parse", e))?;
+        let jwks: Jwks = serde_json::from_str(&body)
+            .map_err(|e| self.warn_idp_parse_failure("jwks parse", &e))?;
         let mut map = HashMap::new();
         for jwk in jwks.keys {
             if let Some(k) = jwk.kid.clone() {
@@ -389,6 +411,31 @@ mod tests {
         assert_eq!(
             pkce_challenge_s256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    /// Why `warn_idp_parse_failure` logs `classify`/`line`/`column` and never
+    /// the error itself. A token endpoint answering with a bare JSON string
+    /// (`"<id_token>"` instead of `{"id_token": "…"}`) makes the WHOLE string
+    /// the unexpected value, so the error's `Display` carries a live token.
+    /// Both halves are asserted: the hazard is real, and what we log instead
+    /// is clean.
+    #[test]
+    fn parse_error_display_carries_the_input_but_the_logged_fields_do_not() {
+        let token = "eyJhbGciOiJSUzI1NiJ9.SECRET-TOKEN-PAYLOAD.signature";
+        // `.err()`, not `unwrap_err()`: `TokenResponse` deliberately has no
+        // `Debug` impl — it holds the id_token.
+        let e = serde_json::from_str::<TokenResponse>(&format!("\"{token}\""))
+            .err()
+            .expect("a bare JSON string must not deserialize into the struct");
+        assert!(
+            e.to_string().contains(token),
+            "the hazard this method exists for: {e}"
+        );
+        let logged = format!("{:?} line={} column={}", e.classify(), e.line(), e.column());
+        assert!(
+            !logged.contains(token),
+            "logged fields must carry no input: {logged}"
         );
     }
 

@@ -85,7 +85,14 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            // Not discarded: a serve error surfaces downstream as a confusing
+            // connection failure in whichever test is using this helper, so
+            // print the real cause. The normal end of life here is
+            // `handle.abort()`, which cancels the task rather than returning
+            // an error, so this stays silent on the happy path.
+            if let Err(e) = axum::serve(listener, app).await {
+                eprintln!("test server stopped with an error: {e}");
+            }
         });
         (addr, handle)
     }
