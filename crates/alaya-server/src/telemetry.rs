@@ -116,3 +116,19 @@ pub fn shutdown_tracing() {
         tracing::warn!("OTLP shutdown error: {e}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// `main` installs the subscriber before it builds the tokio runtime, so
+    /// that the boot credential-transport guard — which runs in
+    /// `Config::from_env`, earlier still — can warn rather than print. Holds
+    /// only while nothing here needs a reactor: the OTLP batch processor runs
+    /// on its own OS thread with a blocking client. If that changes, the
+    /// server panics on startup, so fail here instead.
+    #[test]
+    fn installs_without_a_tokio_runtime() {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        super::init_tracing();
+        tracing::warn!("subscriber is live");
+    }
+}

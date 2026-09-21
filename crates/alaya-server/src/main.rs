@@ -91,10 +91,6 @@ impl Config {
         let cfg = Self {
             qdrant_url: env_required("QDRANT_URL"),
             qdrant_collection: env_or("QDRANT_COLLECTION", "memories_arctic1024"),
-            // `env_non_empty`, not `env_opt`: the latter filters only the
-            // exact empty string, so a whitespace-only value survives as
-            // `Some` and `HeaderValue::from_str` accepts it — a `Bearer   `
-            // header on every Qdrant request, and on the health checker's.
             qdrant_api_key: env_non_empty("QDRANT_API_KEY"),
             embedding_url: env_required("EMBEDDING_URL"),
             embedding_model: env_or("EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-l-v2.0"),
@@ -112,21 +108,22 @@ impl Config {
             listen_addr: env_or("LISTEN_ADDR", "0.0.0.0:3001"),
             api_key: env_or("ALAYA_API_KEY", ""),
             readonly_api_key: env_or("ALAYA_READONLY_API_KEY", ""),
-            oidc_issuer: env_opt("OIDC_ISSUER"),
+            oidc_issuer: env_non_empty("OIDC_ISSUER"),
             public_base_url: normalize_public_base_url(&env_or(
                 "PUBLIC_BASE_URL",
                 "https://alaya.27b.io",
             )),
             allow_unauthenticated: env_or("DANGEROUSLY_ALLOW_UNAUTHENTICATED", "")
                 .eq_ignore_ascii_case("true"),
-            summary_url: env_opt("SUMMARY_URL"),
-            summary_api_key: env_opt("SUMMARY_API_KEY"),
+            summary_url: env_non_empty("SUMMARY_URL"),
+            summary_api_key: env_non_empty("SUMMARY_API_KEY"),
             summary_model: env_or("SUMMARY_MODEL", "claude-haiku-4-5-20251001"),
-            judge_url: env_opt("JUDGE_URL").or_else(|| env_opt("SUMMARY_URL")),
-            judge_api_key: env_opt("JUDGE_API_KEY").or_else(|| env_opt("SUMMARY_API_KEY")),
-            judge_model: env_opt("JUDGE_MODEL").unwrap_or_else(|| "claude-sonnet-5".into()),
-            rerank_url: env_opt("RERANK_URL"),
-            rerank_api_key: env_opt("RERANK_API_KEY"),
+            judge_url: env_non_empty("JUDGE_URL").or_else(|| env_non_empty("SUMMARY_URL")),
+            judge_api_key: env_non_empty("JUDGE_API_KEY")
+                .or_else(|| env_non_empty("SUMMARY_API_KEY")),
+            judge_model: env_non_empty("JUDGE_MODEL").unwrap_or_else(|| "claude-sonnet-5".into()),
+            rerank_url: env_non_empty("RERANK_URL"),
+            rerank_api_key: env_non_empty("RERANK_API_KEY"),
             rerank_top_n: env_or("RERANK_TOP_N", "20")
                 .parse()
                 .expect("RERANK_TOP_N must be a number"),
@@ -136,10 +133,8 @@ impl Config {
                 .parse()
                 .expect("RERANK_TIMEOUT_MS must be a positive integer (ms)"),
         };
-        // Read exactly as `init_l2_cache` reads it: `env_non_empty` trims every
-        // Unicode space, the URL parser only C0 and U+0020, so `env_opt` here
-        // would validate a string the cache never dials — and an unparseable
-        // keyless value is passed through by design.
+        // Read through the helper `init_l2_cache` uses, so the guard and the
+        // cache can never disagree about which string gets dialled.
         let redis_cache_url = env_non_empty("REDIS_CACHE_URL");
         // Every credential-bearing URL this process reads into `Config`,
         // checked on the main thread before the runtime, the worker thread or
@@ -218,11 +213,6 @@ fn env_required(key: &str) -> String {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
-/// Set and non-empty, else `None`.
-fn env_opt(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
 /// Normalize the single origin source-of-truth: strip a trailing slash and
@@ -362,18 +352,16 @@ fn check_credential_transport(
 ) -> Result<(), String> {
     let parsed = match reqwest::Url::parse(url) {
         Ok(parsed) => parsed,
-        // Keyless and unparseable: nothing to protect, and the value is the
-        // client's problem downstream — but say so, or a typo here surfaces
-        // much later with nothing naming the var.
-        //
-        // `eprintln!`, not `tracing::warn!`: this runs from `Config::from_env`
-        // before `init_tracing` installs a subscriber, so a `tracing` event
-        // here would be dropped and the silence would only move.
+        // No credential means no question for this guard, so it must not
+        // escalate — refusing here would stop the service over a var it was
+        // never asked to validate. Say so, though: the client that dials it
+        // fails much later with nothing naming the var.
         Err(e) if !has_api_key => {
-            eprintln!(
-                "credential transport guard: {var} is not a parseable URL \
-                 ({e}); no credential to protect, so boot continues — the \
-                 client that dials it will fail on first use"
+            tracing::warn!(
+                op = "credential_transport_guard",
+                var,
+                err = %e,
+                "not a parseable URL; no credential to protect, so boot continues"
             );
             return Ok(());
         }
@@ -482,6 +470,14 @@ fn init_l2_saas() -> std::result::Result<cachekit::CacheKit, Box<dyn std::error:
 /// not an opaque downstream builder error) and padded/newline-suffixed values
 /// (folded YAML scalars, `echo`-piped secrets) that would fail string matches
 /// and downstream builders if passed through raw.
+///
+/// Reads every optional value, because a whitespace-only one that survives as
+/// `Some` reads as configured everywhere downstream — `OIDC_ISSUER="   "` used
+/// to satisfy the fail-closed "some auth is configured" check at boot.
+/// Deliberately not the bearer vars (`ALAYA_API_KEY`, `ALAYA_READONLY_API_KEY`,
+/// `GRAPH_API_KEY`): both ends of those compare the bytes they were given, so
+/// trimming one end alone would break the match. They are trimmed in the
+/// ExternalSecret template instead, where both ends see it (LAB-371).
 fn env_non_empty(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
@@ -1955,6 +1951,11 @@ fn supervise(worker: std::thread::JoinHandle<()>) -> std::thread::JoinHandle<()>
 }
 
 fn main() {
+    // Before `Config::from_env`, so the boot guard's warnings reach a
+    // subscriber: `init_tracing` needs no runtime (its OTLP batch processor
+    // runs on its own OS thread with a blocking client, which is also happier
+    // constructed outside one).
+    telemetry::init_tracing();
     let config = Config::from_env();
 
     // Multi-threaded runtime for axum; LocalSet thread for MemoryService
@@ -1964,8 +1965,6 @@ fn main() {
         .expect("failed to build runtime");
 
     rt.block_on(async move {
-        telemetry::init_tracing();
-
         let (tx, rx) = mpsc::channel::<Cmd>(CMD_CHANNEL_CAP);
 
         // Watchdog heartbeat: epoch-seconds of the worker's last completed
@@ -2931,10 +2930,10 @@ mod tests {
                 "{keyless}"
             );
         }
-        // The keyless-unparseable arm prints the parse error to stderr on its
-        // way past. That is only safe while `url::ParseError` keeps the input
-        // out of its `Display` — pin it, so a url-crate bump cannot quietly
-        // turn the boot diagnostic into the leak this guard exists to stop.
+        // Both the keyless warning and the refusal render `url::ParseError`,
+        // which is only safe while it keeps the input out of its `Display` —
+        // pin it, so a url-crate bump cannot quietly turn either into the leak
+        // this guard exists to stop.
         let malformed = with_userinfo("http", "");
         let parse_err = reqwest::Url::parse(&malformed).unwrap_err().to_string();
         assert!(
