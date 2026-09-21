@@ -6,11 +6,25 @@ pub mod lb;
 use crate::error::AppError;
 
 /// Validate a post-login redirect target: same-site absolute path only —
-/// no scheme, no authority, no protocol-relative `//`, and no backslashes
-/// anywhere (browsers normalize `\` → `/` in Location, so `/\evil.com`
-/// would resolve to `//evil.com`).
+/// no scheme, no authority, no protocol-relative `//`.
+///
+/// An allow-list, because the deny-list it replaces was one class short. It
+/// refused `\` (browsers normalize it to `/` in a Location, so `/\evil.com`
+/// resolves to `//evil.com`) and passed a TAB — a legal header-value byte,
+/// admitted by `http`’s own validator alongside the printable range. The
+/// WHATWG URL parser removes every ASCII tab and newline from its input
+/// before parsing, so `Location: /<TAB>/evil.com` became `//evil.com` and
+/// the browser left this origin. CR and LF failed only by accident,
+/// rejected by `HeaderValue` as a 500 rather than by this guard.
+///
+/// Every legitimate target is a fixed route or a 64-char hex hash, so
+/// requiring ASCII-graphic bytes refuses the whole class — controls, space
+/// and non-ASCII alike — rather than the members someone thought of.
 pub fn safe_next(next: &str) -> String {
-    if next.starts_with('/') && !next.starts_with("//") && !next.contains('\\') {
+    if next.starts_with('/')
+        && !next.starts_with("//")
+        && next.bytes().all(|b| b.is_ascii_graphic() && b != b'\\')
+    {
         next.to_string()
     } else {
         "/".to_string()
@@ -80,6 +94,19 @@ mod tests {
         assert_eq!(safe_next("/\\/evil.com"), "/");
         assert_eq!(safe_next("/alaya\\..\\x"), "/");
         assert_eq!(safe_next(""), "/");
+        // A TAB is a legal header-value byte and the URL parser strips it
+        // before parsing, so this reached the browser as `//evil.com`.
+        assert_eq!(safe_next("/\t/evil.com"), "/");
+        assert_eq!(safe_next("/\n/evil.com"), "/");
+        assert_eq!(safe_next("/\r/evil.com"), "/");
+        assert_eq!(safe_next("/ /evil.com"), "/");
+        // Still lets the real targets through.
+        assert_eq!(safe_next("/lb"), "/lb");
+        let hash = "a".repeat(64);
+        assert_eq!(
+            safe_next(&format!("/alaya/memory/{hash}")),
+            format!("/alaya/memory/{hash}")
+        );
     }
 
     #[test]

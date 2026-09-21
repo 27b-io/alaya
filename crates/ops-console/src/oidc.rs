@@ -96,6 +96,33 @@ fn normalize_issuer(s: &str) -> &str {
     s.strip_suffix('/').unwrap_or(s)
 }
 
+/// OIDC Core §2 caps the subject identifier: it "MUST NOT exceed 255 ASCII
+/// characters in length". Counted in bytes, because the spec says ASCII and
+/// bytes are what a log line and a session cookie actually cost.
+///
+/// Every claim here is IdP-controlled and was otherwise bounded only by the
+/// 8 MiB body cap in `http.rs`. `sub` reaches a log line on the rejection
+/// path of an unauthenticated route, so a substituted IdP could bill a
+/// megabyte of pod log per refused attempt; `warn_idp_failure` capped
+/// `cause` for that reason and these siblings were left behind.
+///
+/// The optional claims fail differently and worse. They carry no spec
+/// ceiling, but they ride into the session cookie, and a cookie past the
+/// 4 KiB every browser allows per RFC 6265 §6.1 is dropped silently — the
+/// callback then lands with no session, redirects to a login the IdP
+/// answers immediately, and loops until the browser gives up, with nothing
+/// in the log. They borrow this ceiling for that reason, not the spec's.
+///
+/// What this does NOT bound is the transient allocation: `decode` builds the
+/// oversized `String` before either guard runs, so the heap cost up to what
+/// an 8 MiB token body decodes to is unchanged. `MAX_BODY_BYTES` is what
+/// bounds that; this bounds what survives into a log line and a cookie.
+const MAX_CLAIM_BYTES: usize = 255;
+
+fn claim_within_bound(s: &str) -> bool {
+    s.len() <= MAX_CLAIM_BYTES
+}
+
 /// (scheme, host, port) for RFC 6454 same-origin checks, default ports
 /// normalized. Same semantics as alaya-server's `origin_of`.
 fn origin_of(u: &str) -> Option<(String, String, u16)> {
@@ -380,7 +407,22 @@ impl OidcRp {
         if normalize_issuer(&data.claims.iss) != self.issuer {
             return Err(OidcRpError("iss mismatch"));
         }
-        Ok(data.claims)
+        // The one place every consumer of these claims routes through, so
+        // the bound holds for the log sites, the session and the allowlist
+        // at once. The error carries the `&'static str` only — refusing an
+        // oversized `sub` must not itself log it.
+        let mut claims = data.claims;
+        if !claim_within_bound(&claims.sub) {
+            return Err(OidcRpError("sub exceeds the OIDC Core §2 ceiling"));
+        }
+        // Dropped rather than refused: these three are display-only and
+        // `Session::display_name` already falls back through email to `sub`,
+        // so losing an absurd one costs a nicety. Refusing the login instead
+        // would hand any IdP with a verbose `name` claim an outage.
+        claims.email = claims.email.filter(|s| claim_within_bound(s));
+        claims.name = claims.name.filter(|s| claim_within_bound(s));
+        claims.preferred_username = claims.preferred_username.filter(|s| claim_within_bound(s));
+        Ok(claims)
     }
 
     async fn key_for_kid(&self, kid: &str) -> Result<Jwk, OidcRpError> {
@@ -560,6 +602,20 @@ mod tests {
         assert!(same_origin_https("https://id.27b.io", "http://id.27b.io/jwks").is_err());
         // Loopback issuer may use http endpoints (local dev).
         assert!(same_origin_https("http://localhost:8787", "http://localhost:8787/jwks").is_ok());
+    }
+
+    /// Pins the comparison, not the placement: reaching `verify_id_token`
+    /// needs a signed token and a JWKS fixture, which would cost more than
+    /// it pins. Placement is safe by construction instead — `decode` into
+    /// `IdClaims` appears once, in this private method, whose only caller is
+    /// `exchange_and_verify`.
+    #[test]
+    fn claim_bound_is_the_spec_ceiling() {
+        assert!(claim_within_bound(&"a".repeat(255)));
+        assert!(!claim_within_bound(&"a".repeat(256)));
+        // Bytes, not chars — the ceiling exists to bound what a log line and
+        // a cookie cost, so a "fix" to `chars().count()` must fail here.
+        assert!(!claim_within_bound(&"é".repeat(128)));
     }
 
     #[tokio::test]

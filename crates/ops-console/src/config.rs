@@ -66,19 +66,15 @@ impl LbConfig {
         // would otherwise boot clean and fail at the first render as a blank
         // history section — which reads as an LB outage, sending the
         // operator after the wrong system. AC10 is refuse-at-startup.
-        let parse = |key: &str, v: String| {
+        // Annotated because every error path now leaves through `?`, and a
+        // closure with no explicit `Err` cannot infer what it converts into.
+        let parse = |key: &str, v: String| -> Result<url::Url, String> {
             let url: url::Url = v
                 .parse()
                 .map_err(|e| format!("{key} is not a valid URL: {e}"))?;
             validate_upstream_url(key, &url)?;
-            // `join` (lb.rs) appends the endpoint path to `Url::as_str()`,
-            // which carries any query and fragment with it — a base of
-            // `…/select?token=x` would request `/select?token=x/api/v1/…`
-            // and leave the card permanently dark behind a non-2xx. Refuse
-            // at boot rather than defer it to the first render.
-            if url.query().is_some() || url.fragment().is_some() {
-                return Err(format!("{key} must have no query string or fragment"));
-            }
+            // `join` (lb.rs) appends the endpoint path to `Url::as_str()`.
+            reject_query_or_fragment(key, &url)?;
             Ok(url)
         };
         match (url, api_key, metrics_url) {
@@ -126,6 +122,25 @@ impl fmt::Debug for Config {
     }
 }
 
+/// Every base in this config is later grown by concatenation onto its WHOLE
+/// string — `join` in `lb.rs`, `format!` in `alaya.rs`, the discovery path
+/// and `redirect_uri`. A query or fragment therefore swallows the path that
+/// should follow it: `…/select?token=x` requests
+/// `/select?token=x/api/v1/…`, and `https://id.test/realms/ops#x` requests
+/// `/realms/ops` with the well-known path buried in a fragment that is never
+/// sent at all.
+///
+/// Refused at boot because the deferred failure looks like an outage of the
+/// system on the other end — a dark card, a discovery 404, a redirect_uri
+/// the IdP rejects as unregistered — and each sends the operator after the
+/// wrong thing.
+fn reject_query_or_fragment(key: &str, url: &url::Url) -> Result<(), String> {
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(format!("{key} must have no query string or fragment"));
+    }
+    Ok(())
+}
+
 /// https everywhere; plaintext http exists only for loopback local dev (a
 /// non-loopback http URL would also silently disable the Secure cookie flag
 /// — refuse instead).
@@ -140,6 +155,22 @@ fn validate_public_url(public_url: &url::Url) -> Result<(), String> {
             .parse::<std::net::IpAddr>()
             .map(|ip| ip.is_loopback())
             .unwrap_or(false);
+    // `redirect_uri()` appends `/auth/callback` to this URL's whole string,
+    // so a query or fragment here yields a redirect_uri the IdP has no
+    // registration for and every login fails at the authorize step. RFC 6749
+    // §3.1.2 forbids a fragment on a redirection endpoint outright; the
+    // query is refused for the concatenation, which the RFC does permit on a
+    // redirect_uri that was built to carry one.
+    reject_query_or_fragment("CONSOLE_PUBLIC_URL", public_url)?;
+    // Userinfo rides the same concatenation, and this is the worse half of
+    // it: the credential lands in the authorize redirect's `Location` and in
+    // the token POST body, while `public_origin()` and `Config`'s Debug both
+    // render the userinfo-free origin — so nothing in the pod log shows it
+    // leaked. `validate_issuer` has refused this since the last round; the
+    // rule was never applied here.
+    if !public_url.username().is_empty() || public_url.password().is_some() {
+        return Err("CONSOLE_PUBLIC_URL must not carry userinfo".into());
+    }
     match public_url.scheme() {
         "https" => Ok(()),
         "http" if is_loopback => Ok(()),
@@ -240,6 +271,8 @@ fn validate_issuer(issuer: &str) -> Result<(), String> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err("CONSOLE_OIDC_ISSUER must not carry userinfo".into());
     }
+    // Discovery concatenates the well-known path onto the issuer (`oidc.rs`).
+    reject_query_or_fragment("CONSOLE_OIDC_ISSUER", &url)?;
     Ok(())
 }
 
@@ -302,6 +335,9 @@ impl Config {
             .parse()
             .map_err(|e| format!("ALAYA_URL is not a valid URL: {e}"))?;
         validate_upstream_url("ALAYA_URL", &alaya_url)?;
+        // The fifth base on the same rule: `AlayaClient::url` (`alaya.rs`)
+        // builds every request as `format!("{}{path}", base.as_str()…)`.
+        reject_query_or_fragment("ALAYA_URL", &alaya_url)?;
 
         Ok(Config {
             listen_addr: std::env::var("CONSOLE_LISTEN_ADDR")
@@ -408,6 +444,40 @@ mod tests {
         assert!(validate_issuer("https://console@id.test").is_err());
         // '@' in a path is not userinfo — only the parser can tell.
         assert!(validate_issuer("https://id.test/a@b").is_ok());
+        // A query or fragment would swallow the well-known path discovery
+        // appends, silently sending the request to the IdP's front page.
+        assert!(validate_issuer("https://id.test?a=b").is_err());
+        assert!(validate_issuer("https://id.test/realms/ops#x").is_err());
+        // A bare '?' or '#' still parses as an empty component, not as none.
+        assert!(validate_issuer("https://id.test?").is_err());
+        assert!(validate_issuer("https://id.test#").is_err());
+    }
+
+    /// Covers the one base that had no guard at all; the LB pair is pinned
+    /// by `lb_config_is_all_or_nothing` and the issuer by the test above.
+    /// Refusal only — the concatenation it protects (`redirect_uri` appends
+    /// to the whole string, so `?a=b` swallows `/auth/callback` and the IdP
+    /// sees an unregistered redirect_uri) is the same one already pinned for
+    /// METRICS_URL, and re-pinning it here would cost a full `Config`.
+    #[test]
+    fn public_url_may_not_carry_a_query_or_fragment() {
+        let url = |s: &str| -> url::Url { s.parse().unwrap() };
+        assert!(validate_public_url(&url("https://console.test")).is_ok());
+        assert!(validate_public_url(&url("https://console.test/base")).is_ok());
+        assert!(validate_public_url(&url("https://console.test?a=b")).is_err());
+        assert!(validate_public_url(&url("https://console.test#x")).is_err());
+        // Userinfo rides the same concatenation into the redirect_uri, and
+        // `public_origin()` renders it away — so the refusal names the host
+        // and never the credential, exactly as the issuer's rule does.
+        let err = validate_public_url(&url("https://ops:hunter2@console.test")).unwrap_err();
+        assert!(
+            err.contains("userinfo") && !err.contains("hunter2"),
+            "{err}"
+        );
+        // Ordered before the scheme check, so the message names the actual
+        // mistake instead of sending a loopback dev URL after a certificate.
+        let err = validate_public_url(&url("http://localhost:3002?a=b")).unwrap_err();
+        assert!(err.contains("query string or fragment"), "{err}");
     }
 
     #[test]
