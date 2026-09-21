@@ -54,6 +54,8 @@ pub async fn callback(
         // IdP-reported error (user denied, etc). Rendered escaped, but this
         // route is unauthenticated and runs before the state check, so any
         // free text here is attacker-chosen prose on our origin (CWE-451).
+        // The raw value goes to the log, where it is diagnosable but not spoofable.
+        tracing::warn!(error = %err, "idp callback error");
         return Err(AppError::Forbidden(format!(
             "identity provider: {}",
             idp_error_detail(&err)
@@ -128,7 +130,7 @@ pub async fn logout(
 
 /// RFC 6749 §4.1.2.1 error codes. Anything else collapses to a fixed string so
 /// `/auth/callback?error=…` cannot put arbitrary prose on the 403 page.
-pub fn idp_error_detail(err: &str) -> &str {
+fn idp_error_detail(err: &str) -> &str {
     match err {
         "access_denied"
         | "invalid_request"
@@ -146,7 +148,7 @@ mod tests {
     use super::idp_error_detail;
 
     #[test]
-    fn idp_error_detail_passes_spec_codes_and_fixes_everything_else() {
+    fn idp_error_detail_passes_spec_codes_and_collapses_everything_else() {
         for code in [
             "access_denied",
             "invalid_request",
