@@ -31,8 +31,12 @@ const DEFAULT_FILTER: &str =
 /// - `OTEL_SERVICE_NAME`: Service name (default: "alaya-server")
 /// - `RUST_LOG`: Log level filter
 ///
-/// Panics when the headers carry a credential and the endpoint would send it in
-/// the clear off-cluster — see `check_otlp_endpoint`.
+/// - `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `_HEADERS`: the signal-specific
+///   twins, which take precedence over the pair above.
+///
+/// Panics when any header is set and the endpoint would send it in the clear
+/// off-cluster, via `check_credential_transport` — the same guard, policy and
+/// messages as every credential URL in `Config`.
 pub fn init_tracing() {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_FILTER));
@@ -41,28 +45,33 @@ pub fn init_tracing() {
 
     let otel_endpoint = crate::env_non_empty("OTEL_EXPORTER_OTLP_ENDPOINT");
 
-    if let Some(ref endpoint) = otel_endpoint {
-        // Before the exporter is built, so a refusal means the process never
-        // starts rather than starting and posting the token. `main` calls
-        // `init_tracing` before `Config::from_env`, so this is the earliest
-        // guard in the boot, ahead of even the credential-transport table.
-        //
-        // Both endpoint vars, because `opentelemetry-otlp` prefers the
-        // signal-specific one and falls back to the generic
-        // (`resolve_http_endpoint`): checking only the generic one leaves
-        // `OTEL_EXPORTER_OTLP_ENDPOINT=https://ok` covering an
-        // `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://elsewhere` that is what
-        // actually gets dialled. Headers resolve by the same preference, so a
-        // credential in either var is a credential on this wire.
-        let has_credential = crate::env_non_empty("OTEL_EXPORTER_OTLP_HEADERS").is_some()
-            || crate::env_non_empty("OTEL_EXPORTER_OTLP_TRACES_HEADERS").is_some();
-        for var in [
-            "OTEL_EXPORTER_OTLP_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-        ] {
-            if let Some(url) = crate::env_non_empty(var) {
-                check_otlp_endpoint(var, &url, has_credential).unwrap_or_else(|e| panic!("{e}"));
+    if otel_endpoint.is_some() {
+        // Checked before the exporter is built, so a refusal means the process
+        // never starts rather than starting and posting the token. The policy
+        // and the refusal messages are `check_credential_transport`'s: these
+        // vars never reach `Config`, but that guard is a free function over
+        // (var, url, has_credential, transport), so the OTLP path is one more
+        // caller rather than a second copy of the rule.
+        let has_credential = OTLP_HEADER_VARS
+            .iter()
+            .any(|var| crate::env_non_empty(var).is_some());
+        for var in OTLP_ENDPOINT_VARS {
+            // Raw, not trimmed: `opentelemetry-otlp` reads these with
+            // `std::env::var`, so a trimmed copy would certify a string the
+            // exporter never dials. A padded value it cannot parse falls back
+            // to its default endpoint silently, which is a credential going
+            // somewhere nobody configured — refuse instead.
+            let Some(raw) = std::env::var(var).ok().filter(|v| !v.trim().is_empty()) else {
+                continue;
+            };
+            if has_credential && raw != raw.trim() {
+                panic!(
+                    "{var} has leading or trailing whitespace; the exporter reads it raw \
+                     and would silently fall back to its own default endpoint"
+                );
             }
+            crate::check_credential_transport(var, &raw, has_credential, crate::Transport::Http)
+                .unwrap_or_else(|e| panic!("{e}"));
         }
 
         let service_name =
@@ -124,7 +133,12 @@ pub fn init_tracing() {
         // Store provider so shutdown can flush buffered spans
         let _ = TRACER_PROVIDER.set(provider);
 
-        tracing::info!("OTLP tracing enabled → {endpoint} (version: {git_sha})");
+        // Origin only: an endpoint may carry userinfo or a query credential,
+        // and this line goes to the pod log on every boot (CWE-532).
+        tracing::info!(
+            "OTLP tracing enabled → {} (version: {git_sha})",
+            crate::log_safe_origin(otel_endpoint.as_deref().unwrap_or_default())
+        );
     } else {
         tracing_subscriber::registry()
             .with(env_filter)
@@ -133,45 +147,26 @@ pub fn init_tracing() {
     }
 }
 
-/// A bearer token in `OTEL_EXPORTER_OTLP_HEADERS` is a credential on the wire,
-/// and `http://` is a scheme `reqwest` speaks — so unlike every var in
-/// `check_credential_transport`, nothing fails on its own here: an off-cluster
-/// plaintext collector just works, and posts the token in the clear. The
-/// shipped pattern is off-cluster + bearer (`docs/otlp-rust-betterstack.md`),
-/// so this is the deployment, not a hypothetical.
+/// Endpoint vars in `opentelemetry-otlp`'s own precedence order:
+/// `resolve_http_endpoint` tries the signal-specific one first and only then
+/// falls back to the generic. Both are guarded, because otherwise a compliant
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` certifies a plaintext
+/// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` that is what actually gets dialled.
 ///
-/// Same policy as the `Transport::Http` arm of `check_credential_transport`,
-/// and the same `is_cluster_local` decides it — `https` anywhere, plain `http`
-/// only to a cluster-local collector. It cannot share that function because
-/// these vars never pass through `Config`: `opentelemetry-otlp` reads the
-/// environment itself, so the check has to sit at the read.
-///
-/// No credential means nothing to protect, so a plaintext off-cluster endpoint
-/// is allowed — this decides whether the request may carry a secret, not
-/// whether the URL is tasteful.
-///
-/// Messages name the host, never the raw value: an endpoint may carry userinfo.
-fn check_otlp_endpoint(var: &str, endpoint: &str, has_credential: bool) -> Result<(), String> {
-    if !has_credential {
-        return Ok(());
-    }
-    // Unparseable with a credential set is a misconfigured export either way —
-    // the exporter would fail its own build and degrade to stderr. Refuse
-    // instead of degrading, so the operator learns it from the var name rather
-    // than from a silently missing trace stream.
-    let parsed =
-        reqwest::Url::parse(endpoint).map_err(|e| format!("{var} is not a valid URL ({e})"))?;
-    match parsed.scheme() {
-        "https" => Ok(()),
-        "http" if crate::is_cluster_local(&parsed) => Ok(()),
-        scheme => Err(format!(
-            "{var}: {scheme}://{} is not https and not a cluster-local http endpoint; \
-             OTEL_EXPORTER_OTLP_HEADERS carries a credential that must not travel in \
-             the clear",
-            parsed.host_str().unwrap_or(""),
-        )),
-    }
-}
+/// The generic var is also the on-switch for the whole arm, so a
+/// signal-specific-only config exports nothing at all (and leaks nothing).
+const OTLP_ENDPOINT_VARS: [&str; 2] = [
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+];
+
+/// Header vars, same precedence. Any non-empty value counts as a credential:
+/// the union is stricter than the exporter's `signal.or(generic)`, and reading
+/// header *names* to decide would miss `x-api-key`, `dd-api-key` and friends.
+const OTLP_HEADER_VARS: [&str; 2] = [
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+];
 
 /// Flush buffered OTLP spans and shut down the tracer provider.
 /// No-op if OTLP was never configured.
@@ -192,8 +187,12 @@ mod tests {
     ///
     /// It does NOT pin the OTLP arm, and an earlier version of this comment
     /// wrongly claimed it did. `init_tracing` enters that arm only when
-    /// `OTEL_EXPORTER_OTLP_ENDPOINT` is set, which `cargo test` does not, so
-    /// the blocking client never runs here. Measured twice: forcing the arm
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` is set — normally unset under `cargo
+    /// test`, but that is a fact about the shell, not about this test, and a
+    /// developer who exports the pair `docs/otlp-rust-betterstack.md` shows
+    /// will run the arm here (and hit the boot guard). `set_var` is `unsafe`
+    /// in edition 2024 and races the rest of this binary, so the test cannot
+    /// pin it either way. Measured twice: forcing the arm
     /// with an unroutable endpoint still returns in 0.00s (the exporter builds
     /// a client, it does not dial), and substituting the async
     /// `reqwest::Client` leaves this test green, because a missing reactor
@@ -207,106 +206,38 @@ mod tests {
         tracing::warn!("subscriber is live");
     }
 
-    // ─── OTLP credential transport (LAB-4313) ──────────────────────────────
-    //
-    // Against `check_otlp_endpoint`, not against a booted process: `set_var`
-    // is `unsafe` in edition 2024 and races every other test in this binary,
-    // which is why `non_empty_trimmed` and `parse_judge_daily_cap` are split
-    // from their reads the same way. `init_tracing` composes this with
-    // `unwrap_or_else(|e| panic!(...))`, so an `Err` here IS the refused boot.
-
-    /// A token plus plaintext off-cluster is the one combination that must not
-    /// start, and the refusal has to name the var — an operator reading a pod's
-    /// crash log gets the variable, not a scheme complaint.
+    /// The policy — https anywhere, plaintext cluster-local only, nothing to
+    /// protect means nothing to refuse — is `check_credential_transport`'s and
+    /// is pinned in `main.rs`. What is ours is the wiring, and only two things
+    /// in it can regress silently.
+    ///
+    /// First, coverage of the signal-specific twins. Dropping either from these
+    /// lists leaves a compliant generic value certifying a plaintext one that
+    /// `resolve_http_endpoint` prefers — and no assertion about a refusal
+    /// message catches it, because the var is a format argument, never a
+    /// branch. Second, the transport: `Redis` here would refuse every endpoint
+    /// the exporter can actually speak.
     #[test]
-    fn otlp_refuses_a_credential_over_plaintext_off_cluster() {
-        for (var, bad) in [
-            (
-                "OTEL_EXPORTER_OTLP_ENDPOINT",
-                "http://s2349817.eu-fsn-3.betterstackdata.com",
-            ),
-            // End-anchored cluster-local matching, same as the sibling guard:
-            // a public domain wearing an `svc` label is still public.
-            (
-                "OTEL_EXPORTER_OTLP_ENDPOINT",
-                "http://evil.svc.attacker.com",
-            ),
-            (
-                "OTEL_EXPORTER_OTLP_ENDPOINT",
-                "HTTP://Collector.Example.Com",
-            ),
-            // The generic var being fine does not make the signal-specific one
-            // fine: it is the one `opentelemetry-otlp` prefers.
-            (
-                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-                "http://collector.example.com/v1/traces",
-            ),
-            // Not a scheme reqwest can dial, so it is also not https and not
-            // cluster-local http — refused rather than approved and discovered
-            // at first export.
-            (
-                "OTEL_EXPORTER_OTLP_ENDPOINT",
-                "grpc://collector.example.com",
-            ),
-        ] {
-            let err = super::check_otlp_endpoint(var, bad, true).unwrap_err();
-            assert!(err.contains(var), "{bad}: {err}");
-        }
-        // Unparseable is refused too, and neither message may echo a value
-        // that can carry userinfo (CWE-532).
-        let err = super::check_otlp_endpoint("OTEL_EXPORTER_OTLP_ENDPOINT", "not a url", true)
-            .unwrap_err();
-        assert!(err.contains("OTEL_EXPORTER_OTLP_ENDPOINT"), "{err}");
-        let err = super::check_otlp_endpoint(
-            "OTEL_EXPORTER_OTLP_ENDPOINT",
-            "http://user:s3cr3t@collector.example.com",
-            true,
-        )
-        .unwrap_err();
-        assert!(
-            err.contains("collector.example.com") && !err.contains("s3cr3t"),
-            "{err}"
-        );
-    }
+    fn otlp_guards_both_precedence_pairs_as_an_http_transport() {
+        assert!(super::OTLP_ENDPOINT_VARS.contains(&"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"));
+        assert!(super::OTLP_HEADER_VARS.contains(&"OTEL_EXPORTER_OTLP_TRACES_HEADERS"));
 
-    /// TLS anywhere, or plaintext that never leaves the cluster. Both are the
-    /// real shipped shapes — BetterStack over https, and the in-cluster
-    /// collector `CLAUDE.md` documents.
-    #[test]
-    fn otlp_allows_https_anywhere_and_cluster_local_plaintext() {
-        for ok in [
-            "https://s2349817.eu-fsn-3.betterstackdata.com",
-            "HTTPS://collector.example.com",
-            "http://phoenix-svc.recsys.svc:6006",
-            "http://phoenix-svc.recsys.svc.cluster.local:6006",
-            // Single-label service DNS, IP literals, loopback — `is_cluster_local`
-            // decides all of these, this test only pins that it is consulted.
-            "http://collector:4318",
-            "http://localhost:4318",
-            "http://10.0.0.5:4318",
-            "http://[::1]:4318",
-        ] {
-            assert!(
-                super::check_otlp_endpoint("OTEL_EXPORTER_OTLP_ENDPOINT", ok, true).is_ok(),
-                "{ok}"
-            );
-        }
-    }
-
-    /// No headers, no secret, nothing to leak — so this must stay a credential
-    /// guard and not drift into a URL validator that breaks plaintext
-    /// collectors nobody was authenticating to.
-    #[test]
-    fn otlp_without_a_credential_allows_plaintext_off_cluster() {
-        for endpoint in [
-            "http://collector.example.com",
-            "grpc://collector.example.com",
-            "not a url",
-        ] {
-            assert!(
-                super::check_otlp_endpoint("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint, false).is_ok(),
-                "{endpoint}"
-            );
-        }
+        let check = |url, has_credential| {
+            crate::check_credential_transport(
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                url,
+                has_credential,
+                crate::Transport::Http,
+            )
+        };
+        // A bearer off-cluster in the clear is the fault this exists for.
+        assert!(check("http://collector.example.com", true).is_err());
+        assert!(check("https://collector.example.com", true).is_ok());
+        // `http://collector:4318` is single-label service DNS — the sanctioned
+        // in-cluster path, and the reason `Transport::Http` is the right column.
+        assert!(check("http://collector:4318", true).is_ok());
+        // No headers, no secret: a plaintext collector nobody authenticates to
+        // still boots, so this cannot drift into a URL validator.
+        assert!(check("http://collector.example.com", false).is_ok());
     }
 }

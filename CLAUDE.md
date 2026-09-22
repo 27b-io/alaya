@@ -138,9 +138,10 @@ ALAYA_READONLY_API_KEY=                  # optional read-only bearer (pure reads
 LISTEN_ADDR=0.0.0.0:3001
 RUST_LOG=alaya_server=info
 OTEL_EXPORTER_OTLP_ENDPOINT=http://phoenix-svc.recsys.svc:6006  # optional — read by opentelemetry-otlp, not Config.
-OTEL_EXPORTER_OTLP_HEADERS=                                     #   Boot is refused when these headers are set and the
-                                                                #   endpoint is plain http off-cluster: the bearer would go
-                                                                #   out in the clear. https anywhere, http cluster-local only.
+OTEL_EXPORTER_OTLP_HEADERS=                                     #   Boot is refused when ANY header is set here and the
+                                                                #   endpoint is plain http off-cluster — a header is assumed
+                                                                #   to carry a credential, so a non-secret one (X-Scope-OrgID)
+                                                                #   refuses too. https anywhere, http cluster-local only.
                                                                 #   Same rule for the OTEL_EXPORTER_OTLP_TRACES_* twins,
                                                                 #   which take precedence over these.
 OTEL_SERVICE_NAME=alaya-server

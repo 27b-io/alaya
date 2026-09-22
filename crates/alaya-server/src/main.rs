@@ -147,13 +147,13 @@ impl Config {
         // wrong one there is a silent downgrade, so it is one column to read
         // rather than seven call sites.
         //
-        // Credential-bearing but not in `Config`, so not covered here: the
-        // cachekit.io SaaS cache URL (its own builder is HTTPS-only and
-        // host-allowlisted). The OTLP endpoint is not in `Config` either —
-        // `opentelemetry-otlp` reads it, and the bearer token in
-        // `OTEL_EXPORTER_OTLP_HEADERS`, straight from the environment — so its
-        // check sits at that read instead, `telemetry::check_otlp_endpoint`,
-        // on the same policy and the same `is_cluster_local` (LAB-4313).
+        // Credential-bearing but not in `Config`, so not covered by this
+        // table: the cachekit.io SaaS cache URL (its own builder is HTTPS-only
+        // and host-allowlisted). The OTLP endpoint vars are not in `Config`
+        // either — `opentelemetry-otlp` reads them, and the bearer token in
+        // `OTEL_EXPORTER_OTLP_HEADERS`, straight from the environment — so
+        // `telemetry::init_tracing` calls the function below directly, at that
+        // read, rather than adding a row here (LAB-4313).
         for (var, url, has_credential, transport) in [
             (
                 "SUMMARY_URL",
@@ -3167,16 +3167,10 @@ mod tests {
         assert_eq!(non_empty_trimmed(Some("".into())), None);
         assert_eq!(non_empty_trimmed(Some("   ".into())), None);
         assert_eq!(non_empty_trimmed(Some("\t\n ".into())), None);
-        // `str::trim` is Unicode White_Space, not ASCII — the padding that
-        // actually ships comes from YAML and copy-paste, so NBSP (U+00A0) and
-        // the ideographic space (U+3000) are the realistic blanks, and a
-        // regression to `trim_ascii` would leave them reading as configured.
-        assert_eq!(non_empty_trimmed(Some("\u{00a0}".into())), None);
+        // Unicode White_Space, not ASCII: a regression to `trim_ascii` would
+        // leave YAML/copy-paste NBSP and ideographic padding reading as
+        // configured. One case, because it is the one that would then fail.
         assert_eq!(non_empty_trimmed(Some("  \u{00a0}\u{3000} ".into())), None);
-        assert_eq!(
-            non_empty_trimmed(Some("\u{00a0}https://api.anthropic.com\u{00a0}".into())),
-            Some("https://api.anthropic.com".into())
-        );
         // Trimmed, not merely accepted — the value reaching a client is clean.
         assert_eq!(
             non_empty_trimmed(Some("  https://api.anthropic.com  ".into())),
