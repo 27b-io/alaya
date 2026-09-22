@@ -876,25 +876,13 @@ mod tests {
     /// version of this test flaky under parallel test threads.
     #[tokio::test]
     async fn request_span_omits_query_string() {
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Clone, Default)]
-        struct LogBuffer(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for LogBuffer {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let sink = LogBuffer::default();
-        let writer = sink.clone();
+        // `LogBuf` is the writer only; `capture()` is deliberately not used
+        // here because it installs a scoped default, and the note above is
+        // why this test needs the global one.
+        let sink = testlog::LogBuf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_env_filter("ops_console=debug,tower_http=debug")
-            .with_writer(move || writer.clone())
+            .with_writer(sink.clone())
             .with_ansi(false)
             .finish();
         tracing::subscriber::set_global_default(subscriber)
@@ -911,7 +899,7 @@ mod tests {
         // No login cookie: rejected before any identity-provider call.
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        let log = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let log = sink.text();
         assert!(
             log.contains("started processing request"),
             "positive control: the DEBUG request event must be captured:\n{log}"
