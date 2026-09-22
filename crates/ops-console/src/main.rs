@@ -20,6 +20,8 @@ mod oidc;
 mod routes;
 mod session;
 mod state;
+#[cfg(test)]
+mod testlog;
 mod ui;
 
 use axum::Router;
@@ -262,19 +264,32 @@ mod tests {
         AppState::new(config)
     }
 
-    /// Mint a valid encrypted session cookie the way the server would —
-    /// the key derivation must match `AppState::new` exactly.
-    fn session_cookie_header(state: &AppState, sess: &session::Session) -> String {
+    /// Mint a valid encrypted cookie the way the server would — the key
+    /// derivation must match `AppState::new` exactly.
+    fn encrypted_cookie_header(state: &AppState, name: &'static str, value: String) -> String {
         use sha2::Digest;
         let expanded = sha2::Sha512::digest(&state.config.session_secret);
         let key = cookie::Key::from(&expanded);
         let mut jar = cookie::CookieJar::new();
-        jar.private_mut(&key).add(cookie::Cookie::new(
+        jar.private_mut(&key).add(cookie::Cookie::new(name, value));
+        let c = jar.get(name).unwrap();
+        format!("{}={}", c.name(), c.value())
+    }
+
+    fn session_cookie_header(state: &AppState, sess: &session::Session) -> String {
+        encrypted_cookie_header(
+            state,
             session::SESSION_COOKIE,
             serde_json::to_string(sess).unwrap(),
-        ));
-        let c = jar.get(session::SESSION_COOKIE).unwrap();
-        format!("{}={}", c.name(), c.value())
+        )
+    }
+
+    fn login_cookie_header(state: &AppState, login: &session::LoginState) -> String {
+        encrypted_cookie_header(
+            state,
+            session::LOGIN_COOKIE,
+            serde_json::to_string(login).unwrap(),
+        )
     }
 
     async fn body_string(resp: Response) -> String {
@@ -688,5 +703,132 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Serve `routes` on a loopback ephemeral port and return its origin.
+    /// `ALAYA_URL` is plaintext pod-to-pod, so a compromised or on-path
+    /// alaya-server is the threat model this stands in for.
+    async fn fake_upstream(routes: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// The correction's `content_hash` is alaya-server's answer echoed
+    /// verbatim, and it reaches a log field, `memory_href` and `supersede`.
+    /// Unvalidated it forges pod-log records — in the audit trail for this
+    /// very write — so it must be refused, and the refusal must still say
+    /// that the store half committed.
+    #[tokio::test]
+    async fn a_malformed_store_content_hash_is_refused_and_never_reaches_the_log_raw() {
+        const FORGED: &str = "aaaa\n2026-09-22T12:00:00Z  INFO ops_console: corrected + superseded sub=\"admin-sub\"";
+
+        let upstream = Router::new()
+            .route(
+                "/memories/{hash}",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "memory": { "memory_type": "note", "tags": [] }
+                    }))
+                }),
+            )
+            .route(
+                "/store",
+                post(|| async { axum::Json(serde_json::json!({ "content_hash": FORGED })) }),
+            );
+        let mut config = test_config();
+        config.alaya_url = fake_upstream(upstream).await.parse().unwrap();
+
+        let state = AppState::new(config);
+        let sess = session::new_session("admin-sub".into(), None, None);
+        let cookie_header = session_cookie_header(&state, &sess);
+        let csrf = sess.csrf.clone();
+        let hash = "a".repeat(64);
+        let app = app(state);
+
+        let buf = testlog::LogBuf::default();
+        let resp = {
+            let _capture = buf.capture();
+            app.oneshot(
+                HttpRequest::post(format!("/alaya/memory/{hash}/correct"))
+                    .header(header::ORIGIN, "https://console.test")
+                    .header(header::COOKIE, cookie_header)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("csrf={csrf}&content=fixed&reason=typo")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("WAS stored"),
+            "the committed store half must not be hidden by the refusal: {body}"
+        );
+
+        // Panics unless the refusal is in the pod log at all — it has to be
+        // diagnosable — and the record it finds is one line, so the forged
+        // tail being on it is the proof the `\n` never split it.
+        let record = buf.record("unusable content_hash");
+        assert!(
+            record.contains("\\n") && record.contains("corrected + superseded"),
+            "the forged record must be escaped onto the refusal's own line: {record}"
+        );
+        let leaked = testlog::separators_in(&record);
+        assert!(
+            leaked.is_empty(),
+            "no upstream byte may reach the log raw: {leaked:?} in {record}"
+        );
+    }
+
+    /// An IdP outage must log once, from the arm that saw it. The warning
+    /// that names an id_token rejection belongs at the refusal, not around a
+    /// call whose first act is discovery — out there it fired on every
+    /// transport failure too, asserting a rejection that never happened.
+    #[tokio::test]
+    async fn an_idp_transport_failure_logs_once_and_claims_no_id_token_rejection() {
+        let mut config = test_config();
+        // Closed port: discovery fails before any token can exist.
+        config.oidc_issuer = "http://127.0.0.1:1".into();
+        let state = AppState::new(config);
+
+        let login = session::new_login_state("/alaya".into());
+        let cb_state = login.state.clone();
+        let cookie_header = login_cookie_header(&state, &login);
+        let app = app(state);
+
+        let buf = testlog::LogBuf::default();
+        let resp = {
+            let _capture = buf.capture();
+            app.oneshot(
+                HttpRequest::get(format!("/auth/callback?code=xyz&state={cb_state}"))
+                    .header(header::COOKIE, cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let logged = buf.text();
+        assert!(
+            logged.contains("identity provider request failed"),
+            "the outage must still be logged: {logged}"
+        );
+        assert!(
+            !logged.contains("id_token rejected"),
+            "no id_token was received, so none can have been rejected: {logged}"
+        );
+        // The defect this pins is the duplicate, not the wording: the arm
+        // that saw the failure warns, and nothing above it warns again.
+        let console_warns = logged
+            .lines()
+            .filter(|l| l.contains("ops_console::oidc"))
+            .count();
+        assert_eq!(console_warns, 1, "one outage, one record: {logged}");
     }
 }

@@ -771,6 +771,25 @@ pub async fn correct_and_supersede(
         .and_then(|h| h.as_str())
         .ok_or_else(|| AppError::Upstream("store returned no content_hash".into()))?
         .to_string();
+    // alaya-server's answer, echoed verbatim — and until here the one field
+    // in this crate recorded with `%` that never met a validator. The
+    // plain-text subscriber writes a `Display` field raw, so a `\n` in it
+    // forges whole pod-log records in the audit trail for this very write.
+    // It has to be a 64-hex hash to survive `memory_href` and `supersede`
+    // anyway, and it makes the `short_hash` below honest.
+    //
+    // Reported like the supersede half rather than as a bare 400: the store
+    // has already committed, and an error that hides that is exactly what
+    // the two-phase handling below exists to prevent.
+    if validate_hash(&new_hash).is_err() {
+        tracing::error!(sub = ?session.sub, old = %hash, new = ?new_hash, "store returned an unusable content_hash");
+        return Err(AppError::Upstream(format!(
+            "the correction WAS stored but alaya-server returned an unusable id for it, \
+             so {} could not be superseded — find the correction by searching for its \
+             text, then supersede from the original memory's page",
+            short_hash(&hash),
+        )));
+    }
     if new_hash == hash {
         return Err(AppError::BadRequest(
             "corrected content is identical to the original".into(),
@@ -785,7 +804,7 @@ pub async fn correct_and_supersede(
         .supersede(&hash, &new_hash, form.reason.trim())
         .await
     {
-        tracing::error!(sub = ?session.sub, old = %hash, new = %new_hash, "correction stored but supersede failed");
+        tracing::error!(sub = ?session.sub, old = %hash, new = ?new_hash, "correction stored but supersede failed");
         let detail = match e {
             AppError::Upstream(d) => d,
             _ => "supersede failed".to_string(),
@@ -797,7 +816,7 @@ pub async fn correct_and_supersede(
             short_hash(&hash),
         )));
     }
-    tracing::info!(sub = ?session.sub, old = %hash, new = %new_hash, "corrected + superseded");
+    tracing::info!(sub = ?session.sub, old = %hash, new = ?new_hash, "corrected + superseded");
     Ok(flash_redirect(
         jar,
         state.secure_cookies(),

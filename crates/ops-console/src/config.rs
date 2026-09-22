@@ -141,6 +141,21 @@ fn reject_query_or_fragment(key: &str, url: &url::Url) -> Result<(), String> {
     Ok(())
 }
 
+/// Userinfo in a config URL is a credential in a URL, and both URLs that
+/// carry one leak it the same way: it rides the concatenation into an
+/// outbound request while every rendering of the URL this binary logs —
+/// `Config`'s Debug, `public_origin()` — shows the userinfo-free form, so
+/// nothing in the pod log records that it went anywhere.
+///
+/// Parsed, not string-matched: '@' is legal in a path, and only the parser
+/// decides which bytes are userinfo.
+fn reject_userinfo(key: &str, url: &url::Url) -> Result<(), String> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!("{key} must not carry userinfo"));
+    }
+    Ok(())
+}
+
 /// https everywhere; plaintext http exists only for loopback local dev (a
 /// non-loopback http URL would also silently disable the Secure cookie flag
 /// — refuse instead).
@@ -164,13 +179,8 @@ fn validate_public_url(public_url: &url::Url) -> Result<(), String> {
     reject_query_or_fragment("CONSOLE_PUBLIC_URL", public_url)?;
     // Userinfo rides the same concatenation, and this is the worse half of
     // it: the credential lands in the authorize redirect's `Location` and in
-    // the token POST body, while `public_origin()` and `Config`'s Debug both
-    // render the userinfo-free origin — so nothing in the pod log shows it
-    // leaked. `validate_issuer` has refused this since the last round; the
-    // rule was never applied here.
-    if !public_url.username().is_empty() || public_url.password().is_some() {
-        return Err("CONSOLE_PUBLIC_URL must not carry userinfo".into());
-    }
+    // the token POST body.
+    reject_userinfo("CONSOLE_PUBLIC_URL", public_url)?;
     match public_url.scheme() {
         "https" => Ok(()),
         "http" if is_loopback => Ok(()),
@@ -258,9 +268,6 @@ fn validate_upstream_url(var: &str, url: &url::Url) -> Result<(), String> {
 /// Debug prints it (`?config` at startup, unconditionally) and `OidcRp` logs
 /// it on every IdP failure. Refusing the shape at boot is one check;
 /// redacting at each log site is a list that grows and will miss one.
-///
-/// Parsed, not string-matched — '@' is legal in a path, and only the parser
-/// decides which bytes are userinfo.
 fn validate_issuer(issuer: &str) -> Result<(), String> {
     if !issuer.starts_with("https://") {
         return Err("CONSOLE_OIDC_ISSUER must be https".into());
@@ -268,9 +275,7 @@ fn validate_issuer(issuer: &str) -> Result<(), String> {
     let url: url::Url = issuer
         .parse()
         .map_err(|e| format!("CONSOLE_OIDC_ISSUER is not a valid URL: {e}"))?;
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("CONSOLE_OIDC_ISSUER must not carry userinfo".into());
-    }
+    reject_userinfo("CONSOLE_OIDC_ISSUER", &url)?;
     // Discovery concatenates the well-known path onto the issuer (`oidc.rs`).
     reject_query_or_fragment("CONSOLE_OIDC_ISSUER", &url)?;
     Ok(())
