@@ -34,11 +34,8 @@ const DEFAULT_FILTER: &str =
 /// - `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `_HEADERS`: the signal-specific
 ///   twins, which take precedence over the pair above.
 ///
-/// Panics when the headers the exporter will send are non-empty and the
-/// endpoint it will dial would carry them in the clear off-cluster, via
-/// `check_credential_transport` — the same guard, policy and messages as every
-/// credential URL in `Config`. Which endpoint and which headers is decided by
-/// `check_otlp_transport`, by the exporter's own rules.
+/// Panics when `checked_otlp_endpoint` refuses — see it for which pair is
+/// checked and why.
 pub fn init_tracing() {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_FILTER));
@@ -47,16 +44,23 @@ pub fn init_tracing() {
 
     // The generic var is the on-switch for the whole arm, so a
     // signal-specific-only config exports nothing at all (and leaks nothing).
-    if crate::env_non_empty("OTEL_EXPORTER_OTLP_ENDPOINT").is_some() {
+    // Raw, not trimmed, from here on: `opentelemetry-otlp` reads these with
+    // `std::env::var`, so a trimmed copy would certify a string it never dials.
+    if let Some(generic_endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
         // Checked before the exporter is built, so a refusal means the process
-        // never starts rather than starting and posting the token. Raw, not
-        // trimmed: `opentelemetry-otlp` reads these with `std::env::var`, so a
-        // trimmed copy would certify a string the exporter never dials.
-        let endpoint = check_otlp_transport(
-            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_default(),
-            std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").ok(),
-            std::env::var("OTEL_EXPORTER_OTLP_HEADERS").ok(),
-            std::env::var("OTEL_EXPORTER_OTLP_TRACES_HEADERS").ok(),
+        // never starts rather than starting and posting the token.
+        let endpoint = checked_otlp_endpoint(
+            &generic_endpoint,
+            std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+                .ok()
+                .as_deref(),
+            std::env::var("OTEL_EXPORTER_OTLP_HEADERS").ok().as_deref(),
+            std::env::var("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+                .ok()
+                .as_deref(),
         )
         .unwrap_or_else(|e| panic!("{e}"));
 
@@ -133,13 +137,15 @@ pub fn init_tracing() {
     }
 }
 
-/// Guard the endpoint/header pair the exporter will actually use, and return
-/// that endpoint. The pair is selected from the same four raw values
+/// The endpoint the exporter will dial, after guarding it together with the
+/// headers it will send. The pair is selected from the same four raw values
 /// `opentelemetry-otlp` reads, by its own rules (`resolve_http_endpoint` and
 /// `build_client` in `exporter/http/mod.rs`):
 ///
 /// - `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` wins when it is set *and parses as
-///   an `http::Uri`*; otherwise `OTEL_EXPORTER_OTLP_ENDPOINT` is dialled.
+///   an `http::Uri`*; otherwise `OTEL_EXPORTER_OTLP_ENDPOINT` is dialled with
+///   the signal path appended — and if *that* does not parse, the exporter's
+///   own default endpoint is, silently.
 /// - `OTEL_EXPORTER_OTLP_TRACES_HEADERS` wins when it is set *at all*: a
 ///   set-but-empty value sends no headers and silences the generic ones.
 ///
@@ -154,35 +160,51 @@ pub fn init_tracing() {
 /// entries without a `key=value` shape, so this is stricter, and reading
 /// header *names* to decide would miss `x-api-key`, `dd-api-key` and friends.
 ///
-/// Split from the env reads so it can be pinned by a test: `set_var` is
-/// `unsafe` in edition 2024 and races every other test in the binary.
-fn check_otlp_transport(
-    generic_endpoint: String,
-    traces_endpoint: Option<String>,
-    generic_headers: Option<String>,
-    traces_headers: Option<String>,
+/// Pure over the raw values, for the reason `non_empty_trimmed` gives.
+fn checked_otlp_endpoint(
+    generic_endpoint: &str,
+    traces_endpoint: Option<&str>,
+    generic_headers: Option<&str>,
+    traces_headers: Option<&str>,
 ) -> Result<String, String> {
-    let has_credential = crate::non_empty_trimmed(traces_headers.or(generic_headers)).is_some();
+    let has_credential = traces_headers
+        .or(generic_headers)
+        .is_some_and(|h| !h.trim().is_empty());
     // `axum::http` is the one `http` crate in the lockfile — the exporter's
-    // own parser, so the fallback decision is its decision, not an imitation.
+    // own parser, so each fallback decision is its decision, not an imitation.
+    // `reqwest::Url` would not do: its WHATWG parser strips whitespace and
+    // punycodes hosts that `http::Uri` rejects outright.
     let (var, endpoint) = match traces_endpoint {
         Some(t) if t.parse::<axum::http::Uri>().is_ok() => {
             ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", t)
         }
-        _ => ("OTEL_EXPORTER_OTLP_ENDPOINT", generic_endpoint),
+        _ => {
+            // `build_endpoint_uri`: a generic value that fails to parse with
+            // the path appended sends the credential to the exporter's default
+            // endpoint — a destination nobody configured — so refuse rather
+            // than certify a string that is never dialled. Whitespace padding
+            // is the everyday case.
+            let path = if generic_endpoint.ends_with('/') {
+                "v1/traces"
+            } else {
+                "/v1/traces"
+            };
+            if has_credential
+                && format!("{generic_endpoint}{path}")
+                    .parse::<axum::http::Uri>()
+                    .is_err()
+            {
+                return Err(
+                    "OTEL_EXPORTER_OTLP_ENDPOINT is not a URI the exporter can parse; \
+                            it would silently fall back to its own default endpoint"
+                        .to_string(),
+                );
+            }
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", generic_endpoint)
+        }
     };
-    // A padded generic value the exporter cannot parse falls back to its own
-    // default endpoint silently, which is a credential going somewhere nobody
-    // configured — refuse instead. (A signal-specific value that parsed above
-    // cannot be padded; `http::Uri` rejects whitespace.)
-    if has_credential && endpoint != endpoint.trim() {
-        return Err(format!(
-            "{var} has leading or trailing whitespace; the exporter reads it raw \
-             and would silently fall back to its own default endpoint"
-        ));
-    }
-    crate::check_credential_transport(var, &endpoint, has_credential, crate::Transport::Http)?;
-    Ok(endpoint)
+    crate::check_credential_transport(var, endpoint, has_credential, crate::Transport::Http)?;
+    Ok(endpoint.to_string())
 }
 
 /// Flush buffered OTLP spans and shut down the tracer provider.
@@ -223,28 +245,12 @@ mod tests {
         tracing::warn!("subscriber is live");
     }
 
-    /// The policy — https anywhere, plaintext cluster-local only, nothing to
-    /// protect means nothing to refuse — is `check_credential_transport`'s and
-    /// is pinned in `main.rs`. What is ours is *which* pair reaches it, and
-    /// that must match what the exporter dials, in both directions: guard a
-    /// shadowed value and a valid config refuses to boot; miss the winning one
-    /// and a bearer goes out in the clear behind a compliant decoy.
-    ///
-    /// Arguments are the four raw env values in the order `init_tracing`
-    /// reads them; `None` is unset, `Some("")` is set-but-empty.
-    fn guard(
-        generic_endpoint: &str,
-        traces_endpoint: Option<&str>,
-        generic_headers: Option<&str>,
-        traces_headers: Option<&str>,
-    ) -> Result<String, String> {
-        super::check_otlp_transport(
-            generic_endpoint.to_string(),
-            traces_endpoint.map(str::to_string),
-            generic_headers.map(str::to_string),
-            traces_headers.map(str::to_string),
-        )
-    }
+    // The policy — https anywhere, plaintext cluster-local only, nothing to
+    // protect means nothing to refuse — is `check_credential_transport`'s and
+    // is pinned in `main.rs`. These pin which pair reaches it. Arguments are
+    // the four raw env values in the order `init_tracing` reads them; `None`
+    // is unset, `Some("")` is set-but-empty.
+    use super::checked_otlp_endpoint as guard;
 
     const BEARER: Option<&str> = Some("Authorization=Bearer token");
 
@@ -309,13 +315,22 @@ mod tests {
     }
 
     #[test]
-    fn padded_generic_endpoint_is_refused_only_when_a_credential_rides_on_it() {
-        // The exporter would silently fall back to its default endpoint; with a
-        // bearer attached that is refused, without one it is not this guard's
-        // question — so it cannot drift into a URL validator.
-        let err = guard(" http://collector:4318 ", None, BEARER, None).unwrap_err();
-        assert!(err.contains("whitespace"), "{err}");
-        assert!(guard(" http://collector:4318 ", None, None, None).is_ok());
+    fn unparseable_generic_endpoint_is_refused_only_when_a_credential_rides_on_it() {
+        // `build_endpoint_uri` fails on each of these and the exporter silently
+        // dials its default endpoint instead. `reqwest::Url` accepts all three
+        // (it strips the padding and the tab, and tolerates the extra slash),
+        // so a guard that parsed with it would certify a host that is never
+        // dialled. With a bearer attached that is refused; without one it is
+        // not this guard's question, so it cannot drift into a URL validator.
+        for bad in [
+            " http://collector:4318 ",
+            "https:///collector.example.com",
+            "https://collector\t.example.com",
+        ] {
+            let err = guard(bad, None, BEARER, None).unwrap_err();
+            assert!(err.contains("default endpoint"), "{bad:?}: {err}");
+            assert!(guard(bad, None, None, None).is_ok(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -324,6 +339,5 @@ mod tests {
         // in-cluster path, and the reason `Transport::Http` is the right
         // column: `Redis` would refuse every endpoint the exporter can speak.
         assert!(guard("http://collector:4318", None, BEARER, None).is_ok());
-        assert!(guard("https://collector.example.com", None, BEARER, None).is_ok());
     }
 }
