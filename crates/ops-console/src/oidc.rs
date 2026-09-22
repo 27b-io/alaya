@@ -113,6 +113,14 @@ fn normalize_issuer(s: &str) -> &str {
 /// answers immediately, and loops until the browser gives up, with nothing
 /// in the log. They borrow this ceiling for that reason, not the spec's.
 ///
+/// It is a first cut at that hazard and not the guarantee, which this
+/// comment used to claim: the count is RAW bytes, and JSON escaping turns
+/// one control byte into six on the way into the cookie, so three claims at
+/// this cap still issued a 4603-byte `Set-Cookie`. What bounds the encoded
+/// artifact is `MAX_COOKIE_PLAINTEXT_BYTES` in `session.rs`; what this
+/// bounds is the claim — the log line, and how much of it the cookie is
+/// asked to carry in the first place.
+///
 /// What this does NOT bound is the transient allocation: `decode` builds the
 /// oversized `String` before either guard runs, so the heap cost up to what
 /// an 8 MiB token body decodes to is unchanged. `MAX_BODY_BYTES` is what
@@ -604,11 +612,10 @@ mod tests {
         assert!(same_origin_https("http://localhost:8787", "http://localhost:8787/jwks").is_ok());
     }
 
-    /// Pins the comparison, not the placement: reaching `verify_id_token`
-    /// needs a signed token and a JWKS fixture, which would cost more than
-    /// it pins. Placement is safe by construction instead — `decode` into
-    /// `IdClaims` appears once, in this private method, whose only caller is
-    /// `exchange_and_verify`.
+    /// Pins the comparison itself; the signed-token tests at the bottom of
+    /// this module pin what `verify_id_token` does with it. Kept separate
+    /// because that harness cannot fail on the bytes-vs-chars distinction,
+    /// and this is the assertion that holds it.
     #[test]
     fn claim_bound_is_the_spec_ceiling() {
         assert!(claim_within_bound(&"a".repeat(255)));
@@ -644,6 +651,159 @@ mod tests {
         assert!(
             !u.contains("secret"),
             "client secret must never be in the authorize URL"
+        );
+    }
+
+    // --- signed token -> session cookie, measured end to end -------------
+    //
+    // `claim_within_bound` bounds the RAW claim; what a browser measures is
+    // the JSON-escaped, AES-GCM-encrypted, base64'd, percent-encoded cookie.
+    // A NUL costs six bytes as an escaped `u0000` before the jar has touched
+    // it, so three claims at the raw cap once serialized to 3247 bytes of
+    // JSON and a 4581-byte `Set-Cookie` — past the 4096 RFC 6265 6.1 asks
+    // user agents to support, and an oversized cookie is dropped SILENTLY.
+    // The defect lived in the composition of the two bounds, not in either
+    // one, so these mint real ES256 tokens and read the real header.
+
+    /// RFC 6265 6.1: a user agent should support at least 4096 bytes per
+    /// cookie, "as measured by the sum of the length of the cookie's name,
+    /// value, and attributes" — which is exactly one `Set-Cookie` header.
+    const BROWSER_COOKIE_LIMIT: usize = 4096;
+
+    /// Mint an ES256 id_token and run it through the production verifier.
+    /// Discovery is unused and the JWKS is pre-seeded, so nothing touches
+    /// the network.
+    async fn verify_minted(
+        sub: &str,
+        email: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<IdClaims, OidcRpError> {
+        use crate::testkit;
+
+        let rp = OidcRp::new(
+            testkit::ISSUER.into(),
+            testkit::CLIENT_ID.into(),
+            "secret".into(),
+            "https://console.test/auth/callback".into(),
+        );
+        rp.keys.write().await.insert(
+            testkit::KID.into(),
+            Jwk {
+                kty: "EC".into(),
+                kid: Some(testkit::KID.into()),
+                n: None,
+                e: None,
+                x: Some(testkit::EC_X.into()),
+                y: Some(testkit::EC_Y.into()),
+            },
+        );
+        rp.verify_id_token(&testkit::mint_id_token(sub, email, name))
+            .await
+    }
+
+    /// Issue the session the callback would issue for these claims and hand
+    /// back the real `Set-Cookie` header plus the session a browser would
+    /// send back on the next request — so "it fits" is measured against a
+    /// cookie that is still usable, not merely against a smaller number.
+    fn issue_and_replay(claims: IdClaims) -> (String, Option<crate::session::Session>) {
+        use axum::http::header::{COOKIE, SET_COOKIE};
+        use axum::response::IntoResponse;
+        use axum_extra::extract::cookie::{Key, PrivateCookieJar};
+
+        let key = Key::from(&[7u8; 64][..]);
+        let sess = crate::session::new_session(
+            claims.sub,
+            claims.email,
+            claims.name.or(claims.preferred_username),
+        );
+        // `secure = true` is the larger header (`; Secure`), i.e. the shape
+        // the deployed console actually emits.
+        let jar = crate::session::session_cookie(PrivateCookieJar::new(key.clone()), &sess, true);
+        let header = (jar, axum::http::StatusCode::OK)
+            .into_response()
+            .headers()
+            .get(SET_COOKIE)
+            .expect("a session cookie is always issued")
+            .to_str()
+            .expect("the encoded cookie is ascii")
+            .to_string();
+
+        let mut replay = axum::http::HeaderMap::new();
+        let pair = header.split(';').next().expect("name=value").to_string();
+        replay.insert(COOKIE, pair.parse().expect("cookie header"));
+        let back = PrivateCookieJar::from_headers(&replay, key);
+        (header, crate::session::read_session(&back))
+    }
+
+    #[tokio::test]
+    async fn control_heavy_claims_at_the_cap_still_fit_the_cookie_limit() {
+        let nul = "\u{0}".repeat(MAX_CLAIM_BYTES);
+        // The second case is the worst the claim bounds permit: an
+        // allowlisted subject could only look like this if an operator
+        // pasted it in, but it is what makes the fallback provably
+        // sufficient — dropping the two display claims has to be enough
+        // whatever `sub` costs.
+        for (label, sub) in [
+            ("ordinary subject", "ops-operator".to_string()),
+            ("subject at the cap too", nul.clone()),
+        ] {
+            let claims = verify_minted(&sub, Some(&nul), Some(&nul))
+                .await
+                .expect("claims at the cap verify");
+            let (header, session) = issue_and_replay(claims);
+            assert!(
+                header.len() <= BROWSER_COOKIE_LIMIT,
+                "{label}: Set-Cookie is {} bytes, the browser drops it silently",
+                header.len()
+            );
+            assert_eq!(
+                session
+                    .expect("the issued session must survive a round trip")
+                    .sub,
+                sub,
+                "{label}: identity must not be altered to make the cookie fit"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_length_ordinary_profile_keeps_its_display_name() {
+        let name = "n".repeat(MAX_CLAIM_BYTES);
+        let email = format!("{}@example.test", "e".repeat(MAX_CLAIM_BYTES - 13));
+        let claims = verify_minted("ops-operator", Some(&email), Some(&name))
+            .await
+            .expect("boundary-length text verifies");
+        let (header, session) = issue_and_replay(claims);
+        assert!(
+            header.len() <= BROWSER_COOKIE_LIMIT,
+            "Set-Cookie is {} bytes",
+            header.len()
+        );
+        assert_eq!(
+            session.expect("usable session").display_name(),
+            name,
+            "255 bytes of ordinary text is an ordinary profile — dropping it \
+             would be a regression dressed as a fix"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_claims_are_refused_for_sub_and_dropped_for_the_rest() {
+        let over = "a".repeat(MAX_CLAIM_BYTES + 1);
+        assert!(
+            verify_minted(&over, None, None).await.is_err(),
+            "an oversized sub must refuse the login — truncating it would \
+             alias two subjects onto one allowlist entry"
+        );
+        let claims = verify_minted("ops-operator", Some(&over), Some(&over))
+            .await
+            .expect("oversized display claims degrade, they do not refuse");
+        assert!(claims.email.is_none() && claims.name.is_none());
+        let (header, session) = issue_and_replay(claims);
+        assert!(header.len() <= BROWSER_COOKIE_LIMIT);
+        assert_eq!(
+            session.expect("usable session").display_name(),
+            "ops-operator"
         );
     }
 }

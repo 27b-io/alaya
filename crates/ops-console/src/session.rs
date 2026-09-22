@@ -32,6 +32,32 @@ const SESSION_TTL_SECS: i64 = 12 * 3600;
 pub const IDLE_TTL_SECS: i64 = 15 * 60;
 const LOGIN_TTL_SECS: i64 = 600;
 
+/// Plaintext (JSON) ceiling for a cookie value, derived from the encoded
+/// artifact rather than from the input.
+///
+/// RFC 6265 6.1 asks user agents to support at least 4096 bytes per cookie,
+/// "as measured by the sum of the length of the cookie's name, value, and
+/// attributes"; Chrome and Firefox enforce it, and an oversized cookie is
+/// dropped SILENTLY — the callback redirects, the next page has no session,
+/// login starts over, and the pod log records a successful login.
+///
+/// What the browser measures is four expansions away from anything a caller
+/// can see, which is why `oidc.rs`'s 255-byte cap on the raw claims did not
+/// deliver the guarantee its comment claimed:
+///   JSON escaping    — one control byte becomes six, so 255 raw bytes of
+///                      claim serialize to 1530.
+///   AES-GCM          — plus a 12-byte nonce and a 16-byte tag.
+///   base64           — times 4/3.
+///   percent-encoding — `/` and `=` are in the cookie crate's encode set
+///                      (`+` is not), 3 bytes each, ~1/64 of the output.
+/// 2048 plaintext bytes sits well inside that. The arithmetic is not the
+/// guarantee, though — the worst case the claim bounds permit (`sub` at its
+/// 255-byte cap with every byte a control character, both display claims
+/// dropped) measures 2461 bytes on the wire, and
+/// `control_heavy_claims_at_the_cap_still_fit_the_cookie_limit` is what
+/// measures it, through the real jar.
+const MAX_COOKIE_PLAINTEXT_BYTES: usize = 2048;
+
 pub fn now_epoch() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -122,7 +148,30 @@ pub fn removal_cookie(name: &'static str) -> Cookie<'static> {
 }
 
 pub fn session_cookie(jar: PrivateCookieJar, s: &Session, secure: bool) -> PrivateCookieJar {
-    let value = serde_json::to_string(s).expect("session serializes");
+    let mut value = serde_json::to_string(s).expect("session serializes");
+    if value.len() > MAX_COOKIE_PLAINTEXT_BYTES {
+        // The two display claims are the only droppable fields. `sub`
+        // identifies the session and truncating it would alias two subjects
+        // onto one allowlist entry; `sid`, `csrf` and the timestamps are the
+        // session. `display_name` already falls back name -> email -> sub, so
+        // dropping costs a plainer greeting and nothing else — and `oidc.rs`
+        // caps `sub` at 255 bytes, so this fallback is inside the budget even
+        // when every one of those bytes escapes to six.
+        //
+        // Logged, not silent: the operator whose profile this happens to sees
+        // a first name instead of a full one, and that is the only other
+        // symptom there is.
+        tracing::warn!(
+            bytes = value.len(),
+            "session display claims dropped: the cookie would exceed the browser limit"
+        );
+        value = serde_json::to_string(&Session {
+            email: None,
+            name: None,
+            ..s.clone()
+        })
+        .expect("session serializes");
+    }
     jar.add(base_cookie(SESSION_COOKIE, value, secure, SESSION_TTL_SECS))
 }
 

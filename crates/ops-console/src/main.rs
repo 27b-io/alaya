@@ -20,6 +20,8 @@ mod oidc;
 mod routes;
 mod session;
 mod state;
+#[cfg(test)]
+mod testkit;
 mod ui;
 
 use axum::Router;
