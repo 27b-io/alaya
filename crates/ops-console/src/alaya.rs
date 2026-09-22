@@ -16,22 +16,9 @@ pub struct AlayaClient {
     http: reqwest::Client,
 }
 
-/// Extract a safe error string from an upstream error body.
-fn upstream_error(status: reqwest::StatusCode, body: &str) -> AppError {
-    let detail = serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
-        .unwrap_or_else(|| "unrecognized error body".to_string());
-    AppError::Upstream(format!("alaya-server {status}: {detail}"))
-}
-
 impl AlayaClient {
     pub fn new(base: url::Url, bearer: String) -> Self {
-        let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .expect("failed to build alaya http client");
+        let http = crate::http::client(std::time::Duration::from_secs(60));
         AlayaClient { base, bearer, http }
     }
 
@@ -46,11 +33,14 @@ impl AlayaClient {
             .bearer_auth(&self.bearer)
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(|e| AppError::transport("alaya-server", &e))?;
         let status = resp.status();
-        let text = resp.text().await?;
+        let text = crate::http::body_text("alaya-server", resp)
+            .await
+            .map_err(|e| AppError::body("alaya-server", e))?;
         if !status.is_success() {
-            return Err(upstream_error(status, &text));
+            return Err(AppError::non_success("alaya-server", status, &text));
         }
         let body: Value = serde_json::from_str(&text)
             .map_err(|_| AppError::Upstream("alaya-server returned non-JSON".into()))?;
@@ -73,14 +63,17 @@ impl AlayaClient {
             .get(self.url(path))
             .bearer_auth(&self.bearer)
             .send()
-            .await?;
+            .await
+            .map_err(|e| AppError::transport("alaya-server", &e))?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(AppError::NotFound("memory not found".into()));
         }
-        let text = resp.text().await?;
+        let text = crate::http::body_text("alaya-server", resp)
+            .await
+            .map_err(|e| AppError::body("alaya-server", e))?;
         if !status.is_success() {
-            return Err(upstream_error(status, &text));
+            return Err(AppError::non_success("alaya-server", status, &text));
         }
         serde_json::from_str(&text)
             .map_err(|_| AppError::Upstream("alaya-server returned non-JSON".into()))

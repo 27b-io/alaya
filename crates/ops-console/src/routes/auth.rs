@@ -78,17 +78,38 @@ pub async fn callback(
         .oidc
         .exchange_and_verify(&code, &login.pkce_verifier, &login.nonce)
         .await
-        .map_err(|e| AppError::Forbidden(format!("login failed: {e}")))?;
+        .map_err(|e| {
+            // Everything `verify_id_token` refuses after the token decodes —
+            // iss mismatch, an oversized claim, nonce mismatch, a disallowed
+            // alg, an unknown kid — returned silently until now, while
+            // `warn_idp_failure` covered only transport and discovery. Under
+            // a substituted-IdP threat model those refusals are the highest-
+            // signal events this console can observe, and the pod log had no
+            // record of any of them. Safe by type rather than by care: the
+            // payload is `OidcRpError`'s `&'static str`, so no IdP-supplied
+            // byte can reach the log through it.
+            tracing::warn!(op = e.0, "oidc: id_token rejected");
+            AppError::Forbidden(format!("login failed: {e}"))
+        })?;
 
+    // `sub` is recorded with `?`, not `%`, here and everywhere it is logged.
+    // It is an unvalidated string straight out of the id_token, logged on
+    // the rejection path of an unauthenticated route — so it reaches the log
+    // for subjects that are authorized for nothing — and the plain-text
+    // subscriber writes a `Display`-recorded field verbatim, so `%` would
+    // let a substituted IdP forge whole log records by putting a newline in
+    // the subject. `oidc.rs` pins the mechanism with a test, and bounds the
+    // length there so neither line can be made arbitrarily long.
+    //
     // Default-deny subject allowlist (AC1): explicit 403, nothing minted.
     if !state.config.subject_allowed(&claims.sub) {
-        tracing::warn!(sub = %claims.sub, "login rejected: subject not allowlisted");
+        tracing::warn!(sub = ?claims.sub, "login rejected: subject not allowlisted");
         return Err(AppError::Forbidden(
             "this account is not authorized for the console".into(),
         ));
     }
 
-    tracing::info!(sub = %claims.sub, "console login");
+    tracing::info!(sub = ?claims.sub, "console login");
     let sess = new_session(
         claims.sub,
         claims.email,

@@ -9,12 +9,23 @@ use sha2::Digest;
 
 use crate::alaya::AlayaClient;
 use crate::config::Config;
+use crate::lb::{LbClient, MetricsClient};
 use crate::oidc::OidcRp;
+
+/// anthropic-lb monitoring module upstreams, present only when the module
+/// is configured — see `LbConfig`. One value, not two `Option`s: the
+/// all-or-nothing group is encoded in the type.
+#[derive(Clone)]
+pub struct LbModule {
+    pub client: LbClient,
+    pub metrics: MetricsClient,
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub alaya: AlayaClient,
+    pub lb: Option<LbModule>,
     pub oidc: Arc<OidcRp>,
     /// AES-GCM key for the private cookie jar, derived from
     /// CONSOLE_SESSION_SECRET at startup.
@@ -37,6 +48,10 @@ impl AppState {
         let key = Key::from(&expanded);
         let config = Arc::new(config);
         let alaya = AlayaClient::new(config.alaya_url.clone(), config.alaya_api_key.clone());
+        let lb = config.lb.as_ref().map(|c| LbModule {
+            client: LbClient::new(c.url.clone(), c.api_key.clone()),
+            metrics: MetricsClient::new(c.metrics_url.clone()),
+        });
         let oidc = Arc::new(OidcRp::new(
             config.oidc_issuer.clone(),
             config.oidc_client_id.clone(),
@@ -46,6 +61,7 @@ impl AppState {
         AppState {
             config,
             alaya,
+            lb,
             oidc,
             key,
             revoked: Arc::new(Mutex::new(HashMap::new())),
