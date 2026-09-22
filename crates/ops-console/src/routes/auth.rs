@@ -71,11 +71,9 @@ pub async fn callback(
         .await
         // No warn here: every arm below this call already logs its own, at
         // the refusal that produced it (`warn_rejected`, `warn_idp_failure`,
-        // `warn_idp_parse_failure`, `http::body_text`). A wrapper at this
-        // level cannot tell them apart — the first thing `exchange_and_verify`
-        // does is `discovery()` — so it logged a second line claiming an
-        // id_token was rejected on every IdP transport and discovery outage,
-        // degrading the signal it was added to sharpen.
+        // `warn_idp_parse_failure`, `http::body_text`). `warn_rejected` has
+        // the reasoning; a wrapper at this level cannot tell a refusal from
+        // an outage.
         .map_err(|e| AppError::Forbidden(format!("login failed: {e}")))?;
 
     // `sub` is recorded with `?`, not `%`, here and everywhere it is logged.

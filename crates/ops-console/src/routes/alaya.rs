@@ -766,11 +766,6 @@ pub async fn correct_and_supersede(
             "tags": mem.get("tags"),
         }))
         .await?;
-    let new_hash = store_res
-        .get("content_hash")
-        .and_then(|h| h.as_str())
-        .ok_or_else(|| AppError::Upstream("store returned no content_hash".into()))?
-        .to_string();
     // alaya-server's answer, echoed verbatim — and until here the one field
     // in this crate recorded with `%` that never met a validator. The
     // plain-text subscriber writes a `Display` field raw, so a `\n` in it
@@ -778,18 +773,36 @@ pub async fn correct_and_supersede(
     // It has to be a 64-hex hash to survive `memory_href` and `supersede`
     // anyway, and it makes the `short_hash` below honest.
     //
-    // Reported like the supersede half rather than as a bare 400: the store
-    // has already committed, and an error that hides that is exactly what
-    // the two-phase handling below exists to prevent.
-    if validate_hash(&new_hash).is_err() {
-        tracing::error!(sub = ?session.sub, old = %hash, new = ?new_hash, "store returned an unusable content_hash");
+    // One arm for absent, mistyped and malformed alike: the store has
+    // already committed in every one of them, so all three owe the operator
+    // the same thing — which memory is orphaned and how to find it. Splitting
+    // them on JSON type gave the same upstream fault opposite guidance.
+    let Some(new_hash) = store_res
+        .get("content_hash")
+        .and_then(|h| h.as_str())
+        .filter(|h| validate_hash(h).is_ok())
+        .map(str::to_string)
+    else {
+        // Capped: this is upstream text bounded only by `MAX_BODY_BYTES`, so
+        // logging it whole hands the compromised upstream this guard exists
+        // for a megabyte of pod log per attempt — the flood lever
+        // `warn_idp_failure` caps `cause` against. By chars, since a byte
+        // split could land mid-codepoint and panic.
+        let answered: String = store_res
+            .get("content_hash")
+            .and_then(|h| h.as_str())
+            .unwrap_or("<absent or not a string>")
+            .chars()
+            .take(64)
+            .collect();
+        tracing::error!(sub = ?session.sub, old = %hash, answered = ?answered, "store returned no usable content_hash");
         return Err(AppError::Upstream(format!(
-            "the correction WAS stored but alaya-server returned an unusable id for it, \
+            "the correction WAS stored but alaya-server returned no usable id for it, \
              so {} could not be superseded — find the correction by searching for its \
              text, then supersede from the original memory's page",
             short_hash(&hash),
         )));
-    }
+    };
     if new_hash == hash {
         return Err(AppError::BadRequest(
             "corrected content is identical to the original".into(),

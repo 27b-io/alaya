@@ -30,9 +30,9 @@ const MAX_NEXT_BYTES: usize = 512;
 /// and a `Set-Cookie` past the 4 KiB every browser allows per RFC 6265 §6.1
 /// is dropped silently — the callback then finds no login state and answers
 /// 400 "login flow expired" forever, with nothing in the pod log. Bounded
-/// here rather than at either call site because this is the chokepoint all
-/// three route through. 512 clears the longest real target (`/alaya/memory/`
-/// plus a 64-char hash) by an order of magnitude.
+/// here rather than at any call site because this is the chokepoint all three
+/// route through. 512 clears the longest real target (`/alaya/memory/` plus a
+/// 64-char hash, 78 bytes) about six times over.
 pub fn safe_next(next: &str) -> String {
     if next.len() <= MAX_NEXT_BYTES
         && next.starts_with('/')

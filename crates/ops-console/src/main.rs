@@ -711,7 +711,11 @@ mod tests {
     async fn fake_upstream(routes: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
+        // `let _`, not `unwrap`: `axum::serve` documents that it never
+        // completes — see the same helper in `http.rs` for the full note.
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, routes).await;
+        });
         format!("http://{addr}")
     }
 
@@ -770,12 +774,15 @@ mod tests {
         );
 
         // Panics unless the refusal is in the pod log at all — it has to be
-        // diagnosable — and the record it finds is one line, so the forged
-        // tail being on it is the proof the `\n` never split it.
-        let record = buf.record("unusable content_hash");
+        // diagnosable.
+        let record = buf.record("no usable content_hash");
         assert!(
-            record.contains("\\n") && record.contains("corrected + superseded"),
-            "the forged record must be escaped onto the refusal's own line: {record}"
+            record.contains("\\n"),
+            "the forged newline must reach the log escaped, never raw: {record}"
+        );
+        assert!(
+            !record.contains("INFO ops_console: corrected + superseded"),
+            "the forged record must be cut off before it completes: {record}"
         );
         let leaked = testlog::separators_in(&record);
         assert!(
@@ -784,10 +791,10 @@ mod tests {
         );
     }
 
-    /// An IdP outage must log once, from the arm that saw it. The warning
-    /// that names an id_token rejection belongs at the refusal, not around a
-    /// call whose first act is discovery — out there it fired on every
-    /// transport failure too, asserting a rejection that never happened.
+    /// An IdP outage must log once, from the arm that saw it, and must not
+    /// claim an id_token was rejected when none was received. The warning
+    /// used to sit around a call whose first act is discovery — see
+    /// `oidc::warn_rejected` for why that logged every outage twice.
     #[tokio::test]
     async fn an_idp_transport_failure_logs_once_and_claims_no_id_token_rejection() {
         let mut config = test_config();

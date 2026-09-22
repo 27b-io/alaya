@@ -29,14 +29,15 @@ impl LogBuf {
         String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
     }
 
-    /// The single log record containing `needle`, panicking if none does.
+    /// The first log record containing `needle`, panicking if none does.
     ///
     /// Selected by line rather than asserting on the whole capture: a
     /// request that logs twice is normal (the console's own record, then
     /// `tower_http`'s), and the injection question is about one record.
-    /// A record that a raw `\n` split is no longer one line, so anything
-    /// past the split is missing from what this returns — which is what
-    /// `separators_in` and the caller's content assertion then catch.
+    /// A record that a raw `\n` split is no longer one line, so everything
+    /// past the split is missing from what this returns — which the caller
+    /// catches by asserting the whole payload is present, not by
+    /// `separators_in`, whose evidence the split itself removed.
     pub fn record(&self, needle: &str) -> String {
         let logged = self.text();
         logged
@@ -64,7 +65,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
     }
 }
 
-/// Every byte in one log record that could end it early for some reader.
+/// Every char in one log record that could end it early for some reader.
 ///
 /// Asserting the record is one `\n`-delimited line would pin the instance
 /// and miss the class: a Unicode-aware ingester also breaks on

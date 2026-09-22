@@ -39,9 +39,9 @@ impl std::fmt::Display for OidcRpError {
 /// Log an id_token refusal, then return it — the verification-half twin of
 /// `warn_idp_failure`. Named for the side effect: every call emits a warning.
 ///
-/// Everything refused after the token decodes — a bad header, a disallowed
-/// alg, an unknown kid, a failed decode, an iss or nonce mismatch, an
-/// oversized `sub`, a key the JWK cannot build — returned silently, and
+/// Everything `verify_id_token` and its callees refuse — a bad header, a
+/// disallowed alg, an unknown kid, a failed decode, an iss or nonce mismatch,
+/// an oversized `sub`, a key the JWK cannot build — returned silently, and
 /// under a substituted-IdP threat model those refusals are the highest-signal
 /// events this console can observe.
 ///
@@ -592,48 +592,22 @@ mod tests {
         );
     }
 
-    /// The warning that says an id_token was rejected must fire when, and
-    /// only when, one was.
-    ///
-    /// It used to sit around `exchange_and_verify`'s call site in `auth.rs`,
-    /// which covered the refusals but also every transport and discovery
-    /// failure underneath them — those arms warn for themselves, so each IdP
-    /// outage logged twice, the second line naming a rejection that never
-    /// happened. Under the substituted-IdP threat model the line was added
-    /// for, that is the signal it exists to sharpen, degraded.
+    /// Each refusal must name itself in the log. They returned silently
+    /// until the warning moved here from `exchange_and_verify`'s call site in
+    /// `auth.rs` — see `warn_rejected`. The converse, that an IdP outage does
+    /// NOT claim a rejection, is pinned at route level in `main.rs`.
     #[tokio::test]
-    async fn an_id_token_rejection_is_logged_at_the_refusal_and_nowhere_else() {
+    async fn an_id_token_refusal_names_itself_in_the_log() {
         let rp = OidcRp::new(
-            // Closed port: discovery fails at the transport, so no token is
-            // ever received, let alone refused.
-            "http://127.0.0.1:1".into(),
+            "https://id.test".into(),
             "console".into(),
             "secret".into(),
             "https://console.test/auth/callback".into(),
         );
-
         let buf = LogBuf::default();
         {
             let _capture = buf.capture();
-            assert!(
-                rp.exchange_and_verify("code", "verifier", "nonce")
-                    .await
-                    .is_err()
-            );
-        }
-        let logged = buf.text();
-        assert!(
-            logged.contains("identity provider request failed"),
-            "the transport failure must still be logged: {logged}"
-        );
-        assert!(
-            !logged.contains("id_token rejected"),
-            "no id_token was received, so none can have been rejected: {logged}"
-        );
-
-        let buf = LogBuf::default();
-        {
-            let _capture = buf.capture();
+            // Refused by `decode_header`, before any network call.
             assert!(rp.verify_id_token("not-a-jwt").await.is_err());
         }
         let logged = buf.text();
