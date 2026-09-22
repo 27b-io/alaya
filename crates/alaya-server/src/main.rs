@@ -621,6 +621,23 @@ fn epoch_secs() -> u64 {
         .as_secs()
 }
 
+/// Monotonic seconds for the worker heartbeat: elapsed since the first call
+/// in this process, `+1` so a live stamp can never read as the `progress` 0
+/// sentinel ("loop not entered yet") during the first second of uptime.
+///
+/// Deliberately not `epoch_secs`: a forward wall-clock step larger than
+/// `WORKER_STALL_THRESHOLD` — NTP correcting a drifted node, a VM resume —
+/// ages a stamp a healthy worker wrote seconds ago, and the unauthenticated
+/// liveness route then 503s a pod that is fine (LAB-3968). `Instant` does not
+/// move when the wall clock does. A backward step was not harmless either:
+/// `saturating_sub` floored the age at 0, so a wedged worker read healthy
+/// until the clock caught back up. Monotonic closes both halves.
+fn monotonic_secs() -> u64 {
+    static START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    START.elapsed().as_secs() + 1
+}
+
 /// A command sent from axum handlers to the MemoryService worker.
 /// Carries the caller's tracing span so service methods become children
 /// of the HTTP request span across the mpsc thread boundary.
@@ -826,7 +843,7 @@ impl ServiceHandle {
 /// Uses its own reqwest::Client (Clone + Send + Sync) on the axum runtime.
 ///
 /// Bypassing the worker made a wedged worker invisible to k8s (#63), so the
-/// checker also watches `worker_progress` — the epoch-seconds of the last
+/// checker also watches `worker_progress` — `monotonic_secs` of the last
 /// command the worker completed (pings keep it fresh when idle). Stale
 /// progress means the loop stopped draining: status goes `unhealthy` and
 /// /health returns 503 so a liveness probe restarts the pod. Backend outages
@@ -840,6 +857,10 @@ struct HealthChecker {
     graph_api_key: String,
     worker_progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stall_threshold: std::time::Duration,
+    /// Time source for the stall age. `monotonic_secs` in production; a fixed
+    /// fake in tests, because that clock's origin is its own first call — a
+    /// test cannot otherwise hold a stamp that is genuinely 3600s old.
+    clock: fn() -> u64,
     /// Last Qdrant verdict, written by the pinger via `refresh_qdrant` and
     /// read by the bare probe — which therefore never touches Qdrant itself.
     qdrant_ok: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -869,6 +890,7 @@ impl HealthChecker {
             graph_api_key: config.graph_api_key.clone(),
             worker_progress,
             stall_threshold: WORKER_STALL_THRESHOLD,
+            clock: monotonic_secs,
             qdrant_ok: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -880,7 +902,7 @@ impl HealthChecker {
         if last_progress == 0 {
             ("starting", false, 0)
         } else {
-            let age = epoch_secs().saturating_sub(last_progress);
+            let age = (self.clock)().saturating_sub(last_progress);
             let stalled = age > self.stall_threshold.as_secs();
             (if stalled { "stalled" } else { "ok" }, stalled, age)
         }
@@ -1113,7 +1135,7 @@ async fn service_worker(
     // First heartbeat: bootstrap is done and the loop is live. Until this
     // stamp the health checker reports the worker as "starting" (progress
     // sentinel 0), never stalled — see the seed in main().
-    progress.store(epoch_secs(), std::sync::atomic::Ordering::Relaxed);
+    progress.store(monotonic_secs(), std::sync::atomic::Ordering::Relaxed);
 
     while let Some(cmd) = rx.recv().await {
         let op = cmd.op_name();
@@ -1693,7 +1715,7 @@ async fn service_worker(
 
         // Watchdog heartbeat: the loop just finished (or spawned) a command.
         // Stops advancing exactly when the worker stops draining.
-        progress.store(epoch_secs(), std::sync::atomic::Ordering::Relaxed);
+        progress.store(monotonic_secs(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -2250,13 +2272,13 @@ fn main() {
     rt.block_on(async move {
         let (tx, rx) = mpsc::channel::<Cmd>(CMD_CHANNEL_CAP);
 
-        // Watchdog heartbeat: epoch-seconds of the worker's last completed
+        // Watchdog heartbeat: `monotonic_secs` of the worker's last completed
         // command. Written by the worker loop, read by the health checker.
         // Seeded 0 = "worker loop not entered yet": backend bootstrap
         // (ensure_qdrant_collection + init_l2_cache retries) can legitimately
         // exceed the stall threshold on a cluster cold start, and /health is
-        // already serving — a wall-clock seed here would misreport that as a
-        // stall and restart-loop the pod. Every bootstrap await is
+        // already serving — a non-sentinel seed here would misreport that as
+        // a stall and restart-loop the pod. Every bootstrap await is
         // deadline-bounded, so the loop is always entered in bounded time.
         let worker_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let progress_for_worker = worker_progress.clone();
@@ -4309,13 +4331,28 @@ mod wedge_tests {
                 assert_eq!(pong["ok"], true);
 
                 // The worker stamped progress at loop entry and after each
-                // command — the 0 "starting" sentinel must be gone.
-                assert_ne!(progress.load(std::sync::atomic::Ordering::Relaxed), 0);
+                // command, on the same monotonic base the health checker
+                // reads. The range carries both halves: 0 is the "starting"
+                // sentinel and must be gone, and a stamp the reader cannot
+                // outrun (an epoch one, say) saturates every age to 0 —
+                // silently disabling the #63 watchdog with every other test
+                // still green.
+                let stamp = progress.load(std::sync::atomic::Ordering::Relaxed);
+                assert!(
+                    (1..=monotonic_secs()).contains(&stamp),
+                    "worker stamp {stamp} is not on the reader's monotonic base"
+                );
             })
             .await;
     }
 
-    fn test_checker(progress_epoch_s: u64) -> HealthChecker {
+    /// Stall tests read this fixed monotonic "now", so a stamp of
+    /// `TEST_NOW - n` is exactly `n` seconds old however long the test
+    /// process has been up — a real `monotonic_secs()` reading is only ever
+    /// a few seconds past its origin. Production reads `monotonic_secs`.
+    const TEST_NOW: u64 = 1_000_000;
+
+    fn test_checker(progress_s: u64) -> HealthChecker {
         HealthChecker {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_millis(200))
@@ -4327,8 +4364,9 @@ mod wedge_tests {
             collection: "test".into(),
             graph_url: "http://127.0.0.1:1".into(),
             graph_api_key: String::new(),
-            worker_progress: Arc::new(AtomicU64::new(progress_epoch_s)),
+            worker_progress: Arc::new(AtomicU64::new(progress_s)),
             stall_threshold: WORKER_STALL_THRESHOLD,
+            clock: || TEST_NOW,
             qdrant_ok: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -4339,15 +4377,15 @@ mod wedge_tests {
     #[tokio::test]
     async fn health_distinguishes_worker_stall_from_backend_outage() {
         // Fresh worker progress + unreachable backends → degraded, not unhealthy.
-        let v = test_checker(epoch_secs()).check().await;
+        let v = test_checker(TEST_NOW).check().await;
         assert_eq!(v["status"], "degraded");
         assert_eq!(v["worker"]["stalled"], false);
 
         // Stale worker progress → unhealthy, regardless of backend state.
-        let v = test_checker(epoch_secs() - 3600).check().await;
+        let v = test_checker(TEST_NOW - 3600).check().await;
         assert_eq!(v["status"], "unhealthy");
         assert_eq!(v["worker"]["stalled"], true);
-        assert!(v["worker"]["last_progress_age_s"].as_u64().unwrap() >= 3600);
+        assert_eq!(v["worker"]["last_progress_age_s"], 3600);
 
         // 0 sentinel = worker still bootstrapping backends → "starting",
         // never a stall: a slow cluster cold start must not restart-loop
@@ -4363,7 +4401,7 @@ mod wedge_tests {
     #[test]
     fn check_status_preserves_tri_state_and_carries_only_status() {
         // Fresh worker, Qdrant verdict unpublished → degraded (200).
-        let fresh = test_checker(epoch_secs());
+        let fresh = test_checker(TEST_NOW);
         let v = fresh.check_status();
         assert_eq!(v["status"], "degraded");
         assert_eq!(v.as_object().unwrap().len(), 1, "bare probe leaked fields");
@@ -4375,7 +4413,7 @@ mod wedge_tests {
         assert_eq!(v.as_object().unwrap().len(), 1);
 
         // Stale worker → unhealthy (503), whatever Qdrant said.
-        let stalled = test_checker(epoch_secs() - 3600);
+        let stalled = test_checker(TEST_NOW - 3600);
         stalled.qdrant_ok.store(true, Ordering::Relaxed);
         let v = stalled.check_status();
         assert_eq!(v["status"], "unhealthy");
@@ -4410,7 +4448,7 @@ mod wedge_tests {
 
         let checker = HealthChecker {
             qdrant_url,
-            ..test_checker(epoch_secs())
+            ..test_checker(TEST_NOW)
         };
         let routes = health_routes(checker.clone(), test_auth_state());
 
@@ -4510,7 +4548,7 @@ mod wedge_tests {
     /// fail when that happens.
     #[tokio::test]
     async fn unauthenticated_health_exposes_only_status() {
-        let app = health_routes(test_checker(epoch_secs()), test_auth_state());
+        let app = health_routes(test_checker(TEST_NOW), test_auth_state());
 
         let (code, body) = probe(&app, "/health", None).await;
 
@@ -4529,7 +4567,7 @@ mod wedge_tests {
     /// with one.
     #[tokio::test]
     async fn health_detail_requires_auth() {
-        let app = health_routes(test_checker(epoch_secs()), test_auth_state());
+        let app = health_routes(test_checker(TEST_NOW), test_auth_state());
 
         let (code, _) = probe(&app, "/health/detail", None).await;
         assert_eq!(code, StatusCode::UNAUTHORIZED);
@@ -4559,12 +4597,53 @@ mod wedge_tests {
     /// pods. The failure path must not widen the body either.
     #[tokio::test]
     async fn stalled_worker_still_503s_the_bare_probe() {
-        let app = health_routes(test_checker(epoch_secs() - 3600), test_auth_state());
+        let app = health_routes(test_checker(TEST_NOW - 3600), test_auth_state());
 
         let (code, body) = probe(&app, "/health", None).await;
 
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "unhealthy");
         assert_eq!(body.as_object().expect("object body").len(), 1);
+    }
+
+    /// The other half of #63's contract: a worker that IS draining must never
+    /// 503 because the wall clock moved (LAB-3968). NTP correcting a drifted
+    /// node or a VM resume steps `SystemTime` forward; `Instant` does not
+    /// follow, so a stamp written seconds ago stays seconds old.
+    ///
+    /// Simulated at the worst step there is, and with no fake anywhere: the
+    /// stamp is a real `monotonic_secs()` — what the production heartbeat
+    /// writes — read by the real production clock, and the wall clock sits
+    /// ~1.8e9 seconds ahead of that monotonic origin. Age it off `epoch_secs`
+    /// and this worker reads ~55 years stale, 503ing a healthy pod on the
+    /// unauthenticated route; age it off `monotonic_secs` and it reads ~0.
+    #[tokio::test]
+    async fn fresh_heartbeat_survives_a_forward_wall_clock_step() {
+        // The step is implicit in the two clocks: `epoch_secs()` is ~1.79e9
+        // on any host with a post-1970 clock, `monotonic_secs()` is single
+        // digits in a test binary.
+        let checker = HealthChecker {
+            worker_progress: Arc::new(AtomicU64::new(monotonic_secs())),
+            clock: monotonic_secs,
+            ..test_checker(TEST_NOW)
+        };
+
+        let (code, body) = probe(
+            &health_routes(checker.clone(), test_auth_state()),
+            "/health",
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "healthy worker 503d on a clock step");
+        assert_eq!(body["status"], "degraded"); // backends down, worker fine
+
+        // /health/detail agrees, and reports a plausible age rather than an
+        // epoch-sized one.
+        let v = checker.check().await;
+        assert_eq!(v["worker"]["state"], "ok");
+        assert_eq!(v["worker"]["stalled"], false);
+        // Bounded absolutely, not against the threshold: `stalled == false`
+        // already implies the latter, so it would catch nothing on its own.
+        assert!(v["worker"]["last_progress_age_s"].as_u64().unwrap() <= 5);
     }
 }
