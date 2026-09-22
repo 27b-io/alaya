@@ -137,7 +137,12 @@ ALAYA_API_KEY=                           # fail-closed: boot refused when this, 
 ALAYA_READONLY_API_KEY=                  # optional read-only bearer (pure reads; must differ from ALAYA_API_KEY)
 LISTEN_ADDR=0.0.0.0:3001
 RUST_LOG=alaya_server=info
-OTEL_EXPORTER_OTLP_ENDPOINT=http://phoenix-svc.recsys.svc:6006  # optional
+OTEL_EXPORTER_OTLP_ENDPOINT=http://phoenix-svc.recsys.svc:6006  # optional — read by opentelemetry-otlp, not Config.
+OTEL_EXPORTER_OTLP_HEADERS=                                     #   Boot is refused when these headers are set and the
+                                                                #   endpoint is plain http off-cluster: the bearer would go
+                                                                #   out in the clear. https anywhere, http cluster-local only.
+                                                                #   Same rule for the OTEL_EXPORTER_OTLP_TRACES_* twins,
+                                                                #   which take precedence over these.
 OTEL_SERVICE_NAME=alaya-server
 SUMMARY_URL=                             # optional — Anthropic API origin; client appends /v1/messages. https:// required off-cluster
                                          #   (https://api.anthropic.com); plain http only for a cluster-local proxy (http://anthropic-lb:8082).
