@@ -209,7 +209,7 @@ These were discovered during integration testing and are NOT documented in Falko
 4. ~~**Integration testing**~~ — Done (5 tests against real Qdrant + TEI on lab k3s)
 5. ~~**MCP transport**~~ — Done (JSON-RPC 2.0 + SSE, protocol 2025-03-26, 11 tool schemas)
 6. ~~**Deployment**~~ — Done (k3s manifests, CI → ghcr.io, network policies)
-7. **OTLP tracing** — Wired but degraded (reqwest async client issue in container, falls back to stderr)
+7. ~~**OTLP tracing**~~ — Done (reqwest::blocking::Client on the batch-exporter thread; a bearer over plaintext off-cluster refuses boot, stderr-only fallback if the exporter fails to build)
 8. **Prajna integration** — Replace writer.rs qdrant-client with Ālaya HTTP calls
 9. **cachekit-rs integration** — Embedding cache for edge performance (immutable, content-addressed)
 
