@@ -610,7 +610,8 @@ const REPLY_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
 /// Worker is considered stalled when no command has completed for this long.
 /// Must exceed CMD_DEADLINE — a legit inline op may hold the loop that long.
 const WORKER_STALL_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(180);
-/// Pinger period — keeps worker progress fresh when the service is idle.
+/// Pinger period — keeps worker progress fresh when the service is idle and
+/// bounds how stale the bare probe's Qdrant verdict can be (#78).
 const PING_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn epoch_secs() -> u64 {
@@ -839,6 +840,9 @@ struct HealthChecker {
     graph_api_key: String,
     worker_progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stall_threshold: std::time::Duration,
+    /// Last Qdrant verdict, written by the pinger via `refresh_qdrant` and
+    /// read by the bare probe — which therefore never touches Qdrant itself.
+    qdrant_ok: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HealthChecker {
@@ -865,38 +869,74 @@ impl HealthChecker {
             graph_api_key: config.graph_api_key.clone(),
             worker_progress,
             stall_threshold: WORKER_STALL_THRESHOLD,
+            qdrant_ok: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
-    async fn check(&self) -> Value {
-        let start = std::time::Instant::now();
-
-        // All three checks run concurrently via tokio::join!
-        let (qdrant_health, graph_health, count) =
-            tokio::join!(self.check_qdrant(), self.check_graph(), self.check_count(),);
-
-        // 0 = worker loop not entered yet (backend bootstrap in progress).
-        // Bootstrap is deadline-bounded but can legitimately exceed the stall
-        // threshold on a cluster cold start — report "starting", not a stall,
-        // or the liveness probe would restart-loop a pod that's coming up.
+    fn worker_state(&self) -> (&'static str, bool, u64) {
         let last_progress = self
             .worker_progress
             .load(std::sync::atomic::Ordering::Relaxed);
-        let (worker_state, worker_stalled, progress_age) = if last_progress == 0 {
+        if last_progress == 0 {
             ("starting", false, 0)
         } else {
             let age = epoch_secs().saturating_sub(last_progress);
             let stalled = age > self.stall_threshold.as_secs();
             (if stalled { "stalled" } else { "ok" }, stalled, age)
-        };
+        }
+    }
 
-        let status = if worker_stalled {
+    fn status_from(worker_stalled: bool, qdrant_ok: bool) -> &'static str {
+        if worker_stalled {
             "unhealthy"
-        } else if qdrant_health.is_ok() {
+        } else if qdrant_ok {
             "healthy"
         } else {
             "degraded"
-        };
+        }
+    }
+
+    /// Bare-probe path: two atomic reads, zero backend I/O (#78).
+    ///
+    /// The worker-stall side — the only input to the 503 decision — is read
+    /// live. The Qdrant side only picks `healthy` vs `degraded` (both 200) and
+    /// comes from the verdict the pinger last published, so an anonymous
+    /// caller can neither proxy load into Qdrant nor time an outage off the
+    /// probe. Staleness is bounded by `PING_PERIOD` plus the probe client's
+    /// 10s timeout — well inside `WORKER_STALL_THRESHOLD`.
+    fn check_status(&self) -> Value {
+        let (_, worker_stalled, progress_age) = self.worker_state();
+        let qdrant_ok = self.qdrant_ok.load(std::sync::atomic::Ordering::Relaxed);
+        let status = Self::status_from(worker_stalled, qdrant_ok);
+
+        if worker_stalled {
+            tracing::error!(
+                progress_age_s = progress_age,
+                threshold_s = self.stall_threshold.as_secs(),
+                "service worker stalled — reporting unhealthy so the pod gets restarted"
+            );
+        } else {
+            tracing::debug!(op = "health", status, "probe");
+        }
+        json!({ "status": status })
+    }
+
+    /// Probe Qdrant once and publish the verdict `check_status` serves.
+    /// Driven by the pinger, off the request path on purpose (#78).
+    async fn refresh_qdrant(&self) {
+        let ok = self.check_qdrant().await.is_ok();
+        self.qdrant_ok
+            .store(ok, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    async fn check(&self) -> Value {
+        let start = std::time::Instant::now();
+
+        let (qdrant_health, graph_health, count) =
+            tokio::join!(self.check_qdrant(), self.check_graph(), self.check_count(),);
+
+        let (worker_state, worker_stalled, progress_age) = self.worker_state();
+        let status = Self::status_from(worker_stalled, qdrant_health.is_ok());
 
         let elapsed = start.elapsed().as_millis();
         if worker_stalled {
@@ -911,8 +951,7 @@ impl HealthChecker {
 
         json!({
             "status": status,
-            // Build identity so any consumer can answer "is build X live?"
-            // without cluster access (#70). null when the build didn't pass it.
+            // "is build X live?" without cluster access (#70)
             "version": build_info::version(),
             "git_sha": build_info::git_sha(),
             "built_at": build_info::built_at(),
@@ -2377,8 +2416,11 @@ fn main() {
         // stays fresh while idle. try_send on purpose — if the channel is
         // full, real commands are keeping (or failing to keep) progress
         // fresh, which is exactly what the watchdog should observe.
+        // Also refreshes the Qdrant verdict the bare probe serves, so the
+        // unauthenticated route does no backend I/O of its own (#78).
         let pinger = {
             let handle = handle.clone();
+            let checker = checker.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(PING_PERIOD);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2389,6 +2431,7 @@ fn main() {
                         inner: CmdInner::Ping { reply },
                         span: tracing::Span::none(),
                     });
+                    checker.refresh_qdrant().await;
                 }
             })
         };
@@ -2514,8 +2557,8 @@ async fn shutdown_signal() {
 async fn health(
     axum::extract::State(checker): axum::extract::State<HealthChecker>,
 ) -> (StatusCode, Json<Value>) {
-    let v = checker.check().await;
-    (health_code(&v), Json(json!({ "status": v["status"] })))
+    let v = checker.check_status();
+    (health_code(&v), Json(v))
 }
 
 /// Authenticated operator view: the full health document, including build
@@ -3903,7 +3946,7 @@ mod tests {
 mod wedge_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -4286,6 +4329,7 @@ mod wedge_tests {
             graph_api_key: String::new(),
             worker_progress: Arc::new(AtomicU64::new(progress_epoch_s)),
             stall_threshold: WORKER_STALL_THRESHOLD,
+            qdrant_ok: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -4312,6 +4356,84 @@ mod wedge_tests {
         assert_eq!(v["status"], "degraded");
         assert_eq!(v["worker"]["state"], "starting");
         assert_eq!(v["worker"]["stalled"], false);
+    }
+
+    /// check_status() preserves the #63 tri-state contract from two atomic
+    /// reads and carries no field beyond `status` (#78).
+    #[test]
+    fn check_status_preserves_tri_state_and_carries_only_status() {
+        // Fresh worker, Qdrant verdict unpublished → degraded (200).
+        let fresh = test_checker(epoch_secs());
+        let v = fresh.check_status();
+        assert_eq!(v["status"], "degraded");
+        assert_eq!(v.as_object().unwrap().len(), 1, "bare probe leaked fields");
+
+        // Published verdict → healthy.
+        fresh.qdrant_ok.store(true, Ordering::Relaxed);
+        let v = fresh.check_status();
+        assert_eq!(v["status"], "healthy");
+        assert_eq!(v.as_object().unwrap().len(), 1);
+
+        // Stale worker → unhealthy (503), whatever Qdrant said.
+        let stalled = test_checker(epoch_secs() - 3600);
+        stalled.qdrant_ok.store(true, Ordering::Relaxed);
+        let v = stalled.check_status();
+        assert_eq!(v["status"], "unhealthy");
+        assert_eq!(v.as_object().unwrap().len(), 1);
+
+        // Bootstrap sentinel → degraded, not a stall.
+        let v = test_checker(0).check_status();
+        assert_eq!(v["status"], "degraded");
+        assert_eq!(v.as_object().unwrap().len(), 1);
+    }
+
+    /// The anonymous probe never reaches Qdrant; only the pinger's refresh
+    /// does, and its verdict is what the probe then serves (#78). A counting
+    /// loopback Qdrant is the witness — reintroducing any await on the
+    /// request path shows up here as hits > 0.
+    #[tokio::test]
+    async fn bare_probe_does_no_qdrant_io_and_serves_pinger_verdict() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let qdrant_url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicU64::new(0));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/collections/test",
+            get(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Json(json!({
+                    "result": { "status": "green", "points_count": 0 }
+                })))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let checker = HealthChecker {
+            qdrant_url,
+            ..test_checker(epoch_secs())
+        };
+        let routes = health_routes(checker.clone(), test_auth_state());
+
+        for _ in 0..50 {
+            let (code, body) = probe(&routes, "/health", None).await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(body["status"], "degraded");
+        }
+        assert_eq!(hits.load(Ordering::Relaxed), 0, "bare probe reached Qdrant");
+
+        checker.refresh_qdrant().await;
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+        let (_, body) = probe(&routes, "/health", None).await;
+        assert_eq!(body["status"], "healthy");
+
+        // Qdrant gone (port 1 refuses) → the next refresh withdraws it.
+        let down = HealthChecker {
+            qdrant_url: "http://127.0.0.1:1".into(),
+            ..checker
+        };
+        down.refresh_qdrant().await;
+        let (_, body) = probe(&routes, "/health", None).await;
+        assert_eq!(body["status"], "degraded");
     }
 
     /// #97: `process::exit` cannot be observed in-process, so the test re-runs
