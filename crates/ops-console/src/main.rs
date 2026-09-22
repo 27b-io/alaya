@@ -176,7 +176,17 @@ fn app(state: AppState) -> Router {
             session_refresh,
         ))
         .layer(middleware::from_fn(security_headers))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        // The request span records the path, not the full URI: a query
+        // string is never a safe thing to log.
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http().make_span_with(|req: &Request| {
+                tracing::debug_span!(
+                    "request",
+                    method = %req.method(),
+                    path = %req.uri().path(),
+                )
+            }),
+        )
         .with_state(state)
 }
 
@@ -852,5 +862,71 @@ mod tests {
         // inert — the wording assertion above was carrying it alone.
         let console_warns = logged.lines().filter(|l| l.contains("ops_console")).count();
         assert_eq!(console_warns, 1, "one outage, one record: {logged}");
+    }
+
+    /// Asserted on the formatted log at `tower_http=debug` (the level that
+    /// enables the request span), with positive controls so a broken capture
+    /// fails instead of passing vacuously.
+    ///
+    /// The subscriber is installed process-wide, not scoped to this future:
+    /// every test here drives the same tower-http callsites, and tracing
+    /// caches a callsite's interest from whichever thread registers it
+    /// first — a scoped subscriber is never consulted for a callsite another
+    /// test registered with no subscriber installed, which made a scoped
+    /// version of this test flaky under parallel test threads.
+    #[tokio::test]
+    async fn request_span_omits_query_string() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for LogBuffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sink = LogBuffer::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("ops_console=debug,tower_http=debug")
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("only this test installs a global subscriber");
+
+        let resp = app(test_state())
+            .oneshot(
+                HttpRequest::get("/auth/callback?code=CODE-SENTINEL&state=STATE-SENTINEL")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // No login cookie: rejected before any identity-provider call.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let log = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("started processing request"),
+            "positive control: the DEBUG request event must be captured:\n{log}"
+        );
+        assert!(
+            log.contains("path=/auth/callback"),
+            "positive control: the span must record the request path:\n{log}"
+        );
+        assert!(
+            !log.contains("CODE-SENTINEL"),
+            "authorization code reached the log:\n{log}"
+        );
+        assert!(
+            !log.contains("STATE-SENTINEL"),
+            "state parameter reached the log:\n{log}"
+        );
     }
 }
