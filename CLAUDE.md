@@ -142,8 +142,9 @@ OTEL_EXPORTER_OTLP_HEADERS=                                     #   Boot is refu
                                                                 #   endpoint is plain http off-cluster — a header is assumed
                                                                 #   to carry a credential, so a non-secret one (X-Scope-OrgID)
                                                                 #   refuses too. https anywhere, http cluster-local only.
-                                                                #   Same rule for the OTEL_EXPORTER_OTLP_TRACES_* twins,
-                                                                #   which take precedence over these.
+                                                                #   The OTEL_EXPORTER_OTLP_TRACES_* twins take precedence,
+                                                                #   exactly as the exporter resolves them; only the pair it
+                                                                #   will actually use is checked.
 OTEL_SERVICE_NAME=alaya-server
 SUMMARY_URL=                             # optional — Anthropic API origin; client appends /v1/messages. https:// required off-cluster
                                          #   (https://api.anthropic.com); plain http only for a cluster-local proxy (http://anthropic-lb:8082).
