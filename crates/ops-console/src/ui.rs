@@ -205,8 +205,8 @@ fn flash_banner(flash: &Flash) -> impl IntoView + use<> {
     view! { <div class=class role="status">{msg}</div> }
 }
 
-/// Authenticated page shell: top nav (two-tenant module bar — Ālaya now, LB
-/// staged behind LAB-1964), flash banner, then the page content.
+/// Authenticated page shell: top nav (two-tenant module bar — Ālaya and the
+/// anthropic-lb read-only pane), flash banner, then the page content.
 pub fn page(
     title: &str,
     session: &Session,
@@ -225,6 +225,7 @@ pub fn page(
                         <a class="hover:text-foreground" href="/alaya/duplicates">"Duplicates"</a>
                         <a class="hover:text-foreground" href="/alaya/contradictions">"Contradictions"</a>
                         <a class="hover:text-foreground" href="/alaya/auth">"Auth state"</a>
+                        <a class="hover:text-foreground" href="/lb">"anthropic-lb"</a>
                     </nav>
                     <div class="ml-auto flex items-center gap-3 text-sm text-muted-foreground">
                         <span>{who}</span>

@@ -1,10 +1,11 @@
 //! ops-console — OIDC-gated web console for the 27b workspace (LAB-1684).
 //!
-//! Two-tenant skeleton (LAB-1641 constraint A): the Ālaya memory-curation
-//! module ships here; the anthropic-lb read-only pane lands as a second route
-//! module (LAB-1964). Trust model (D2, ratified 2026-08-15): the browser
-//! authenticates with an OIDC session; every alaya-server call happens
-//! server-side with the static bearer. No credential reaches the browser.
+//! Two-tenant console (LAB-1641 constraint A): the Ālaya memory-curation
+//! module and the anthropic-lb read-only monitoring pane as a second route
+//! module. Trust model (D2, ratified 2026-08-15): the browser
+//! authenticates with an OIDC session; every upstream call (alaya-server
+//! bearer, anthropic-lb operator key) happens server-side. No credential
+//! reaches the browser.
 //!
 //! Session posture (LAB-1694 panel, pass/fail set): CSRF token + Origin check
 //! on every POST, `HttpOnly`/`SameSite`/`Secure` cookies, session regeneration
@@ -13,6 +14,8 @@
 mod alaya;
 mod config;
 mod error;
+mod http;
+mod lb;
 mod oidc;
 mod routes;
 mod session;
@@ -162,6 +165,9 @@ fn app(state: AppState) -> Router {
             post(routes::alaya::keep_both_submit),
         )
         .route("/alaya/auth", get(routes::alaya::auth_view))
+        // anthropic-lb module: GET only, by design. No POST route to the LB
+        // exists and none may be added here.
+        .route("/lb", get(routes::lb::pane))
         .layer(middleware::from_fn_with_state(state.clone(), origin_check))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -223,9 +229,10 @@ mod tests {
     use tower::ServiceExt;
 
     const TEST_SECRET: &[u8] = b"0123456789abcdef0123456789abcdef-test";
+    const LB_KEY: &str = "lb-operator-key-secret-value";
 
-    fn test_state() -> AppState {
-        let config = config::Config {
+    fn test_config() -> config::Config {
+        config::Config {
             listen_addr: "127.0.0.1:0".into(),
             public_url: "https://console.test".parse().unwrap(),
             oidc_issuer: "https://id.test".into(),
@@ -236,7 +243,22 @@ mod tests {
             // Closed port: upstream calls fail fast; pages must degrade, not leak.
             alaya_url: "http://127.0.0.1:1".parse().unwrap(),
             alaya_api_key: "alaya-bearer-secret-value".into(),
-        };
+            lb: None,
+        }
+    }
+
+    fn test_state() -> AppState {
+        AppState::new(test_config())
+    }
+
+    /// LB module configured against closed ports: both upstreams fail fast.
+    fn test_state_with_lb() -> AppState {
+        let mut config = test_config();
+        config.lb = Some(config::LbConfig {
+            url: "http://127.0.0.1:1".parse().unwrap(),
+            api_key: LB_KEY.into(),
+            metrics_url: "http://127.0.0.1:1".parse().unwrap(),
+        });
         AppState::new(config)
     }
 
@@ -388,16 +410,80 @@ mod tests {
     }
 
     /// AC8: no server-held credential may ever appear in a rendered page —
-    /// including on the home page, whose upstream call fails here.
+    /// including on the home page and the LB pane, whose upstream calls all
+    /// fail here (every error path renders).
     #[tokio::test]
     async fn rendered_pages_never_contain_credentials() {
+        let state = test_state_with_lb();
+        let sess = session::new_session("admin-sub".into(), None, None);
+        let cookie_header = session_cookie_header(&state, &sess);
+        let app = app(state);
+        for path in ["/", "/lb"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::get(path)
+                        .header(header::COOKIE, cookie_header.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let html = body_string(resp).await;
+            assert!(!html.contains("alaya-bearer-secret-value"), "{path}");
+            assert!(!html.contains("oidc-client-secret-value"), "{path}");
+            assert!(!html.contains(LB_KEY), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn lb_pane_requires_a_session() {
+        let app = app(test_state_with_lb());
+        let resp = app
+            .oneshot(HttpRequest::get("/lb").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/auth/login");
+    }
+
+    /// Module disabled (no LB_* env): the pane and the home card say so
+    /// explicitly rather than 404ing or rendering an empty table.
+    #[tokio::test]
+    async fn lb_pane_reports_an_unconfigured_module() {
         let state = test_state();
+        let sess = session::new_session("admin-sub".into(), None, None);
+        let cookie_header = session_cookie_header(&state, &sess);
+        let app = app(state);
+        for path in ["/lb", "/"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::get(path)
+                        .header(header::COOKIE, cookie_header.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            assert!(body_string(resp).await.contains("not configured"), "{path}");
+        }
+    }
+
+    /// Each section degrades on its own: with both upstreams dark the page
+    /// still renders, names each unavailable source, keeps the provenance
+    /// text, and carries no form that could POST to the LB.
+    #[tokio::test]
+    async fn lb_pane_degrades_per_section_and_has_no_write_path() {
+        let state = test_state_with_lb();
         let sess = session::new_session("admin-sub".into(), None, None);
         let cookie_header = session_cookie_header(&state, &sess);
         let app = app(state);
         let resp = app
             .oneshot(
-                HttpRequest::get("/")
+                HttpRequest::get("/lb")
                     .header(header::COOKIE, cookie_header)
                     .body(Body::empty())
                     .unwrap(),
@@ -406,8 +492,12 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let html = body_string(resp).await;
-        assert!(!html.contains("alaya-bearer-secret-value"));
-        assert!(!html.contains("oidc-client-secret-value"));
+        assert!(html.contains("anthropic-lb: connection failed"), "{html}");
+        assert!(html.contains("metrics: connection failed"), "{html}");
+        assert!(html.contains("TOML, GitOps"));
+        // The only form on any authenticated page is the logout form.
+        assert_eq!(html.matches("<form").count(), 1);
+        assert!(html.contains("action=\"/auth/logout\""));
     }
 
     #[tokio::test]
