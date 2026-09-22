@@ -57,7 +57,7 @@ pub async fn callback(
         // The raw value goes to the log, where it is diagnosable but not
         // spoofable. Debug-formatted so control characters are escaped and an
         // attacker cannot forge log records with embedded newlines (CWE-117).
-        tracing::warn!(error = ?err, "idp callback error");
+        tracing::warn!(error = ?clipped_idp_error(&err), "idp callback error");
         return Err(AppError::Forbidden(format!(
             "identity provider: {}",
             idp_error_detail(&err)
@@ -145,9 +145,31 @@ fn idp_error_detail(err: &str) -> &str {
     }
 }
 
+/// Ceiling on the raw IdP error in the log line. The longest code in
+/// RFC 6749 §4.1.2.1 and OIDC Core §3.1.2.6 is 26 characters.
+const MAX_LOGGED_ERROR_CHARS: usize = 120;
+
+/// The IdP's raw error, clipped for the log line and marked when clipped.
+///
+/// `error` is caller-controlled on an unauthenticated route: `?` bounds the
+/// alphabet, this bounds the length. Logged raw rather than collapsed,
+/// because `idp_error_detail` renders a fixed string for every code outside
+/// RFC 6749, so a genuine vendor code survives here and — until the request
+/// span stops recording the whole URI — nowhere else worth reading. Marked,
+/// or a clip reads as the IdP's own value. By chars: a byte split can land
+/// mid-codepoint and panic.
+fn clipped_idp_error(err: &str) -> String {
+    let mut out: String = err.chars().take(MAX_LOGGED_ERROR_CHARS).collect();
+    // Exact, and O(1): `out` is by construction a byte prefix of `err`.
+    if out.len() < err.len() {
+        out.push('…');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::idp_error_detail;
+    use super::{MAX_LOGGED_ERROR_CHARS, clipped_idp_error, idp_error_detail};
 
     #[test]
     fn idp_error_detail_passes_spec_codes_and_collapses_everything_else() {
@@ -168,5 +190,20 @@ mod tests {
         );
         assert_eq!(idp_error_detail(""), "login refused");
         assert_eq!(idp_error_detail("Access_Denied"), "login refused");
+    }
+
+    #[test]
+    fn clipped_idp_error_marks_only_what_it_clipped() {
+        assert_eq!(clipped_idp_error("access_denied"), "access_denied");
+
+        let flood = "x".repeat(8192);
+        let clipped = clipped_idp_error(&flood);
+        assert_eq!(clipped.chars().count(), MAX_LOGGED_ERROR_CHARS + 1);
+        assert!(clipped.ends_with('…'));
+
+        // At the ceiling in 4-byte codepoints: a byte-compared bound would
+        // false-clip this, and a byte slice would panic on it.
+        let wide = "🔒".repeat(MAX_LOGGED_ERROR_CHARS);
+        assert_eq!(clipped_idp_error(&wide), wide);
     }
 }
