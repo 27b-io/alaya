@@ -93,7 +93,7 @@ impl Config {
         let cfg = Self {
             qdrant_url: env_required("QDRANT_URL"),
             qdrant_collection: env_or("QDRANT_COLLECTION", "memories_arctic1024"),
-            qdrant_api_key: std::env::var("QDRANT_API_KEY").ok(),
+            qdrant_api_key: env_non_empty("QDRANT_API_KEY"),
             embedding_url: env_required("EMBEDDING_URL"),
             embedding_model: env_or("EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-l-v2.0"),
             embedding_dimensions: env_or("EMBEDDING_DIMENSIONS", "1024")
@@ -110,23 +110,24 @@ impl Config {
             listen_addr: env_or("LISTEN_ADDR", "0.0.0.0:3001"),
             api_key: env_or("ALAYA_API_KEY", ""),
             readonly_api_key: env_or("ALAYA_READONLY_API_KEY", ""),
-            oidc_issuer: env_opt("OIDC_ISSUER"),
+            oidc_issuer: env_non_empty("OIDC_ISSUER"),
             public_base_url: normalize_public_base_url(&env_or(
                 "PUBLIC_BASE_URL",
                 "https://alaya.27b.io",
             )),
             allow_unauthenticated: env_or("DANGEROUSLY_ALLOW_UNAUTHENTICATED", "")
                 .eq_ignore_ascii_case("true"),
-            summary_url: env_opt("SUMMARY_URL"),
-            summary_api_key: env_opt("SUMMARY_API_KEY"),
+            summary_url: env_non_empty("SUMMARY_URL"),
+            summary_api_key: env_non_empty("SUMMARY_API_KEY"),
             summary_model: env_or("SUMMARY_MODEL", "claude-haiku-4-5-20251001"),
-            judge_url: env_opt("JUDGE_URL").or_else(|| env_opt("SUMMARY_URL")),
-            judge_api_key: env_opt("JUDGE_API_KEY").or_else(|| env_opt("SUMMARY_API_KEY")),
-            judge_model: env_opt("JUDGE_MODEL").unwrap_or_else(|| "claude-sonnet-5".into()),
-            judge_daily_cap: parse_judge_daily_cap(env_opt("JUDGE_DAILY_CAP"))
+            judge_url: env_non_empty("JUDGE_URL").or_else(|| env_non_empty("SUMMARY_URL")),
+            judge_api_key: env_non_empty("JUDGE_API_KEY")
+                .or_else(|| env_non_empty("SUMMARY_API_KEY")),
+            judge_model: env_non_empty("JUDGE_MODEL").unwrap_or_else(|| "claude-sonnet-5".into()),
+            judge_daily_cap: parse_judge_daily_cap(env_non_empty("JUDGE_DAILY_CAP"))
                 .unwrap_or_else(|e| panic!("{e}")),
-            rerank_url: env_opt("RERANK_URL"),
-            rerank_api_key: env_opt("RERANK_API_KEY"),
+            rerank_url: env_non_empty("RERANK_URL"),
+            rerank_api_key: env_non_empty("RERANK_API_KEY"),
             rerank_top_n: env_or("RERANK_TOP_N", "20")
                 .parse()
                 .expect("RERANK_TOP_N must be a number"),
@@ -136,20 +137,74 @@ impl Config {
                 .parse()
                 .expect("RERANK_TIMEOUT_MS must be a positive integer (ms)"),
         };
-        // Every credential-bearing endpoint, checked on the main thread before
-        // the runtime, the worker thread or the listener exist: a refused
-        // endpoint means the process never starts.
-        for (var, url, has_api_key) in [
+        // Read through the helper `init_l2_cache` uses, so the guard and the
+        // cache can never disagree about which string gets dialled.
+        let redis_cache_url = env_non_empty("REDIS_CACHE_URL");
+        // Every credential-bearing URL this process reads into `Config`,
+        // checked on the main thread before the runtime, the worker thread or
+        // the listener exist: a refused endpoint means the process never
+        // starts. The transport column is the client that dials that var — the
+        // wrong one there is a silent downgrade, so it is one column to read
+        // rather than seven call sites.
+        //
+        // Credential-bearing but not in `Config`, so not covered here: the
+        // cachekit.io SaaS cache URL (its own builder is HTTPS-only and
+        // host-allowlisted) and `OTEL_EXPORTER_OTLP_ENDPOINT`, which
+        // `opentelemetry-otlp` reads directly along with the bearer token in
+        // `OTEL_EXPORTER_OTLP_HEADERS`.
+        for (var, url, has_credential, transport) in [
             (
                 "SUMMARY_URL",
-                &cfg.summary_url,
+                cfg.summary_url.as_deref(),
                 cfg.summary_api_key.is_some(),
+                Transport::Http,
             ),
-            ("JUDGE_URL", &cfg.judge_url, cfg.judge_api_key.is_some()),
-            ("RERANK_URL", &cfg.rerank_url, cfg.rerank_api_key.is_some()),
+            (
+                "JUDGE_URL",
+                cfg.judge_url.as_deref(),
+                cfg.judge_api_key.is_some(),
+                Transport::Http,
+            ),
+            (
+                "RERANK_URL",
+                cfg.rerank_url.as_deref(),
+                cfg.rerank_api_key.is_some(),
+                Transport::Http,
+            ),
+            (
+                "QDRANT_URL",
+                Some(cfg.qdrant_url.as_str()),
+                cfg.qdrant_api_key.is_some(),
+                Transport::Http,
+            ),
+            (
+                "GRAPH_URL",
+                Some(cfg.graph_url.as_str()),
+                // HealthChecker puts QDRANT_API_KEY in the shared client's
+                // default_headers; check_graph overrides only when graph_api_key
+                // is non-empty, so the Qdrant key leaks to graph probes.
+                !cfg.graph_api_key.is_empty() || cfg.qdrant_api_key.is_some(),
+                Transport::Http,
+            ),
+            (
+                // `false` holds only because the worker passes `None` to
+                // `EmbeddingClient::new`, leaving userinfo as the only
+                // credential this can carry. Mirrored at that call site.
+                "EMBEDDING_URL",
+                Some(cfg.embedding_url.as_str()),
+                false,
+                Transport::Http,
+            ),
+            (
+                "REDIS_CACHE_URL",
+                redis_cache_url.as_deref(),
+                false,
+                Transport::Redis,
+            ),
         ] {
             if let Some(url) = url {
-                check_credential_transport(var, url, has_api_key).unwrap_or_else(|e| panic!("{e}"));
+                check_credential_transport(var, url, has_credential, transport)
+                    .unwrap_or_else(|e| panic!("{e}"));
             }
         }
         cfg
@@ -162,11 +217,6 @@ fn env_required(key: &str) -> String {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
-/// Set and non-empty, else `None`.
-fn env_opt(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
 /// Normalize the single origin source-of-truth: strip a trailing slash and
@@ -280,37 +330,104 @@ fn is_cluster_local(url: &reqwest::Url) -> bool {
     let Some(h) = url.host_str() else {
         return false;
     };
-    let h = h.trim_start_matches('[').trim_end_matches(']');
+    // Lowercase: the url crate only normalises special-scheme hosts (http/https);
+    // non-special schemes (redis, rediss) preserve case from the input.
+    let h = h
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let h = h.as_str();
     host_is_private(h) || (h.parse::<std::net::IpAddr>().is_err() && !h.contains('.'))
 }
 
+/// Which client dials the URL, and so which schemes it can speak. A scheme the
+/// client cannot speak must be refused here, not approved and then discovered
+/// at the first request — and the two sets do not overlap, so one merged set
+/// is wrong for both.
+#[derive(Clone, Copy)]
+enum Transport {
+    /// `reqwest` — `http` and `https` only; any other scheme is an error out of
+    /// `Client::execute`, never a connection.
+    Http,
+    /// `fred`, via cachekit — `redis` and `rediss`, both of them plaintext:
+    /// fred is built without TLS (`enable-rustls`/`enable-native-tls` are not
+    /// compiled), so `rediss://` opens plain TCP despite the scheme name. It
+    /// also never validates the scheme, so an `https://` cache URL does not
+    /// fail — it dials plain TCP on 6379 and sends `AUTH` in the clear.
+    Redis,
+}
+
 /// A credential sent in the clear to a host that is not cluster-local is a
-/// credential on the wire. Fail closed at boot (Ray on LAB-3283, 2026-09-11):
-/// `https://` anywhere, plain `http://` only to a cluster-local proxy such as
-/// `http://anthropic-lb:8082`, anything else refused. The credential is the
-/// API key when one is set, or URL userinfo (`http://user:secret@host`) which
-/// reqwest sends as Basic auth on every request. Classified on the URL as
-/// reqwest parses it (lowercased scheme, real host), so the check and the
-/// transport cannot disagree about where the credential goes. Messages name
-/// the host, never the raw value: a URL may carry userinfo.
-fn check_credential_transport(var: &str, url: &str, has_api_key: bool) -> Result<(), String> {
+/// credential on the wire. Fail closed at boot (Ray, 2026-09-11) against the
+/// `Transport` that will carry it: `Http` takes `https` anywhere or plain
+/// `http` to a cluster-local endpoint such as `http://anthropic-lb:8082`,
+/// `Redis` takes only a cluster-local `redis://redis-svc:6379`. The credential
+/// is the API key when one is set, or URL-embedded credentials
+/// (`http://user:secret@host` sent as Basic auth by reqwest,
+/// `redis://user:pw@host` sent as `AUTH` by fred). Classified on the URL as the
+/// `url` crate parses it (lowercased
+/// scheme, real host), so the check and the transport cannot disagree about
+/// where the credential goes. Messages name the host, never the raw value: a
+/// URL may carry credentials.
+fn check_credential_transport(
+    var: &str,
+    url: &str,
+    has_api_key: bool,
+    transport: Transport,
+) -> Result<(), String> {
     let parsed = match reqwest::Url::parse(url) {
         Ok(parsed) => parsed,
-        // Keyless and unparseable: nothing to protect; the client reports it.
-        Err(_) if !has_api_key => return Ok(()),
+        // No credential means no question for this guard, so it must not
+        // escalate — refusing here would stop the service over a var it was
+        // never asked to validate. Say so, though: the client that dials it
+        // fails much later with nothing naming the var.
+        Err(e) if !has_api_key => {
+            tracing::warn!(
+                op = "credential_transport_guard",
+                var,
+                err = %e,
+                "not a parseable URL; no credential to protect, so boot continues"
+            );
+            return Ok(());
+        }
         Err(e) => return Err(format!("{var} is not a valid URL ({e})")),
     };
     let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
     if !has_api_key && !has_userinfo {
         return Ok(());
     }
-    match parsed.scheme() {
-        "https" => Ok(()),
-        "http" if is_cluster_local(&parsed) => Ok(()),
-        scheme => Err(format!(
-            "{var}: {scheme}://{} is neither https nor a cluster-local http proxy; \
-             an API key or URL userinfo must not travel in the clear",
-            parsed.host_str().unwrap_or("")
+    match (transport, parsed.scheme()) {
+        (Transport::Http, "https") => Ok(()),
+        (Transport::Http, "http") if is_cluster_local(&parsed) => Ok(()),
+        // fred dispatches on scheme suffix (`redis-cluster`, `rediss-cluster`,
+        // `redis-sentinel`), all plaintext (no TLS compiled).
+        (Transport::Redis, scheme) if scheme.starts_with("redis") && is_cluster_local(&parsed) => {
+            Ok(())
+        }
+        // Unusable scheme: reqwest rejects non-http at `Client::execute`, so
+        // nothing is ever dialled and "in the clear" would be false — the host
+        // in `QDRANT_URL=redis://qdrant:6333` IS cluster-local. Off-cluster
+        // `http` is a real cleartext fault and must fall through (hence
+        // `!= "http"`).
+        (Transport::Http, scheme) if scheme != "http" => Err(format!(
+            "{var}: unusable scheme {scheme}:// — this client speaks http and https only",
+        )),
+        // fred opens plain TCP regardless of scheme, so `https://` buys no
+        // encryption — it just makes fred dial port 6379 and send `AUTH` in
+        // the clear.
+        (Transport::Redis, scheme) if !scheme.starts_with("redis") => Err(format!(
+            "{var}: unusable scheme {scheme}:// — this client speaks redis:// \
+             variants only (fred opens plain TCP regardless of scheme)",
+        )),
+        (_, scheme) => Err(format!(
+            "{var}: {scheme}://{} is not {}; an API key or URL credential must \
+             not travel in the clear",
+            parsed.host_str().unwrap_or(""),
+            match transport {
+                Transport::Http => "https and not a cluster-local http endpoint",
+                Transport::Redis =>
+                    "a cluster-local redis:// or rediss:// endpoint (this client has no TLS)",
+            }
         )),
     }
 }
@@ -378,11 +495,23 @@ fn init_l2_saas() -> std::result::Result<cachekit::CacheKit, Box<dyn std::error:
 /// not an opaque downstream builder error) and padded/newline-suffixed values
 /// (folded YAML scalars, `echo`-piped secrets) that would fail string matches
 /// and downstream builders if passed through raw.
+///
+/// Reads every optional value, because a whitespace-only one that survives as
+/// `Some` reads as configured everywhere downstream — `OIDC_ISSUER="   "` used
+/// to satisfy the fail-closed "some auth is configured" check at boot.
+/// Deliberately not the bearer vars (`ALAYA_API_KEY`, `ALAYA_READONLY_API_KEY`,
+/// `GRAPH_API_KEY`): both ends of those compare the bytes they were given, so
+/// trimming one end alone would break the match. They are trimmed in the
+/// ExternalSecret template instead, where both ends see it.
 fn env_non_empty(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    non_empty_trimmed(std::env::var(key).ok())
+}
+
+/// The transformation above, split from the read so it can be pinned by a
+/// test: `set_var` is `unsafe` in edition 2024 and races every other test in
+/// the binary. Same shape as `parse_judge_daily_cap`, for the same reason.
+fn non_empty_trimmed(raw: Option<String>) -> Option<String> {
+    raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
 /// L2 embedding cache init, dispatched on `CACHE_BACKEND` (default `redis`).
@@ -481,7 +610,8 @@ const REPLY_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
 /// Worker is considered stalled when no command has completed for this long.
 /// Must exceed CMD_DEADLINE — a legit inline op may hold the loop that long.
 const WORKER_STALL_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(180);
-/// Pinger period — keeps worker progress fresh when the service is idle.
+/// Pinger period — keeps worker progress fresh when the service is idle and
+/// bounds how stale the bare probe's Qdrant verdict can be (#78).
 const PING_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn epoch_secs() -> u64 {
@@ -489,6 +619,23 @@ fn epoch_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Monotonic seconds for the worker heartbeat: elapsed since the first call
+/// in this process, `+1` so a live stamp can never read as the `progress` 0
+/// sentinel ("loop not entered yet") during the first second of uptime.
+///
+/// Deliberately not `epoch_secs`: a forward wall-clock step larger than
+/// `WORKER_STALL_THRESHOLD` — NTP correcting a drifted node, a VM resume —
+/// ages a stamp a healthy worker wrote seconds ago, and the unauthenticated
+/// liveness route then 503s a pod that is fine (LAB-3968). `Instant` does not
+/// move when the wall clock does. A backward step was not harmless either:
+/// `saturating_sub` floored the age at 0, so a wedged worker read healthy
+/// until the clock caught back up. Monotonic closes both halves.
+fn monotonic_secs() -> u64 {
+    static START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    START.elapsed().as_secs() + 1
 }
 
 /// A command sent from axum handlers to the MemoryService worker.
@@ -696,7 +843,7 @@ impl ServiceHandle {
 /// Uses its own reqwest::Client (Clone + Send + Sync) on the axum runtime.
 ///
 /// Bypassing the worker made a wedged worker invisible to k8s (#63), so the
-/// checker also watches `worker_progress` — the epoch-seconds of the last
+/// checker also watches `worker_progress` — `monotonic_secs` of the last
 /// command the worker completed (pings keep it fresh when idle). Stale
 /// progress means the loop stopped draining: status goes `unhealthy` and
 /// /health returns 503 so a liveness probe restarts the pod. Backend outages
@@ -710,6 +857,13 @@ struct HealthChecker {
     graph_api_key: String,
     worker_progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stall_threshold: std::time::Duration,
+    /// Time source for the stall age. `monotonic_secs` in production; a fixed
+    /// fake in tests, because that clock's origin is its own first call — a
+    /// test cannot otherwise hold a stamp that is genuinely 3600s old.
+    clock: fn() -> u64,
+    /// Last Qdrant verdict, written by the pinger via `refresh_qdrant` and
+    /// read by the bare probe — which therefore never touches Qdrant itself.
+    qdrant_ok: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HealthChecker {
@@ -736,38 +890,75 @@ impl HealthChecker {
             graph_api_key: config.graph_api_key.clone(),
             worker_progress,
             stall_threshold: WORKER_STALL_THRESHOLD,
+            clock: monotonic_secs,
+            qdrant_ok: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    fn worker_state(&self) -> (&'static str, bool, u64) {
+        let last_progress = self
+            .worker_progress
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if last_progress == 0 {
+            ("starting", false, 0)
+        } else {
+            let age = (self.clock)().saturating_sub(last_progress);
+            let stalled = age > self.stall_threshold.as_secs();
+            (if stalled { "stalled" } else { "ok" }, stalled, age)
+        }
+    }
+
+    fn status_from(worker_stalled: bool, qdrant_ok: bool) -> &'static str {
+        if worker_stalled {
+            "unhealthy"
+        } else if qdrant_ok {
+            "healthy"
+        } else {
+            "degraded"
+        }
+    }
+
+    /// Bare-probe path: two atomic reads, zero backend I/O (#78).
+    ///
+    /// The worker-stall side — the only input to the 503 decision — is read
+    /// live. The Qdrant side only picks `healthy` vs `degraded` (both 200) and
+    /// comes from the verdict the pinger last published, so an anonymous
+    /// caller can neither proxy load into Qdrant nor time an outage off the
+    /// probe. Staleness is bounded by `PING_PERIOD` plus the probe client's
+    /// 10s timeout — well inside `WORKER_STALL_THRESHOLD`.
+    fn check_status(&self) -> Value {
+        let (_, worker_stalled, progress_age) = self.worker_state();
+        let qdrant_ok = self.qdrant_ok.load(std::sync::atomic::Ordering::Relaxed);
+        let status = Self::status_from(worker_stalled, qdrant_ok);
+
+        if worker_stalled {
+            tracing::error!(
+                progress_age_s = progress_age,
+                threshold_s = self.stall_threshold.as_secs(),
+                "service worker stalled — reporting unhealthy so the pod gets restarted"
+            );
+        } else {
+            tracing::debug!(op = "health", status, "probe");
+        }
+        json!({ "status": status })
+    }
+
+    /// Probe Qdrant once and publish the verdict `check_status` serves.
+    /// Driven by the pinger, off the request path on purpose (#78).
+    async fn refresh_qdrant(&self) {
+        let ok = self.check_qdrant().await.is_ok();
+        self.qdrant_ok
+            .store(ok, std::sync::atomic::Ordering::Relaxed);
     }
 
     async fn check(&self) -> Value {
         let start = std::time::Instant::now();
 
-        // All three checks run concurrently via tokio::join!
         let (qdrant_health, graph_health, count) =
             tokio::join!(self.check_qdrant(), self.check_graph(), self.check_count(),);
 
-        // 0 = worker loop not entered yet (backend bootstrap in progress).
-        // Bootstrap is deadline-bounded but can legitimately exceed the stall
-        // threshold on a cluster cold start — report "starting", not a stall,
-        // or the liveness probe would restart-loop a pod that's coming up.
-        let last_progress = self
-            .worker_progress
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let (worker_state, worker_stalled, progress_age) = if last_progress == 0 {
-            ("starting", false, 0)
-        } else {
-            let age = epoch_secs().saturating_sub(last_progress);
-            let stalled = age > self.stall_threshold.as_secs();
-            (if stalled { "stalled" } else { "ok" }, stalled, age)
-        };
-
-        let status = if worker_stalled {
-            "unhealthy"
-        } else if qdrant_health.is_ok() {
-            "healthy"
-        } else {
-            "degraded"
-        };
+        let (worker_state, worker_stalled, progress_age) = self.worker_state();
+        let status = Self::status_from(worker_stalled, qdrant_health.is_ok());
 
         let elapsed = start.elapsed().as_millis();
         if worker_stalled {
@@ -782,8 +973,7 @@ impl HealthChecker {
 
         json!({
             "status": status,
-            // Build identity so any consumer can answer "is build X live?"
-            // without cluster access (#70). null when the build didn't pass it.
+            // "is build X live?" without cluster access (#70)
             "version": build_info::version(),
             "git_sha": build_info::git_sha(),
             "built_at": build_info::built_at(),
@@ -945,7 +1135,7 @@ async fn service_worker(
     // First heartbeat: bootstrap is done and the loop is live. Until this
     // stamp the health checker reports the worker as "starting" (progress
     // sentinel 0), never stalled — see the seed in main().
-    progress.store(epoch_secs(), std::sync::atomic::Ordering::Relaxed);
+    progress.store(monotonic_secs(), std::sync::atomic::Ordering::Relaxed);
 
     while let Some(cmd) = rx.recv().await {
         let op = cmd.op_name();
@@ -1525,7 +1715,7 @@ async fn service_worker(
 
         // Watchdog heartbeat: the loop just finished (or spawned) a command.
         // Stops advancing exactly when the worker stops draining.
-        progress.store(epoch_secs(), std::sync::atomic::Ordering::Relaxed);
+        progress.store(monotonic_secs(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -2066,6 +2256,11 @@ fn supervise(worker: std::thread::JoinHandle<()>) -> std::thread::JoinHandle<()>
 }
 
 fn main() {
+    // Before `Config::from_env`, so the boot guard's warnings reach a
+    // subscriber: `init_tracing` needs no runtime (its OTLP batch processor
+    // runs on its own OS thread with a blocking client, which is also happier
+    // constructed outside one).
+    telemetry::init_tracing();
     let config = Config::from_env();
 
     // Multi-threaded runtime for axum; LocalSet thread for MemoryService
@@ -2075,17 +2270,15 @@ fn main() {
         .expect("failed to build runtime");
 
     rt.block_on(async move {
-        telemetry::init_tracing();
-
         let (tx, rx) = mpsc::channel::<Cmd>(CMD_CHANNEL_CAP);
 
-        // Watchdog heartbeat: epoch-seconds of the worker's last completed
+        // Watchdog heartbeat: `monotonic_secs` of the worker's last completed
         // command. Written by the worker loop, read by the health checker.
         // Seeded 0 = "worker loop not entered yet": backend bootstrap
         // (ensure_qdrant_collection + init_l2_cache retries) can legitimately
         // exceed the stall threshold on a cluster cold start, and /health is
-        // already serving — a wall-clock seed here would misreport that as a
-        // stall and restart-loop the pod. Every bootstrap await is
+        // already serving — a non-sentinel seed here would misreport that as
+        // a stall and restart-loop the pod. Every bootstrap await is
         // deadline-bounded, so the loop is always entered in bounded time.
         let worker_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let progress_for_worker = worker_progress.clone();
@@ -2186,6 +2379,9 @@ fn main() {
                     cfg_clone.embedding_model,
                     cfg_clone.embedding_dimensions,
                     cfg_clone.embedding_batch_size,
+                    // No API key. `EMBEDDING_URL` is guarded at boot with
+                    // `has_credential: false` on the strength of this `None` —
+                    // passing a key here means updating that row too.
                     None,
                 );
                 // L2 embedding cache via cachekit-rs (optional) — backend
@@ -2242,8 +2438,11 @@ fn main() {
         // stays fresh while idle. try_send on purpose — if the channel is
         // full, real commands are keeping (or failing to keep) progress
         // fresh, which is exactly what the watchdog should observe.
+        // Also refreshes the Qdrant verdict the bare probe serves, so the
+        // unauthenticated route does no backend I/O of its own (#78).
         let pinger = {
             let handle = handle.clone();
+            let checker = checker.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(PING_PERIOD);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2254,6 +2453,7 @@ fn main() {
                         inner: CmdInner::Ping { reply },
                         span: tracing::Span::none(),
                     });
+                    checker.refresh_qdrant().await;
                 }
             })
         };
@@ -2379,8 +2579,8 @@ async fn shutdown_signal() {
 async fn health(
     axum::extract::State(checker): axum::extract::State<HealthChecker>,
 ) -> (StatusCode, Json<Value>) {
-    let v = checker.check().await;
-    (health_code(&v), Json(json!({ "status": v["status"] })))
+    let v = checker.check_status();
+    (health_code(&v), Json(v))
 }
 
 /// Authenticated operator view: the full health document, including build
@@ -2968,6 +3168,32 @@ mod tests {
         assert_eq!(calls.get(), 1);
     }
 
+    // ─── Optional config reads ─────────────────────────────────────────────
+
+    /// `env_non_empty` replaced an untrimmed `env_opt` at every optional call
+    /// site, so a whitespace-only value now reads as absent rather than set.
+    /// Two live consequences, both silent before: `OIDC_ISSUER="   "` used to
+    /// reach the fail-closed boot check as `Some`, satisfying "some auth is
+    /// configured" with an issuer that resolves nothing; and a whitespace-only
+    /// `JUDGE_URL` used to win its own `or_else` and suppress the `SUMMARY_URL`
+    /// fallback, disabling the judge instead of falling back to it.
+    ///
+    /// Pins the helper, not the wiring: nothing here can catch a call site
+    /// that stops using it. A test that rebuilt the `or_else` chain in its own
+    /// body was cut for exactly that — it asserted `Option::or_else`.
+    #[test]
+    fn non_empty_trimmed_treats_blank_as_absent() {
+        assert_eq!(non_empty_trimmed(None), None);
+        assert_eq!(non_empty_trimmed(Some("".into())), None);
+        assert_eq!(non_empty_trimmed(Some("   ".into())), None);
+        assert_eq!(non_empty_trimmed(Some("\t\n ".into())), None);
+        // Trimmed, not merely accepted — the value reaching a client is clean.
+        assert_eq!(
+            non_empty_trimmed(Some("  https://api.anthropic.com  ".into())),
+            Some("https://api.anthropic.com".into())
+        );
+    }
+
     // ─── Daily judge spend cap (LAB-3895) ──────────────────────────────────
 
     #[test]
@@ -3463,7 +3689,10 @@ mod tests {
             "http://10.43.144.201:8082",
             "http://[::1]:8082",
             // Userinfo bound for a cluster-local proxy is that proxy's business.
-            "http://user:pass@anthropic-lb:8082",
+            with_userinfo("http", "anthropic-lb:8082").as_str(),
+            // Non-special schemes preserve host case; lowercasing fixes this.
+            with_userinfo("redis", "redis.mcp.SVC:6379").as_str(),
+            with_userinfo("rediss", "Redis-Svc:6379").as_str(),
         ] {
             assert!(is_cluster_local(&parse(ok)), "{ok}");
         }
@@ -3472,7 +3701,9 @@ mod tests {
             "http://proxy.example.net:8082",
             "http://1.2.3.4",
             // The host is what reqwest connects to, not what precedes the `@`.
-            "http://user:pass@api.anthropic.com",
+            with_userinfo("http", "api.anthropic.com").as_str(),
+            // Spoof probe: the userinfo IS the payload — never rewrite with
+            // the builder.
             "http://anthropic-lb:8082@api.anthropic.com",
             // An IPv6 literal has no dots but is not a service name.
             "http://[2606:4700::1111]",
@@ -3480,6 +3711,19 @@ mod tests {
         ] {
             assert!(!is_cluster_local(&parse(no)), "{no}");
         }
+    }
+
+    /// Userinfo placeholders. This guard exists to refuse credential-shaped
+    /// URLs, so the tests must build them — and at fourteen call sites one
+    /// builder beats fourteen literals. Only the PRESENCE of userinfo is ever
+    /// asserted on, never its value.
+    const FAKE_USER: &str = "redacted-user";
+    const FAKE_SECRET: &str = "redacted-secret";
+
+    /// `scheme://` + placeholder userinfo + `rest` (authority, and whatever
+    /// path/query/fragment the caller is exercising).
+    fn with_userinfo(scheme: &str, rest: &str) -> String {
+        format!("{scheme}://{FAKE_USER}:{FAKE_SECRET}@{rest}")
     }
 
     #[test]
@@ -3505,7 +3749,7 @@ mod tests {
             "not a url",
         ] {
             assert!(
-                check_credential_transport("JUDGE_URL", bad, true).is_err(),
+                check_credential_transport("JUDGE_URL", bad, true, Transport::Http).is_err(),
                 "{bad}"
             );
         }
@@ -3526,36 +3770,117 @@ mod tests {
             "http://[::ffff:10.0.0.5]:8082",
         ] {
             assert!(
-                check_credential_transport("SUMMARY_URL", ok, true).is_ok(),
+                check_credential_transport("SUMMARY_URL", ok, true, Transport::Http).is_ok(),
                 "{ok}"
             );
         }
         for keyless in [
-            "http://api.anthropic.com",
-            "not a url",
-            "http://user:pass@anthropic-lb:8082",
+            "http://api.anthropic.com".to_string(),
+            "not a url".to_string(),
+            with_userinfo("http", "anthropic-lb:8082"),
         ] {
             assert!(
-                check_credential_transport("SUMMARY_URL", keyless, false).is_ok(),
+                check_credential_transport("SUMMARY_URL", keyless.as_str(), false, Transport::Http)
+                    .is_ok(),
                 "{keyless}"
             );
         }
+        // Both the keyless warning and the refusal render `url::ParseError`,
+        // which is only safe while it keeps the input out of its `Display` —
+        // pin it, so a url-crate bump cannot quietly turn either into the leak
+        // this guard exists to stop.
+        let malformed = with_userinfo("http", "");
+        let parse_err = reqwest::Url::parse(&malformed).unwrap_err().to_string();
+        assert!(
+            !parse_err.contains(FAKE_SECRET) && !parse_err.contains(FAKE_USER),
+            "url::ParseError now echoes its input: {parse_err}"
+        );
+
         // Userinfo is a credential too: reqwest sends it as Basic auth on
         // every request, so it faces the same policy with or without a key.
         for (bad, has_key) in [
-            ("http://user:s3cret@api.anthropic.com", true),
-            ("http://user:s3cret@api.anthropic.com", false),
-            ("http://user@api.anthropic.com", false),
-            ("http://:s3cret@api.anthropic.com", false),
+            (with_userinfo("http", "api.anthropic.com"), true),
+            (with_userinfo("http", "api.anthropic.com"), false),
+            (format!("http://{FAKE_USER}@api.anthropic.com"), false),
+            (format!("http://:{FAKE_SECRET}@api.anthropic.com"), false),
         ] {
             // The refusal goes to pod logs: name the host, never echo a
             // value that carries userinfo.
-            let err = check_credential_transport("JUDGE_URL", bad, has_key).unwrap_err();
+            let err =
+                check_credential_transport("JUDGE_URL", bad.as_str(), has_key, Transport::Http)
+                    .unwrap_err();
             assert!(
-                err.contains("api.anthropic.com") && !err.contains("s3cret"),
+                err.contains("api.anthropic.com") && !err.contains(FAKE_SECRET),
                 "{bad} {has_key}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn credential_transport_covers_qdrant_graph_and_redis() {
+        // Annotated, not inferred: an unannotated closure binds one concrete
+        // lifetime from its first call site and rejects every built-at-runtime URL.
+        let http =
+            |var: &str, url: &str, key| check_credential_transport(var, url, key, Transport::Http);
+        let redis =
+            |var: &str, url: &str, key| check_credential_transport(var, url, key, Transport::Redis);
+
+        // QDRANT_URL with API key: cluster-local ok, off-cluster refused.
+        assert!(http("QDRANT_URL", "http://qdrant:6333", true).is_ok());
+        assert!(http("QDRANT_URL", "http://qdrant.cloud.io", true).is_err());
+
+        // GRAPH_URL with API key: same policy.
+        assert!(http("GRAPH_URL", "http://alaya-bridge:3000", true).is_ok());
+        assert!(http("GRAPH_URL", "http://graph.cloud.io", true).is_err());
+
+        // Cluster-local does not redeem a scheme the client cannot speak, and
+        // the refusal must name which fault it is.
+        for wrong_scheme in [
+            with_userinfo("redis", "qdrant:6333"),
+            with_userinfo("rediss", "qdrant:6333"),
+            "redis://qdrant:6333".to_string(),
+        ] {
+            let err = http("QDRANT_URL", wrong_scheme.as_str(), true).unwrap_err();
+            assert!(
+                err.contains("unusable scheme") && !err.contains("in the clear"),
+                "{wrong_scheme}: {err}"
+            );
+        }
+
+        // redis:// — fred has no TLS, so rediss:// off-cluster is refused too.
+        for scheme in ["redis", "rediss"] {
+            let off = with_userinfo(scheme, "redis.cloud.io");
+            let local = with_userinfo(scheme, "redis-svc:6379");
+            assert!(
+                redis("REDIS_CACHE_URL", off.as_str(), false).is_err(),
+                "{off}"
+            );
+            // Cluster-local: both redis and rediss are fine.
+            assert!(
+                redis("REDIS_CACHE_URL", local.as_str(), false).is_ok(),
+                "{local}"
+            );
+        }
+
+        // Non-redis scheme with Redis transport: fred opens plain TCP
+        // regardless, so `https` buys no encryption. The refusal must name
+        // the scheme as the fault, not the host.
+        for wrong_scheme in [
+            with_userinfo("https", "redis.cloud.io"),
+            with_userinfo("https", "redis-svc:6379"),
+        ] {
+            let err = redis("REDIS_CACHE_URL", wrong_scheme.as_str(), false).unwrap_err();
+            assert!(
+                err.contains("unusable scheme") && !err.contains("in the clear"),
+                "{wrong_scheme}: {err}"
+            );
+        }
+
+        // Still a credential guard, not a URL validator: with nothing to keep
+        // off the wire a mismatched scheme is left to the client, exactly as an
+        // unparseable keyless URL already is.
+        assert!(http("QDRANT_URL", "redis://qdrant:6333", false).is_ok());
+        assert!(redis("REDIS_CACHE_URL", "https://redis-svc:6379", false).is_ok());
     }
 
     #[test]
@@ -3573,13 +3898,18 @@ mod tests {
             host_of("http://localhost:@evil.com"),
             Some("evil.com".into())
         );
-        assert_eq!(host_of("https://secret@host"), Some("host".into()));
+        assert_eq!(
+            host_of(format!("https://{FAKE_USER}@host").as_str()),
+            Some("host".into())
+        );
     }
 
     #[test]
     fn log_safe_origin_drops_userinfo_path_and_query() {
         assert_eq!(
-            log_safe_origin("https://user:s3cret@tei.mcp.svc:8443/v1/rerank?api_key=k3y#f"),
+            log_safe_origin(
+                with_userinfo("https", "tei.mcp.svc:8443/v1/rerank?api_key=k3y#f").as_str()
+            ),
             "https://tei.mcp.svc:8443"
         );
         assert_eq!(
@@ -3638,7 +3968,7 @@ mod tests {
 mod wedge_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -4001,13 +4331,28 @@ mod wedge_tests {
                 assert_eq!(pong["ok"], true);
 
                 // The worker stamped progress at loop entry and after each
-                // command — the 0 "starting" sentinel must be gone.
-                assert_ne!(progress.load(std::sync::atomic::Ordering::Relaxed), 0);
+                // command, on the same monotonic base the health checker
+                // reads. The range carries both halves: 0 is the "starting"
+                // sentinel and must be gone, and a stamp the reader cannot
+                // outrun (an epoch one, say) saturates every age to 0 —
+                // silently disabling the #63 watchdog with every other test
+                // still green.
+                let stamp = progress.load(std::sync::atomic::Ordering::Relaxed);
+                assert!(
+                    (1..=monotonic_secs()).contains(&stamp),
+                    "worker stamp {stamp} is not on the reader's monotonic base"
+                );
             })
             .await;
     }
 
-    fn test_checker(progress_epoch_s: u64) -> HealthChecker {
+    /// Stall tests read this fixed monotonic "now", so a stamp of
+    /// `TEST_NOW - n` is exactly `n` seconds old however long the test
+    /// process has been up — a real `monotonic_secs()` reading is only ever
+    /// a few seconds past its origin. Production reads `monotonic_secs`.
+    const TEST_NOW: u64 = 1_000_000;
+
+    fn test_checker(progress_s: u64) -> HealthChecker {
         HealthChecker {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_millis(200))
@@ -4019,8 +4364,10 @@ mod wedge_tests {
             collection: "test".into(),
             graph_url: "http://127.0.0.1:1".into(),
             graph_api_key: String::new(),
-            worker_progress: Arc::new(AtomicU64::new(progress_epoch_s)),
+            worker_progress: Arc::new(AtomicU64::new(progress_s)),
             stall_threshold: WORKER_STALL_THRESHOLD,
+            clock: || TEST_NOW,
+            qdrant_ok: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -4030,15 +4377,15 @@ mod wedge_tests {
     #[tokio::test]
     async fn health_distinguishes_worker_stall_from_backend_outage() {
         // Fresh worker progress + unreachable backends → degraded, not unhealthy.
-        let v = test_checker(epoch_secs()).check().await;
+        let v = test_checker(TEST_NOW).check().await;
         assert_eq!(v["status"], "degraded");
         assert_eq!(v["worker"]["stalled"], false);
 
         // Stale worker progress → unhealthy, regardless of backend state.
-        let v = test_checker(epoch_secs() - 3600).check().await;
+        let v = test_checker(TEST_NOW - 3600).check().await;
         assert_eq!(v["status"], "unhealthy");
         assert_eq!(v["worker"]["stalled"], true);
-        assert!(v["worker"]["last_progress_age_s"].as_u64().unwrap() >= 3600);
+        assert_eq!(v["worker"]["last_progress_age_s"], 3600);
 
         // 0 sentinel = worker still bootstrapping backends → "starting",
         // never a stall: a slow cluster cold start must not restart-loop
@@ -4047,6 +4394,84 @@ mod wedge_tests {
         assert_eq!(v["status"], "degraded");
         assert_eq!(v["worker"]["state"], "starting");
         assert_eq!(v["worker"]["stalled"], false);
+    }
+
+    /// check_status() preserves the #63 tri-state contract from two atomic
+    /// reads and carries no field beyond `status` (#78).
+    #[test]
+    fn check_status_preserves_tri_state_and_carries_only_status() {
+        // Fresh worker, Qdrant verdict unpublished → degraded (200).
+        let fresh = test_checker(TEST_NOW);
+        let v = fresh.check_status();
+        assert_eq!(v["status"], "degraded");
+        assert_eq!(v.as_object().unwrap().len(), 1, "bare probe leaked fields");
+
+        // Published verdict → healthy.
+        fresh.qdrant_ok.store(true, Ordering::Relaxed);
+        let v = fresh.check_status();
+        assert_eq!(v["status"], "healthy");
+        assert_eq!(v.as_object().unwrap().len(), 1);
+
+        // Stale worker → unhealthy (503), whatever Qdrant said.
+        let stalled = test_checker(TEST_NOW - 3600);
+        stalled.qdrant_ok.store(true, Ordering::Relaxed);
+        let v = stalled.check_status();
+        assert_eq!(v["status"], "unhealthy");
+        assert_eq!(v.as_object().unwrap().len(), 1);
+
+        // Bootstrap sentinel → degraded, not a stall.
+        let v = test_checker(0).check_status();
+        assert_eq!(v["status"], "degraded");
+        assert_eq!(v.as_object().unwrap().len(), 1);
+    }
+
+    /// The anonymous probe never reaches Qdrant; only the pinger's refresh
+    /// does, and its verdict is what the probe then serves (#78). A counting
+    /// loopback Qdrant is the witness — reintroducing any await on the
+    /// request path shows up here as hits > 0.
+    #[tokio::test]
+    async fn bare_probe_does_no_qdrant_io_and_serves_pinger_verdict() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let qdrant_url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicU64::new(0));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/collections/test",
+            get(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Json(json!({
+                    "result": { "status": "green", "points_count": 0 }
+                })))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let checker = HealthChecker {
+            qdrant_url,
+            ..test_checker(TEST_NOW)
+        };
+        let routes = health_routes(checker.clone(), test_auth_state());
+
+        for _ in 0..50 {
+            let (code, body) = probe(&routes, "/health", None).await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(body["status"], "degraded");
+        }
+        assert_eq!(hits.load(Ordering::Relaxed), 0, "bare probe reached Qdrant");
+
+        checker.refresh_qdrant().await;
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+        let (_, body) = probe(&routes, "/health", None).await;
+        assert_eq!(body["status"], "healthy");
+
+        // Qdrant gone (port 1 refuses) → the next refresh withdraws it.
+        let down = HealthChecker {
+            qdrant_url: "http://127.0.0.1:1".into(),
+            ..checker
+        };
+        down.refresh_qdrant().await;
+        let (_, body) = probe(&routes, "/health", None).await;
+        assert_eq!(body["status"], "degraded");
     }
 
     /// #97: `process::exit` cannot be observed in-process, so the test re-runs
@@ -4123,7 +4548,7 @@ mod wedge_tests {
     /// fail when that happens.
     #[tokio::test]
     async fn unauthenticated_health_exposes_only_status() {
-        let app = health_routes(test_checker(epoch_secs()), test_auth_state());
+        let app = health_routes(test_checker(TEST_NOW), test_auth_state());
 
         let (code, body) = probe(&app, "/health", None).await;
 
@@ -4142,7 +4567,7 @@ mod wedge_tests {
     /// with one.
     #[tokio::test]
     async fn health_detail_requires_auth() {
-        let app = health_routes(test_checker(epoch_secs()), test_auth_state());
+        let app = health_routes(test_checker(TEST_NOW), test_auth_state());
 
         let (code, _) = probe(&app, "/health/detail", None).await;
         assert_eq!(code, StatusCode::UNAUTHORIZED);
@@ -4172,12 +4597,53 @@ mod wedge_tests {
     /// pods. The failure path must not widen the body either.
     #[tokio::test]
     async fn stalled_worker_still_503s_the_bare_probe() {
-        let app = health_routes(test_checker(epoch_secs() - 3600), test_auth_state());
+        let app = health_routes(test_checker(TEST_NOW - 3600), test_auth_state());
 
         let (code, body) = probe(&app, "/health", None).await;
 
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "unhealthy");
         assert_eq!(body.as_object().expect("object body").len(), 1);
+    }
+
+    /// The other half of #63's contract: a worker that IS draining must never
+    /// 503 because the wall clock moved (LAB-3968). NTP correcting a drifted
+    /// node or a VM resume steps `SystemTime` forward; `Instant` does not
+    /// follow, so a stamp written seconds ago stays seconds old.
+    ///
+    /// Simulated at the worst step there is, and with no fake anywhere: the
+    /// stamp is a real `monotonic_secs()` — what the production heartbeat
+    /// writes — read by the real production clock, and the wall clock sits
+    /// ~1.8e9 seconds ahead of that monotonic origin. Age it off `epoch_secs`
+    /// and this worker reads ~55 years stale, 503ing a healthy pod on the
+    /// unauthenticated route; age it off `monotonic_secs` and it reads ~0.
+    #[tokio::test]
+    async fn fresh_heartbeat_survives_a_forward_wall_clock_step() {
+        // The step is implicit in the two clocks: `epoch_secs()` is ~1.79e9
+        // on any host with a post-1970 clock, `monotonic_secs()` is single
+        // digits in a test binary.
+        let checker = HealthChecker {
+            worker_progress: Arc::new(AtomicU64::new(monotonic_secs())),
+            clock: monotonic_secs,
+            ..test_checker(TEST_NOW)
+        };
+
+        let (code, body) = probe(
+            &health_routes(checker.clone(), test_auth_state()),
+            "/health",
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "healthy worker 503d on a clock step");
+        assert_eq!(body["status"], "degraded"); // backends down, worker fine
+
+        // /health/detail agrees, and reports a plausible age rather than an
+        // epoch-sized one.
+        let v = checker.check().await;
+        assert_eq!(v["worker"]["state"], "ok");
+        assert_eq!(v["worker"]["stalled"], false);
+        // Bounded absolutely, not against the threshold: `stalled == false`
+        // already implies the latter, so it would catch nothing on its own.
+        assert!(v["worker"]["last_progress_age_s"].as_u64().unwrap() <= 5);
     }
 }

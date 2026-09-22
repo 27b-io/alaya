@@ -1,8 +1,8 @@
 //! anthropic-lb module — read-only monitoring pane (LAB-1964).
 //!
 //! GET only. Renders per-client budget burn vs budget (live from `/_stats`,
-//! 7-day history from the metrics store) and per-account utilisation /
-//! headroom. Every card names its source; limits render as "TOML, GitOps".
+//! 7-day history from the metrics store) and per-account utilisation. Every
+//! card names its source; limits render as "TOML, GitOps".
 //! There is no edit flow here by design and the LB exposes no admin write
 //! route — the console has no write route to the LB and this module must
 //! not grow one.
@@ -52,7 +52,7 @@ pub async fn pane(
     };
 
     // Sections are independent: a dark metrics store must not hide live
-    // headroom, and an LB outage must not hide the burn history.
+    // utilisation, and an LB outage must not hide the burn history.
     let (stats, burn) = tokio::join!(lb.client.stats(), lb.metrics.daily_burn());
 
     let content = view! {
@@ -114,7 +114,6 @@ fn fleet_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                 Some(false) => (badge(BadgeKind::Destructive), "disconnected"),
                 None => (badge(BadgeKind::Muted), "no cluster info"),
             };
-            let headroom = int_or_dash(s.pointer("/aggregate/total_headroom_requests"));
             // serde_json maps iterate in key order — no sort needed.
             let transport = cluster
                 .and_then(|c| c.get("transport_errors"))
@@ -129,24 +128,25 @@ fn fleet_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                 .unwrap_or_else(|| "—".into());
 
             Either::Right(view! {
-                <dl class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
+                <dl class="grid grid-cols-2 sm:grid-cols-3 gap-4 text-sm">
                     <div>
                         <dt class="text-muted-foreground text-xs">"Strategy"</dt>
                         <dd>{strategy}</dd>
                     </div>
+                    // `replicas_seen` counts heartbeating instances in the shared
+                    // coordination store, which more than one deployment writes to —
+                    // it is not this Deployment's replica count, and reading it as
+                    // one sends people hunting a phantom pod (LAB-4554).
                     <div>
-                        <dt class="text-muted-foreground text-xs">"Replicas seen"</dt>
+                        <dt class="text-muted-foreground text-xs">"Heartbeating instances (shared store)"</dt>
                         <dd>{replicas}</dd>
                     </div>
                     <div>
                         <dt class="text-muted-foreground text-xs">"Shared state (Redis)"</dt>
                         <dd><span class=redis_class>{redis_text}</span></dd>
                     </div>
-                    <div>
-                        <dt class="text-muted-foreground text-xs">"Pooled headroom (requests)"</dt>
-                        <dd>{headroom}</dd>
-                    </div>
-                    <div class="col-span-2 sm:col-span-4">
+                    // No pooled-headroom tile: see the note above accounts_card (LAB-4554).
+                    <div class="col-span-2 sm:col-span-3">
                         <dt class="text-muted-foreground text-xs">"Upstream transport errors (fleet, cumulative)"</dt>
                         <dd>{transport}</dd>
                     </div>
@@ -285,7 +285,7 @@ fn budgets_card(
     }
 }
 
-// ─── Upstream accounts: utilisation + headroom ──────────────────────────────
+// ─── Upstream accounts: utilisation ─────────────────────────────────────────
 
 fn status_of(e: &Value) -> (String, String) {
     if let Some(secs) = e.get("hard_limited_remaining_secs").and_then(Value::as_u64) {
@@ -306,6 +306,11 @@ fn status_of(e: &Value) -> (String, String) {
     (badge(BadgeKind::Success), "allowed".into())
 }
 
+// Deliberately no request-headroom column, and none of the `headroom_requests`
+// / `total_headroom_requests` fields `/_stats` publishes: Anthropic's headers
+// carry token/claim utilisation, not a request-count limit, so they are always
+// null or 0 here (measured live twice, seven weeks apart — LAB-4554).
+// Utilisation is the signal that exists. Don't re-add the column.
 fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
     let body = match stats {
         Err(e) => Either::Left(unavailable("accounts (anthropic-lb /_stats)", e)),
@@ -337,7 +342,6 @@ fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                     let u5 = ratio_pct(e.get("utilization_5h").and_then(Value::as_f64));
                     let u7 = ratio_pct(e.get("utilization_7d").and_then(Value::as_f64));
                     let (status_class, status_text) = status_of(e);
-                    let headroom = int_or_dash(e.get("headroom_requests"));
                     let reset_5h = e
                         .get("reset_5h")
                         .and_then(Value::as_f64)
@@ -356,7 +360,6 @@ fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                             <TableCell><span class="tabular-nums">{u5}</span></TableCell>
                             <TableCell><span class="tabular-nums">{u7}</span></TableCell>
                             <TableCell><span class=status_class>{status_text}</span></TableCell>
-                            <TableCell><span class="tabular-nums">{headroom}</span></TableCell>
                             <TableCell><span class="whitespace-nowrap">{reset_5h}</span></TableCell>
                         </TableRow>
                     }
@@ -372,7 +375,6 @@ fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                             <TableHead>"5h util"</TableHead>
                             <TableHead>"7d util"</TableHead>
                             <TableHead>"Status"</TableHead>
-                            <TableHead>"Headroom (req)"</TableHead>
                             <TableHead>"5h reset (UTC)"</TableHead>
                         </TableRow>
                     </TableHeader>
@@ -386,7 +388,7 @@ fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
             <CardHeader>
                 <CardTitle>"Upstream accounts"</CardTitle>
                 <CardDescription>
-                    "Per account: Anthropic 5-hour / 7-day window utilisation, routing status and remaining requests, hottest first. Endpoints and priorities are TOML, GitOps."
+                    "Per account: Anthropic 5-hour / 7-day window utilisation, routing status and 5h reset, hottest first. Endpoints and priorities are TOML, GitOps."
                 </CardDescription>
             </CardHeader>
             <CardContent>{body}</CardContent>
@@ -404,7 +406,6 @@ mod tests {
         json!({
             "strategy": "sticky-weighted-v2",
             "aggregate": {
-                "total_headroom_requests": null,
                 "consumers": {"multica-runtime": {"requests_per_minute": 6.83, "share": 0.991}}
             },
             // Replica-local mirror: deliberately stale (1 token) so the test
@@ -423,7 +424,7 @@ mod tests {
                 {"name": "acct-cool", "priority": 2, "protocol": "anthropic",
                  "utilization_5h": 0.0, "utilization_7d": 0.21,
                  "status_5h": "allowed", "status_7d": "allowed",
-                 "headroom_requests": 0, "burn_rate": {"last_1h": 0.0}, "reset_5h": 1789833600},
+                 "burn_rate": {"last_1h": 0.0}, "reset_5h": 1789833600},
                 {"name": "acct-hot", "priority": 1, "protocol": "anthropic", "passthrough": true,
                  "utilization_5h": 0.9, "utilization_7d": 0.97,
                  "status_5h": "allowed_warning", "status_7d": "allowed",
@@ -490,6 +491,9 @@ mod tests {
         assert!(html.contains("hard-limited 120s"));
         assert!(html.contains("passthrough"));
         assert!(html.contains("97%"));
+        // LAB-4554: request headroom is structurally empty upstream. Matched
+        // case-insensitively so a re-add under any label trips the guard.
+        assert!(!html.to_lowercase().contains("headroom"), "{html}");
     }
 
     /// Process-local counters (consumers, burn rates) must not render: through
@@ -501,6 +505,14 @@ mod tests {
         assert!(html.contains(">connected<"), "{html}");
         assert!(html.contains("other 4103 · timeout 706"), "{html}");
         assert!(!html.contains("multica-runtime"), "{html}");
+        // LAB-4554: the pooled request-headroom tile is gone for good, and the
+        // instance count says what it counts rather than "Replicas seen".
+        assert!(!html.to_lowercase().contains("headroom"), "{html}");
+        assert!(
+            html.contains("Heartbeating instances (shared store)"),
+            "{html}"
+        );
+        assert!(!html.contains("Replicas seen"), "{html}");
     }
 
     #[test]
