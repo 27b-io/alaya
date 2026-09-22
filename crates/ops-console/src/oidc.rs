@@ -113,13 +113,13 @@ fn normalize_issuer(s: &str) -> &str {
 /// answers immediately, and loops until the browser gives up, with nothing
 /// in the log. They borrow this ceiling for that reason, not the spec's.
 ///
-/// It is a first cut at that hazard and not the guarantee, which this
-/// comment used to claim: the count is RAW bytes, and JSON escaping turns
-/// one control byte into six on the way into the cookie, so three claims at
-/// this cap still issued a 4603-byte `Set-Cookie`. What bounds the encoded
-/// artifact is `MAX_COOKIE_PLAINTEXT_BYTES` in `session.rs`; what this
-/// bounds is the claim — the log line, and how much of it the cookie is
-/// asked to carry in the first place.
+/// It is a first cut at that hazard, not the guarantee. The count is RAW
+/// bytes, and JSON escaping turns one control byte into six on the way into
+/// the cookie: an ordinary subject with `email` and `name` both at this cap
+/// issued a ~4.6 KiB `Set-Cookie`. What bounds the encoded artifact is
+/// `MAX_SESSION_PLAINTEXT_BYTES` in `session.rs`; what this bounds is the
+/// claim — the log line, and how much of it the cookie is asked to carry in
+/// the first place.
 ///
 /// What this does NOT bound is the transient allocation: `decode` builds the
 /// oversized `String` before either guard runs, so the heap cost up to what
@@ -656,14 +656,11 @@ mod tests {
 
     // --- signed token -> session cookie, measured end to end -------------
     //
-    // `claim_within_bound` bounds the RAW claim; what a browser measures is
-    // the JSON-escaped, AES-GCM-encrypted, base64'd, percent-encoded cookie.
-    // A NUL costs six bytes as an escaped `u0000` before the jar has touched
-    // it, so three claims at the raw cap once serialized to 3247 bytes of
-    // JSON and a 4581-byte `Set-Cookie` — past the 4096 RFC 6265 6.1 asks
-    // user agents to support, and an oversized cookie is dropped SILENTLY.
-    // The defect lived in the composition of the two bounds, not in either
-    // one, so these mint real ES256 tokens and read the real header.
+    // Why real tokens rather than a hand-built `Session`: the defect these
+    // cover lived in the COMPOSITION of `claim_within_bound` and the cookie
+    // budget, not in either one, so a test starting after verification would
+    // assert the fix on the wrong side of the seam that broke. The expansion
+    // chain is documented at `MAX_SESSION_PLAINTEXT_BYTES` in `session.rs`.
 
     /// RFC 6265 6.1: a user agent should support at least 4096 bytes per
     /// cookie, "as measured by the sum of the length of the cookie's name,
@@ -711,11 +708,7 @@ mod tests {
         use axum_extra::extract::cookie::{Key, PrivateCookieJar};
 
         let key = Key::from(&[7u8; 64][..]);
-        let sess = crate::session::new_session(
-            claims.sub,
-            claims.email,
-            claims.name.or(claims.preferred_username),
-        );
+        let sess = crate::session::session_for(claims);
         // `secure = true` is the larger header (`; Secure`), i.e. the shape
         // the deployed console actually emits.
         let jar = crate::session::session_cookie(PrivateCookieJar::new(key.clone()), &sess, true);

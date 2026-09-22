@@ -48,15 +48,21 @@ const LOGIN_TTL_SECS: i64 = 600;
 ///                      claim serialize to 1530.
 ///   AES-GCM          — plus a 12-byte nonce and a 16-byte tag.
 ///   base64           — times 4/3.
-///   percent-encoding — `/` and `=` are in the cookie crate's encode set
-///                      (`+` is not), 3 bytes each, ~1/64 of the output.
-/// 2048 plaintext bytes sits well inside that. The arithmetic is not the
-/// guarantee, though — the worst case the claim bounds permit (`sub` at its
-/// 255-byte cap with every byte a control character, both display claims
-/// dropped) measures 2461 bytes on the wire, and
-/// `control_heavy_claims_at_the_cap_still_fit_the_cookie_limit` is what
-/// measures it, through the real jar.
-const MAX_COOKIE_PLAINTEXT_BYTES: usize = 2048;
+///   percent-encoding — the jar emits `Cookie::encoded()`, and some base64
+///                      characters cost 3 bytes there.
+/// 2048 plaintext bytes sits well inside that, and the shrink below always
+/// succeeds on its first try. Note what that means for when it fires: three
+/// ASCII-graphic claims at the 255-byte cap serialize to ~950 bytes, so no
+/// ordinary profile ever reaches this — only escape-heavy IdP input does.
+///
+/// The arithmetic is not the guarantee. The worst case the claim bounds
+/// permit (`sub` at its cap with every byte a control character, both
+/// display claims dropped) measures ~2.5 KiB on the wire — and only ever
+/// approximately, because the count of percent-encoded characters tracks the
+/// random GCM nonce and drifts tens of bytes per run. What holds the bound is
+/// `control_heavy_claims_at_the_cap_still_fit_the_cookie_limit`, which
+/// measures the real header through the real jar.
+const MAX_SESSION_PLAINTEXT_BYTES: usize = 2048;
 
 pub fn now_epoch() -> i64 {
     std::time::SystemTime::now()
@@ -149,28 +155,36 @@ pub fn removal_cookie(name: &'static str) -> Cookie<'static> {
 
 pub fn session_cookie(jar: PrivateCookieJar, s: &Session, secure: bool) -> PrivateCookieJar {
     let mut value = serde_json::to_string(s).expect("session serializes");
-    if value.len() > MAX_COOKIE_PLAINTEXT_BYTES {
+    if value.len() > MAX_SESSION_PLAINTEXT_BYTES {
         // The two display claims are the only droppable fields. `sub`
         // identifies the session and truncating it would alias two subjects
         // onto one allowlist entry; `sid`, `csrf` and the timestamps are the
-        // session. `display_name` already falls back name -> email -> sub, so
-        // dropping costs a plainer greeting and nothing else — and `oidc.rs`
-        // caps `sub` at 255 bytes, so this fallback is inside the budget even
-        // when every one of those bytes escapes to six.
-        //
-        // Logged, not silent: the operator whose profile this happens to sees
-        // a first name instead of a full one, and that is the only other
-        // symptom there is.
-        tracing::warn!(
-            bytes = value.len(),
-            "session display claims dropped: the cookie would exceed the browser limit"
-        );
+        // session. `display_name` falls back name -> email -> sub, so the
+        // console greets this operator by their raw subject identifier from
+        // here on — the whole visible cost, and the reason `sub` has to stay.
         value = serde_json::to_string(&Session {
             email: None,
             name: None,
             ..s.clone()
         })
         .expect("session serializes");
+        tracing::warn!(
+            bytes = value.len(),
+            sub = ?s.sub,
+            "session display claims dropped: the full profile exceeded the cookie budget"
+        );
+    }
+    if value.len() > MAX_SESSION_PLAINTEXT_BYTES {
+        // Unreachable while `oidc.rs` caps `sub` at 255 bytes: six bytes per
+        // escaped byte plus the fixed fields leaves the fallback ~1.7 KiB.
+        // But that guarantee lives in another module and rests on a constant
+        // nobody here can see, and dropping the display claims is the only
+        // lever this function has — so if it ever stops being enough, the one
+        // thing that must not happen again is the failure being invisible.
+        tracing::error!(
+            bytes = value.len(),
+            "session cookie over budget after dropping display claims — the browser may drop it"
+        );
     }
     jar.add(base_cookie(SESSION_COOKIE, value, secure, SESSION_TTL_SECS))
 }
@@ -221,6 +235,17 @@ pub fn new_session(sub: String, email: Option<String>, name: Option<String>) -> 
         exp: now_epoch() + SESSION_TTL_SECS,
         last_seen: now_epoch(),
     }
+}
+
+/// The callback's claims -> session mapping, in one place so a test that
+/// drives it is testing what production runs. `preferred_username` is the
+/// fallback `name`, matching what `display_name` then prefers.
+pub fn session_for(claims: crate::oidc::IdClaims) -> Session {
+    new_session(
+        claims.sub,
+        claims.email,
+        claims.name.or(claims.preferred_username),
+    )
 }
 
 pub fn new_login_state(next: String) -> LoginState {

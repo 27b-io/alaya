@@ -12,9 +12,7 @@ use serde::Deserialize;
 
 use crate::error::AppError;
 use crate::routes::safe_next;
-use crate::session::{
-    self, Flash, LOGIN_COOKIE, SESSION_COOKIE, new_login_state, new_session, read_login,
-};
+use crate::session::{self, Flash, LOGIN_COOKIE, SESSION_COOKIE, new_login_state, read_login};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -101,11 +99,7 @@ pub async fn callback(
     }
 
     tracing::info!(sub = ?claims.sub, "console login");
-    let sess = new_session(
-        claims.sub,
-        claims.email,
-        claims.name.or(claims.preferred_username),
-    );
+    let sess = session::session_for(claims);
     let secure = state.secure_cookies();
     let jar = jar.remove(session::removal_cookie(LOGIN_COOKIE));
     let jar = session::session_cookie(jar, &sess, secure);
