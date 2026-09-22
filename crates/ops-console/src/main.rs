@@ -711,8 +711,13 @@ mod tests {
     async fn fake_upstream(routes: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        // `let _`, not `unwrap`: `axum::serve` documents that it never
-        // completes — see the same helper in `http.rs` for the full note.
+        // `let _`, not `unwrap`: there is no error value to surface.
+        // `axum::serve` is typed `io::Result<()>` but documents that it
+        // never completes or returns an error — accept errors are retried
+        // inside its own loop. Nothing here holds the handle, so the task
+        // ends with the test's runtime. The one observable failure is the
+        // bind, and that is the `unwrap()` above, outside the spawn, where
+        // it panics the test rather than hanging it.
         tokio::spawn(async move {
             let _ = axum::serve(listener, routes).await;
         });
@@ -784,6 +789,13 @@ mod tests {
             !record.contains("INFO ops_console: corrected + superseded"),
             "the forged record must be cut off before it completes: {record}"
         );
+        // A cut at exactly 64 is a well-formed hash's own length, so an
+        // unmarked one reads as a complete hash on a line that says there
+        // was no usable hash.
+        assert!(
+            record.contains('…'),
+            "a truncated answer must say it was truncated: {record}"
+        );
         let leaked = testlog::separators_in(&record);
         assert!(
             leaked.is_empty(),
@@ -832,10 +844,13 @@ mod tests {
         );
         // The defect this pins is the duplicate, not the wording: the arm
         // that saw the failure warns, and nothing above it warns again.
-        let console_warns = logged
-            .lines()
-            .filter(|l| l.contains("ops_console::oidc"))
-            .count();
+        //
+        // Matched on the crate, not on `ops_console::oidc`: the warning this
+        // guards against lived at the call site in `routes/auth.rs`, which
+        // emits target `ops_console::routes::auth`, so a module-scoped
+        // filter left the count at 1 and the duplicate half of this test
+        // inert — the wording assertion above was carrying it alone.
+        let console_warns = logged.lines().filter(|l| l.contains("ops_console")).count();
         assert_eq!(console_warns, 1, "one outage, one record: {logged}");
     }
 }

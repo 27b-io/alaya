@@ -788,13 +788,22 @@ pub async fn correct_and_supersede(
         // for a megabyte of pod log per attempt — the flood lever
         // `warn_idp_failure` caps `cause` against. By chars, since a byte
         // split could land mid-codepoint and panic.
-        let answered: String = store_res
+        let full = store_res
             .get("content_hash")
             .and_then(|h| h.as_str())
-            .unwrap_or("<absent or not a string>")
-            .chars()
-            .take(64)
-            .collect();
+            .unwrap_or("<absent or not a string>");
+        let mut answered: String = full.chars().take(64).collect();
+        // Marked, exactly as `warn_idp_failure` marks its own cut and for the
+        // same reason: an unmarked cut renders as a complete-looking wrong
+        // value. Here the cap IS 64, a well-formed hash's own length, so a
+        // 65-char answer whose first 64 are valid hex would log as a perfect
+        // hash on a line saying there was no usable one — reading as though
+        // `validate_hash` had rejected a good hash, and inviting a manual
+        // supersede onto an upstream-chosen target. Compared by bytes: a
+        // char-prefix is shorter in bytes too, and `full` is upstream text.
+        if answered.len() < full.len() {
+            answered.push('…');
+        }
         tracing::error!(sub = ?session.sub, old = %hash, answered = ?answered, "store returned no usable content_hash");
         return Err(AppError::Upstream(format!(
             "the correction WAS stored but alaya-server returned no usable id for it, \
