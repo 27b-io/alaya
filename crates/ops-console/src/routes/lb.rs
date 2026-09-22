@@ -133,8 +133,12 @@ fn fleet_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                         <dt class="text-muted-foreground text-xs">"Strategy"</dt>
                         <dd>{strategy}</dd>
                     </div>
+                    // `replicas_seen` counts heartbeating instances in the shared
+                    // coordination store, which more than one deployment writes to —
+                    // it is not this Deployment's replica count, and reading it as
+                    // one sends people hunting a phantom pod (LAB-4554).
                     <div>
-                        <dt class="text-muted-foreground text-xs">"Replicas seen"</dt>
+                        <dt class="text-muted-foreground text-xs">"Heartbeating instances (shared store)"</dt>
                         <dd>{replicas}</dd>
                     </div>
                     <div>
@@ -501,8 +505,14 @@ mod tests {
         assert!(html.contains(">connected<"), "{html}");
         assert!(html.contains("other 4103 · timeout 706"), "{html}");
         assert!(!html.contains("multica-runtime"), "{html}");
-        // LAB-4554: the pooled request-headroom tile is gone for good.
+        // LAB-4554: the pooled request-headroom tile is gone for good, and the
+        // instance count says what it counts rather than "Replicas seen".
         assert!(!html.to_lowercase().contains("headroom"), "{html}");
+        assert!(
+            html.contains("Heartbeating instances (shared store)"),
+            "{html}"
+        );
+        assert!(!html.contains("Replicas seen"), "{html}");
     }
 
     #[test]
