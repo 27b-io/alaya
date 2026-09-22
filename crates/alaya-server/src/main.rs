@@ -22,7 +22,7 @@ mod wellknown;
 
 use axum::{
     Json, Router,
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, Request},
     http::{Method, StatusCode, header},
     middleware,
     routing::{get, post},
@@ -2462,9 +2462,7 @@ fn main() {
                 auth::require_auth,
             ))
             .layer(DefaultBodyLimit::max(MAX_BODY))
-            .layer(TraceLayer::new_for_http().make_span_with(
-                tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO),
-            ))
+            .layer(TraceLayer::new_for_http().make_span_with(request_span))
             .with_state(handle);
 
         // Read-only auth-config view (LAB-1684 AC7). Same auth middleware;
@@ -2527,6 +2525,15 @@ fn main() {
         telemetry::shutdown_tracing();
         tracing::info!("shutdown complete");
     });
+}
+
+/// The request span for authenticated REST routes: `method` and `path`
+/// only — a query string is never safe to log (mirrors ops-console).
+/// `info_span!` keeps the span alive at `tower_http=info`, the deployed
+/// default filter (`telemetry.rs`); `DefaultMakeSpan` can set the span's
+/// level but cannot drop its `uri` field, so a custom closure is required.
+fn request_span(req: &Request) -> tracing::Span {
+    tracing::info_span!("request", method = %req.method(), path = %req.uri().path())
 }
 
 async fn shutdown_signal() {
@@ -4566,5 +4573,80 @@ mod wedge_tests {
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "unhealthy");
         assert_eq!(body.as_object().expect("object body").len(), 1);
+    }
+
+    /// Mirrors `request_span_omits_query_string` in `ops-console/src/main.rs`
+    /// (LAB-4506). Exercises the real `request_span` function against
+    /// `TraceLayer`, not a copy of it, so this fails the moment the span
+    /// construction regresses to logging the full URI.
+    ///
+    /// Thread-scoped (`set_default`, not `set_global_default`): this binary
+    /// also has `telemetry::tests::installs_without_a_tokio_runtime`, which
+    /// installs a real global default — the two would race for the single
+    /// process-wide slot. Scoped is normally flaky (tracing-core caches
+    /// callsite interest per registering thread), but that requires another
+    /// concurrently-running test to hit the *same* callsite before this
+    /// subscriber goes live; `request_span` and the local `probe_handler`
+    /// below are both exclusive to this test, so no other thread can race it.
+    #[tokio::test]
+    async fn request_span_omits_query_string() {
+        use std::sync::{Arc, Mutex};
+        use tower::ServiceExt;
+
+        #[derive(Clone, Default)]
+        struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for LogBuffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        async fn probe_handler() -> StatusCode {
+            // Stands in for a handler's own `tracing::info!` calls — proof
+            // that any INFO event inside the span reprints its fields.
+            tracing::info!("handling probe request");
+            StatusCode::OK
+        }
+
+        let sink = LogBuffer::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("alaya_server=info,tower_http=info")
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let app = Router::new()
+            .route("/probe", get(probe_handler))
+            .layer(TraceLayer::new_for_http().make_span_with(request_span));
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/probe?token=QUERY-SENTINEL")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let log = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("handling probe request"),
+            "positive control: the INFO event inside the span must be captured:\n{log}"
+        );
+        assert!(
+            log.contains("path=/probe"),
+            "positive control: the span must record the request path:\n{log}"
+        );
+        assert!(
+            !log.contains("QUERY-SENTINEL"),
+            "query string reached the log:\n{log}"
+        );
     }
 }
