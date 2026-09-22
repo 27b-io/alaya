@@ -170,7 +170,6 @@ pub fn session_cookie(jar: PrivateCookieJar, s: &Session, secure: bool) -> Priva
         .expect("session serializes");
         tracing::warn!(
             bytes = value.len(),
-            sub = ?s.sub,
             "session display claims dropped: the full profile exceeded the cookie budget"
         );
     }

@@ -11,11 +11,10 @@ repos:
         args: ['--maxkb=1000']
       - id: check-merge-conflict
       - id: detect-private-key
-        # The testkit.rs files hold intentional test-only OIDC keypairs (the
-        # console's RP tests reuse the server's EC key). This hook has no content
-        # allowlist, so those files are excluded here — but gitleaks (below) still
-        # scans them and flags any NON-allowlisted secret via .gitleaks.toml.
-        exclude: ^crates/(alaya-server|ops-console)/src/testkit\.rs$
+        # testkit.rs holds two intentional test-only OIDC keypairs. This hook has
+        # no content allowlist, so the file is excluded here — but gitleaks (below)
+        # still scans it and flags any NON-allowlisted secret via .gitleaks.toml.
+        exclude: ^crates/alaya-server/src/testkit\.rs$
 
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.30.1

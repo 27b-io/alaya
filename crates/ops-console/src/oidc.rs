@@ -690,8 +690,8 @@ mod tests {
                 kid: Some(testkit::KID.into()),
                 n: None,
                 e: None,
-                x: Some(testkit::EC_X.into()),
-                y: Some(testkit::EC_Y.into()),
+                x: Some(testkit::KEY.x.clone()),
+                y: Some(testkit::KEY.y.clone()),
             },
         );
         rp.verify_id_token(&testkit::mint_id_token(sub, email, name))

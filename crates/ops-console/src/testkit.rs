@@ -1,28 +1,41 @@
 //! Test-only OIDC fixtures: a signing key and an `id_token` minter, so the
 //! RP tests can drive `verify_id_token` instead of asserting around it.
 //!
-//! Its own file for one reason: `detect-private-key` has no content allowlist,
-//! so any file holding a PEM must be excluded from that hook by path. Keeping
-//! the key here leaves the hook covering `oidc.rs`, which is where a real key
-//! would actually be dangerous. gitleaks still scans this file — its allowlist
-//! matches the key's own bytes rather than a path (`.gitleaks.toml`). Same
-//! trade `alaya-server`'s `testkit.rs` already made, same key.
+//! The P-256 keypair is generated once per test process, never committed. A
+//! key that only ever exists in memory needs no secret-scanner carve-out —
+//! `detect-private-key` and gitleaks scan this file like any other.
 
+use std::sync::LazyLock;
+
+use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Serialize;
 
 pub(crate) const ISSUER: &str = "https://id.test";
 pub(crate) const CLIENT_ID: &str = "console";
 pub(crate) const KID: &str = "test-ec";
 
-/// P-256 test keypair: the private PEM and its public point. Generated for
-/// tests, used by no deployment, grants access to nothing.
-pub(crate) const EC_PRIV_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgYQR4QrEzqrzkofjM
-bOF4ADXv20gmQnyEBtfoG+tQ8EqhRANCAATEWqHSurY5EaXckIZjvb3J5PZTyXHS
-jwpkxxan/gmmbi+yhKKskU6nPVp3geFMrYyWPEoVuJfihzp2bc9U3mbP
------END PRIVATE KEY-----"#;
-pub(crate) const EC_X: &str = "xFqh0rq2ORGl3JCGY729yeT2U8lx0o8KZMcWp_4Jpm4";
-pub(crate) const EC_Y: &str = "L7KEoqyRTqc9WneB4UytjJY8ShW4l-KHOnZtz1TeZs8";
+pub(crate) struct TestKey {
+    signing: jsonwebtoken::EncodingKey,
+    /// Affine coordinates, base64url unpadded — the JWK's `x` and `y`.
+    pub x: String,
+    pub y: String,
+}
+
+pub(crate) static KEY: LazyLock<TestKey> = LazyLock::new(|| {
+    let pair =
+        EcdsaKeyPair::generate(&ECDSA_P256_SHA256_FIXED_SIGNING).expect("generate P-256 key");
+    // `jsonwebtoken`'s ES256 signer parses the encoding key as PKCS#8 DER.
+    let pkcs8 = pair.to_pkcs8v1().expect("encode P-256 key");
+    // Uncompressed X9.62 point: 0x04 || X (32 bytes) || Y (32 bytes).
+    let point = pair.public_key().as_ref();
+    TestKey {
+        signing: jsonwebtoken::EncodingKey::from_ec_der(pkcs8.as_ref()),
+        x: URL_SAFE_NO_PAD.encode(&point[1..33]),
+        y: URL_SAFE_NO_PAD.encode(&point[33..65]),
+    }
+});
 
 /// The claims the console's verifier reads. `email` and `name` are skipped
 /// when absent so a minted token matches what an IdP that omits them sends,
@@ -56,7 +69,7 @@ pub(crate) fn mint_id_token(sub: &str, email: Option<&str>, name: Option<&str>) 
             email: email.map(str::to_string),
             name: name.map(str::to_string),
         },
-        &jsonwebtoken::EncodingKey::from_ec_pem(EC_PRIV_PEM.as_bytes()).expect("ec test key"),
+        &KEY.signing,
     )
     .expect("mint id_token")
 }

@@ -2,14 +2,13 @@
 # keypairs — pinned by a unique slice of each key, NOT by file path.
 #
 # crates/alaya-server/src/testkit.rs embeds a fixed RSA-2048 / EC-P256 keypair
-# used solely to mint JWTs in the auth test suite; crates/ops-console/src/testkit.rs
-# reuses the same EC key to mint id_tokens for the RP tests. The keys are generated
-# for tests, are never used by any deployment, and grant access to nothing — but
+# used solely to mint JWTs in the auth test suite. The keys are generated for
+# tests, are never used by any deployment, and grant access to nothing — but
 # they trip the default private-key rule.
 #
-# A file-path allowlist would also silence any OTHER secret later added to those
-# files. Instead we match a distinctive prefix of each test key, so a different
-# key/token/credential added to either testkit.rs is still flagged.
+# A file-path allowlist would also silence any OTHER secret later added to that
+# file. Instead we match a distinctive prefix of each test key, so a different
+# key/token/credential added to testkit.rs is still flagged.
 title = "alaya"
 
 [extend]
