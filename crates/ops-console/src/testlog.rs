@@ -7,22 +7,46 @@
 //! which is the fiddly part; this is it, once, instead of per module.
 
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
+
+use tracing::Dispatch;
+use tracing::subscriber::{DefaultGuard, NoSubscriber};
+
+/// A dispatcher that lives as long as the test process, so at least two are
+/// always registered once any capture starts.
+///
+/// With exactly one registered, tracing-core takes a fast path that computes
+/// a callsite's interest from the default of whichever thread registers it
+/// first. A parallel test with no subscriber of its own then caches `never`
+/// for every thread, and a capture asserting on that callsite comes back
+/// empty. With two, registration asks every registered dispatcher, the
+/// capture included. Upstream is tokio-rs/tracing#3611, reported against
+/// 0.1.36: retire this once the tracing-core in Cargo.lock carries the fix,
+/// not when the issue closes.
+static OFF_THE_FAST_PATH: LazyLock<Dispatch> = LazyLock::new(|| Dispatch::new(NoSubscriber::new()));
+
+/// Make `sub` the default subscriber for the current thread until the
+/// returned guard drops — the one way a test here installs a subscriber.
+/// `set_default`, not `with_default`: the code under test is usually async,
+/// and a closure cannot hold an `.await`.
+pub fn scoped(sub: impl tracing::Subscriber + Send + Sync + 'static) -> DefaultGuard {
+    LazyLock::force(&OFF_THE_FAST_PATH);
+    tracing::subscriber::set_default(sub)
+}
 
 #[derive(Clone, Default)]
 pub struct LogBuf(Arc<Mutex<Vec<u8>>>);
 
 impl LogBuf {
-    /// Make this buffer the default subscriber for the current thread until
-    /// the returned guard drops. `set_default`, not `with_default`: the code
-    /// under test is usually async, and a closure cannot hold an `.await`.
-    /// Thread-local, so parallel tests cannot cross-contaminate.
-    pub fn capture(&self) -> tracing::subscriber::DefaultGuard {
-        let sub = tracing_subscriber::fmt()
-            .with_writer(self.clone())
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::set_default(sub)
+    /// Capture into this buffer on the current thread until the returned
+    /// guard drops. Thread-local, so parallel tests cannot cross-contaminate.
+    pub fn capture(&self) -> DefaultGuard {
+        scoped(
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_ansi(false)
+                .finish(),
+        )
     }
 
     pub fn text(&self) -> String {

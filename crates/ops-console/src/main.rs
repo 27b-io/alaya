@@ -866,38 +866,30 @@ mod tests {
         assert_eq!(console_warns, 1, "one outage, one record: {logged}");
     }
 
-    /// Asserted on the formatted log at `tower_http=debug` (the level that
-    /// enables the request span), with positive controls so a broken capture
-    /// fails instead of passing vacuously.
-    ///
-    /// The subscriber is installed process-wide, not scoped to this future:
-    /// every test here drives the same tower-http callsites, and tracing
-    /// caches a callsite's interest from whichever thread registers it
-    /// first — a scoped subscriber is never consulted for a callsite another
-    /// test registered with no subscriber installed, which made a scoped
-    /// version of this test flaky under parallel test threads.
+    /// Asserted on the formatted log at `ops_console=debug` (the request span
+    /// is built in `app`, so it takes this crate's target, not tower-http's)
+    /// and `tower_http=debug` (tower-http's own request event), with positive
+    /// controls so a broken capture fails instead of passing vacuously.
     #[tokio::test]
     async fn request_span_omits_query_string() {
-        // `LogBuf` is the writer only; `capture()` is deliberately not used
-        // here because it installs a scoped default, and the note above is
-        // why this test needs the global one.
         let sink = testlog::LogBuf::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_env_filter("ops_console=debug,tower_http=debug")
-            .with_writer(sink.clone())
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("only this test installs a global subscriber");
-
-        let resp = app(test_state())
-            .oneshot(
-                HttpRequest::get("/auth/callback?code=CODE-SENTINEL&state=STATE-SENTINEL")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let resp = {
+            let _capture = testlog::scoped(
+                tracing_subscriber::fmt()
+                    .with_env_filter("ops_console=debug,tower_http=debug")
+                    .with_writer(sink.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            app(test_state())
+                .oneshot(
+                    HttpRequest::get("/auth/callback?code=CODE-SENTINEL&state=STATE-SENTINEL")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        };
         // No login cookie: rejected before any identity-provider call.
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
