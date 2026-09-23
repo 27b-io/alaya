@@ -5,6 +5,8 @@ pub mod lb;
 
 use crate::error::AppError;
 
+const MAX_NEXT_BYTES: usize = 512;
+
 /// Validate a post-login redirect target: same-site absolute path only —
 /// no scheme, no authority, no protocol-relative `//`.
 ///
@@ -20,8 +22,15 @@ use crate::error::AppError;
 /// Every legitimate target is a fixed route or a 64-char hex hash, so
 /// requiring ASCII-graphic bytes refuses the whole class — controls, space
 /// and non-ASCII alike — rather than the members someone thought of.
+///
+/// Bounded too: this string is stored in the login cookie, which hits the
+/// same 4 KiB wall as the session cookie and is dropped just as silently —
+/// a crafted `/login?next=<4 KiB path>` link would send the visitor through
+/// the IdP and back to "login flow expired". The longest real target is
+/// `/alaya/memory/<64 hex>`, so 512 bytes is slack, not a limit.
 pub fn safe_next(next: &str) -> String {
-    if next.starts_with('/')
+    if next.len() <= MAX_NEXT_BYTES
+        && next.starts_with('/')
         && !next.starts_with("//")
         && next.bytes().all(|b| b.is_ascii_graphic() && b != b'\\')
     {
@@ -100,6 +109,12 @@ mod tests {
         assert_eq!(safe_next("/\n/evil.com"), "/");
         assert_eq!(safe_next("/\r/evil.com"), "/");
         assert_eq!(safe_next("/ /evil.com"), "/");
+        // Unbounded, this rode into the login cookie and past the same 4 KiB
+        // wall the session cookie hits — a browser drops it without a word
+        // and the callback answers "login flow expired".
+        assert_eq!(safe_next(&format!("/{}", "a".repeat(MAX_NEXT_BYTES))), "/");
+        let longest_ok = format!("/{}", "a".repeat(MAX_NEXT_BYTES - 1));
+        assert_eq!(safe_next(&longest_ok), longest_ok);
         // Still lets the real targets through.
         assert_eq!(safe_next("/lb"), "/lb");
         let hash = "a".repeat(64);
