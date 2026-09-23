@@ -21,6 +21,8 @@ mod routes;
 mod session;
 mod state;
 #[cfg(test)]
+mod testkit;
+#[cfg(test)]
 mod testlog;
 mod ui;
 

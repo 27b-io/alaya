@@ -5,7 +5,6 @@ pub mod lb;
 
 use crate::error::AppError;
 
-/// Ceiling on a caller-supplied redirect target — see `safe_next`.
 const MAX_NEXT_BYTES: usize = 512;
 
 /// Validate a post-login redirect target: same-site absolute path only —
@@ -24,15 +23,11 @@ const MAX_NEXT_BYTES: usize = 512;
 /// requiring ASCII-graphic bytes refuses the whole class — controls, space
 /// and non-ASCII alike — rather than the members someone thought of.
 ///
-/// The length bound is the same failure `MAX_CLAIM_BYTES` closes on the
-/// session cookie, on the one field an unauthenticated caller fully
-/// controls: `next` rides `GET /auth/login` straight into the login cookie,
-/// and a `Set-Cookie` past the 4 KiB every browser allows per RFC 6265 §6.1
-/// is dropped silently — the callback then finds no login state and answers
-/// 400 "login flow expired" forever, with nothing in the pod log. Bounded
-/// here rather than at any call site because this is the chokepoint all three
-/// route through. 512 clears the longest real target (`/alaya/memory/` plus a
-/// 64-char hash, 78 bytes) about six times over.
+/// Bounded too: this string is stored in the login cookie, which hits the
+/// same 4 KiB wall as the session cookie and is dropped just as silently —
+/// a crafted `/login?next=<4 KiB path>` link would send the visitor through
+/// the IdP and back to "login flow expired". The longest real target is
+/// `/alaya/memory/<64 hex>`, so 512 bytes is slack, not a limit.
 pub fn safe_next(next: &str) -> String {
     if next.len() <= MAX_NEXT_BYTES
         && next.starts_with('/')
@@ -114,6 +109,12 @@ mod tests {
         assert_eq!(safe_next("/\n/evil.com"), "/");
         assert_eq!(safe_next("/\r/evil.com"), "/");
         assert_eq!(safe_next("/ /evil.com"), "/");
+        // Unbounded, this rode into the login cookie and past the same 4 KiB
+        // wall the session cookie hits — a browser drops it without a word
+        // and the callback answers "login flow expired".
+        assert_eq!(safe_next(&format!("/{}", "a".repeat(MAX_NEXT_BYTES))), "/");
+        let longest_ok = format!("/{}", "a".repeat(MAX_NEXT_BYTES - 1));
+        assert_eq!(safe_next(&longest_ok), longest_ok);
         // Still lets the real targets through.
         assert_eq!(safe_next("/lb"), "/lb");
         let hash = "a".repeat(64);
@@ -121,21 +122,6 @@ mod tests {
             safe_next(&format!("/alaya/memory/{hash}")),
             format!("/alaya/memory/{hash}")
         );
-    }
-
-    /// `next` is fully caller-controlled on the unauthenticated
-    /// `GET /auth/login` and rides into the login cookie. Past 4 KiB the
-    /// browser drops the `Set-Cookie` silently, the callback finds no login
-    /// state, and every attempt answers 400 "login flow expired" — a crafted
-    /// link that stops the recipient logging in, with nothing in the pod log.
-    #[test]
-    fn safe_next_is_bounded() {
-        let at_limit = format!("/{}", "a".repeat(MAX_NEXT_BYTES - 1));
-        assert_eq!(safe_next(&at_limit), at_limit);
-        let over = format!("/{}", "a".repeat(MAX_NEXT_BYTES));
-        assert_eq!(safe_next(&over), "/");
-        // Comfortably past what a cookie can hold, which is the real target.
-        assert_eq!(safe_next(&format!("/{}", "a".repeat(8192))), "/");
     }
 
     #[test]
