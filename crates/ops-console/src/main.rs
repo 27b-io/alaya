@@ -985,7 +985,7 @@ mod tests {
         );
     }
 
-    /// `GET /auth/login` against `idp`: the console built on it, plus the
+    /// `GET /auth/login` against `issuer`: the console built on it, plus the
     /// login cookie exactly as the client would send it back — the raw
     /// `name=value` from `Set-Cookie` — and the `state` from the redirect.
     async fn start_login(issuer: String) -> (Router, String, String) {

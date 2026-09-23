@@ -105,9 +105,17 @@ impl AppState {
     ///
     /// What this bounds: one outbound token exchange per issued login state.
     /// It is not a volume cap — every `/auth/login` issues a fresh state.
+    ///
+    /// An already-expired state is refused outright, before the purge: at
+    /// `now == exp` a separately-read `read_login` clock could still accept
+    /// the cookie while this purge would drop the entry, letting the state
+    /// be spent again.
     pub fn consume_login(&self, state: &str, exp: i64) -> bool {
         let mut consumed = self.consumed_logins.lock().expect("login lock poisoned");
         let now = crate::session::now_epoch();
+        if exp <= now {
+            return false;
+        }
         consumed.retain(|_, e| *e > now);
         consumed.insert(state.to_string(), exp).is_none()
     }
@@ -117,5 +125,39 @@ impl AppState {
 impl FromRef<AppState> for Key {
     fn from_ref(state: &AppState) -> Self {
         state.key.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::now_epoch;
+
+    fn test_state() -> AppState {
+        AppState::new(Config {
+            listen_addr: "127.0.0.1:0".into(),
+            public_url: "https://console.test".parse().unwrap(),
+            oidc_issuer: "https://id.test".into(),
+            oidc_client_id: "console".into(),
+            oidc_client_secret: "oidc-client-secret-value".into(),
+            allowed_subjects: vec!["admin-sub".into()],
+            session_secret: b"0123456789abcdef0123456789abcdef-test".to_vec(),
+            alaya_url: "http://127.0.0.1:1".parse().unwrap(),
+            alaya_api_key: "alaya-bearer-secret-value".into(),
+            lb: None,
+        })
+    }
+
+    #[test]
+    fn consume_login_refuses_an_already_expired_state() {
+        let state = test_state();
+        assert!(!state.consume_login("s", now_epoch()));
+    }
+
+    #[test]
+    fn consume_login_spends_a_live_state_exactly_once() {
+        let state = test_state();
+        assert!(state.consume_login("t", now_epoch() + 600));
+        assert!(!state.consume_login("t", now_epoch() + 600));
     }
 }
