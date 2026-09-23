@@ -74,7 +74,10 @@ pub async fn callback(
     // Before the exchange, not after it: a second callback on this state —
     // a scripted caller resending the original `Cookie:` header ignores the
     // deletion below — is refused without an outbound call to the IdP.
-    if !state.consume_login(&login.state, login.exp) {
+    if !state.consume_login(&login.state, login.exp, session::now_epoch()) {
+        // A replayed flow cookie is worth a trail; the state itself stays out
+        // of the log, as it does everywhere else on this route.
+        tracing::warn!("oidc: login state already used — callback refused");
         return Err(AppError::BadRequest(
             "login flow already used — start again".into(),
         ));

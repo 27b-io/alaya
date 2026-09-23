@@ -1,6 +1,6 @@
 //! Shared application state.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::FromRef;
@@ -37,13 +37,18 @@ pub struct AppState {
     // ponytail: in-memory, per-replica — matches the single-replica deploy
     // (deploy/console: replicas 1). Move to shared storage if replicas > 1.
     revoked: Arc<Mutex<HashMap<String, i64>>>,
-    /// Spent OIDC login states: state → login-cookie expiry. The login cookie
-    /// is stateless and deleting it is only a request to the browser, so
-    /// without this a captured `(cookie, state)` pair replays the callback —
-    /// one outbound token exchange each — for the cookie's whole lifetime.
+    /// Spent OIDC login states as `(login-cookie expiry, state)`. The login
+    /// cookie is stateless and deleting it is only a request to the browser,
+    /// so without this a captured `(cookie, state)` pair replays the callback
+    /// — one outbound token exchange each — for the cookie's whole lifetime.
+    /// Ordered by expiry so the purge pops only what has expired: entries are
+    /// added by unauthenticated callbacks, and a full-table scan per callback
+    /// would be quadratic in the states an attacker keeps live. Keying on the
+    /// pair is safe because a state's expiry is fixed — both ride in the same
+    /// encrypted cookie, so a replay carries the same `exp`.
     // ponytail: in-memory, per-replica, same as `revoked` — both move to
     // shared storage together if replicas > 1.
-    consumed_logins: Arc<Mutex<HashMap<String, i64>>>,
+    consumed_logins: Arc<Mutex<BTreeSet<(i64, String)>>>,
 }
 
 impl AppState {
@@ -72,7 +77,7 @@ impl AppState {
             oidc,
             key,
             revoked: Arc::new(Mutex::new(HashMap::new())),
-            consumed_logins: Arc::new(Mutex::new(HashMap::new())),
+            consumed_logins: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -109,15 +114,16 @@ impl AppState {
     /// An already-expired state is refused outright, before the purge: at
     /// `now == exp` a separately-read `read_login` clock could still accept
     /// the cookie while this purge would drop the entry, letting the state
-    /// be spent again.
-    pub fn consume_login(&self, state: &str, exp: i64) -> bool {
+    /// be spent again. `now` is the caller's so tests can pin that boundary.
+    pub fn consume_login(&self, state: &str, exp: i64, now: i64) -> bool {
         let mut consumed = self.consumed_logins.lock().expect("login lock poisoned");
-        let now = crate::session::now_epoch();
         if exp <= now {
             return false;
         }
-        consumed.retain(|_, e| *e > now);
-        consumed.insert(state.to_string(), exp).is_none()
+        while consumed.first().is_some_and(|(e, _)| *e <= now) {
+            consumed.pop_first();
+        }
+        consumed.insert((exp, state.to_string()))
     }
 }
 
@@ -131,7 +137,6 @@ impl FromRef<AppState> for Key {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::now_epoch;
 
     fn test_state() -> AppState {
         AppState::new(Config {
@@ -149,15 +154,27 @@ mod tests {
     }
 
     #[test]
-    fn consume_login_refuses_an_already_expired_state() {
+    fn consume_login_refuses_a_state_at_its_expiry() {
         let state = test_state();
-        assert!(!state.consume_login("s", now_epoch()));
+        assert!(!state.consume_login("s", 1_000, 1_000));
     }
 
     #[test]
     fn consume_login_spends_a_live_state_exactly_once() {
         let state = test_state();
-        assert!(state.consume_login("t", now_epoch() + 600));
-        assert!(!state.consume_login("t", now_epoch() + 600));
+        assert!(state.consume_login("t", 1_600, 1_000));
+        assert!(!state.consume_login("t", 1_600, 1_000));
+    }
+
+    #[test]
+    fn consume_login_purges_expired_states_and_keeps_live_ones() {
+        let state = test_state();
+        assert!(state.consume_login("old", 1_100, 1_000));
+        assert!(state.consume_login("live", 1_600, 1_000));
+        // Past "old"'s expiry: it is dropped, "live" is still spent.
+        assert!(state.consume_login("new", 1_700, 1_100));
+        let consumed = state.consumed_logins.lock().unwrap();
+        let states: Vec<&str> = consumed.iter().map(|(_, s)| s.as_str()).collect();
+        assert_eq!(states, ["live", "new"]);
     }
 }
