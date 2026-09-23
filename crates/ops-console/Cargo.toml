@@ -40,3 +40,5 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # Mint encrypted session cookies in tests (same crate/version axum-extra uses).
 cookie = { version = "0.18", features = ["private"] }
+# P-256 test signing key generated at runtime; already jsonwebtoken's backend.
+aws-lc-rs = "1"
