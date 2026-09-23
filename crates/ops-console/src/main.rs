@@ -984,4 +984,91 @@ mod tests {
             "value round-trips intact: {record}"
         );
     }
+
+    /// `GET /auth/login` against `idp`: the console built on it, plus the
+    /// login cookie exactly as the client would send it back — the raw
+    /// `name=value` from `Set-Cookie` — and the `state` from the redirect.
+    async fn start_login(issuer: String) -> (Router, String, String) {
+        let mut config = test_config();
+        config.oidc_issuer = issuer;
+        let app = app(AppState::new(config));
+        let resp = app
+            .clone()
+            .oneshot(HttpRequest::get("/auth/login").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let set_cookie = resp.headers()[header::SET_COOKIE].to_str().unwrap();
+        let cookie = set_cookie.split(';').next().unwrap().to_string();
+        assert!(cookie.starts_with(session::LOGIN_COOKIE), "{set_cookie}");
+        let location: url::Url = resp.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let state = location
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .map(|(_, v)| v.into_owned())
+            .expect("authorize redirect carries state");
+        (app, cookie, state)
+    }
+
+    /// The raw header resent verbatim, the way a scripted caller replays it:
+    /// never a jar that honours the callback's `Set-Cookie` deletion, which
+    /// would pass against a deletion-only fix and prove nothing.
+    fn callback_request(cookie: &str, state: &str) -> HttpRequest<Body> {
+        HttpRequest::get(format!("/auth/callback?code=junk&state={state}"))
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_replayed_login_state_never_reaches_the_token_endpoint() {
+        use std::sync::atomic::Ordering;
+        let (issuer, token_calls) = testkit::mock_idp().await;
+        let (app, cookie, state) = start_login(issuer).await;
+
+        let first = app
+            .clone()
+            .oneshot(callback_request(&cookie, &state))
+            .await
+            .unwrap();
+        // Positive control: the first callback did reach the IdP, which
+        // refused the junk code.
+        assert_eq!(first.status(), StatusCode::FORBIDDEN);
+        assert_eq!(token_calls.load(Ordering::SeqCst), 1);
+
+        let replay = app
+            .oneshot(callback_request(&cookie, &state))
+            .await
+            .unwrap();
+        assert_eq!(
+            token_calls.load(Ordering::SeqCst),
+            1,
+            "replay reached the IdP"
+        );
+        assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+        assert!(body_string(replay).await.contains("already used"));
+    }
+
+    /// The first callback is parked on the token exchange when the second
+    /// arrives, so this fails for any check made after the exchange rather
+    /// than before it.
+    #[tokio::test]
+    async fn concurrent_callbacks_on_one_state_make_one_token_exchange() {
+        use std::sync::atomic::Ordering;
+        let (issuer, token_calls) = testkit::mock_idp().await;
+        let (app, cookie, state) = start_login(issuer).await;
+
+        let (a, b) = tokio::join!(
+            app.clone().oneshot(callback_request(&cookie, &state)),
+            app.clone().oneshot(callback_request(&cookie, &state)),
+        );
+        let mut statuses = [a.unwrap().status(), b.unwrap().status()];
+        statuses.sort();
+        assert_eq!(statuses, [StatusCode::BAD_REQUEST, StatusCode::FORBIDDEN]);
+        assert_eq!(token_calls.load(Ordering::SeqCst), 1);
+    }
 }

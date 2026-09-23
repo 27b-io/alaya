@@ -37,6 +37,13 @@ pub struct AppState {
     // ponytail: in-memory, per-replica — matches the single-replica deploy
     // (deploy/console: replicas 1). Move to shared storage if replicas > 1.
     revoked: Arc<Mutex<HashMap<String, i64>>>,
+    /// Spent OIDC login states: state → login-cookie expiry. The login cookie
+    /// is stateless and deleting it is only a request to the browser, so
+    /// without this a captured `(cookie, state)` pair replays the callback —
+    /// one outbound token exchange each — for the cookie's whole lifetime.
+    // ponytail: in-memory, per-replica, same as `revoked` — both move to
+    // shared storage together if replicas > 1.
+    consumed_logins: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl AppState {
@@ -65,6 +72,7 @@ impl AppState {
             oidc,
             key,
             revoked: Arc::new(Mutex::new(HashMap::new())),
+            consumed_logins: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -88,6 +96,20 @@ impl AppState {
         revoked
             .get(sid)
             .is_some_and(|e| *e > crate::session::now_epoch())
+    }
+
+    /// Spend a login state; true only the first time. Test-and-set under one
+    /// lock acquisition — a separate `contains` then `insert` would let two
+    /// concurrent callbacks both pass. `exp` is the login cookie's expiry;
+    /// after it `read_login` refuses the cookie anyway, so the entry is purged.
+    ///
+    /// What this bounds: one outbound token exchange per issued login state.
+    /// It is not a volume cap — every `/auth/login` issues a fresh state.
+    pub fn consume_login(&self, state: &str, exp: i64) -> bool {
+        let mut consumed = self.consumed_logins.lock().expect("login lock poisoned");
+        let now = crate::session::now_epoch();
+        consumed.retain(|_, e| *e > now);
+        consumed.insert(state.to_string(), exp).is_none()
     }
 }
 

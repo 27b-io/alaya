@@ -71,6 +71,14 @@ pub async fn callback(
     if login.state != cb_state {
         return Err(AppError::Forbidden("state mismatch".into()));
     }
+    // Before the exchange, not after it: a second callback on this state —
+    // a scripted caller resending the original `Cookie:` header ignores the
+    // deletion below — is refused without an outbound call to the IdP.
+    if !state.consume_login(&login.state, login.exp) {
+        return Err(AppError::BadRequest(
+            "login flow already used — start again".into(),
+        ));
+    }
 
     let claims = state
         .oidc
