@@ -2458,34 +2458,7 @@ fn main() {
             })
         };
 
-        const MAX_BODY: usize = 1_048_576; // 1 MB — covers the /mcp Bytes extractor
-
-        // Protected routes: handlers keep `ServiceHandle` state; `require_auth`
-        // is layered with its own `AuthState` (axum allows differing types).
-        let protected = Router::new()
-            .route("/mcp", post(mcp::mcp_handler))
-            .route("/store", post(store))
-            .route("/search", post(search))
-            .route("/delete", post(delete))
-            .route("/relation", post(relation))
-            .route("/supersede", post(supersede))
-            .route("/contradictions", post(contradictions))
-            .route("/contradictions/resolution", post(resolve_contradiction))
-            .route("/duplicates/find", post(find_duplicates))
-            .route("/duplicates/merge", post(merge_duplicates))
-            .route(
-                "/memories/{content_hash}",
-                get(get_memory).patch(patch_memory),
-            )
-            .route("/backfill/summaries", post(backfill_summaries))
-            .route("/backfill/contradictions", post(backfill_contradictions))
-            .layer(middleware::from_fn_with_state(
-                auth_state.clone(),
-                auth::require_auth,
-            ))
-            .layer(DefaultBodyLimit::max(MAX_BODY))
-            .layer(TraceLayer::new_for_http().make_span_with(request_span))
-            .with_state(handle);
+        let protected = protected_router(handle, auth_state.clone());
 
         // Read-only auth-config view (LAB-1684 AC7). Same auth middleware;
         // GET /auth/config is unmapped in rest_route_op → static-bearer only
@@ -2549,11 +2522,49 @@ fn main() {
     });
 }
 
+/// The authenticated REST + MCP routes, composed.
+///
+/// Assembled here rather than inline in `main` for the same reason as
+/// `health_routes`: tests drive the real layer stack, so dropping the auth
+/// layer or reverting the request span fails a test instead of passing CI.
+fn protected_router(handle: ServiceHandle, auth_state: AuthState) -> Router {
+    const MAX_BODY: usize = 1_048_576; // 1 MB — covers the /mcp Bytes extractor
+
+    // Handlers keep `ServiceHandle` state; `require_auth` is layered with its
+    // own `AuthState` (axum allows differing types).
+    Router::new()
+        .route("/mcp", post(mcp::mcp_handler))
+        .route("/store", post(store))
+        .route("/search", post(search))
+        .route("/delete", post(delete))
+        .route("/relation", post(relation))
+        .route("/supersede", post(supersede))
+        .route("/contradictions", post(contradictions))
+        .route("/contradictions/resolution", post(resolve_contradiction))
+        .route("/duplicates/find", post(find_duplicates))
+        .route("/duplicates/merge", post(merge_duplicates))
+        .route(
+            "/memories/{content_hash}",
+            get(get_memory).patch(patch_memory),
+        )
+        .route("/backfill/summaries", post(backfill_summaries))
+        .route("/backfill/contradictions", post(backfill_contradictions))
+        .layer(middleware::from_fn_with_state(
+            auth_state,
+            auth::require_auth,
+        ))
+        .layer(DefaultBodyLimit::max(MAX_BODY))
+        .layer(TraceLayer::new_for_http().make_span_with(request_span))
+        .with_state(handle)
+}
+
 /// The request span for authenticated REST routes: `method` and `path`
 /// only — a query string is never safe to log (mirrors ops-console).
-/// `info_span!` keeps the span alive at `tower_http=info`, the deployed
-/// default filter (`telemetry.rs`); `DefaultMakeSpan` can set the span's
-/// level but cannot drop its `uri` field, so a custom closure is required.
+/// `info_span!` targets this module (`alaya_server`), so the directive that
+/// keeps it alive is `alaya_server=info` in the default filter
+/// (`telemetry.rs`); `tower_http=info` only governs tower-http's own
+/// request/response events. `DefaultMakeSpan` can set the span's level but
+/// cannot drop its `uri` field, so a custom `MakeSpan` is required.
 fn request_span(req: &Request) -> tracing::Span {
     tracing::info_span!("request", method = %req.method(), path = %req.uri().path())
 }
@@ -4614,22 +4625,25 @@ mod wedge_tests {
     }
 
     /// Mirrors `request_span_omits_query_string` in `ops-console/src/main.rs`
-    /// (LAB-4506). Exercises the real `request_span` function against
-    /// `TraceLayer`, not a copy of it, so this fails the moment the span
-    /// construction regresses to logging the full URI.
+    /// (LAB-4506), driven through `protected_router` — the router `main`
+    /// serves — so reverting production's `make_span_with(request_span)`
+    /// fails this test, not just editing `request_span` itself.
     ///
     /// Thread-scoped (`set_default`, not `set_global_default`): this binary
     /// also has `telemetry::tests::installs_without_a_tokio_runtime`, which
     /// installs a real global default — the two would race for the single
     /// process-wide slot. Scoped is normally flaky (tracing-core caches
-    /// callsite interest per registering thread), but that requires another
-    /// concurrently-running test to hit the *same* callsite before this
-    /// subscriber goes live; `request_span` and the local `probe_handler`
-    /// below are both exclusive to this test, so no other thread can race it.
+    /// callsite interest per registering thread), but only for a callsite
+    /// another concurrent test hits first. The sole callsite asserted on is
+    /// `request_span`'s own close event (`FmtSpan::CLOSE`), and nothing else
+    /// in this binary builds `protected_router`. Never assert on tower-http's
+    /// `on_request`/`on_response` events: those are shared, and would bring
+    /// the flake back.
     #[tokio::test]
     async fn request_span_omits_query_string() {
         use std::sync::{Arc, Mutex};
         use tower::ServiceExt;
+        use tracing_subscriber::fmt::format::FmtSpan;
 
         #[derive(Clone, Default)]
         struct LogBuffer(Arc<Mutex<Vec<u8>>>);
@@ -4643,44 +4657,37 @@ mod wedge_tests {
             }
         }
 
-        async fn probe_handler() -> StatusCode {
-            // Stands in for a handler's own `tracing::info!` calls — proof
-            // that any INFO event inside the span reprints its fields.
-            tracing::info!("handling probe request");
-            StatusCode::OK
-        }
-
         let sink = LogBuffer::default();
         let writer = sink.clone();
         let subscriber = tracing_subscriber::fmt()
             .with_env_filter("alaya_server=info,tower_http=info")
+            .with_span_events(FmtSpan::CLOSE)
             .with_writer(move || writer.clone())
             .with_ansi(false)
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let app = Router::new()
-            .route("/probe", get(probe_handler))
-            .layer(TraceLayer::new_for_http().make_span_with(request_span));
+        // Anonymous, so `require_auth` answers 401 inside the span and no
+        // handler ever reaches the (unserviced) command channel.
+        let (tx, _rx) = mpsc::channel(1);
+        let app = protected_router(ServiceHandle { tx }, test_auth_state());
 
         let resp = app
             .oneshot(
-                axum::http::Request::get("/probe?token=QUERY-SENTINEL")
+                axum::http::Request::post("/store?token=QUERY-SENTINEL")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // `TraceLayer`'s response body owns the span; it closes on drop.
+        drop(resp);
 
         let log = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
         assert!(
-            log.contains("handling probe request"),
-            "positive control: the INFO event inside the span must be captured:\n{log}"
-        );
-        assert!(
-            log.contains("path=/probe"),
-            "positive control: the span must record the request path:\n{log}"
+            log.contains("path=/store"),
+            "positive control: the request span must close with its path:\n{log}"
         );
         assert!(
             !log.contains("QUERY-SENTINEL"),
