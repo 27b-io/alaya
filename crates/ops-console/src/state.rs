@@ -114,17 +114,27 @@ impl AppState {
     /// An already-expired state is refused outright, before the purge: at
     /// `now == exp` a separately-read `read_login` clock could still accept
     /// the cookie while this purge would drop the entry, letting the state
-    /// be spent again. `now` is the caller's so tests can pin that boundary.
-    pub fn consume_login(&self, state: &str, exp: i64, now: i64) -> bool {
+    /// be spent again.
+    pub fn consume_login(&self, state: &str, exp: i64) -> bool {
         let mut consumed = self.consumed_logins.lock().expect("login lock poisoned");
-        if exp <= now {
-            return false;
-        }
-        while consumed.first().is_some_and(|(e, _)| *e <= now) {
-            consumed.pop_first();
-        }
-        consumed.insert((exp, state.to_string()))
+        // The clock is read under the guard, so holders read it in lock
+        // order: barring a wall-clock step back, a caller that read an
+        // earlier second cannot take the lock after a purge and find a spent
+        // entry gone.
+        spend_login(&mut consumed, state, exp, crate::session::now_epoch())
     }
+}
+
+/// `consume_login` over a bare set, with `now` supplied so tests can pin the
+/// expiry boundary. `now` must not go backwards between calls.
+fn spend_login(consumed: &mut BTreeSet<(i64, String)>, state: &str, exp: i64, now: i64) -> bool {
+    if exp <= now {
+        return false;
+    }
+    while consumed.first().is_some_and(|(e, _)| *e <= now) {
+        consumed.pop_first();
+    }
+    consumed.insert((exp, state.to_string()))
 }
 
 // Lets PrivateCookieJar::from_request_parts find the encryption key.
@@ -138,42 +148,25 @@ impl FromRef<AppState> for Key {
 mod tests {
     use super::*;
 
-    fn test_state() -> AppState {
-        AppState::new(Config {
-            listen_addr: "127.0.0.1:0".into(),
-            public_url: "https://console.test".parse().unwrap(),
-            oidc_issuer: "https://id.test".into(),
-            oidc_client_id: "console".into(),
-            oidc_client_secret: "oidc-client-secret-value".into(),
-            allowed_subjects: vec!["admin-sub".into()],
-            session_secret: b"0123456789abcdef0123456789abcdef-test".to_vec(),
-            alaya_url: "http://127.0.0.1:1".parse().unwrap(),
-            alaya_api_key: "alaya-bearer-secret-value".into(),
-            lb: None,
-        })
+    #[test]
+    fn spend_login_refuses_a_state_at_its_expiry() {
+        assert!(!spend_login(&mut BTreeSet::new(), "s", 1_000, 1_000));
     }
 
     #[test]
-    fn consume_login_refuses_a_state_at_its_expiry() {
-        let state = test_state();
-        assert!(!state.consume_login("s", 1_000, 1_000));
+    fn spend_login_spends_a_live_state_exactly_once() {
+        let mut consumed = BTreeSet::new();
+        assert!(spend_login(&mut consumed, "t", 1_600, 1_000));
+        assert!(!spend_login(&mut consumed, "t", 1_600, 1_000));
     }
 
     #[test]
-    fn consume_login_spends_a_live_state_exactly_once() {
-        let state = test_state();
-        assert!(state.consume_login("t", 1_600, 1_000));
-        assert!(!state.consume_login("t", 1_600, 1_000));
-    }
-
-    #[test]
-    fn consume_login_purges_expired_states_and_keeps_live_ones() {
-        let state = test_state();
-        assert!(state.consume_login("old", 1_100, 1_000));
-        assert!(state.consume_login("live", 1_600, 1_000));
-        // Past "old"'s expiry: it is dropped, "live" is still spent.
-        assert!(state.consume_login("new", 1_700, 1_100));
-        let consumed = state.consumed_logins.lock().unwrap();
+    fn spend_login_purges_expired_states_and_keeps_live_ones() {
+        let mut consumed = BTreeSet::new();
+        assert!(spend_login(&mut consumed, "old", 1_100, 1_000));
+        assert!(spend_login(&mut consumed, "live", 1_600, 1_000));
+        // At "old"'s expiry: it is dropped, "live" is still spent.
+        assert!(spend_login(&mut consumed, "new", 1_700, 1_100));
         let states: Vec<&str> = consumed.iter().map(|(_, s)| s.as_str()).collect();
         assert_eq!(states, ["live", "new"]);
     }

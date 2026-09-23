@@ -1055,18 +1055,19 @@ mod tests {
 
     /// The first callback is parked on the token exchange when the second
     /// arrives, so this fails for any check made after the exchange rather
-    /// than before it. Separate tasks on worker threads, as in production;
-    /// atomicity of the test-and-set itself is one lock guard in
-    /// `consume_login`, which a race can only probe, never prove.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// than before it. One task on purpose: `join!` is what guarantees that
+    /// ordering, where spawned tasks could run back to back. Atomicity of
+    /// the test-and-set is the single lock guard in `consume_login`.
+    #[tokio::test]
     async fn concurrent_callbacks_on_one_state_make_one_token_exchange() {
         use std::sync::atomic::Ordering;
         let (issuer, token_calls) = testkit::mock_idp().await;
         let (app, cookie, state) = start_login(issuer).await;
 
-        let a = tokio::spawn(app.clone().oneshot(callback_request(&cookie, &state)));
-        let b = tokio::spawn(app.clone().oneshot(callback_request(&cookie, &state)));
-        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+        let (a, b) = tokio::join!(
+            app.clone().oneshot(callback_request(&cookie, &state)),
+            app.clone().oneshot(callback_request(&cookie, &state)),
+        );
         let mut statuses = [a.unwrap().status(), b.unwrap().status()];
         statuses.sort();
         assert_eq!(statuses, [StatusCode::BAD_REQUEST, StatusCode::FORBIDDEN]);
