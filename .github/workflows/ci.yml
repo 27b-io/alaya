@@ -12,6 +12,7 @@ env:
   IMAGE_NAME: 27b-io/alaya
   CARGO_TERM_COLOR: always
 
+# All jobs run GitHub-hosted: public, forkable repo.
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -47,7 +48,6 @@ jobs:
   build-image:
     needs: [check, audit]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    # GitHub-hosted: public, forkable repo.
     runs-on: ubuntu-latest
     permissions:
       contents: read
