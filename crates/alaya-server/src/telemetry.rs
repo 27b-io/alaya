@@ -116,3 +116,28 @@ pub fn shutdown_tracing() {
         tracing::warn!("OTLP shutdown error: {e}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// `main` installs the subscriber before it builds the tokio runtime, so
+    /// that the boot credential-transport guard — which runs in
+    /// `Config::from_env`, earlier still — can warn rather than print. This
+    /// pins that ordering: installing must not need a reactor.
+    ///
+    /// It does NOT pin the OTLP arm, and an earlier version of this comment
+    /// wrongly claimed it did. `init_tracing` enters that arm only when
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` is set, which `cargo test` does not, so
+    /// the blocking client never runs here. Measured twice: forcing the arm
+    /// with an unroutable endpoint still returns in 0.00s (the exporter builds
+    /// a client, it does not dial), and substituting the async
+    /// `reqwest::Client` leaves this test green, because a missing reactor
+    /// panics at first export on the batch thread rather than at
+    /// construction. Reaching that needs a live span flushed to a real
+    /// endpoint, which is not a unit test's job.
+    #[test]
+    fn installs_without_a_tokio_runtime() {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        super::init_tracing();
+        tracing::warn!("subscriber is live");
+    }
+}

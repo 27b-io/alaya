@@ -2184,6 +2184,7 @@ dependencies = [
 name = "ops-console"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "axum",
  "axum-extra",
  "base64",

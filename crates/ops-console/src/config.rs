@@ -141,6 +141,30 @@ fn reject_query_or_fragment(key: &str, url: &url::Url) -> Result<(), String> {
     Ok(())
 }
 
+/// Userinfo in a config URL is a credential in a URL, and the two URLs that
+/// get this guard leak it in opposite directions — which is why the guard is
+/// shared but the reasons are not interchangeable.
+///
+/// `CONSOLE_PUBLIC_URL` leaks it SILENTLY: it rides the concatenation into
+/// the authorize redirect's `Location` and the token POST body, while every
+/// rendering this binary logs — `Config`'s Debug via `origin_of`,
+/// `public_origin()` — shows the userinfo-free origin, so nothing in the pod
+/// log records that it went anywhere.
+///
+/// `CONSOLE_OIDC_ISSUER` leaks it LOUDLY: `Config`'s Debug prints it
+/// verbatim, not as an origin, and `warn_idp_failure` records it on every
+/// IdP failure. Refusing the shape at boot is one check; redacting at each
+/// log site is a list that grows and will miss one.
+///
+/// Parsed, not string-matched: '@' is legal in a path, and only the parser
+/// decides which bytes are userinfo.
+fn reject_userinfo(key: &str, url: &url::Url) -> Result<(), String> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!("{key} must not carry userinfo"));
+    }
+    Ok(())
+}
+
 /// https everywhere; plaintext http exists only for loopback local dev (a
 /// non-loopback http URL would also silently disable the Secure cookie flag
 /// — refuse instead).
@@ -162,15 +186,9 @@ fn validate_public_url(public_url: &url::Url) -> Result<(), String> {
     // query is refused for the concatenation, which the RFC does permit on a
     // redirect_uri that was built to carry one.
     reject_query_or_fragment("CONSOLE_PUBLIC_URL", public_url)?;
-    // Userinfo rides the same concatenation, and this is the worse half of
-    // it: the credential lands in the authorize redirect's `Location` and in
-    // the token POST body, while `public_origin()` and `Config`'s Debug both
-    // render the userinfo-free origin — so nothing in the pod log shows it
-    // leaked. `validate_issuer` has refused this since the last round; the
-    // rule was never applied here.
-    if !public_url.username().is_empty() || public_url.password().is_some() {
-        return Err("CONSOLE_PUBLIC_URL must not carry userinfo".into());
-    }
+    // Userinfo rides the same concatenation — see `reject_userinfo` for the
+    // half of its reasoning that is about this URL.
+    reject_userinfo("CONSOLE_PUBLIC_URL", public_url)?;
     match public_url.scheme() {
         "https" => Ok(()),
         "http" if is_loopback => Ok(()),
@@ -253,14 +271,8 @@ fn validate_upstream_url(var: &str, url: &url::Url) -> Result<(), String> {
 /// The IdP is stricter than every other upstream: https only, with no
 /// cluster-local exemption — and no userinfo.
 ///
-/// The userinfo rule is what keeps a credential out of the logs. The issuer
-/// is the one credential-shaped value that reaches a log verbatim: `Config`'s
-/// Debug prints it (`?config` at startup, unconditionally) and `OidcRp` logs
-/// it on every IdP failure. Refusing the shape at boot is one check;
-/// redacting at each log site is a list that grows and will miss one.
-///
-/// Parsed, not string-matched — '@' is legal in a path, and only the parser
-/// decides which bytes are userinfo.
+/// The userinfo rule is what keeps a credential out of the logs — see
+/// `reject_userinfo` for why this URL is the loud half of it.
 fn validate_issuer(issuer: &str) -> Result<(), String> {
     if !issuer.starts_with("https://") {
         return Err("CONSOLE_OIDC_ISSUER must be https".into());
@@ -268,9 +280,7 @@ fn validate_issuer(issuer: &str) -> Result<(), String> {
     let url: url::Url = issuer
         .parse()
         .map_err(|e| format!("CONSOLE_OIDC_ISSUER is not a valid URL: {e}"))?;
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("CONSOLE_OIDC_ISSUER must not carry userinfo".into());
-    }
+    reject_userinfo("CONSOLE_OIDC_ISSUER", &url)?;
     // Discovery concatenates the well-known path onto the issuer (`oidc.rs`).
     reject_query_or_fragment("CONSOLE_OIDC_ISSUER", &url)?;
     Ok(())

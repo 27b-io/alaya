@@ -113,7 +113,7 @@ pub async fn home(
                 <CardHeader>
                     <CardTitle>"anthropic-lb — monitoring"</CardTitle>
                     <CardDescription>
-                        "Read-only budget burn and account headroom for the load balancer. Limits are TOML, GitOps."
+                        "Read-only budget burn and account utilisation for the load balancer. Limits are TOML, GitOps."
                     </CardDescription>
                 </CardHeader>
                 <CardContent>{lb_card}</CardContent>

@@ -12,9 +12,7 @@ use serde::Deserialize;
 
 use crate::error::AppError;
 use crate::routes::safe_next;
-use crate::session::{
-    self, Flash, LOGIN_COOKIE, SESSION_COOKIE, new_login_state, new_session, read_login,
-};
+use crate::session::{self, Flash, LOGIN_COOKIE, SESSION_COOKIE, new_login_state, read_login};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -78,19 +76,12 @@ pub async fn callback(
         .oidc
         .exchange_and_verify(&code, &login.pkce_verifier, &login.nonce)
         .await
-        .map_err(|e| {
-            // Everything `verify_id_token` refuses after the token decodes —
-            // iss mismatch, an oversized claim, nonce mismatch, a disallowed
-            // alg, an unknown kid — returned silently until now, while
-            // `warn_idp_failure` covered only transport and discovery. Under
-            // a substituted-IdP threat model those refusals are the highest-
-            // signal events this console can observe, and the pod log had no
-            // record of any of them. Safe by type rather than by care: the
-            // payload is `OidcRpError`'s `&'static str`, so no IdP-supplied
-            // byte can reach the log through it.
-            tracing::warn!(op = e.0, "oidc: id_token rejected");
-            AppError::Forbidden(format!("login failed: {e}"))
-        })?;
+        // No warn here: every arm below this call already logs its own, at
+        // the refusal that produced it (`warn_rejected`, `warn_idp_failure`,
+        // `warn_idp_parse_failure`, `http::body_text`). `warn_rejected` has
+        // the reasoning; a wrapper at this level cannot tell a refusal from
+        // an outage.
+        .map_err(|e| AppError::Forbidden(format!("login failed: {e}")))?;
 
     // `sub` is recorded with `?`, not `%`, here and everywhere it is logged.
     // It is an unvalidated string straight out of the id_token, logged on
@@ -110,11 +101,7 @@ pub async fn callback(
     }
 
     tracing::info!(sub = ?claims.sub, "console login");
-    let sess = new_session(
-        claims.sub,
-        claims.email,
-        claims.name.or(claims.preferred_username),
-    );
+    let sess = session::session_for(claims);
     let secure = state.secure_cookies();
     let jar = jar.remove(session::removal_cookie(LOGIN_COOKIE));
     let jar = session::session_cookie(jar, &sess, secure);
