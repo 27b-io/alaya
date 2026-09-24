@@ -58,9 +58,11 @@ is `user-123`, not `"user-123"`.
 
 1. Have them log in once (they'll get a 403 page); the rejected subject is
    in `fields.sub` on the console's `login rejected: subject not
-   allowlisted` record. Take the text *inside* the inner quotes: a quoted
-   entry never matches and the 403 persists silently. (Or read the `sub`
-   from the IdP's user admin.)
+   allowlisted` record. It is a Debug string, so strip the inner quotes *and*
+   decode its backslash escapes (`a\\b` is `a\b`) — `jq -r '.fields.sub |
+   fromjson'` on the record does both. A quoted or still-escaped entry never
+   matches and the 403 persists silently. (Or read the `sub` from the IdP's
+   user admin.)
 2. Add it to `CONSOLE_ALLOWED_SUBJECTS` (comma-separated) and roll the pod.
 
 ## Ālaya module
