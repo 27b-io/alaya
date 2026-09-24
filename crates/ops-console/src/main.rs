@@ -739,13 +739,29 @@ mod tests {
     /// The correction's `content_hash` is alaya-server's answer echoed
     /// verbatim, and it reaches a log field, `memory_href` and `supersede`.
     /// Unvalidated it forges pod-log records — in the audit trail for this
-    /// very write — so it must be refused, and the refusal must still say
-    /// that the store half committed.
+    /// very write — so it must be refused before any of them, and the
+    /// refusal must still say that the store half committed.
     #[tokio::test]
     async fn a_malformed_store_content_hash_is_refused_and_never_reaches_the_log_raw() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         const FORGED: &str = "aaaa\n2026-09-22T12:00:00Z  INFO ops_console: corrected + superseded sub=\"admin-sub\"";
 
+        // Answers success, so the counter is the only thing that can notice a
+        // supersede call. Without this route a regression that superseded onto
+        // the forged hash and ignored the result got a 404, fell through to
+        // the refusal, and passed every assertion below.
+        let supersede_calls = Arc::new(AtomicUsize::new(0));
+        let seen = supersede_calls.clone();
         let upstream = Router::new()
+            .route(
+                "/supersede",
+                post(move || {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    async { axum::Json(serde_json::json!({ "success": true })) }
+                }),
+            )
             .route(
                 "/memories/{hash}",
                 get(|| async {
@@ -788,6 +804,11 @@ mod tests {
         assert!(
             body.contains("WAS stored"),
             "the committed store half must not be hidden by the refusal: {body}"
+        );
+        assert_eq!(
+            supersede_calls.load(Ordering::SeqCst),
+            0,
+            "a refused content_hash must never be sent upstream as a supersede target"
         );
 
         // Panics unless the refusal is in the pod log at all — it has to be
