@@ -39,9 +39,12 @@ pub enum AlayaError {
     /// Transient upstream failure — connect/timeout, 5xx, or an auth/model
     /// misconfiguration (401/403/404) that is not the request's fault.
     /// Nothing about the input caused it, so callers must not record a
-    /// per-item failure; retry later.
-    #[error("upstream unavailable: {0}")]
-    Unavailable(String),
+    /// per-item failure; retry later. `spent` = the request got past
+    /// connect and nothing definitive came back (post-send timeout, reset,
+    /// body cut after 2xx, 5xx), so a paid upstream may have billed it; a
+    /// refused connect or a 401/403/404 is free.
+    #[error("upstream unavailable: {message}")]
+    Unavailable { message: String, spent: bool },
 
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -67,7 +70,7 @@ impl AlayaError {
             Self::Rerank(_) => -32006,
             Self::Judge(_) => -32007,
             Self::RateLimited { .. } => -32008,
-            Self::Unavailable(_) => -32009,
+            Self::Unavailable { .. } => -32009,
             Self::Serialization(_) => -32600,
             Self::Conflict(_) => -32010,
         }
@@ -87,7 +90,7 @@ impl AlayaError {
             Self::Rerank(_) => "Rerank operation failed",
             Self::Judge(_) => "Contradiction judge failed",
             Self::RateLimited { .. } => "Upstream rate limited",
-            Self::Unavailable(_) => "Upstream temporarily unavailable",
+            Self::Unavailable { .. } => "Upstream temporarily unavailable",
             Self::Serialization(_) => "Invalid request format",
             Self::Conflict(_) => {
                 "Edge carries a verdict or resolution; resolve it (keep_both / supersede) instead of deleting"

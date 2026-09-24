@@ -22,7 +22,7 @@ mod wellknown;
 
 use axum::{
     Json, Router,
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, Request},
     http::{Method, StatusCode, header},
     middleware,
     routing::{get, post},
@@ -73,13 +73,15 @@ struct Config {
     summary_url: Option<String>,
     summary_api_key: Option<String>,
     summary_model: String,
-    /// Contradiction judge (LAB-3283). URL and key fall back to the
+    /// Contradiction judge (LAB-3283, LAB-3895). URL and key fall back to the
     /// SUMMARY_* counterpart; with neither set the engine is disabled. The
     /// model has its own default: summaries are priced for volume, verdicts
-    /// for precision on the golden set.
+    /// for precision on the golden set. `judge_daily_cap` bounds store-path
+    /// judge spend per UTC day (default 1000).
     judge_url: Option<String>,
     judge_api_key: Option<String>,
     judge_model: String,
+    judge_daily_cap: usize,
     rerank_url: Option<String>,
     rerank_api_key: Option<String>,
     rerank_top_n: usize,
@@ -91,7 +93,7 @@ impl Config {
         let cfg = Self {
             qdrant_url: env_required("QDRANT_URL"),
             qdrant_collection: env_or("QDRANT_COLLECTION", "memories_arctic1024"),
-            qdrant_api_key: std::env::var("QDRANT_API_KEY").ok(),
+            qdrant_api_key: env_non_empty("QDRANT_API_KEY"),
             embedding_url: env_required("EMBEDDING_URL"),
             embedding_model: env_or("EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-l-v2.0"),
             embedding_dimensions: env_or("EMBEDDING_DIMENSIONS", "1024")
@@ -108,21 +110,24 @@ impl Config {
             listen_addr: env_or("LISTEN_ADDR", "0.0.0.0:3001"),
             api_key: env_or("ALAYA_API_KEY", ""),
             readonly_api_key: env_or("ALAYA_READONLY_API_KEY", ""),
-            oidc_issuer: env_opt("OIDC_ISSUER"),
+            oidc_issuer: env_non_empty("OIDC_ISSUER"),
             public_base_url: normalize_public_base_url(&env_or(
                 "PUBLIC_BASE_URL",
                 "https://alaya.27b.io",
             )),
             allow_unauthenticated: env_or("DANGEROUSLY_ALLOW_UNAUTHENTICATED", "")
                 .eq_ignore_ascii_case("true"),
-            summary_url: env_opt("SUMMARY_URL"),
-            summary_api_key: env_opt("SUMMARY_API_KEY"),
+            summary_url: env_non_empty("SUMMARY_URL"),
+            summary_api_key: env_non_empty("SUMMARY_API_KEY"),
             summary_model: env_or("SUMMARY_MODEL", "claude-haiku-4-5-20251001"),
-            judge_url: env_opt("JUDGE_URL").or_else(|| env_opt("SUMMARY_URL")),
-            judge_api_key: env_opt("JUDGE_API_KEY").or_else(|| env_opt("SUMMARY_API_KEY")),
-            judge_model: env_opt("JUDGE_MODEL").unwrap_or_else(|| "claude-sonnet-5".into()),
-            rerank_url: env_opt("RERANK_URL"),
-            rerank_api_key: env_opt("RERANK_API_KEY"),
+            judge_url: env_non_empty("JUDGE_URL").or_else(|| env_non_empty("SUMMARY_URL")),
+            judge_api_key: env_non_empty("JUDGE_API_KEY")
+                .or_else(|| env_non_empty("SUMMARY_API_KEY")),
+            judge_model: env_non_empty("JUDGE_MODEL").unwrap_or_else(|| "claude-sonnet-5".into()),
+            judge_daily_cap: parse_judge_daily_cap(env_non_empty("JUDGE_DAILY_CAP"))
+                .unwrap_or_else(|e| panic!("{e}")),
+            rerank_url: env_non_empty("RERANK_URL"),
+            rerank_api_key: env_non_empty("RERANK_API_KEY"),
             rerank_top_n: env_or("RERANK_TOP_N", "20")
                 .parse()
                 .expect("RERANK_TOP_N must be a number"),
@@ -132,20 +137,74 @@ impl Config {
                 .parse()
                 .expect("RERANK_TIMEOUT_MS must be a positive integer (ms)"),
         };
-        // Every credential-bearing endpoint, checked on the main thread before
-        // the runtime, the worker thread or the listener exist: a refused
-        // endpoint means the process never starts.
-        for (var, url, has_api_key) in [
+        // Read through the helper `init_l2_cache` uses, so the guard and the
+        // cache can never disagree about which string gets dialled.
+        let redis_cache_url = env_non_empty("REDIS_CACHE_URL");
+        // Every credential-bearing URL this process reads into `Config`,
+        // checked on the main thread before the runtime, the worker thread or
+        // the listener exist: a refused endpoint means the process never
+        // starts. The transport column is the client that dials that var — the
+        // wrong one there is a silent downgrade, so it is one column to read
+        // rather than seven call sites.
+        //
+        // Credential-bearing but not in `Config`, so not covered here: the
+        // cachekit.io SaaS cache URL (its own builder is HTTPS-only and
+        // host-allowlisted) and `OTEL_EXPORTER_OTLP_ENDPOINT`, which
+        // `opentelemetry-otlp` reads directly along with the bearer token in
+        // `OTEL_EXPORTER_OTLP_HEADERS`.
+        for (var, url, has_credential, transport) in [
             (
                 "SUMMARY_URL",
-                &cfg.summary_url,
+                cfg.summary_url.as_deref(),
                 cfg.summary_api_key.is_some(),
+                Transport::Http,
             ),
-            ("JUDGE_URL", &cfg.judge_url, cfg.judge_api_key.is_some()),
-            ("RERANK_URL", &cfg.rerank_url, cfg.rerank_api_key.is_some()),
+            (
+                "JUDGE_URL",
+                cfg.judge_url.as_deref(),
+                cfg.judge_api_key.is_some(),
+                Transport::Http,
+            ),
+            (
+                "RERANK_URL",
+                cfg.rerank_url.as_deref(),
+                cfg.rerank_api_key.is_some(),
+                Transport::Http,
+            ),
+            (
+                "QDRANT_URL",
+                Some(cfg.qdrant_url.as_str()),
+                cfg.qdrant_api_key.is_some(),
+                Transport::Http,
+            ),
+            (
+                "GRAPH_URL",
+                Some(cfg.graph_url.as_str()),
+                // HealthChecker puts QDRANT_API_KEY in the shared client's
+                // default_headers; check_graph overrides only when graph_api_key
+                // is non-empty, so the Qdrant key leaks to graph probes.
+                !cfg.graph_api_key.is_empty() || cfg.qdrant_api_key.is_some(),
+                Transport::Http,
+            ),
+            (
+                // `false` holds only because the worker passes `None` to
+                // `EmbeddingClient::new`, leaving userinfo as the only
+                // credential this can carry. Mirrored at that call site.
+                "EMBEDDING_URL",
+                Some(cfg.embedding_url.as_str()),
+                false,
+                Transport::Http,
+            ),
+            (
+                "REDIS_CACHE_URL",
+                redis_cache_url.as_deref(),
+                false,
+                Transport::Redis,
+            ),
         ] {
             if let Some(url) = url {
-                check_credential_transport(var, url, has_api_key).unwrap_or_else(|e| panic!("{e}"));
+                check_credential_transport(var, url, has_credential, transport)
+                    .unwrap_or_else(|e| panic!("{e}"));
             }
         }
         cfg
@@ -158,11 +217,6 @@ fn env_required(key: &str) -> String {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
-/// Set and non-empty, else `None`.
-fn env_opt(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
 /// Normalize the single origin source-of-truth: strip a trailing slash and
@@ -232,15 +286,36 @@ fn is_private_host(url: &str) -> bool {
     host_of(url).is_some_and(|h| host_is_private(&h))
 }
 
+// Duplicated verbatim in ops-console/src/config.rs (no shared crate between
+// a Leptos console and the server) — edit both. Drift is safe in one
+// direction only: a stale copy is the NARROWER one, so it refuses a boot its
+// sibling allows, loudly, in the deploy that introduced it.
 fn host_is_private(h: &str) -> bool {
-    // DNS-only special names — these can't be IP literals.
-    if h == "localhost" || h.ends_with(".svc") || h.ends_with(".internal") {
+    // DNS-only special names — these can't be IP literals. Both the short
+    // Service form and the fully-qualified one: `.svc.cluster.local` is what
+    // most k8s docs show, and it ends with `.local`, so `.svc` alone refuses
+    // a correct config. Both suffixes stay END-anchored — that is what stops
+    // `evil.svc.attacker.com` matching, so neither may become a substring
+    // test. A non-default cluster domain needs its literal added here.
+    if h == "localhost"
+        || h.ends_with(".svc")
+        || h.ends_with(".svc.cluster.local")
+        || h.ends_with(".internal")
+    {
         return true;
     }
     // Anything else must parse as an actual IP literal to qualify as private.
     match h.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private(),
-        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        // An IPv4-mapped literal (`::ffff:10.0.0.1`) is the v4 address it
+        // wraps — `Ipv6Addr::is_loopback` is false for `::ffff:127.0.0.1`,
+        // so judge the mapped address or a mapped loopback reads as public.
+        // ULA (`fc00::/7`) is v6's private range; without it a v6-native
+        // cluster is pushed onto DNS names for no security gain.
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.is_loopback() || v4.is_private(),
+            None => v6.is_loopback() || v6.is_unique_local(),
+        },
         Err(_) => false,
     }
 }
@@ -255,37 +330,104 @@ fn is_cluster_local(url: &reqwest::Url) -> bool {
     let Some(h) = url.host_str() else {
         return false;
     };
-    let h = h.trim_start_matches('[').trim_end_matches(']');
+    // Lowercase: the url crate only normalises special-scheme hosts (http/https);
+    // non-special schemes (redis, rediss) preserve case from the input.
+    let h = h
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let h = h.as_str();
     host_is_private(h) || (h.parse::<std::net::IpAddr>().is_err() && !h.contains('.'))
 }
 
+/// Which client dials the URL, and so which schemes it can speak. A scheme the
+/// client cannot speak must be refused here, not approved and then discovered
+/// at the first request — and the two sets do not overlap, so one merged set
+/// is wrong for both.
+#[derive(Clone, Copy)]
+enum Transport {
+    /// `reqwest` — `http` and `https` only; any other scheme is an error out of
+    /// `Client::execute`, never a connection.
+    Http,
+    /// `fred`, via cachekit — `redis` and `rediss`, both of them plaintext:
+    /// fred is built without TLS (`enable-rustls`/`enable-native-tls` are not
+    /// compiled), so `rediss://` opens plain TCP despite the scheme name. It
+    /// also never validates the scheme, so an `https://` cache URL does not
+    /// fail — it dials plain TCP on 6379 and sends `AUTH` in the clear.
+    Redis,
+}
+
 /// A credential sent in the clear to a host that is not cluster-local is a
-/// credential on the wire. Fail closed at boot (Ray on LAB-3283, 2026-09-11):
-/// `https://` anywhere, plain `http://` only to a cluster-local proxy such as
-/// `http://anthropic-lb:8082`, anything else refused. The credential is the
-/// API key when one is set, or URL userinfo (`http://user:secret@host`) which
-/// reqwest sends as Basic auth on every request. Classified on the URL as
-/// reqwest parses it (lowercased scheme, real host), so the check and the
-/// transport cannot disagree about where the credential goes. Messages name
-/// the host, never the raw value: a URL may carry userinfo.
-fn check_credential_transport(var: &str, url: &str, has_api_key: bool) -> Result<(), String> {
+/// credential on the wire. Fail closed at boot (Ray, 2026-09-11) against the
+/// `Transport` that will carry it: `Http` takes `https` anywhere or plain
+/// `http` to a cluster-local endpoint such as `http://anthropic-lb:8082`,
+/// `Redis` takes only a cluster-local `redis://redis-svc:6379`. The credential
+/// is the API key when one is set, or URL-embedded credentials
+/// (`http://user:secret@host` sent as Basic auth by reqwest,
+/// `redis://user:pw@host` sent as `AUTH` by fred). Classified on the URL as the
+/// `url` crate parses it (lowercased
+/// scheme, real host), so the check and the transport cannot disagree about
+/// where the credential goes. Messages name the host, never the raw value: a
+/// URL may carry credentials.
+fn check_credential_transport(
+    var: &str,
+    url: &str,
+    has_api_key: bool,
+    transport: Transport,
+) -> Result<(), String> {
     let parsed = match reqwest::Url::parse(url) {
         Ok(parsed) => parsed,
-        // Keyless and unparseable: nothing to protect; the client reports it.
-        Err(_) if !has_api_key => return Ok(()),
+        // No credential means no question for this guard, so it must not
+        // escalate — refusing here would stop the service over a var it was
+        // never asked to validate. Say so, though: the client that dials it
+        // fails much later with nothing naming the var.
+        Err(e) if !has_api_key => {
+            tracing::warn!(
+                op = "credential_transport_guard",
+                var,
+                err = %e,
+                "not a parseable URL; no credential to protect, so boot continues"
+            );
+            return Ok(());
+        }
         Err(e) => return Err(format!("{var} is not a valid URL ({e})")),
     };
     let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
     if !has_api_key && !has_userinfo {
         return Ok(());
     }
-    match parsed.scheme() {
-        "https" => Ok(()),
-        "http" if is_cluster_local(&parsed) => Ok(()),
-        scheme => Err(format!(
-            "{var}: {scheme}://{} is neither https nor a cluster-local http proxy; \
-             an API key or URL userinfo must not travel in the clear",
-            parsed.host_str().unwrap_or("")
+    match (transport, parsed.scheme()) {
+        (Transport::Http, "https") => Ok(()),
+        (Transport::Http, "http") if is_cluster_local(&parsed) => Ok(()),
+        // fred dispatches on scheme suffix (`redis-cluster`, `rediss-cluster`,
+        // `redis-sentinel`), all plaintext (no TLS compiled).
+        (Transport::Redis, scheme) if scheme.starts_with("redis") && is_cluster_local(&parsed) => {
+            Ok(())
+        }
+        // Unusable scheme: reqwest rejects non-http at `Client::execute`, so
+        // nothing is ever dialled and "in the clear" would be false — the host
+        // in `QDRANT_URL=redis://qdrant:6333` IS cluster-local. Off-cluster
+        // `http` is a real cleartext fault and must fall through (hence
+        // `!= "http"`).
+        (Transport::Http, scheme) if scheme != "http" => Err(format!(
+            "{var}: unusable scheme {scheme}:// — this client speaks http and https only",
+        )),
+        // fred opens plain TCP regardless of scheme, so `https://` buys no
+        // encryption — it just makes fred dial port 6379 and send `AUTH` in
+        // the clear.
+        (Transport::Redis, scheme) if !scheme.starts_with("redis") => Err(format!(
+            "{var}: unusable scheme {scheme}:// — this client speaks redis:// \
+             variants only (fred opens plain TCP regardless of scheme)",
+        )),
+        (_, scheme) => Err(format!(
+            "{var}: {scheme}://{} is not {}; an API key or URL credential must \
+             not travel in the clear",
+            parsed.host_str().unwrap_or(""),
+            match transport {
+                Transport::Http => "https and not a cluster-local http endpoint",
+                Transport::Redis =>
+                    "a cluster-local redis:// or rediss:// endpoint (this client has no TLS)",
+            }
         )),
     }
 }
@@ -353,11 +495,23 @@ fn init_l2_saas() -> std::result::Result<cachekit::CacheKit, Box<dyn std::error:
 /// not an opaque downstream builder error) and padded/newline-suffixed values
 /// (folded YAML scalars, `echo`-piped secrets) that would fail string matches
 /// and downstream builders if passed through raw.
+///
+/// Reads every optional value, because a whitespace-only one that survives as
+/// `Some` reads as configured everywhere downstream — `OIDC_ISSUER="   "` used
+/// to satisfy the fail-closed "some auth is configured" check at boot.
+/// Deliberately not the bearer vars (`ALAYA_API_KEY`, `ALAYA_READONLY_API_KEY`,
+/// `GRAPH_API_KEY`): both ends of those compare the bytes they were given, so
+/// trimming one end alone would break the match. They are trimmed in the
+/// ExternalSecret template instead, where both ends see it.
 fn env_non_empty(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    non_empty_trimmed(std::env::var(key).ok())
+}
+
+/// The transformation above, split from the read so it can be pinned by a
+/// test: `set_var` is `unsafe` in edition 2024 and races every other test in
+/// the binary. Same shape as `parse_judge_daily_cap`, for the same reason.
+fn non_empty_trimmed(raw: Option<String>) -> Option<String> {
+    raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
 /// L2 embedding cache init, dispatched on `CACHE_BACKEND` (default `redis`).
@@ -456,7 +610,8 @@ const REPLY_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
 /// Worker is considered stalled when no command has completed for this long.
 /// Must exceed CMD_DEADLINE — a legit inline op may hold the loop that long.
 const WORKER_STALL_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(180);
-/// Pinger period — keeps worker progress fresh when the service is idle.
+/// Pinger period — keeps worker progress fresh when the service is idle and
+/// bounds how stale the bare probe's Qdrant verdict can be (#78).
 const PING_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn epoch_secs() -> u64 {
@@ -464,6 +619,23 @@ fn epoch_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Monotonic seconds for the worker heartbeat: elapsed since the first call
+/// in this process, `+1` so a live stamp can never read as the `progress` 0
+/// sentinel ("loop not entered yet") during the first second of uptime.
+///
+/// Deliberately not `epoch_secs`: a forward wall-clock step larger than
+/// `WORKER_STALL_THRESHOLD` — NTP correcting a drifted node, a VM resume —
+/// ages a stamp a healthy worker wrote seconds ago, and the unauthenticated
+/// liveness route then 503s a pod that is fine (LAB-3968). `Instant` does not
+/// move when the wall clock does. A backward step was not harmless either:
+/// `saturating_sub` floored the age at 0, so a wedged worker read healthy
+/// until the clock caught back up. Monotonic closes both halves.
+fn monotonic_secs() -> u64 {
+    static START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    START.elapsed().as_secs() + 1
 }
 
 /// A command sent from axum handlers to the MemoryService worker.
@@ -671,7 +843,7 @@ impl ServiceHandle {
 /// Uses its own reqwest::Client (Clone + Send + Sync) on the axum runtime.
 ///
 /// Bypassing the worker made a wedged worker invisible to k8s (#63), so the
-/// checker also watches `worker_progress` — the epoch-seconds of the last
+/// checker also watches `worker_progress` — `monotonic_secs` of the last
 /// command the worker completed (pings keep it fresh when idle). Stale
 /// progress means the loop stopped draining: status goes `unhealthy` and
 /// /health returns 503 so a liveness probe restarts the pod. Backend outages
@@ -687,6 +859,13 @@ struct HealthChecker {
     graph_api_key: String,
     worker_progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stall_threshold: std::time::Duration,
+    /// Time source for the stall age. `monotonic_secs` in production; a fixed
+    /// fake in tests, because that clock's origin is its own first call — a
+    /// test cannot otherwise hold a stamp that is genuinely 3600s old.
+    clock: fn() -> u64,
+    /// Last Qdrant verdict, written by the pinger via `refresh_qdrant` and
+    /// read by the bare probe — which therefore never touches Qdrant itself.
+    qdrant_ok: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HealthChecker {
@@ -710,38 +889,75 @@ impl HealthChecker {
             graph_api_key: config.graph_api_key.clone(),
             worker_progress,
             stall_threshold: WORKER_STALL_THRESHOLD,
+            clock: monotonic_secs,
+            qdrant_ok: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    fn worker_state(&self) -> (&'static str, bool, u64) {
+        let last_progress = self
+            .worker_progress
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if last_progress == 0 {
+            ("starting", false, 0)
+        } else {
+            let age = (self.clock)().saturating_sub(last_progress);
+            let stalled = age > self.stall_threshold.as_secs();
+            (if stalled { "stalled" } else { "ok" }, stalled, age)
+        }
+    }
+
+    fn status_from(worker_stalled: bool, qdrant_ok: bool) -> &'static str {
+        if worker_stalled {
+            "unhealthy"
+        } else if qdrant_ok {
+            "healthy"
+        } else {
+            "degraded"
+        }
+    }
+
+    /// Bare-probe path: two atomic reads, zero backend I/O (#78).
+    ///
+    /// The worker-stall side — the only input to the 503 decision — is read
+    /// live. The Qdrant side only picks `healthy` vs `degraded` (both 200) and
+    /// comes from the verdict the pinger last published, so an anonymous
+    /// caller can neither proxy load into Qdrant nor time an outage off the
+    /// probe. Staleness is bounded by `PING_PERIOD` plus the probe client's
+    /// 10s timeout — well inside `WORKER_STALL_THRESHOLD`.
+    fn check_status(&self) -> Value {
+        let (_, worker_stalled, progress_age) = self.worker_state();
+        let qdrant_ok = self.qdrant_ok.load(std::sync::atomic::Ordering::Relaxed);
+        let status = Self::status_from(worker_stalled, qdrant_ok);
+
+        if worker_stalled {
+            tracing::error!(
+                progress_age_s = progress_age,
+                threshold_s = self.stall_threshold.as_secs(),
+                "service worker stalled — reporting unhealthy so the pod gets restarted"
+            );
+        } else {
+            tracing::debug!(op = "health", status, "probe");
+        }
+        json!({ "status": status })
+    }
+
+    /// Probe Qdrant once and publish the verdict `check_status` serves.
+    /// Driven by the pinger, off the request path on purpose (#78).
+    async fn refresh_qdrant(&self) {
+        let ok = self.check_qdrant().await.is_ok();
+        self.qdrant_ok
+            .store(ok, std::sync::atomic::Ordering::Relaxed);
     }
 
     async fn check(&self) -> Value {
         let start = std::time::Instant::now();
 
-        // All three checks run concurrently via tokio::join!
         let (qdrant_health, graph_health, count) =
             tokio::join!(self.check_qdrant(), self.check_graph(), self.check_count(),);
 
-        // 0 = worker loop not entered yet (backend bootstrap in progress).
-        // Bootstrap is deadline-bounded but can legitimately exceed the stall
-        // threshold on a cluster cold start — report "starting", not a stall,
-        // or the liveness probe would restart-loop a pod that's coming up.
-        let last_progress = self
-            .worker_progress
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let (worker_state, worker_stalled, progress_age) = if last_progress == 0 {
-            ("starting", false, 0)
-        } else {
-            let age = epoch_secs().saturating_sub(last_progress);
-            let stalled = age > self.stall_threshold.as_secs();
-            (if stalled { "stalled" } else { "ok" }, stalled, age)
-        };
-
-        let status = if worker_stalled {
-            "unhealthy"
-        } else if qdrant_health.is_ok() {
-            "healthy"
-        } else {
-            "degraded"
-        };
+        let (worker_state, worker_stalled, progress_age) = self.worker_state();
+        let status = Self::status_from(worker_stalled, qdrant_health.is_ok());
 
         let elapsed = start.elapsed().as_millis();
         if worker_stalled {
@@ -757,8 +973,7 @@ impl HealthChecker {
 
         json!({
             "status": status,
-            // Build identity so any consumer can answer "is build X live?"
-            // without cluster access (#70). null when the build didn't pass it.
+            // "is build X live?" without cluster access (#70)
             "version": build_info::version(),
             "git_sha": build_info::git_sha(),
             "built_at": build_info::built_at(),
@@ -891,11 +1106,12 @@ impl HealthChecker {
 
 // ─── Service worker ─────────────────────────────────────────────────────────
 
-/// Deadlines the worker applies per command. A struct only so tests can
-/// shrink them — production always uses `Default` (the consts above).
+/// Deadlines and limits the worker applies per command. A struct only so tests can
+/// shrink them — in production, deadlines use Default and judge_daily_cap is passed from Config.
 struct WorkerLimits {
     cmd: std::time::Duration,
     long: std::time::Duration,
+    judge_daily_cap: usize,
 }
 
 impl Default for WorkerLimits {
@@ -903,6 +1119,7 @@ impl Default for WorkerLimits {
         Self {
             cmd: CMD_DEADLINE,
             long: LONG_CMD_DEADLINE,
+            judge_daily_cap: JUDGE_DAILY_CAP_DEFAULT,
         }
     }
 }
@@ -950,11 +1167,14 @@ async fn service_worker(
     // deadline cannot run a second pass over the same unjudged pairs.
     let judge_gate = std::rc::Rc::new(tokio::sync::Semaphore::new(JUDGE_CONCURRENCY));
     let backfill_running = std::rc::Rc::new(std::cell::Cell::new(false));
+    let judge_limiter = std::rc::Rc::new(std::cell::RefCell::new(JudgeDailyCap::new(
+        limits.judge_daily_cap,
+    )));
 
     // First heartbeat: bootstrap is done and the loop is live. Until this
     // stamp the health checker reports the worker as "starting" (progress
     // sentinel 0), never stalled — see the seed in main().
-    progress.store(epoch_secs(), std::sync::atomic::Ordering::Relaxed);
+    progress.store(monotonic_secs(), std::sync::atomic::Ordering::Relaxed);
 
     while let Some(cmd) = rx.recv().await {
         let op = cmd.op_name();
@@ -1054,24 +1274,14 @@ async fn service_worker(
                         // Only a genuinely new memory: a re-store re-runs
                         // interference but its edges (and verdicts) already
                         // exist — re-judging would churn and re-bill them.
-                        if !read_only
-                            && svc.judge.is_some()
-                            && !skipped
-                            && r.get("created").and_then(Value::as_bool) == Some(true)
-                            && let Some(new_hash) = r.get("content_hash").and_then(|v| v.as_str())
-                        {
-                            for dst in contradicted_hashes(&r) {
-                                let src = new_hash.to_string();
-                                let svc = svc.clone();
-                                let gate = judge_gate.clone();
-                                tokio::task::spawn_local(async move {
-                                    let Ok(_permit) = gate.acquire().await else {
-                                        return;
-                                    };
-                                    svc.judge_contradiction(&src, &dst).await;
-                                });
-                            }
-                        }
+                        // LAB-3895: store-path judge spend is capped per UTC day.
+                        spawn_store_contradiction_judges(
+                            &svc,
+                            &judge_gate,
+                            &judge_limiter,
+                            &r,
+                            read_only,
+                        );
 
                         json!(r)
                     }
@@ -1544,7 +1754,7 @@ async fn service_worker(
 
         // Watchdog heartbeat: the loop just finished (or spawned) a command.
         // Stops advancing exactly when the worker stops draining.
-        progress.store(epoch_secs(), std::sync::atomic::Ordering::Relaxed);
+        progress.store(monotonic_secs(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1568,8 +1778,219 @@ fn contradicted_hashes(store_result: &std::collections::HashMap<String, Value>) 
     hashes
 }
 
+/// Default daily cap for store-path judge calls (LAB-3895).
+const JUDGE_DAILY_CAP_DEFAULT: usize = 1000;
+
+fn parse_judge_daily_cap(raw: Option<String>) -> Result<usize, String> {
+    match raw {
+        None => Ok(JUDGE_DAILY_CAP_DEFAULT),
+        Some(s) if s.trim().is_empty() => Ok(JUDGE_DAILY_CAP_DEFAULT),
+        Some(s) => s.trim().parse::<usize>().map_err(|e| {
+            format!("JUDGE_DAILY_CAP must be a non-negative integer (e.g. 1000): {s} ({e})")
+        }),
+    }
+}
+
+/// Returns (year, month, day) in UTC for a given Unix timestamp in seconds.
+/// Implements Howard Hinnant's civil calendar algorithm (pure integer math).
+fn utc_date(epoch_secs: u64) -> (i32, u32, u32) {
+    let days = (epoch_secs / 86400) as i64;
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d)
+}
+
+fn utc_date_str(epoch_secs: u64) -> String {
+    let (y, m, d) = utc_date(epoch_secs);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Bounds store-path contradiction judging (LAB-3895) on two independent axes:
+/// `cap` judge calls per UTC day (the spend budget, `JUDGE_DAILY_CAP`) and
+/// `JUDGE_STORE_BACKLOG_MAX` tasks outstanding (queued on the gate or in
+/// flight), so a stalled judge endpoint cannot back up one task per
+/// contradicted pair without limit. Separate knobs on purpose: raising the
+/// day's budget for a bulk import must not raise the number of live tasks by
+/// the same factor. A pair refused by either bound stays unjudged for operator
+/// backfill, which is subject to neither.
+struct JudgeDailyCap {
+    cap: usize,
+    current_day: u64,
+    count: usize,
+    /// One WARN per reason per UTC day. Budget and backlog are latched
+    /// separately because they ask the operator for different things — raise
+    /// the cap or drain the queue, versus the judge endpoint is not answering —
+    /// and a shared latch would hide whichever fired second for the rest of the
+    /// day.
+    warned_budget: bool,
+    warned_backlog: bool,
+    /// One permit per outstanding task, held until the task ends. `Arc`, not
+    /// `Rc`: `try_acquire_owned` needs it; the worker is single-threaded anyway.
+    slots: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Clock, so tests can queue calls across a UTC-day boundary.
+    clock: fn() -> u64,
+}
+
+impl JudgeDailyCap {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            current_day: u64::MAX,
+            count: 0,
+            warned_budget: false,
+            warned_backlog: false,
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(JUDGE_STORE_BACKLOG_MAX)),
+            clock: epoch_secs,
+        }
+    }
+
+    /// Start a new UTC day when `now_secs` has crossed into one: fresh budget,
+    /// fresh warnings. Returns the day key `now_secs` falls in.
+    fn roll_day(&mut self, now_secs: u64) -> u64 {
+        let day = now_secs / 86400;
+        if self.current_day != day {
+            self.current_day = day;
+            self.count = 0;
+            self.warned_budget = false;
+            self.warned_backlog = false;
+        }
+        day
+    }
+
+    /// Reserve a slot for one store-path task; `None` once
+    /// `JUDGE_STORE_BACKLOG_MAX` tasks are outstanding.
+    ///
+    /// This refusal warns rather than leaving it to `try_admit`: it happens
+    /// *before* a task exists to consult the budget, so against a stalled judge
+    /// endpoint it is the only skip an operator would ever see.
+    fn try_slot(&mut self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if let Ok(permit) = self.slots.clone().try_acquire_owned() {
+            return Some(permit);
+        }
+        let now = (self.clock)();
+        self.roll_day(now);
+        let date = utc_date_str(now);
+        const MSG: &str = "store-path judge backlog full; pair left unjudged for backfill";
+        if !self.warned_backlog {
+            tracing::warn!(reason = "backlog", max = JUDGE_STORE_BACKLOG_MAX, date = %date, MSG);
+            self.warned_backlog = true;
+        } else {
+            tracing::debug!(reason = "backlog", max = JUDGE_STORE_BACKLOG_MAX, date = %date, MSG);
+        }
+        None
+    }
+
+    /// Try to admit one pair to be judged off the store path at the current time.
+    fn try_admit(&mut self) -> Option<u64> {
+        self.try_admit_at((self.clock)())
+    }
+
+    /// Try to admit one pair at the given unix timestamp (seconds). `Some(day)`
+    /// has billed the day's budget; hand that day back to `refund` if the call
+    /// turns out to have spent nothing.
+    fn try_admit_at(&mut self, now_secs: u64) -> Option<u64> {
+        let day = self.roll_day(now_secs);
+        if self.count < self.cap {
+            self.count += 1;
+            return Some(day);
+        }
+        let date = utc_date_str(now_secs);
+        const MSG: &str = "judge daily cap reached; skipping store-path contradiction judge call";
+        if !self.warned_budget {
+            tracing::warn!(reason = "budget", cap = self.cap, date = %date, MSG);
+            self.warned_budget = true;
+        } else {
+            tracing::debug!(reason = "budget", cap = self.cap, date = %date, MSG);
+        }
+        None
+    }
+
+    /// Give back a unit billed by `try_admit` for a call that spent nothing.
+    /// Ignored once the UTC day has rolled: that unit was drawn on a budget
+    /// that has already reset, and refunding it would credit the wrong day.
+    fn refund(&mut self, day: u64) {
+        if self.current_day == day && self.count > 0 {
+            self.count -= 1;
+        }
+    }
+}
+
+/// Spawns background contradiction judge tasks for new CONTRADICTS signals from a store result
+/// (LAB-3895). Returns the number of tasks spawned; a pair is skipped (left unjudged for
+/// backfill) once `JUDGE_STORE_BACKLOG_MAX` tasks are outstanding. The daily cap itself is
+/// applied inside each task, once it holds a gate permit and just before the call: a pair
+/// queued before UTC midnight is billed to the day it actually runs, so a process's calls in
+/// any UTC day never exceed the cap.
+fn spawn_store_contradiction_judges(
+    svc: &std::rc::Rc<MemoryService>,
+    judge_gate: &std::rc::Rc<tokio::sync::Semaphore>,
+    limiter: &std::rc::Rc<std::cell::RefCell<JudgeDailyCap>>,
+    result: &std::collections::HashMap<String, Value>,
+    read_only: bool,
+) -> usize {
+    let skipped = result
+        .get("duplicate")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if read_only
+        || svc.judge.is_none()
+        || skipped
+        || result.get("created").and_then(Value::as_bool) != Some(true)
+    {
+        return 0;
+    }
+    let Some(new_hash) = result.get("content_hash").and_then(|v| v.as_str()) else {
+        return 0;
+    };
+
+    let mut spawned = 0;
+    for dst in contradicted_hashes(result) {
+        // Bound the borrow to this statement: `try_slot` warns, so it needs `&mut`.
+        let slot = limiter.borrow_mut().try_slot();
+        let Some(slot) = slot else { continue };
+        let src = new_hash.to_string();
+        let svc = svc.clone();
+        let gate = judge_gate.clone();
+        let limiter = limiter.clone();
+        tokio::task::spawn_local(async move {
+            let _slot = slot; // released when this task ends, refused or judged
+            let Ok(_permit) = gate.acquire().await else {
+                return;
+            };
+            // Synchronous, so the borrow ends before the await below.
+            let admitted = limiter.borrow_mut().try_admit();
+            let Some(day) = admitted else {
+                return;
+            };
+            let outcome = svc.judge_contradiction(&src, &dst).await;
+            // Give the unit back when nothing was billed: a graph or vector blip
+            // mid-import must not spend the day's budget on no-ops. `spent()`
+            // owns which paths are free; a judged pair stays billed even if the
+            // edge write failed — the tokens went out either way.
+            if !outcome.spent() {
+                limiter.borrow_mut().refund(day);
+            }
+        });
+        spawned += 1;
+    }
+    spawned
+}
+
 /// In-flight judge calls during a backfill (LAB-3283 AC-5).
 const JUDGE_CONCURRENCY: usize = 4;
+/// Store-path judge tasks that may be outstanding at once — queued on the gate
+/// or in flight (LAB-3895). Bounds how far a stalled judge endpoint can back up
+/// behind `JUDGE_CONCURRENCY`; deliberately *not* `JUDGE_DAILY_CAP`, which is a
+/// spend budget and would otherwise double as a throughput limit.
+const JUDGE_STORE_BACKLOG_MAX: usize = 64;
 /// Retries on 429 before a pair is counted unjudged (AC-9).
 const JUDGE_MAX_RETRIES: u32 = 5;
 const JUDGE_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
@@ -1662,7 +2083,10 @@ async fn backfill_judge(
             // (four sleeping pairs would stall the pass and the store path).
             with_backoff(|| async {
                 let Ok(_permit) = gate.acquire().await else {
-                    return JudgeOutcome::Unjudged { marked: false };
+                    return JudgeOutcome::Unjudged {
+                        marked: false,
+                        spent: false,
+                    };
                 };
                 svc.judge_contradiction(&p.memory_a_hash, &p.memory_b_hash)
                     .await
@@ -1686,9 +2110,9 @@ async fn backfill_judge(
                 t.input_tokens += judgement.input_tokens;
                 t.output_tokens += judgement.output_tokens;
             }
-            JudgeOutcome::Unjudged { marked: true } => t.marked += 1,
+            JudgeOutcome::Unjudged { marked: true, .. } => t.marked += 1,
             // `with_backoff` never returns RateLimited; treat it as transient.
-            JudgeOutcome::Unjudged { marked: false } | JudgeOutcome::RateLimited { .. } => {
+            JudgeOutcome::Unjudged { marked: false, .. } | JudgeOutcome::RateLimited { .. } => {
                 t.unjudged += 1
             }
         }
@@ -1716,7 +2140,10 @@ where
                         retries = n,
                         "backfill: still rate limited, giving up on pair"
                     );
-                    return JudgeOutcome::Unjudged { marked: false };
+                    return JudgeOutcome::Unjudged {
+                        marked: false,
+                        spent: false,
+                    };
                 }
                 let wait = retry_after_secs
                     .map(std::time::Duration::from_secs)
@@ -1732,7 +2159,10 @@ where
             }
         }
     }
-    JudgeOutcome::Unjudged { marked: false }
+    JudgeOutcome::Unjudged {
+        marked: false,
+        spent: false,
+    }
 }
 
 /// Fire-and-forget summary generation helper.
@@ -1865,6 +2295,11 @@ fn supervise(worker: std::thread::JoinHandle<()>) -> std::thread::JoinHandle<()>
 }
 
 fn main() {
+    // Before `Config::from_env`, so the boot guard's warnings reach a
+    // subscriber: `init_tracing` needs no runtime (its OTLP batch processor
+    // runs on its own OS thread with a blocking client, which is also happier
+    // constructed outside one).
+    telemetry::init_tracing();
     let config = Config::from_env();
 
     // Multi-threaded runtime for axum; LocalSet thread for MemoryService
@@ -1874,17 +2309,15 @@ fn main() {
         .expect("failed to build runtime");
 
     rt.block_on(async move {
-        telemetry::init_tracing();
-
         let (tx, rx) = mpsc::channel::<Cmd>(CMD_CHANNEL_CAP);
 
-        // Watchdog heartbeat: epoch-seconds of the worker's last completed
+        // Watchdog heartbeat: `monotonic_secs` of the worker's last completed
         // command. Written by the worker loop, read by the health checker.
         // Seeded 0 = "worker loop not entered yet": backend bootstrap
         // (ensure_qdrant_collection + init_l2_cache retries) can legitimately
         // exceed the stall threshold on a cluster cold start, and /health is
-        // already serving — a wall-clock seed here would misreport that as a
-        // stall and restart-loop the pod. Every bootstrap await is
+        // already serving — a non-sentinel seed here would misreport that as
+        // a stall and restart-loop the pod. Every bootstrap await is
         // deadline-bounded, so the loop is always entered in bounded time.
         let worker_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let progress_for_worker = worker_progress.clone();
@@ -1950,6 +2383,7 @@ fn main() {
                 origin = log_safe_origin(url).as_str(),
                 model = config.judge_model.as_str(),
                 has_api_key = config.judge_api_key.is_some(),
+                daily_cap = config.judge_daily_cap,
                 "contradiction judge enabled (advisory: annotates CONTRADICTS edges, never writes memories)"
             );
             Some(
@@ -1984,6 +2418,9 @@ fn main() {
                     cfg_clone.embedding_model,
                     cfg_clone.embedding_dimensions,
                     cfg_clone.embedding_batch_size,
+                    // No API key. `EMBEDDING_URL` is guarded at boot with
+                    // `has_credential: false` on the strength of this `None` —
+                    // passing a key here means updating that row too.
                     None,
                 );
                 // L2 embedding cache via cachekit-rs (optional) — backend
@@ -2015,7 +2452,11 @@ fn main() {
                     svc = svc.with_reranker(Box::new(rerank));
                 }
 
-                service_worker(rx, svc, progress_for_worker, WorkerLimits::default()).await;
+                let limits = WorkerLimits {
+                    judge_daily_cap: cfg_clone.judge_daily_cap,
+                    ..WorkerLimits::default()
+                };
+                service_worker(rx, svc, progress_for_worker, limits).await;
             });
         }));
 
@@ -2036,8 +2477,11 @@ fn main() {
         // stays fresh while idle. try_send on purpose — if the channel is
         // full, real commands are keeping (or failing to keep) progress
         // fresh, which is exactly what the watchdog should observe.
+        // Also refreshes the Qdrant verdict the bare probe serves, so the
+        // unauthenticated route does no backend I/O of its own (#78).
         let pinger = {
             let handle = handle.clone();
+            let checker = checker.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(PING_PERIOD);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2048,40 +2492,12 @@ fn main() {
                         inner: CmdInner::Ping { reply },
                         span: tracing::Span::none(),
                     });
+                    checker.refresh_qdrant().await;
                 }
             })
         };
 
-        const MAX_BODY: usize = 1_048_576; // 1 MB — covers the /mcp Bytes extractor
-
-        // Protected routes: handlers keep `ServiceHandle` state; `require_auth`
-        // is layered with its own `AuthState` (axum allows differing types).
-        let protected = Router::new()
-            .route("/mcp", post(mcp::mcp_handler))
-            .route("/store", post(store))
-            .route("/search", post(search))
-            .route("/delete", post(delete))
-            .route("/relation", post(relation))
-            .route("/supersede", post(supersede))
-            .route("/contradictions", post(contradictions))
-            .route("/contradictions/resolution", post(resolve_contradiction))
-            .route("/duplicates/find", post(find_duplicates))
-            .route("/duplicates/merge", post(merge_duplicates))
-            .route(
-                "/memories/{content_hash}",
-                get(get_memory).patch(patch_memory),
-            )
-            .route("/backfill/summaries", post(backfill_summaries))
-            .route("/backfill/contradictions", post(backfill_contradictions))
-            .layer(middleware::from_fn_with_state(
-                auth_state.clone(),
-                auth::require_auth,
-            ))
-            .layer(DefaultBodyLimit::max(MAX_BODY))
-            .layer(TraceLayer::new_for_http().make_span_with(
-                tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO),
-            ))
-            .with_state(handle);
+        let protected = protected_router(handle, auth_state.clone());
 
         // Read-only auth-config view (LAB-1684 AC7). Same auth middleware;
         // GET /auth/config is unmapped in rest_route_op → static-bearer only
@@ -2145,6 +2561,53 @@ fn main() {
     });
 }
 
+/// The authenticated REST + MCP routes, composed.
+///
+/// Assembled here rather than inline in `main` for the same reason as
+/// `health_routes`: tests drive the real layer stack, so dropping the auth
+/// layer or reverting the request span fails a test instead of passing CI.
+fn protected_router(handle: ServiceHandle, auth_state: AuthState) -> Router {
+    const MAX_BODY: usize = 1_048_576; // 1 MB — covers the /mcp Bytes extractor
+
+    // Handlers keep `ServiceHandle` state; `require_auth` is layered with its
+    // own `AuthState` (axum allows differing types).
+    Router::new()
+        .route("/mcp", post(mcp::mcp_handler))
+        .route("/store", post(store))
+        .route("/search", post(search))
+        .route("/delete", post(delete))
+        .route("/relation", post(relation))
+        .route("/supersede", post(supersede))
+        .route("/contradictions", post(contradictions))
+        .route("/contradictions/resolution", post(resolve_contradiction))
+        .route("/duplicates/find", post(find_duplicates))
+        .route("/duplicates/merge", post(merge_duplicates))
+        .route(
+            "/memories/{content_hash}",
+            get(get_memory).patch(patch_memory),
+        )
+        .route("/backfill/summaries", post(backfill_summaries))
+        .route("/backfill/contradictions", post(backfill_contradictions))
+        .layer(middleware::from_fn_with_state(
+            auth_state,
+            auth::require_auth,
+        ))
+        .layer(DefaultBodyLimit::max(MAX_BODY))
+        .layer(TraceLayer::new_for_http().make_span_with(request_span))
+        .with_state(handle)
+}
+
+/// The request span for authenticated REST routes: `method` and `path`
+/// only — a query string is never safe to log (mirrors ops-console).
+/// `info_span!` targets this module (`alaya_server`), so the directive that
+/// keeps it alive is `alaya_server=info` in the default filter
+/// (`telemetry.rs`); `tower_http=info` only governs tower-http's own
+/// request/response events. `DefaultMakeSpan` can set the span's level but
+/// cannot drop its `uri` field, so a custom `MakeSpan` is required.
+fn request_span(req: &Request) -> tracing::Span {
+    tracing::info_span!("request", method = %req.method(), path = %req.uri().path())
+}
+
 async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -2173,8 +2636,8 @@ async fn shutdown_signal() {
 async fn health(
     axum::extract::State(checker): axum::extract::State<HealthChecker>,
 ) -> (StatusCode, Json<Value>) {
-    let v = checker.check().await;
-    (health_code(&v), Json(json!({ "status": v["status"] })))
+    let v = checker.check_status();
+    (health_code(&v), Json(v))
 }
 
 /// Authenticated operator view: the full health document, including build
@@ -2718,7 +3181,13 @@ mod tests {
         })
         .await;
         assert!(
-            matches!(out, JudgeOutcome::Unjudged { marked: false }),
+            matches!(
+                out,
+                JudgeOutcome::Unjudged {
+                    marked: false,
+                    spent: false
+                }
+            ),
             "{out:?}"
         );
         assert_eq!(calls.get(), JUDGE_MAX_RETRIES + 1);
@@ -2735,14 +3204,535 @@ mod tests {
         let calls = std::cell::Cell::new(0u32);
         let out = with_backoff(|| {
             calls.set(calls.get() + 1);
-            async { JudgeOutcome::Unjudged { marked: true } }
+            async {
+                JudgeOutcome::Unjudged {
+                    marked: true,
+                    spent: true,
+                }
+            }
         })
         .await;
         assert!(
-            matches!(out, JudgeOutcome::Unjudged { marked: true }),
+            matches!(
+                out,
+                JudgeOutcome::Unjudged {
+                    marked: true,
+                    spent: true
+                }
+            ),
             "{out:?}"
         );
         assert_eq!(calls.get(), 1);
+    }
+
+    // ─── Optional config reads ─────────────────────────────────────────────
+
+    /// `env_non_empty` replaced an untrimmed `env_opt` at every optional call
+    /// site, so a whitespace-only value now reads as absent rather than set.
+    /// Two live consequences, both silent before: `OIDC_ISSUER="   "` used to
+    /// reach the fail-closed boot check as `Some`, satisfying "some auth is
+    /// configured" with an issuer that resolves nothing; and a whitespace-only
+    /// `JUDGE_URL` used to win its own `or_else` and suppress the `SUMMARY_URL`
+    /// fallback, disabling the judge instead of falling back to it.
+    ///
+    /// Pins the helper, not the wiring: nothing here can catch a call site
+    /// that stops using it. A test that rebuilt the `or_else` chain in its own
+    /// body was cut for exactly that — it asserted `Option::or_else`.
+    #[test]
+    fn non_empty_trimmed_treats_blank_as_absent() {
+        assert_eq!(non_empty_trimmed(None), None);
+        assert_eq!(non_empty_trimmed(Some("".into())), None);
+        assert_eq!(non_empty_trimmed(Some("   ".into())), None);
+        assert_eq!(non_empty_trimmed(Some("\t\n ".into())), None);
+        // Trimmed, not merely accepted — the value reaching a client is clean.
+        assert_eq!(
+            non_empty_trimmed(Some("  https://api.anthropic.com  ".into())),
+            Some("https://api.anthropic.com".into())
+        );
+    }
+
+    // ─── Daily judge spend cap (LAB-3895) ──────────────────────────────────
+
+    #[test]
+    fn parse_judge_daily_cap_defaults_and_validates() {
+        assert_eq!(parse_judge_daily_cap(None).unwrap(), 1000);
+        assert_eq!(parse_judge_daily_cap(Some("".into())).unwrap(), 1000);
+        assert_eq!(parse_judge_daily_cap(Some("  ".into())).unwrap(), 1000);
+        assert_eq!(parse_judge_daily_cap(Some("1000".into())).unwrap(), 1000);
+        assert_eq!(parse_judge_daily_cap(Some("50".into())).unwrap(), 50);
+        assert_eq!(parse_judge_daily_cap(Some("0".into())).unwrap(), 0);
+
+        let err = parse_judge_daily_cap(Some("foo".into())).unwrap_err();
+        assert!(err.contains("JUDGE_DAILY_CAP must be a non-negative integer"));
+        assert!(err.contains("foo"));
+
+        let err = parse_judge_daily_cap(Some("-10".into())).unwrap_err();
+        assert!(err.contains("JUDGE_DAILY_CAP must be a non-negative integer"));
+
+        let err = parse_judge_daily_cap(Some("12.5".into())).unwrap_err();
+        assert!(err.contains("JUDGE_DAILY_CAP must be a non-negative integer"));
+    }
+
+    const DAY1: u64 = 1789733949; // 2026-09-18
+
+    #[test]
+    fn utc_date_str_computes_civil_calendar_correctly() {
+        // Unix epoch start
+        assert_eq!(utc_date_str(0), "1970-01-01");
+        assert_eq!(utc_date_str(86399), "1970-01-01");
+        assert_eq!(utc_date_str(86400), "1970-01-02");
+        // Leap year 2024-02-29 (1709164800 is 2024-02-29 00:00:00 UTC)
+        assert_eq!(utc_date_str(1709164800), "2024-02-29");
+        assert_eq!(utc_date_str(1709251199), "2024-02-29");
+        assert_eq!(utc_date_str(1709251200), "2024-03-01");
+        // Known date: 2026-09-18
+        assert_eq!(utc_date_str(DAY1), "2026-09-18");
+    }
+
+    #[test]
+    fn judge_daily_cap_cap_reached_and_rollover() {
+        let mut limiter = JudgeDailyCap::new(2);
+        let day1 = DAY1;
+        let day2 = day1 + 86400; // 2026-09-19
+
+        // Day 1: admit 2 items, each billed to day 1.
+        assert_eq!(limiter.try_admit_at(day1), Some(day1 / 86400));
+        assert_eq!(limiter.count, 1);
+        assert!(!limiter.warned_budget);
+
+        assert_eq!(limiter.try_admit_at(day1), Some(day1 / 86400));
+        assert_eq!(limiter.count, 2);
+        assert!(!limiter.warned_budget);
+
+        // Day 1: 3rd item hits cap, sets warned_budget = true
+        assert_eq!(limiter.try_admit_at(day1), None);
+        assert_eq!(limiter.count, 2);
+        assert!(limiter.warned_budget);
+
+        // Day 1: 4th item is silent, still refused
+        assert_eq!(limiter.try_admit_at(day1), None);
+        assert_eq!(limiter.count, 2);
+        assert!(limiter.warned_budget);
+
+        // Day 2 (rollover): counter and warning reset!
+        assert_eq!(limiter.try_admit_at(day2), Some(day2 / 86400));
+        assert_eq!(limiter.count, 1);
+        assert!(!limiter.warned_budget);
+        assert_eq!(limiter.current_day, day2 / 86400);
+
+        assert_eq!(limiter.try_admit_at(day2), Some(day2 / 86400));
+        assert_eq!(limiter.count, 2);
+        assert!(!limiter.warned_budget);
+
+        // Day 2: cap reached again, warned fires once for day 2
+        assert_eq!(limiter.try_admit_at(day2), None);
+        assert_eq!(limiter.count, 2);
+        assert!(limiter.warned_budget);
+
+        assert_eq!(limiter.try_admit_at(day2), None);
+        assert_eq!(limiter.count, 2);
+        assert!(limiter.warned_budget);
+    }
+
+    /// A unit is returned only to the day that was billed for it, and only for
+    /// a call that spent nothing. After a UTC rollover the refund is dropped:
+    /// crediting it would hand the new day free budget it never used.
+    #[test]
+    fn judge_daily_cap_refund_is_day_scoped() {
+        let mut limiter = JudgeDailyCap::new(2);
+        let day1 = DAY1 / 86400;
+
+        let billed = limiter.try_admit_at(DAY1).expect("admitted");
+        assert_eq!(limiter.count, 1);
+        limiter.refund(billed);
+        assert_eq!(limiter.count, 0, "the unit is back for reuse today");
+
+        // A refund for a day that has rolled is ignored, and never underflows.
+        assert_eq!(limiter.try_admit_at(DAY1), Some(day1));
+        assert_eq!(limiter.try_admit_at(DAY1 + 86400), Some(day1 + 1));
+        assert_eq!(limiter.count, 1, "rollover reset the count");
+        limiter.refund(day1);
+        assert_eq!(limiter.count, 1, "yesterday's refund does not credit today");
+        limiter.refund(day1 + 1);
+        limiter.refund(day1 + 1);
+        assert_eq!(limiter.count, 0, "saturates at zero");
+    }
+
+    #[test]
+    fn judge_daily_cap_zero_cap_refuses_immediately() {
+        let mut limiter = JudgeDailyCap::new(0);
+        let now = DAY1;
+        assert_eq!(limiter.try_admit_at(now), None);
+        assert!(limiter.warned_budget);
+        assert_eq!(limiter.try_admit_at(now), None);
+    }
+
+    struct StubJudge;
+
+    #[async_trait::async_trait(?Send)]
+    impl alaya_backends::ContradictionJudge for StubJudge {
+        /// Answers like a model that returned garbage: deterministic, and the
+        /// tokens went out. Tests behind a hanging store never get this far.
+        async fn judge(
+            &self,
+            _a: &alaya_types::memory::Memory,
+            _b: &alaya_types::memory::Memory,
+        ) -> alaya_types::Result<alaya_backends::Judgement> {
+            Err(alaya_types::AlayaError::Judge("malformed verdict".into()))
+        }
+        fn model_name(&self) -> &str {
+            "stub-judge"
+        }
+    }
+
+    thread_local! {
+        static FAKE_NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    fn fake_now() -> u64 {
+        FAKE_NOW.get()
+    }
+
+    /// A limiter on the test clock, shared the way `service_worker` shares it.
+    fn capped(cap: usize) -> std::rc::Rc<std::cell::RefCell<JudgeDailyCap>> {
+        std::rc::Rc::new(std::cell::RefCell::new(JudgeDailyCap {
+            clock: fake_now,
+            ..JudgeDailyCap::new(cap)
+        }))
+    }
+
+    /// A judge-enabled service whose backend never answers: an admitted call
+    /// parks holding its gate permit and slot, as against a stalled endpoint.
+    fn judged_hanging_service() -> std::rc::Rc<MemoryService> {
+        std::rc::Rc::new(wedge_tests::hanging_service().with_judge(Box::new(StubJudge)))
+    }
+
+    /// A judge-enabled service whose store answers `get_batch` with `batch`,
+    /// so a spawned task runs to completion and the limiter can be read after.
+    fn judged_service_with_batch(
+        batch: Vec<alaya_types::memory::Memory>,
+    ) -> std::rc::Rc<MemoryService> {
+        std::rc::Rc::new(wedge_tests::stub_service(Some(batch)).with_judge(Box::new(StubJudge)))
+    }
+
+    fn mem(hash: &str) -> alaya_types::memory::Memory {
+        serde_json::from_value(json!({
+            "content": "c", "content_hash": hash, "tags": [], "memory_type": "note",
+            "created_at": 0.0, "updated_at": 0.0,
+        }))
+        .expect("memory")
+    }
+
+    /// A `created` store result whose new memory contradicts `n` existing ones.
+    fn store_result_contradicting(n: usize) -> std::collections::HashMap<String, Value> {
+        let contradictions: Vec<Value> = (0..n)
+            .map(|i| json!({"existing_hash": format!("{i:064x}"), "signal_type": "Negation"}))
+            .collect();
+        let mut r = std::collections::HashMap::new();
+        r.insert("created".to_string(), json!(true));
+        r.insert("content_hash".to_string(), json!("a".repeat(64)));
+        r.insert(
+            "interference".to_string(),
+            json!({"contradictions": contradictions}),
+        );
+        r
+    }
+
+    /// Run the spawned local tasks: `run_until` polls every ready local task
+    /// each time the inner future returns Pending, so one yield is one tick.
+    async fn settle() {
+        tokio::task::yield_now().await;
+    }
+
+    #[tokio::test]
+    async fn store_contradiction_judge_admits_at_call_time_and_bounds_backlog() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let svc = judged_hanging_service();
+                let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(4));
+                let limiter = capped(2);
+                FAKE_NOW.set(DAY1);
+                let r = store_result_contradicting(2);
+
+                // 1. Two pairs: queued, then admitted once each holds a permit.
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    2
+                );
+                settle().await;
+                assert_eq!(limiter.borrow().count, 2);
+                assert!(!limiter.borrow().warned_budget);
+
+                // 2. The budget is spent but the backlog is not: the pairs are still
+                //    queued, and refused inside the task rather than at the slot gate.
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    2
+                );
+                settle().await;
+                assert_eq!(limiter.borrow().count, 2, "budget holds at the cap");
+                assert!(limiter.borrow().warned_budget, "and the operator is told");
+
+                // 3. Under read_only: nothing is ever queued.
+                let fresh = capped(10);
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &fresh, &r, true),
+                    0
+                );
+                assert_eq!(fresh.borrow().count, 0);
+            })
+            .await;
+    }
+
+    /// With the day's budget spent, a queued pair is refused when its call would
+    /// start. The task exits without calling the judge, so its slot frees.
+    #[tokio::test]
+    async fn store_contradiction_judge_refused_at_call_time_stays_unjudged() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let svc = judged_hanging_service();
+                let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(4));
+                let limiter = capped(1);
+                FAKE_NOW.set(DAY1);
+                assert!(
+                    limiter.borrow_mut().try_admit().is_some(),
+                    "spend today's budget"
+                );
+                let r = store_result_contradicting(1);
+
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    1
+                );
+                settle().await;
+                assert_eq!(limiter.borrow().count, 1);
+                assert!(limiter.borrow().warned_budget, "refused at call time");
+                // Its slot is free again: the refused task never reached the stalled call.
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    1
+                );
+            })
+            .await;
+    }
+
+    /// A pair queued on the judge gate before UTC midnight is billed to the
+    /// day the call runs. Billing at spawn time let the new day's calls exceed
+    /// the cap by the size of the overnight backlog.
+    #[tokio::test]
+    async fn store_contradiction_judge_bills_the_day_the_call_runs() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let svc = judged_hanging_service();
+                // No permits: every spawned task queues on the gate.
+                let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(0));
+                let limiter = capped(2);
+                let r = store_result_contradicting(2);
+
+                let midnight = (DAY1 / 86400 + 1) * 86400;
+                FAKE_NOW.set(midnight - 1);
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    2
+                );
+                settle().await;
+                // Queued, not admitted: day 1 has been billed nothing.
+                assert_eq!(limiter.borrow().count, 0);
+                assert_eq!(limiter.borrow().current_day, u64::MAX);
+
+                // Midnight passes while the pairs are still queued.
+                FAKE_NOW.set(midnight);
+                gate.add_permits(2);
+                settle().await;
+                let l = limiter.borrow();
+                assert_eq!(l.current_day, midnight / 86400);
+                assert_eq!(l.count, 2, "the queued calls draw on day 2's quota");
+            })
+            .await;
+    }
+
+    /// The refusal an operator actually meets first when the judge endpoint
+    /// stalls: the backlog fills, so pairs are turned away at the slot gate
+    /// before any task exists to consult the day's budget. That path must warn
+    /// on its own — `debug!` is invisible under the `alaya_server=info` filter
+    /// both the crate default and the compose file pin.
+    #[tokio::test]
+    async fn store_contradiction_judge_warns_when_the_backlog_refuses() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let svc = judged_hanging_service();
+                let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(4));
+                // Budget far above the backlog: the backlog is what refuses.
+                let limiter = capped(100_000);
+                FAKE_NOW.set(DAY1);
+                let r = store_result_contradicting(JUDGE_STORE_BACKLOG_MAX + 1);
+
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    JUDGE_STORE_BACKLOG_MAX,
+                    "one pair over the backlog is refused"
+                );
+                assert!(
+                    limiter.borrow().warned_backlog,
+                    "and the operator is told, at WARN"
+                );
+                assert!(
+                    !limiter.borrow().warned_budget,
+                    "the budget was never the reason"
+                );
+
+                // Subsequent refusals that day are silent, and the backlog stays shut.
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    0
+                );
+            })
+            .await;
+    }
+
+    /// `JUDGE_DAILY_CAP=0` disables store-path judging. It must say so: the
+    /// whole point of the cap is that the guard trips loudly.
+    #[tokio::test]
+    async fn store_contradiction_judge_zero_cap_warns_through_the_spawn_path() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let svc = judged_hanging_service();
+                let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(4));
+                let limiter = capped(0);
+                FAKE_NOW.set(DAY1);
+                let r = store_result_contradicting(1);
+
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    1,
+                    "a zero budget still reserves a slot, so the task can report it"
+                );
+                settle().await;
+                assert_eq!(limiter.borrow().count, 0);
+                assert!(limiter.borrow().warned_budget);
+            })
+            .await;
+    }
+
+    /// A call that never reached the judge costs nothing, so it must not cost
+    /// budget either — otherwise a vector-store blip mid-import spends the
+    /// day's ceiling on no-ops. An invalid pair is rejected inside
+    /// `judge_contradiction` before any request goes out.
+    #[tokio::test]
+    async fn store_contradiction_judge_refunds_a_call_that_spent_nothing() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let svc = judged_hanging_service();
+                let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(4));
+                let limiter = capped(1);
+                FAKE_NOW.set(DAY1);
+
+                let mut r = std::collections::HashMap::new();
+                r.insert("created".to_string(), json!(true));
+                r.insert("content_hash".to_string(), json!("a".repeat(64)));
+                r.insert(
+                    "interference".to_string(),
+                    json!({"contradictions": [{"existing_hash": "not-a-hash"}]}),
+                );
+
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    1
+                );
+                settle().await;
+                assert_eq!(
+                    limiter.borrow().count,
+                    0,
+                    "the unit is back: nothing was sent to the judge"
+                );
+                assert!(!limiter.borrow().warned_budget);
+            })
+            .await;
+    }
+
+    /// The refund keys on `spent`, not `marked` (LAB-3901): a pair whose other
+    /// endpoint is missing from the store is marked (so the backfill skips it)
+    /// yet sent nothing, so its unit comes back; a malformed verdict is marked
+    /// too, but the tokens went out, so it stays billed.
+    #[tokio::test]
+    async fn store_contradiction_judge_refunds_by_spend_not_by_marker() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(4));
+                let r = store_result_contradicting(1);
+                let (src, dst) = ("a".repeat(64), "0".repeat(64));
+                FAKE_NOW.set(DAY1);
+
+                // Endpoint missing: only the new memory is in the store.
+                let svc = judged_service_with_batch(vec![mem(&src)]);
+                let limiter = capped(1);
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    1
+                );
+                settle().await;
+                assert_eq!(
+                    limiter.borrow().count,
+                    0,
+                    "marked, but nothing was sent: refunded"
+                );
+
+                // Malformed verdict: both endpoints present, the stub judge errs.
+                let svc = judged_service_with_batch(vec![mem(&src), mem(&dst)]);
+                let limiter = capped(1);
+                assert_eq!(
+                    spawn_store_contradiction_judges(&svc, &gate, &limiter, &r, false),
+                    1
+                );
+                settle().await;
+                assert_eq!(
+                    limiter.borrow().count,
+                    1,
+                    "marked and paid for: stays billed"
+                );
+            })
+            .await;
+    }
+
+    /// AC-4: the operator backfill is not subject to the daily cap. The proof
+    /// is structural — `backfill_judge` takes no limiter — so the test drives a
+    /// pair through it with the budget exhausted and asserts the pair was
+    /// actually processed. A vacuous `vec![]` would pass even if it were capped.
+    #[tokio::test]
+    async fn backfill_ignores_daily_cap() {
+        let mut limiter = JudgeDailyCap::new(0);
+        assert_eq!(limiter.try_admit(), None, "no budget left today");
+
+        // Invalid hashes: judged without a request going out, so the pass
+        // completes without a live judge backend.
+        let pair = alaya_types::graph::Contradiction {
+            memory_a_hash: "not-a-hash".into(),
+            memory_b_hash: "also-not-a-hash".into(),
+            confidence: None,
+            created_at: None,
+            verdict: None,
+            resolution: None,
+            resolved_at: None,
+            resolved_via: None,
+        };
+        let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(JUDGE_CONCURRENCY));
+        let svc = wedge_tests::hanging_service().with_judge(Box::new(StubJudge));
+        let totals = backfill_judge(&svc, &gate, vec![pair]).await;
+        assert_eq!(
+            totals,
+            BackfillTotals {
+                unjudged: 1,
+                ..Default::default()
+            },
+            "the backfill processed the pair despite the exhausted cap"
+        );
     }
 
     #[test]
@@ -2756,7 +3746,10 @@ mod tests {
             "http://10.43.144.201:8082",
             "http://[::1]:8082",
             // Userinfo bound for a cluster-local proxy is that proxy's business.
-            "http://user:pass@anthropic-lb:8082",
+            with_userinfo("http", "anthropic-lb:8082").as_str(),
+            // Non-special schemes preserve host case; lowercasing fixes this.
+            with_userinfo("redis", "redis.mcp.SVC:6379").as_str(),
+            with_userinfo("rediss", "Redis-Svc:6379").as_str(),
         ] {
             assert!(is_cluster_local(&parse(ok)), "{ok}");
         }
@@ -2765,7 +3758,9 @@ mod tests {
             "http://proxy.example.net:8082",
             "http://1.2.3.4",
             // The host is what reqwest connects to, not what precedes the `@`.
-            "http://user:pass@api.anthropic.com",
+            with_userinfo("http", "api.anthropic.com").as_str(),
+            // Spoof probe: the userinfo IS the payload — never rewrite with
+            // the builder.
             "http://anthropic-lb:8082@api.anthropic.com",
             // An IPv6 literal has no dots but is not a service name.
             "http://[2606:4700::1111]",
@@ -2773,6 +3768,19 @@ mod tests {
         ] {
             assert!(!is_cluster_local(&parse(no)), "{no}");
         }
+    }
+
+    /// Userinfo placeholders. This guard exists to refuse credential-shaped
+    /// URLs, so the tests must build them — and at fourteen call sites one
+    /// builder beats fourteen literals. Only the PRESENCE of userinfo is ever
+    /// asserted on, never its value.
+    const FAKE_USER: &str = "redacted-user";
+    const FAKE_SECRET: &str = "redacted-secret";
+
+    /// `scheme://` + placeholder userinfo + `rest` (authority, and whatever
+    /// path/query/fragment the caller is exercising).
+    fn with_userinfo(scheme: &str, rest: &str) -> String {
+        format!("{scheme}://{FAKE_USER}:{FAKE_SECRET}@{rest}")
     }
 
     #[test]
@@ -2785,12 +3793,20 @@ mod tests {
             "http://proxy.example.net:8082",
             "HTTP://api.anthropic.com",
             "Http://API.Anthropic.com:80",
+            // A mapped PUBLIC v4, and a global v6 — the latter parses as an
+            // IP, so it never reaches the single-label fallback.
+            "http://[::ffff:93.184.216.34]:8082",
+            "http://[2606:4700::1111]:8082",
+            // End-anchored: a public domain wearing an `svc` label is not
+            // cluster-local, however much it looks like one.
+            "http://evil.svc.attacker.com",
+            "http://alaya-bridge.mcp.svc.cluster.local.evil.com",
             "htps://api.anthropic.com",
             "api.anthropic.com:443",
             "not a url",
         ] {
             assert!(
-                check_credential_transport("JUDGE_URL", bad, true).is_err(),
+                check_credential_transport("JUDGE_URL", bad, true, Transport::Http).is_err(),
                 "{bad}"
             );
         }
@@ -2802,39 +3818,126 @@ mod tests {
             "http://anthropic-lb:8082",
             "HTTP://Anthropic-LB:8082",
             "http://alaya-bridge.mcp.svc:3000",
+            "http://alaya-bridge.mcp.svc.cluster.local:3000",
             "http://localhost:8082",
+            // IPv6 literals: loopback, ULA and IPv4-mapped private addresses
+            // are as cluster-local as their v4 spellings.
+            "http://[::1]:8082",
+            "http://[fd00::1]:8082",
+            "http://[::ffff:10.0.0.5]:8082",
         ] {
             assert!(
-                check_credential_transport("SUMMARY_URL", ok, true).is_ok(),
+                check_credential_transport("SUMMARY_URL", ok, true, Transport::Http).is_ok(),
                 "{ok}"
             );
         }
         for keyless in [
-            "http://api.anthropic.com",
-            "not a url",
-            "http://user:pass@anthropic-lb:8082",
+            "http://api.anthropic.com".to_string(),
+            "not a url".to_string(),
+            with_userinfo("http", "anthropic-lb:8082"),
         ] {
             assert!(
-                check_credential_transport("SUMMARY_URL", keyless, false).is_ok(),
+                check_credential_transport("SUMMARY_URL", keyless.as_str(), false, Transport::Http)
+                    .is_ok(),
                 "{keyless}"
             );
         }
+        // Both the keyless warning and the refusal render `url::ParseError`,
+        // which is only safe while it keeps the input out of its `Display` —
+        // pin it, so a url-crate bump cannot quietly turn either into the leak
+        // this guard exists to stop.
+        let malformed = with_userinfo("http", "");
+        let parse_err = reqwest::Url::parse(&malformed).unwrap_err().to_string();
+        assert!(
+            !parse_err.contains(FAKE_SECRET) && !parse_err.contains(FAKE_USER),
+            "url::ParseError now echoes its input: {parse_err}"
+        );
+
         // Userinfo is a credential too: reqwest sends it as Basic auth on
         // every request, so it faces the same policy with or without a key.
         for (bad, has_key) in [
-            ("http://user:s3cret@api.anthropic.com", true),
-            ("http://user:s3cret@api.anthropic.com", false),
-            ("http://user@api.anthropic.com", false),
-            ("http://:s3cret@api.anthropic.com", false),
+            (with_userinfo("http", "api.anthropic.com"), true),
+            (with_userinfo("http", "api.anthropic.com"), false),
+            (format!("http://{FAKE_USER}@api.anthropic.com"), false),
+            (format!("http://:{FAKE_SECRET}@api.anthropic.com"), false),
         ] {
             // The refusal goes to pod logs: name the host, never echo a
             // value that carries userinfo.
-            let err = check_credential_transport("JUDGE_URL", bad, has_key).unwrap_err();
+            let err =
+                check_credential_transport("JUDGE_URL", bad.as_str(), has_key, Transport::Http)
+                    .unwrap_err();
             assert!(
-                err.contains("api.anthropic.com") && !err.contains("s3cret"),
+                err.contains("api.anthropic.com") && !err.contains(FAKE_SECRET),
                 "{bad} {has_key}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn credential_transport_covers_qdrant_graph_and_redis() {
+        // Annotated, not inferred: an unannotated closure binds one concrete
+        // lifetime from its first call site and rejects every built-at-runtime URL.
+        let http =
+            |var: &str, url: &str, key| check_credential_transport(var, url, key, Transport::Http);
+        let redis =
+            |var: &str, url: &str, key| check_credential_transport(var, url, key, Transport::Redis);
+
+        // QDRANT_URL with API key: cluster-local ok, off-cluster refused.
+        assert!(http("QDRANT_URL", "http://qdrant:6333", true).is_ok());
+        assert!(http("QDRANT_URL", "http://qdrant.cloud.io", true).is_err());
+
+        // GRAPH_URL with API key: same policy.
+        assert!(http("GRAPH_URL", "http://alaya-bridge:3000", true).is_ok());
+        assert!(http("GRAPH_URL", "http://graph.cloud.io", true).is_err());
+
+        // Cluster-local does not redeem a scheme the client cannot speak, and
+        // the refusal must name which fault it is.
+        for wrong_scheme in [
+            with_userinfo("redis", "qdrant:6333"),
+            with_userinfo("rediss", "qdrant:6333"),
+            "redis://qdrant:6333".to_string(),
+        ] {
+            let err = http("QDRANT_URL", wrong_scheme.as_str(), true).unwrap_err();
+            assert!(
+                err.contains("unusable scheme") && !err.contains("in the clear"),
+                "{wrong_scheme}: {err}"
+            );
+        }
+
+        // redis:// — fred has no TLS, so rediss:// off-cluster is refused too.
+        for scheme in ["redis", "rediss"] {
+            let off = with_userinfo(scheme, "redis.cloud.io");
+            let local = with_userinfo(scheme, "redis-svc:6379");
+            assert!(
+                redis("REDIS_CACHE_URL", off.as_str(), false).is_err(),
+                "{off}"
+            );
+            // Cluster-local: both redis and rediss are fine.
+            assert!(
+                redis("REDIS_CACHE_URL", local.as_str(), false).is_ok(),
+                "{local}"
+            );
+        }
+
+        // Non-redis scheme with Redis transport: fred opens plain TCP
+        // regardless, so `https` buys no encryption. The refusal must name
+        // the scheme as the fault, not the host.
+        for wrong_scheme in [
+            with_userinfo("https", "redis.cloud.io"),
+            with_userinfo("https", "redis-svc:6379"),
+        ] {
+            let err = redis("REDIS_CACHE_URL", wrong_scheme.as_str(), false).unwrap_err();
+            assert!(
+                err.contains("unusable scheme") && !err.contains("in the clear"),
+                "{wrong_scheme}: {err}"
+            );
+        }
+
+        // Still a credential guard, not a URL validator: with nothing to keep
+        // off the wire a mismatched scheme is left to the client, exactly as an
+        // unparseable keyless URL already is.
+        assert!(http("QDRANT_URL", "redis://qdrant:6333", false).is_ok());
+        assert!(redis("REDIS_CACHE_URL", "https://redis-svc:6379", false).is_ok());
     }
 
     #[test]
@@ -2852,13 +3955,18 @@ mod tests {
             host_of("http://localhost:@evil.com"),
             Some("evil.com".into())
         );
-        assert_eq!(host_of("https://secret@host"), Some("host".into()));
+        assert_eq!(
+            host_of(format!("https://{FAKE_USER}@host").as_str()),
+            Some("host".into())
+        );
     }
 
     #[test]
     fn log_safe_origin_drops_userinfo_path_and_query() {
         assert_eq!(
-            log_safe_origin("https://user:s3cret@tei.mcp.svc:8443/v1/rerank?api_key=k3y#f"),
+            log_safe_origin(
+                with_userinfo("https", "tei.mcp.svc:8443/v1/rerank?api_key=k3y#f").as_str()
+            ),
             "https://tei.mcp.svc:8443"
         );
         assert_eq!(
@@ -2886,6 +3994,14 @@ mod tests {
         assert!(is_private_host("http://172.20.0.1"));
         assert!(is_private_host("http://alaya-server.mcp.svc"));
         assert!(is_private_host("http://kube-api.internal"));
+        // Widened with `host_is_private`: this gate decides whether the
+        // dev-only open mode may run, so the v6 spellings of a private
+        // address need their own fence, not inherited coverage from the
+        // credential-transport test.
+        assert!(is_private_host("http://[fd00::1]:3001"));
+        assert!(is_private_host("http://[::ffff:10.0.0.1]:3001"));
+        assert!(!is_private_host("http://[::ffff:93.184.216.34]:3001"));
+        assert!(!is_private_host("http://[2606:4700::1111]:3001"));
 
         // DNS-name look-alikes must NOT count — the bug fix is this:
         assert!(!is_private_host("http://127.0.0.1.evil.com"));
@@ -2909,7 +4025,7 @@ mod tests {
 mod wedge_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -2944,10 +4060,13 @@ mod wedge_tests {
         );
     }
 
-    /// VectorStorage whose `delete` blackholes — models a backend whose pod
-    /// IP vanished without an RST. Every other method panics: the test only
-    /// exercises the delete path and the no-op ping.
-    struct HangVectors;
+    /// VectorStorage whose `delete` and `get_batch` blackhole — models a
+    /// backend whose pod IP vanished without an RST. `get_batch` can instead
+    /// answer a fixed batch, so a judge task can run to completion. Every
+    /// other method panics: no test exercises them.
+    struct HangVectors {
+        batch: Option<Vec<Memory>>,
+    }
 
     #[async_trait(?Send)]
     impl VectorStorage for HangVectors {
@@ -2969,7 +4088,10 @@ mod wedge_tests {
             unimplemented!()
         }
         async fn get_batch(&self, _hashes: &[&str]) -> Result<Vec<Memory>> {
-            unimplemented!()
+            match &self.batch {
+                Some(b) => Ok(b.clone()),
+                None => std::future::pending().await,
+            }
         }
         async fn delete(&self, _content_hash: &str) -> Result<bool> {
             std::future::pending().await
@@ -3122,7 +4244,8 @@ mod wedge_tests {
             _dst: &str,
             _verdict: &alaya_types::graph::EdgeVerdict,
         ) -> Result<bool> {
-            unimplemented!()
+            // The marker write lands, so a judge task can finish `marked: true`.
+            Ok(true)
         }
         async fn set_contradiction_resolution(
             &self,
@@ -3199,9 +4322,14 @@ mod wedge_tests {
         }
     }
 
-    fn hanging_service() -> MemoryService {
+    pub(super) fn hanging_service() -> MemoryService {
+        stub_service(None)
+    }
+
+    /// `hanging_service`, with `get_batch` answering `batch` when given.
+    pub(super) fn stub_service(batch: Option<Vec<Memory>>) -> MemoryService {
         MemoryService::new(
-            Box::new(HangVectors),
+            Box::new(HangVectors { batch }),
             Box::new(StubEmbeddings),
             Box::new(StubGraph),
             Box::new(StubHebbian),
@@ -3225,6 +4353,7 @@ mod wedge_tests {
                 let limits = WorkerLimits {
                     cmd: Duration::from_millis(100),
                     long: Duration::from_millis(200),
+                    ..WorkerLimits::default()
                 };
                 tokio::task::spawn_local(service_worker(
                     rx,
@@ -3266,13 +4395,28 @@ mod wedge_tests {
                 assert_eq!(pong["ok"], true);
 
                 // The worker stamped progress at loop entry and after each
-                // command — the 0 "starting" sentinel must be gone.
-                assert_ne!(progress.load(std::sync::atomic::Ordering::Relaxed), 0);
+                // command, on the same monotonic base the health checker
+                // reads. The range carries both halves: 0 is the "starting"
+                // sentinel and must be gone, and a stamp the reader cannot
+                // outrun (an epoch one, say) saturates every age to 0 —
+                // silently disabling the #63 watchdog with every other test
+                // still green.
+                let stamp = progress.load(std::sync::atomic::Ordering::Relaxed);
+                assert!(
+                    (1..=monotonic_secs()).contains(&stamp),
+                    "worker stamp {stamp} is not on the reader's monotonic base"
+                );
             })
             .await;
     }
 
-    fn test_checker(progress_epoch_s: u64) -> HealthChecker {
+    /// Stall tests read this fixed monotonic "now", so a stamp of
+    /// `TEST_NOW - n` is exactly `n` seconds old however long the test
+    /// process has been up — a real `monotonic_secs()` reading is only ever
+    /// a few seconds past its origin. Production reads `monotonic_secs`.
+    const TEST_NOW: u64 = 1_000_000;
+
+    fn test_checker(progress_s: u64) -> HealthChecker {
         HealthChecker {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_millis(200))
@@ -3286,8 +4430,10 @@ mod wedge_tests {
             embedding_url: "http://127.0.0.1:1".into(),
             graph_url: "http://127.0.0.1:1".into(),
             graph_api_key: String::new(),
-            worker_progress: Arc::new(AtomicU64::new(progress_epoch_s)),
+            worker_progress: Arc::new(AtomicU64::new(progress_s)),
             stall_threshold: WORKER_STALL_THRESHOLD,
+            clock: || TEST_NOW,
+            qdrant_ok: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3297,15 +4443,15 @@ mod wedge_tests {
     #[tokio::test]
     async fn health_distinguishes_worker_stall_from_backend_outage() {
         // Fresh worker progress + unreachable backends → degraded, not unhealthy.
-        let v = test_checker(epoch_secs()).check().await;
+        let v = test_checker(TEST_NOW).check().await;
         assert_eq!(v["status"], "degraded");
         assert_eq!(v["worker"]["stalled"], false);
 
         // Stale worker progress → unhealthy, regardless of backend state.
-        let v = test_checker(epoch_secs() - 3600).check().await;
+        let v = test_checker(TEST_NOW - 3600).check().await;
         assert_eq!(v["status"], "unhealthy");
         assert_eq!(v["worker"]["stalled"], true);
-        assert!(v["worker"]["last_progress_age_s"].as_u64().unwrap() >= 3600);
+        assert_eq!(v["worker"]["last_progress_age_s"], 3600);
 
         // 0 sentinel = worker still bootstrapping backends → "starting",
         // never a stall: a slow cluster cold start must not restart-loop
@@ -3314,6 +4460,84 @@ mod wedge_tests {
         assert_eq!(v["status"], "degraded");
         assert_eq!(v["worker"]["state"], "starting");
         assert_eq!(v["worker"]["stalled"], false);
+    }
+
+    /// check_status() preserves the #63 tri-state contract from two atomic
+    /// reads and carries no field beyond `status` (#78).
+    #[test]
+    fn check_status_preserves_tri_state_and_carries_only_status() {
+        // Fresh worker, Qdrant verdict unpublished → degraded (200).
+        let fresh = test_checker(TEST_NOW);
+        let v = fresh.check_status();
+        assert_eq!(v["status"], "degraded");
+        assert_eq!(v.as_object().unwrap().len(), 1, "bare probe leaked fields");
+
+        // Published verdict → healthy.
+        fresh.qdrant_ok.store(true, Ordering::Relaxed);
+        let v = fresh.check_status();
+        assert_eq!(v["status"], "healthy");
+        assert_eq!(v.as_object().unwrap().len(), 1);
+
+        // Stale worker → unhealthy (503), whatever Qdrant said.
+        let stalled = test_checker(TEST_NOW - 3600);
+        stalled.qdrant_ok.store(true, Ordering::Relaxed);
+        let v = stalled.check_status();
+        assert_eq!(v["status"], "unhealthy");
+        assert_eq!(v.as_object().unwrap().len(), 1);
+
+        // Bootstrap sentinel → degraded, not a stall.
+        let v = test_checker(0).check_status();
+        assert_eq!(v["status"], "degraded");
+        assert_eq!(v.as_object().unwrap().len(), 1);
+    }
+
+    /// The anonymous probe never reaches Qdrant; only the pinger's refresh
+    /// does, and its verdict is what the probe then serves (#78). A counting
+    /// loopback Qdrant is the witness — reintroducing any await on the
+    /// request path shows up here as hits > 0.
+    #[tokio::test]
+    async fn bare_probe_does_no_qdrant_io_and_serves_pinger_verdict() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let qdrant_url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicU64::new(0));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/collections/test",
+            get(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Json(json!({
+                    "result": { "status": "green", "points_count": 0 }
+                })))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let checker = HealthChecker {
+            qdrant_url,
+            ..test_checker(TEST_NOW)
+        };
+        let routes = health_routes(checker.clone(), test_auth_state());
+
+        for _ in 0..50 {
+            let (code, body) = probe(&routes, "/health", None).await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(body["status"], "degraded");
+        }
+        assert_eq!(hits.load(Ordering::Relaxed), 0, "bare probe reached Qdrant");
+
+        checker.refresh_qdrant().await;
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+        let (_, body) = probe(&routes, "/health", None).await;
+        assert_eq!(body["status"], "healthy");
+
+        // Qdrant gone (port 1 refuses) → the next refresh withdraws it.
+        let down = HealthChecker {
+            qdrant_url: "http://127.0.0.1:1".into(),
+            ..checker
+        };
+        down.refresh_qdrant().await;
+        let (_, body) = probe(&routes, "/health", None).await;
+        assert_eq!(body["status"], "degraded");
     }
 
     /// #97: `process::exit` cannot be observed in-process, so the test re-runs
@@ -3390,7 +4614,7 @@ mod wedge_tests {
     /// fail when that happens.
     #[tokio::test]
     async fn unauthenticated_health_exposes_only_status() {
-        let app = health_routes(test_checker(epoch_secs()), test_auth_state());
+        let app = health_routes(test_checker(TEST_NOW), test_auth_state());
 
         let (code, body) = probe(&app, "/health", None).await;
 
@@ -3409,7 +4633,7 @@ mod wedge_tests {
     /// with one.
     #[tokio::test]
     async fn health_detail_requires_auth() {
-        let app = health_routes(test_checker(epoch_secs()), test_auth_state());
+        let app = health_routes(test_checker(TEST_NOW), test_auth_state());
 
         let (code, _) = probe(&app, "/health/detail", None).await;
         assert_eq!(code, StatusCode::UNAUTHORIZED);
@@ -3494,12 +4718,124 @@ mod wedge_tests {
     /// pods. The failure path must not widen the body either.
     #[tokio::test]
     async fn stalled_worker_still_503s_the_bare_probe() {
-        let app = health_routes(test_checker(epoch_secs() - 3600), test_auth_state());
+        let app = health_routes(test_checker(TEST_NOW - 3600), test_auth_state());
 
         let (code, body) = probe(&app, "/health", None).await;
 
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "unhealthy");
         assert_eq!(body.as_object().expect("object body").len(), 1);
+    }
+
+    /// Mirrors `request_span_omits_query_string` in `ops-console/src/main.rs`
+    /// (LAB-4506), driven through `protected_router` — the router `main`
+    /// serves — so reverting production's `make_span_with(request_span)`
+    /// fails this test, not just editing `request_span` itself.
+    ///
+    /// Thread-scoped (`set_default`, not `set_global_default`): this binary
+    /// also has `telemetry::tests::installs_without_a_tokio_runtime`, which
+    /// installs a real global default — the two would race for the single
+    /// process-wide slot. Scoped is normally flaky (tracing-core caches
+    /// callsite interest per registering thread), but only for a callsite
+    /// another concurrent test hits first. The sole callsite asserted on is
+    /// `request_span`'s own close event (`FmtSpan::CLOSE`), and nothing else
+    /// in this binary builds `protected_router`. Never assert on tower-http's
+    /// `on_request`/`on_response` events: those are shared, and would bring
+    /// the flake back.
+    #[tokio::test]
+    async fn request_span_omits_query_string() {
+        use std::sync::{Arc, Mutex};
+        use tower::ServiceExt;
+        use tracing_subscriber::fmt::format::FmtSpan;
+
+        #[derive(Clone, Default)]
+        struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for LogBuffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sink = LogBuffer::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("alaya_server=info,tower_http=info")
+            .with_span_events(FmtSpan::CLOSE)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Anonymous, so `require_auth` answers 401 inside the span and no
+        // handler ever reaches the (unserviced) command channel.
+        let (tx, _rx) = mpsc::channel(1);
+        let app = protected_router(ServiceHandle { tx }, test_auth_state());
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::post("/store?token=QUERY-SENTINEL")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // `TraceLayer`'s response body owns the span; it closes on drop.
+        drop(resp);
+
+        let log = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("path=/store"),
+            "positive control: the request span must close with its path:\n{log}"
+        );
+        assert!(
+            !log.contains("QUERY-SENTINEL"),
+            "query string reached the log:\n{log}"
+        );
+    }
+
+    /// The other half of #63's contract: a worker that IS draining must never
+    /// 503 because the wall clock moved (LAB-3968). NTP correcting a drifted
+    /// node or a VM resume steps `SystemTime` forward; `Instant` does not
+    /// follow, so a stamp written seconds ago stays seconds old.
+    ///
+    /// Simulated at the worst step there is, and with no fake anywhere: the
+    /// stamp is a real `monotonic_secs()` — what the production heartbeat
+    /// writes — read by the real production clock, and the wall clock sits
+    /// ~1.8e9 seconds ahead of that monotonic origin. Age it off `epoch_secs`
+    /// and this worker reads ~55 years stale, 503ing a healthy pod on the
+    /// unauthenticated route; age it off `monotonic_secs` and it reads ~0.
+    #[tokio::test]
+    async fn fresh_heartbeat_survives_a_forward_wall_clock_step() {
+        // The step is implicit in the two clocks: `epoch_secs()` is ~1.79e9
+        // on any host with a post-1970 clock, `monotonic_secs()` is single
+        // digits in a test binary.
+        let checker = HealthChecker {
+            worker_progress: Arc::new(AtomicU64::new(monotonic_secs())),
+            clock: monotonic_secs,
+            ..test_checker(TEST_NOW)
+        };
+
+        let (code, body) = probe(
+            &health_routes(checker.clone(), test_auth_state()),
+            "/health",
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "healthy worker 503d on a clock step");
+        assert_eq!(body["status"], "degraded"); // backends down, worker fine
+
+        // /health/detail agrees, and reports a plausible age rather than an
+        // epoch-sized one.
+        let v = checker.check().await;
+        assert_eq!(v["worker"]["state"], "ok");
+        assert_eq!(v["worker"]["stalled"], false);
+        // Bounded absolutely, not against the threshold: `stalled == false`
+        // already implies the latter, so it would catch nothing on its own.
+        assert!(v["worker"]["last_progress_age_s"].as_u64().unwrap() <= 5);
     }
 }

@@ -85,6 +85,12 @@ probes the embedding endpoint; both verdicts are reported only on
 Probers read the HTTP code, so a k8s `httpGet` probe and `curl -sf .../health`
 both work against this endpoint unchanged.
 
+This route does no backend I/O per request. The worker-stall check (the only
+input to the 503) is read live; the Qdrant verdict behind `healthy` vs
+`degraded` is refreshed by an internal task every 30s and may lag a Qdrant
+outage by up to ~40s. Neither the HTTP code nor any restart decision depends on
+it. Use `/health/detail` for a live per-backend view.
+
 ## `GET /health/detail`
 
 Authenticated. The full operational document — per-backend health, worker state,

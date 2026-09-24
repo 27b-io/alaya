@@ -1,15 +1,39 @@
 pub mod alaya;
 pub mod auth;
 pub mod home;
+pub mod lb;
 
 use crate::error::AppError;
 
+const MAX_NEXT_BYTES: usize = 512;
+
 /// Validate a post-login redirect target: same-site absolute path only —
-/// no scheme, no authority, no protocol-relative `//`, and no backslashes
-/// anywhere (browsers normalize `\` → `/` in Location, so `/\evil.com`
-/// would resolve to `//evil.com`).
+/// no scheme, no authority, no protocol-relative `//`.
+///
+/// An allow-list, because the deny-list it replaces was one class short. It
+/// refused `\` (browsers normalize it to `/` in a Location, so `/\evil.com`
+/// resolves to `//evil.com`) and passed a TAB — a legal header-value byte,
+/// admitted by `http`’s own validator alongside the printable range. The
+/// WHATWG URL parser removes every ASCII tab and newline from its input
+/// before parsing, so `Location: /<TAB>/evil.com` became `//evil.com` and
+/// the browser left this origin. CR and LF failed only by accident,
+/// rejected by `HeaderValue` as a 500 rather than by this guard.
+///
+/// Every legitimate target is a fixed route or a 64-char hex hash, so
+/// requiring ASCII-graphic bytes refuses the whole class — controls, space
+/// and non-ASCII alike — rather than the members someone thought of.
+///
+/// Bounded too: this string is stored in the login cookie, which hits the
+/// same 4 KiB wall as the session cookie and is dropped just as silently —
+/// a crafted `/login?next=<4 KiB path>` link would send the visitor through
+/// the IdP and back to "login flow expired". The longest real target is
+/// `/alaya/memory/<64 hex>`, so 512 bytes is slack, not a limit.
 pub fn safe_next(next: &str) -> String {
-    if next.starts_with('/') && !next.starts_with("//") && !next.contains('\\') {
+    if next.len() <= MAX_NEXT_BYTES
+        && next.starts_with('/')
+        && !next.starts_with("//")
+        && next.bytes().all(|b| b.is_ascii_graphic() && b != b'\\')
+    {
         next.to_string()
     } else {
         "/".to_string()
@@ -28,6 +52,19 @@ pub fn validate_hash(hash: &str) -> Result<&str, AppError> {
     } else {
         Err(AppError::BadRequest("invalid content hash".into()))
     }
+}
+
+/// Defensive readers over upstream JSON: a missing or mistyped field renders
+/// as empty / zero instead of failing the page. Shared by both modules.
+pub fn vs(v: &serde_json::Value, key: &str) -> String {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+pub fn vf(v: &serde_json::Value, key: &str) -> f64 {
+    v.get(key).and_then(|x| x.as_f64()).unwrap_or(0.0)
 }
 
 /// Short display prefix for a content hash.
@@ -66,6 +103,25 @@ mod tests {
         assert_eq!(safe_next("/\\/evil.com"), "/");
         assert_eq!(safe_next("/alaya\\..\\x"), "/");
         assert_eq!(safe_next(""), "/");
+        // A TAB is a legal header-value byte and the URL parser strips it
+        // before parsing, so this reached the browser as `//evil.com`.
+        assert_eq!(safe_next("/\t/evil.com"), "/");
+        assert_eq!(safe_next("/\n/evil.com"), "/");
+        assert_eq!(safe_next("/\r/evil.com"), "/");
+        assert_eq!(safe_next("/ /evil.com"), "/");
+        // Unbounded, this rode into the login cookie and past the same 4 KiB
+        // wall the session cookie hits — a browser drops it without a word
+        // and the callback answers "login flow expired".
+        assert_eq!(safe_next(&format!("/{}", "a".repeat(MAX_NEXT_BYTES))), "/");
+        let longest_ok = format!("/{}", "a".repeat(MAX_NEXT_BYTES - 1));
+        assert_eq!(safe_next(&longest_ok), longest_ok);
+        // Still lets the real targets through.
+        assert_eq!(safe_next("/lb"), "/lb");
+        let hash = "a".repeat(64);
+        assert_eq!(
+            safe_next(&format!("/alaya/memory/{hash}")),
+            format!("/alaya/memory/{hash}")
+        );
     }
 
     #[test]

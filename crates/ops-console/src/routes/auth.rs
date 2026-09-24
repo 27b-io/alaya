@@ -12,9 +12,7 @@ use serde::Deserialize;
 
 use crate::error::AppError;
 use crate::routes::safe_next;
-use crate::session::{
-    self, Flash, LOGIN_COOKIE, SESSION_COOKIE, new_login_state, new_session, read_login,
-};
+use crate::session::{self, Flash, LOGIN_COOKIE, SESSION_COOKIE, new_login_state, read_login};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -69,22 +67,32 @@ pub async fn callback(
         .oidc
         .exchange_and_verify(&code, &login.pkce_verifier, &login.nonce)
         .await
+        // No warn here: every arm below this call already logs its own, at
+        // the refusal that produced it (`warn_rejected`, `warn_idp_failure`,
+        // `warn_idp_parse_failure`, `http::body_text`). `warn_rejected` has
+        // the reasoning; a wrapper at this level cannot tell a refusal from
+        // an outage.
         .map_err(|e| AppError::Forbidden(format!("login failed: {e}")))?;
 
+    // `sub` is recorded with `?`, not `%`, here and everywhere it is logged.
+    // It is an unvalidated string straight out of the id_token, logged on
+    // the rejection path of an unauthenticated route — so it reaches the log
+    // for subjects that are authorized for nothing — and the plain-text
+    // subscriber writes a `Display`-recorded field verbatim, so `%` would
+    // let a substituted IdP forge whole log records by putting a newline in
+    // the subject. `oidc.rs` pins the mechanism with a test, and bounds the
+    // length there so neither line can be made arbitrarily long.
+    //
     // Default-deny subject allowlist (AC1): explicit 403, nothing minted.
     if !state.config.subject_allowed(&claims.sub) {
-        tracing::warn!(sub = %claims.sub, "login rejected: subject not allowlisted");
+        tracing::warn!(sub = ?claims.sub, "login rejected: subject not allowlisted");
         return Err(AppError::Forbidden(
             "this account is not authorized for the console".into(),
         ));
     }
 
-    tracing::info!(sub = %claims.sub, "console login");
-    let sess = new_session(
-        claims.sub,
-        claims.email,
-        claims.name.or(claims.preferred_username),
-    );
+    tracing::info!(sub = ?claims.sub, "console login");
+    let sess = session::session_for(claims);
     let secure = state.secure_cookies();
     let jar = jar.remove(session::removal_cookie(LOGIN_COOKIE));
     let jar = session::session_cookie(jar, &sess, secure);

@@ -1,10 +1,11 @@
 //! ops-console — OIDC-gated web console for the 27b workspace (LAB-1684).
 //!
-//! Two-tenant skeleton (LAB-1641 constraint A): the Ālaya memory-curation
-//! module ships here; the anthropic-lb read-only pane lands as a second route
-//! module (LAB-1964). Trust model (D2, ratified 2026-08-15): the browser
-//! authenticates with an OIDC session; every alaya-server call happens
-//! server-side with the static bearer. No credential reaches the browser.
+//! Two-tenant console (LAB-1641 constraint A): the Ālaya memory-curation
+//! module and the anthropic-lb read-only monitoring pane as a second route
+//! module. Trust model (D2, ratified 2026-08-15): the browser
+//! authenticates with an OIDC session; every upstream call (alaya-server
+//! bearer, anthropic-lb operator key) happens server-side. No credential
+//! reaches the browser.
 //!
 //! Session posture (LAB-1694 panel, pass/fail set): CSRF token + Origin check
 //! on every POST, `HttpOnly`/`SameSite`/`Secure` cookies, session regeneration
@@ -13,10 +14,16 @@
 mod alaya;
 mod config;
 mod error;
+mod http;
+mod lb;
 mod oidc;
 mod routes;
 mod session;
 mod state;
+#[cfg(test)]
+mod testkit;
+#[cfg(test)]
+mod testlog;
 mod ui;
 
 use axum::Router;
@@ -162,13 +169,26 @@ fn app(state: AppState) -> Router {
             post(routes::alaya::keep_both_submit),
         )
         .route("/alaya/auth", get(routes::alaya::auth_view))
+        // anthropic-lb module: GET only, by design. No POST route to the LB
+        // exists and none may be added here.
+        .route("/lb", get(routes::lb::pane))
         .layer(middleware::from_fn_with_state(state.clone(), origin_check))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             session_refresh,
         ))
         .layer(middleware::from_fn(security_headers))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        // The request span records the path, not the full URI: a query
+        // string is never a safe thing to log.
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http().make_span_with(|req: &Request| {
+                tracing::debug_span!(
+                    "request",
+                    method = %req.method(),
+                    path = %req.uri().path(),
+                )
+            }),
+        )
         .with_state(state)
 }
 
@@ -223,9 +243,10 @@ mod tests {
     use tower::ServiceExt;
 
     const TEST_SECRET: &[u8] = b"0123456789abcdef0123456789abcdef-test";
+    const LB_KEY: &str = "lb-operator-key-secret-value";
 
-    fn test_state() -> AppState {
-        let config = config::Config {
+    fn test_config() -> config::Config {
+        config::Config {
             listen_addr: "127.0.0.1:0".into(),
             public_url: "https://console.test".parse().unwrap(),
             oidc_issuer: "https://id.test".into(),
@@ -236,23 +257,51 @@ mod tests {
             // Closed port: upstream calls fail fast; pages must degrade, not leak.
             alaya_url: "http://127.0.0.1:1".parse().unwrap(),
             alaya_api_key: "alaya-bearer-secret-value".into(),
-        };
+            lb: None,
+        }
+    }
+
+    fn test_state() -> AppState {
+        AppState::new(test_config())
+    }
+
+    /// LB module configured against closed ports: both upstreams fail fast.
+    fn test_state_with_lb() -> AppState {
+        let mut config = test_config();
+        config.lb = Some(config::LbConfig {
+            url: "http://127.0.0.1:1".parse().unwrap(),
+            api_key: LB_KEY.into(),
+            metrics_url: "http://127.0.0.1:1".parse().unwrap(),
+        });
         AppState::new(config)
     }
 
-    /// Mint a valid encrypted session cookie the way the server would —
-    /// the key derivation must match `AppState::new` exactly.
-    fn session_cookie_header(state: &AppState, sess: &session::Session) -> String {
+    /// Mint a valid encrypted cookie the way the server would — the key
+    /// derivation must match `AppState::new` exactly.
+    fn encrypted_cookie_header(state: &AppState, name: &'static str, value: String) -> String {
         use sha2::Digest;
         let expanded = sha2::Sha512::digest(&state.config.session_secret);
         let key = cookie::Key::from(&expanded);
         let mut jar = cookie::CookieJar::new();
-        jar.private_mut(&key).add(cookie::Cookie::new(
+        jar.private_mut(&key).add(cookie::Cookie::new(name, value));
+        let c = jar.get(name).unwrap();
+        format!("{}={}", c.name(), c.value())
+    }
+
+    fn session_cookie_header(state: &AppState, sess: &session::Session) -> String {
+        encrypted_cookie_header(
+            state,
             session::SESSION_COOKIE,
             serde_json::to_string(sess).unwrap(),
-        ));
-        let c = jar.get(session::SESSION_COOKIE).unwrap();
-        format!("{}={}", c.name(), c.value())
+        )
+    }
+
+    fn login_cookie_header(state: &AppState, login: &session::LoginState) -> String {
+        encrypted_cookie_header(
+            state,
+            session::LOGIN_COOKIE,
+            serde_json::to_string(login).unwrap(),
+        )
     }
 
     async fn body_string(resp: Response) -> String {
@@ -388,16 +437,80 @@ mod tests {
     }
 
     /// AC8: no server-held credential may ever appear in a rendered page —
-    /// including on the home page, whose upstream call fails here.
+    /// including on the home page and the LB pane, whose upstream calls all
+    /// fail here (every error path renders).
     #[tokio::test]
     async fn rendered_pages_never_contain_credentials() {
+        let state = test_state_with_lb();
+        let sess = session::new_session("admin-sub".into(), None, None);
+        let cookie_header = session_cookie_header(&state, &sess);
+        let app = app(state);
+        for path in ["/", "/lb"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::get(path)
+                        .header(header::COOKIE, cookie_header.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let html = body_string(resp).await;
+            assert!(!html.contains("alaya-bearer-secret-value"), "{path}");
+            assert!(!html.contains("oidc-client-secret-value"), "{path}");
+            assert!(!html.contains(LB_KEY), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn lb_pane_requires_a_session() {
+        let app = app(test_state_with_lb());
+        let resp = app
+            .oneshot(HttpRequest::get("/lb").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/auth/login");
+    }
+
+    /// Module disabled (no LB_* env): the pane and the home card say so
+    /// explicitly rather than 404ing or rendering an empty table.
+    #[tokio::test]
+    async fn lb_pane_reports_an_unconfigured_module() {
         let state = test_state();
+        let sess = session::new_session("admin-sub".into(), None, None);
+        let cookie_header = session_cookie_header(&state, &sess);
+        let app = app(state);
+        for path in ["/lb", "/"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::get(path)
+                        .header(header::COOKIE, cookie_header.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            assert!(body_string(resp).await.contains("not configured"), "{path}");
+        }
+    }
+
+    /// Each section degrades on its own: with both upstreams dark the page
+    /// still renders, names each unavailable source, keeps the provenance
+    /// text, and carries no form that could POST to the LB.
+    #[tokio::test]
+    async fn lb_pane_degrades_per_section_and_has_no_write_path() {
+        let state = test_state_with_lb();
         let sess = session::new_session("admin-sub".into(), None, None);
         let cookie_header = session_cookie_header(&state, &sess);
         let app = app(state);
         let resp = app
             .oneshot(
-                HttpRequest::get("/")
+                HttpRequest::get("/lb")
                     .header(header::COOKIE, cookie_header)
                     .body(Body::empty())
                     .unwrap(),
@@ -406,8 +519,12 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let html = body_string(resp).await;
-        assert!(!html.contains("alaya-bearer-secret-value"));
-        assert!(!html.contains("oidc-client-secret-value"));
+        assert!(html.contains("anthropic-lb: connection failed"), "{html}");
+        assert!(html.contains("metrics: connection failed"), "{html}");
+        assert!(html.contains("TOML, GitOps"));
+        // The only form on any authenticated page is the logout form.
+        assert_eq!(html.matches("<form").count(), 1);
+        assert!(html.contains("action=\"/auth/logout\""));
     }
 
     #[tokio::test]
@@ -598,5 +715,221 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Serve `routes` on a loopback ephemeral port and return its origin.
+    /// `ALAYA_URL` is plaintext pod-to-pod, so a compromised or on-path
+    /// alaya-server is the threat model this stands in for.
+    async fn fake_upstream(routes: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // `let _`, not `unwrap`: there is no error value to surface.
+        // `axum::serve` is typed `io::Result<()>` but documents that it
+        // never completes or returns an error — accept errors are retried
+        // inside its own loop. Nothing here holds the handle, so the task
+        // ends with the test's runtime. The one observable failure is the
+        // bind, and that is the `unwrap()` above, outside the spawn, where
+        // it panics the test rather than hanging it.
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, routes).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// The correction's `content_hash` is alaya-server's answer echoed
+    /// verbatim, and it reaches a log field, `memory_href` and `supersede`.
+    /// Unvalidated it forges pod-log records — in the audit trail for this
+    /// very write — so it must be refused before any of them, and the
+    /// refusal must still say that the store half committed.
+    #[tokio::test]
+    async fn a_malformed_store_content_hash_is_refused_and_never_reaches_the_log_raw() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const FORGED: &str = "aaaa\n2026-09-22T12:00:00Z  INFO ops_console: corrected + superseded sub=\"admin-sub\"";
+
+        // Answers success, so the counter is the only thing that can notice a
+        // supersede call. Without this route a regression that superseded onto
+        // the forged hash and ignored the result got a 404, fell through to
+        // the refusal, and passed every assertion below.
+        let supersede_calls = Arc::new(AtomicUsize::new(0));
+        let seen = supersede_calls.clone();
+        let upstream = Router::new()
+            .route(
+                "/supersede",
+                post(move || {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    async { axum::Json(serde_json::json!({ "success": true })) }
+                }),
+            )
+            .route(
+                "/memories/{hash}",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "memory": { "memory_type": "note", "tags": [] }
+                    }))
+                }),
+            )
+            .route(
+                "/store",
+                post(|| async { axum::Json(serde_json::json!({ "content_hash": FORGED })) }),
+            );
+        let mut config = test_config();
+        config.alaya_url = fake_upstream(upstream).await.parse().unwrap();
+
+        let state = AppState::new(config);
+        let sess = session::new_session("admin-sub".into(), None, None);
+        let cookie_header = session_cookie_header(&state, &sess);
+        let csrf = sess.csrf.clone();
+        let hash = "a".repeat(64);
+        let app = app(state);
+
+        let buf = testlog::LogBuf::default();
+        let resp = {
+            let _capture = buf.capture();
+            app.oneshot(
+                HttpRequest::post(format!("/alaya/memory/{hash}/correct"))
+                    .header(header::ORIGIN, "https://console.test")
+                    .header(header::COOKIE, cookie_header)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("csrf={csrf}&content=fixed&reason=typo")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("WAS stored"),
+            "the committed store half must not be hidden by the refusal: {body}"
+        );
+        assert_eq!(
+            supersede_calls.load(Ordering::SeqCst),
+            0,
+            "a refused content_hash must never be sent upstream as a supersede target"
+        );
+
+        // Panics unless the refusal is in the pod log at all — it has to be
+        // diagnosable.
+        let record = buf.record("no usable content_hash");
+        assert!(
+            record.contains("\\n"),
+            "the forged newline must reach the log escaped, never raw: {record}"
+        );
+        assert!(
+            !record.contains("INFO ops_console: corrected + superseded"),
+            "the forged record must be cut off before it completes: {record}"
+        );
+        // A cut at exactly 64 is a well-formed hash's own length, so an
+        // unmarked one reads as a complete hash on a line that says there
+        // was no usable hash.
+        assert!(
+            record.contains('…'),
+            "a truncated answer must say it was truncated: {record}"
+        );
+        let leaked = testlog::separators_in(&record);
+        assert!(
+            leaked.is_empty(),
+            "no upstream byte may reach the log raw: {leaked:?} in {record}"
+        );
+    }
+
+    /// An IdP outage must log once, from the arm that saw it, and must not
+    /// claim an id_token was rejected when none was received. The warning
+    /// used to sit around a call whose first act is discovery — see
+    /// `oidc::warn_rejected` for why that logged every outage twice.
+    #[tokio::test]
+    async fn an_idp_transport_failure_logs_once_and_claims_no_id_token_rejection() {
+        let mut config = test_config();
+        // Closed port: discovery fails before any token can exist.
+        config.oidc_issuer = "http://127.0.0.1:1".into();
+        let state = AppState::new(config);
+
+        let login = session::new_login_state("/alaya".into());
+        let cb_state = login.state.clone();
+        let cookie_header = login_cookie_header(&state, &login);
+        let app = app(state);
+
+        let buf = testlog::LogBuf::default();
+        let resp = {
+            let _capture = buf.capture();
+            app.oneshot(
+                HttpRequest::get(format!("/auth/callback?code=xyz&state={cb_state}"))
+                    .header(header::COOKIE, cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let logged = buf.text();
+        assert!(
+            logged.contains("identity provider request failed"),
+            "the outage must still be logged: {logged}"
+        );
+        assert!(
+            !logged.contains("id_token rejected"),
+            "no id_token was received, so none can have been rejected: {logged}"
+        );
+        // The defect this pins is the duplicate, not the wording: the arm
+        // that saw the failure warns, and nothing above it warns again.
+        //
+        // Matched on the crate, not on `ops_console::oidc`: the warning this
+        // guards against lived at the call site in `routes/auth.rs`, which
+        // emits target `ops_console::routes::auth`, so a module-scoped
+        // filter left the count at 1 and the duplicate half of this test
+        // inert — the wording assertion above was carrying it alone.
+        let console_warns = logged.lines().filter(|l| l.contains("ops_console")).count();
+        assert_eq!(console_warns, 1, "one outage, one record: {logged}");
+    }
+
+    /// Asserted on the formatted log at `ops_console=debug` (the request span
+    /// is built in `app`, so it takes this crate's target, not tower-http's)
+    /// and `tower_http=debug` (tower-http's own request event), with positive
+    /// controls so a broken capture fails instead of passing vacuously.
+    #[tokio::test]
+    async fn request_span_omits_query_string() {
+        let sink = testlog::LogBuf::default();
+        let resp = {
+            let _capture = testlog::scoped(
+                tracing_subscriber::fmt()
+                    .with_env_filter("ops_console=debug,tower_http=debug")
+                    .with_writer(sink.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            app(test_state())
+                .oneshot(
+                    HttpRequest::get("/auth/callback?code=CODE-SENTINEL&state=STATE-SENTINEL")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+        // No login cookie: rejected before any identity-provider call.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let log = sink.text();
+        assert!(
+            log.contains("started processing request"),
+            "positive control: the DEBUG request event must be captured:\n{log}"
+        );
+        assert!(
+            log.contains("path=/auth/callback"),
+            "positive control: the span must record the request path:\n{log}"
+        );
+        assert!(
+            !log.contains("CODE-SENTINEL"),
+            "authorization code reached the log:\n{log}"
+        );
+        assert!(
+            !log.contains("STATE-SENTINEL"),
+            "state parameter reached the log:\n{log}"
+        );
     }
 }
