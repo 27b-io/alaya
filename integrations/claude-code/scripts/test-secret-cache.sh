@@ -2,7 +2,8 @@
 # Shim test for _resolve_secret in alaya-session-save.sh (LAB-1663 pattern,
 # generalized from a hardcoded `op read` call to any value-or-command source).
 # Proves: cold fetch = 1 resolver call; warm = 0 resolver calls; 0600 cache
-# perms; stale cache served when the resolver fails; hook still parses.
+# perms; stale cache served when the resolver fails; a failing resolver retried
+# at most once per 15 min (stale and cold); hook still parses.
 set -e
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOK="$HERE/alaya-session-save.sh"
