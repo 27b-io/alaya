@@ -209,7 +209,6 @@ where
                 .unwrap_or_else(|_| "ops_console=info,tower_http=info".into()),
         )
         .with_writer(writer)
-        .with_ansi(false)
         .finish()
 }
 
