@@ -192,14 +192,31 @@ fn app(state: AppState) -> Router {
         .with_state(state)
 }
 
-#[tokio::main]
-async fn main() {
+/// The binary's log subscriber, taking the writer so a test can drive this
+/// exact one. JSON, one object per record: the structured fields (`sub`,
+/// `issuer`, `cause`, ...) are what an outage is triaged off, and the encoder
+/// escapes every C0 control char in every field however a call site records
+/// it — `%` included. It does not escape U+2028/U+2029/NEL, so recording
+/// untrusted values with `?` and a length cap still matters.
+fn log_subscriber<W>(writer: W) -> impl tracing::Subscriber + Send + Sync + 'static
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
     tracing_subscriber::fmt()
+        .json()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "ops_console=info,tower_http=info".into()),
         )
-        .init();
+        .with_writer(writer)
+        .with_ansi(false)
+        .finish()
+}
+
+#[tokio::main]
+async fn main() {
+    use tracing_subscriber::util::SubscriberInitExt;
+    log_subscriber(std::io::stdout).init();
 
     // Fail-closed: any missing/invalid config value refuses startup (AC10).
     let config = match config::Config::from_env() {
@@ -930,6 +947,38 @@ mod tests {
         assert!(
             !log.contains("STATE-SENTINEL"),
             "state parameter reached the log:\n{log}"
+        );
+    }
+
+    /// Drives the binary's own subscriber, recording with `%` on purpose: the
+    /// `?`-discipline tests (`oidc.rs`) prove call sites escape; this proves
+    /// the encoder does even when a call site does not. Needs `RUST_LOG`
+    /// unset, or at least letting `ops_console` warnings through.
+    #[test]
+    fn json_log_keeps_a_display_recorded_newline_inside_one_record() {
+        let hostile = "first\nforged record\r\u{1b}[2J";
+        let sink = testlog::LogBuf::default();
+        {
+            let _capture = testlog::scoped(log_subscriber(sink.clone()));
+            tracing::warn!(cause = %hostile, "json-injection-probe");
+        }
+        let logged = sink.text();
+        assert_eq!(
+            logged.lines().count(),
+            1,
+            "one event, one record: {logged:?}"
+        );
+        let record = sink.record("json-injection-probe");
+        assert_eq!(
+            testlog::separators_in(&record),
+            Vec::<char>::new(),
+            "{record:?}"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&record).expect("record is one JSON object");
+        assert_eq!(
+            json["fields"]["cause"], hostile,
+            "value round-trips intact: {record}"
         );
     }
 }

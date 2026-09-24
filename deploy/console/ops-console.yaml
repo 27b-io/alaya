@@ -80,6 +80,8 @@ spec:
               value: "https://ops.<tailnet>.ts.net"
             - name: CONSOLE_OIDC_ISSUER
               value: "https://id.27b.io"
+            # Logs are JSON, one object per line (fields under `fields.*`),
+            # not plain text — query them structurally, don't regex them.
             - name: RUST_LOG
               value: "ops_console=info,tower_http=info"
           # Credentials come from the Secret (secret manager → ESO):

@@ -47,11 +47,15 @@ CSP (`default-src 'none'`).
 
 Every upstream URL (`ALAYA_URL`, `LB_URL`, `METRICS_URL`) must be https, or plain http to a cluster-local host (`*.svc`, `*.svc.cluster.local`, `*.internal`, a single-label name, or a loopback/private IP literal), and must carry no query string or fragment. Anything else refuses startup — `METRICS_URL` included, keyless or not: off-cluster plaintext leaves the budget history both readable and rewritable in flight. `CONSOLE_OIDC_ISSUER` is stricter still: https only, no cluster-local exemption, and no userinfo (it is printed verbatim in the startup config log).
 
+Logs are JSON, one object per line on stdout, so structured fields (`sub`,
+`op`, `issuer`, `cause`, ...) are queryable as `fields.<name>` rather than
+scraped from text. `RUST_LOG` defaults to `ops_console=info,tower_http=info`.
+
 ### Allowlisting an admin
 
-1. Have them log in once (they'll get a 403 page); the rejected `sub` is in
-   the console log line `login rejected: subject not allowlisted`.
-   (Or read the `sub` from the IdP's user admin.)
+1. Have them log in once (they'll get a 403 page); the rejected subject is
+   the `fields.sub` value on the console's `login rejected: subject not
+   allowlisted` record. (Or read the `sub` from the IdP's user admin.)
 2. Add it to `CONSOLE_ALLOWED_SUBJECTS` (comma-separated) and roll the pod.
 
 ## Ālaya module
