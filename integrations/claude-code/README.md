@@ -85,8 +85,10 @@ The hooks do not enforce this; the endpoint choice is yours.
 or sourced from a command via the `_CMD` variant (e.g. `ALAYA_API_KEY_CMD='op read op://vault/item/field'`
 for a 1Password service account). The command's output is cached under `ALAYA_HOOK_STATE_DIR`
 for `ALAYA_SECRET_CACHE_MINUTES`, and a stale cache is served if the command fails — so saves
-keep working through a secret manager's rate-limit windows. Delete the cache file (named after
-the variable, e.g. `alaya-api-key`) to force a refresh after a key rotation.
+keep working through a secret manager's rate-limit windows. A failed command is retried at most
+once every 15 minutes, not on every Stop, so the retries don't keep spending the rate limit that
+made it fail. Delete the cache file (named after the variable, e.g. `alaya-api-key`) and its
+`.attempt` marker to force a refresh after a key rotation.
 
 **Missing configuration is a silent no-op, not a hook error:** if `ALAYA_URL`, `ALAYA_LLM_URL`,
 or either secret can't be resolved, the Stop hook logs one line to
@@ -113,7 +115,9 @@ scripts/test-secret-cache.sh
 
 Proves the value-or-command secret resolver (`_resolve_secret` in `alaya-session-save.sh`):
 cold fetch calls the resolver once, a warm cache calls it zero times, the cache file is written
-`0600`, a stale cache is served if the resolver starts failing, and the hook script still parses.
+`0600`, a stale cache is served if the resolver starts failing, a failing resolver is retried at
+most once per 15 minutes (with or without a stale cache, and never leaves an empty cache file),
+and the hook script still parses.
 
 ## Troubleshooting
 
