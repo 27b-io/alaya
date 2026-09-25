@@ -89,7 +89,9 @@ impl MessagesTransport {
     /// with the request:
     /// - 429 → `AlayaError::RateLimited` (with the `retry-after` hint);
     /// - connect/timeout, 5xx, and auth/model misconfiguration
-    ///   (401/403/404) → `AlayaError::Unavailable` (transient);
+    ///   (401/403/404) → `AlayaError::Unavailable` (transient), `spent`
+    ///   when the request got past connect and may have been billed
+    ///   (post-send timeout, reset, body cut after 2xx, 5xx);
     /// - 400/413/422 and an unparseable body → `err(..)`, the caller's own
     ///   variant, meaning *this request* will fail the same way again.
     pub(crate) async fn messages(
@@ -104,7 +106,10 @@ impl MessagesTransport {
             .json(body)
             .send()
             .await
-            .map_err(|e| AlayaError::Unavailable(crate::redact_reqwest_error(e)))?;
+            .map_err(|e| AlayaError::Unavailable {
+                spent: reached_upstream(&e),
+                message: crate::redact_reqwest_error(e),
+            })?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -121,7 +126,12 @@ impl MessagesTransport {
             return Err(if is_request_fault(status) {
                 err(msg)
             } else {
-                AlayaError::Unavailable(msg)
+                AlayaError::Unavailable {
+                    message: msg,
+                    // A 5xx may have been served and billed upstream before a
+                    // proxy gave up; 401/403/404 are a definitive, free reject.
+                    spent: status.is_server_error(),
+                }
             });
         }
 
@@ -134,10 +144,11 @@ impl MessagesTransport {
                     crate::redact_reqwest_error(e)
                 ))
             } else {
-                AlayaError::Unavailable(format!(
-                    "response body: {}",
-                    crate::redact_reqwest_error(e)
-                ))
+                AlayaError::Unavailable {
+                    message: format!("response body: {}", crate::redact_reqwest_error(e)),
+                    // The 2xx headers arrived: the model answered and billed.
+                    spent: true,
+                }
             }
         })
     }
@@ -149,6 +160,20 @@ impl MessagesTransport {
 /// the request's fault.
 fn is_request_fault(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 400 | 413 | 422)
+}
+
+/// Whether a failed `send()` got past connect, so the upstream may have
+/// served — and billed — the request before it failed: a request timeout,
+/// a reset, a body error. A refused or timed-out connect never left the box.
+#[cfg(not(target_arch = "wasm32"))]
+fn reached_upstream(e: &reqwest::Error) -> bool {
+    !e.is_connect()
+}
+
+/// reqwest-wasm cannot tell a connect failure apart; err on the billed side.
+#[cfg(target_arch = "wasm32")]
+fn reached_upstream(_e: &reqwest::Error) -> bool {
+    true
 }
 
 // ─── Response types ────────────────────────────────────────────────────────

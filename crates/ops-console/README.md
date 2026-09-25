@@ -1,8 +1,8 @@
 # ops-console
 
-OIDC-gated web console for the 27b workspace (LAB-1684 / LAB-1641). The
-Ālaya memory-curation module ships first; the anthropic-lb read-only
-monitoring pane lands as a second route module (LAB-1964) in this same crate.
+OIDC-gated web console for the 27b workspace (LAB-1684 / LAB-1641). Two
+route modules in one crate: Ālaya memory curation, and the anthropic-lb
+read-only monitoring pane (LAB-1964).
 
 ## Trust model (D2 — ratified 2026-08-15, do not re-litigate here)
 
@@ -43,12 +43,26 @@ CSP (`default-src 'none'`).
 | `ALAYA_URL` | `http://alaya-server.mcp.svc:3001` |
 | `ALAYA_API_KEY` | Static bearer (full write) — server-side only. |
 | `CONSOLE_LISTEN_ADDR` | Optional, default `0.0.0.0:3002`. |
+| `LB_URL` / `LB_API_KEY` / `METRICS_URL` | anthropic-lb module — **all three or none**. None: the module is disabled and the home card says so. A partial set refuses startup. `LB_URL` = the LB's base URL; `LB_API_KEY` = an LB **operator** client key, sent server-side as `x-api-key` (the LB rejects `Authorization: Bearer` on `/_stats`); `METRICS_URL` = a Prometheus-compatible query API for the 7-day history — the console only ever calls `/api/v1/query_range` on it, so point it at a route that exposes nothing else. |
+
+Every upstream URL (`ALAYA_URL`, `LB_URL`, `METRICS_URL`) must be https, or plain http to a cluster-local host (`*.svc`, `*.svc.cluster.local`, `*.internal`, a single-label name, or a loopback/private IP literal), and must carry no query string or fragment. Anything else refuses startup — `METRICS_URL` included, keyless or not: off-cluster plaintext leaves the budget history both readable and rewritable in flight. `CONSOLE_OIDC_ISSUER` is stricter still: https only, no cluster-local exemption, and no userinfo (it is printed verbatim in the startup config log).
+
+Logs are JSON, one object per line on stdout, so structured fields (`sub`,
+`op`, `issuer`, `cause`, ...) are queryable as `fields.<name>` rather than
+scraped from text. `RUST_LOG` defaults to `ops_console=info,tower_http=info`.
+Untrusted values are recorded in Debug form, so their JSON string keeps the
+quotes and escapes: a subject logs as `"sub":"\"user-123\""`, and the value
+is `user-123`, not `"user-123"`.
 
 ### Allowlisting an admin
 
-1. Have them log in once (they'll get a 403 page); the rejected `sub` is in
-   the console log line `login rejected: subject not allowlisted`.
-   (Or read the `sub` from the IdP's user admin.)
+1. Have them log in once (they'll get a 403 page); the rejected subject is
+   in `fields.sub` on the console's `login rejected: subject not
+   allowlisted` record. It is a Debug string, so strip the inner quotes *and*
+   decode its backslash escapes (`a\\b` is `a\b`) — `jq -r '.fields.sub |
+   fromjson'` on the record does both. A quoted or still-escaped entry never
+   matches and the 403 persists silently. (Or read the `sub` from the IdP's
+   user admin.)
 2. Add it to `CONSOLE_ALLOWED_SUBJECTS` (comma-separated) and roll the pod.
 
 ## Ālaya module
@@ -64,23 +78,64 @@ CSP (`default-src 'none'`).
 - **Auth state** — read-only view of alaya-server's `GET /auth/config`:
   principal × operation matrix + OIDC issuer/audience/allowlist.
 
+## anthropic-lb module (read-only)
+
+Scope: the console **renders** LB state; budgets, limits, endpoints and
+client identities change through GitOps only. The console has **no write
+route to the LB**, the LB exposes no admin write API, and this module must
+not grow one. Values render with their provenance; limits are
+"TOML, GitOps".
+
+- **Fleet** — routing strategy, replicas seen, shared-state (Redis) health,
+  pooled headroom, cumulative upstream transport errors. Source:
+  `GET /_stats`. Only fleet-wide values render: `/_stats` also carries
+  process-local counters (per-consumer request rates, per-endpoint burn
+  rates) that describe one random replica behind a Service, so they are
+  deliberately left out.
+- **Per-client budget burn** — today's fleet-wide used / limit with a
+  progress bar (`/_stats` → `cluster.budget_usage`, the Redis aggregate).
+  When that aggregate is absent or empty the card falls back to the
+  replica-local `client_budgets` mirror and says so with a "replica-local"
+  badge — that mirror resets on pod restart and undercounts the fleet. Plus
+  a 7-column history: the daily peak of `anthropic_cluster_budget_used` per
+  UTC day, today's column running. History is one `query_range` against
+  `METRICS_URL` (`max by (client) (max_over_time(…[23h58m]))` at 23:59 UTC
+  of each day — the trimmed window keeps the first post-midnight scrape,
+  which can still carry yesterday's total, out of today's peak). No history
+  store in the console, no dashboard embeds.
+- **Upstream accounts** — per endpoint: 5-hour / 7-day window utilisation,
+  hard-limit / throttle status, remaining requests, next 5h reset; hottest
+  first.
+
+Each card degrades on its own: a dark metrics store leaves live headroom
+up, an LB outage leaves the burn history up. Every upstream client in the
+console refuses redirects (no credential ever rides a 3xx off-host).
+
 ## Deploy
 
 Deployed from the private infra repo's Kubernetes manifests (LAB-2712).
-`deploy/console/ops-console.yaml` here is a mirror of the deployed manifest —
-keep them in sync. Shape: Deployment +
-Service + NetworkPolicy — own label, egress pinned to alaya-server + IdP :443
-(DNS via the namespace `allow-dns` policy), **no dragonfly egress**, image
-digest-pinned via the `flux-system:alaya` imagepolicy marker so the console
-rolls with alaya-server. The binary ships in the existing public
+`deploy/console/ops-console.yaml` here is the runtime-contract template
+(Deployment + Service: image, command, env, probes, security context). The
+deployed manifest — including the NetworkPolicy / egress allowlist, real
+hostnames and the digest pin — lives in the private infra repo and is the
+truth; cluster topology is not published from this repository. Binding
+shape wherever this binary runs: own label, own NetworkPolicy with egress
+pinned to the module upstreams + IdP :443 only, **no dragonfly egress**,
+image digest-pinned via the `flux-system:alaya` imagepolicy marker so the
+console rolls with alaya-server. The binary ships in the existing public
 `ghcr.io/27b-io/alaya` image (`command: ["ops-console"]`), pulled anonymously
 since LAB-3719 — no pull secret.
 
-Config split: `CONSOLE_PUBLIC_URL`, `CONSOLE_OIDC_ISSUER`, `ALAYA_URL` are plain
-env in the manifest; `CONSOLE_OIDC_CLIENT_ID`, `CONSOLE_OIDC_CLIENT_SECRET`,
-`CONSOLE_ALLOWED_SUBJECTS`, `CONSOLE_SESSION_SECRET`, and `ALAYA_API_KEY` come
-from a secret manager, rendered by ESO into Secret `ops-console-env`.
-Editing the Secret rolls the pod (Reloader annotation).
+Config split: `CONSOLE_PUBLIC_URL`, `CONSOLE_OIDC_ISSUER`, `ALAYA_URL`,
+`LB_URL`, `METRICS_URL` are plain env in the manifest;
+`CONSOLE_OIDC_CLIENT_ID`, `CONSOLE_OIDC_CLIENT_SECRET`,
+`CONSOLE_ALLOWED_SUBJECTS`, `CONSOLE_SESSION_SECRET`, `ALAYA_API_KEY` and
+`LB_API_KEY` come from a secret manager, rendered by ESO into Secret
+`ops-console-env`. Editing the Secret rolls the pod (Reloader annotation).
+`LB_URL`, `METRICS_URL` (manifest) and `LB_API_KEY` (Secret) are one
+all-or-nothing group: land all three in the same change — a half-set group
+refuses startup by design (see the `LB_URL` comment in
+`deploy/console/ops-console.yaml`).
 
 Tailnet HTTPS — order matters: define `svc:ops` in the Tailscale admin
 console **first**, then on the lab node run `tailscale serve --bg --service
@@ -96,6 +151,9 @@ kubectl -n mcp exec deploy/ops-console -- sh -c '
   curl -sS -m3 telnet://alaya-bridge.mcp.svc:3000; echo bridge_exit=$?;
   curl -sS -m3 -o /dev/null -w "alaya=%{http_code}\n" http://alaya-server.mcp.svc:3001/health'
 ```
+
+The equivalent probes for the LB pane's two upstreams live with the deployed
+manifest.
 
 ## Development
 

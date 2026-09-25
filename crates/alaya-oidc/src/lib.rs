@@ -8,6 +8,8 @@
 //! - issuer normalisation (one trailing slash) and RFC 6454 origin parsing
 //! - discovery over a redirect-disabled, timeout-bounded client; the document's
 //!   `issuer` must echo the configured one (OIDC Core §4.3)
+//! - every discovery and JWKS body read under a byte cap, so a hostile IdP
+//!   response cannot OOM either binary
 //! - `jwks_uri` must be same-origin with the issuer and https (http only for a
 //!   loopback issuer, so local dev works); the relying party applies the same
 //!   rule to its own endpoints through [`same_origin_https`]
@@ -20,7 +22,9 @@
 //!   normalised — never delegated to jsonwebtoken's exact match
 //!
 //! What stays with the consumer is role-specific: the audience it binds to and
-//! the max-token-age cap (server); PKCE, nonce, token exchange (console).
+//! the max-token-age cap (server); PKCE, nonce, token exchange (console). So
+//! does logging: [`Error::Provider`] carries the cause, and each consumer
+//! decides how loudly to record it.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -38,21 +42,93 @@ const JWKS_COOLDOWN: Duration = Duration::from_secs(30);
 /// Clock-skew leeway applied to `exp` (and, server-side, to `iat`).
 pub const CLOCK_SKEW_LEEWAY_SECS: u64 = 60;
 
+/// Ceiling on a discovery or JWKS body. reqwest reads to EOF with no default
+/// cap, and the request timeout bounds the seconds, not the bytes a fast link
+/// delivers inside them — so without this a substituted IdP answering with an
+/// endless body grows the heap until the OOM killer takes the pod. Honest
+/// documents are kilobytes; this matches the console's cap on every other
+/// upstream body.
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug)]
 pub enum Error {
-    /// Any validation failure. The message is a server-safe `&'static str`
+    /// The token was refused. The message is a server-safe `&'static str`
     /// (never token internals); the consumer decides whether it reaches a
     /// client — the server returns a generic 401, the console renders it.
     Invalid(&'static str),
+    /// The provider failed: unreachable, a non-2xx, an oversized or
+    /// unparseable body, or a discovery document that broke a rule. `op` is
+    /// the same kind of server-safe literal and is all `Display` renders;
+    /// `cause` is for an operator log, never a client.
+    Provider { op: &'static str, cause: Cause },
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Invalid(m) => write!(f, "{m}"),
+            Error::Invalid(op) | Error::Provider { op, .. } => write!(f, "{op}"),
         }
     }
 }
+
+/// Why an [`Error::Provider`] happened. Wherever it carries text that text is
+/// IdP-influenced, so a consumer that logs it records it escaped (`?`, not
+/// `%`) and bounded.
+///
+/// Closed on purpose: no variant holds a `serde_json::Error`, because its
+/// `Display` embeds the offending input — and a body that is a bare JSON
+/// string makes the whole body that input. [`ParseFailure`] keeps the shape.
+#[derive(Debug)]
+pub enum Cause {
+    Transport(reqwest::Error),
+    Status(reqwest::StatusCode),
+    /// The body ran past [`MAX_BODY_BYTES`]; the read was abandoned there.
+    TooLarge,
+    Parse(ParseFailure),
+    /// The discovery-document value that broke a rule — attacker-chosen text.
+    Document(String),
+}
+
+/// Where and how a body failed to parse, never what it said: a fieldless
+/// enum and two `usize` cannot carry input, so the types are the proof.
+#[derive(Debug, Clone, Copy)]
+pub struct ParseFailure {
+    pub category: serde_json::error::Category,
+    pub line: usize,
+    pub column: usize,
+}
+
+impl From<&serde_json::Error> for ParseFailure {
+    fn from(e: &serde_json::Error) -> Self {
+        ParseFailure {
+            category: e.classify(),
+            line: e.line(),
+            column: e.column(),
+        }
+    }
+}
+
+/// The reasons one provider fetch can fail with, in pipeline order.
+struct FetchOps {
+    send: &'static str,
+    status: &'static str,
+    read: &'static str,
+    parse: &'static str,
+}
+
+const DISCOVERY_OPS: FetchOps = FetchOps {
+    send: "discovery failed",
+    status: "discovery status",
+    read: "discovery read",
+    parse: "discovery parse",
+};
+
+const JWKS_OPS: FetchOps = FetchOps {
+    send: "jwks fetch failed",
+    status: "jwks status",
+    read: "jwks read",
+    parse: "jwks parse",
+};
 
 impl std::error::Error for Error {}
 
@@ -193,6 +269,14 @@ impl Provider {
             .timeout(Duration::from_secs(10))
             .build()
             .expect("failed to build OIDC http client");
+        Self::with_client(issuer, http)
+    }
+
+    /// [`Provider::new`] over the consumer's own client, for a consumer whose
+    /// every upstream shares one builder so a hardening knob added there
+    /// cannot miss the IdP. The client MUST refuse redirects and bound its
+    /// timeouts, as `new`'s does; passing one is taking that on.
+    pub fn with_client(issuer: &str, http: reqwest::Client) -> Self {
         // Seeded in the past so the first real fetch isn't blocked by the cooldown.
         let seeded = Instant::now()
             .checked_sub(JWKS_COOLDOWN * 2)
@@ -226,27 +310,24 @@ impl Provider {
             return Ok(d);
         }
         let url = format!("{}/.well-known/openid-configuration", self.issuer);
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|_| Error::Invalid("discovery failed"))?;
-        if !resp.status().is_success() {
-            return Err(Error::Invalid("discovery status"));
-        }
-        let disc: Discovery = resp
-            .json()
-            .await
-            .map_err(|_| Error::Invalid("discovery parse"))?;
+        let disc: Discovery = self.fetch_json(&url, &DISCOVERY_OPS).await?;
 
         // OIDC Core §4.3: prevents a sibling tenant on a shared origin from
         // serving a discovery document that quietly substitutes keys.
         if normalize_issuer(&disc.issuer) != self.issuer {
-            return Err(Error::Invalid("discovery issuer mismatch"));
+            return Err(Error::Provider {
+                op: "discovery issuer mismatch",
+                cause: Cause::Document(disc.issuer),
+            });
         }
-        same_origin_https(&self.issuer, &disc.jwks_uri)
-            .map_err(|_| Error::Invalid("jwks_uri not same-origin"))?;
+        // Off the issuer's origin is the substituted-IdP signal; the cause
+        // names the endpoint, which the bare reason cannot.
+        if same_origin_https(&self.issuer, &disc.jwks_uri).is_err() {
+            return Err(Error::Provider {
+                op: "jwks_uri not same-origin",
+                cause: Cause::Document(format!("jwks_uri={}", disc.jwks_uri)),
+            });
+        }
 
         *self.discovery.write().await = Some(disc.clone());
         Ok(disc)
@@ -320,22 +401,41 @@ impl Provider {
     /// Discover (if needed) and fetch the JWKS, swapping the key cache.
     async fn refetch_jwks(&self) -> Result<(), Error> {
         let jwks_uri = self.discovery().await?.jwks_uri;
-        let resp = self
-            .http
-            .get(&jwks_uri)
-            .send()
-            .await
-            .map_err(|_| Error::Invalid("jwks fetch failed"))?;
-        if !resp.status().is_success() {
-            return Err(Error::Invalid("jwks status"));
-        }
-        let jwks: Jwks = resp
-            .json()
-            .await
-            .map_err(|_| Error::Invalid("jwks parse"))?;
+        let jwks: Jwks = self.fetch_json(&jwks_uri, &JWKS_OPS).await?;
         *self.keys.write().await = key_map(jwks.keys);
         Ok(())
     }
+
+    /// GET `url` and parse its JSON body, the body read under
+    /// [`MAX_BODY_BYTES`]. Every failure is an [`Error::Provider`] tagged
+    /// with the matching reason from `ops`.
+    async fn fetch_json<T: DeserializeOwned>(&self, url: &str, ops: &FetchOps) -> Result<T, Error> {
+        let fail = |op, cause| Error::Provider { op, cause };
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| fail(ops.send, Cause::Transport(e)))?;
+        if !resp.status().is_success() {
+            return Err(fail(ops.status, Cause::Status(resp.status())));
+        }
+        let body = read_capped(resp).await.map_err(|c| fail(ops.read, c))?;
+        serde_json::from_slice(&body).map_err(|e| fail(ops.parse, Cause::Parse((&e).into())))
+    }
+}
+
+/// Read a body, refusing anything past [`MAX_BODY_BYTES`]. Overrun drops the
+/// connection mid-body, so nothing past the cap is ever buffered.
+async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, Cause> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(Cause::Transport)? {
+        if buf.len() + chunk.len() > MAX_BODY_BYTES {
+            return Err(Cause::TooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 /// Index JWKs by `kid`; keys without one are unaddressable and dropped.
@@ -440,5 +540,40 @@ mod tests {
         assert!(same_origin_https("https://id.27b.io", "http://id.27b.io/jwks").is_err());
         // Loopback issuer may use http endpoints (local dev).
         assert!(same_origin_https("http://localhost:8787", "http://localhost:8787/jwks").is_ok());
+    }
+
+    /// A substituted IdP answering discovery with a body past the cap is
+    /// refused at the read, not buffered: the pod's heap is the target.
+    /// Served by hand over loopback so the crate needs no HTTP-server dev-dep.
+    #[tokio::test]
+    async fn oversized_discovery_body_is_refused_not_buffered() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _request_len = sock.read(&mut req).await.unwrap();
+            let len = MAX_BODY_BYTES + 1024;
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {len}\r\n\r\n");
+            sock.write_all(head.as_bytes()).await.unwrap();
+            // The client is meant to hang up mid-body, so the write failing
+            // with a reset is the outcome under test, not an error.
+            let _hung_up = sock.write_all(&vec![b' '; len]).await;
+        });
+
+        let err = Provider::new(&issuer).discovery().await.err();
+        server.abort();
+        assert!(
+            matches!(
+                err,
+                Some(Error::Provider {
+                    op: "discovery read",
+                    cause: Cause::TooLarge
+                })
+            ),
+            "{err:?}"
+        );
     }
 }

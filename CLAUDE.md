@@ -20,7 +20,7 @@ Rust rewrite of the mcp-memory-service API layer. Deployed on k3s as a native se
 | **alaya-bridge** | native only | Done | FalkorDB typed RPC bridge (axum + redis), 18 endpoints |
 | **alaya-backends** | wasm32 + native | Done | Trait definitions + HTTP clients (Qdrant, Embedding, Graph) |
 | **alaya-core** | wasm32 + native | Done | MemoryService orchestration (all 11 MCP tools), 5 integration tests |
-| **alaya-oidc** | native only | Done | Shared OIDC discovery + JWKS hardening (issuer echo, same-origin-https, cooldown-before-fetch, alg allowlist) consumed by alaya-server (RS) and ops-console (RP) — #82 |
+| **alaya-oidc** | native only | Done | Shared OIDC discovery + JWKS hardening (issuer echo, same-origin-https, cooldown-before-fetch, capped body reads, alg allowlist) consumed by alaya-server (RS) and ops-console (RP) — #82 |
 | **alaya-server** | native only | Done | REST API + MCP Streamable HTTP (axum, channel-based, 9 endpoints + /mcp) |
 | **ops-console** | native only | Done | OIDC-gated admin console (Leptos SSR + vendored Rust/UI, LAB-1684) — memory curation UI over alaya-server's REST API; see `crates/ops-console/README.md` |
 | **alaya-worker** | wasm32 | Deferred | CF Worker entry point (reqwest-wasm unreliable on Workers, native server sufficient) |
@@ -152,6 +152,7 @@ JUDGE_URL=                               # contradiction judge; URL and key fall
 JUDGE_API_KEY=                           #   (so SUMMARY_URL alone enables the judge). Both unset = judge disabled.
 JUDGE_MODEL=claude-sonnet-5              #   Own default, not SUMMARY_MODEL: Haiku fails the golden-set precision bar.
                                          #   Advisory: verdicts annotate CONTRADICTS edges, never memory payloads.
+JUDGE_DAILY_CAP=1000                     # store-path judge spend budget per UTC day; overflow fails closed to unjudged (resets on restart)
 RERANK_URL=                              # optional — empty disables cross-encoder rerank
 RERANK_API_KEY=                          # optional
 RERANK_TOP_N=20                          # how many RRF candidates to rerank

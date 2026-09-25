@@ -15,7 +15,7 @@ tokio = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["json"] }
 reqwest = { workspace = true, features = ["rustls-tls"] }
 sha2 = { workspace = true }
 
@@ -39,3 +39,7 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # Mint encrypted session cookies in tests (same crate/version axum-extra uses).
 cookie = { version = "0.18", features = ["private"] }
+# Token minting for testkit — verification itself lives in alaya-oidc.
+jsonwebtoken = { workspace = true }
+# P-256 test signing key generated at runtime; already jsonwebtoken's backend.
+aws-lc-rs = "1"

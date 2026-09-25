@@ -227,10 +227,10 @@ mod tests {
     /// Assert the verifier rejected with EXACTLY this reason. Exact-match (not
     /// substring) so a test can't pass on a different-but-also-failing branch
     /// — e.g. "iss" is a substring of "missing kid", and "kid" of both
-    /// "missing kid" and "unknown kid (cooldown)".
+    /// "missing kid" and "unknown kid (cooldown)". Compared on `Display`, which
+    /// is the bare reason for a refused token and a failed provider alike.
     fn assert_invalid(err: OidcError, expected: &str) {
-        let OidcError::Invalid(m) = err;
-        assert_eq!(m, expected, "wrong rejection reason");
+        assert_eq!(err.to_string(), expected, "wrong rejection reason");
     }
 
     #[tokio::test]

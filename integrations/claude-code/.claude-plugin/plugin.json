@@ -1,7 +1,7 @@
 {
   "name": "alaya-memory-hooks",
   "displayName": "Ālaya Memory Hooks",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Stop-hook memory extraction and PreCompact save-reminder that persist Claude Code session knowledge into an Ālaya long-term memory server.",
   "author": {
     "name": "27b.io",

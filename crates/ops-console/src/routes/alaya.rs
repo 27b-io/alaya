@@ -12,23 +12,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::AppError;
-use crate::routes::{fmt_epoch, short_hash, validate_hash};
+use crate::routes::{fmt_epoch, short_hash, validate_hash, vf, vs};
 use crate::session::{Flash, Session, flash_cookie, take_flash};
 use crate::state::AppState;
 use crate::ui::*;
 
 // ─── Value helpers (defensive rendering over upstream JSON) ────────────────
-
-fn vs(v: &Value, key: &str) -> String {
-    v.get(key)
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string()
-}
-
-fn vf(v: &Value, key: &str) -> f64 {
-    v.get(key).and_then(|x| x.as_f64()).unwrap_or(0.0)
-}
 
 fn excerpt(v: &Value, max: usize) -> String {
     let text = v
@@ -603,7 +592,7 @@ pub async fn delete_memory(
     session.verify_csrf(&form.csrf)?;
     validate_hash(&hash)?;
     state.alaya.delete(&hash).await?;
-    tracing::info!(sub = %session.sub, hash = %hash, "memory deleted");
+    tracing::info!(sub = ?session.sub, hash = %hash, "memory deleted");
     Ok(flash_redirect(
         jar,
         state.secure_cookies(),
@@ -725,7 +714,7 @@ pub async fn supersede_submit(
         .alaya
         .supersede(&form.old_hash, &form.new_hash, form.reason.trim())
         .await?;
-    tracing::info!(sub = %session.sub, old = %form.old_hash, new = %form.new_hash, "memory superseded");
+    tracing::info!(sub = ?session.sub, old = %form.old_hash, new = %form.new_hash, "memory superseded");
     Ok(flash_redirect(
         jar,
         state.secure_cookies(),
@@ -777,11 +766,52 @@ pub async fn correct_and_supersede(
             "tags": mem.get("tags"),
         }))
         .await?;
-    let new_hash = store_res
+    // alaya-server's answer, echoed verbatim — and until here the one field
+    // in this crate recorded with `%` that never met a validator. The
+    // plain-text subscriber writes a `Display` field raw, so a `\n` in it
+    // forges whole pod-log records in the audit trail for this very write.
+    // It has to be a 64-hex hash to survive `memory_href` and `supersede`
+    // anyway, and it makes the `short_hash` below honest.
+    //
+    // One arm for absent, mistyped and malformed alike: the store has
+    // already committed in every one of them, so all three owe the operator
+    // the same thing — which memory is orphaned and how to find it. Splitting
+    // them on JSON type gave the same upstream fault opposite guidance.
+    let Some(new_hash) = store_res
         .get("content_hash")
         .and_then(|h| h.as_str())
-        .ok_or_else(|| AppError::Upstream("store returned no content_hash".into()))?
-        .to_string();
+        .filter(|h| validate_hash(h).is_ok())
+        .map(str::to_string)
+    else {
+        // Capped: this is upstream text bounded only by `MAX_BODY_BYTES`, so
+        // logging it whole hands the compromised upstream this guard exists
+        // for a megabyte of pod log per attempt — the flood lever
+        // `warn_idp_failure` caps `cause` against. By chars, since a byte
+        // split could land mid-codepoint and panic.
+        let full = store_res
+            .get("content_hash")
+            .and_then(|h| h.as_str())
+            .unwrap_or("<absent or not a string>");
+        let mut answered: String = full.chars().take(64).collect();
+        // Marked, exactly as `warn_idp_failure` marks its own cut and for the
+        // same reason: an unmarked cut renders as a complete-looking wrong
+        // value. Here the cap IS 64, a well-formed hash's own length, so a
+        // 65-char answer whose first 64 are valid hex would log as a perfect
+        // hash on a line saying there was no usable one — reading as though
+        // `validate_hash` had rejected a good hash, and inviting a manual
+        // supersede onto an upstream-chosen target. Compared by bytes: a
+        // char-prefix is shorter in bytes too, and `full` is upstream text.
+        if answered.len() < full.len() {
+            answered.push('…');
+        }
+        tracing::error!(sub = ?session.sub, old = %hash, answered = ?answered, "store returned no usable content_hash");
+        return Err(AppError::Upstream(format!(
+            "the correction WAS stored but alaya-server returned no usable id for it, \
+             so {} could not be superseded — find the correction by searching for its \
+             text, then supersede from the original memory's page",
+            short_hash(&hash),
+        )));
+    };
     if new_hash == hash {
         return Err(AppError::BadRequest(
             "corrected content is identical to the original".into(),
@@ -796,7 +826,7 @@ pub async fn correct_and_supersede(
         .supersede(&hash, &new_hash, form.reason.trim())
         .await
     {
-        tracing::error!(sub = %session.sub, old = %hash, new = %new_hash, "correction stored but supersede failed");
+        tracing::error!(sub = ?session.sub, old = %hash, new = ?new_hash, "correction stored but supersede failed");
         let detail = match e {
             AppError::Upstream(d) => d,
             _ => "supersede failed".to_string(),
@@ -808,7 +838,7 @@ pub async fn correct_and_supersede(
             short_hash(&hash),
         )));
     }
-    tracing::info!(sub = %session.sub, old = %hash, new = %new_hash, "corrected + superseded");
+    tracing::info!(sub = ?session.sub, old = %hash, new = ?new_hash, "corrected + superseded");
     Ok(flash_redirect(
         jar,
         state.secure_cookies(),
@@ -873,7 +903,7 @@ async fn relation_action(
             Some(&form.relation_type),
         )
         .await?;
-    tracing::info!(sub = %session.sub, action = %action, source = %form.content_hash, target = %form.target_hash, rel = %form.relation_type, "relation changed");
+    tracing::info!(sub = ?session.sub, action = %action, source = %form.content_hash, target = %form.target_hash, rel = %form.relation_type, "relation changed");
     let back = crate::routes::safe_next(&form.back);
     Ok(flash_redirect(
         jar,
@@ -1125,7 +1155,7 @@ pub async fn merge_submit(
         .and_then(|e| e.as_array())
         .map(|a| a.len())
         .unwrap_or(0);
-    tracing::info!(sub = %session.sub, canonical = %form.canonical_hash, merged, errors, "duplicates merged");
+    tracing::info!(sub = ?session.sub, canonical = %form.canonical_hash, merged, errors, "duplicates merged");
     let msg = if errors > 0 {
         format!(
             "Merged {merged} duplicates into {} ({errors} errors — see server logs).",
@@ -1335,7 +1365,7 @@ pub async fn keep_both_submit(
         .alaya
         .keep_both(&form.memory_a_hash, &form.memory_b_hash)
         .await?;
-    tracing::info!(sub = %session.sub, a = %form.memory_a_hash, b = %form.memory_b_hash, "contradiction kept both");
+    tracing::info!(sub = ?session.sub, a = %form.memory_a_hash, b = %form.memory_b_hash, "contradiction kept both");
     Ok(flash_redirect(
         jar,
         state.secure_cookies(),
