@@ -21,34 +21,47 @@
 use std::time::Duration;
 
 use alaya_oidc::{
-    Cause, Error as OidcError, IssuedClaims, ParseFailure, Provider, same_origin_https,
+    Cause, Discovery, Error as OidcError, IssuedClaims, ParseFailure, Provider, same_origin_https,
 };
 use base64::Engine;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+/// The page-safe reason a login step failed. By the time one exists the
+/// failure has been logged, once, by the helper that built it — so, unlike
+/// `alaya_oidc::Error`, it carries no cause and no refusal-vs-outage class.
+#[derive(Debug)]
+pub struct OidcRpError(pub &'static str);
+
+impl std::fmt::Display for OidcRpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Log an id_token refusal, then return it — the verification-half twin of
 /// `warn_idp_failure`. Named for the side effect: every call emits a warning.
 ///
-/// Everything `verify_id_token` and its callees refuse — a bad header, a
-/// disallowed alg, an unknown kid, a failed decode, an iss or nonce mismatch,
-/// an oversized `sub`, a key the JWK cannot build — returned silently, and
-/// under a substituted-IdP threat model those refusals are the highest-signal
-/// events this console can observe.
+/// Every id_token refusal — a bad header, a disallowed alg, an unknown kid, a
+/// failed decode, an iss or nonce mismatch, an oversized `sub`, a key the JWK
+/// cannot build — comes through here, and under a substituted-IdP threat
+/// model those refusals are the highest-signal events this console can
+/// observe. The shared verifier's refusals arrive via `logged`; the nonce and
+/// `sub` checks call it directly.
 ///
-/// It sits at each refusal rather than around `exchange_and_verify`'s call
-/// site because that call opens with discovery: a wrapper out there fires on
-/// every IdP transport and discovery outage as well, and those arms already
-/// warn — so each outage logs twice, the second line asserting an id_token
-/// was rejected when none was ever received. `logged` keeps the two apart for
-/// what the shared layer returns: `Invalid` is a refusal, `Provider` an outage.
+/// It is never a wrapper around `exchange_and_verify`'s call site, because
+/// that call opens with discovery: a wrapper out there fires on every IdP
+/// transport and discovery outage as well, and those arms already warn — so
+/// each outage logs twice, the second line asserting an id_token was rejected
+/// when none was ever received. `logged` keeps the two apart by the class the
+/// shared layer returns: `Invalid` is a refusal, `Provider` an outage.
 ///
 /// Safe by type: the payload is a `&'static str` literal, so no IdP-supplied
 /// byte can reach the log through it. Use `ok_or_else`, never `ok_or` — the
 /// eager form logs a refusal on the success path.
-fn warn_rejected(op: &'static str) -> OidcError {
+fn warn_rejected(op: &'static str) -> OidcRpError {
     tracing::warn!(op, "oidc: id_token rejected");
-    OidcError::Invalid(op)
+    OidcRpError(op)
 }
 
 /// The closed set of causes `warn_idp_failure` may print verbatim.
@@ -59,8 +72,8 @@ fn warn_rejected(op: &'static str) -> OidcError {
 /// offending input into its own message, and for a token-endpoint body that
 /// input can be a live id_token. It has no impl here, so routing a parse
 /// failure to the wrong helper stops compiling. That catches the accident,
-/// not the act: `String` has an impl — `format!("{which}={endpoint}")` needs
-/// one — so `warn_idp_failure(op, e.to_string())` would still build. The
+/// not the act: `String` has an impl — `Cause::Document` carries one — so
+/// `warn_idp_failure(op, e.to_string())` would still build. The
 /// claim is that nobody reaches the leak by reflex, not that it is sealed.
 trait SafeCause: std::fmt::Display {}
 impl SafeCause for reqwest::Error {}
@@ -176,13 +189,15 @@ impl OidcRp {
     /// recorded the same way regardless: `validate_issuer` refuses userinfo
     /// and a non-https scheme, and says nothing about control characters, so
     /// the old "it is config, therefore safe" argument did not hold up.
-    fn warn_idp_failure(&self, op: &'static str, cause: impl SafeCause) -> OidcError {
+    fn warn_idp_failure(&self, op: &'static str, cause: impl SafeCause) -> OidcRpError {
         // Recorded with `?`, not `%`, and that is not cosmetic. Two callers
-        // pass a string lifted straight out of the discovery document. The
+        // pass a string lifted straight out of the discovery document. A
         // plain-text subscriber writes a field recorded as `Display`
         // verbatim, so one `\n` in it emits a second, wholly attacker-authored
         // line that reads like a real record; recorded as `Debug` the same
-        // string is escaped and quoted onto one line. Capped because the only
+        // string is escaped and quoted onto one line. The binary's JSON
+        // encoder escapes it too (`main.rs` pins that); `?` keeps this call
+        // site safe under any encoder. Capped because the only
         // other bound on it is the 8 MiB body cap, which is a log-flood lever
         // — by chars, since a byte split could land mid-codepoint and panic.
         let full = cause.to_string();
@@ -200,14 +215,15 @@ impl OidcRp {
             cause = ?cause,
             "oidc: identity provider request failed"
         );
-        OidcError::Invalid(op)
+        OidcRpError(op)
     }
 
     /// The parse-failure twin of `warn_idp_failure`: logs the SHAPE of the
     /// error — category and position — and never its `Display`.
     ///
-    /// `serde_json` renders the unexpected value into its message, and the
-    /// bodies parsed here are the token endpoint's and the JWKS. A body that
+    /// `serde_json` renders the unexpected value into its message. The token
+    /// response is parsed here; discovery and the JWKS are parsed in
+    /// `alaya-oidc` and arrive through `logged` as the same shape. A body that
     /// is a bare JSON string — a broken or hostile IdP answering
     /// `"<id_token>"` instead of `{"id_token": "…"}` — makes the WHOLE
     /// string the unexpected value, so `Display` would put a live token in
@@ -215,16 +231,15 @@ impl OidcRp {
     /// Typing every IdP-sourced field as `String` does not save it: that
     /// argument covers the fields, not the top-level value.
     ///
-    /// `ParseFailure` keeps syntax vs data vs early EOF, and where. None of
-    /// it can carry input: a fieldless enum and two `usize`, so the types
-    /// are the proof, not a test.
+    /// `ParseFailure` keeps syntax vs data vs early EOF, and where — and, by
+    /// type, nothing else (see its doc).
     ///
     /// It is not free. The commonest real failure — the token endpoint
     /// answering `{"error":"invalid_grant"}` — used to log ``missing field
     /// `id_token` ``, which names the problem and is built from the derive's
     /// `&'static str`, so it was never unsafe. `serde_json` offers no way to
     /// tell that arm from the input-bearing ones, so the safe arms lose too.
-    fn warn_idp_parse_failure(&self, op: &'static str, e: ParseFailure) -> OidcError {
+    fn warn_idp_parse_failure(&self, op: &'static str, e: ParseFailure) -> OidcRpError {
         tracing::warn!(
             op,
             issuer = ?self.provider.issuer(),
@@ -233,7 +248,7 @@ impl OidcRp {
             column = e.column,
             "oidc: identity provider response did not parse"
         );
-        OidcError::Invalid(op)
+        OidcRpError(op)
     }
 
     /// Record a shared-layer failure once, by class, at the call that
@@ -241,7 +256,7 @@ impl OidcRp {
     /// provider through the IdP helpers with the cause the layer carried
     /// back. The match is exhaustive on purpose — a new `Cause` must pick
     /// its log line before this compiles.
-    fn logged(&self, e: OidcError) -> OidcError {
+    fn logged(&self, e: OidcError) -> OidcRpError {
         match e {
             OidcError::Invalid(op) => warn_rejected(op),
             OidcError::Provider { op, cause } => match cause {
@@ -258,12 +273,24 @@ impl OidcRp {
     /// and both same-origin-https with the issuer. Checked together on every
     /// use so a bad `token_endpoint` is refused when the login starts, before
     /// the user is ever redirected.
-    async fn endpoints(&self) -> Result<(String, String), OidcError> {
+    async fn endpoints(&self) -> Result<(String, String), OidcRpError> {
         let disc = self
             .provider
             .discovery()
             .await
             .map_err(|e| self.logged(e))?;
+        let checked = self.rp_endpoints(disc);
+        if checked.is_err() {
+            // The shared layer cached this document on its own rules, which
+            // do not cover these two endpoints. Forget it, so the next login
+            // re-fetches and an IdP that corrects its document recovers
+            // without a restart.
+            self.provider.forget_discovery().await;
+        }
+        checked
+    }
+
+    fn rp_endpoints(&self, disc: Discovery) -> Result<(String, String), OidcRpError> {
         let authorization = disc.authorization_endpoint.ok_or_else(|| {
             self.warn_idp_failure("discovery missing authorization_endpoint", "absent")
         })?;
@@ -271,19 +298,15 @@ impl OidcRp {
             .token_endpoint
             .ok_or_else(|| self.warn_idp_failure("discovery missing token_endpoint", "absent"))?;
         // A discovery document pointing an endpoint off the issuer's origin
-        // is the substituted-IdP signal (OIDC Core §4.3). The cause names the
-        // value, which the page reason cannot: this is the rejection an
+        // is the substituted-IdP signal (OIDC Core §4.3). The cause records
+        // the value, which the page reason cannot: this is the rejection an
         // operator most needs a record of.
-        for (op, which, endpoint) in [
-            (
-                "authorization_endpoint not same-origin",
-                "authorization_endpoint",
-                &authorization,
-            ),
-            ("token_endpoint not same-origin", "token_endpoint", &token),
+        for (op, endpoint) in [
+            ("authorization_endpoint not same-origin", &authorization),
+            ("token_endpoint not same-origin", &token),
         ] {
             same_origin_https(self.provider.issuer(), endpoint)
-                .map_err(|_| self.warn_idp_failure(op, format!("{which}={endpoint}")))?;
+                .map_err(|_| self.warn_idp_failure(op, endpoint))?;
         }
         Ok((authorization, token))
     }
@@ -294,11 +317,11 @@ impl OidcRp {
         state: &str,
         nonce: &str,
         pkce_verifier: &str,
-    ) -> Result<String, OidcError> {
+    ) -> Result<String, OidcRpError> {
         let (authorization_endpoint, _) = self.endpoints().await?;
         let mut u: url::Url = authorization_endpoint
             .parse()
-            .map_err(|_| OidcError::Invalid("authorization_endpoint form"))?;
+            .map_err(|_| OidcRpError("authorization_endpoint form"))?;
         u.query_pairs_mut()
             .append_pair("response_type", "code")
             .append_pair("client_id", &self.client_id)
@@ -318,7 +341,7 @@ impl OidcRp {
         code: &str,
         pkce_verifier: &str,
         expected_nonce: &str,
-    ) -> Result<IdClaims, OidcError> {
+    ) -> Result<IdClaims, OidcRpError> {
         let (_, token_endpoint) = self.endpoints().await?;
         let resp = self
             .provider
@@ -340,7 +363,7 @@ impl OidcRp {
         // `body_text` logs its own failures, so the refusal is not logged twice.
         let body = crate::http::body_text("oidc token response", resp)
             .await
-            .map_err(|_| OidcError::Invalid("token response read"))?;
+            .map_err(|_| OidcRpError("token response read"))?;
         let tokens: TokenResponse = serde_json::from_str(&body)
             .map_err(|e| self.warn_idp_parse_failure("token response parse", (&e).into()))?;
 
@@ -352,7 +375,7 @@ impl OidcRp {
         Ok(claims)
     }
 
-    async fn verify_id_token(&self, token: &str) -> Result<IdClaims, OidcError> {
+    async fn verify_id_token(&self, token: &str) -> Result<IdClaims, OidcRpError> {
         // ID token audience is the RP's client_id (OIDC Core §3.1.3.7 #3).
         let mut claims: IdClaims = self
             .provider
@@ -381,7 +404,7 @@ impl OidcRp {
 mod tests {
     use super::*;
     use crate::testlog::{LogBuf, separators_in};
-    use alaya_oidc::{Discovery, Jwk};
+    use alaya_oidc::Jwk;
 
     #[test]
     fn pkce_challenge_matches_rfc7636_appendix_b() {
@@ -418,10 +441,11 @@ mod tests {
 
     /// A substituted IdP must not be able to write its own log records.
     /// `cause` is the one field on this path that carries IdP text — the
-    /// discovery `issuer` at the mismatch branch, and the three endpoints
-    /// below it — and the plain-text subscriber this binary installs
-    /// neutralises nothing in a field recorded as `Display`. The `?` in
-    /// `warn_idp_failure` is the whole guard; this is what holds it there.
+    /// echoed discovery `issuer` and any off-origin endpoint, arriving through
+    /// `logged`'s `Cause::Document` arm and `rp_endpoints` — and a plain-text
+    /// subscriber neutralises nothing in a field recorded as `Display`. The
+    /// `?` in `warn_idp_failure` is the call site's own guard, whatever the
+    /// encoder; this is what holds it there.
     #[test]
     fn no_separator_in_an_idp_cause_can_forge_a_log_line() {
         let rp = OidcRp::new(
@@ -456,10 +480,10 @@ mod tests {
         );
     }
 
-    /// Each refusal must name itself in the log. They returned silently
-    /// until the warning moved here from `exchange_and_verify`'s call site in
-    /// `auth.rs` — see `warn_rejected`. The converse, that an IdP outage does
-    /// NOT claim a rejection, is pinned at route level in `main.rs`.
+    /// Each refusal must name itself in the log, where it surfaces rather
+    /// than around `exchange_and_verify`'s call site in `auth.rs` — see
+    /// `warn_rejected`. The converse, that an IdP outage does NOT claim a
+    /// rejection, is pinned at route level in `main.rs`.
     #[tokio::test]
     async fn an_id_token_refusal_names_itself_in_the_log() {
         let rp = OidcRp::new(
@@ -546,6 +570,36 @@ mod tests {
         assert_eq!(err.to_string(), "token_endpoint not same-origin");
     }
 
+    /// The shared layer caches discovery on its own rules, which do not cover
+    /// the RP endpoints. A document refused on them must not stay cached, or
+    /// one bad answer locks every login out until the pod restarts.
+    #[tokio::test]
+    async fn a_refused_rp_endpoint_is_refetched_not_served_from_cache() {
+        // Closed loopback port: the re-fetch fails fast as a transport error,
+        // which is the proof it happened.
+        let issuer = "http://127.0.0.1:1";
+        let rp = OidcRp::new(
+            issuer.into(),
+            "console".into(),
+            "secret".into(),
+            "https://console.test/auth/callback".into(),
+        );
+        rp.provider.seed_discovery(Discovery {
+            issuer: issuer.into(),
+            authorization_endpoint: Some(format!("{issuer}/authorize")),
+            token_endpoint: Some("https://evil.test/token".into()),
+            jwks_uri: format!("{issuer}/jwks"),
+        });
+        let first = rp.authorize_url("S", "N", "V").await.unwrap_err();
+        assert_eq!(first.to_string(), "token_endpoint not same-origin");
+        let second = rp.authorize_url("S", "N", "V").await.unwrap_err();
+        assert_eq!(
+            second.to_string(),
+            "discovery failed",
+            "the refused document must be re-fetched, not refused again from cache"
+        );
+    }
+
     // --- signed token -> session cookie, measured end to end -------------
     //
     // Why real tokens rather than a hand-built `Session`: the defect these
@@ -566,7 +620,7 @@ mod tests {
         sub: &str,
         email: Option<&str>,
         name: Option<&str>,
-    ) -> Result<IdClaims, OidcError> {
+    ) -> Result<IdClaims, OidcRpError> {
         use crate::testkit;
 
         let rp = OidcRp::new(

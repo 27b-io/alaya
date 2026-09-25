@@ -6,7 +6,8 @@
 //! rule both sides must agree on lives here:
 //!
 //! - issuer normalisation (one trailing slash) and RFC 6454 origin parsing
-//! - discovery over a redirect-disabled, timeout-bounded client; the document's
+//! - discovery over a redirect-disabled, timeout-bounded client ([`Provider::new`]
+//!   builds one; a [`Provider::with_client`] caller owns that); the document's
 //!   `issuer` must echo the configured one (OIDC Core §4.3)
 //! - every discovery and JWKS body read under a byte cap, so a hostile IdP
 //!   response cannot OOM either binary
@@ -46,15 +47,16 @@ pub const CLOCK_SKEW_LEEWAY_SECS: u64 = 60;
 /// cap, and the request timeout bounds the seconds, not the bytes a fast link
 /// delivers inside them — so without this a substituted IdP answering with an
 /// endless body grows the heap until the OOM killer takes the pod. Honest
-/// documents are kilobytes; this matches the console's cap on every other
-/// upstream body.
+/// documents are kilobytes.
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum Error {
-    /// The token was refused. The message is a server-safe `&'static str`
-    /// (never token internals); the consumer decides whether it reaches a
-    /// client — the server returns a generic 401, the console renders it.
+    /// A rule refused the input — the token, in [`Provider::verify`]; an
+    /// endpoint, in [`same_origin_https`]. The message is a server-safe
+    /// `&'static str` (never token internals); the consumer decides whether it
+    /// reaches a client — the server returns a generic 401, the console
+    /// renders it.
     Invalid(&'static str),
     /// The provider failed: unreachable, a non-2xx, an oversized or
     /// unparseable body, or a discovery document that broke a rule. `op` is
@@ -321,16 +323,23 @@ impl Provider {
             });
         }
         // Off the issuer's origin is the substituted-IdP signal; the cause
-        // names the endpoint, which the bare reason cannot.
+        // records the value, which the bare reason cannot.
         if same_origin_https(&self.issuer, &disc.jwks_uri).is_err() {
             return Err(Error::Provider {
                 op: "jwks_uri not same-origin",
-                cause: Cause::Document(format!("jwks_uri={}", disc.jwks_uri)),
+                cause: Cause::Document(disc.jwks_uri),
             });
         }
 
         *self.discovery.write().await = Some(disc.clone());
         Ok(disc)
+    }
+
+    /// Drop the cached discovery document so the next use re-fetches — for a
+    /// consumer that refuses a document on rules of its own. Without it, one
+    /// answer the shared checks accepted stays cached until restart.
+    pub async fn forget_discovery(&self) {
+        *self.discovery.write().await = None;
     }
 
     /// Verify a compact JWS against this provider and decode its claims:

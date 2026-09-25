@@ -81,7 +81,8 @@ impl OidcVerifier {
     }
 
     /// Validate a bearer token. Returns Ok on a fully-valid token; any failure
-    /// is `OidcError::Invalid` and must surface to the client as a generic 401.
+    /// — a refused token (`Invalid`) or a failed provider (`Provider`) — must
+    /// surface to the client as a generic 401.
     pub async fn validate(&self, token: &str) -> Result<(), OidcError> {
         // Shared pipeline: header allowlist + kid, key (cache → single-flight
         // refetch), signature + `exp`/`aud` for our audience, normalised `iss`.
