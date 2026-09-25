@@ -4692,7 +4692,7 @@ mod wedge_tests {
         let checker = HealthChecker {
             qdrant_url: backend_url.clone(),
             graph_url: backend_url,
-            ..test_checker(epoch_secs())
+            ..test_checker(TEST_NOW)
         };
 
         let bare = checker.check().await;
@@ -4707,7 +4707,7 @@ mod wedge_tests {
         assert_eq!(detail["total_memories"], 7);
 
         let stalled = HealthChecker {
-            worker_progress: Arc::new(AtomicU64::new(epoch_secs() - 3600)),
+            worker_progress: Arc::new(AtomicU64::new(TEST_NOW - 3600)),
             ..checker
         };
         assert_eq!(stalled.check_detail().await["status"], "unhealthy");
