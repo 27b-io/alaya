@@ -854,7 +854,9 @@ impl ServiceHandle {
 struct HealthChecker {
     client: reqwest::Client,
     qdrant_url: String,
+    qdrant_api_key: Option<String>,
     collection: String,
+    embedding_url: String,
     graph_url: String,
     graph_api_key: String,
     worker_progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -870,15 +872,10 @@ struct HealthChecker {
 
 impl HealthChecker {
     fn new(config: &Config, worker_progress: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
-        let mut headers = reqwest::header::HeaderMap::new();
-        if let Some(ref key) = config.qdrant_api_key
-            && let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
-        {
-            headers.insert(reqwest::header::AUTHORIZATION, val);
-        }
-
+        // One client, three backends: each credential is attached per
+        // request (`bearer_auth`), never as a client default header, so
+        // Qdrant's bearer is not sent to the embedding endpoint or the bridge.
         let client = reqwest::Client::builder()
-            .default_headers(headers)
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(10))
             .build()
@@ -887,7 +884,9 @@ impl HealthChecker {
         Self {
             client,
             qdrant_url: config.qdrant_url.clone(),
+            qdrant_api_key: config.qdrant_api_key.clone(),
             collection: config.qdrant_collection.clone(),
+            embedding_url: config.embedding_url.clone(),
             graph_url: config.graph_url.clone(),
             graph_api_key: config.graph_api_key.clone(),
             worker_progress,
@@ -970,6 +969,7 @@ impl HealthChecker {
                 "service worker stalled — reporting unhealthy so the pod gets restarted"
             );
         } else {
+            // `check_detail` may still downgrade this to `degraded` (embedding).
             tracing::debug!(op = "health", elapsed_ms = elapsed, status, "ok (direct)");
         }
 
@@ -997,13 +997,19 @@ impl HealthChecker {
         })
     }
 
+    fn qdrant_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.qdrant_api_key {
+            Some(key) => req.bearer_auth(key),
+            None => req,
+        }
+    }
+
     async fn check_qdrant(&self) -> Result<Value, String> {
         let resp = self
-            .client
-            .get(format!(
+            .qdrant_auth(self.client.get(format!(
                 "{}/collections/{}",
                 self.qdrant_url, self.collection
-            ))
+            )))
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -1049,11 +1055,10 @@ impl HealthChecker {
 
     async fn check_count(&self) -> Result<usize, String> {
         let resp = self
-            .client
-            .post(format!(
+            .qdrant_auth(self.client.post(format!(
                 "{}/collections/{}/points/count",
                 self.qdrant_url, self.collection
-            ))
+            )))
             .json(&json!({}))
             .send()
             .await
@@ -1064,6 +1069,40 @@ impl HealthChecker {
             .pointer("/result/count")
             .and_then(|n| n.as_u64())
             .unwrap_or(0) as usize)
+    }
+
+    /// TEI / vLLM readiness endpoint — 200 once the model is loaded. The
+    /// same probe `EmbeddingClient::health` makes on the worker side; this
+    /// copy exists because the checker bypasses the worker (see struct doc).
+    async fn check_embedding(&self) -> Result<Value, String> {
+        let resp = self
+            .client
+            .get(format!("{}/health", self.embedding_url))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !resp.status().is_success() {
+            return Err(format!("embedding returned {}", resp.status()));
+        }
+        Ok(json!({ "status": "healthy" }))
+    }
+
+    /// Operator view: the full document plus the embedding probe (LAB-4025).
+    /// Only this path contacts the embedding endpoint — the bare probe must
+    /// not grow another anonymous fan-out (#78). A dead endpoint degrades
+    /// `status` but never overrides `unhealthy`: that word is the
+    /// worker-stall 503 contract (#63), and a restart does not fix TEI.
+    async fn check_detail(&self) -> Value {
+        let (mut v, embedding) = tokio::join!(self.check(), self.check_embedding());
+        if embedding.is_err() && v["status"] == "healthy" {
+            v["status"] = json!("degraded");
+        }
+        v["embedding_health"] = match embedding {
+            Ok(e) => e,
+            Err(e) => json!({ "status": "unhealthy", "error": e }),
+        };
+        v
     }
 }
 
@@ -2610,7 +2649,7 @@ async fn health(
 async fn health_detail(
     axum::extract::State(checker): axum::extract::State<HealthChecker>,
 ) -> (StatusCode, Json<Value>) {
-    let v = checker.check().await;
+    let v = checker.check_detail().await;
     (health_code(&v), Json(v))
 }
 
@@ -4145,6 +4184,13 @@ mod wedge_tests {
         fn model_name(&self) -> &str {
             "stub"
         }
+        async fn health(&self) -> Result<HealthStatus> {
+            Ok(HealthStatus {
+                status: "healthy".into(),
+                backend: "stub".into(),
+                details: None,
+            })
+        }
     }
 
     struct StubGraph;
@@ -4385,7 +4431,9 @@ mod wedge_tests {
                 .unwrap(),
             // Port 1 refuses immediately — models an unreachable backend.
             qdrant_url: "http://127.0.0.1:1".into(),
+            qdrant_api_key: None,
             collection: "test".into(),
+            embedding_url: "http://127.0.0.1:1".into(),
             graph_url: "http://127.0.0.1:1".into(),
             graph_api_key: String::new(),
             worker_progress: Arc::new(AtomicU64::new(progress_s)),
@@ -4610,10 +4658,65 @@ mod wedge_tests {
         // The detail view keeps that; the bare probe's exact-key-set
         // assertion above is what proves it never reaches an anonymous caller.
         assert!(body["vector_health"]["error"].is_string());
+        // LAB-4025: the embedding probe rides the same authenticated surface.
+        assert_eq!(body["embedding_health"]["status"], "unhealthy");
+        assert!(body["embedding_health"]["error"].is_string());
         // Build identity (#70) rides the authenticated surface now.
         assert!(body.get("version").is_some());
         assert!(body.get("git_sha").is_some());
         assert!(body.get("built_at").is_some());
+    }
+
+    /// LAB-4025: Qdrant and the bridge up, embedding endpoint down. The
+    /// operator view degrades and names the probe; the bare probe's verdict —
+    /// the k8s contract — is untouched and carries no embedding verdict (#78:
+    /// no new anonymous fan-out; `check()` is not wired to `check_embedding`).
+    /// A stalled worker still wins: `unhealthy` is the 503 signal and TEI is
+    /// not fixed by a restart.
+    #[tokio::test]
+    async fn embedding_outage_degrades_detail_but_not_bare_probe() {
+        // Loopback stand-in for Qdrant *and* the bridge; TEI stays at port 1.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route(
+                "/collections/test",
+                get(|| async {
+                    Json(json!({ "result": { "status": "green", "points_count": 7 } }))
+                }),
+            )
+            .route(
+                "/collections/test/points/count",
+                post(|| async { Json(json!({ "result": { "count": 7 } })) }),
+            )
+            .route(
+                "/health",
+                get(|| async { Json(json!({ "status": "healthy" })) }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let checker = HealthChecker {
+            qdrant_url: backend_url.clone(),
+            graph_url: backend_url,
+            ..test_checker(TEST_NOW)
+        };
+
+        let bare = checker.check().await;
+        assert_eq!(bare["status"], "healthy");
+        assert!(bare.get("embedding_health").is_none());
+
+        let detail = checker.check_detail().await;
+        assert_eq!(detail["status"], "degraded");
+        assert_eq!(detail["embedding_health"]["status"], "unhealthy");
+        assert!(detail["embedding_health"]["error"].is_string());
+        assert_eq!(detail["vector_health"]["status"], "green");
+        assert_eq!(detail["total_memories"], 7);
+
+        let stalled = HealthChecker {
+            worker_progress: Arc::new(AtomicU64::new(TEST_NOW - 3600)),
+            ..checker
+        };
+        assert_eq!(stalled.check_detail().await["status"], "unhealthy");
     }
 
     /// The #63 contract is the HTTP code, not the body: a wedged worker must

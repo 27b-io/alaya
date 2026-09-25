@@ -1026,8 +1026,7 @@ impl MemoryService {
             let budget = reranker.timeout();
             let started = std::time::Instant::now();
             let outcome =
-                rerank_with_budget(budget, reranker.rerank(&params.query, &candidate_contents))
-                    .await;
+                with_budget(budget, reranker.rerank(&params.query, &candidate_contents)).await;
             let elapsed = started.elapsed();
             let scores = match outcome {
                 Some(Ok(s)) if s.len() == top_n => s,
@@ -1561,7 +1560,21 @@ impl MemoryService {
     pub async fn check_database_health(&self) -> Result<HashMap<String, Value>> {
         let vector_health = self.vectors.health().await?;
 
-        let graph_health = match self.graph.get_stats().await {
+        // The embedding probe gets its own 5s budget: the client's 60s embed
+        // timeout would let an endpoint that accepts TCP and never answers
+        // park this single-threaded worker — and every read queued behind
+        // it — for a minute per health call.
+        let (graph, embedding) = futures::join!(
+            self.graph.get_stats(),
+            with_budget(std::time::Duration::from_secs(5), self.embeddings.health())
+        );
+        let embedding = embedding.unwrap_or_else(|| {
+            Err(alaya_types::AlayaError::Embedding(
+                "health probe timed out".into(),
+            ))
+        });
+
+        let graph_health = match graph {
             Ok(stats) => serde_json::json!({
                 "status": "healthy",
                 "node_count": stats.node_count,
@@ -1573,16 +1586,34 @@ impl MemoryService {
             }),
         };
 
+        // LAB-4025: a dead embedding endpoint fails every store and every
+        // semantic search, so it degrades `status` exactly as the vector
+        // store does. Reads and tag-mode search still work — `degraded`,
+        // not `unhealthy`. Graph stays informational: its calls are
+        // non-fatal by design, so a graph blip degrades nothing.
+        let embedding_ok = embedding.is_ok();
+        let embedding_health = match embedding {
+            Ok(h) => serde_json::to_value(h).unwrap_or_default(),
+            Err(e) => {
+                // The response is sanitised; the pod log keeps the reason
+                // (refused vs 503 vs timed out) an operator actually needs.
+                tracing::warn!(error = %e, "embedding health probe failed");
+                serde_json::json!({
+                    "status": "unhealthy",
+                    "error": e.safe_message(),
+                })
+            }
+        };
+
+        let vector_ok = vector_health.status == "green" || vector_health.status == "ok";
         let mut result = HashMap::new();
         result.insert(
             "status".into(),
-            serde_json::json!(
-                if vector_health.status == "green" || vector_health.status == "ok" {
-                    "healthy"
-                } else {
-                    "degraded"
-                }
-            ),
+            serde_json::json!(if vector_ok && embedding_ok {
+                "healthy"
+            } else {
+                "degraded"
+            }),
         );
         result.insert("backend".into(), serde_json::json!("qdrant"));
         result.insert(
@@ -1590,6 +1621,7 @@ impl MemoryService {
             serde_json::to_value(&vector_health).unwrap_or_default(),
         );
         result.insert("graph_health".into(), graph_health);
+        result.insert("embedding_health".into(), embedding_health);
         result.insert(
             "total_memories".into(),
             serde_json::json!(self.vectors.count().await.unwrap_or(0)),
@@ -2358,29 +2390,31 @@ impl MemoryService {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-/// Runs `fut` under [`RerankingService::timeout`]; `None` means the budget
-/// expired. Native builds (alaya-server, production) bound it with
+/// Runs `fut` under `budget`; `None` means the budget expired. Callers: the
+/// rerank pass ([`RerankingService::timeout`]) and the embedding health probe.
+///
+/// Native builds (alaya-server, production) bound it with
 /// `tokio::time::timeout` and nothing else: it polls `fut` before its own
 /// deadline, so a response that has already arrived is used even on a late
 /// poll, and dropping `fut` on elapse aborts the request. That makes the two
 /// outcomes exact — `None` is "nothing arrived within the budget", `Some(Err)`
 /// is a real transport or HTTP error with its detail intact. wasm32
 /// (`alaya-worker`, deferred) has no tokio timer and awaits directly — there
-/// the per-request reqwest timeout in `RerankClient::rerank` is the bound and
+/// the per-request reqwest timeout in the backend client is the bound and
 /// surfaces as `Some(Err)`.
 #[cfg(not(target_arch = "wasm32"))]
-async fn rerank_with_budget(
+async fn with_budget<T>(
     budget: std::time::Duration,
-    fut: impl std::future::Future<Output = Result<Vec<f32>>>,
-) -> Option<Result<Vec<f32>>> {
+    fut: impl std::future::Future<Output = T>,
+) -> Option<T> {
     tokio::time::timeout(budget, fut).await.ok()
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn rerank_with_budget(
+async fn with_budget<T>(
     _budget: std::time::Duration,
-    fut: impl std::future::Future<Output = Result<Vec<f32>>>,
-) -> Option<Result<Vec<f32>>> {
+    fut: impl std::future::Future<Output = T>,
+) -> Option<T> {
     Some(fut.await)
 }
 
@@ -2681,6 +2715,13 @@ mod tests {
         fn model_name(&self) -> &str {
             "mock"
         }
+        async fn health(&self) -> Result<HealthStatus> {
+            Ok(HealthStatus {
+                status: "healthy".into(),
+                backend: "mock".into(),
+                details: None,
+            })
+        }
     }
 
     /// No-op graph service.
@@ -2846,6 +2887,110 @@ mod tests {
             clock,
         );
         (svc, counter)
+    }
+
+    // ─── check_database_health (LAB-4025) ──────────────────────────────
+
+    /// Embedding endpoint that refuses everything — models TEI down.
+    struct FailingEmbeddings;
+
+    #[async_trait(?Send)]
+    impl EmbeddingProvider for FailingEmbeddings {
+        async fn embed_batch(&self, _t: &[&str], _p: PromptName) -> Result<Vec<Vec<f32>>> {
+            Err(AlayaError::Embedding("connection refused".into()))
+        }
+        fn dimensions(&self) -> usize {
+            1024
+        }
+        fn model_name(&self) -> &str {
+            "failing"
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            Err(AlayaError::Embedding("connection refused".into()))
+        }
+    }
+
+    /// Before LAB-4025 the health document never consulted the embedding
+    /// client: TEI down reported `healthy` while every store and semantic
+    /// search failed. Now it degrades, names the probe, and — safe_message —
+    /// leaks no endpoint detail.
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_degrades_when_embedding_endpoint_is_down() {
+        let svc = MemoryService::new(
+            Box::new(MockVectors::new(vec![], Rc::new(Cell::new(0)))),
+            Box::new(FailingEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        );
+
+        let h = svc.check_database_health().await.unwrap();
+
+        assert_eq!(h["status"], "degraded");
+        assert_eq!(h["embedding_health"]["status"], "unhealthy");
+        assert_eq!(
+            h["embedding_health"]["error"],
+            "Embedding generation failed"
+        );
+        // The new probe must not disturb the vector verdict.
+        assert_eq!(h["vector_health"]["status"], "ok");
+        assert_eq!(h["graph_health"]["status"], "healthy");
+    }
+
+    /// Embedding endpoint that accepts the call and never answers — a wedged
+    /// model server behind a live TCP listener.
+    struct HangingEmbeddings;
+
+    #[async_trait(?Send)]
+    impl EmbeddingProvider for HangingEmbeddings {
+        async fn embed_batch(&self, _t: &[&str], _p: PromptName) -> Result<Vec<Vec<f32>>> {
+            std::future::pending().await
+        }
+        fn dimensions(&self) -> usize {
+            1024
+        }
+        fn model_name(&self) -> &str {
+            "hanging"
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            std::future::pending().await
+        }
+    }
+
+    /// The probe runs under its own budget so a hung endpoint cannot park the
+    /// worker for the embed client's full 60s. Paused clock: the budget
+    /// elapses instantly; lose the bound and this test hangs instead.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn health_bounds_a_hung_embedding_probe() {
+        let svc = MemoryService::new(
+            Box::new(MockVectors::new(vec![], Rc::new(Cell::new(0)))),
+            Box::new(HangingEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        );
+
+        let h = svc.check_database_health().await.unwrap();
+
+        assert_eq!(h["status"], "degraded");
+        assert_eq!(h["embedding_health"]["status"], "unhealthy");
+        assert_eq!(
+            h["embedding_health"]["error"],
+            "Embedding generation failed"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_reports_embedding_endpoint_when_up() {
+        let (svc, _) = build_mock_service(vec![]);
+
+        let h = svc.check_database_health().await.unwrap();
+
+        assert_eq!(h["status"], "healthy");
+        assert_eq!(h["embedding_health"]["status"], "healthy");
+        assert_eq!(h["embedding_health"]["backend"], "mock");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3198,6 +3343,13 @@ mod tests {
         }
         fn model_name(&self) -> &str {
             "mock-tracked"
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            Ok(HealthStatus {
+                status: "healthy".into(),
+                backend: "mock-tracked".into(),
+                details: None,
+            })
         }
     }
 

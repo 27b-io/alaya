@@ -20,6 +20,7 @@ use mini_moka::unsync::Cache;
 
 use alaya_backends::traits::EmbeddingProvider;
 use alaya_types::Result;
+use alaya_types::memory::HealthStatus;
 use alaya_types::search::PromptName;
 
 /// Consecutive L2 failures before the circuit opens.
@@ -412,6 +413,12 @@ impl EmbeddingProvider for CachedEmbedding {
     fn model_name(&self) -> &str {
         self.inner.model_name()
     }
+
+    /// Never served from cache: a cached vector says nothing about whether
+    /// the endpoint can produce a new one.
+    async fn health(&self) -> Result<HealthStatus> {
+        self.inner.health().await
+    }
 }
 
 #[cfg(test)]
@@ -465,6 +472,13 @@ mod tests {
         }
         fn model_name(&self) -> &str {
             "stub"
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            Ok(HealthStatus {
+                status: "healthy".into(),
+                backend: "stub".into(),
+                details: None,
+            })
         }
     }
 

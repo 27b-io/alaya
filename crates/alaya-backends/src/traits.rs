@@ -154,6 +154,10 @@ pub trait EmbeddingProvider {
     async fn embed_batch(&self, texts: &[&str], prompt_name: PromptName) -> Result<Vec<Vec<f32>>>;
     fn dimensions(&self) -> usize;
     fn model_name(&self) -> &str;
+    /// Reachability of the embedding endpoint. `Err` means every store and
+    /// every semantic search will fail, so a health report must not say
+    /// `healthy` without consulting it (LAB-4025).
+    async fn health(&self) -> Result<HealthStatus>;
 }
 
 /// Graph operations backend (calls alaya-bridge typed RPC).
