@@ -151,8 +151,12 @@ fi
 # command, with a cached result so a slow secret manager (1Password, vault,
 # etc.) isn't invoked on every Stop. On resolver failure, serve the last
 # cached value rather than dropping the save (LAB-1663). ---
-# `rm` the matching cache file under STATE_DIR to force a refresh after a
-# key rotation.
+# A failing refresh is retried at most once per 15 min: "$cache.attempt" is
+# touched before each attempt and removed when one succeeds. Without it, a
+# failing command (e.g. a secret manager that is rate-limiting) re-runs on
+# every Stop once the cache goes stale, piling more requests onto the limit.
+# `rm` the matching cache file and its .attempt marker under STATE_DIR to
+# force a refresh after a key rotation.
 _resolve_secret() { # <env-var-name> <cache-file>
     local name="$1" cache="$2" direct cmd_var cmd val
     direct="${!name:-}"
@@ -163,7 +167,9 @@ _resolve_secret() { # <env-var-name> <cache-file>
     cmd_var="${name}_CMD"
     cmd="${!cmd_var:-}"
     [[ -z "$cmd" ]] && return 1
-    if [[ -z "$(find "$cache" -mmin -"$SECRET_CACHE_MINUTES" 2>/dev/null)" ]]; then
+    if [[ -z "$(find "$cache" -mmin -"$SECRET_CACHE_MINUTES" 2>/dev/null)" \
+        && -z "$(find "$cache.attempt" -mmin -15 2>/dev/null)" ]]; then
+        touch "$cache.attempt"
         # Resolver's own stderr (e.g. "op: command not found", vault-not-found)
         # goes to failures.log instead of /dev/null — it's the one piece of
         # info that explains WHICH failure mode this is.
@@ -187,7 +193,7 @@ except subprocess.TimeoutExpired:
     sys.stderr.write("secret resolver timed out after " + sys.argv[2] + "s\n")
     sys.exit(124)' "$cmd" "${_RESOLVER_TIMEOUT_SECS:-15}" 2>>"$STATE_DIR/failures.log")
         fi
-        [[ -n "$val" ]] && printf '%s' "$val" > "$cache"
+        [[ -n "$val" ]] && printf '%s' "$val" > "$cache" && rm -f "$cache.attempt"
     fi
     [[ -r "$cache" ]] && cat "$cache"
 }

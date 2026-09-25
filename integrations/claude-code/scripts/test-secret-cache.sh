@@ -2,7 +2,8 @@
 # Shim test for _resolve_secret in alaya-session-save.sh (LAB-1663 pattern,
 # generalized from a hardcoded `op read` call to any value-or-command source).
 # Proves: cold fetch = 1 resolver call; warm = 0 resolver calls; 0600 cache
-# perms; stale cache served when the resolver fails; hook still parses.
+# perms; stale cache served when the resolver fails; a failing resolver retried
+# at most once per 15 min (stale and cold); hook still parses.
 set -e
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOK="$HERE/alaya-session-save.sh"
@@ -34,7 +35,7 @@ v2=$(_resolve_secret TEST_SECRET "$C"); c2=$(cat "$RESOLVECOUNT")
 # timestamp computed via python3 — GNU-only `touch -d '13 hours ago'` isn't.
 perms=$(stat -c %a "$C" 2>/dev/null || stat -f %Lp "$C")
 STALE=$(python3 -c 'import datetime; print((datetime.datetime.now()-datetime.timedelta(hours=13)).strftime("%Y%m%d%H%M"))')
-touch -t "$STALE" "$C"; touch "$RESOLVEFAIL"   # stale cache + resolver now failing
+touch -t "$STALE" "$C" "$C.attempt"; touch "$RESOLVEFAIL"   # 13 h later: stale cache + resolver now failing
 v3=$(_resolve_secret TEST_SECRET "$C"); c3=$(cat "$RESOLVECOUNT")
 
 [[ "$v1" == "sekrit-value" ]] || { echo "FAIL cold value: $v1"; exit 1; }
@@ -44,10 +45,32 @@ v3=$(_resolve_secret TEST_SECRET "$C"); c3=$(cat "$RESOLVECOUNT")
 [[ "$v3" == "sekrit-value" && "$c3" == 2 ]] || { echo "FAIL stale-fallback: v=$v3 c=$c3"; exit 1; }
 bash -n "$HOOK" || { echo "FAIL syntax"; exit 1; }
 
+# Retry backoff: a failing resolver is re-run at most once per 15 min, not on
+# every Stop — each retry against a rate-limited secret manager spends quota.
+for _ in 1 2 3 4 5 6 7 8 9; do v=$(_resolve_secret TEST_SECRET "$C"); done
+c6=$(cat "$RESOLVECOUNT")
+[[ "$v" == "sekrit-value" && "$c6" == 2 ]] || { echo "FAIL backoff (stale): v=$v c=$c6, want stale value and no retry"; exit 1; }
+RETRY=$(python3 -c 'import datetime; print((datetime.datetime.now()-datetime.timedelta(minutes=16)).strftime("%Y%m%d%H%M"))')
+touch -t "$RETRY" "$C.attempt"
+v=$(_resolve_secret TEST_SECRET "$C"); c7=$(cat "$RESOLVECOUNT")
+[[ "$v" == "sekrit-value" && "$c7" == 3 ]] || { echo "FAIL backoff expiry: v=$v c=$c7, want one retry after 15 min"; exit 1; }
+# Cold cache + failing resolver: one call, and no empty cache file left behind
+C2="$T/cold-cache"
+for _ in 1 2 3 4 5 6 7 8 9 10; do v=$(_resolve_secret TEST_SECRET "$C2") || true; done
+c8=$(cat "$RESOLVECOUNT")
+[[ -z "$v" && "$c8" == 4 && ! -e "$C2" ]] || { echo "FAIL backoff (cold): v=$v c=$c8 cache-exists=$([[ -e $C2 ]] && echo y || echo n)"; exit 1; }
+rm -f "$RESOLVEFAIL"
+# A successful refresh clears the marker, so deleting the cache after a key
+# rotation refetches on the next call instead of waiting out the backoff.
+C3="$T/rotate-cache"
+_resolve_secret TEST_SECRET "$C3" >/dev/null; rm -f "$C3"
+v=$(_resolve_secret TEST_SECRET "$C3") || true; c9=$(cat "$RESOLVECOUNT")
+[[ "$v" == "sekrit-value" && "$c9" == 6 ]] || { echo "FAIL rotation refetch: v=$v c=$c9, want an immediate refetch"; exit 1; }
+
 # Direct-value path bypasses the command sourcing entirely
 export TEST_SECRET="direct-value"
 v4=$(_resolve_secret TEST_SECRET "$C"); c4=$(cat "$RESOLVECOUNT")
-[[ "$v4" == "direct-value" && "$c4" == 2 ]] || { echo "FAIL direct-value: v=$v4 c=$c4"; exit 1; }
+[[ "$v4" == "direct-value" && "$c4" == "$c9" ]] || { echo "FAIL direct-value: v=$v4 c=$c4"; exit 1; }
 
 # python3 watchdog branch (macOS/BSD path, where timeout(1) doesn't exist):
 # with timeout hidden from PATH, a hanging resolver must be killed at the
@@ -55,7 +78,7 @@ v4=$(_resolve_secret TEST_SECRET "$C"); c4=$(cat "$RESOLVECOUNT")
 # otherwise never execute this branch.
 printf '%s\n' '#!/bin/bash' 'sleep 30' > "$T/hangs"; chmod +x "$T/hangs"
 mkdir "$T/nobin"
-for c in bash python3 find cat sleep; do ln -s "$(command -v "$c")" "$T/nobin/$c"; done
+for c in bash python3 find cat sleep touch; do ln -s "$(command -v "$c")" "$T/nobin/$c"; done
 start=$(date +%s)
 v5=$(env PATH="$T/nobin" STATE_DIR="$T" SECRET_CACHE_MINUTES=720 _RESOLVER_TIMEOUT_SECS=2 \
     HANG_SECRET_CMD="$T/hangs" bash -c "source '$T/fn.sh'; _resolve_secret HANG_SECRET '$T/cache-hang'") || true
@@ -63,4 +86,4 @@ took=$(( $(date +%s) - start ))
 [[ -z "$v5" && "$took" -le 15 ]] || { echo "FAIL watchdog: v='$v5' took=${took}s"; exit 1; }
 grep -q 'timed out' "$T/failures.log" || { echo "FAIL watchdog: no timeout line in failures.log"; exit 1; }
 
-echo "ALL PASS: cold=1 call, warm=0 calls, 0600 perms, stale cache on resolver failure, direct-value bypass, watchdog bound without timeout(1), hook syntax clean"
+echo "ALL PASS: cold=1 call, warm=0 calls, 0600 perms, stale cache on resolver failure, 15-min retry backoff (stale and cold), direct-value bypass, watchdog bound without timeout(1), hook syntax clean"
