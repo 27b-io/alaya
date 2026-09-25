@@ -60,11 +60,17 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do v=$(_resolve_secret TEST_SECRET "$C2") || true
 c8=$(cat "$RESOLVECOUNT")
 [[ -z "$v" && "$c8" == 4 && ! -e "$C2" ]] || { echo "FAIL backoff (cold): v=$v c=$c8 cache-exists=$([[ -e $C2 ]] && echo y || echo n)"; exit 1; }
 rm -f "$RESOLVEFAIL"
+# A successful refresh clears the marker, so deleting the cache after a key
+# rotation refetches on the next call instead of waiting out the backoff.
+C3="$T/rotate-cache"
+_resolve_secret TEST_SECRET "$C3" >/dev/null; rm -f "$C3"
+v=$(_resolve_secret TEST_SECRET "$C3") || true; c9=$(cat "$RESOLVECOUNT")
+[[ "$v" == "sekrit-value" && "$c9" == 6 ]] || { echo "FAIL rotation refetch: v=$v c=$c9, want an immediate refetch"; exit 1; }
 
 # Direct-value path bypasses the command sourcing entirely
 export TEST_SECRET="direct-value"
 v4=$(_resolve_secret TEST_SECRET "$C"); c4=$(cat "$RESOLVECOUNT")
-[[ "$v4" == "direct-value" && "$c4" == "$c8" ]] || { echo "FAIL direct-value: v=$v4 c=$c4"; exit 1; }
+[[ "$v4" == "direct-value" && "$c4" == "$c9" ]] || { echo "FAIL direct-value: v=$v4 c=$c4"; exit 1; }
 
 # python3 watchdog branch (macOS/BSD path, where timeout(1) doesn't exist):
 # with timeout hidden from PATH, a hanging resolver must be killed at the

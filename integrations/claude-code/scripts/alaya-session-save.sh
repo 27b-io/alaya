@@ -151,10 +151,10 @@ fi
 # command, with a cached result so a slow secret manager (1Password, vault,
 # etc.) isn't invoked on every Stop. On resolver failure, serve the last
 # cached value rather than dropping the save (LAB-1663). ---
-# A refresh is attempted at most once per 15 min: "$cache.attempt" is touched
-# before each one. Without it, a failing command (e.g. a secret manager whose
-# rate limit is spent) re-runs on every Stop once the cache goes stale, and
-# those retries keep spending the limit that caused the failure.
+# A failing refresh is retried at most once per 15 min: "$cache.attempt" is
+# touched before each attempt and removed when one succeeds. Without it, a
+# failing command (e.g. a secret manager that is rate-limiting) re-runs on
+# every Stop once the cache goes stale, piling more requests onto the limit.
 # `rm` the matching cache file and its .attempt marker under STATE_DIR to
 # force a refresh after a key rotation.
 _resolve_secret() { # <env-var-name> <cache-file>
@@ -193,7 +193,7 @@ except subprocess.TimeoutExpired:
     sys.stderr.write("secret resolver timed out after " + sys.argv[2] + "s\n")
     sys.exit(124)' "$cmd" "${_RESOLVER_TIMEOUT_SECS:-15}" 2>>"$STATE_DIR/failures.log")
         fi
-        [[ -n "$val" ]] && printf '%s' "$val" > "$cache"
+        [[ -n "$val" ]] && printf '%s' "$val" > "$cache" && rm -f "$cache.attempt"
     fi
     [[ -r "$cache" ]] && cat "$cache"
 }
