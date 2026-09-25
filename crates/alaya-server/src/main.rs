@@ -182,16 +182,18 @@ impl Config {
             (
                 "GRAPH_URL",
                 Some(cfg.graph_url.as_str()),
-                // HealthChecker puts QDRANT_API_KEY in the shared client's
-                // default_headers; check_graph overrides only when graph_api_key
-                // is non-empty, so the Qdrant key leaks to graph probes.
-                !cfg.graph_api_key.is_empty() || cfg.qdrant_api_key.is_some(),
+                // The Qdrant key is never sent here: pinned by
+                // `qdrant_key_reaches_only_qdrant`.
+                !cfg.graph_api_key.is_empty(),
                 Transport::Http,
             ),
             (
-                // `false` holds only because the worker passes `None` to
-                // `EmbeddingClient::new`, leaving userinfo as the only
-                // credential this can carry. Mirrored at that call site.
+                // `false` holds only because neither sender attaches a
+                // credential: the worker passes `None` to
+                // `EmbeddingClient::new`, and `HealthChecker::check_embedding`
+                // sends no bearer — leaving userinfo as the only credential
+                // this can carry. Mirrored at both call sites; the second is
+                // pinned by `qdrant_key_reaches_only_qdrant`.
                 "EMBEDDING_URL",
                 Some(cfg.embedding_url.as_str()),
                 false,
@@ -875,6 +877,7 @@ impl HealthChecker {
         // One client, three backends: each credential is attached per
         // request (`bearer_auth`), never as a client default header, so
         // Qdrant's bearer is not sent to the embedding endpoint or the bridge.
+        // Pinned by `qdrant_key_reaches_only_qdrant`.
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(10))
@@ -1074,6 +1077,8 @@ impl HealthChecker {
     /// TEI / vLLM readiness endpoint — 200 once the model is loaded. The
     /// same probe `EmbeddingClient::health` makes on the worker side; this
     /// copy exists because the checker bypasses the worker (see struct doc).
+    /// No credential: `EMBEDDING_URL` is guarded at boot with
+    /// `has_credential: false` — sending a key here means updating that row.
     async fn check_embedding(&self) -> Result<Value, String> {
         let resp = self
             .client
@@ -4712,6 +4717,89 @@ mod wedge_tests {
             ..checker
         };
         assert_eq!(stalled.check_detail().await["status"], "unhealthy");
+    }
+
+    /// The Qdrant key reaches Qdrant and nothing else. Built through
+    /// `HealthChecker::new` because the production constructor is where a
+    /// client-wide default header would be set; `test_checker` builds its own
+    /// client and could not see one. reqwest fills default headers into vacant
+    /// entries only, so with `GRAPH_API_KEY` empty — as here — a default
+    /// Qdrant bearer would ride every graph probe. The boot guard's
+    /// `GRAPH_URL` and `EMBEDDING_URL` rows rely on this.
+    #[tokio::test]
+    async fn qdrant_key_reaches_only_qdrant() {
+        const QDRANT_KEY: &str = "qdrant-secret";
+        // One loopback listener for all three backends; a path prefix per
+        // backend tells the graph and embedding `/health` probes apart.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let log = seen.clone();
+        let app = Router::new().fallback(move |req: Request| {
+            let auth = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+            // Qdrant also accepts its key as `api-key`, so any header counts.
+            let carries_key = req
+                .headers()
+                .values()
+                .any(|v| String::from_utf8_lossy(v.as_bytes()).contains(QDRANT_KEY));
+            log.lock()
+                .unwrap()
+                .insert(req.uri().path().to_owned(), (auth, carries_key));
+            std::future::ready(Json(json!({})))
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // Only the URL and key fields reach `HealthChecker::new`.
+        let config = Config {
+            qdrant_url: format!("{base}/qdrant"),
+            qdrant_collection: "test".into(),
+            qdrant_api_key: Some(QDRANT_KEY.into()),
+            embedding_url: format!("{base}/embedding"),
+            embedding_model: String::new(),
+            embedding_dimensions: 0,
+            embedding_batch_size: 0,
+            graph_url: format!("{base}/graph"),
+            graph_api_key: String::new(),
+            listen_addr: String::new(),
+            api_key: String::new(),
+            readonly_api_key: String::new(),
+            oidc_issuer: None,
+            public_base_url: String::new(),
+            allow_unauthenticated: false,
+            summary_url: None,
+            summary_api_key: None,
+            summary_model: String::new(),
+            judge_url: None,
+            judge_api_key: None,
+            judge_model: String::new(),
+            judge_daily_cap: 0,
+            rerank_url: None,
+            rerank_api_key: None,
+            rerank_top_n: 0,
+            rerank_timeout_ms: std::num::NonZeroU64::MIN,
+        };
+        // `check_detail` fans out to all four probes.
+        HealthChecker::new(&config, Arc::new(AtomicU64::new(0)))
+            .check_detail()
+            .await;
+
+        let bearer = Some(format!("Bearer {QDRANT_KEY}"));
+        let expected = HashMap::from([
+            (
+                "/qdrant/collections/test".to_owned(),
+                (bearer.clone(), true),
+            ),
+            (
+                "/qdrant/collections/test/points/count".to_owned(),
+                (bearer, true),
+            ),
+            ("/graph/health".to_owned(), (None, false)),
+            ("/embedding/health".to_owned(), (None, false)),
+        ]);
+        assert_eq!(*seen.lock().unwrap(), expected);
     }
 
     /// The #63 contract is the HTTP code, not the body: a wedged worker must
