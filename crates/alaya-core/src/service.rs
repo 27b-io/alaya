@@ -2960,7 +2960,8 @@ mod tests {
 
     /// The probe runs under its own budget so a hung endpoint cannot park the
     /// worker for the embed client's full 60s. Paused clock: the budget
-    /// elapses instantly; lose the bound and this test hangs instead.
+    /// elapses instantly and exactly, so `elapsed` pins it at 5s; lose the
+    /// bound and this test hangs instead.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn health_bounds_a_hung_embedding_probe() {
         let svc = MemoryService::new(
@@ -2972,7 +2973,9 @@ mod tests {
             None,
         );
 
+        let started = tokio::time::Instant::now();
         let h = svc.check_database_health().await.unwrap();
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
 
         assert_eq!(h["status"], "degraded");
         assert_eq!(h["embedding_health"]["status"], "unhealthy");
