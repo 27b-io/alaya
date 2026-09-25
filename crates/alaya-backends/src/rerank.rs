@@ -51,15 +51,20 @@ impl RerankClient {
         // at or below the budget fires in the same tick as the call-site
         // tokio timer on a blackholed connect and steals its log line, and
         // the call-site timer bounds the connect phase anyway.
-        let client = Client::builder()
-            .default_headers(headers)
-            .build()
-            .map_err(|e| {
-                AlayaError::Config(format!(
-                    "rerank HTTP client: {}",
-                    crate::redact_reqwest_error(e)
-                ))
-            })?;
+        let builder = Client::builder().default_headers(headers);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let builder = builder
+            // Dial the host the boot guard classified, never an env proxy
+            // (see `check_credential_transport` in alaya-server).
+            .no_proxy();
+
+        let client = builder.build().map_err(|e| {
+            AlayaError::Config(format!(
+                "rerank HTTP client: {}",
+                crate::redact_reqwest_error(e)
+            ))
+        })?;
 
         Ok(Self {
             client,

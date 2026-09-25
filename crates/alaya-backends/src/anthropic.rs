@@ -70,6 +70,9 @@ impl MessagesTransport {
         #[cfg(not(target_arch = "wasm32"))]
         let builder = builder
             .http1_only()
+            // Dial the host the boot guard classified, never an env proxy
+            // (see `check_credential_transport` in alaya-server).
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(request_timeout);
