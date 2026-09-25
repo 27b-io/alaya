@@ -7,13 +7,15 @@
 //!
 //! - issuer normalisation (one trailing slash) and RFC 6454 origin parsing
 //! - discovery over a redirect-disabled, timeout-bounded client ([`Provider::new`]
-//!   builds one; a [`Provider::with_client`] caller owns that); the document's
-//!   `issuer` must echo the configured one (OIDC Core §4.3)
+//!   builds one; a [`Provider::for_relying_party`] caller owns that); the
+//!   document's `issuer` must echo the configured one (OIDC Core §4.3)
 //! - every discovery and JWKS body read under a byte cap, so a hostile IdP
 //!   response cannot OOM either binary
 //! - `jwks_uri` must be same-origin with the issuer and https (http only for a
-//!   loopback issuer, so local dev works); the relying party applies the same
-//!   rule to its own endpoints through [`same_origin_https`]
+//!   loopback issuer, so local dev works); a relying party's
+//!   `authorization_endpoint` and `token_endpoint` must be present and pass the
+//!   same rule. Every rule runs before the document is cached, so a refused
+//!   one is fetched afresh on next use, never served from the cache
 //! - JWKS cache with single-flight refetch and a per-provider cooldown that is
 //!   extended *before* the fetch, so an unknown-`kid` flood or a down IdP can't
 //!   turn either binary into an outbound-fetch amplifier
@@ -89,6 +91,8 @@ pub enum Cause {
     Parse(ParseFailure),
     /// The discovery-document value that broke a rule — attacker-chosen text.
     Document(String),
+    /// The discovery document lacks a field the provider's role requires.
+    Missing,
 }
 
 /// Where and how a body failed to parse, never what it said: a fieldless
@@ -147,8 +151,8 @@ pub struct Discovery {
     pub issuer: String,
     pub jwks_uri: String,
     /// Optional because a resource server never uses them and its test IdP
-    /// omits them. Only `jwks_uri` is origin-checked here — a relying party
-    /// requires both of these at use time and checks them itself.
+    /// omits them. A [`Provider::for_relying_party`] requires both and
+    /// origin-checks them before caching, so from it they are always `Some`.
     pub authorization_endpoint: Option<String>,
     pub token_endpoint: Option<String>,
 }
@@ -257,6 +261,9 @@ pub struct Provider {
     /// Single-flight fetch gate; the inner `Instant` is the last fetch time
     /// (cooldown). Holding the mutex serializes refetches across requests.
     fetch_gate: Mutex<Instant>,
+    /// Relying-party role: discovery also requires `authorization_endpoint`
+    /// and `token_endpoint`, same-origin-https with the issuer.
+    relying_party: bool,
 }
 
 impl Provider {
@@ -264,6 +271,10 @@ impl Provider {
     /// deferred to first use — a down provider degrades to a rejection, never
     /// a startup failure. The client follows no redirects (a 3xx on discovery
     /// or JWKS would otherwise substitute keys) and is timeout-bounded.
+    ///
+    /// This is the resource-server role: it never calls the authorization or
+    /// token endpoint, so it must not reject an IdP (e.g. a split-origin one)
+    /// over them.
     pub fn new(issuer: &str) -> Self {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -271,14 +282,23 @@ impl Provider {
             .timeout(Duration::from_secs(10))
             .build()
             .expect("failed to build OIDC http client");
-        Self::with_client(issuer, http)
+        Self::build(issuer, http, false)
     }
 
-    /// [`Provider::new`] over the consumer's own client, for a consumer whose
-    /// every upstream shares one builder so a hardening knob added there
-    /// cannot miss the IdP. The client MUST refuse redirects and bound its
-    /// timeouts, as `new`'s does; passing one is taking that on.
-    pub fn with_client(issuer: &str, http: reqwest::Client) -> Self {
+    /// The relying-party role: discovery also requires `authorization_endpoint`
+    /// and `token_endpoint`, same-origin-https with the issuer, before the
+    /// document is cached — the RP redirects the user to one and posts the
+    /// authorization code to the other.
+    ///
+    /// Over the consumer's own client, for a consumer whose every upstream
+    /// shares one builder so a hardening knob added there cannot miss the IdP.
+    /// The client MUST refuse redirects and bound its timeouts, as `new`'s
+    /// does; passing one is taking that on.
+    pub fn for_relying_party(issuer: &str, http: reqwest::Client) -> Self {
+        Self::build(issuer, http, true)
+    }
+
+    fn build(issuer: &str, http: reqwest::Client, relying_party: bool) -> Self {
         // Seeded in the past so the first real fetch isn't blocked by the cooldown.
         let seeded = Instant::now()
             .checked_sub(JWKS_COOLDOWN * 2)
@@ -289,6 +309,7 @@ impl Provider {
             discovery: RwLock::new(None),
             keys: RwLock::new(HashMap::new()),
             fetch_gate: Mutex::new(seeded),
+            relying_party,
         }
     }
 
@@ -305,8 +326,9 @@ impl Provider {
 
     /// Fetch (once) and cache the discovery document, enforcing the issuer
     /// echo and same-origin-https on `jwks_uri` — the one endpoint both roles
-    /// fetch. A resource server never calls the other endpoints, so it must
-    /// not reject an IdP (e.g. a split-origin one) over them.
+    /// fetch — plus, for a relying party, its two endpoints. Only a document
+    /// that passes every rule is cached; a refused one is fetched afresh on
+    /// the next call.
     pub async fn discovery(&self) -> Result<Discovery, Error> {
         if let Some(d) = self.discovery.read().await.clone() {
             return Ok(d);
@@ -330,16 +352,12 @@ impl Provider {
                 cause: Cause::Document(disc.jwks_uri),
             });
         }
+        if self.relying_party {
+            check_rp_endpoints(&self.issuer, &disc)?;
+        }
 
         *self.discovery.write().await = Some(disc.clone());
         Ok(disc)
-    }
-
-    /// Drop the cached discovery document so the next use re-fetches — for a
-    /// consumer that refuses a document on rules of its own. Without it, one
-    /// answer the shared checks accepted stays cached until restart.
-    pub async fn forget_discovery(&self) {
-        *self.discovery.write().await = None;
     }
 
     /// Verify a compact JWS against this provider and decode its claims:
@@ -447,6 +465,38 @@ async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, Cause> {
     Ok(buf)
 }
 
+/// Both relying-party endpoints present and same-origin-https with `issuer`.
+/// Off-origin is the substituted-IdP signal (OIDC Core §4.3): a hostile
+/// `token_endpoint` would receive the authorization code and PKCE verifier.
+fn check_rp_endpoints(issuer: &str, disc: &Discovery) -> Result<(), Error> {
+    for (missing, off_origin, endpoint) in [
+        (
+            "discovery missing authorization_endpoint",
+            "authorization_endpoint not same-origin",
+            &disc.authorization_endpoint,
+        ),
+        (
+            "discovery missing token_endpoint",
+            "token_endpoint not same-origin",
+            &disc.token_endpoint,
+        ),
+    ] {
+        let Some(endpoint) = endpoint else {
+            return Err(Error::Provider {
+                op: missing,
+                cause: Cause::Missing,
+            });
+        };
+        if same_origin_https(issuer, endpoint).is_err() {
+            return Err(Error::Provider {
+                op: off_origin,
+                cause: Cause::Document(endpoint.clone()),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Index JWKs by `kid`; keys without one are unaddressable and dropped.
 fn key_map(keys: impl IntoIterator<Item = Jwk>) -> HashMap<String, Jwk> {
     keys.into_iter()
@@ -475,7 +525,8 @@ fn build_decoding_key(jwk: &Jwk, alg: Algorithm) -> Result<DecodingKey, Error> {
 /// taken non-blocking because a test holds the only reference.
 #[cfg(feature = "test-seams")]
 impl Provider {
-    /// Pre-populate the discovery cache.
+    /// Pre-populate the discovery cache. Unchecked: a seeded document skips
+    /// every discovery rule, so seed only what a test means to trust.
     pub fn seed_discovery(&self, discovery: Discovery) {
         *self.discovery.try_write().expect("uncontended in tests") = Some(discovery);
     }

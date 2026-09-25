@@ -8,8 +8,8 @@
 //! - PKCE S256 challenge; `state` and `nonce` are supplied by the login flow
 //! - `redirect_uri` is pinned from config; never derived from request headers
 //! - `authorization_endpoint` and `token_endpoint` must be present and pass
-//!   the same same-origin-https rule as `jwks_uri` (the shared layer checks
-//!   only `jwks_uri`, because a resource server never calls the other two)
+//!   the same same-origin-https rule as `jwks_uri` — enforced by `alaya-oidc`
+//!   for this role, before the document is cached
 //! - token exchange with `client_secret_basic` (RFC 6749 §2.3.1 — the scheme
 //!   servers MUST support), over the console's one upstream client, its body
 //!   read through `http::body_text`
@@ -20,9 +20,7 @@
 
 use std::time::Duration;
 
-use alaya_oidc::{
-    Cause, Discovery, Error as OidcError, IssuedClaims, ParseFailure, Provider, same_origin_https,
-};
+use alaya_oidc::{Cause, Error as OidcError, IssuedClaims, ParseFailure, Provider};
 use base64::Engine;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -79,7 +77,6 @@ trait SafeCause: std::fmt::Display {}
 impl SafeCause for reqwest::Error {}
 impl SafeCause for reqwest::StatusCode {}
 impl SafeCause for String {}
-impl SafeCause for &'_ String {}
 impl SafeCause for &'static str {}
 
 #[derive(Deserialize)]
@@ -163,7 +160,7 @@ impl OidcRp {
         // unauthenticated caller can make the console reach.
         let http = crate::http::client(Duration::from_secs(10));
         OidcRp {
-            provider: Provider::with_client(&issuer, http),
+            provider: Provider::for_relying_party(&issuer, http),
             client_id,
             client_secret,
             redirect_uri,
@@ -182,16 +179,18 @@ impl OidcRp {
     /// carries the input inside its own message. Parse failures go through
     /// `warn_idp_parse_failure` instead.
     ///
-    /// Two callers do pass a PARSED field of the discovery document — the
-    /// echoed issuer, and each endpoint that fails the origin check. Those
-    /// are attacker-chosen text, which is what the recording below is about.
+    /// `logged`'s `Cause::Document` arm does pass a PARSED field of the
+    /// discovery document — the echoed issuer, or an endpoint that failed the
+    /// origin check. That is attacker-chosen text, which is what the
+    /// recording below is about.
     /// The configured issuer is config rather than IdP-supplied, but it is
     /// recorded the same way regardless: `validate_issuer` refuses userinfo
     /// and a non-https scheme, and says nothing about control characters, so
     /// the old "it is config, therefore safe" argument did not hold up.
     fn warn_idp_failure(&self, op: &'static str, cause: impl SafeCause) -> OidcRpError {
-        // Recorded with `?`, not `%`, and that is not cosmetic. Two callers
-        // pass a string lifted straight out of the discovery document. A
+        // Recorded with `?`, not `%`, and that is not cosmetic. A
+        // `Cause::Document` is a string lifted straight out of the discovery
+        // document. A
         // plain-text subscriber writes a field recorded as `Display`
         // verbatim, so one `\n` in it emits a second, wholly attacker-authored
         // line that reads like a real record; recorded as `Debug` the same
@@ -264,51 +263,28 @@ impl OidcRp {
                 Cause::Status(status) => self.warn_idp_failure(op, status),
                 Cause::TooLarge => self.warn_idp_failure(op, "response body exceeded the cap"),
                 Cause::Document(value) => self.warn_idp_failure(op, value),
+                Cause::Missing => self.warn_idp_failure(op, "absent"),
                 Cause::Parse(shape) => self.warn_idp_parse_failure(op, shape),
             },
         }
     }
 
-    /// `(authorization_endpoint, token_endpoint)` from discovery, both required
-    /// and both same-origin-https with the issuer. Checked together on every
-    /// use so a bad `token_endpoint` is refused when the login starts, before
-    /// the user is ever redirected.
+    /// `(authorization_endpoint, token_endpoint)` from discovery. Fetched on
+    /// every use, so a bad `token_endpoint` is refused when the login starts,
+    /// before the user is ever redirected; the relying-party `Provider` has
+    /// already required both and origin-checked them.
     async fn endpoints(&self) -> Result<(String, String), OidcRpError> {
         let disc = self
             .provider
             .discovery()
             .await
             .map_err(|e| self.logged(e))?;
-        let checked = self.rp_endpoints(disc);
-        if checked.is_err() {
-            // The shared layer cached this document on its own rules, which
-            // do not cover these two endpoints. Forget it, so the next login
-            // re-fetches and an IdP that corrects its document recovers
-            // without a restart.
-            self.provider.forget_discovery().await;
+        match (disc.authorization_endpoint, disc.token_endpoint) {
+            (Some(authorization), Some(token)) => Ok((authorization, token)),
+            // Unreachable from a fetched document; kept as a logged refusal
+            // rather than a panic.
+            _ => Err(self.warn_idp_failure("discovery missing endpoint", "absent")),
         }
-        checked
-    }
-
-    fn rp_endpoints(&self, disc: Discovery) -> Result<(String, String), OidcRpError> {
-        let authorization = disc.authorization_endpoint.ok_or_else(|| {
-            self.warn_idp_failure("discovery missing authorization_endpoint", "absent")
-        })?;
-        let token = disc
-            .token_endpoint
-            .ok_or_else(|| self.warn_idp_failure("discovery missing token_endpoint", "absent"))?;
-        // A discovery document pointing an endpoint off the issuer's origin
-        // is the substituted-IdP signal (OIDC Core §4.3). The cause records
-        // the value, which the page reason cannot: this is the rejection an
-        // operator most needs a record of.
-        for (op, endpoint) in [
-            ("authorization_endpoint not same-origin", &authorization),
-            ("token_endpoint not same-origin", &token),
-        ] {
-            same_origin_https(self.provider.issuer(), endpoint)
-                .map_err(|_| self.warn_idp_failure(op, endpoint))?;
-        }
-        Ok((authorization, token))
     }
 
     /// Build the authorization redirect for a fresh login flow.
@@ -404,7 +380,7 @@ impl OidcRp {
 mod tests {
     use super::*;
     use crate::testlog::{LogBuf, separators_in};
-    use alaya_oidc::Jwk;
+    use alaya_oidc::{Discovery, Jwk};
 
     #[test]
     fn pkce_challenge_matches_rfc7636_appendix_b() {
@@ -442,7 +418,7 @@ mod tests {
     /// A substituted IdP must not be able to write its own log records.
     /// `cause` is the one field on this path that carries IdP text — the
     /// echoed discovery `issuer` and any off-origin endpoint, arriving through
-    /// `logged`'s `Cause::Document` arm and `rp_endpoints` — and a plain-text
+    /// `logged`'s `Cause::Document` arm — and a plain-text
     /// subscriber neutralises nothing in a field recorded as `Display`. The
     /// `?` in `warn_idp_failure` is the call site's own guard, whatever the
     /// encoder; this is what holds it there.
@@ -465,7 +441,7 @@ mod tests {
         let buf = LogBuf::default();
         {
             let _capture = buf.capture();
-            rp.warn_idp_failure("discovery issuer mismatch", &hostile);
+            rp.warn_idp_failure("discovery issuer mismatch", hostile);
         }
 
         let record = buf.record("identity provider request failed");
@@ -547,57 +523,58 @@ mod tests {
         );
     }
 
+    /// A discovery document naming an off-origin `token_endpoint` must refuse
+    /// the login before the user is redirected — and must not be cached, or
+    /// one bad answer would lock every login out until the pod restarts. So
+    /// this drives the real fetch path: a loopback IdP whose first document
+    /// is hostile and whose second is correct.
     #[tokio::test]
-    async fn cross_origin_rp_endpoint_is_refused_before_redirect() {
-        // The shared layer checks only jwks_uri; the RP must apply the same
-        // rule to its own endpoints before the user is sent anywhere.
-        let rp = OidcRp::new(
-            "https://id.test".into(),
-            "console".into(),
-            "secret".into(),
-            "https://console.test/auth/callback".into(),
-        );
-        rp.provider.seed_discovery(Discovery {
-            issuer: "https://id.test".into(),
-            authorization_endpoint: Some("https://id.test/authorize".into()),
-            token_endpoint: Some("https://evil.test/token".into()),
-            jwks_uri: "https://id.test/jwks".into(),
-        });
-        let err = rp
-            .authorize_url("STATE", "NONCE", "VERIFIER")
-            .await
-            .unwrap_err();
-        assert_eq!(err.to_string(), "token_endpoint not same-origin");
-    }
+    async fn a_cross_origin_rp_endpoint_is_refused_and_not_cached() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// The shared layer caches discovery on its own rules, which do not cover
-    /// the RP endpoints. A document refused on them must not stay cached, or
-    /// one bad answer locks every login out until the pod restarts.
-    #[tokio::test]
-    async fn a_refused_rp_endpoint_is_refetched_not_served_from_cache() {
-        // Closed loopback port: the re-fetch fails fast as a transport error,
-        // which is the proof it happened.
-        let issuer = "http://127.0.0.1:1";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let (doc_issuer, seen) = (issuer.clone(), fetches.clone());
+        let app = axum::Router::new().route(
+            "/.well-known/openid-configuration",
+            axum::routing::get(move || {
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                let token = if n == 0 {
+                    "https://evil.test/token".to_string()
+                } else {
+                    format!("{doc_issuer}/token")
+                };
+                let doc = serde_json::json!({
+                    "issuer": doc_issuer,
+                    "jwks_uri": format!("{doc_issuer}/jwks"),
+                    "authorization_endpoint": format!("{doc_issuer}/authorize"),
+                    "token_endpoint": token,
+                });
+                async move { axum::Json(doc) }
+            }),
+        );
+        // `axum::serve` never returns; the task ends when the test does.
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
         let rp = OidcRp::new(
-            issuer.into(),
+            issuer.clone(),
             "console".into(),
             "secret".into(),
             "https://console.test/auth/callback".into(),
         );
-        rp.provider.seed_discovery(Discovery {
-            issuer: issuer.into(),
-            authorization_endpoint: Some(format!("{issuer}/authorize")),
-            token_endpoint: Some("https://evil.test/token".into()),
-            jwks_uri: format!("{issuer}/jwks"),
-        });
         let first = rp.authorize_url("S", "N", "V").await.unwrap_err();
         assert_eq!(first.to_string(), "token_endpoint not same-origin");
-        let second = rp.authorize_url("S", "N", "V").await.unwrap_err();
-        assert_eq!(
-            second.to_string(),
-            "discovery failed",
-            "the refused document must be re-fetched, not refused again from cache"
-        );
+        let second = rp
+            .authorize_url("S", "N", "V")
+            .await
+            .expect("the corrected document must be fetched, not the refused one reused");
+        assert!(second.starts_with(&format!("{issuer}/authorize?")));
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        server.abort();
     }
 
     // --- signed token -> session cookie, measured end to end -------------
