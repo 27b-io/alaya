@@ -3,8 +3,10 @@
 //! Several defences in this crate are assertions about what reaches the pod
 //! log — that no IdP- or upstream-supplied byte can forge a record, and that
 //! a warning fires on the event it names and no other. Pinning those needs
-//! the binary's own plain-text subscriber writing somewhere a test can read,
-//! which is the fiddly part; this is it, once, instead of per module.
+//! a subscriber writing somewhere a test can read, which is the fiddly part;
+//! this is it, once, instead of per module. `LogBuf::capture` is plain text
+//! on purpose (the binary logs JSON): it proves call sites escape untrusted
+//! values themselves, independently of the encoder.
 
 use std::io::Write;
 use std::sync::{Arc, LazyLock, Mutex};

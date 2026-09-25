@@ -10,7 +10,7 @@
       "name": "alaya-memory-hooks",
       "source": "./integrations/claude-code",
       "description": "Stop-hook memory extraction + PreCompact save-reminder for Ālaya",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "author": {
         "name": "27b.io"
       },
