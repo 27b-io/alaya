@@ -1,6 +1,8 @@
 //! One reqwest builder for every upstream client, and the one bounded body
 //! read they all go through. Redirects are refused everywhere: a 3xx must
-//! never be able to carry a server-held credential off-host.
+//! never be able to carry a server-held credential off-host. Proxy env vars
+//! are ignored for the same reason: the peer dialled must be the host
+//! `validate_upstream_url` classified, not whatever `HTTP_PROXY` names.
 
 use std::time::Duration;
 
@@ -31,6 +33,8 @@ pub enum BodyError {
 
 pub fn client(timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
+        // Dial the host `validate_upstream_url` classified, never an env proxy.
+        .no_proxy()
         .connect_timeout(Duration::from_secs(5))
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
@@ -145,6 +149,80 @@ mod tests {
         server.abort();
         // Following it would return 200 from /followed instead.
         assert_eq!(resp.status().as_u16(), 307);
+    }
+
+    /// The peer dialled must be the host `validate_upstream_url` classified,
+    /// so `client()` ignores `HTTP_PROXY` and friends (LAB-4695). reqwest
+    /// reads them at `build()` and `set_var` races this binary, so the probe
+    /// runs in a child that inherits them: a trap listener named as the proxy
+    /// must see no connection when `client()` dials a refused loopback port.
+    /// A default client must see one, or the harness proves nothing.
+    #[test]
+    fn client_ignores_system_proxy() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const CHILD: &str = "OPS_CONSOLE_PROXY_TEST_CHILD";
+        const TARGET: &str = "http://127.0.0.1:1";
+        if std::env::var_os(CHILD).is_none() {
+            let trap = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let proxy = format!("http://{}", trap.local_addr().unwrap());
+            drop(trap); // the child binds it again; only the port is needed
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "http::tests::client_ignores_system_proxy",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, &proxy)
+                .env("HTTP_PROXY", &proxy)
+                .env("HTTPS_PROXY", &proxy)
+                .env("ALL_PROXY", &proxy)
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy")
+                // A set REQUEST_METHOD makes reqwest ignore HTTP_PROXY (CGI).
+                .env_remove("REQUEST_METHOD")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+
+        let proxy = std::env::var(CHILD).unwrap();
+        let trap = std::net::TcpListener::bind(proxy.trim_start_matches("http://")).unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            for stream in trap.incoming() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream); // the client sees a reset and returns
+            }
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _ = reqwest::Client::new().get(TARGET).send().await;
+        });
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "harness broken: a default client did not use the env proxy"
+        );
+        rt.block_on(async {
+            let _ = client(Duration::from_secs(5)).get(TARGET).send().await;
+        });
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "client() dialled through the env proxy"
+        );
     }
 
     #[tokio::test]

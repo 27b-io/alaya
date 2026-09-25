@@ -373,6 +373,16 @@ enum Transport {
 /// scheme, real host), so the check and the transport cannot disagree about
 /// where the credential goes. Messages name the host, never the raw value: a
 /// URL may carry credentials.
+///
+/// What it certifies is the URL's host, not the network path. That is the
+/// peer dialled only because every `Http` client it guards is built with
+/// `.no_proxy()` (pinned by `clients_ignore_system_proxy`). Left on, reqwest's
+/// default would hand a plaintext request to whatever `HTTP_PROXY` or
+/// `ALL_PROXY` names, absolute-form and with the credential on it, and a
+/// conventional `NO_PROXY=.svc,.cluster.local` does not exempt a single-label
+/// host like `anthropic-lb`. A client added behind this guard must set it too.
+/// It does not promise the host is who it claims to be over plain `http`: that
+/// is what the cluster-local rule accepts.
 fn check_credential_transport(
     var: &str,
     url: &str,
@@ -878,14 +888,8 @@ impl HealthChecker {
         // request (`bearer_auth`), never as a client default header, so
         // Qdrant's bearer is not sent to the embedding endpoint or the bridge.
         // Pinned by `qdrant_key_reaches_only_qdrant`.
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("failed to build health check client");
-
         Self {
-            client,
+            client: Self::client(),
             qdrant_url: config.qdrant_url.clone(),
             qdrant_api_key: config.qdrant_api_key.clone(),
             collection: config.qdrant_collection.clone(),
@@ -897,6 +901,20 @@ impl HealthChecker {
             clock: monotonic_secs,
             qdrant_ok: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Split from `new` so the no-proxy posture can be pinned without a
+    /// whole `Config` (`clients_ignore_system_proxy`). No default headers:
+    /// see `new` for why every credential is per request.
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder()
+            // Dial the host `check_credential_transport` classified, never an
+            // env proxy.
+            .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("failed to build health check client")
     }
 
     fn worker_state(&self) -> (&'static str, bool, u64) {
@@ -3949,6 +3967,144 @@ mod tests {
         // unparseable keyless URL already is.
         assert!(http("QDRANT_URL", "redis://qdrant:6333", false).is_ok());
         assert!(redis("REDIS_CACHE_URL", "https://redis-svc:6379", false).is_ok());
+    }
+
+    /// Every client that dials a URL `check_credential_transport` approved
+    /// must ignore `HTTP_PROXY` and friends, or the certified host is not the
+    /// peer (LAB-4695). reqwest reads the proxy env at `build()`, and
+    /// `set_var` races this binary, so the probe runs in a child that inherits
+    /// the vars. Each client dials a refused loopback port; a trap listener
+    /// named as the proxy counts connections, so any client that went through
+    /// a proxy is named in the child's failure.
+    #[test]
+    fn clients_ignore_system_proxy() {
+        use alaya_backends::{EmbeddingProvider, GraphService, RerankingService};
+        use alaya_backends::{SummaryProvider, VectorStorage};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        const CHILD: &str = "ALAYA_PROXY_TEST_CHILD";
+        const TARGET: &str = "http://127.0.0.1:1";
+        if std::env::var_os(CHILD).is_none() {
+            let trap = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let proxy = format!("http://{}", trap.local_addr().unwrap());
+            drop(trap); // the child binds it again; only the port is needed
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "tests::clients_ignore_system_proxy",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, &proxy)
+                .env("HTTP_PROXY", &proxy)
+                .env("HTTPS_PROXY", &proxy)
+                .env("ALL_PROXY", &proxy)
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy")
+                // A set REQUEST_METHOD makes reqwest ignore HTTP_PROXY (CGI).
+                .env_remove("REQUEST_METHOD")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+
+        let proxy = std::env::var(CHILD).unwrap();
+        let trap = std::net::TcpListener::bind(proxy.trim_start_matches("http://")).unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            for stream in trap.incoming() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream); // the client sees a reset and returns
+            }
+        });
+
+        let mut leaked: Vec<&str> = Vec::new();
+        let mut probe = |name: &'static str, dialled: &mut dyn FnMut()| {
+            let before = hits.load(Ordering::SeqCst);
+            dialled();
+            if hits.load(Ordering::SeqCst) != before {
+                leaked.push(name);
+            }
+        };
+
+        // Blocking client: must not run inside a tokio context.
+        probe("otlp", &mut || {
+            let _ = telemetry::otlp_http_client().get(TARGET).send();
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Control: a default reqwest client must reach the trap, or the
+        // harness proves nothing (wrong var names, CGI mode, exemption).
+        // Clients are built inside `block_on` too: reqwest's builder needs a
+        // reactor.
+        probe("control (default reqwest client)", &mut || {
+            rt.block_on(async {
+                let _ = reqwest::Client::new().get(TARGET).send().await;
+            });
+        });
+        probe("health checker", &mut || {
+            rt.block_on(async {
+                let _ = HealthChecker::client().get(TARGET).send().await;
+            });
+        });
+        probe("qdrant", &mut || {
+            rt.block_on(async {
+                let c = QdrantClient::new(TARGET.into(), "m".into(), Some("k".into())).unwrap();
+                let _ = c.count().await;
+            });
+        });
+        probe("graph", &mut || {
+            rt.block_on(async {
+                let _ = GraphHttpClient::new(TARGET.into(), "k")
+                    .unwrap()
+                    .get_stats()
+                    .await;
+            });
+        });
+        probe("embedding", &mut || {
+            rt.block_on(async {
+                let c = EmbeddingClient::new(TARGET.into(), "m".into(), 4, 1, Some("k".into()));
+                let _ = c
+                    .embed_batch(&["x"], alaya_types::search::PromptName::Query)
+                    .await;
+            });
+        });
+        // Summary and judge share the one Messages transport builder.
+        probe("anthropic transport", &mut || {
+            rt.block_on(async {
+                let c = SummaryClient::new(TARGET.into(), "m".into(), Some("k".into())).unwrap();
+                let _ = c.summarize("x").await;
+            });
+        });
+        probe("rerank", &mut || {
+            rt.block_on(async {
+                let c =
+                    RerankClient::new(TARGET.into(), 1, Some("k".into()), Duration::from_secs(5))
+                        .unwrap();
+                let _ = c.rerank("q", &["x"]).await;
+            });
+        });
+
+        let control = "control (default reqwest client)";
+        assert!(
+            leaked.contains(&control),
+            "harness broken: a default client did not use the env proxy"
+        );
+        leaked.retain(|n| *n != control);
+        assert!(
+            leaked.is_empty(),
+            "dialled through the env proxy: {leaked:?}"
+        );
     }
 
     #[test]
