@@ -1089,8 +1089,8 @@ impl HealthChecker {
     }
 
     /// Operator view: the full document plus the embedding probe (LAB-4025).
-    /// Only this path contacts the embedding endpoint — the bare probe must
-    /// not grow another anonymous fan-out (#78). A dead endpoint degrades
+    /// The bare probe does no backend I/O; the embedding probe runs only on
+    /// this authenticated detail path (#78). A dead endpoint degrades
     /// `status` but never overrides `unhealthy`: that word is the
     /// worker-stall 503 contract (#63), and a restart does not fix TEI.
     async fn check_detail(&self) -> Value {
@@ -4668,13 +4668,12 @@ mod wedge_tests {
     }
 
     /// LAB-4025: Qdrant and the bridge up, embedding endpoint down. The
-    /// operator view degrades and names the probe; the bare probe's verdict —
-    /// the k8s contract — is untouched and carries no embedding verdict (#78:
-    /// no new anonymous fan-out; `check()` is not wired to `check_embedding`).
-    /// A stalled worker still wins: `unhealthy` is the 503 signal and TEI is
-    /// not fixed by a restart.
+    /// operator view degrades and names the probe. A stalled worker still
+    /// wins: `unhealthy` is the 503 signal and TEI is not fixed by a restart.
+    /// The bare route is guarded by `unauthenticated_health_exposes_only_status`
+    /// and `check_status_preserves_tri_state_and_carries_only_status`.
     #[tokio::test]
-    async fn embedding_outage_degrades_detail_but_not_bare_probe() {
+    async fn embedding_outage_degrades_detail() {
         // Loopback stand-in for Qdrant *and* the bridge; TEI stays at port 1.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_url = format!("http://{}", listener.local_addr().unwrap());
@@ -4700,10 +4699,6 @@ mod wedge_tests {
             graph_url: backend_url,
             ..test_checker(TEST_NOW)
         };
-
-        let bare = checker.check().await;
-        assert_eq!(bare["status"], "healthy");
-        assert!(bare.get("embedding_health").is_none());
 
         let detail = checker.check_detail().await;
         assert_eq!(detail["status"], "degraded");

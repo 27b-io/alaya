@@ -78,9 +78,8 @@ curl http://localhost:3001/health
 `status` is `healthy` when the service worker is live and Qdrant is reachable,
 `degraded` (HTTP 200) when Qdrant is down — restarting the pod won't fix Qdrant —
 and `unhealthy` (HTTP 503) when the service worker has stalled, so a liveness
-probe restarts it. The bare probe's verdict ignores the graph and it never
-probes the embedding endpoint; both verdicts are reported only on
-`/health/detail`.
+probe restarts it. The bare verdict ignores the graph and the embedding
+endpoint; both are reported only on `/health/detail`.
 
 Probers read the HTTP code, so a k8s `httpGet` probe and `curl -sf .../health`
 both work against this endpoint unchanged.
