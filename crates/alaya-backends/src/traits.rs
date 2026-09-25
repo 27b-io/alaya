@@ -361,6 +361,13 @@ pub trait RerankingService {
     /// Score each (query, text) pair; returns one score per input text,
     /// in the same order as `texts`. Higher = more relevant.
     /// Scores are sigmoid-normalized to roughly [0, 1] when supported.
+    ///
+    /// Cancel-safe, and on native carries **no client-side bound of its
+    /// own** — dropping the future aborts the request cleanly, but nothing
+    /// times it out. Callers MUST wrap every call in
+    /// `tokio::time::timeout(self.timeout(), …)`; an unwrapped call hangs
+    /// forever on a stalled connection. Only wasm32 implementations bound
+    /// their own transport, since there is no tokio timer to wrap with.
     async fn rerank(&self, query: &str, texts: &[&str]) -> Result<Vec<f32>>;
 
     /// Number of candidates to rerank per query.
