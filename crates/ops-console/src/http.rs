@@ -164,6 +164,7 @@ mod tests {
 
         const CHILD: &str = "OPS_CONSOLE_PROXY_TEST_CHILD";
         const TARGET: &str = "http://127.0.0.1:1";
+        const PROBED: &str = "proxy probe complete";
         if std::env::var_os(CHILD).is_none() {
             let trap = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let proxy = format!("http://{}", trap.local_addr().unwrap());
@@ -188,6 +189,12 @@ mod tests {
                 out.status.success(),
                 "{}",
                 String::from_utf8_lossy(&out.stderr)
+            );
+            // libtest exits 0 when `--exact` matches nothing, so success alone
+            // passes a renamed or moved test with no client probed.
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains(PROBED),
+                "child never reached the end of the probe"
             );
             return;
         }
@@ -223,6 +230,7 @@ mod tests {
             1,
             "client() dialled through the env proxy"
         );
+        println!("{PROBED}");
     }
 
     #[tokio::test]
