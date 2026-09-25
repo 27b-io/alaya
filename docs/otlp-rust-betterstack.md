@@ -132,6 +132,12 @@ OTEL_SERVICE_NAME=my-service
 RUST_LOG=my_crate=info,my_lib=info,tower_http=info
 ```
 
+- **`https://` is required off-cluster.** Whenever any `OTEL_EXPORTER_OTLP_HEADERS`
+  value is set, the server refuses to boot on a plain-`http` endpoint that is not
+  cluster-local — the header is assumed to carry a credential, and `http` is a
+  scheme reqwest speaks, so nothing else would fail. The
+  `OTEL_EXPORTER_OTLP_TRACES_*` twins take precedence exactly as the exporter
+  resolves them, and only the pair it will actually use is checked.
 - The SDK appends `/v1/traces` to the endpoint automatically
 - Headers are parsed on the first `=` sign: `Authorization=Bearer token` → key `Authorization`, value `Bearer token`
 - BetterStack per-source endpoint (not `in-otel.logs.betterstack.com`)

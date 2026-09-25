@@ -147,11 +147,13 @@ impl Config {
         // wrong one there is a silent downgrade, so it is one column to read
         // rather than seven call sites.
         //
-        // Credential-bearing but not in `Config`, so not covered here: the
-        // cachekit.io SaaS cache URL (its own builder is HTTPS-only and
-        // host-allowlisted) and `OTEL_EXPORTER_OTLP_ENDPOINT`, which
-        // `opentelemetry-otlp` reads directly along with the bearer token in
-        // `OTEL_EXPORTER_OTLP_HEADERS`.
+        // Credential-bearing but not in `Config`, so not covered by this
+        // table: the cachekit.io SaaS cache URL (its own builder is HTTPS-only
+        // and host-allowlisted). The OTLP endpoint vars are not in `Config`
+        // either — `opentelemetry-otlp` reads them, and the bearer token in
+        // `OTEL_EXPORTER_OTLP_HEADERS`, straight from the environment — so
+        // `telemetry::init_tracing` calls the function below directly, at that
+        // read, rather than adding a row here (LAB-4313).
         for (var, url, has_credential, transport) in [
             (
                 "SUMMARY_URL",
@@ -3205,6 +3207,10 @@ mod tests {
         assert_eq!(non_empty_trimmed(Some("".into())), None);
         assert_eq!(non_empty_trimmed(Some("   ".into())), None);
         assert_eq!(non_empty_trimmed(Some("\t\n ".into())), None);
+        // Unicode White_Space, not ASCII: a regression to `trim_ascii` would
+        // leave YAML/copy-paste NBSP and ideographic padding reading as
+        // configured. One case, because it is the one that would then fail.
+        assert_eq!(non_empty_trimmed(Some("  \u{00a0}\u{3000} ".into())), None);
         // Trimmed, not merely accepted — the value reaching a client is clean.
         assert_eq!(
             non_empty_trimmed(Some("  https://api.anthropic.com  ".into())),

@@ -137,7 +137,14 @@ ALAYA_API_KEY=                           # fail-closed: boot refused when this, 
 ALAYA_READONLY_API_KEY=                  # optional read-only bearer (pure reads; must differ from ALAYA_API_KEY)
 LISTEN_ADDR=0.0.0.0:3001
 RUST_LOG=alaya_server=info
-OTEL_EXPORTER_OTLP_ENDPOINT=http://phoenix-svc.recsys.svc:6006  # optional
+OTEL_EXPORTER_OTLP_ENDPOINT=http://phoenix-svc.recsys.svc:6006  # optional — read by opentelemetry-otlp, not Config.
+OTEL_EXPORTER_OTLP_HEADERS=                                     #   Boot is refused when ANY header is set here and the
+                                                                #   endpoint is plain http off-cluster — a header is assumed
+                                                                #   to carry a credential, so a non-secret one (X-Scope-OrgID)
+                                                                #   refuses too. https anywhere, http cluster-local only.
+                                                                #   The OTEL_EXPORTER_OTLP_TRACES_* twins take precedence,
+                                                                #   exactly as the exporter resolves them; only the pair it
+                                                                #   will actually use is checked.
 OTEL_SERVICE_NAME=alaya-server
 SUMMARY_URL=                             # optional — Anthropic API origin; client appends /v1/messages. https:// required off-cluster
                                          #   (https://api.anthropic.com); plain http only for a cluster-local proxy (http://anthropic-lb:8082).
@@ -202,7 +209,7 @@ These were discovered during integration testing and are NOT documented in Falko
 4. ~~**Integration testing**~~ — Done (5 tests against real Qdrant + TEI on lab k3s)
 5. ~~**MCP transport**~~ — Done (JSON-RPC 2.0 + SSE, protocol 2025-03-26, 11 tool schemas)
 6. ~~**Deployment**~~ — Done (k3s manifests, CI → ghcr.io, network policies)
-7. **OTLP tracing** — Wired but degraded (reqwest async client issue in container, falls back to stderr)
+7. ~~**OTLP tracing**~~ — Done (reqwest::blocking::Client on the batch-exporter thread; a bearer over plaintext off-cluster refuses boot, stderr-only fallback if the exporter fails to build)
 8. **Prajna integration** — Replace writer.rs qdrant-client with Ālaya HTTP calls
 9. **cachekit-rs integration** — Embedding cache for edge performance (immutable, content-addressed)
 
