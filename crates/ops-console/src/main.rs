@@ -1053,6 +1053,81 @@ mod tests {
         assert!(body_string(replay).await.contains("already used"));
     }
 
+    const CODE_SENTINEL: &str = "CODE-SENTINEL";
+    const STATE_SENTINEL: &str = "STATE-SENTINEL";
+    const NO_COOKIE_LINE: &str = "oidc: no valid login cookie — callback refused";
+
+    /// Drive one callback under capture and pin its refusal: the status, one
+    /// record naming it, and no sent credential anywhere in the log.
+    async fn refused_callback(app: Router, req: HttpRequest<Body>) -> (StatusCode, String) {
+        let buf = testlog::LogBuf::default();
+        let status = {
+            let _capture = buf.capture();
+            app.oneshot(req).await.unwrap().status()
+        };
+        let logged = buf.text();
+        for secret in [CODE_SENTINEL, STATE_SENTINEL] {
+            assert!(
+                !logged.contains(secret),
+                "{secret} reached the log:\n{logged}"
+            );
+        }
+        (status, logged)
+    }
+
+    fn assert_one_record(logged: &str, line: &str) {
+        let n = logged.lines().filter(|l| l.contains(line)).count();
+        assert_eq!(n, 1, "expected one {line:?} record:\n{logged}");
+    }
+
+    #[tokio::test]
+    async fn a_callback_missing_its_state_is_logged_without_the_code() {
+        let req = HttpRequest::get(format!("/auth/callback?code={CODE_SENTINEL}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, logged) = refused_callback(app(test_state()), req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_one_record(&logged, "oidc: missing code or state — callback refused");
+    }
+
+    #[tokio::test]
+    async fn a_callback_with_no_login_cookie_is_logged_without_code_or_state() {
+        let req = HttpRequest::get(format!(
+            "/auth/callback?code={CODE_SENTINEL}&state={STATE_SENTINEL}"
+        ))
+        .body(Body::empty())
+        .unwrap();
+        let (status, logged) = refused_callback(app(test_state()), req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_one_record(&logged, NO_COOKIE_LINE);
+    }
+
+    /// A genuine login cookie from `/auth/login`, answered with someone
+    /// else's state: the login-CSRF shape. Neither state reaches the log,
+    /// and the cookie arm it passed through stays silent.
+    #[tokio::test]
+    async fn a_state_mismatch_is_logged_without_either_state() {
+        let (issuer, _token_calls) = testkit::mock_idp().await;
+        let (app, cookie, real_state) = start_login(issuer).await;
+        let req = HttpRequest::get(format!(
+            "/auth/callback?code={CODE_SENTINEL}&state={STATE_SENTINEL}"
+        ))
+        .header(header::COOKIE, cookie)
+        .body(Body::empty())
+        .unwrap();
+        let (status, logged) = refused_callback(app, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_one_record(&logged, "oidc: login state mismatch — callback refused");
+        assert!(
+            !logged.contains(&real_state),
+            "cookie state reached the log:\n{logged}"
+        );
+        assert!(
+            !logged.contains(NO_COOKIE_LINE),
+            "a valid cookie must not log the no-cookie refusal:\n{logged}"
+        );
+    }
+
     /// The first callback is parked on the token exchange when the second
     /// arrives, so this fails for any check made after the exchange rather
     /// than before it. One task on purpose: `join!` is what guarantees that
