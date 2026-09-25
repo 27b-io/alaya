@@ -182,8 +182,9 @@ impl Config {
             (
                 "GRAPH_URL",
                 Some(cfg.graph_url.as_str()),
-                // The Qdrant key is never sent here: pinned by
-                // `qdrant_key_reaches_only_qdrant`.
+                // The Qdrant key is never sent here: `GraphHttpClient` takes
+                // only `GRAPH_API_KEY`, and the `HealthChecker` probe is
+                // pinned by `qdrant_key_reaches_only_qdrant`.
                 !cfg.graph_api_key.is_empty(),
                 Transport::Http,
             ),
@@ -192,8 +193,8 @@ impl Config {
                 // credential: the worker passes `None` to
                 // `EmbeddingClient::new`, and `HealthChecker::check_embedding`
                 // sends no bearer — leaving userinfo as the only credential
-                // this can carry. Mirrored at both call sites; the second is
-                // pinned by `qdrant_key_reaches_only_qdrant`.
+                // this can carry. Mirrored at both call sites; the
+                // `HealthChecker` one is pinned by `qdrant_key_reaches_only_qdrant`.
                 "EMBEDDING_URL",
                 Some(cfg.embedding_url.as_str()),
                 false,
@@ -4733,7 +4734,9 @@ mod wedge_tests {
         // backend tells the graph and embedding `/health` probes apart.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let seen = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        // Every request is kept, so a clean request cannot mask a leaking one
+        // to the same path.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = seen.clone();
         let app = Router::new().fallback(move |req: Request| {
             let auth = req
@@ -4747,12 +4750,13 @@ mod wedge_tests {
                 .any(|v| String::from_utf8_lossy(v.as_bytes()).contains(QDRANT_KEY));
             log.lock()
                 .unwrap()
-                .insert(req.uri().path().to_owned(), (auth, carries_key));
+                .push((req.uri().path().to_owned(), auth, carries_key));
             std::future::ready(Json(json!({})))
         });
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        // Only the URL and key fields reach `HealthChecker::new`.
+        // Only the URL, key and `qdrant_collection` fields reach
+        // `HealthChecker::new`.
         let config = Config {
             qdrant_url: format!("{base}/qdrant"),
             qdrant_collection: "test".into(),
@@ -4787,19 +4791,20 @@ mod wedge_tests {
             .await;
 
         let bearer = Some(format!("Bearer {QDRANT_KEY}"));
-        let expected = HashMap::from([
-            (
-                "/qdrant/collections/test".to_owned(),
-                (bearer.clone(), true),
-            ),
+        // Exactly one request per probe, sorted by path.
+        let expected = vec![
+            ("/embedding/health".to_owned(), None, false),
+            ("/graph/health".to_owned(), None, false),
+            ("/qdrant/collections/test".to_owned(), bearer.clone(), true),
             (
                 "/qdrant/collections/test/points/count".to_owned(),
-                (bearer, true),
+                bearer,
+                true,
             ),
-            ("/graph/health".to_owned(), (None, false)),
-            ("/embedding/health".to_owned(), (None, false)),
-        ]);
-        assert_eq!(*seen.lock().unwrap(), expected);
+        ];
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(seen, expected);
     }
 
     /// The #63 contract is the HTTP code, not the body: a wedged worker must
