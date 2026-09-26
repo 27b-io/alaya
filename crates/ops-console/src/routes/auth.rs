@@ -61,14 +61,30 @@ pub async fn callback(
             idp_error_detail(&err)
         )));
     }
+    // The three refusals below log a static line and no request-derived
+    // field: `AppError` renders without logging, so an unlogged 4xx here is
+    // invisible, and the code and state are the credentials this route guards.
     let (code, cb_state) = match (q.code, q.state) {
         (Some(c), Some(s)) => (c, s),
-        _ => return Err(AppError::BadRequest("missing code/state".into())),
+        _ => {
+            // `info`, not `warn`: with no state there is nothing to plant, so
+            // this is a stray visit or a probe, never a login-CSRF attempt.
+            tracing::info!("oidc: missing code or state — callback refused");
+            return Err(AppError::BadRequest("missing code/state".into()));
+        }
     };
 
-    let login = read_login(&jar)
-        .ok_or_else(|| AppError::BadRequest("login flow expired — start again".into()))?;
+    // Lazy on purpose: an eager `ok_or` would log this on every success.
+    // `warn`: login CSRF against a victim holding no login cookie lands here,
+    // as does a flow that outlived its cookie — this line cannot tell which.
+    let login = read_login(&jar).ok_or_else(|| {
+        tracing::warn!("oidc: no valid login cookie — callback refused");
+        AppError::BadRequest("login flow expired — start again".into())
+    })?;
     if login.state != cb_state {
+        // The strongest login-CSRF signal: someone else's state delivered to
+        // a browser mid-login of its own.
+        tracing::warn!("oidc: login state mismatch — callback refused");
         return Err(AppError::Forbidden("state mismatch".into()));
     }
     // Before the exchange, not after it: a second callback on this state —
