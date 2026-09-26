@@ -744,19 +744,19 @@ impl MemoryService {
 
     #[tracing::instrument(skip(self, params))]
     async fn search_hybrid(&self, params: &SearchParams, read_only: bool) -> Result<Value> {
-        let clock = StageClock::start();
-        let result = self.search_hybrid_timed(params, read_only, &clock).await;
-        clock.finish(result.is_ok());
+        let stages = StageClock::start();
+        let result = self.search_hybrid_timed(params, read_only, &stages).await;
+        stages.finish(result.is_ok());
         result
     }
 
-    /// The body of [`Self::search_hybrid`], which owns `clock` so that a
+    /// The body of [`Self::search_hybrid`], which owns `stages` so that a
     /// failed or dropped search still logs its stage timings.
     async fn search_hybrid_timed(
         &self,
         params: &SearchParams,
         read_only: bool,
-        clock: &StageClock,
+        stages: &StageClock,
     ) -> Result<Value> {
         if params.query.trim().is_empty() {
             return Err(AlayaError::Validation(
@@ -774,33 +774,33 @@ impl MemoryService {
         // tags→keywords→tag_search chains as a concurrent branch.
         let (embed_result, mut tag_results, corpus_size, n_keywords) = {
             let _span = tracing::info_span!("fan_out").entered();
-            let _stage = clock.stage(Stage::FanOut);
+            let _stage = stages.stage(Stage::FanOut);
             let query_texts = [params.query.as_str()];
-            let embed_fut = clock.time(
+            let embed_fut = stages.time(
                 Stage::Embed,
                 self.embeddings.embed_batch(&query_texts, PromptName::Query),
             );
 
             let tag_search_fut = async {
                 let _span = tracing::info_span!("get_all_tags").entered();
-                let tags_started = std::time::Instant::now();
-                let all_tags = {
-                    let cached = self.tag_cache.borrow().clone();
-                    if let Some((ts, tags)) = cached {
-                        if now - ts < TAG_CACHE_TTL {
-                            tags
+                let all_tags = stages
+                    .time(Stage::Tags, async {
+                        let cached = self.tag_cache.borrow().clone();
+                        if let Some((ts, tags)) = cached {
+                            if now - ts < TAG_CACHE_TTL {
+                                tags
+                            } else {
+                                let fresh = self.vectors.get_all_tags().await.unwrap_or_default();
+                                *self.tag_cache.borrow_mut() = Some((now, fresh.clone()));
+                                fresh
+                            }
                         } else {
                             let fresh = self.vectors.get_all_tags().await.unwrap_or_default();
                             *self.tag_cache.borrow_mut() = Some((now, fresh.clone()));
                             fresh
                         }
-                    } else {
-                        let fresh = self.vectors.get_all_tags().await.unwrap_or_default();
-                        *self.tag_cache.borrow_mut() = Some((now, fresh.clone()));
-                        fresh
-                    }
-                };
-                clock.record(Stage::Tags, tags_started);
+                    })
+                    .await;
                 drop(_span);
 
                 let tag_set: std::collections::HashSet<String> = all_tags.into_iter().collect();
@@ -814,7 +814,7 @@ impl MemoryService {
                     let search = self
                         .vectors
                         .search_by_tags(&keyword_refs, false, fetch_size);
-                    clock
+                    stages
                         .time(Stage::TagSearch, search)
                         .await
                         .unwrap_or_default()
@@ -822,7 +822,7 @@ impl MemoryService {
                 (results, n_keywords)
             };
 
-            let count_fut = clock.time(Stage::Count, self.vectors.count());
+            let count_fut = stages.time(Stage::Count, self.vectors.count());
 
             let (embed, (tags, n_kw), count) = futures::join!(embed_fut, tag_search_fut, count_fut);
             (embed, tags, count, n_kw)
@@ -845,7 +845,7 @@ impl MemoryService {
         // 44-64ms semantic search overlaps with search_by_vector.
         let (mut vector_results, semantic_tag_results) = {
             let _span = tracing::info_span!("vector_search").entered();
-            let _stage = clock.stage(Stage::VectorSearch);
+            let _stage = stages.stage(Stage::VectorSearch);
             let vector_fut =
                 self.vectors
                     .search_by_vector(&query_embedding, fetch_size, Some(filter));
@@ -900,7 +900,7 @@ impl MemoryService {
                 tags = tag_results.len()
             )
             .entered();
-            let _stage = clock.stage(Stage::RrfFuse);
+            let _stage = stages.stage(Stage::RrfFuse);
             let v_tuples: Vec<(String, f64)> = vector_results
                 .iter()
                 .map(|s| (s.memory.content_hash.clone(), s.score))
@@ -927,7 +927,7 @@ impl MemoryService {
         // Stage 4: Boost — graph queries run concurrently
         let (spreading, hebbian_boosts) = {
             let _span = tracing::info_span!("graph_boost").entered();
-            let _stage = clock.stage(Stage::GraphBoost);
+            let _stage = stages.stage(Stage::GraphBoost);
             let result_hashes: Vec<&str> =
                 fused.iter().take(20).map(|(h, _, _)| h.as_str()).collect();
 
@@ -950,7 +950,7 @@ impl MemoryService {
         // when their cosine similarity to the query is low.
         let injected_neighbors: Vec<ScoredMemory> = if !spreading.is_empty() {
             let _span = tracing::info_span!("graph_inject").entered();
-            let _stage = clock.stage(Stage::GraphInject);
+            let _stage = stages.stage(Stage::GraphInject);
             let fused_hashes: std::collections::HashSet<&str> =
                 fused.iter().map(|(h, _, _)| h.as_str()).collect();
 
@@ -1034,7 +1034,7 @@ impl MemoryService {
                 break 'rerank HashMap::new();
             };
             let _span = tracing::info_span!("rerank", top_n = reranker.top_n()).entered();
-            let _stage = clock.stage(Stage::Rerank);
+            let _stage = stages.stage(Stage::Rerank);
             let top_n = reranker.top_n().min(fused.len());
             if top_n == 0 {
                 break 'rerank HashMap::new();
@@ -1242,7 +1242,7 @@ impl MemoryService {
 
         if !read_only {
             let _span = tracing::info_span!("enrich", results = page_hashes.len()).entered();
-            let _stage = clock.stage(Stage::Enrich);
+            let _stage = stages.stage(Stage::Enrich);
             let access_fut = self.vectors.increment_access_count_batch(&page_hashes);
 
             let hebbian_enqueue_fut = async {
@@ -2487,11 +2487,14 @@ impl Stage {
 /// dropped at the worker's deadline, which is why the line comes from `Drop`.
 ///
 /// `outcome` is `ok` or `error` (set by [`Self::finish`] from the result), or
-/// `dropped` when the future was dropped (or unwound) before finishing. An
-/// unfinished search also logs `stage`: the last stage it entered, whose
-/// `_ms` is then its elapsed-so-far. A stage that did not run has no `_ms`;
-/// a fan-out branch only gets one when it completes, so in a dropped
-/// `fan_out` the missing branch is the one that never answered.
+/// `dropped` when the future was dropped (or unwound) before finishing. A
+/// dropped search logs `stage` as the stage still running, whose `_ms` is its
+/// elapsed-so-far. An error logs `stage` as the last stage entered, the one
+/// whose result failed, whose `_ms` is complete; a validation error before any
+/// stage has no `stage`. A stage that did not run has no `_ms`. A fan-out
+/// branch only gets one when it completes, so in a dropped `fan_out` a missing
+/// `embed_ms`, `tags_ms` or `count_ms` is a branch that never answered, while
+/// `tag_search_ms` is also absent whenever no query word matched a tag.
 struct StageClock {
     started: std::time::Instant,
     ms: RefCell<Vec<(Stage, u64)>>,
@@ -6148,21 +6151,25 @@ mod tests {
         }
     }
 
+    /// Keeps a second dispatcher registered for the whole test process. A
+    /// callsite caches its interest when first hit; while only one dispatcher
+    /// is registered, tracing-core asks just the hitting thread's default —
+    /// none, when a parallel test hits it first — and caches `never`. With two
+    /// registered it asks every live one, the capturing dispatcher included.
+    static KEEPALIVE: std::sync::LazyLock<tracing::Dispatch> =
+        std::sync::LazyLock::new(|| tracing::Dispatch::new(tracing_subscriber::registry()));
+
     /// Runs `fut` and returns what it logged on `target`. Only the polling
     /// thread is captured, and only while `fut` is being polled.
     async fn captured<T>(
         target: &'static str,
         fut: impl std::future::Future<Output = T>,
     ) -> (T, Vec<HashMap<String, String>>) {
+        std::sync::LazyLock::force(&KEEPALIVE);
         let events = Arc::new(Mutex::new(Vec::new()));
         let capture = tracing::Dispatch::new(
             tracing_subscriber::registry().with(Capture(target, events.clone())),
         );
-        // A callsite caches its interest when first hit. While only one
-        // dispatcher is live, tracing-core asks just the hitting thread's
-        // default — none, when a parallel test hits it first — and caches
-        // `never`. A second live dispatcher makes it ask every live one.
-        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
         let out = fut.with_subscriber(capture).await;
         let collected = events.lock().unwrap().clone();
         (out, collected)
@@ -6229,9 +6236,49 @@ mod tests {
         }
     }
 
+    /// Graph injection and rerank run only with graph neighbours to inject and
+    /// a reranker configured; with both, their durations are on the ok line.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_search_logs_graph_inject_and_rerank_timings() {
+        let seed = make_scored_memory(&"a".repeat(64), "seed", 0.6);
+        let neighbor = make_scored_memory(&"b".repeat(64), "neighbor", 0.0).memory;
+        let svc = MemoryService::new(
+            Box::new(MockVectorsWithInjection {
+                search_results: vec![seed],
+                injectable_memories: HashMap::from([(neighbor.content_hash.clone(), neighbor)]),
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraphWithActivation {
+                activation: HashMap::from([("b".repeat(64), 0.8)]),
+            }),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        )
+        .with_reranker(Box::new(MockReranker {
+            top_n: 20,
+            scores_by_doc_prefix: HashMap::new(),
+            sleep_for: std::time::Duration::ZERO,
+            budget: std::time::Duration::from_secs(5),
+        }));
+
+        let (out, lines) = stage_lines(svc.search(search_params("anything"))).await;
+
+        out.expect("search succeeds");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert_eq!(line["outcome"], "ok");
+        let keys = keys(line);
+        assert!(
+            keys.contains(&"graph_inject_ms") && keys.contains(&"rerank_ms"),
+            "{keys:?}"
+        );
+    }
+
     /// The worker drops a search at its deadline; the line must still come
-    /// out, naming the stage it was stuck in. Inside fan-out the branch that
-    /// never answered is the one without a duration.
+    /// out, naming the stage it was stuck in. Inside fan-out a branch that
+    /// never answered has no duration (here `embed_ms`); `tag_search_ms` is
+    /// absent too, because no query word matched a tag.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn dropped_hybrid_search_logs_the_stage_it_was_stuck_in() {
         let svc = MemoryService::new(
