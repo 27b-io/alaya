@@ -58,7 +58,7 @@ use tracing;
 
 use alaya_backends::{
     ConsolidationService, EmbeddingProvider, GraphService, HebbianService, RerankingService,
-    SummaryProvider, VectorStorage,
+    StoreMode, SummaryProvider, VectorStorage,
 };
 use alaya_types::{
     AlayaError, Result,
@@ -459,16 +459,14 @@ impl MemoryService {
         // A read-only principal's store is additive only. Re-storing content
         // that already exists would replace the record's caller-owned fields
         // (tags, metadata, summary, memory_type) — the effect of patch /
-        // supersede, which read-only is denied. `exists` judges presence
-        // exactly as `store` does (raw point, not parseability), so guard and
-        // write cannot disagree; it runs immediately before the write to keep
-        // the window against concurrent writers minimal. Fails closed on a
-        // lookup error.
-        if read_only && self.vectors.exists(&content_hash).await? {
-            return Err(AlayaError::Validation(format!(
-                "memory {content_hash} already exists; read-only principals may only add new memories"
-            )));
-        }
+        // supersede, which read-only is denied. Read-only stores are
+        // insert-only: an existing record, judged on the raw point rather than
+        // parseability, is reported as created=false by the write itself.
+        let mode = if read_only {
+            StoreMode::InsertOnly
+        } else {
+            StoreMode::Upsert
+        };
 
         // Store in vector DB. `created == false` means a point with this
         // content_hash already existed: the backend carried its created_at,
@@ -477,7 +475,12 @@ impl MemoryService {
         // provenance — replaced the stored ones. Who owns provenance when two
         // callers store the same content is LAB-1084's decision; today's
         // replace semantics stand until then.
-        let (created, _) = self.vectors.store(&memory).await?;
+        let (created, _) = self.vectors.store(&memory, mode).await?;
+        if read_only && !created {
+            return Err(AlayaError::Validation(format!(
+                "memory {content_hash} already exists; read-only principals may only add new memories"
+            )));
+        }
         if !created {
             tracing::info!(
                 hash = %content_hash,
@@ -1748,7 +1751,9 @@ impl MemoryService {
             )));
         }
 
-        self.mark_superseded(&[old_hash], new_hash, reason).await?;
+        self.mark_superseded(&[old_hash], new_hash, reason)
+            .await
+            .map_err(|f| f.error)?;
 
         Ok(serde_json::json!({
             "success": true,
@@ -1764,15 +1769,31 @@ impl MemoryService {
     /// `supersession_reason`) for all memories, then one batched edge write
     /// creates the SUPERSEDES edges. Edge failures only warn — graph
     /// operations are non-fatal by design.
+    ///
+    /// The update is atomic per memory, not per batch, so a failure can leave
+    /// some memories marked (alaya#130). Those still get their edge — the
+    /// marked set is re-read, so a write that landed without being confirmed
+    /// counts too — and are returned with the error, so the caller reports
+    /// them as superseded.
+    ///
+    /// When that re-read fails as well, which memories carry the marker is
+    /// unknown. They are returned as in doubt — never as untouched — and get
+    /// no edge: an edge on a memory whose marker did not land would claim a
+    /// supersession search does not apply. Nothing is lost either way. The
+    /// marker is the durable record and the edge is derived from it, so
+    /// retrying the same call converges (re-marking writes the same marker,
+    /// edge creation is a MERGE), and `scripts/backfill_graph.py` rebuilds
+    /// every SUPERSEDES edge from the markers.
     async fn mark_superseded(
         &self,
         old_hashes: &[&str],
         new_hash: &str,
         reason: &str,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), SupersedeFailure> {
         let mut extra = HashMap::new();
         extra.insert("supersession_reason".into(), serde_json::json!(reason));
-        self.vectors
+        let updated = self
+            .vectors
             .update_metadata_batch(
                 old_hashes,
                 MetadataUpdate {
@@ -1781,8 +1802,52 @@ impl MemoryService {
                     ..Default::default()
                 },
             )
-            .await?;
+            .await;
+        if let Err(error) = updated {
+            let memories = match self.vectors.get_batch(old_hashes).await {
+                Ok(memories) => memories,
+                Err(read) => {
+                    let in_doubt: Vec<String> =
+                        old_hashes.iter().map(|h| (*h).to_string()).collect();
+                    tracing::error!(
+                        new_hash,
+                        in_doubt = ?in_doubt,
+                        error = %error,
+                        read_error = %read,
+                        "supersession outcome unknown: markers may have landed without \
+                         SUPERSEDES edges; retry the call (it is idempotent) or run \
+                         scripts/backfill_graph.py"
+                    );
+                    return Err(SupersedeFailure {
+                        marked: Vec::new(),
+                        in_doubt,
+                        error,
+                    });
+                }
+            };
+            let marked: Vec<String> = memories
+                .into_iter()
+                .filter(|m| superseded_by(m) == Some(new_hash))
+                .map(|m| m.content_hash)
+                .collect();
+            let refs: Vec<&str> = marked.iter().map(String::as_str).collect();
+            self.write_supersedes_edges(&refs, new_hash).await;
+            return Err(SupersedeFailure {
+                marked,
+                in_doubt: Vec::new(),
+                error,
+            });
+        }
 
+        self.write_supersedes_edges(old_hashes, new_hash).await;
+        Ok(())
+    }
+
+    /// One batched write of `new_hash -> old` SUPERSEDES edges; non-fatal.
+    async fn write_supersedes_edges(&self, old_hashes: &[&str], new_hash: &str) {
+        if old_hashes.is_empty() {
+            return;
+        }
         let now = (self.clock)();
         let edges: Vec<(String, String, SystemRelationType, f64)> = old_hashes
             .iter()
@@ -1798,8 +1863,6 @@ impl MemoryService {
         if let Err(e) = self.graph.create_system_edges_batch(&edges).await {
             tracing::warn!("failed to create SUPERSEDES edge(s): {e}");
         }
-
-        Ok(())
     }
 
     // ─── Contradiction judge (LAB-3283, Phase 1: advisory) ──────────────
@@ -2335,9 +2398,21 @@ impl MemoryService {
                 .await
             {
                 Ok(()) => superseded.extend(to_supersede.iter().map(|s| s.to_string())),
-                Err(e) => {
-                    let msg = e.safe_message();
+                Err(SupersedeFailure {
+                    marked,
+                    in_doubt,
+                    error,
+                }) => {
                     for &dup_hash in &to_supersede {
+                        if marked.iter().any(|m| m == dup_hash) {
+                            superseded.push(dup_hash.to_string());
+                            continue;
+                        }
+                        let msg = if in_doubt.iter().any(|m| m == dup_hash) {
+                            SUPERSEDE_OUTCOME_UNKNOWN
+                        } else {
+                            error.safe_message()
+                        };
                         errors.push(serde_json::json!({
                             "hash": dup_hash,
                             "error": msg,
@@ -2452,6 +2527,29 @@ fn is_superseded(m: &Memory) -> bool {
         .is_some()
 }
 
+/// A supersession that failed part-way (see `mark_superseded`).
+struct SupersedeFailure {
+    /// Memories that carry the marker anyway; their edges are written.
+    marked: Vec<String>,
+    /// Memories whose outcome could not be read back: the marker may have
+    /// landed, without its edge. A retry of the same call settles them.
+    in_doubt: Vec<String>,
+    error: AlayaError,
+}
+
+/// Per-item error for a memory in `SupersedeFailure::in_doubt`. Distinct from
+/// a plain failure so an operator can tell which memories need a retry.
+const SUPERSEDE_OUTCOME_UNKNOWN: &str = "Outcome unknown: this memory may already be superseded \
+     without its audit edge. Retry the same call; it is idempotent and converges.";
+
+/// The hash `m` is superseded by, when set.
+fn superseded_by(m: &Memory) -> Option<&str> {
+    m.metadata
+        .as_ref()
+        .and_then(|md| md.get("superseded_by"))
+        .and_then(Value::as_str)
+}
+
 /// Over-fetch and filter superseded at the application layer (the
 /// PayloadFilter route is a no-op — see is_superseded). Calls `fetch` with a
 /// growing fetch size, doubling until `target` live results are collected,
@@ -2562,8 +2660,8 @@ mod tests {
     // ─── Mock backends for tag cache tests ─────────────────────────────
 
     use alaya_backends::{
-        ConsolidationService, EmbeddingProvider, GraphService, HebbianService, SummaryProvider,
-        VectorStorage,
+        ConsolidationService, EmbeddingProvider, GraphService, HebbianService, StoreMode,
+        SummaryProvider, VectorStorage,
     };
     use alaya_types::{
         AlayaError,
@@ -2616,14 +2714,11 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MockVectors {
-        async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+        async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             Ok((true, "mock".into()))
         }
         async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
             Ok(None)
-        }
-        async fn exists(&self, _h: &str) -> Result<bool> {
-            Ok(false)
         }
         async fn set_generated_summary(
             &self,
@@ -3226,14 +3321,11 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MockVectorsWithMemories {
-        async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+        async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             Ok((true, "mock".into()))
         }
         async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
             Ok(None)
-        }
-        async fn exists(&self, _h: &str) -> Result<bool> {
-            Ok(false)
         }
         async fn set_generated_summary(
             &self,
@@ -3607,14 +3699,11 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MockVectorsWithSimilar {
-        async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+        async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             Ok((true, "mock".into()))
         }
         async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
             Ok(None)
-        }
-        async fn exists(&self, _h: &str) -> Result<bool> {
-            Ok(false)
         }
         async fn set_generated_summary(
             &self,
@@ -3944,15 +4033,20 @@ mod tests {
     struct MockVectorsPersisting {
         stored: Rc<RefCell<HashMap<String, Memory>>>,
         /// Hashes present as raw points whose payload no longer parses as a
-        /// `Memory` (e.g. left by the legacy writer): `exists` sees them,
+        /// `Memory` (e.g. left by the legacy writer): `store` sees them,
         /// `get_by_hash` does not.
         raw_only: std::collections::HashSet<String>,
     }
 
     #[async_trait(?Send)]
     impl VectorStorage for MockVectorsPersisting {
-        async fn store(&self, m: &Memory) -> Result<(bool, String)> {
+        async fn store(&self, m: &Memory, mode: StoreMode) -> Result<(bool, String)> {
             let mut stored = self.stored.borrow_mut();
+            let exists =
+                self.raw_only.contains(&m.content_hash) || stored.contains_key(&m.content_hash);
+            if exists && mode == StoreMode::InsertOnly {
+                return Ok((false, m.content_hash.clone()));
+            }
             let mut next = m.clone();
             let created = match stored.get(&m.content_hash) {
                 Some(prev) => {
@@ -3968,9 +4062,6 @@ mod tests {
         }
         async fn get_by_hash(&self, h: &str) -> Result<Option<Memory>> {
             Ok(self.stored.borrow().get(h).cloned())
-        }
-        async fn exists(&self, h: &str) -> Result<bool> {
-            Ok(self.raw_only.contains(h) || self.stored.borrow().contains_key(h))
         }
         async fn set_generated_summary(
             &self,
@@ -4537,14 +4628,11 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MockVectorsWithInjection {
-        async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+        async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             Ok((true, "mock".into()))
         }
         async fn get_by_hash(&self, h: &str) -> Result<Option<Memory>> {
             Ok(self.injectable_memories.get(h).cloned())
-        }
-        async fn exists(&self, h: &str) -> Result<bool> {
-            Ok(self.injectable_memories.contains_key(h))
         }
         async fn set_generated_summary(
             &self,
@@ -5285,6 +5373,12 @@ mod tests {
         single_edge_calls: Cell<usize>,
         edge_batch_calls: Cell<usize>,
         fail_update: Cell<bool>,
+        /// When set, update_metadata_batch marks only these memories, then
+        /// fails: a batch that committed part-way.
+        partial_update: RefCell<Option<Vec<String>>>,
+        /// When set to `n`, the n-th get_batch call and every later one fail:
+        /// Qdrant stops answering reads mid-operation.
+        fail_get_batch_from: Cell<Option<usize>>,
     }
 
     impl MergeRecorder {
@@ -5302,7 +5396,7 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MergeVectors {
-        async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+        async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             Ok((true, "mock".into()))
         }
         async fn get_by_hash(&self, h: &str) -> Result<Option<Memory>> {
@@ -5310,9 +5404,6 @@ mod tests {
                 .get_by_hash_calls
                 .set(self.0.get_by_hash_calls.get() + 1);
             Ok(self.0.memories.borrow().get(h).cloned())
-        }
-        async fn exists(&self, h: &str) -> Result<bool> {
-            Ok(self.0.memories.borrow().contains_key(h))
         }
         async fn set_generated_summary(
             &self,
@@ -5324,6 +5415,14 @@ mod tests {
         }
         async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>> {
             self.0.get_batch_calls.set(self.0.get_batch_calls.get() + 1);
+            if self
+                .0
+                .fail_get_batch_from
+                .get()
+                .is_some_and(|n| self.0.get_batch_calls.get() >= n)
+            {
+                return Err(AlayaError::Storage("mock read failure".into()));
+            }
             let mems = self.0.memories.borrow();
             Ok(hashes
                 .iter()
@@ -5349,6 +5448,19 @@ mod tests {
                 .set(self.0.update_batch_calls.get() + 1);
             if self.0.fail_update.get() {
                 return Err(AlayaError::Storage("mock update failure".into()));
+            }
+            if let Some(marked) = self.0.partial_update.borrow().as_ref() {
+                let mut mems = self.0.memories.borrow_mut();
+                for h in marked {
+                    let m = mems
+                        .get_mut(h)
+                        .expect("partial_update names a seeded memory");
+                    m.metadata.get_or_insert_with(HashMap::new).insert(
+                        "superseded_by".into(),
+                        serde_json::json!(updates.superseded_by),
+                    );
+                }
+                return Err(AlayaError::Storage("mock partial failure".into()));
             }
             self.0
                 .updates
@@ -5675,6 +5787,130 @@ mod tests {
         assert!(rec.system_edges.borrow().is_empty());
     }
 
+    /// A batch that commits part-way (alaya#130): the memory that was marked
+    /// gets its SUPERSEDES edge and is reported as superseded; only the other
+    /// one is an error. Nothing is hidden from search without its audit edge.
+    #[tokio::test(flavor = "current_thread")]
+    async fn merge_duplicates_partial_commit_writes_edges_for_what_landed() {
+        let canonical = "c".repeat(64);
+        let d1 = "1".repeat(64);
+        let d2 = "2".repeat(64);
+
+        let (svc, rec) = build_merge_service();
+        rec.seed(&[&canonical, &d1, &d2]);
+        *rec.partial_update.borrow_mut() = Some(vec![d1.clone()]);
+
+        let result = svc
+            .merge_duplicates(&canonical, &[&d1, &d2], "dedup", false)
+            .await
+            .expect("a partial failure is per-item, not a call failure");
+
+        assert_eq!(result["success"], serde_json::json!(false));
+        assert_eq!(result["superseded"], serde_json::json!([d1]));
+        let errors = result["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0]["hash"], serde_json::json!(d2));
+        assert_eq!(*rec.system_edges.borrow(), vec![(canonical, d1)]);
+    }
+
+    /// Both markers land, the batch still errors, and the
+    /// recovery read fails too. Which memories were marked is unknown, so both
+    /// are reported as outcome-unknown — not as untouched — and no edge is
+    /// guessed. Once Qdrant answers again, retrying the same merge converges:
+    /// both superseded, both edges written.
+    #[tokio::test(flavor = "current_thread")]
+    async fn merge_duplicates_unreadable_outcome_is_unknown_and_a_retry_converges() {
+        let canonical = "c".repeat(64);
+        let d1 = "1".repeat(64);
+        let d2 = "2".repeat(64);
+
+        let (svc, rec) = build_merge_service();
+        rec.seed(&[&canonical, &d1, &d2]);
+        *rec.partial_update.borrow_mut() = Some(vec![d1.clone(), d2.clone()]);
+        // Call 1 is the existence pre-check; call 2, the recovery read, fails.
+        rec.fail_get_batch_from.set(Some(2));
+
+        let result = svc
+            .merge_duplicates(&canonical, &[&d1, &d2], "dedup", false)
+            .await
+            .expect("an unknown outcome is per-item, not a call failure");
+        assert_eq!(result["success"], serde_json::json!(false));
+        assert_eq!(result["superseded"], serde_json::json!([] as [&str; 0]));
+        let errors = result["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        for e in errors {
+            assert_eq!(
+                e["error"],
+                serde_json::json!(SUPERSEDE_OUTCOME_UNKNOWN),
+                "{e}"
+            );
+        }
+        assert!(
+            rec.system_edges.borrow().is_empty(),
+            "no edge is guessed for an unknown outcome"
+        );
+
+        // Qdrant is back: the same call again.
+        *rec.partial_update.borrow_mut() = None;
+        rec.fail_get_batch_from.set(None);
+        let retry = svc
+            .merge_duplicates(&canonical, &[&d1, &d2], "dedup", false)
+            .await
+            .expect("retry succeeds");
+        assert_eq!(retry["success"], serde_json::json!(true));
+        assert_eq!(retry["superseded"], serde_json::json!([d1, d2]));
+        assert_eq!(
+            *rec.system_edges.borrow(),
+            vec![(canonical.clone(), d1), (canonical, d2)]
+        );
+    }
+
+    /// The single-memory form of the same schedule: the error surfaces, no
+    /// edge is guessed, and a retry writes the edge.
+    #[tokio::test(flavor = "current_thread")]
+    async fn memory_supersede_unreadable_outcome_errors_and_a_retry_converges() {
+        let old = "0".repeat(64);
+        let new = "f".repeat(64);
+
+        let (svc, rec) = build_merge_service();
+        rec.seed(&[&old, &new]);
+        *rec.partial_update.borrow_mut() = Some(vec![old.clone()]);
+        rec.fail_get_batch_from.set(Some(2));
+
+        let err = svc
+            .memory_supersede(&old, &new, "corrected")
+            .await
+            .expect_err("the failure is reported");
+        assert!(matches!(err, AlayaError::Storage(_)), "{err:?}");
+        assert!(rec.system_edges.borrow().is_empty());
+
+        *rec.partial_update.borrow_mut() = None;
+        rec.fail_get_batch_from.set(None);
+        svc.memory_supersede(&old, &new, "corrected")
+            .await
+            .expect("retry succeeds");
+        assert_eq!(*rec.system_edges.borrow(), vec![(new, old)]);
+    }
+
+    /// A single supersede whose write landed but failed to confirm still gets
+    /// its edge, and the caller still sees the error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn memory_supersede_writes_the_edge_when_the_marker_landed_despite_an_error() {
+        let old = "0".repeat(64);
+        let new = "f".repeat(64);
+
+        let (svc, rec) = build_merge_service();
+        rec.seed(&[&old, &new]);
+        *rec.partial_update.borrow_mut() = Some(vec![old.clone()]);
+
+        let err = svc
+            .memory_supersede(&old, &new, "corrected")
+            .await
+            .expect_err("the failure is reported");
+        assert!(matches!(err, AlayaError::Storage(_)), "{err:?}");
+        assert_eq!(*rec.system_edges.borrow(), vec![(new, old)]);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn merge_duplicates_dry_run_writes_nothing() {
         let canonical = "c".repeat(64);
@@ -5747,14 +5983,11 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MockVectorsCorpus {
-        async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+        async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             Ok((true, "mock".into()))
         }
         async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
             Ok(None)
-        }
-        async fn exists(&self, _h: &str) -> Result<bool> {
-            Ok(false)
         }
         async fn set_generated_summary(
             &self,
@@ -6026,11 +6259,8 @@ mod tests {
 
         #[async_trait(?Send)]
         impl VectorStorage for PairVectors {
-            async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+            async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
                 unreachable!("judge must never write to the vector store")
-            }
-            async fn exists(&self, h: &str) -> Result<bool> {
-                Ok(self.0.iter().any(|m| m.content_hash == h))
             }
             async fn get_by_hash(&self, h: &str) -> Result<Option<Memory>> {
                 Ok(self.0.iter().find(|m| m.content_hash == h).cloned())

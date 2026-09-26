@@ -15,38 +15,62 @@ use alaya_types::{
     search::{PayloadFilter, PromptName},
 };
 
+/// Whether `VectorStorage::store` may replace an existing record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreMode {
+    /// Insert new content, or re-store over the existing record.
+    Upsert,
+    /// Insert new content only (read-only principals may only add). An
+    /// existing record is left untouched and reported as `created == false`
+    /// by the insert-only write itself.
+    InsertOnly,
+}
+
 /// Vector storage backend (Qdrant REST API).
 ///
 /// `?Send` bound because WASM is single-threaded.
+///
+/// # Concurrent writers (alaya#130)
+///
+/// More than one process may write the same collection, so no in-process
+/// lock can order writes. Every writer that reads a record and writes back
+/// something derived from it — `store` on a re-store, `patch_memory`,
+/// `set_generated_summary`, `update_metadata*`, `increment_access_count*` —
+/// MUST commit conditionally on the revision it read (compare-and-set), stamp
+/// a new revision, and on a lost race rebuild from a fresh read, up to a
+/// bound; when the bound is exhausted, or it cannot tell whether its write
+/// applied, it returns an error, never an unconditional write. New records
+/// are written insert-only, so a lost insert race becomes a re-store
+/// (`created == false`). A record with no revision yet is the zero revision.
+/// `delete` is the only unconditional write: it reads nothing, and a
+/// conditional write that read the record before it is rejected after it.
+/// A backend that cannot make a write conditional on a revision cannot
+/// implement this trait.
 #[async_trait(?Send)]
 pub trait VectorStorage {
     // Core CRUD
 
-    /// Upsert a memory keyed by `content_hash`.
+    /// Store a memory keyed by `content_hash`.
     ///
     /// Returns `(created, content_hash)`. `created` is `false` when a point
     /// with the same `content_hash` already existed, whether or not its
-    /// stored payload still parses as a `Memory`. On that path the
-    /// implementation MUST carry the existing point's server-maintained
-    /// fields over the caller's values — `created_at`, `access_count`,
-    /// `access_timestamps`, `supersession_reason`, `metadata.superseded_by`,
-    /// and `summary_embedding` for as long as `summary` is unchanged — so a
+    /// stored payload still parses as a `Memory`. Under
+    /// `StoreMode::InsertOnly` nothing is written on that path. Under
+    /// `StoreMode::Upsert` the implementation MUST carry the existing
+    /// point's server-maintained fields over the caller's values —
+    /// `created_at`, `access_count`, `access_timestamps`,
+    /// `supersession_reason`, `metadata.superseded_by`, and
+    /// `summary_embedding` for as long as `summary` is unchanged — so a
     /// re-store never zeroes ranking inputs, resurrects a superseded memory,
     /// or silently drops derived retrieval state (alaya#86). Every other
     /// payload field is written from `memory` as given and fields absent on
     /// `memory` are removed; `updated_at` is therefore whatever the caller
-    /// set. Because the write replaces the whole payload from that snapshot,
-    /// the retrieve→write section MUST be mutually exclusive with every
-    /// other write on the same client (`patch_memory`, `update_metadata*`,
-    /// `increment_access_count*`, `delete`): a write landing inside it would
-    /// be silently rolled back, and a delete would be undone.
-    async fn store(&self, memory: &Memory) -> Result<(bool, String)>;
-    /// Whether a point with this `content_hash` exists, judged exactly as
-    /// `store` judges it: raw point presence, not whether the payload still
-    /// parses as a `Memory`. Authorization (read-only principals may only
-    /// add) relies on this agreeing with `store`'s `created` result, so an
-    /// implementation MUST answer from the same source `store` reads.
-    async fn exists(&self, content_hash: &str) -> Result<bool>;
+    /// set. The write is conditional on the record the carry-over read (see
+    /// the trait docs), so a write that landed in between is never rolled
+    /// back and a deleted record is never brought back from that copy. A
+    /// delete that lands while the store is in flight is reported as
+    /// `AlayaError::Conflict`: nothing of the store survives it.
+    async fn store(&self, memory: &Memory, mode: StoreMode) -> Result<(bool, String)>;
     async fn get_by_hash(&self, content_hash: &str) -> Result<Option<Memory>>;
     async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>>;
     async fn delete(&self, content_hash: &str) -> Result<bool>;
@@ -55,9 +79,13 @@ pub trait VectorStorage {
     /// Apply the SAME metadata update to many memories.
     ///
     /// Default: sequential fallback via `update_metadata`. Implementations
-    /// may override with batched writes (e.g. one Qdrant set-payload call
-    /// covering all points) while preserving `update_metadata`'s
-    /// aux-fields-first / supersession-marker-last commit ordering.
+    /// may override with batched writes. Each memory's top-level fields and
+    /// its supersession marker land together in one conditional write, so a
+    /// marker never commits without its reason. `AlayaError::NotFound`, with
+    /// nothing written, when a memory does not exist. Writes are atomic per
+    /// memory, not per batch: any other error may leave some memories updated,
+    /// so a caller that acts on the batch as a whole must re-read to learn
+    /// which.
     async fn update_metadata_batch(
         &self,
         content_hashes: &[&str],
@@ -77,19 +105,16 @@ pub trait VectorStorage {
     ///
     /// `summary_embedding` is derived from `summary`: a patch that changes
     /// `summary` without supplying `summary_embedding` MUST remove the stored
-    /// embedding, so the pair is never stale and `store`'s carry-over rule
-    /// (keep the embedding while the summary is unchanged) stays sound. The
-    /// read→invalidate→write sequence MUST be mutually exclusive with other
-    /// `patch_memory` and `store` calls on the same client; crash-safety
-    /// (invalidate first) is not concurrency-safety (alaya#86).
+    /// embedding in the same write, so the pair is never stale and `store`'s
+    /// carry-over rule (keep the embedding while the summary is unchanged)
+    /// stays sound (alaya#86).
     async fn patch_memory(&self, content_hash: &str, patch: &PatchMemoryRequest) -> Result<Memory>;
 
     /// Commit a server-generated summary (and its embedding) only if the
-    /// record still has no summary. The check and the write happen under the
-    /// same exclusion as every other write, so a background job that started
-    /// before a caller supplied a summary can never overwrite it: a caller's
-    /// summary always wins. Returns whether the generated summary was applied
-    /// (alaya#86).
+    /// record still has no summary. The check is made on the copy the write
+    /// is conditional on, so a background job that started before a caller
+    /// supplied a summary can never overwrite it: a caller's summary always
+    /// wins. Returns whether the generated summary was applied (alaya#86).
     async fn set_generated_summary(
         &self,
         content_hash: &str,

@@ -10,7 +10,7 @@
 
 services:
   qdrant:
-    image: docker.io/qdrant/qdrant:v1.14.1
+    image: docker.io/qdrant/qdrant:v1.17.1
     environment:
       QDRANT__STORAGE__STORAGE_PATH: /tmp/qdrant_bench
     ports: ["127.0.0.1:16333:6333"]  # loopback-only (alaya runs auth-disabled); off default 6333 so the harness's data-safety guard can fail closed
