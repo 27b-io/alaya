@@ -1774,8 +1774,16 @@ impl MemoryService {
     /// some memories marked (alaya#130). Those still get their edge — the
     /// marked set is re-read, so a write that landed without being confirmed
     /// counts too — and are returned with the error, so the caller reports
-    /// them as superseded: a memory is never hidden from search without its
-    /// audit edge, and never reported as untouched while it is hidden.
+    /// them as superseded.
+    ///
+    /// When that re-read fails as well, which memories carry the marker is
+    /// unknown. They are returned as in doubt — never as untouched — and get
+    /// no edge: an edge on a memory whose marker did not land would claim a
+    /// supersession search does not apply. Nothing is lost either way. The
+    /// marker is the durable record and the edge is derived from it, so
+    /// retrying the same call converges (re-marking writes the same marker,
+    /// edge creation is a MERGE), and `scripts/backfill_graph.py` rebuilds
+    /// every SUPERSEDES edge from the markers.
     async fn mark_superseded(
         &self,
         old_hashes: &[&str],
@@ -1796,24 +1804,39 @@ impl MemoryService {
             )
             .await;
         if let Err(error) = updated {
-            let marked: Vec<String> = match self.vectors.get_batch(old_hashes).await {
-                Ok(memories) => memories
-                    .into_iter()
-                    .filter(|m| superseded_by(m) == Some(new_hash))
-                    .map(|m| m.content_hash)
-                    .collect(),
+            let memories = match self.vectors.get_batch(old_hashes).await {
+                Ok(memories) => memories,
                 Err(read) => {
+                    let in_doubt: Vec<String> =
+                        old_hashes.iter().map(|h| (*h).to_string()).collect();
                     tracing::error!(
                         new_hash,
-                        "supersession failed part-way and the marked memories could not be \
-                         re-read; any that were marked have no SUPERSEDES edge: {read}"
+                        in_doubt = ?in_doubt,
+                        error = %error,
+                        read_error = %read,
+                        "supersession outcome unknown: markers may have landed without \
+                         SUPERSEDES edges; retry the call (it is idempotent) or run \
+                         scripts/backfill_graph.py"
                     );
-                    Vec::new()
+                    return Err(SupersedeFailure {
+                        marked: Vec::new(),
+                        in_doubt,
+                        error,
+                    });
                 }
             };
+            let marked: Vec<String> = memories
+                .into_iter()
+                .filter(|m| superseded_by(m) == Some(new_hash))
+                .map(|m| m.content_hash)
+                .collect();
             let refs: Vec<&str> = marked.iter().map(String::as_str).collect();
             self.write_supersedes_edges(&refs, new_hash).await;
-            return Err(SupersedeFailure { marked, error });
+            return Err(SupersedeFailure {
+                marked,
+                in_doubt: Vec::new(),
+                error,
+            });
         }
 
         self.write_supersedes_edges(old_hashes, new_hash).await;
@@ -2375,17 +2398,25 @@ impl MemoryService {
                 .await
             {
                 Ok(()) => superseded.extend(to_supersede.iter().map(|s| s.to_string())),
-                Err(SupersedeFailure { marked, error }) => {
-                    let msg = error.safe_message();
+                Err(SupersedeFailure {
+                    marked,
+                    in_doubt,
+                    error,
+                }) => {
                     for &dup_hash in &to_supersede {
                         if marked.iter().any(|m| m == dup_hash) {
                             superseded.push(dup_hash.to_string());
-                        } else {
-                            errors.push(serde_json::json!({
-                                "hash": dup_hash,
-                                "error": msg,
-                            }));
+                            continue;
                         }
+                        let msg = if in_doubt.iter().any(|m| m == dup_hash) {
+                            SUPERSEDE_OUTCOME_UNKNOWN
+                        } else {
+                            error.safe_message()
+                        };
+                        errors.push(serde_json::json!({
+                            "hash": dup_hash,
+                            "error": msg,
+                        }));
                     }
                 }
             }
@@ -2500,8 +2531,16 @@ fn is_superseded(m: &Memory) -> bool {
 struct SupersedeFailure {
     /// Memories that carry the marker anyway; their edges are written.
     marked: Vec<String>,
+    /// Memories whose outcome could not be read back: the marker may have
+    /// landed, without its edge. A retry of the same call settles them.
+    in_doubt: Vec<String>,
     error: AlayaError,
 }
+
+/// Per-item error for a memory in `SupersedeFailure::in_doubt`. Distinct from
+/// a plain failure so an operator can tell which memories need a retry.
+const SUPERSEDE_OUTCOME_UNKNOWN: &str = "Outcome unknown: this memory may already be superseded \
+     without its audit edge. Retry the same call; it is idempotent and converges.";
 
 /// The hash `m` is superseded by, when set.
 fn superseded_by(m: &Memory) -> Option<&str> {
@@ -5337,6 +5376,9 @@ mod tests {
         /// When set, update_metadata_batch marks only these memories, then
         /// fails: a batch that committed part-way.
         partial_update: RefCell<Option<Vec<String>>>,
+        /// When set to `n`, the n-th get_batch call and every later one fail:
+        /// Qdrant stops answering reads mid-operation.
+        fail_get_batch_from: Cell<Option<usize>>,
     }
 
     impl MergeRecorder {
@@ -5373,6 +5415,14 @@ mod tests {
         }
         async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>> {
             self.0.get_batch_calls.set(self.0.get_batch_calls.get() + 1);
+            if self
+                .0
+                .fail_get_batch_from
+                .get()
+                .is_some_and(|n| self.0.get_batch_calls.get() >= n)
+            {
+                return Err(AlayaError::Storage("mock read failure".into()));
+            }
             let mems = self.0.memories.borrow();
             Ok(hashes
                 .iter()
@@ -5761,6 +5811,85 @@ mod tests {
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert_eq!(errors[0]["hash"], serde_json::json!(d2));
         assert_eq!(*rec.system_edges.borrow(), vec![(canonical, d1)]);
+    }
+
+    /// Both markers land, the batch still errors, and the
+    /// recovery read fails too. Which memories were marked is unknown, so both
+    /// are reported as outcome-unknown — not as untouched — and no edge is
+    /// guessed. Once Qdrant answers again, retrying the same merge converges:
+    /// both superseded, both edges written.
+    #[tokio::test(flavor = "current_thread")]
+    async fn merge_duplicates_unreadable_outcome_is_unknown_and_a_retry_converges() {
+        let canonical = "c".repeat(64);
+        let d1 = "1".repeat(64);
+        let d2 = "2".repeat(64);
+
+        let (svc, rec) = build_merge_service();
+        rec.seed(&[&canonical, &d1, &d2]);
+        *rec.partial_update.borrow_mut() = Some(vec![d1.clone(), d2.clone()]);
+        // Call 1 is the existence pre-check; call 2, the recovery read, fails.
+        rec.fail_get_batch_from.set(Some(2));
+
+        let result = svc
+            .merge_duplicates(&canonical, &[&d1, &d2], "dedup", false)
+            .await
+            .expect("an unknown outcome is per-item, not a call failure");
+        assert_eq!(result["success"], serde_json::json!(false));
+        assert_eq!(result["superseded"], serde_json::json!([] as [&str; 0]));
+        let errors = result["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        for e in errors {
+            assert_eq!(
+                e["error"],
+                serde_json::json!(SUPERSEDE_OUTCOME_UNKNOWN),
+                "{e}"
+            );
+        }
+        assert!(
+            rec.system_edges.borrow().is_empty(),
+            "no edge is guessed for an unknown outcome"
+        );
+
+        // Qdrant is back: the same call again.
+        *rec.partial_update.borrow_mut() = None;
+        rec.fail_get_batch_from.set(None);
+        let retry = svc
+            .merge_duplicates(&canonical, &[&d1, &d2], "dedup", false)
+            .await
+            .expect("retry succeeds");
+        assert_eq!(retry["success"], serde_json::json!(true));
+        assert_eq!(retry["superseded"], serde_json::json!([d1, d2]));
+        assert_eq!(
+            *rec.system_edges.borrow(),
+            vec![(canonical.clone(), d1), (canonical, d2)]
+        );
+    }
+
+    /// The single-memory form of the same schedule: the error surfaces, no
+    /// edge is guessed, and a retry writes the edge.
+    #[tokio::test(flavor = "current_thread")]
+    async fn memory_supersede_unreadable_outcome_errors_and_a_retry_converges() {
+        let old = "0".repeat(64);
+        let new = "f".repeat(64);
+
+        let (svc, rec) = build_merge_service();
+        rec.seed(&[&old, &new]);
+        *rec.partial_update.borrow_mut() = Some(vec![old.clone()]);
+        rec.fail_get_batch_from.set(Some(2));
+
+        let err = svc
+            .memory_supersede(&old, &new, "corrected")
+            .await
+            .expect_err("the failure is reported");
+        assert!(matches!(err, AlayaError::Storage(_)), "{err:?}");
+        assert!(rec.system_edges.borrow().is_empty());
+
+        *rec.partial_update.borrow_mut() = None;
+        rec.fail_get_batch_from.set(None);
+        svc.memory_supersede(&old, &new, "corrected")
+            .await
+            .expect("retry succeeds");
+        assert_eq!(*rec.system_edges.borrow(), vec![(new, old)]);
     }
 
     /// A single supersede whose write landed but failed to confirm still gets

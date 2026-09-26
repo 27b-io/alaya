@@ -311,6 +311,8 @@ Content-Type: application/json
 
 `reason` is optional. Returns `{ "superseded": true, "old_hash": "...", "new_hash": "..." }`.
 
+Supersession is idempotent. After an error, the memory may already be superseded, so retry the same call: it converges and writes any missing audit edge.
+
 ## `POST /contradictions`
 
 ```http
@@ -413,6 +415,8 @@ Content-Type: application/json
   "dry_run": false
 }
 ```
+
+Returns `{ "success", "canonical_hash", "superseded": [...], "errors": [{ "hash", "error" }], "dry_run" }`. Writes are atomic per memory, not per batch: after a partial failure, `superseded` lists exactly the memories that were superseded (their audit edges are written), and `errors` lists the rest. An error that starts with `Outcome unknown` means the server could not read back whether that memory was superseded. Retry the same call; it is idempotent and converges. `scripts/backfill_graph.py` also rebuilds every missing `SUPERSEDES` edge from the stored markers.
 
 ## `POST /backfill/summaries`
 
