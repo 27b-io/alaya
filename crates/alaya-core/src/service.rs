@@ -58,7 +58,7 @@ use tracing;
 
 use alaya_backends::{
     ConsolidationService, EmbeddingProvider, GraphService, HebbianService, RerankingService,
-    SummaryProvider, VectorStorage,
+    StoreMode, SummaryProvider, VectorStorage,
 };
 use alaya_types::{
     AlayaError, Result,
@@ -459,16 +459,15 @@ impl MemoryService {
         // A read-only principal's store is additive only. Re-storing content
         // that already exists would replace the record's caller-owned fields
         // (tags, metadata, summary, memory_type) — the effect of patch /
-        // supersede, which read-only is denied. `exists` judges presence
-        // exactly as `store` does (raw point, not parseability), so guard and
-        // write cannot disagree; it runs immediately before the write to keep
-        // the window against concurrent writers minimal. Fails closed on a
-        // lookup error.
-        if read_only && self.vectors.exists(&content_hash).await? {
-            return Err(AlayaError::Validation(format!(
-                "memory {content_hash} already exists; read-only principals may only add new memories"
-            )));
-        }
+        // supersede, which read-only is denied. The guard is the write
+        // itself: insert-only, so a store from another writer that lands
+        // first cannot be reshaped by this one, and presence is judged on the
+        // raw point, not parseability.
+        let mode = if read_only {
+            StoreMode::InsertOnly
+        } else {
+            StoreMode::Upsert
+        };
 
         // Store in vector DB. `created == false` means a point with this
         // content_hash already existed: the backend carried its created_at,
@@ -477,7 +476,12 @@ impl MemoryService {
         // provenance — replaced the stored ones. Who owns provenance when two
         // callers store the same content is LAB-1084's decision; today's
         // replace semantics stand until then.
-        let (created, _) = self.vectors.store(&memory).await?;
+        let (created, _) = self.vectors.store(&memory, mode).await?;
+        if read_only && !created {
+            return Err(AlayaError::Validation(format!(
+                "memory {content_hash} already exists; read-only principals may only add new memories"
+            )));
+        }
         if !created {
             tracing::info!(
                 hash = %content_hash,
@@ -2562,8 +2566,8 @@ mod tests {
     // ─── Mock backends for tag cache tests ─────────────────────────────
 
     use alaya_backends::{
-        ConsolidationService, EmbeddingProvider, GraphService, HebbianService, SummaryProvider,
-        VectorStorage,
+        ConsolidationService, EmbeddingProvider, GraphService, HebbianService, StoreMode,
+        SummaryProvider, VectorStorage,
     };
     use alaya_types::{
         AlayaError,
@@ -2616,14 +2620,11 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MockVectors {
-        async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+        async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             Ok((true, "mock".into()))
         }
         async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
             Ok(None)
-        }
-        async fn exists(&self, _h: &str) -> Result<bool> {
-            Ok(false)
         }
         async fn set_generated_summary(
             &self,
@@ -3226,14 +3227,11 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MockVectorsWithMemories {
-        async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+        async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             Ok((true, "mock".into()))
         }
         async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
             Ok(None)
-        }
-        async fn exists(&self, _h: &str) -> Result<bool> {
-            Ok(false)
         }
         async fn set_generated_summary(
             &self,
@@ -3607,14 +3605,11 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MockVectorsWithSimilar {
-        async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+        async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             Ok((true, "mock".into()))
         }
         async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
             Ok(None)
-        }
-        async fn exists(&self, _h: &str) -> Result<bool> {
-            Ok(false)
         }
         async fn set_generated_summary(
             &self,
@@ -3944,15 +3939,20 @@ mod tests {
     struct MockVectorsPersisting {
         stored: Rc<RefCell<HashMap<String, Memory>>>,
         /// Hashes present as raw points whose payload no longer parses as a
-        /// `Memory` (e.g. left by the legacy writer): `exists` sees them,
+        /// `Memory` (e.g. left by the legacy writer): `store` sees them,
         /// `get_by_hash` does not.
         raw_only: std::collections::HashSet<String>,
     }
 
     #[async_trait(?Send)]
     impl VectorStorage for MockVectorsPersisting {
-        async fn store(&self, m: &Memory) -> Result<(bool, String)> {
+        async fn store(&self, m: &Memory, mode: StoreMode) -> Result<(bool, String)> {
             let mut stored = self.stored.borrow_mut();
+            let exists =
+                self.raw_only.contains(&m.content_hash) || stored.contains_key(&m.content_hash);
+            if exists && mode == StoreMode::InsertOnly {
+                return Ok((false, m.content_hash.clone()));
+            }
             let mut next = m.clone();
             let created = match stored.get(&m.content_hash) {
                 Some(prev) => {
@@ -3968,9 +3968,6 @@ mod tests {
         }
         async fn get_by_hash(&self, h: &str) -> Result<Option<Memory>> {
             Ok(self.stored.borrow().get(h).cloned())
-        }
-        async fn exists(&self, h: &str) -> Result<bool> {
-            Ok(self.raw_only.contains(h) || self.stored.borrow().contains_key(h))
         }
         async fn set_generated_summary(
             &self,
@@ -4537,14 +4534,11 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MockVectorsWithInjection {
-        async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+        async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             Ok((true, "mock".into()))
         }
         async fn get_by_hash(&self, h: &str) -> Result<Option<Memory>> {
             Ok(self.injectable_memories.get(h).cloned())
-        }
-        async fn exists(&self, h: &str) -> Result<bool> {
-            Ok(self.injectable_memories.contains_key(h))
         }
         async fn set_generated_summary(
             &self,
@@ -5302,7 +5296,7 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MergeVectors {
-        async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+        async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             Ok((true, "mock".into()))
         }
         async fn get_by_hash(&self, h: &str) -> Result<Option<Memory>> {
@@ -5310,9 +5304,6 @@ mod tests {
                 .get_by_hash_calls
                 .set(self.0.get_by_hash_calls.get() + 1);
             Ok(self.0.memories.borrow().get(h).cloned())
-        }
-        async fn exists(&self, h: &str) -> Result<bool> {
-            Ok(self.0.memories.borrow().contains_key(h))
         }
         async fn set_generated_summary(
             &self,
@@ -5747,14 +5738,11 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MockVectorsCorpus {
-        async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+        async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             Ok((true, "mock".into()))
         }
         async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
             Ok(None)
-        }
-        async fn exists(&self, _h: &str) -> Result<bool> {
-            Ok(false)
         }
         async fn set_generated_summary(
             &self,
@@ -6026,11 +6014,8 @@ mod tests {
 
         #[async_trait(?Send)]
         impl VectorStorage for PairVectors {
-            async fn store(&self, _m: &Memory) -> Result<(bool, String)> {
+            async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
                 unreachable!("judge must never write to the vector store")
-            }
-            async fn exists(&self, h: &str) -> Result<bool> {
-                Ok(self.0.iter().any(|m| m.content_hash == h))
             }
             async fn get_by_hash(&self, h: &str) -> Result<Option<Memory>> {
                 Ok(self.0.iter().find(|m| m.content_hash == h).cloned())

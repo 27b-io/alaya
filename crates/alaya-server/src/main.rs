@@ -560,6 +560,41 @@ async fn init_l2_cache() -> Option<cachekit::CacheKit> {
     }
 }
 
+/// Refuse to run against a Qdrant that cannot make writes conditional
+/// (alaya#130): below 1.17 `update_mode` is silently ignored, so an insert-only
+/// write overwrites and an update-only write resurrects. Retries while Qdrant is
+/// unreachable (cluster cold start, as `ensure_qdrant_collection`), then panics —
+/// `supervise` turns that into exit 101 — on a version that is too old or
+/// unreadable, or when Qdrant never answers: without a verified version no write
+/// can be trusted to be conditional. Under a rolling update the old pods keep
+/// serving while the new one crash-loops.
+async fn require_conditional_writes(qdrant: &QdrantClient) {
+    for attempt in 0..L2_MAX_ATTEMPTS {
+        match qdrant.check_server_version().await {
+            Ok(version) => {
+                tracing::info!(%version, "Qdrant supports conditional writes");
+                return;
+            }
+            Err(e @ alaya_types::AlayaError::Config(_)) => panic!("refusing to start: {e}"),
+            Err(e) if attempt + 1 == L2_MAX_ATTEMPTS => panic!(
+                "refusing to start: could not read the Qdrant version after \
+                 {L2_MAX_ATTEMPTS} attempts: {e}"
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    error = %e,
+                    "Qdrant version check failed, retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    L2_BASE_RETRY_MS * (1 << attempt),
+                ))
+                .await;
+            }
+        }
+    }
+}
+
 /// Ensure the Qdrant collection exists before the server serves writes, so a
 /// fresh deployment needs no manual bootstrap (#31). Retries with backoff: on a
 /// cluster cold-start the server pod can come up before Qdrant is ready (same
@@ -1171,7 +1206,12 @@ async fn service_worker(
     // LAB-3283: one cap on in-flight judge calls shared by store-path spawns
     // and the backfill (a bulk import must not fan thousands of calls at the
     // LB), and a single-flight guard so an operator retry after the reply
-    // deadline cannot run a second pass over the same unjudged pairs.
+    // deadline cannot run a second pass over the same unjudged pairs. All
+    // three are per process (alaya#130): with N replicas, N passes and N times
+    // the daily cap are possible. That costs judge spend, never data — a
+    // verdict annotates an edge and a pair judged twice is last-writer-wins —
+    // so it is documented (JUDGE_DAILY_CAP, POST /backfill/contradictions)
+    // rather than coordinated across processes.
     let judge_gate = std::rc::Rc::new(tokio::sync::Semaphore::new(JUDGE_CONCURRENCY));
     let backfill_running = std::rc::Rc::new(std::cell::Cell::new(false));
     let judge_limiter = std::rc::Rc::new(std::cell::RefCell::new(JudgeDailyCap::new(
@@ -1827,7 +1867,8 @@ fn utc_date_str(epoch_secs: u64) -> String {
 /// contradicted pair without limit. Separate knobs on purpose: raising the
 /// day's budget for a bulk import must not raise the number of live tasks by
 /// the same factor. A pair refused by either bound stays unjudged for operator
-/// backfill, which is subject to neither.
+/// backfill, which is subject to neither. Both bounds are per process: N
+/// replicas can spend N × `cap` a day (see the worker's note on alaya#130).
 struct JudgeDailyCap {
     cap: usize,
     current_day: u64,
@@ -2417,6 +2458,7 @@ fn main() {
 
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
+                require_conditional_writes(&qdrant).await;
                 // Fresh-deploy bootstrap: create the memory collection if it is
                 // absent so the first write doesn't 404 (#31).
                 ensure_qdrant_collection(&qdrant, cfg_clone.embedding_dimensions).await;
@@ -4053,7 +4095,8 @@ mod wedge_tests {
 
     use super::*;
     use alaya_backends::traits::{
-        ConsolidationService, EmbeddingProvider, GraphService, HebbianService, VectorStorage,
+        ConsolidationService, EmbeddingProvider, GraphService, HebbianService, StoreMode,
+        VectorStorage,
     };
     use alaya_types::memory::ScoredMemory;
 
@@ -4081,13 +4124,10 @@ mod wedge_tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for HangVectors {
-        async fn store(&self, _memory: &Memory) -> Result<(bool, String)> {
+        async fn store(&self, _memory: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             unimplemented!()
         }
         async fn get_by_hash(&self, _content_hash: &str) -> Result<Option<Memory>> {
-            unimplemented!()
-        }
-        async fn exists(&self, _content_hash: &str) -> Result<bool> {
             unimplemented!()
         }
         async fn set_generated_summary(
