@@ -1,0 +1,19 @@
+[package]
+name = "alaya-oidc"
+version.workspace = true
+edition.workspace = true
+
+# Native-only (tokio + reqwest TLS): must never be pulled by a WASM-targeted crate.
+
+[dependencies]
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+# Cache seeding + cooldown arming so consumer unit tests never touch the
+# network. Enable ONLY from a `[dev-dependencies]` entry — resolver 2 keeps a
+# dev-dependency's features out of the binaries' normal build.
+test-seams = []

@@ -1,6 +1,8 @@
-//! One reqwest builder for every upstream client, and the one bounded body
-//! read they all go through. Redirects are refused everywhere: a 3xx must
-//! never be able to carry a server-held credential off-host.
+//! One reqwest builder for every upstream client, and the bounded body read
+//! they all go through — except OIDC discovery and the JWKS, which
+//! `alaya-oidc` reads under its own cap over this same client. Redirects are
+//! refused everywhere: a 3xx must never be able to carry a server-held
+//! credential off-host.
 
 use std::time::Duration;
 
