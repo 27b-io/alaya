@@ -1659,13 +1659,23 @@ impl VectorStorage for QdrantClient {
         let outcome = match self.bump_access(&point_ids).await {
             Ok(o) => o,
             Err(e) => {
-                tracing::warn!("batch increment_access_count failed: {e}");
+                tracing::warn!(
+                    op = "increment_access_count_batch",
+                    n = point_ids.len(),
+                    error = %e,
+                    "batch increment_access_count failed"
+                );
                 return Ok(());
             }
         };
         for (id, update) in outcome {
             if let Update::Unconfirmed(why) = update {
-                tracing::warn!(point = %id, "batch increment_access_count: {why}");
+                tracing::warn!(
+                    op = "increment_access_count_batch",
+                    point = %id,
+                    error = %why,
+                    "access increment not applied"
+                );
             }
         }
         Ok(())
