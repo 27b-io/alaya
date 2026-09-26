@@ -9,16 +9,16 @@
 //! - retrieve (`POST /points`): `ids`, `with_payload` `true` or a key list;
 //! - upsert (`PUT /points`): `update_mode` `upsert` (default), `insert_only`
 //!   or `update_only`; `update_filter` limits which EXISTING points update;
-//! - set payload (`POST /points/payload`, merge), overwrite payload (`PUT
-//!   /points/payload`), delete payload keys (`POST /points/payload/delete`)
-//!   and delete points (`POST /points/delete`), selected by `points` or
-//!   `filter`;
-//! - filters: `must` / `should` / `must_not` over `has_id`, `key` +
-//!   `match.value`, `is_empty`, `is_null` and nested filters. A condition
-//!   where a Filter belongs (a bare `update_filter` condition) is a 400, as in
-//!   Qdrant — never a filter that matches everything.
+//! - set payload (`POST /points/payload`, merge) and overwrite payload (`PUT
+//!   /points/payload`), selected by `points` or `filter`; delete points
+//!   (`POST /points/delete`) by `points`;
+//! - filters: `must` over `has_id`, `key` + `match.value` and `is_empty` —
+//!   exactly what the client sends. A condition where a Filter belongs (a
+//!   bare `update_filter` condition) is a 400, as in Qdrant — never a filter
+//!   that matches everything.
 //!
-//! Anything outside that subset is a 400 naming what the fake lacks, never a
+//! Anything outside that subset — including the payload-key delete the
+//! client no longer sends — is a 4xx naming what the fake lacks, never a
 //! guess, and every write must carry `wait=true`.
 //!
 //! A request is applied the moment it arrives; `delay_next` only holds the
@@ -149,8 +149,7 @@ enum Op {
     },
     SetPayload(Map<String, Value>, Select),
     OverwritePayload(Map<String, Value>, Select),
-    DeletePayload(Vec<String>, Select),
-    DeletePoints(Select),
+    DeletePoints(Vec<String>),
 }
 
 impl State {
@@ -166,8 +165,10 @@ impl State {
             ("PUT", POINTS_PATH) => parse_upsert(&body)?,
             ("POST", PAYLOAD_PATH) => Op::SetPayload(payload_of(&body)?, select_of(&body)?),
             ("PUT", PAYLOAD_PATH) => Op::OverwritePayload(payload_of(&body)?, select_of(&body)?),
-            ("POST", PAYLOAD_DELETE_PATH) => Op::DeletePayload(keys_of(&body)?, select_of(&body)?),
-            ("POST", POINTS_DELETE_PATH) => Op::DeletePoints(select_of(&body)?),
+            ("POST", POINTS_DELETE_PATH) => match select_of(&body)? {
+                Select::Ids(ids) => Op::DeletePoints(ids),
+                Select::Filter(_) => return Err(bad("the fake deletes points by id only")),
+            },
             (m, p) => return Err((404, format!("the fake does not serve {m} {p}"))),
         };
         if !request
@@ -259,7 +260,7 @@ impl State {
                 }
             }
             Op::SetPayload(payload, select) => {
-                for id in self.selected(&select, true)? {
+                for id in self.selected(&select)? {
                     let point = self.points.get_mut(&id).expect("selected points exist");
                     for (k, v) in &payload {
                         point[k.as_str()] = v.clone();
@@ -267,22 +268,12 @@ impl State {
                 }
             }
             Op::OverwritePayload(payload, select) => {
-                for id in self.selected(&select, true)? {
+                for id in self.selected(&select)? {
                     self.points.insert(id, Value::Object(payload.clone()));
                 }
             }
-            Op::DeletePayload(keys, select) => {
-                for id in self.selected(&select, true)? {
-                    let point = self.points.get_mut(&id).expect("selected points exist");
-                    if let Some(obj) = point.as_object_mut() {
-                        for k in &keys {
-                            obj.remove(k);
-                        }
-                    }
-                }
-            }
-            Op::DeletePoints(select) => {
-                for id in self.selected(&select, false)? {
+            Op::DeletePoints(ids) => {
+                for id in ids {
                     self.points.remove(&id);
                 }
             }
@@ -291,12 +282,11 @@ impl State {
     }
 
     /// The existing points `select` names. Qdrant fails a payload write that
-    /// names an absent id (`must_exist`); deleting one is a no-op.
-    fn selected(&self, select: &Select, must_exist: bool) -> Result<Vec<String>, Failure> {
+    /// names an absent id.
+    fn selected(&self, select: &Select) -> Result<Vec<String>, Failure> {
         Ok(match select {
             Select::Ids(ids) => {
-                if must_exist && let Some(id) = ids.iter().find(|id| !self.points.contains_key(*id))
-                {
+                if let Some(id) = ids.iter().find(|id| !self.points.contains_key(*id)) {
                     return Err((404, format!("No point with id {id} found")));
                 }
                 ids.iter()
@@ -375,13 +365,6 @@ fn payload_of(body: &Value) -> Result<Map<String, Value>, Failure> {
         .ok_or_else(|| bad("a payload write needs a `payload` object"))
 }
 
-fn keys_of(body: &Value) -> Result<Vec<String>, Failure> {
-    body.get("keys")
-        .and_then(Value::as_array)
-        .and_then(|keys| keys.iter().map(|k| k.as_str().map(str::to_owned)).collect())
-        .ok_or_else(|| bad("delete payload needs a `keys` list of strings"))
-}
-
 fn select_of(body: &Value) -> Result<Select, Failure> {
     match (body.get("points"), body.get("filter")) {
         (Some(Value::Array(ids)), None) => Ok(Select::Ids(
@@ -397,7 +380,7 @@ fn select_of(body: &Value) -> Result<Select, Failure> {
     }
 }
 
-const CLAUSES: [&str; 3] = ["must", "should", "must_not"];
+const CLAUSES: [&str; 1] = ["must"];
 
 /// A clause's conditions: Qdrant takes one condition or a list.
 fn conditions(clause: &Value) -> Vec<&Value> {
@@ -438,16 +421,15 @@ fn check_condition(c: &Value) -> Result<(), Failure> {
     let has = |keys: &[&str]| obj.len() == keys.len() && keys.iter().all(|k| obj.contains_key(*k));
     let ok = if has(&["has_id"]) {
         obj["has_id"].is_array()
-    } else if has(&["is_empty"]) || has(&["is_null"]) {
-        obj.values()
-            .all(|v| v.get("key").is_some_and(Value::is_string))
+    } else if has(&["is_empty"]) {
+        obj["is_empty"].get("key").is_some_and(Value::is_string)
     } else if has(&["key", "match"]) {
         obj["key"].is_string()
             && obj["match"]
                 .as_object()
                 .is_some_and(|m| m.len() == 1 && m.contains_key("value"))
     } else {
-        return check_filter(c);
+        false
     };
     if ok {
         Ok(())
@@ -458,11 +440,11 @@ fn check_condition(c: &Value) -> Result<(), Failure> {
 
 /// Whether the point `id` holding `payload` matches the (checked) filter `f`.
 fn matches(f: &Value, id: &str, payload: &Value) -> bool {
-    let clause = |name: &str| f.get(name).map(conditions).unwrap_or_default();
-    let should = clause("should");
-    clause("must").iter().all(|c| holds(c, id, payload))
-        && (should.is_empty() || should.iter().any(|c| holds(c, id, payload)))
-        && !clause("must_not").iter().any(|c| holds(c, id, payload))
+    f.get("must")
+        .map(conditions)
+        .unwrap_or_default()
+        .iter()
+        .all(|c| holds(c, id, payload))
 }
 
 fn holds(c: &Value, id: &str, payload: &Value) -> bool {
@@ -476,9 +458,6 @@ fn holds(c: &Value, id: &str, payload: &Value) -> bool {
             Some(_) => false,
         };
     }
-    if let Some(key) = c.pointer("/is_null/key").and_then(Value::as_str) {
-        return matches!(field(payload, key), Some(Value::Null));
-    }
     if let (Some(key), Some(want)) = (
         c.get("key").and_then(Value::as_str),
         c.pointer("/match/value"),
@@ -489,7 +468,7 @@ fn holds(c: &Value, id: &str, payload: &Value) -> bool {
             None => false,
         };
     }
-    matches(c, id, payload)
+    unreachable!("check_condition admits no other condition: {c}")
 }
 
 /// The payload value at a dotted `key`.

@@ -139,7 +139,7 @@ Copy `.env.example` to `.env`. All settings have sensible defaults for local dev
 
 | Variable | Default | Description |
 |:---------|:--------|:------------|
-| `QDRANT_URL` | — (required) | Qdrant HTTP endpoint. Qdrant **1.17 or newer**: every memory write is conditional (`update_mode`, `update_filter`), and the server refuses to start against an older Qdrant, which would silently ignore the condition |
+| `QDRANT_URL` | — (required) | Qdrant HTTP endpoint. Qdrant **1.17 or newer**, **single node** (`replication_factor` 1): every memory write is conditional (`update_mode`, `update_filter`), and the server refuses to start against an older Qdrant, which would silently ignore the condition. Replicated collections are not supported: with default write ordering each replica evaluates the condition on its own |
 | `QDRANT_COLLECTION` | `memories_arctic1024` | Vector collection name |
 | `QDRANT_API_KEY` | — | Optional Qdrant auth |
 | `EMBEDDING_URL` | — (required) | OpenAI-compatible embeddings endpoint |

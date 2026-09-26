@@ -20,10 +20,9 @@ use alaya_types::{
 pub enum StoreMode {
     /// Insert new content, or re-store over the existing record.
     Upsert,
-    /// Insert new content only. An existing record is left untouched and
-    /// reported as `created == false`, decided by the same conditional write
-    /// that would have inserted — not by an earlier existence check another
-    /// writer could slip past (read-only principals may only add).
+    /// Insert new content only (read-only principals may only add). An
+    /// existing record is left untouched and reported as `created == false`
+    /// by the insert-only write itself.
     InsertOnly,
 }
 
@@ -82,8 +81,11 @@ pub trait VectorStorage {
     /// Default: sequential fallback via `update_metadata`. Implementations
     /// may override with batched writes. Each memory's top-level fields and
     /// its supersession marker land together in one conditional write, so a
-    /// marker never commits without its reason. `AlayaError::NotFound` when a
-    /// memory does not exist.
+    /// marker never commits without its reason. `AlayaError::NotFound`, with
+    /// nothing written, when a memory does not exist. Writes are atomic per
+    /// memory, not per batch: any other error may leave some memories updated,
+    /// so a caller that acts on the batch as a whole must re-read to learn
+    /// which.
     async fn update_metadata_batch(
         &self,
         content_hashes: &[&str],

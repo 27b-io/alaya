@@ -12,9 +12,15 @@ key comes out, and a fresh `rev` is stamped onto `rev_log`. The write applies on
 the point still carries the `rev` just read, so a concurrent alaya-server write is never
 rolled back; a lost race is re-read and retried. Needs Qdrant >= 1.17, like the server.
 
+Only write once EVERY alaya-server process runs a compare-and-set build. An older
+server changes points without stamping `rev`, so this whole-payload write could
+overwrite such a change from a stale copy, and the backup would not show the loss.
+`--write` therefore also needs `--all-servers-conditional`, the operator's word that the
+rollout has finished (not merely merged).
+
     kubectl -n mcp port-forward svc/qdrant 6333:6333 &
     uv run scripts/migrate_flat_superseded.py            # dry run: report only
-    uv run scripts/migrate_flat_superseded.py --write    # backup + migrate + verify
+    uv run scripts/migrate_flat_superseded.py --write --all-servers-conditional
 """
 
 from __future__ import annotations
@@ -31,9 +37,7 @@ DEFAULT_COLLECTION = "memories_arctic1024"
 FLAT_KEY = "metadata.superseded_by"
 REV_LOG_LEN = 8  # must match alaya-backends qdrant.rs
 MAX_ATTEMPTS = 8
-COLLECTION = (
-    DEFAULT_COLLECTION  # overridden by --collection (also enables integration tests)
-)
+COLLECTION = DEFAULT_COLLECTION  # overridden by --collection
 
 
 def scroll_all(c: httpx.Client) -> list[dict[str, Any]]:
@@ -69,6 +73,8 @@ def fetch_payload(c: httpx.Client, point_id: int | str) -> dict[str, Any] | None
 def migrate_point(c: httpx.Client, point_id: int | str) -> str | None:
     """Move one point's flat marker into metadata, conditionally; the value written,
     or None when there was nothing to do (vanished or already fixed)."""
+    # Retrying is safe only because every round re-reads and stops once the flat key
+    # is gone: a write that landed but read back as lost is never applied twice.
     for _ in range(MAX_ATTEMPTS):
         # decide the winning value from live state, and condition the write on it
         fresh = fetch_payload(c, point_id)
@@ -105,7 +111,14 @@ def main() -> int:
     ap.add_argument("--qdrant-url", default="http://localhost:6333")
     ap.add_argument("--collection", default=DEFAULT_COLLECTION)
     ap.add_argument("--write", action="store_true", help="apply (default: dry run)")
+    ap.add_argument(
+        "--all-servers-conditional",
+        action="store_true",
+        help="required with --write: every alaya-server runs a compare-and-set build",
+    )
     args = ap.parse_args()
+    if args.write and not args.all_servers_conditional:
+        ap.error("--write needs --all-servers-conditional (see the module docstring)")
     global COLLECTION  # noqa: PLW0603 — one-shot script, simplest way to thread the override
     COLLECTION = args.collection
 

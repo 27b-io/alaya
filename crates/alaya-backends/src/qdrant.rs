@@ -191,8 +191,11 @@ impl QdrantClient {
     /// on the revision read, and reads back to see whether it landed. A write
     /// that lost a race is rebuilt from a fresh read, up to
     /// `MAX_WRITE_ATTEMPTS` rounds; there is never an unconditional fallback.
-    /// A read error, or an error from `modify`, aborts the whole call; `batch`
-    /// decides what an absent point or a failed write does.
+    /// Every write of a round is built before any is sent, so an error from
+    /// `modify` in the first round aborts with nothing written; a read error
+    /// aborts too. A failed write is that point's outcome alone: the rest of
+    /// the batch still goes out, and the caller learns per point what landed.
+    /// `batch` decides what a point absent from the first read does.
     async fn update_points(
         &self,
         ids: &[String],
@@ -227,7 +230,8 @@ impl QdrantClient {
                 }
                 return Ok(outcome);
             }
-            let mut written = Vec::new();
+
+            let mut writes = Vec::new();
             for id in pending.drain(..) {
                 let Some(prev) = read.get(&id) else {
                     let gone = if round == 0 {
@@ -244,15 +248,19 @@ impl QdrantClient {
                 };
                 let read_rev = rev_of(prev).map(str::to_owned);
                 let mine = self.stamp(&mut write, Some(prev));
+                writes.push((id, read_rev, mine, write));
+            }
+
+            let mut written = Vec::new();
+            for (id, read_rev, mine, write) in writes {
                 match self
                     .write_payload_if(&id, read_rev.as_deref(), &write, how)
                     .await
                 {
                     Ok(()) => written.push((id, read_rev, mine)),
-                    Err(e) if batch == Batch::BestEffort => {
+                    Err(e) => {
                         outcome.insert(id, Update::Unconfirmed(e.to_string()));
                     }
-                    Err(e) => return Err(e),
                 }
             }
             if written.is_empty() {
@@ -431,7 +439,10 @@ impl QdrantClient {
 // landed; the token it conditioned on still in the log without its own means
 // it lost the race and rebuilds from a fresh read.
 
-/// Oldest Qdrant that honours `update_mode`; older servers ignore it.
+/// Oldest Qdrant that honours `update_mode`; older servers ignore it. The
+/// protocol also assumes one copy of each point (single node,
+/// `replication_factor` 1): under Qdrant's default weak write ordering each
+/// replica evaluates a condition on its own.
 const MIN_QDRANT_VERSION: (u64, u64) = (1, 17);
 /// Payload key: the revision token of the last write. Absent on points last
 /// written before conditional writes, which count as the zero revision.
@@ -453,16 +464,14 @@ enum PayloadWrite {
     Replace,
 }
 
-/// How `update_points` treats a batch.
+/// How `update_points` treats a point absent from its first read.
 #[derive(Clone, Copy, PartialEq)]
 enum Batch {
-    /// Every point must exist when first read, or nothing is written (the
-    /// present ones come back `Skipped`); the first failed request aborts the
-    /// call. For writes whose caller acts on the batch as a whole — a
-    /// supersession goes on to write graph edges.
+    /// Every point must exist, or nothing is written (the present ones come
+    /// back `Skipped`). For writes that name the memories they change — a
+    /// supersession, a patch.
     Strict,
-    /// An absent point is skipped and a failed write is that point's outcome
-    /// alone. For fire-and-forget writes (access counts).
+    /// An absent point is skipped. For fire-and-forget writes (access counts).
     BestEffort,
 }
 
@@ -1031,35 +1040,9 @@ impl VectorStorage for QdrantClient {
             .map(|h| hash_to_uuid(h))
             .collect::<Result<Vec<String>>>()?;
 
-        let body = json!({
-            "ids": ids,
-            "with_payload": true,
-            "with_vector": false,
-        });
-
-        let resp = self
-            .client
-            .post(format!(
-                "{}/collections/{}/points",
-                self.base_url, self.collection
-            ))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
-
-        if !resp.status().is_success() {
-            return Err(qdrant_error(resp).await);
-        }
-
-        let data: QdrantResponse<Vec<Value>> = resp
-            .json()
-            .await
-            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
-
-        Ok(data
-            .result
-            .unwrap_or_default()
+        Ok(self
+            .retrieve(&ids, None)
+            .await?
             .iter()
             .filter_map(point_to_memory)
             .collect())

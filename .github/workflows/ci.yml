@@ -33,6 +33,34 @@ jobs:
           cargo build -p alaya-backends --target wasm32-unknown-unknown
           cargo build -p alaya-core --target wasm32-unknown-unknown
 
+  # Compare-and-set against a real Qdrant: the two-process races in
+  # qdrant_cas_real are #[ignore]d without a server, so they only count here.
+  qdrant-races:
+    runs-on: ubuntu-latest
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.17.1@sha256:94728574965d17c6485dd361aa3c0818b325b9016dac5ea6afec7b4b2700865f
+        ports:
+          - 6333:6333
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Wait for Qdrant
+        run: |
+          for _ in $(seq 1 30); do
+            curl -sf http://localhost:6333/ && exit 0
+            sleep 2
+          done
+          echo "Qdrant did not come up" >&2
+          exit 1
+      - name: Two-process write races
+        env:
+          QDRANT_TEST_URL: http://localhost:6333
+        run: cargo test -p alaya-backends --test qdrant_cas_real -- --include-ignored --test-threads=1
+
   audit:
     runs-on: ubuntu-latest
     steps:
@@ -47,7 +75,7 @@ jobs:
         run: cargo audit
 
   build-image:
-    needs: [check, audit]
+    needs: [check, audit, qdrant-races]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:

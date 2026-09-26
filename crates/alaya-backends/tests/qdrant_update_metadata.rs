@@ -389,3 +389,52 @@ async fn batch_access_increment_survives_one_failed_write() {
     );
     assert_eq!(fake.point(&id('c')).unwrap()["access_count"], json!(3));
 }
+
+/// Writes are atomic per memory, not per batch: one point's failed write does
+/// not stop the rest, and the call reports the failure. The caller re-reads
+/// to learn which landed (alaya-core's `mark_superseded` does).
+#[tokio::test]
+async fn strict_batch_keeps_going_past_one_failed_write() {
+    let (server, fake) = fake_with(&[('a', Some("r1")), ('b', None), ('c', Some("r3"))]).await;
+    Mock::given(method("POST"))
+        .and(path(PAYLOAD_PATH))
+        .and(WriteTo(id('b')))
+        .respond_with(
+            ResponseTemplate::new(500).set_body_json(json!({"status": {"error": "boom"}})),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let result = client_for(&server)
+        .update_metadata_batch(
+            &[hash('a').as_str(), hash('b').as_str(), hash('c').as_str()],
+            supersede(None),
+        )
+        .await;
+    assert!(matches!(result, Err(AlayaError::Storage(_))), "{result:?}");
+    let marker = |c| {
+        fake.point(&id(c)).unwrap()["metadata"]
+            .get("superseded_by")
+            .cloned()
+    };
+    assert_eq!(marker('a'), Some(json!(hash('b'))));
+    assert_eq!(marker('b'), None, "its write failed");
+    assert_eq!(marker('c'), Some(json!(hash('b'))));
+}
+
+/// Every write of a round is built before any is sent: a memory that cannot
+/// take the marker fails the call before a sibling is marked.
+#[tokio::test]
+async fn batch_update_that_cannot_build_one_write_sends_none() {
+    let (server, fake) = fake_with(&[('a', Some("r1"))]).await;
+    let mut payload = memory_payload('c', None);
+    payload["metadata"] = json!("legacy string");
+    fake.insert(&id('c'), payload);
+
+    let result = client_for(&server)
+        .update_metadata_batch(&[hash('a').as_str(), hash('c').as_str()], supersede(None))
+        .await;
+    assert!(matches!(result, Err(AlayaError::Storage(_))), "{result:?}");
+    assert!(writes(&server).await.is_empty(), "nothing may be marked");
+}

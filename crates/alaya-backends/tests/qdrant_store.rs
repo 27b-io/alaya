@@ -384,10 +384,10 @@ async fn store_fails_closed_when_readback_has_no_result() {
     assert!(matches!(result, Err(AlayaError::Storage(_))), "{result:?}");
 }
 
-// ─── Insert-only stores (read-only principals) ──────────────────────────────
+// ─── Insert-only stores ─────────────────────────────────────────────────────
 
-/// A read-only principal may only add: on an existing point the insert-only
-/// store reports `created: false` and writes nothing at all.
+/// On an existing point an insert-only store reports `created: false` and
+/// writes nothing at all.
 #[tokio::test]
 async fn insert_only_leaves_an_existing_point_untouched() {
     let before = with_rev(existing_payload(), "r1");
@@ -406,8 +406,8 @@ async fn insert_only_leaves_an_existing_point_untouched() {
     assert_eq!(fake.point(ID).unwrap(), before);
 }
 
-/// Presence is judged exactly as the upsert path judges it — raw point, not
-/// parseability — so the read-only guard and the write cannot disagree.
+/// Presence is judged exactly as the upsert path judges it: raw point, not
+/// parseability.
 #[tokio::test]
 async fn insert_only_judges_raw_presence_not_parseability() {
     let malformed = json!({ "created_at": 1000.0 });
@@ -876,8 +876,8 @@ async fn store_that_loses_the_insert_race_becomes_a_restore() {
     assert_eq!(stored["tags"], json!(["new-tag"]));
 }
 
-/// The read-only guard holds under the same race: an insert-only store that
-/// loses the insert reports `created: false` and writes nothing more.
+/// An insert-only store that loses the insert reports `created: false` and
+/// writes nothing more.
 #[tokio::test]
 async fn insert_only_store_that_loses_the_insert_race_writes_nothing_more() {
     let (server, fake) = fake_with(None).await;

@@ -459,10 +459,9 @@ impl MemoryService {
         // A read-only principal's store is additive only. Re-storing content
         // that already exists would replace the record's caller-owned fields
         // (tags, metadata, summary, memory_type) — the effect of patch /
-        // supersede, which read-only is denied. The guard is the write
-        // itself: insert-only, so a store from another writer that lands
-        // first cannot be reshaped by this one, and presence is judged on the
-        // raw point, not parseability.
+        // supersede, which read-only is denied. Read-only stores are
+        // insert-only: an existing record, judged on the raw point rather than
+        // parseability, is reported as created=false by the write itself.
         let mode = if read_only {
             StoreMode::InsertOnly
         } else {
@@ -1752,7 +1751,9 @@ impl MemoryService {
             )));
         }
 
-        self.mark_superseded(&[old_hash], new_hash, reason).await?;
+        self.mark_superseded(&[old_hash], new_hash, reason)
+            .await
+            .map_err(|f| f.error)?;
 
         Ok(serde_json::json!({
             "success": true,
@@ -1768,15 +1769,23 @@ impl MemoryService {
     /// `supersession_reason`) for all memories, then one batched edge write
     /// creates the SUPERSEDES edges. Edge failures only warn — graph
     /// operations are non-fatal by design.
+    ///
+    /// The update is atomic per memory, not per batch, so a failure can leave
+    /// some memories marked (alaya#130). Those still get their edge — the
+    /// marked set is re-read, so a write that landed without being confirmed
+    /// counts too — and are returned with the error, so the caller reports
+    /// them as superseded: a memory is never hidden from search without its
+    /// audit edge, and never reported as untouched while it is hidden.
     async fn mark_superseded(
         &self,
         old_hashes: &[&str],
         new_hash: &str,
         reason: &str,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), SupersedeFailure> {
         let mut extra = HashMap::new();
         extra.insert("supersession_reason".into(), serde_json::json!(reason));
-        self.vectors
+        let updated = self
+            .vectors
             .update_metadata_batch(
                 old_hashes,
                 MetadataUpdate {
@@ -1785,8 +1794,37 @@ impl MemoryService {
                     ..Default::default()
                 },
             )
-            .await?;
+            .await;
+        if let Err(error) = updated {
+            let marked: Vec<String> = match self.vectors.get_batch(old_hashes).await {
+                Ok(memories) => memories
+                    .into_iter()
+                    .filter(|m| superseded_by(m) == Some(new_hash))
+                    .map(|m| m.content_hash)
+                    .collect(),
+                Err(read) => {
+                    tracing::error!(
+                        new_hash,
+                        "supersession failed part-way and the marked memories could not be \
+                         re-read; any that were marked have no SUPERSEDES edge: {read}"
+                    );
+                    Vec::new()
+                }
+            };
+            let refs: Vec<&str> = marked.iter().map(String::as_str).collect();
+            self.write_supersedes_edges(&refs, new_hash).await;
+            return Err(SupersedeFailure { marked, error });
+        }
 
+        self.write_supersedes_edges(old_hashes, new_hash).await;
+        Ok(())
+    }
+
+    /// One batched write of `new_hash -> old` SUPERSEDES edges; non-fatal.
+    async fn write_supersedes_edges(&self, old_hashes: &[&str], new_hash: &str) {
+        if old_hashes.is_empty() {
+            return;
+        }
         let now = (self.clock)();
         let edges: Vec<(String, String, SystemRelationType, f64)> = old_hashes
             .iter()
@@ -1802,8 +1840,6 @@ impl MemoryService {
         if let Err(e) = self.graph.create_system_edges_batch(&edges).await {
             tracing::warn!("failed to create SUPERSEDES edge(s): {e}");
         }
-
-        Ok(())
     }
 
     // ─── Contradiction judge (LAB-3283, Phase 1: advisory) ──────────────
@@ -2339,13 +2375,17 @@ impl MemoryService {
                 .await
             {
                 Ok(()) => superseded.extend(to_supersede.iter().map(|s| s.to_string())),
-                Err(e) => {
-                    let msg = e.safe_message();
+                Err(SupersedeFailure { marked, error }) => {
+                    let msg = error.safe_message();
                     for &dup_hash in &to_supersede {
-                        errors.push(serde_json::json!({
-                            "hash": dup_hash,
-                            "error": msg,
-                        }));
+                        if marked.iter().any(|m| m == dup_hash) {
+                            superseded.push(dup_hash.to_string());
+                        } else {
+                            errors.push(serde_json::json!({
+                                "hash": dup_hash,
+                                "error": msg,
+                            }));
+                        }
                     }
                 }
             }
@@ -2454,6 +2494,21 @@ fn is_superseded(m: &Memory) -> bool {
         .as_ref()
         .and_then(|md| md.get("superseded_by"))
         .is_some()
+}
+
+/// A supersession that failed part-way (see `mark_superseded`).
+struct SupersedeFailure {
+    /// Memories that carry the marker anyway; their edges are written.
+    marked: Vec<String>,
+    error: AlayaError,
+}
+
+/// The hash `m` is superseded by, when set.
+fn superseded_by(m: &Memory) -> Option<&str> {
+    m.metadata
+        .as_ref()
+        .and_then(|md| md.get("superseded_by"))
+        .and_then(Value::as_str)
 }
 
 /// Over-fetch and filter superseded at the application layer (the
@@ -5279,6 +5334,9 @@ mod tests {
         single_edge_calls: Cell<usize>,
         edge_batch_calls: Cell<usize>,
         fail_update: Cell<bool>,
+        /// When set, update_metadata_batch marks only these memories, then
+        /// fails: a batch that committed part-way.
+        partial_update: RefCell<Option<Vec<String>>>,
     }
 
     impl MergeRecorder {
@@ -5340,6 +5398,19 @@ mod tests {
                 .set(self.0.update_batch_calls.get() + 1);
             if self.0.fail_update.get() {
                 return Err(AlayaError::Storage("mock update failure".into()));
+            }
+            if let Some(marked) = self.0.partial_update.borrow().as_ref() {
+                let mut mems = self.0.memories.borrow_mut();
+                for h in marked {
+                    let m = mems
+                        .get_mut(h)
+                        .expect("partial_update names a seeded memory");
+                    m.metadata.get_or_insert_with(HashMap::new).insert(
+                        "superseded_by".into(),
+                        serde_json::json!(updates.superseded_by),
+                    );
+                }
+                return Err(AlayaError::Storage("mock partial failure".into()));
             }
             self.0
                 .updates
@@ -5664,6 +5735,51 @@ mod tests {
         assert_eq!(result["errors"].as_array().unwrap().len(), 2);
         // No edges when the metadata commit failed
         assert!(rec.system_edges.borrow().is_empty());
+    }
+
+    /// A batch that commits part-way (alaya#130): the memory that was marked
+    /// gets its SUPERSEDES edge and is reported as superseded; only the other
+    /// one is an error. Nothing is hidden from search without its audit edge.
+    #[tokio::test(flavor = "current_thread")]
+    async fn merge_duplicates_partial_commit_writes_edges_for_what_landed() {
+        let canonical = "c".repeat(64);
+        let d1 = "1".repeat(64);
+        let d2 = "2".repeat(64);
+
+        let (svc, rec) = build_merge_service();
+        rec.seed(&[&canonical, &d1, &d2]);
+        *rec.partial_update.borrow_mut() = Some(vec![d1.clone()]);
+
+        let result = svc
+            .merge_duplicates(&canonical, &[&d1, &d2], "dedup", false)
+            .await
+            .expect("a partial failure is per-item, not a call failure");
+
+        assert_eq!(result["success"], serde_json::json!(false));
+        assert_eq!(result["superseded"], serde_json::json!([d1]));
+        let errors = result["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0]["hash"], serde_json::json!(d2));
+        assert_eq!(*rec.system_edges.borrow(), vec![(canonical, d1)]);
+    }
+
+    /// A single supersede whose write landed but failed to confirm still gets
+    /// its edge, and the caller still sees the error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn memory_supersede_writes_the_edge_when_the_marker_landed_despite_an_error() {
+        let old = "0".repeat(64);
+        let new = "f".repeat(64);
+
+        let (svc, rec) = build_merge_service();
+        rec.seed(&[&old, &new]);
+        *rec.partial_update.borrow_mut() = Some(vec![old.clone()]);
+
+        let err = svc
+            .memory_supersede(&old, &new, "corrected")
+            .await
+            .expect_err("the failure is reported");
+        assert!(matches!(err, AlayaError::Storage(_)), "{err:?}");
+        assert_eq!(*rec.system_edges.borrow(), vec![(new, old)]);
     }
 
     #[tokio::test(flavor = "current_thread")]

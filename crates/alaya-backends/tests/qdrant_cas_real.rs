@@ -1,11 +1,13 @@
 //! Two-process write races against a real Qdrant (alaya#130).
 //!
-//! Gated on `QDRANT_TEST_URL` (a disposable Qdrant >= 1.17; every test makes
-//! and drops its own collection):
+//! Ignored by default: they need `QDRANT_TEST_URL`, a disposable Qdrant >= 1.17
+//! (every test makes and drops its own collection). CI runs them against a
+//! Qdrant service container; a run without the URL fails rather than passing
+//! silently:
 //!
 //!   docker run -d -p 16417:6333 qdrant/qdrant:v1.17.1
 //!   QDRANT_TEST_URL=http://localhost:16417 \
-//!     cargo test -p alaya-backends --test qdrant_cas_real -- --test-threads=1
+//!     cargo test -p alaya-backends --test qdrant_cas_real -- --include-ignored --test-threads=1
 //!
 //! `QDRANT_TEST_URL_OLD`, if set to a Qdrant < 1.17, also checks the startup
 //! refusal against it.
@@ -29,8 +31,9 @@ use tokio::sync::oneshot;
 const CHILD_ROLE: &str = "ALAYA_CAS_CHILD_ROLE";
 const CHILD_RESULT: &str = "CAS_CHILD_RESULT ";
 
-fn qdrant_url() -> Option<String> {
-    std::env::var("QDRANT_TEST_URL").ok()
+fn qdrant_url() -> String {
+    std::env::var("QDRANT_TEST_URL")
+        .expect("QDRANT_TEST_URL must point at a disposable Qdrant >= 1.17")
 }
 
 fn memory(content: &str, tags: &[&str]) -> Memory {
@@ -243,6 +246,7 @@ async fn pump(client: TcpStream, server: TcpStream, gate: Arc<Gate>) {
 /// `ALAYA_CAS_CHILD_ROLE` set; then performs one write with its own client,
 /// straight to Qdrant, and prints its result for the parent.
 #[tokio::test]
+#[ignore = "needs QDRANT_TEST_URL"]
 async fn child_process_writer() {
     let Ok(role) = std::env::var(CHILD_ROLE) else {
         return;
@@ -299,6 +303,7 @@ async fn run_child(role: &str, url: &str, collection: &str, hash: &str, content:
         .args([
             "--exact",
             "child_process_writer",
+            "--include-ignored",
             "--nocapture",
             "--test-threads=1",
         ])
@@ -355,8 +360,9 @@ async fn race<T>(
 /// revision): B's marker and reason survive A's re-store, and A's own
 /// caller-owned fields still land.
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "needs QDRANT_TEST_URL"]
 async fn restore_racing_a_supersede_keeps_the_marker() {
-    let Some(url) = qdrant_url() else { return };
+    let url = qdrant_url();
     let coll = Collection::new(&url, "supersede").await;
     let seed = memory("supersede probe", &["seed"]);
     coll.put_legacy(&seed).await;
@@ -383,8 +389,9 @@ async fn restore_racing_a_supersede_keeps_the_marker() {
 /// Re-store vs access increments: three accesses counted by another process
 /// inside A's window are all kept.
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "needs QDRANT_TEST_URL"]
 async fn restore_racing_access_increments_keeps_every_count() {
-    let Some(url) = qdrant_url() else { return };
+    let url = qdrant_url();
     let coll = Collection::new(&url, "increment").await;
     let seed = memory("increment probe", &["seed"]);
     let (created, hash) = coll
@@ -413,8 +420,9 @@ async fn restore_racing_access_increments_keeps_every_count() {
 /// Re-store vs delete: the delete stands. A's re-store must not bring the
 /// point back from its pre-delete copy, and says the memory is gone.
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "needs QDRANT_TEST_URL"]
 async fn restore_racing_a_delete_does_not_resurrect() {
-    let Some(url) = qdrant_url() else { return };
+    let url = qdrant_url();
     let coll = Collection::new(&url, "delete").await;
     let seed = memory("delete probe", &["seed"]);
     let (_, hash) = coll
@@ -442,8 +450,9 @@ async fn restore_racing_a_delete_does_not_resurrect() {
 /// Two processes storing the same new content: exactly one reports
 /// `created`. A loses the insert race and takes the re-store path.
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "needs QDRANT_TEST_URL"]
 async fn lost_insert_race_reports_created_false() {
-    let Some(url) = qdrant_url() else { return };
+    let url = qdrant_url();
     let coll = Collection::new(&url, "insert").await;
     let content = "insert probe";
     let hash = memory(content, &[]).content_hash;
@@ -466,17 +475,19 @@ async fn lost_insert_race_reports_created_false() {
     coll.cleanup().await;
 }
 
-/// An insert-only (read-only principal's) store that finds a writable store
-/// already landed writes nothing: the other writer's record is not reshaped.
+/// Two processes storing the same new content, one of them insert-only:
+/// the insert-only store that loses writes nothing and reports
+/// `created: false`.
 #[tokio::test(flavor = "current_thread")]
-async fn insert_only_store_never_reshapes_a_record_that_landed_first() {
-    let Some(url) = qdrant_url() else { return };
+#[ignore = "needs QDRANT_TEST_URL"]
+async fn insert_only_store_that_loses_the_insert_race_writes_nothing() {
+    let url = qdrant_url();
     let coll = Collection::new(&url, "insertonly").await;
     let content = "insert-only probe";
     let hash = memory(content, &[]).content_hash;
 
     let (a, b, upserts) = race(&coll, &url, ("store", &hash, content), async |a| {
-        a.store(&memory(content, &["hijack"]), StoreMode::InsertOnly)
+        a.store(&memory(content, &["from-a"]), StoreMode::InsertOnly)
             .await
     })
     .await;
@@ -492,8 +503,9 @@ async fn insert_only_store_never_reshapes_a_record_that_landed_first() {
 
 /// The startup gate reads the real server's version.
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "needs QDRANT_TEST_URL"]
 async fn server_version_gate_against_real_servers() {
-    let Some(url) = qdrant_url() else { return };
+    let url = qdrant_url();
     let version = QdrantClient::new(url, "unused".into(), None)
         .unwrap()
         .check_server_version()
