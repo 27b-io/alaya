@@ -311,6 +311,8 @@ Content-Type: application/json
 
 `reason` is optional. Returns `{ "superseded": true, "old_hash": "...", "new_hash": "..." }`.
 
+Supersession is idempotent. After an error, the memory may already be superseded, so retry the same call: it converges and writes any missing audit edge.
+
 ## `POST /contradictions`
 
 ```http
@@ -414,6 +416,8 @@ Content-Type: application/json
 }
 ```
 
+Returns `{ "success", "canonical_hash", "superseded": [...], "errors": [{ "hash", "error" }], "dry_run" }`. Writes are atomic per memory, not per batch: after a partial failure, `superseded` lists exactly the memories that were superseded (their audit edges are written), and `errors` lists the rest. An error that starts with `Outcome unknown` means the server could not read back whether that memory was superseded. Retry the same call; it is idempotent and converges. `scripts/backfill_graph.py` also rebuilds every missing `SUPERSEDES` edge from the stored markers.
+
 ## `POST /backfill/summaries`
 
 For deployments that turned on `SUMMARY_URL` after the corpus already existed: generates summaries for up to `limit` memories that don't have one yet.
@@ -454,7 +458,7 @@ Failures are classified so one poison pair cannot stall the pass or re-bill fore
 
 Re-running is idempotent: only edges with no verdict at all are selected. **Switching `JUDGE_MODEL`** does not touch existing verdicts; run with `"rejudge": true` to also re-annotate every edge whose `verdict_model` differs from the configured model **and every `unjudged` marker** (the operator's way to retry deterministic failures after a fix), paging with `limit` until `queued` is `0`. A marker never overwrites a real verdict — if a re-judge fails on a pair that already has one, the old verdict stands. Verdicts are written onto the graph edge only; no memory record is modified.
 
-One pass at a time: a second call while one is running returns `{"success": false, "error": "backfill already running"}`. The HTTP reply waits at most 630 s, so keep `limit` around 200 per call; a pass that outlives the reply still runs to completion and the next call is refused until it finishes.
+One pass at a time per `alaya-server` process: a second call to the same process while one is running returns `{"success": false, "error": "backfill already running"}`. With more than one replica behind the Service, a second call can land on another process and run alongside the first. The two passes select the same unjudged pairs, so some pairs are judged, and billed, twice; each verdict write is last-writer-wins on the edge and touches no memory, so nothing is corrupted. Send backfills to one pod (`kubectl port-forward pod/...`) to avoid the double spend. The HTTP reply waits at most 630 s, so keep `limit` around 200 per call; a pass that outlives the reply still runs to completion and the next call is refused until it finishes.
 
 ## `POST /mcp`
 
