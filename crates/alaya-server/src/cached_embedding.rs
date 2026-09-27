@@ -75,18 +75,19 @@ fn cache_key(model: &str, dims: usize, prompt: PromptName, text: &str) -> Result
     })
 }
 
-/// Build the L2 CacheKit client used for embeddings.
+/// Build the L2 CacheKit client used for embeddings from a builder that
+/// already carries its backend (plain `CacheKit::builder()` or a preset).
 ///
-/// MUST stay un-namespaced: interop keys carry their own `alaya:embed:`
-/// segment, and a client namespace silently prefixes `ns:` onto every plain
-/// `get`/`set` key (unlike `interop_get`, which fails closed), producing keys
-/// no other SDK can compute. Verified at the wire level by
-/// `l2_keys_reach_backend_verbatim` below.
+/// MUST stay un-namespaced — never pass a builder with `.namespace()` set:
+/// interop keys carry their own `alaya:embed:` segment, and a client
+/// namespace silently prefixes `ns:` onto every plain `get`/`set` key (unlike
+/// `interop_get`, which fails closed), producing keys no other SDK can
+/// compute. Verified at the wire level by `l2_keys_reach_backend_verbatim`
+/// below.
 pub fn build_l2_client(
-    backend: cachekit::SharedBackend,
+    builder: cachekit::CacheKitBuilder,
 ) -> std::result::Result<cachekit::CacheKit, cachekit::CachekitError> {
-    cachekit::CacheKit::builder()
-        .backend(backend)
+    builder
         .default_ttl(std::time::Duration::from_secs(86400 * 30))
         .no_l1()
         .build()
@@ -487,7 +488,10 @@ mod tests {
     /// Paused clock — the 3s timeouts elapse instantly.
     #[tokio::test(start_paused = true)]
     async fn hanging_l2_times_out_and_degrades_to_inner_provider() {
-        let l2 = build_l2_client(std::rc::Rc::new(HangingBackend)).unwrap();
+        let l2 = build_l2_client(
+            cachekit::CacheKit::builder().backend(std::rc::Rc::new(HangingBackend)),
+        )
+        .unwrap();
         let cache = CachedEmbedding::new(Box::new(StubEmbeddings), 10, Some(l2));
 
         let out = cache
@@ -555,7 +559,8 @@ mod tests {
     #[tokio::test]
     async fn l2_keys_reach_backend_verbatim() {
         let backend = std::rc::Rc::new(RecordingBackend::default());
-        let l2_writer = build_l2_client(backend.clone()).unwrap();
+        let l2_writer =
+            build_l2_client(cachekit::CacheKit::builder().backend(backend.clone())).unwrap();
         let writer = CachedEmbedding::new(Box::new(StubEmbeddings), 10, Some(l2_writer));
         writer
             .embed_batch(&["hello"], PromptName::Passage)
@@ -564,7 +569,8 @@ mod tests {
 
         // Fresh client + fresh L1 over the same backend — models another pod
         // (or another SDK that derived the same interop key).
-        let l2_reader = build_l2_client(backend.clone()).unwrap();
+        let l2_reader =
+            build_l2_client(cachekit::CacheKit::builder().backend(backend.clone())).unwrap();
         let reader = CachedEmbedding::new(Box::new(StubEmbeddings), 10, Some(l2_reader));
         reader
             .embed_batch(&["hello"], PromptName::Passage)
@@ -592,7 +598,7 @@ mod tests {
         // 0xc1 is reserved in MessagePack — guaranteed Serialization error.
         backend.store.borrow_mut().insert(key.clone(), vec![0xc1]);
 
-        let l2 = build_l2_client(backend.clone()).unwrap();
+        let l2 = build_l2_client(cachekit::CacheKit::builder().backend(backend.clone())).unwrap();
         let cache = CachedEmbedding::new(Box::new(StubEmbeddings), 10, Some(l2));
 
         for _ in 0..BREAKER_THRESHOLD {
@@ -623,10 +629,11 @@ mod tests {
         let key = cache_key("stub", 4, PromptName::Passage, "hello").unwrap();
 
         // Plant a valid 3-dim entry via the same plain-set interop write path.
-        let planter = build_l2_client(backend.clone()).unwrap();
+        let planter =
+            build_l2_client(cachekit::CacheKit::builder().backend(backend.clone())).unwrap();
         planter.set(&key, &vec![0.1_f32; 3]).await.unwrap();
 
-        let l2 = build_l2_client(backend.clone()).unwrap();
+        let l2 = build_l2_client(cachekit::CacheKit::builder().backend(backend.clone())).unwrap();
         let cache = CachedEmbedding::new(Box::new(StubEmbeddings), 10, Some(l2));
 
         let got = cache.l2_get_batch(&[key.as_str()]).await;
@@ -639,7 +646,8 @@ mod tests {
             .embed_batch(&["hello"], PromptName::Passage)
             .await
             .unwrap();
-        let reader = build_l2_client(backend.clone()).unwrap();
+        let reader =
+            build_l2_client(cachekit::CacheKit::builder().backend(backend.clone())).unwrap();
         let healed: Option<Vec<f32>> = reader.interop_get(&key).await.unwrap();
         assert_eq!(healed.unwrap().len(), 4, "re-embed must overwrite poison");
     }

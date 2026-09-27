@@ -443,9 +443,13 @@ const L2_BASE_RETRY_MS: u64 = 500;
 async fn init_l2_redis(
     url: &str,
 ) -> std::result::Result<cachekit::CacheKit, Box<dyn std::error::Error>> {
-    let redis = cachekit::backend::redis::RedisBackend::builder()
-        .url(url)
-        .build()?;
+    // Built through `CacheKit::production` because it is the only public way
+    // to get fred's reconnect policy (`auto_reconnect()` is crate-private).
+    // Without it a connection lost to a Redis restart is never redialled and
+    // every L2 op times out until this process restarts. The preset's TTL and
+    // L1 are overridden in `build_l2_client`; its retry/breaker stack needs
+    // cachekit's `reliability` feature, which this workspace leaves off.
+    //
     // Retry connection with backoff — at pod startup the CNI/kube-proxy may
     // not have finished installing network rules yet, causing ECONNREFUSED.
     // Each attempt is deadline-bounded: cachekit sets no fred connect
@@ -453,15 +457,19 @@ async fn init_l2_redis(
     // thread before its command loop ever starts (#63).
     let mut last_err: Option<String> = None;
     for attempt in 0..L2_MAX_ATTEMPTS {
-        let connected = tokio::time::timeout(std::time::Duration::from_secs(10), redis.connect());
+        let connected = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            cachekit::CacheKit::production(url),
+        );
         let err_msg = match connected.await {
-            Ok(Ok(handle)) => {
-                drop(handle);
+            Ok(Ok(builder)) => {
                 if attempt > 0 {
                     tracing::info!(attempt, "L2 cache connected after retry");
                 }
-                return Ok(cached_embedding::build_l2_client(std::rc::Rc::new(redis))?);
+                return Ok(cached_embedding::build_l2_client(builder)?);
             }
+            // A bad URL will not fix itself: fail now, as before the retries.
+            Ok(Err(e @ cachekit::CachekitError::Config(_))) => return Err(e.into()),
             Ok(Err(e)) => e.to_string(),
             Err(_) => "connect timed out after 10s".to_string(),
         };
@@ -490,9 +498,9 @@ fn init_l2_saas() -> std::result::Result<cachekit::CacheKit, Box<dyn std::error:
         builder = builder.api_url(url);
     }
     let backend = builder.build()?;
-    Ok(cached_embedding::build_l2_client(std::rc::Rc::new(
-        backend,
-    ))?)
+    Ok(cached_embedding::build_l2_client(
+        cachekit::CacheKit::builder().backend(std::rc::Rc::new(backend)),
+    )?)
 }
 
 /// Env var treated as unset when blank, returned trimmed — k8s manifests
@@ -4070,6 +4078,101 @@ mod tests {
         // Public origins.
         assert!(!is_private_host("https://alaya.27b.io"));
         assert!(!is_private_host("https://example.com"));
+    }
+    // ─── L2 Redis reconnect (LAB-5792) ────────────────────────────────────
+
+    /// A throwaway `redis-server` on a fixed port, killed on drop.
+    struct RedisServer(std::process::Child);
+
+    impl RedisServer {
+        async fn start(port: u16) -> Self {
+            let child = std::process::Command::new("redis-server")
+                .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
+                .args(["--save", "", "--appendonly", "no"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("redis-server must be on PATH for this test");
+            let server = Self(child);
+            for _ in 0..100 {
+                if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .is_ok()
+                {
+                    return server;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("redis-server did not accept connections on port {port} within 5s");
+        }
+    }
+
+    impl Drop for RedisServer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A malformed URL is a config error: it must fail on the first attempt,
+    /// not spend the connect-retry backoff (~7.5s) on something no retry fixes.
+    #[tokio::test]
+    async fn l2_init_fails_fast_on_a_malformed_url() {
+        let started = std::time::Instant::now();
+        let err = init_l2_redis("not a redis url").await.err().unwrap();
+        assert!(err.to_string().contains("configuration error"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(400));
+    }
+
+    /// The L2 client must serve again once its Redis server comes back —
+    /// without a reconnect policy fred never redials a lost connection, and
+    /// every L2 op after a server restart fails until the process restarts.
+    ///
+    /// Needs `redis-server` on PATH (CI has none), hence ignored. Run with:
+    /// `cargo test -p alaya-server l2_serves_again_after_redis_restart -- --ignored`
+    #[tokio::test]
+    #[ignore = "needs redis-server on PATH"]
+    async fn l2_serves_again_after_redis_restart() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let op = std::time::Duration::from_secs(3);
+
+        let server = RedisServer::start(port).await;
+        let l2 = init_l2_redis(&format!("redis://127.0.0.1:{port}"))
+            .await
+            .expect("L2 connects to a live server");
+        tokio::time::timeout(op, l2.set("k", &1u32))
+            .await
+            .expect("set before restart timed out")
+            .expect("set before restart failed");
+
+        drop(server);
+        let _server = RedisServer::start(port).await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let err = match tokio::time::timeout(op, l2.set("k", &2u32)).await {
+                Ok(Ok(())) => break,
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => "timed out".to_string(),
+            };
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "L2 never served again after the Redis restart; last error: {err}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        let got: Option<u32> = tokio::time::timeout(op, l2.get("k"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            got,
+            Some(2),
+            "read-back after reconnect must hit the new server"
+        );
     }
 }
 

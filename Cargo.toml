@@ -31,6 +31,9 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 mini-moka = "0.10"
+# Keep `reliability` off: alaya-server builds its Redis L2 through
+# `CacheKit::production`, which would then stack cachekit's retry/breaker on
+# top of the embedding cache's own op timeout and breaker.
 cachekit-rs = { version = "0.7", default-features = false, features = ["redis", "cachekitio", "l1", "unsync"] }
 
 [profile.release]
