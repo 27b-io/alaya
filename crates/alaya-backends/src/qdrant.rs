@@ -187,25 +187,30 @@ impl QdrantClient {
     ///
     /// Reads each point (payload restricted to `keys` plus the revision keys,
     /// or all of it when `keys` is `None`), lets `modify` build the write from
-    /// what it read — `None` leaves the point alone — commits it conditionally
-    /// on the revision read, and reads back to see whether it landed. A write
-    /// that lost a race is rebuilt from a fresh read, up to
-    /// `MAX_WRITE_ATTEMPTS` rounds; there is never an unconditional fallback.
-    /// Every write of a round is built before any is sent, so an error from
-    /// `modify` in the first round aborts with nothing written; a read error
-    /// aborts too. A failed write is that point's outcome alone: the rest of
-    /// the batch still goes out, and the caller learns per point what landed.
-    /// `batch` decides what a point absent from the first read does.
+    /// what it read — `None` leaves the point alone — commits it the way
+    /// `commit` says, conditionally on the revision read, and reads back to
+    /// see whether it landed. A write that lost a race is rebuilt from a
+    /// fresh read, up to `MAX_WRITE_ATTEMPTS` rounds; there is never an
+    /// unconditional fallback. Every write of a round is built before any is
+    /// sent, so an error from `modify` in the first round aborts with nothing
+    /// written; a read error aborts too. A failed write is that point's
+    /// outcome alone: the rest of the batch still goes out, and the caller
+    /// learns per point what landed. `commit` also decides what a point
+    /// absent from a read does.
     async fn update_points(
         &self,
         ids: &[String],
         keys: Option<&[&str]>,
-        how: PayloadWrite,
-        batch: Batch,
+        commit: Commit<'_>,
         modify: impl Fn(&Value) -> Result<Option<Value>>,
     ) -> Result<HashMap<String, Update>> {
         let keys: Option<Vec<&str>> =
             keys.map(|k| k.iter().copied().chain([REV, REV_LOG]).collect());
+        // A store needs only the verdict, not the payload it wrote.
+        let back_keys = match commit {
+            Commit::Payload(..) => keys.clone(),
+            Commit::Upsert { .. } => Some(vec![REV, REV_LOG]),
+        };
         let mut pending: Vec<String> = ids.to_vec();
         pending.sort();
         pending.dedup();
@@ -217,7 +222,7 @@ impl QdrantClient {
             }
             let read = by_id(self.retrieve(&pending, keys.as_deref()).await?);
             if round == 0
-                && batch == Batch::Strict
+                && matches!(commit, Commit::Payload(_, Batch::Strict))
                 && pending.iter().any(|id| !read.contains_key(id))
             {
                 for id in pending {
@@ -233,31 +238,43 @@ impl QdrantClient {
 
             let mut writes = Vec::new();
             for id in pending.drain(..) {
-                let Some(prev) = read.get(&id) else {
-                    let gone = if round == 0 {
-                        Update::Absent
-                    } else {
-                        Update::Deleted
-                    };
-                    outcome.insert(id, gone);
-                    continue;
+                let prev = read.get(&id);
+                let write = match (prev, commit) {
+                    (Some(prev), _) => modify(prev)?,
+                    (None, Commit::Upsert { insert, .. }) => Some(insert.clone()),
+                    (None, Commit::Payload(..)) => {
+                        let gone = if round == 0 {
+                            Update::Absent
+                        } else {
+                            Update::Deleted
+                        };
+                        outcome.insert(id, gone);
+                        continue;
+                    }
                 };
-                let Some(mut write) = modify(prev)? else {
+                let Some(mut write) = write else {
                     outcome.insert(id, Update::Skipped);
                     continue;
                 };
-                let read_rev = rev_of(prev).map(str::to_owned);
-                let mine = self.stamp(&mut write, Some(prev));
-                writes.push((id, read_rev, mine, write));
+                let read_rev = prev.and_then(rev_of).map(str::to_owned);
+                let mine = self.stamp(&mut write, prev);
+                writes.push((id, prev.is_none(), read_rev, mine, write));
             }
 
             let mut written = Vec::new();
-            for (id, read_rev, mine, write) in writes {
-                match self
-                    .write_payload_if(&id, read_rev.as_deref(), &write, how)
-                    .await
-                {
-                    Ok(()) => written.push((id, read_rev, mine)),
+            for (id, created, read_rev, mine, write) in writes {
+                let sent = match commit {
+                    Commit::Payload(how, _) => {
+                        self.write_payload_if(&id, read_rev.as_deref(), &write, how)
+                            .await
+                    }
+                    Commit::Upsert { vector, .. } => {
+                        let condition = (!created).then(|| rev_condition(read_rev.as_deref()));
+                        self.upsert_point(&id, vector, &write, condition).await
+                    }
+                };
+                match sent {
+                    Ok(()) => written.push((id, created, read_rev, mine)),
                     Err(e) => {
                         outcome.insert(id, Update::Unconfirmed(e.to_string()));
                     }
@@ -267,13 +284,14 @@ impl QdrantClient {
                 break;
             }
 
-            let ids: Vec<String> = written.iter().map(|(id, _, _)| id.clone()).collect();
-            let mut back = by_id(self.retrieve(&ids, keys.as_deref()).await?);
-            for (id, read_rev, mine) in written {
+            let ids: Vec<String> = written.iter().map(|(id, ..)| id.clone()).collect();
+            let mut back = by_id(self.retrieve(&ids, back_keys.as_deref()).await?);
+            for (id, created, read_rev, mine) in written {
                 let now = back.remove(&id);
                 match landed(read_rev.as_deref(), now.as_ref(), &mine) {
                     Landed::Yes => {
-                        outcome.insert(id, Update::Landed(now.unwrap_or_default()));
+                        let payload = now.unwrap_or_default();
+                        outcome.insert(id, Update::Landed { payload, created });
                     }
                     Landed::No => pending.push(id),
                     Landed::Gone => {
@@ -306,8 +324,7 @@ impl QdrantClient {
         self.update_points(
             point_ids,
             Some(&["access_count", "access_timestamps"]),
-            PayloadWrite::Merge,
-            Batch::BestEffort,
+            Commit::Payload(PayloadWrite::Merge, Batch::BestEffort),
             |prev| {
                 let count = prev
                     .get("access_count")
@@ -464,8 +481,26 @@ enum PayloadWrite {
     Replace,
 }
 
-/// How `update_points` treats a point absent from its first read.
-#[derive(Clone, Copy, PartialEq)]
+/// How `update_points` commits the write it built for a point.
+#[derive(Clone, Copy)]
+enum Commit<'a> {
+    /// A payload write filtered by `has_id` + the revision read. It cannot
+    /// create a point, so an absent one is not written: absent from the first
+    /// read it is `Absent` (and `Batch` decides the rest), from a later one
+    /// `Deleted`.
+    Payload(PayloadWrite, Batch),
+    /// Upsert the point with `vector`: `update_only` with an `update_filter`
+    /// on the revision read for a present point (the write `modify` built),
+    /// `insert_only` of `insert` whenever a read finds it absent. For
+    /// `store`, one point at a time.
+    Upsert {
+        vector: &'a [f32],
+        insert: &'a Value,
+    },
+}
+
+/// How a payload write treats a point absent from its first read.
+#[derive(Clone, Copy)]
 enum Batch {
     /// Every point must exist, or nothing is written (the present ones come
     /// back `Skipped`). For writes that name the memories they change — a
@@ -477,13 +512,14 @@ enum Batch {
 
 /// What `update_points` did to one point.
 enum Update {
-    /// The write landed; the payload as read back.
-    Landed(Value),
+    /// The write landed: the payload as read back (the revision keys alone
+    /// for an upsert), and whether it inserted the point.
+    Landed { payload: Value, created: bool },
     /// `modify` chose not to write.
     Skipped,
-    /// No such point when first read.
+    /// No such point when first read (a payload write only).
     Absent,
-    /// Present when first read, deleted before the write was confirmed.
+    /// Deleted before the write was confirmed.
     Deleted,
     /// Not applied, or applied but unconfirmable; the reason.
     Unconfirmed(String),
@@ -959,66 +995,60 @@ impl VectorStorage for QdrantClient {
             .as_ref()
             .ok_or_else(|| AlayaError::Validation("memory has no embedding".into()))?;
 
+        let fresh = memory_to_payload(memory);
+
         let _write = self.write_lock.lock().await;
 
-        for _ in 0..MAX_WRITE_ATTEMPTS {
-            // Qdrant upsert replaces the payload wholesale and the point id is
-            // derived from content_hash, so the existing point's
-            // server-maintained fields must be carried over or a re-store
-            // silently zeroes them (alaya#86). Existence is judged on the raw
-            // point: a payload that no longer parses as a Memory still exists
-            // and must not be overwritten as new. Fail closed: a retrieve error
-            // propagates rather than falling through to a write.
-            let existing = self.retrieve_point(&point_id).await?;
-            if existing.is_some() && mode == StoreMode::InsertOnly {
-                return Ok((false, hash.clone()));
+        // New content is insert-only: losing the insert race to another
+        // process leaves its point untouched and the next round re-stores
+        // over it. A re-store is update-only and conditional on the revision
+        // its carry-over read, so a supersession, access increment or delete
+        // that landed in between rejects it instead of being rolled back, and
+        // it rebuilds from a fresh read. Existence is judged on the raw point:
+        // a payload that no longer parses as a Memory still exists and must
+        // not be overwritten as new. Fail closed: a retrieve error propagates
+        // rather than falling through to a write.
+        let mut outcome = self
+            .update_points(
+                std::slice::from_ref(&point_id),
+                None,
+                Commit::Upsert {
+                    vector: embedding,
+                    insert: &fresh,
+                },
+                |prev| {
+                    if mode == StoreMode::InsertOnly {
+                        return Ok(None);
+                    }
+                    // Qdrant upsert replaces the payload wholesale and the
+                    // point id is derived from content_hash, so the existing
+                    // point's server-maintained fields must be carried over or
+                    // a re-store silently zeroes them (alaya#86).
+                    let mut payload = fresh.clone();
+                    carry_over(&mut payload, prev);
+                    Ok(Some(payload))
+                },
+            )
+            .await?;
+        match outcome.remove(&point_id) {
+            Some(Update::Landed { created, .. }) => Ok((created, hash.clone())),
+            // Insert-only onto an existing point: nothing written.
+            Some(Update::Skipped) => Ok((false, hash.clone())),
+            // Deleted after our write or before it: either way nothing of
+            // this store survives, and retrying could resurrect a memory
+            // deleted after our write had landed. Say so.
+            Some(Update::Deleted) => Err(AlayaError::Conflict(format!(
+                "memory {hash} was deleted while it was being stored; store it again to keep it"
+            ))),
+            Some(Update::Unconfirmed(why)) => {
+                Err(AlayaError::Storage(format!("store of {hash}: {why}")))
             }
-            let prev = existing
-                .as_ref()
-                .map(|p| p.get("payload").unwrap_or(&Value::Null));
-            let mut payload = memory_to_payload(memory);
-            if let Some(prev) = prev {
-                carry_over(&mut payload, prev);
-            }
-            let read_rev = prev.and_then(rev_of).map(str::to_owned);
-            let mine = self.stamp(&mut payload, prev);
-
-            // New content is insert-only: losing the insert race to another
-            // process leaves its point untouched and the next round re-stores
-            // over it. A re-store is update-only and conditional on the
-            // revision its carry-over read, so a supersession, access
-            // increment or delete that landed in between rejects it instead
-            // of being rolled back, and it rebuilds from a fresh read.
-            let condition = existing
-                .as_ref()
-                .map(|_| rev_condition(read_rev.as_deref()));
-            self.upsert_point(&point_id, embedding, &payload, condition)
-                .await?;
-
-            let back = self
-                .retrieve(std::slice::from_ref(&point_id), Some(&[REV, REV_LOG]))
-                .await?;
-            let now = back
-                .first()
-                .map(|p| p.get("payload").unwrap_or(&Value::Null));
-            match landed(read_rev.as_deref(), now, &mine) {
-                Landed::Yes => return Ok((existing.is_none(), hash.clone())),
-                Landed::No => continue,
-                // Deleted after our write or before it: either way nothing of
-                // this store survives, and retrying could resurrect a memory
-                // deleted after our write had landed. Say so.
-                Landed::Gone => {
-                    return Err(AlayaError::Conflict(format!(
-                        "memory {hash} was deleted while it was being stored; store it again \
-                         to keep it"
-                    )));
-                }
-                Landed::Unknown => return Err(AlayaError::Storage(unconfirmed(&mine))),
-            }
+            // An upsert inserts an absent point, so neither can happen; fail
+            // closed rather than report a store that did not run.
+            Some(Update::Absent) | None => Err(AlayaError::Storage(format!(
+                "store of {hash} returned no outcome; not stored"
+            ))),
         }
-        Err(AlayaError::Storage(format!(
-            "store of {hash} lost {MAX_WRITE_ATTEMPTS} write races in a row; not stored"
-        )))
     }
 
     async fn get_by_hash(&self, content_hash: &str) -> Result<Option<Memory>> {
@@ -1109,8 +1139,7 @@ impl VectorStorage for QdrantClient {
             .update_points(
                 &point_ids,
                 Some(&["metadata"]),
-                PayloadWrite::Merge,
-                Batch::Strict,
+                Commit::Payload(PayloadWrite::Merge, Batch::Strict),
                 |prev| {
                     let mut write = Value::Object(top.clone());
                     if let Some(ref sb) = updates.superseded_by {
@@ -1137,7 +1166,7 @@ impl VectorStorage for QdrantClient {
 
         for (hash, id) in content_hashes.iter().zip(&point_ids) {
             match outcome.get(id) {
-                Some(Update::Landed(_) | Update::Skipped) => {}
+                Some(Update::Landed { .. } | Update::Skipped) => {}
                 // Gone mid-update: a deleted memory needs no marker, and the
                 // rest of the batch has committed, so its caller must go on.
                 Some(Update::Deleted) => {
@@ -1175,8 +1204,7 @@ impl VectorStorage for QdrantClient {
             .update_points(
                 std::slice::from_ref(&point_id),
                 None,
-                PayloadWrite::Replace,
-                Batch::Strict,
+                Commit::Payload(PayloadWrite::Replace, Batch::Strict),
                 |prev| {
                     if parse_payload(prev).is_none() {
                         return Err(not_found());
@@ -1186,7 +1214,7 @@ impl VectorStorage for QdrantClient {
             )
             .await?;
         match outcome.remove(&point_id) {
-            Some(Update::Landed(payload)) => parse_payload(&payload).ok_or_else(|| {
+            Some(Update::Landed { payload, .. }) => parse_payload(&payload).ok_or_else(|| {
                 AlayaError::Storage(format!("patched memory {content_hash} no longer parses"))
             }),
             Some(Update::Unconfirmed(why)) => Err(AlayaError::Storage(format!(
@@ -1220,8 +1248,7 @@ impl VectorStorage for QdrantClient {
             .update_points(
                 std::slice::from_ref(&point_id),
                 None,
-                PayloadWrite::Replace,
-                Batch::Strict,
+                Commit::Payload(PayloadWrite::Replace, Batch::Strict),
                 |prev| {
                     let Some(existing) = parse_payload(prev) else {
                         return Err(not_found());
@@ -1234,7 +1261,7 @@ impl VectorStorage for QdrantClient {
             )
             .await?;
         match outcome.remove(&point_id) {
-            Some(Update::Landed(_)) => Ok(true),
+            Some(Update::Landed { .. }) => Ok(true),
             Some(Update::Skipped) => Ok(false),
             Some(Update::Unconfirmed(why)) => Err(AlayaError::Storage(format!(
                 "generated summary for {content_hash}: {why}"
