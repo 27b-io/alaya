@@ -80,18 +80,9 @@ pub fn init_tracing() {
             ))
             .build();
 
-        // The BatchSpanProcessor runs on a dedicated OS thread and calls
-        // futures_executor::block_on() — not a tokio runtime. reqwest's async
-        // client panics without a tokio reactor. Use reqwest::blocking::Client
-        // which works on any thread.
-        let blocking_client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("failed to build blocking reqwest client");
-
         let exporter = match SpanExporter::builder()
             .with_http()
-            .with_http_client(blocking_client)
+            .with_http_client(otlp_http_client())
             .build()
         {
             Ok(e) => e,
@@ -205,6 +196,19 @@ fn checked_otlp_endpoint(
     };
     crate::check_credential_transport(var, endpoint, has_credential, crate::Transport::Http)?;
     Ok(endpoint.to_string())
+}
+
+/// The exporter's HTTP client. The BatchSpanProcessor runs on a dedicated OS
+/// thread and calls futures_executor::block_on() — not a tokio runtime.
+/// reqwest's async client panics without a tokio reactor, so this is
+/// reqwest::blocking::Client, which works on any thread. No proxy: it dials
+/// the endpoint `checked_otlp_endpoint` certified, never an env proxy.
+pub(crate) fn otlp_http_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("failed to build blocking reqwest client")
 }
 
 /// Flush buffered OTLP spans and shut down the tracer provider.
