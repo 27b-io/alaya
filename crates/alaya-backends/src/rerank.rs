@@ -10,6 +10,14 @@ use alaya_types::{AlayaError, Result};
 
 use crate::RerankingService;
 
+/// TEI `/rerank`-backed [`RerankingService`].
+///
+/// On native, `rerank()` sets no client-side timer and is unbounded on its
+/// own — see the call-site comment there for why a second timer would steal
+/// the wrong log line on a late poll. Every call MUST be wrapped by the
+/// caller in `tokio::time::timeout(self.timeout(), …)`; see
+/// [`RerankingService::timeout`] for the budget. wasm32 has no tokio timer
+/// and bounds its own transport instead.
 pub struct RerankClient {
     client: Client,
     base_url: String,
@@ -43,15 +51,20 @@ impl RerankClient {
         // at or below the budget fires in the same tick as the call-site
         // tokio timer on a blackholed connect and steals its log line, and
         // the call-site timer bounds the connect phase anyway.
-        let client = Client::builder()
-            .default_headers(headers)
-            .build()
-            .map_err(|e| {
-                AlayaError::Config(format!(
-                    "rerank HTTP client: {}",
-                    crate::redact_reqwest_error(e)
-                ))
-            })?;
+        let builder = Client::builder().default_headers(headers);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let builder = builder
+            // Dial the host the boot guard classified, never an env proxy
+            // (see `check_credential_transport` in alaya-server).
+            .no_proxy();
+
+        let client = builder.build().map_err(|e| {
+            AlayaError::Config(format!(
+                "rerank HTTP client: {}",
+                crate::redact_reqwest_error(e)
+            ))
+        })?;
 
         Ok(Self {
             client,

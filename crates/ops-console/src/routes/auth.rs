@@ -71,6 +71,21 @@ pub async fn callback(
     if login.state != cb_state {
         return Err(AppError::Forbidden("state mismatch".into()));
     }
+    // Before the exchange, not after it: a second callback on this state —
+    // a scripted caller resending the original `Cookie:` header ignores the
+    // deletion below — is refused without an outbound call to the IdP.
+    if !state.consume_login(&login.state, login.exp) {
+        // Never log the state itself. A replay and a flow that expired in
+        // flight both land here, so neither line may claim a replay; `exp`
+        // against the record's timestamp is what tells the two apart.
+        tracing::warn!(
+            exp = login.exp,
+            "oidc: login state spent or expired — callback refused"
+        );
+        return Err(AppError::BadRequest(
+            "login flow already used or expired — start again".into(),
+        ));
+    }
 
     let claims = state
         .oidc

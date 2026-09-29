@@ -147,11 +147,13 @@ impl Config {
         // wrong one there is a silent downgrade, so it is one column to read
         // rather than seven call sites.
         //
-        // Credential-bearing but not in `Config`, so not covered here: the
-        // cachekit.io SaaS cache URL (its own builder is HTTPS-only and
-        // host-allowlisted) and `OTEL_EXPORTER_OTLP_ENDPOINT`, which
-        // `opentelemetry-otlp` reads directly along with the bearer token in
-        // `OTEL_EXPORTER_OTLP_HEADERS`.
+        // Credential-bearing but not in `Config`, so not covered by this
+        // table: the cachekit.io SaaS cache URL (its own builder is HTTPS-only
+        // and host-allowlisted). The OTLP endpoint vars are not in `Config`
+        // either — `opentelemetry-otlp` reads them, and the bearer token in
+        // `OTEL_EXPORTER_OTLP_HEADERS`, straight from the environment — so
+        // `telemetry::init_tracing` calls the function below directly, at that
+        // read, rather than adding a row here (LAB-4313).
         for (var, url, has_credential, transport) in [
             (
                 "SUMMARY_URL",
@@ -180,16 +182,19 @@ impl Config {
             (
                 "GRAPH_URL",
                 Some(cfg.graph_url.as_str()),
-                // HealthChecker puts QDRANT_API_KEY in the shared client's
-                // default_headers; check_graph overrides only when graph_api_key
-                // is non-empty, so the Qdrant key leaks to graph probes.
-                !cfg.graph_api_key.is_empty() || cfg.qdrant_api_key.is_some(),
+                // The Qdrant key is never sent here: `GraphHttpClient` takes
+                // only `GRAPH_API_KEY`, and the `HealthChecker` probe is
+                // pinned by `qdrant_key_reaches_only_qdrant`.
+                !cfg.graph_api_key.is_empty(),
                 Transport::Http,
             ),
             (
-                // `false` holds only because the worker passes `None` to
-                // `EmbeddingClient::new`, leaving userinfo as the only
-                // credential this can carry. Mirrored at that call site.
+                // `false` holds only because neither sender attaches a
+                // credential: the worker passes `None` to
+                // `EmbeddingClient::new`, and `HealthChecker::check_embedding`
+                // sends no bearer — leaving userinfo as the only credential
+                // this can carry. Mirrored at both call sites; the
+                // `HealthChecker` one is pinned by `qdrant_key_reaches_only_qdrant`.
                 "EMBEDDING_URL",
                 Some(cfg.embedding_url.as_str()),
                 false,
@@ -369,6 +374,16 @@ enum Transport {
 /// scheme, real host), so the check and the transport cannot disagree about
 /// where the credential goes. Messages name the host, never the raw value: a
 /// URL may carry credentials.
+///
+/// What it certifies is the URL's host, not the network path. That is the
+/// peer dialled only because every `Http` client it guards is built with
+/// `.no_proxy()` (pinned by `clients_ignore_system_proxy`). Left on, reqwest's
+/// default would hand a plaintext request to whatever `HTTP_PROXY` or
+/// `ALL_PROXY` names, absolute-form and with the credential on it, and a
+/// conventional `NO_PROXY=.svc,.cluster.local` does not exempt a single-label
+/// host like `anthropic-lb`. A client added behind this guard must set it too.
+/// It does not promise the host is who it claims to be over plain `http`: that
+/// is what the cluster-local rule accepts.
 fn check_credential_transport(
     var: &str,
     url: &str,
@@ -438,9 +453,13 @@ const L2_BASE_RETRY_MS: u64 = 500;
 async fn init_l2_redis(
     url: &str,
 ) -> std::result::Result<cachekit::CacheKit, Box<dyn std::error::Error>> {
-    let redis = cachekit::backend::redis::RedisBackend::builder()
-        .url(url)
-        .build()?;
+    // Built through `CacheKit::production` because it is the only public way
+    // to get fred's reconnect policy (`auto_reconnect()` is crate-private).
+    // Without it a connection lost to a Redis restart is never redialled and
+    // every L2 op times out until this process restarts. The preset's TTL and
+    // L1 are overridden in `build_l2_client`; its retry/breaker stack needs
+    // cachekit's `reliability` feature, which this workspace leaves off.
+    //
     // Retry connection with backoff — at pod startup the CNI/kube-proxy may
     // not have finished installing network rules yet, causing ECONNREFUSED.
     // Each attempt is deadline-bounded: cachekit sets no fred connect
@@ -448,15 +467,19 @@ async fn init_l2_redis(
     // thread before its command loop ever starts (#63).
     let mut last_err: Option<String> = None;
     for attempt in 0..L2_MAX_ATTEMPTS {
-        let connected = tokio::time::timeout(std::time::Duration::from_secs(10), redis.connect());
+        let connected = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            cachekit::CacheKit::production(url),
+        );
         let err_msg = match connected.await {
-            Ok(Ok(handle)) => {
-                drop(handle);
+            Ok(Ok(builder)) => {
                 if attempt > 0 {
                     tracing::info!(attempt, "L2 cache connected after retry");
                 }
-                return Ok(cached_embedding::build_l2_client(std::rc::Rc::new(redis))?);
+                return Ok(cached_embedding::build_l2_client(builder)?);
             }
+            // A bad URL will not fix itself: fail now, as before the retries.
+            Ok(Err(e @ cachekit::CachekitError::Config(_))) => return Err(e.into()),
             Ok(Err(e)) => e.to_string(),
             Err(_) => "connect timed out after 10s".to_string(),
         };
@@ -485,9 +508,9 @@ fn init_l2_saas() -> std::result::Result<cachekit::CacheKit, Box<dyn std::error:
         builder = builder.api_url(url);
     }
     let backend = builder.build()?;
-    Ok(cached_embedding::build_l2_client(std::rc::Rc::new(
-        backend,
-    ))?)
+    Ok(cached_embedding::build_l2_client(
+        cachekit::CacheKit::builder().backend(std::rc::Rc::new(backend)),
+    )?)
 }
 
 /// Env var treated as unset when blank, returned trimmed — k8s manifests
@@ -552,6 +575,41 @@ async fn init_l2_cache() -> Option<cachekit::CacheKit> {
         Err(e) => {
             tracing::warn!(backend = %backend, "L2 cache init failed, running L1-only: {e}");
             None
+        }
+    }
+}
+
+/// Refuse to run against a Qdrant that cannot make writes conditional
+/// (alaya#130): below 1.17 `update_mode` is silently ignored, so an insert-only
+/// write overwrites and an update-only write resurrects. Retries while Qdrant is
+/// unreachable (cluster cold start, as `ensure_qdrant_collection`), then panics —
+/// `supervise` turns that into exit 101 — on a version that is too old or
+/// unreadable, or when Qdrant never answers: without a verified version no write
+/// can be trusted to be conditional. Under a rolling update the old pods keep
+/// serving while the new one crash-loops.
+async fn require_conditional_writes(qdrant: &QdrantClient) {
+    for attempt in 0..L2_MAX_ATTEMPTS {
+        match qdrant.check_server_version().await {
+            Ok(version) => {
+                tracing::info!(%version, "Qdrant supports conditional writes");
+                return;
+            }
+            Err(e @ alaya_types::AlayaError::Config(_)) => panic!("refusing to start: {e}"),
+            Err(e) if attempt + 1 == L2_MAX_ATTEMPTS => panic!(
+                "refusing to start: could not read the Qdrant version after \
+                 {L2_MAX_ATTEMPTS} attempts: {e}"
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    error = %e,
+                    "Qdrant version check failed, retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    L2_BASE_RETRY_MS * (1 << attempt),
+                ))
+                .await;
+            }
         }
     }
 }
@@ -852,7 +910,9 @@ impl ServiceHandle {
 struct HealthChecker {
     client: reqwest::Client,
     qdrant_url: String,
+    qdrant_api_key: Option<String>,
     collection: String,
+    embedding_url: String,
     graph_url: String,
     graph_api_key: String,
     worker_progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -868,24 +928,16 @@ struct HealthChecker {
 
 impl HealthChecker {
     fn new(config: &Config, worker_progress: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
-        let mut headers = reqwest::header::HeaderMap::new();
-        if let Some(ref key) = config.qdrant_api_key
-            && let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
-        {
-            headers.insert(reqwest::header::AUTHORIZATION, val);
-        }
-
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("failed to build health check client");
-
+        // One client, three backends: each credential is attached per
+        // request (`bearer_auth`), never as a client default header, so
+        // Qdrant's bearer is not sent to the embedding endpoint or the bridge.
+        // Pinned by `qdrant_key_reaches_only_qdrant`.
         Self {
-            client,
+            client: Self::client(),
             qdrant_url: config.qdrant_url.clone(),
+            qdrant_api_key: config.qdrant_api_key.clone(),
             collection: config.qdrant_collection.clone(),
+            embedding_url: config.embedding_url.clone(),
             graph_url: config.graph_url.clone(),
             graph_api_key: config.graph_api_key.clone(),
             worker_progress,
@@ -893,6 +945,20 @@ impl HealthChecker {
             clock: monotonic_secs,
             qdrant_ok: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Split from `new` so the no-proxy posture can be pinned without a
+    /// whole `Config` (`clients_ignore_system_proxy`). No default headers:
+    /// see `new` for why every credential is per request.
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder()
+            // Dial the host `check_credential_transport` classified, never an
+            // env proxy.
+            .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("failed to build health check client")
     }
 
     fn worker_state(&self) -> (&'static str, bool, u64) {
@@ -968,6 +1034,7 @@ impl HealthChecker {
                 "service worker stalled — reporting unhealthy so the pod gets restarted"
             );
         } else {
+            // `check_detail` may still downgrade this to `degraded` (embedding).
             tracing::debug!(op = "health", elapsed_ms = elapsed, status, "ok (direct)");
         }
 
@@ -995,13 +1062,19 @@ impl HealthChecker {
         })
     }
 
+    fn qdrant_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.qdrant_api_key {
+            Some(key) => req.bearer_auth(key),
+            None => req,
+        }
+    }
+
     async fn check_qdrant(&self) -> Result<Value, String> {
         let resp = self
-            .client
-            .get(format!(
+            .qdrant_auth(self.client.get(format!(
                 "{}/collections/{}",
                 self.qdrant_url, self.collection
-            ))
+            )))
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -1047,11 +1120,10 @@ impl HealthChecker {
 
     async fn check_count(&self) -> Result<usize, String> {
         let resp = self
-            .client
-            .post(format!(
+            .qdrant_auth(self.client.post(format!(
                 "{}/collections/{}/points/count",
                 self.qdrant_url, self.collection
-            ))
+            )))
             .json(&json!({}))
             .send()
             .await
@@ -1062,6 +1134,42 @@ impl HealthChecker {
             .pointer("/result/count")
             .and_then(|n| n.as_u64())
             .unwrap_or(0) as usize)
+    }
+
+    /// TEI / vLLM readiness endpoint — 200 once the model is loaded. The
+    /// same probe `EmbeddingClient::health` makes on the worker side; this
+    /// copy exists because the checker bypasses the worker (see struct doc).
+    /// No credential: `EMBEDDING_URL` is guarded at boot with
+    /// `has_credential: false` — sending a key here means updating that row.
+    async fn check_embedding(&self) -> Result<Value, String> {
+        let resp = self
+            .client
+            .get(format!("{}/health", self.embedding_url))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !resp.status().is_success() {
+            return Err(format!("embedding returned {}", resp.status()));
+        }
+        Ok(json!({ "status": "healthy" }))
+    }
+
+    /// Operator view: the full document plus the embedding probe (LAB-4025).
+    /// The bare probe does no backend I/O; the embedding probe runs only on
+    /// this authenticated detail path (#78). A dead endpoint degrades
+    /// `status` but never overrides `unhealthy`: that word is the
+    /// worker-stall 503 contract (#63), and a restart does not fix TEI.
+    async fn check_detail(&self) -> Value {
+        let (mut v, embedding) = tokio::join!(self.check(), self.check_embedding());
+        if embedding.is_err() && v["status"] == "healthy" {
+            v["status"] = json!("degraded");
+        }
+        v["embedding_health"] = match embedding {
+            Ok(e) => e,
+            Err(e) => json!({ "status": "unhealthy", "error": e }),
+        };
+        v
     }
 }
 
@@ -1125,7 +1233,12 @@ async fn service_worker(
     // LAB-3283: one cap on in-flight judge calls shared by store-path spawns
     // and the backfill (a bulk import must not fan thousands of calls at the
     // LB), and a single-flight guard so an operator retry after the reply
-    // deadline cannot run a second pass over the same unjudged pairs.
+    // deadline cannot run a second pass over the same unjudged pairs. All
+    // three are per process (alaya#130): with N replicas, N passes and N times
+    // the daily cap are possible. That costs judge spend, never data — a
+    // verdict annotates an edge and a pair judged twice is last-writer-wins —
+    // so it is documented (JUDGE_DAILY_CAP, POST /backfill/contradictions)
+    // rather than coordinated across processes.
     let judge_gate = std::rc::Rc::new(tokio::sync::Semaphore::new(JUDGE_CONCURRENCY));
     let backfill_running = std::rc::Rc::new(std::cell::Cell::new(false));
     let judge_limiter = std::rc::Rc::new(std::cell::RefCell::new(JudgeDailyCap::new(
@@ -1781,7 +1894,8 @@ fn utc_date_str(epoch_secs: u64) -> String {
 /// contradicted pair without limit. Separate knobs on purpose: raising the
 /// day's budget for a bulk import must not raise the number of live tasks by
 /// the same factor. A pair refused by either bound stays unjudged for operator
-/// backfill, which is subject to neither.
+/// backfill, which is subject to neither. Both bounds are per process: N
+/// replicas can spend N × `cap` a day (see the worker's note on alaya#130).
 struct JudgeDailyCap {
     cap: usize,
     current_day: u64,
@@ -2371,6 +2485,7 @@ fn main() {
 
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
+                require_conditional_writes(&qdrant).await;
                 // Fresh-deploy bootstrap: create the memory collection if it is
                 // absent so the first write doesn't 404 (#31).
                 ensure_qdrant_collection(&qdrant, cfg_clone.embedding_dimensions).await;
@@ -2608,7 +2723,7 @@ async fn health(
 async fn health_detail(
     axum::extract::State(checker): axum::extract::State<HealthChecker>,
 ) -> (StatusCode, Json<Value>) {
-    let v = checker.check().await;
+    let v = checker.check_detail().await;
     (health_code(&v), Json(v))
 }
 
@@ -3205,6 +3320,10 @@ mod tests {
         assert_eq!(non_empty_trimmed(Some("".into())), None);
         assert_eq!(non_empty_trimmed(Some("   ".into())), None);
         assert_eq!(non_empty_trimmed(Some("\t\n ".into())), None);
+        // Unicode White_Space, not ASCII: a regression to `trim_ascii` would
+        // leave YAML/copy-paste NBSP and ideographic padding reading as
+        // configured. One case, because it is the one that would then fail.
+        assert_eq!(non_empty_trimmed(Some("  \u{00a0}\u{3000} ".into())), None);
         // Trimmed, not merely accepted — the value reaching a client is clean.
         assert_eq!(
             non_empty_trimmed(Some("  https://api.anthropic.com  ".into())),
@@ -3901,6 +4020,152 @@ mod tests {
         assert!(redis("REDIS_CACHE_URL", "https://redis-svc:6379", false).is_ok());
     }
 
+    /// Every client that dials a URL `check_credential_transport` approved
+    /// must ignore `HTTP_PROXY` and friends, or the certified host is not the
+    /// peer (LAB-4695). reqwest reads the proxy env at `build()`, and
+    /// `set_var` races this binary, so the probe runs in a child that inherits
+    /// the vars. Each client dials a refused loopback port; a trap listener
+    /// named as the proxy counts connections, so any client that went through
+    /// a proxy is named in the child's failure.
+    #[test]
+    fn clients_ignore_system_proxy() {
+        use alaya_backends::{EmbeddingProvider, GraphService, RerankingService};
+        use alaya_backends::{SummaryProvider, VectorStorage};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        const CHILD: &str = "ALAYA_PROXY_TEST_CHILD";
+        const TARGET: &str = "http://127.0.0.1:1";
+        const PROBED: &str = "proxy probe complete";
+        if std::env::var_os(CHILD).is_none() {
+            let trap = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let proxy = format!("http://{}", trap.local_addr().unwrap());
+            drop(trap); // the child binds it again; only the port is needed
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "tests::clients_ignore_system_proxy",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, &proxy)
+                .env("HTTP_PROXY", &proxy)
+                .env("HTTPS_PROXY", &proxy)
+                .env("ALL_PROXY", &proxy)
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy")
+                // A set REQUEST_METHOD makes reqwest ignore HTTP_PROXY (CGI).
+                .env_remove("REQUEST_METHOD")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // libtest exits 0 when `--exact` matches nothing, so success alone
+            // passes a renamed or moved test with no client probed.
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains(PROBED),
+                "child never reached the end of the probe"
+            );
+            return;
+        }
+
+        let proxy = std::env::var(CHILD).unwrap();
+        let trap = std::net::TcpListener::bind(proxy.trim_start_matches("http://")).unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            for stream in trap.incoming() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream); // the client sees a reset and returns
+            }
+        });
+
+        let mut leaked: Vec<&str> = Vec::new();
+        let mut probe = |name: &'static str, dialled: &mut dyn FnMut()| {
+            let before = hits.load(Ordering::SeqCst);
+            dialled();
+            if hits.load(Ordering::SeqCst) != before {
+                leaked.push(name);
+            }
+        };
+
+        // Blocking client: must not run inside a tokio context.
+        probe("otlp", &mut || {
+            let _ = telemetry::otlp_http_client().get(TARGET).send();
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Control: a default reqwest client must reach the trap, or the
+        // harness proves nothing (wrong var names, CGI mode, exemption).
+        // Clients are built inside `block_on` too: reqwest's builder needs a
+        // reactor.
+        probe("control (default reqwest client)", &mut || {
+            rt.block_on(async {
+                let _ = reqwest::Client::new().get(TARGET).send().await;
+            });
+        });
+        probe("health checker", &mut || {
+            rt.block_on(async {
+                let _ = HealthChecker::client().get(TARGET).send().await;
+            });
+        });
+        probe("qdrant", &mut || {
+            rt.block_on(async {
+                let c = QdrantClient::new(TARGET.into(), "m".into(), Some("k".into())).unwrap();
+                let _ = c.count().await;
+            });
+        });
+        probe("graph", &mut || {
+            rt.block_on(async {
+                let _ = GraphHttpClient::new(TARGET.into(), "k")
+                    .unwrap()
+                    .get_stats()
+                    .await;
+            });
+        });
+        probe("embedding", &mut || {
+            rt.block_on(async {
+                let c = EmbeddingClient::new(TARGET.into(), "m".into(), 4, 1, Some("k".into()));
+                let _ = c
+                    .embed_batch(&["x"], alaya_types::search::PromptName::Query)
+                    .await;
+            });
+        });
+        // Summary and judge share the one Messages transport builder.
+        probe("anthropic transport", &mut || {
+            rt.block_on(async {
+                let c = SummaryClient::new(TARGET.into(), "m".into(), Some("k".into())).unwrap();
+                let _ = c.summarize("x").await;
+            });
+        });
+        probe("rerank", &mut || {
+            rt.block_on(async {
+                let c =
+                    RerankClient::new(TARGET.into(), 1, Some("k".into()), Duration::from_secs(5))
+                        .unwrap();
+                let _ = c.rerank("q", &["x"]).await;
+            });
+        });
+
+        let control = "control (default reqwest client)";
+        assert!(
+            leaked.contains(&control),
+            "harness broken: a default client did not use the env proxy"
+        );
+        leaked.retain(|n| *n != control);
+        assert!(
+            leaked.is_empty(),
+            "dialled through the env proxy: {leaked:?}"
+        );
+        println!("{PROBED}");
+    }
+
     #[test]
     fn host_of_strips_port_and_unwraps_ipv6_brackets() {
         assert_eq!(host_of("https://id.27b.io"), Some("id.27b.io".into()));
@@ -3978,6 +4243,101 @@ mod tests {
         assert!(!is_private_host("https://alaya.27b.io"));
         assert!(!is_private_host("https://example.com"));
     }
+    // ─── L2 Redis reconnect (LAB-5792) ────────────────────────────────────
+
+    /// A throwaway `redis-server` on a fixed port, killed on drop.
+    struct RedisServer(std::process::Child);
+
+    impl RedisServer {
+        async fn start(port: u16) -> Self {
+            let child = std::process::Command::new("redis-server")
+                .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
+                .args(["--save", "", "--appendonly", "no"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("redis-server must be on PATH for this test");
+            let server = Self(child);
+            for _ in 0..100 {
+                if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .is_ok()
+                {
+                    return server;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("redis-server did not accept connections on port {port} within 5s");
+        }
+    }
+
+    impl Drop for RedisServer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A malformed URL is a config error: it must fail on the first attempt,
+    /// not spend the connect-retry backoff (~7.5s) on something no retry fixes.
+    #[tokio::test]
+    async fn l2_init_fails_fast_on_a_malformed_url() {
+        let started = std::time::Instant::now();
+        let err = init_l2_redis("not a redis url").await.err().unwrap();
+        assert!(err.to_string().contains("configuration error"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(400));
+    }
+
+    /// The L2 client must serve again once its Redis server comes back —
+    /// without a reconnect policy fred never redials a lost connection, and
+    /// every L2 op after a server restart fails until the process restarts.
+    ///
+    /// Needs `redis-server` on PATH (CI has none), hence ignored. Run with:
+    /// `cargo test -p alaya-server l2_serves_again_after_redis_restart -- --ignored`
+    #[tokio::test]
+    #[ignore = "needs redis-server on PATH"]
+    async fn l2_serves_again_after_redis_restart() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let op = std::time::Duration::from_secs(3);
+
+        let server = RedisServer::start(port).await;
+        let l2 = init_l2_redis(&format!("redis://127.0.0.1:{port}"))
+            .await
+            .expect("L2 connects to a live server");
+        tokio::time::timeout(op, l2.set("k", &1u32))
+            .await
+            .expect("set before restart timed out")
+            .expect("set before restart failed");
+
+        drop(server);
+        let _server = RedisServer::start(port).await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let err = match tokio::time::timeout(op, l2.set("k", &2u32)).await {
+                Ok(Ok(())) => break,
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => "timed out".to_string(),
+            };
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "L2 never served again after the Redis restart; last error: {err}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        let got: Option<u32> = tokio::time::timeout(op, l2.get("k"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            got,
+            Some(2),
+            "read-back after reconnect must hit the new server"
+        );
+    }
 }
 
 /// Regression tests for #63: one stuck backend await must never wedge the
@@ -4003,7 +4363,8 @@ mod wedge_tests {
 
     use super::*;
     use alaya_backends::traits::{
-        ConsolidationService, EmbeddingProvider, GraphService, HebbianService, VectorStorage,
+        ConsolidationService, EmbeddingProvider, GraphService, HebbianService, StoreMode,
+        VectorStorage,
     };
     use alaya_types::memory::ScoredMemory;
 
@@ -4031,13 +4392,10 @@ mod wedge_tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for HangVectors {
-        async fn store(&self, _memory: &Memory) -> Result<(bool, String)> {
+        async fn store(&self, _memory: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             unimplemented!()
         }
         async fn get_by_hash(&self, _content_hash: &str) -> Result<Option<Memory>> {
-            unimplemented!()
-        }
-        async fn exists(&self, _content_hash: &str) -> Result<bool> {
             unimplemented!()
         }
         async fn set_generated_summary(
@@ -4138,6 +4496,13 @@ mod wedge_tests {
         }
         fn model_name(&self) -> &str {
             "stub"
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            Ok(HealthStatus {
+                status: "healthy".into(),
+                backend: "stub".into(),
+                details: None,
+            })
         }
     }
 
@@ -4379,7 +4744,9 @@ mod wedge_tests {
                 .unwrap(),
             // Port 1 refuses immediately — models an unreachable backend.
             qdrant_url: "http://127.0.0.1:1".into(),
+            qdrant_api_key: None,
             collection: "test".into(),
+            embedding_url: "http://127.0.0.1:1".into(),
             graph_url: "http://127.0.0.1:1".into(),
             graph_api_key: String::new(),
             worker_progress: Arc::new(AtomicU64::new(progress_s)),
@@ -4604,10 +4971,147 @@ mod wedge_tests {
         // The detail view keeps that; the bare probe's exact-key-set
         // assertion above is what proves it never reaches an anonymous caller.
         assert!(body["vector_health"]["error"].is_string());
+        // LAB-4025: the embedding probe rides the same authenticated surface.
+        assert_eq!(body["embedding_health"]["status"], "unhealthy");
+        assert!(body["embedding_health"]["error"].is_string());
         // Build identity (#70) rides the authenticated surface now.
         assert!(body.get("version").is_some());
         assert!(body.get("git_sha").is_some());
         assert!(body.get("built_at").is_some());
+    }
+
+    /// LAB-4025: Qdrant and the bridge up, embedding endpoint down. The
+    /// operator view degrades and names the probe. A stalled worker still
+    /// wins: `unhealthy` is the 503 signal and TEI is not fixed by a restart.
+    /// The bare route is guarded by `unauthenticated_health_exposes_only_status`
+    /// and `check_status_preserves_tri_state_and_carries_only_status`.
+    #[tokio::test]
+    async fn embedding_outage_degrades_detail() {
+        // Loopback stand-in for Qdrant *and* the bridge; TEI stays at port 1.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route(
+                "/collections/test",
+                get(|| async {
+                    Json(json!({ "result": { "status": "green", "points_count": 7 } }))
+                }),
+            )
+            .route(
+                "/collections/test/points/count",
+                post(|| async { Json(json!({ "result": { "count": 7 } })) }),
+            )
+            .route(
+                "/health",
+                get(|| async { Json(json!({ "status": "healthy" })) }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let checker = HealthChecker {
+            qdrant_url: backend_url.clone(),
+            graph_url: backend_url,
+            ..test_checker(TEST_NOW)
+        };
+
+        let detail = checker.check_detail().await;
+        assert_eq!(detail["status"], "degraded");
+        assert_eq!(detail["embedding_health"]["status"], "unhealthy");
+        assert!(detail["embedding_health"]["error"].is_string());
+        assert_eq!(detail["vector_health"]["status"], "green");
+        assert_eq!(detail["total_memories"], 7);
+
+        let stalled = HealthChecker {
+            worker_progress: Arc::new(AtomicU64::new(TEST_NOW - 3600)),
+            ..checker
+        };
+        assert_eq!(stalled.check_detail().await["status"], "unhealthy");
+    }
+
+    /// The Qdrant key reaches Qdrant and nothing else. Built through
+    /// `HealthChecker::new` because the production constructor is where a
+    /// client-wide default header would be set; `test_checker` builds its own
+    /// client and could not see one. reqwest fills default headers into vacant
+    /// entries only, so with `GRAPH_API_KEY` empty — as here — a default
+    /// Qdrant bearer would ride every graph probe. The boot guard's
+    /// `GRAPH_URL` and `EMBEDDING_URL` rows rely on this.
+    #[tokio::test]
+    async fn qdrant_key_reaches_only_qdrant() {
+        const QDRANT_KEY: &str = "qdrant-secret";
+        // One loopback listener for all three backends; a path prefix per
+        // backend tells the graph and embedding `/health` probes apart.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        // Every request is kept, so a clean request cannot mask a leaking one
+        // to the same path.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let app = Router::new().fallback(move |req: Request| {
+            let auth = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+            // Qdrant also accepts its key as `api-key`, so any header counts.
+            let carries_key = req
+                .headers()
+                .values()
+                .any(|v| String::from_utf8_lossy(v.as_bytes()).contains(QDRANT_KEY));
+            log.lock()
+                .unwrap()
+                .push((req.uri().path().to_owned(), auth, carries_key));
+            std::future::ready(Json(json!({})))
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // Only the URL, key and `qdrant_collection` fields reach
+        // `HealthChecker::new`.
+        let config = Config {
+            qdrant_url: format!("{base}/qdrant"),
+            qdrant_collection: "test".into(),
+            qdrant_api_key: Some(QDRANT_KEY.into()),
+            embedding_url: format!("{base}/embedding"),
+            embedding_model: String::new(),
+            embedding_dimensions: 0,
+            embedding_batch_size: 0,
+            graph_url: format!("{base}/graph"),
+            graph_api_key: String::new(),
+            listen_addr: String::new(),
+            api_key: String::new(),
+            readonly_api_key: String::new(),
+            oidc_issuer: None,
+            public_base_url: String::new(),
+            allow_unauthenticated: false,
+            summary_url: None,
+            summary_api_key: None,
+            summary_model: String::new(),
+            judge_url: None,
+            judge_api_key: None,
+            judge_model: String::new(),
+            judge_daily_cap: 0,
+            rerank_url: None,
+            rerank_api_key: None,
+            rerank_top_n: 0,
+            rerank_timeout_ms: std::num::NonZeroU64::MIN,
+        };
+        // `check_detail` fans out to all four probes.
+        HealthChecker::new(&config, Arc::new(AtomicU64::new(0)))
+            .check_detail()
+            .await;
+
+        let bearer = Some(format!("Bearer {QDRANT_KEY}"));
+        // Exactly one request per probe, sorted by path.
+        let expected = vec![
+            ("/embedding/health".to_owned(), None, false),
+            ("/graph/health".to_owned(), None, false),
+            ("/qdrant/collections/test".to_owned(), bearer.clone(), true),
+            (
+                "/qdrant/collections/test/points/count".to_owned(),
+                bearer,
+                true,
+            ),
+        ];
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(seen, expected);
     }
 
     /// The #63 contract is the HTTP code, not the body: a wedged worker must

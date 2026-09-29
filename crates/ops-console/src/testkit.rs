@@ -73,3 +73,43 @@ pub(crate) fn mint_id_token(sub: &str, email: Option<&str>, name: Option<&str>) 
     )
     .expect("mint id_token")
 }
+
+/// A loopback IdP that serves discovery and a token endpoint which refuses
+/// every code (`invalid_grant`), counting the token requests it receives.
+/// Returns the issuer to put in `Config::oidc_issuer`; `same_origin_https`
+/// admits its `http` endpoints because the issuer is a loopback origin.
+pub(crate) async fn mock_idp() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use axum::routing::{get, post};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock IdP");
+    let issuer = format!("http://{}", listener.local_addr().unwrap());
+    let discovery = serde_json::json!({
+        "issuer": issuer,
+        "authorization_endpoint": format!("{issuer}/authorize"),
+        "token_endpoint": format!("{issuer}/token"),
+        "jwks_uri": format!("{issuer}/jwks"),
+    });
+    let token_calls = Arc::new(AtomicUsize::new(0));
+    let counter = token_calls.clone();
+    let idp = axum::Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            get(move || std::future::ready(axum::Json(discovery.clone()))),
+        )
+        .route(
+            "/token",
+            post(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::future::ready((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    r#"{"error":"invalid_grant"}"#,
+                ))
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
+    (issuer, token_calls)
+}

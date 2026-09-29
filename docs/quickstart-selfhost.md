@@ -118,11 +118,11 @@ Every knob lives in `.env`. The interesting ones:
 | `REDIS_CACHE_URL` | `redis://falkordb:6379` | L2 embedding cache. Reuses falkordb's Redis layer by default. |
 | `RERANK_URL` | empty | Set to `http://tei-rerank:80` to enable rerank (requires `--profile rerank`). |
 | `RERANK_TOP_N` | `20` | How many top RRF candidates to re-score. |
-| `RERANK_TIMEOUT_MS` | `5000` | Budget per rerank call. Past it the search falls back to RRF order and logs `rerank timed out`; raise it for a CPU reranker. |
+| `RERANK_TIMEOUT_MS` | `5000` | Budget per rerank call. Past it the search falls back to RRF order and logs `rerank timed out` (or `rerank failed` with `elapsed_ms >= budget_ms`, if a transport error lands in the same late poll); raise it for a CPU reranker. |
 | `OIDC_ISSUER` | empty | Set to your IdP's issuer URL to enable OAuth Resource Server mode. See [MCP quickstart → OAuth](./quickstart-mcp.md#oauth-optional). |
 | `SUMMARY_URL` | empty | Anthropic API origin (`https://api.anthropic.com`, no path — the client appends `/v1/messages`). Set + provide `SUMMARY_API_KEY` to auto-generate one-line summaries. Plain `http://` is accepted only for a cluster-local proxy; anything else is refused at boot. |
 | `JUDGE_URL` / `JUDGE_API_KEY` / `JUDGE_MODEL` | the `SUMMARY_*` values | Contradiction judge: annotates every flagged `CONTRADICTS` pair with an advisory verdict (`contradiction` / `supersession` / `coexist` / `unrelated`). Each falls back to its `SUMMARY_*` counterpart, so setting `SUMMARY_URL` enables both. |
-| `JUDGE_DAILY_CAP` | `1000` | Max contradiction pairs to judge per UTC day from the store path — a spend budget only, not a concurrency limit. When exhausted, new pairs fail closed to `unjudged` (drained later by operator backfill); one WARN is logged per UTC day, and a pair that never reached the judge (fetch failure, unreachable endpoint, 429) is refunded rather than billed. In-process counter resets at UTC midnight and on process restart. |
+| `JUDGE_DAILY_CAP` | `1000` | Max contradiction pairs to judge per UTC day from the store path — a spend budget only, not a concurrency limit. When exhausted, new pairs fail closed to `unjudged` (drained later by operator backfill); one WARN is logged per UTC day, and a pair that never reached the judge (fetch failure, unreachable endpoint, 429) is refunded rather than billed. In-process counter, one per `alaya-server` process: N replicas can spend N × the cap, so set it to the daily budget divided by the replica count. Resets at UTC midnight and on process restart. |
 
 The complete list — including the bridge-side variables — lives in `CLAUDE.md` under "Environment Variables".
 
@@ -148,7 +148,8 @@ Migrations: none for the Rust server itself, but if you change `EMBEDDING_MODEL`
 If you'd rather run native binaries:
 
 ```bash
-# 1. Bring up the three external backends however you like — falkordb, qdrant, tei.
+# 1. Bring up the three external backends however you like — falkordb, qdrant (1.17 or
+#    newer: alaya-server refuses an older one), tei.
 
 # 2. Point at them and run:
 export REDIS_URL=redis://localhost:6379

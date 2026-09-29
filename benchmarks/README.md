@@ -190,10 +190,12 @@ docker compose logs alaya | grep -cE "rerank failed|rerank timed out"   # must b
 
 **Why verification is not optional.** Rerank runs only if the *server* has
 `RERANK_URL` set; the harness cannot read the server's environment. A rerank
-*failure* logs `rerank failed (non-fatal); using RRF order`, a call past
-`RERANK_TIMEOUT_MS` logs `rerank timed out (non-fatal); using RRF order`, and
-both silently fall back to RRF — so a misconfigured or too-slow "ON" arm can
-look identical to OFF. And rerank
+*failure* logs `rerank failed (non-fatal); using RRF order`, and a call past
+`RERANK_TIMEOUT_MS` normally logs `rerank timed out (non-fatal); using RRF
+order` — though if a transport error lands in the same late poll as the
+expired timer, it logs `rerank failed` instead (with `elapsed_ms >=
+budget_ms`). Both silently fall back to RRF — so a misconfigured or too-slow
+"ON" arm can look identical to OFF. And rerank
 *success* is **silent** in alaya's logs (only failures warn), so the authoritative
 proof it executed is the reranker TEI's own request counter:
 
@@ -244,7 +246,7 @@ docker compose down -v
 | `--out` | timestamped | Output JSONL (`*_summary.json` written alongside). |
 | server `RERANK_URL` | unset | Set on the **server** to enable the cross-encoder reranker; verify in logs. |
 | server `RERANK_TOP_N` | `20` | How many RRF candidates the cross-encoder re-scores. |
-| server `RERANK_TIMEOUT_MS` | `5000` | Budget per rerank call (ms). Past it the query falls back to RRF and logs `rerank timed out` — the validity gate above must count zero. |
+| server `RERANK_TIMEOUT_MS` | `5000` | Budget per rerank call (ms). Past it the query falls back to RRF and logs `rerank timed out` (or `rerank failed` with `elapsed_ms >= budget_ms`, if a transport error lands in the same late poll) — the validity gate above must count zero. |
 
 ---
 

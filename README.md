@@ -139,7 +139,7 @@ Copy `.env.example` to `.env`. All settings have sensible defaults for local dev
 
 | Variable | Default | Description |
 |:---------|:--------|:------------|
-| `QDRANT_URL` | — (required) | Qdrant HTTP endpoint |
+| `QDRANT_URL` | — (required) | Qdrant HTTP endpoint. Qdrant **1.17 or newer**, **single node** (`replication_factor` 1): every memory write is conditional (`update_mode`, `update_filter`), and the server refuses to start against an older Qdrant, which would silently ignore the condition. Replicated collections are not supported: with default write ordering each replica evaluates the condition on its own |
 | `QDRANT_COLLECTION` | `memories_arctic1024` | Vector collection name |
 | `QDRANT_API_KEY` | — | Optional Qdrant auth |
 | `EMBEDDING_URL` | — (required) | OpenAI-compatible embeddings endpoint |
@@ -157,7 +157,7 @@ Copy `.env.example` to `.env`. All settings have sensible defaults for local dev
 | `JUDGE_URL` | `SUMMARY_URL` | Contradiction judge API origin, same format as `SUMMARY_URL` (optional). Falls back to `SUMMARY_URL`; unset both to disable the judge |
 | `JUDGE_API_KEY` | `SUMMARY_API_KEY` | Falls back to `SUMMARY_API_KEY` |
 | `JUDGE_MODEL` | `claude-sonnet-5` | Model that judges `CONTRADICTS` pairs (advisory verdicts on the edge; never writes memories). Not inherited from `SUMMARY_MODEL`: Haiku misses the judge's precision bar on the golden set |
-| `JUDGE_DAILY_CAP` | `1000` | Max contradiction pairs to judge per UTC day from the store path — a spend budget only, not a concurrency limit. When exhausted, new pairs fail closed to `unjudged` (drained later by operator backfill); one WARN is logged per UTC day, and a pair that never reached the judge (fetch failure, unreachable endpoint, 429) is refunded rather than billed. In-process counter resets at UTC midnight and on process restart |
+| `JUDGE_DAILY_CAP` | `1000` | Max contradiction pairs to judge per UTC day from the store path — a spend budget only, not a concurrency limit. When exhausted, new pairs fail closed to `unjudged` (drained later by operator backfill); one WARN is logged per UTC day, and a pair that never reached the judge (fetch failure, unreachable endpoint, 429) is refunded rather than billed. In-process counter, one per `alaya-server` process: N replicas can spend N × the cap, so set it to the daily budget divided by the replica count. Resets at UTC midnight and on process restart |
 | `RERANK_URL` | — | TEI `/rerank` endpoint (empty = rerank disabled) |
 | `RERANK_API_KEY` | — | Optional bearer token for `RERANK_URL`. With it set, plain `http://` to a host that is not cluster-local is refused at boot, as for `SUMMARY_URL` |
 | `RERANK_TOP_N` | `20` | How many top RRF candidates to rerank |

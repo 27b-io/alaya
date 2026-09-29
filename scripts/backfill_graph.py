@@ -5,7 +5,10 @@ Scrolls all memories in Qdrant, creates a graph node for each via the
 alaya-bridge /nodes/ensure endpoint, then rebuilds SUPERSEDES edges
 from qdrant metadata.superseded_by fields.
 
-Idempotent — safe to re-run. MERGE semantics on both nodes and edges.
+Idempotent — safe to re-run. MERGE semantics on both nodes and edges. It is
+also the repair for a supersession whose outcome alaya-server could not read
+back: the Qdrant marker is the durable record, and this rebuilds the missing
+SUPERSEDES edge from it.
 
 Usage:
     kubectl -n mcp port-forward svc/qdrant 6333:6333 &
@@ -15,6 +18,7 @@ Usage:
 Environment:
     QDRANT_URL      (default: http://localhost:6333)
     BRIDGE_URL      (default: http://localhost:3000)
+    GRAPH_API_KEY   (bridge bearer; required unless the bridge runs unauthenticated)
     COLLECTION      (default: memories_arctic1024)
     CONCURRENCY     (default: 20)
     BATCH_SIZE      (default: 250)
@@ -33,6 +37,8 @@ from qdrant_client import QdrantClient
 
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 BRIDGE_URL = os.environ.get("BRIDGE_URL", "http://localhost:3000")
+GRAPH_API_KEY = os.environ.get("GRAPH_API_KEY", "")
+BRIDGE_HEADERS = {"Authorization": f"Bearer {GRAPH_API_KEY}"} if GRAPH_API_KEY else {}
 COLLECTION = os.environ.get("COLLECTION", "memories_arctic1024")
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "20"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "250"))
@@ -74,7 +80,9 @@ async def ensure_node(
             else:
                 stats.nodes_failed += 1
                 if stats.nodes_failed <= 5:
-                    print(f"  WARN node {content_hash[:16]}...: {r.status_code} {r.text[:100]}")
+                    print(
+                        f"  WARN node {content_hash[:16]}...: {r.status_code} {r.text[:100]}"
+                    )
         except Exception as e:
             stats.nodes_failed += 1
             if stats.nodes_failed <= 5:
@@ -108,7 +116,9 @@ async def create_supersedes_edge(
             else:
                 stats.edges_failed += 1
                 if stats.edges_failed <= 5:
-                    print(f"  WARN edge {source[:12]}→{target[:12]}: {r.status_code} {r.text[:100]}")
+                    print(
+                        f"  WARN edge {source[:12]}→{target[:12]}: {r.status_code} {r.text[:100]}"
+                    )
         except Exception as e:
             stats.edges_failed += 1
             if stats.edges_failed <= 5:
@@ -167,19 +177,20 @@ async def run() -> None:
     print(f"\nPhase 2: Creating graph nodes ({stats.scrolled} total)...")
     t0 = time.monotonic()
 
-    async with httpx.AsyncClient(base_url=BRIDGE_URL, timeout=10.0) as client:
+    async with httpx.AsyncClient(
+        base_url=BRIDGE_URL, headers=BRIDGE_HEADERS, timeout=10.0
+    ) as client:
         for batch_start in range(0, len(memories), BATCH_SIZE):
             batch = memories[batch_start : batch_start + BATCH_SIZE]
-            tasks = [
-                ensure_node(client, sem, h, ts, stats)
-                for h, ts, _ in batch
-            ]
+            tasks = [ensure_node(client, sem, h, ts, stats) for h, ts, _ in batch]
             await asyncio.gather(*tasks)
 
             done = min(batch_start + BATCH_SIZE, len(memories))
             elapsed = time.monotonic() - t0
             rate = done / elapsed if elapsed > 0 else 0
-            print(f"  {done}/{stats.scrolled} ({rate:.0f}/s) — created={stats.nodes_created} existed={stats.nodes_existed} failed={stats.nodes_failed}")
+            print(
+                f"  {done}/{stats.scrolled} ({rate:.0f}/s) — created={stats.nodes_created} existed={stats.nodes_existed} failed={stats.nodes_failed}"
+            )
 
     node_elapsed = time.monotonic() - t0
     print(f"  Done in {node_elapsed:.1f}s")
@@ -187,23 +198,33 @@ async def run() -> None:
     # --- Phase 3: Collect and create SUPERSEDES edges ---
     for content_hash, created_at, metadata in memories:
         superseded_by = metadata.get("superseded_by")
-        if superseded_by and isinstance(superseded_by, str) and len(superseded_by) == 64:
+        if (
+            superseded_by
+            and isinstance(superseded_by, str)
+            and len(superseded_by) == 64
+        ):
             # SUPERSEDES direction: new → old (source=superseder, target=superseded)
-            stats.supersede_pairs.append({
-                "source": superseded_by,
-                "target": content_hash,
-                "created_at": created_at,
-            })
+            stats.supersede_pairs.append(
+                {
+                    "source": superseded_by,
+                    "target": content_hash,
+                    "created_at": created_at,
+                }
+            )
 
     if stats.supersede_pairs:
         print(f"\nPhase 3: Creating {len(stats.supersede_pairs)} SUPERSEDES edges...")
         t1 = time.monotonic()
 
-        async with httpx.AsyncClient(base_url=BRIDGE_URL, timeout=10.0) as client:
+        async with httpx.AsyncClient(
+            base_url=BRIDGE_URL, headers=BRIDGE_HEADERS, timeout=10.0
+        ) as client:
             for batch_start in range(0, len(stats.supersede_pairs), BATCH_SIZE):
                 batch = stats.supersede_pairs[batch_start : batch_start + BATCH_SIZE]
                 tasks = [
-                    create_supersedes_edge(client, sem, e["source"], e["target"], e["created_at"], stats)
+                    create_supersedes_edge(
+                        client, sem, e["source"], e["target"], e["created_at"], stats
+                    )
                     for e in batch
                 ]
                 await asyncio.gather(*tasks)
