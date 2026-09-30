@@ -5,6 +5,13 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use leptos::prelude::*;
 
+use crate::routes::clip;
+
+/// Ceiling on an upstream's JSON `error` field on a page. Needed because the
+/// field is upstream text bounded only by the body cap, and it renders on an
+/// operator's error page.
+const MAX_SHOWN_ERROR_CHARS: usize = 160;
+
 pub enum AppError {
     /// Not logged in — bounce to login (GET only; POSTs get 403 instead).
     LoginRedirect,
@@ -97,16 +104,12 @@ impl AppError {
     }
 
     /// Non-2xx from a named upstream. Only the `error` field of a JSON error
-    /// body is surfaced, bounded; an arbitrary body (a proxy's HTML page, a
-    /// stack trace) never reaches a page.
+    /// body is surfaced, clipped and marked; an arbitrary body (a proxy's
+    /// HTML page, a stack trace) never reaches a page.
     pub fn non_success(what: &str, status: StatusCode, body: &str) -> Self {
         let detail: String = serde_json::from_str::<serde_json::Value>(body)
             .ok()
-            .and_then(|v| {
-                v.get("error")?
-                    .as_str()
-                    .map(|s| s.chars().take(160).collect())
-            })
+            .and_then(|v| Some(clip(v.get("error")?.as_str()?, MAX_SHOWN_ERROR_CHARS)))
             .unwrap_or_else(|| "unrecognized error body".to_string());
         AppError::Upstream(format!("{what} {status}: {detail}"))
     }
@@ -125,9 +128,17 @@ mod tests {
         let e = AppError::non_success("lb", status, "<html><body>nginx 502</body></html>");
         assert_eq!(e.detail(), "lb 401 Unauthorized: unrecognized error body");
         let long = format!(r#"{{"error":"{}"}}"#, "x".repeat(500));
+        let clipped = format!(
+            "lb 401 Unauthorized: {}…",
+            "x".repeat(MAX_SHOWN_ERROR_CHARS)
+        );
+        assert_eq!(AppError::non_success("lb", status, &long).detail(), clipped);
+        // Exactly at the cap is not a cut, so it is not marked.
+        let at_cap = "x".repeat(MAX_SHOWN_ERROR_CHARS);
+        let body = format!(r#"{{"error":"{at_cap}"}}"#);
         assert_eq!(
-            AppError::non_success("lb", status, &long).detail().len(),
-            "lb 401 Unauthorized: ".len() + 160
+            AppError::non_success("lb", status, &body).detail(),
+            format!("lb 401 Unauthorized: {at_cap}")
         );
     }
 }

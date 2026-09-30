@@ -72,6 +72,21 @@ pub fn short_hash(hash: &str) -> String {
     hash.chars().take(12).collect()
 }
 
+/// `s` clipped to `max` chars, with `'…'` appended when anything was cut.
+///
+/// Marked, because an unmarked cut renders as a complete-looking wrong value.
+/// By chars, because a byte split can land mid-codepoint and panic. The cut
+/// is detected by bytes: `out` is a char-prefix of `s`, so it is shorter in
+/// bytes exactly when it is shorter in chars, and counting chars would walk
+/// an input bounded only by the 8 MiB body cap a second time.
+pub fn clip(s: &str, max: usize) -> String {
+    let mut out: String = s.chars().take(max).collect();
+    if out.len() < s.len() {
+        out.push('…');
+    }
+    out
+}
+
 /// Epoch seconds → `YYYY-MM-DD HH:MM` UTC for display. Missing/zero
 /// timestamps render as "—", never as a fictitious 1970 date.
 pub fn fmt_epoch(secs: f64) -> String {
@@ -92,6 +107,16 @@ pub fn fmt_epoch(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clip_marks_only_what_it_cut() {
+        assert_eq!(clip("abc", 3), "abc");
+        assert_eq!(clip("abcd", 3), "abc…");
+        // At the cap in 4-byte codepoints: a byte-length test against `max`
+        // would false-clip this, and a byte slice would panic on it.
+        let wide = "🔒".repeat(3);
+        assert_eq!(clip(&wide, 3), wide);
+    }
 
     #[test]
     fn safe_next_rejects_offsite() {
