@@ -62,6 +62,8 @@ noise() {
   entry '[{"type":"text","text":"Base directory for this skill: /s\n\nSKILL-BODY-TEXT"}]' '{"isMeta":true}'
   entry '[{"type":"text","text":"[Request interrupted by user]"}]'
   entry '[{"type":"text","text":"[Request interrupted by user for tool use]"}]'
+  # a subagent's task prompt: the parent agent wrote it, not the user
+  entry '[{"type":"text","text":"SIDECHAIN-TASK-TEXT"}]' '{"isSidechain":true}'
   # the tool input matches the hook's '"type":"user"' grep; only its .type check keeps this out of the count
   jq -cn '{type:"assistant", message:{role:"assistant", content:[
     {type:"tool_use", id:"t2", name:"x", input:{type:"user"}}, {type:"text", text:"assistant closing words"}]}}'
@@ -69,7 +71,8 @@ noise() {
 
 # terminal session: prompts are strings
 {
-  for n in one two three four five; do entry "\"string prompt $n\""; done
+  for n in one two three four; do entry "\"string prompt $n\""; done
+  entry '"[Request interrupted? no, string prompt five]"' # typed; only looks like a marker
   entry "\"$REMINDER\""
   noise
 } > "$T/string.jsonl"
@@ -78,7 +81,8 @@ for n in one two three four five; do has "string: prompt $n extracted" "string p
 lacks "string: <system-reminder> body dropped" "REMINDER-BODY-TEXT"
 lacks "string: tool result dropped"           "TOOL-RESULT-TEXT"
 lacks "string: isMeta skill body dropped"     "SKILL-BODY-TEXT"
-lacks "string: interrupt marker dropped"      "[Request interrupted"
+lacks "string: interrupt marker dropped"      "[Request interrupted by user"
+lacks "string: sidechain task prompt dropped" "SIDECHAIN-TASK-TEXT"
 has   "string: last assistant text kept"      "assistant closing words"
 total "string: 5 message lines counted" 5
 
@@ -93,17 +97,19 @@ for n in one two three four five; do has "blocks: prompt $n extracted" "block pr
 lacks "blocks: <system-reminder> block dropped" "REMINDER-BODY-TEXT"
 lacks "blocks: tool result dropped"             "TOOL-RESULT-TEXT"
 lacks "blocks: isMeta skill body dropped"       "SKILL-BODY-TEXT"
-lacks "blocks: interrupt marker dropped"        "[Request interrupted"
+lacks "blocks: interrupt marker dropped"        "[Request interrupted by user"
+lacks "blocks: sidechain task prompt dropped"   "SIDECHAIN-TASK-TEXT"
 total "blocks: 5 message lines counted" 5
 
-# optional replay of a real transcript: must reach the extractor with a non-zero count.
+# optional replay of a real transcript: a smoke test that it reaches the extractor with a
+# non-zero count. It cannot know which lines are real prompts; the fixtures above prove that.
 # Save gates off, so a short or still-running session measures extraction, not eligibility.
 if [[ -n "${1:-}" ]]; then
   run_hook "$1" ALAYA_MIN_DURATION_SECS=0 ALAYA_MIN_NEW_MESSAGES=1
   got=$(cat "$T/cap/total" 2>/dev/null)
-  if [[ "${got:-0}" -gt 0 ]]; then echo "ok    replay: $got message lines extracted from $(basename "$1")"
+  if [[ "${got:-0}" -gt 0 ]]; then echo "smoke replay: $got message lines reached the extractor from $(basename "$1") (count only)"
   else echo "FAIL  replay: nothing extracted from $1"; RC=1; fi
 fi
 
-[[ $RC -eq 0 ]] && echo "ALL PASS: string and block-list prompts extracted; tool results, isMeta injections, interrupt markers and <wrapper> bodies excluded"
+[[ $RC -eq 0 ]] && echo "ALL PASS: string and block-list prompts extracted; tool results, isMeta and sidechain entries, interrupt markers and <wrapper> bodies excluded"
 exit $RC

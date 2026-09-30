@@ -90,15 +90,18 @@ BRANCH=$(git branch --show-current 2>/dev/null || echo "n/a")
 # sessions — read the text of both; tool results carry no text blocks. Reading
 # only strings made every SDK-driven run save nothing. The grep is only a fast
 # prefilter: an assistant tool input can contain "type":"user" too, so jq checks
-# the entry type. isMeta entries are harness injections (skill bodies up to
-# ~850 KB, image-size notes), not typed prompts, and so are the
-# "[Request interrupted by user...]" markers. A message or block starting with <
-# is a wrapper (<system-reminder>, <command-name>, <task-notification>): drop it
-# whole, since a line filter leaks the body of a multi-line wrapper.
+# the entry type. Not typed prompts either: isMeta entries (harness injections:
+# skill bodies up to ~850 KB, image-size notes), isSidechain entries (a
+# subagent's task, written by the parent agent) and the two interrupt markers.
+# A message or block starting with < is a wrapper (<system-reminder>,
+# <command-name>, <task-notification>): drop it whole, since a line filter
+# leaks the body of a multi-line wrapper. A typed prompt that starts with < is
+# lost too, on purpose: a list of known wrapper tags would leak every new one.
 grep '"type":"user"' "$TRANSCRIPT" \
-    | jq -r 'select(.type == "user" and .isMeta != true) | .message.content
+    | jq -r 'select(.type == "user" and .isMeta != true and .isSidechain != true) | .message.content
         | if type == "string" then . else (.[]? | select(.type? == "text") | .text) end
-        | strings | select((startswith("<") or startswith("[Request interrupted")) | not)' 2>/dev/null \
+        | strings | select(startswith("<") | not)
+        | select(. != "[Request interrupted by user]" and . != "[Request interrupted by user for tool use]")' 2>/dev/null \
     > "$_HOOKDIR/all_messages.txt" || true
 
 TOTAL=$(wc -l < "$_HOOKDIR/all_messages.txt" 2>/dev/null || echo 0)
