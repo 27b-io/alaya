@@ -268,7 +268,7 @@ impl OidcRp {
                 // An outage still, not a refusal: no id_token exists yet.
                 Cause::Cooldown => self.warn_idp_failure(
                     op,
-                    "an earlier fetch failed; not retried until the cooldown expires",
+                    "an earlier discovery failed or was refused; not retried until the cooldown expires",
                 ),
                 Cause::Parse(shape) => self.warn_idp_parse_failure(op, shape),
             },
