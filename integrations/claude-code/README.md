@@ -120,6 +120,16 @@ cold fetch calls the resolver once, a warm cache calls it zero times, the cache 
 most once per 15 minutes (with or without a stale cache, and never leaves an empty cache file),
 and the hook script still parses.
 
+```bash
+scripts/test-prompt-extraction.sh [transcript.jsonl]
+```
+
+Runs the real Stop hook against a stub `curl` and proves what reaches the extractor: prompts are
+read whether they are strings (terminal sessions) or lists of text blocks (SDK and agent
+sessions), while tool results, `isMeta` injections such as skill bodies, and `<wrapper>` messages
+like `<system-reminder>` are left out. Pass a real transcript to also replay it and check that it
+extracts a non-zero message count.
+
 ## Troubleshooting
 
 - **No memories are showing up** — check `$ALAYA_HOOK_STATE_DIR/failures.log` (default
