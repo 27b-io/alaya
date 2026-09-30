@@ -1,7 +1,8 @@
 //! OIDC Relying Party — authorization-code flow with PKCE (S256) against
 //! id.27b.io.
 //!
-//! Discovery, same-origin/HTTPS enforcement, the JWKS cache + cooldown, the
+//! Discovery, same-origin/HTTPS enforcement, the discovery and JWKS caches
+//! with their fetch cooldowns, the
 //! capped discovery/JWKS body reads and the whole ID-token verify pipeline
 //! live in `alaya-oidc` (shared with alaya-server's resource-side verifier).
 //! This module keeps what only a relying party decides:
@@ -264,12 +265,17 @@ impl OidcRp {
                 Cause::TooLarge => self.warn_idp_failure(op, "response body exceeded the cap"),
                 Cause::Document(value) => self.warn_idp_failure(op, value),
                 Cause::Missing => self.warn_idp_failure(op, "absent"),
+                // An outage still, not a refusal: no id_token exists yet.
+                Cause::Cooldown => self.warn_idp_failure(
+                    op,
+                    "an earlier fetch failed; not retried until the cooldown expires",
+                ),
                 Cause::Parse(shape) => self.warn_idp_parse_failure(op, shape),
             },
         }
     }
 
-    /// `(authorization_endpoint, token_endpoint)` from discovery. Fetched on
+    /// `(authorization_endpoint, token_endpoint)` from discovery. Read on
     /// every use, so a bad `token_endpoint` is refused when the login starts,
     /// before the user is ever redirected; the relying-party `Provider` has
     /// already required both and origin-checked them.
@@ -527,7 +533,8 @@ mod tests {
     /// the login before the user is redirected — and must not be cached, or
     /// one bad answer would lock every login out until the pod restarts. So
     /// this drives the real fetch path: a loopback IdP whose first document
-    /// is hostile and whose second is correct.
+    /// is hostile and whose second is correct. The refusal starts the
+    /// discovery cooldown, which the test expires rather than waits out.
     #[tokio::test]
     async fn a_cross_origin_rp_endpoint_is_refused_and_not_cached() {
         use std::sync::Arc;
@@ -568,6 +575,7 @@ mod tests {
         );
         let first = rp.authorize_url("S", "N", "V").await.unwrap_err();
         assert_eq!(first.to_string(), "token_endpoint not same-origin");
+        rp.provider.expire_discovery_cooldown();
         let second = rp
             .authorize_url("S", "N", "V")
             .await
@@ -575,6 +583,34 @@ mod tests {
         assert!(second.starts_with(&format!("{issuer}/authorize?")));
         assert_eq!(fetches.load(Ordering::SeqCst), 2);
         server.abort();
+    }
+
+    /// A login refused by the discovery cooldown is an IdP outage, logged on
+    /// the outage line like the failure that started it. It must never
+    /// claim an id_token was rejected: none exists before the redirect.
+    #[tokio::test]
+    async fn a_login_inside_the_discovery_cooldown_logs_an_outage() {
+        // Closed port: the first discovery fails and starts the cooldown.
+        let rp = OidcRp::new(
+            "http://127.0.0.1:1".into(),
+            "console".into(),
+            "secret".into(),
+            "https://console.test/auth/callback".into(),
+        );
+        let buf = LogBuf::default();
+        let second = {
+            let _capture = buf.capture();
+            assert!(rp.authorize_url("S", "N", "V").await.is_err());
+            rp.authorize_url("S", "N", "V").await.unwrap_err()
+        };
+        assert_eq!(second.to_string(), "discovery (cooldown)");
+        let logged = buf.text();
+        assert_eq!(
+            logged.matches("identity provider request failed").count(),
+            2,
+            "one outage line per refused login: {logged}"
+        );
+        assert!(!logged.contains("id_token rejected"), "{logged}");
     }
 
     // --- signed token -> session cookie, measured end to end -------------
