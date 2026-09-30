@@ -1,0 +1,17 @@
+# A reqwest client reads HTTP_PROXY / HTTPS_PROXY / ALL_PROXY at build() unless
+# told not to, which would route a request (and its credential) to the proxy
+# instead of the host the boot guards classified. Every production client is
+# built at a sanctioned site that calls `.no_proxy()` and carries
+# `#[allow(clippy::disallowed_methods)]`; `clients_ignore_system_proxy` in
+# alaya-server pins them. CI runs clippy without --all-targets, so test-only
+# clients are not affected.
+disallowed-methods = [
+    { path = "reqwest::Client::builder", reason = "build clients at a sanctioned site that sets .no_proxy()" },
+    { path = "reqwest::Client::new", reason = "build clients at a sanctioned site that sets .no_proxy()" },
+    { path = "reqwest::ClientBuilder::new", reason = "build clients at a sanctioned site that sets .no_proxy()" },
+    { path = "reqwest::blocking::Client::builder", reason = "build clients at a sanctioned site that sets .no_proxy()" },
+    { path = "reqwest::blocking::Client::new", reason = "build clients at a sanctioned site that sets .no_proxy()" },
+    { path = "reqwest::blocking::ClientBuilder::new", reason = "build clients at a sanctioned site that sets .no_proxy()" },
+    { path = "reqwest::get", reason = "builds a default client; use a sanctioned client that sets .no_proxy()" },
+    { path = "reqwest::blocking::get", reason = "builds a default client; use a sanctioned client that sets .no_proxy()" },
+]

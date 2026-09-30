@@ -61,6 +61,7 @@ impl QdrantClient {
             headers.insert(AUTHORIZATION, val);
         }
 
+        #[allow(clippy::disallowed_methods, reason = "sets .no_proxy() below")]
         let builder = reqwest::Client::builder().default_headers(headers);
 
         #[cfg(not(target_arch = "wasm32"))]

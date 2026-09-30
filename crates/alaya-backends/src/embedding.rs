@@ -50,6 +50,7 @@ impl EmbeddingClient {
             );
         }
 
+        #[allow(clippy::disallowed_methods, reason = "sets .no_proxy() below")]
         let builder = Client::builder().default_headers(headers);
 
         #[cfg(not(target_arch = "wasm32"))]

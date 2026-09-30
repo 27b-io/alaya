@@ -33,6 +33,7 @@ pub enum BodyError {
     TooLarge,
 }
 
+#[allow(clippy::disallowed_methods, reason = "sets .no_proxy()")]
 pub fn client(timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
         // Dial the host `validate_upstream_url` classified, never an env proxy.
