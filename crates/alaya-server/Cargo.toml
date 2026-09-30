@@ -11,6 +11,7 @@ path = "src/main.rs"
 alaya-types = { path = "../alaya-types" }
 alaya-backends = { path = "../alaya-backends" }
 alaya-core = { path = "../alaya-core" }
+alaya-oidc = { path = "../alaya-oidc" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -24,11 +25,6 @@ mini-moka = { workspace = true }
 cachekit-rs = { workspace = true }
 futures = { workspace = true }
 
-# Auth (native-only — must never reach WASM-targeted crates)
-# v10 made the crypto backend pluggable. aws_lc_rs (BoringSSL-derived, C)
-# instead of rust_crypto: keeps the vulnerable pure-Rust `rsa` crate
-# (RUSTSEC-2023-0071) out of the tree. Requires cmake in the build image.
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 subtle = { workspace = true }
 
 # OpenTelemetry (optional — enabled when OTEL_ENDPOINT is set)
@@ -38,6 +34,11 @@ opentelemetry-otlp = { version = "0.29", default-features = false, features = ["
 tracing-opentelemetry = "0.30"
 
 [dev-dependencies]
+# Pre-seed the JWKS cache so `oidc`, `auth` and `wellknown` tests verify real
+# signed tokens without a network. Dev-only by construction.
+alaya-oidc = { path = "../alaya-oidc", features = ["test-seams"] }
+# Token minting for testkit — verification itself lives in alaya-oidc.
+jsonwebtoken = { workspace = true }
 # test-util enables tokio's paused clock (start_paused) for the wedge
 # regression tests (#63) — deliberately dev-only.
 tokio = { workspace = true, features = ["test-util"] }

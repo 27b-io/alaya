@@ -8,6 +8,7 @@ name = "ops-console"
 path = "src/main.rs"
 
 [dependencies]
+alaya-oidc = { path = "../alaya-oidc" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -26,19 +27,19 @@ leptos = { version = "0.8", features = ["ssr"] }
 # `form` adds multi-value form support (serde_html_form) for checkbox groups.
 axum-extra = { version = "0.10", features = ["cookie-private", "form"] }
 
-# ID-token verification for the OIDC RP flow. Same version + crypto backend
-# as alaya-server (aws_lc_rs keeps RUSTSEC-2023-0071 `rsa` out of the tree).
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
-
 base64 = "0.22"
 rand = "0.9"
 url = "2"
 time = { version = "0.3", features = ["formatting"] }
 
 [dev-dependencies]
+# Pre-seed discovery so the authorize-URL test never touches the network.
+alaya-oidc = { path = "../alaya-oidc", features = ["test-seams"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # Mint encrypted session cookies in tests (same crate/version axum-extra uses).
 cookie = { version = "0.18", features = ["private"] }
+# Token minting for testkit — verification itself lives in alaya-oidc.
+jsonwebtoken = { workspace = true }
 # P-256 test signing key generated at runtime; already jsonwebtoken's backend.
 aws-lc-rs = "1"
