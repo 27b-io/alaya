@@ -273,7 +273,10 @@ fn validate_upstream_url(var: &str, url: &url::Url) -> Result<(), String> {
 ///
 /// The userinfo rule is what keeps a credential out of the logs — see
 /// `reject_userinfo` for why this URL is the loud half of it.
-fn validate_issuer(issuer: &str) -> Result<(), String> {
+///
+/// Returns the issuer to store: `canonical_issuer` of the parsed URL, never
+/// the raw string.
+fn validate_issuer(issuer: &str) -> Result<String, String> {
     if !issuer.starts_with("https://") {
         return Err("CONSOLE_OIDC_ISSUER must be https".into());
     }
@@ -283,7 +286,16 @@ fn validate_issuer(issuer: &str) -> Result<(), String> {
     reject_userinfo("CONSOLE_OIDC_ISSUER", &url)?;
     // Discovery concatenates the well-known path onto the issuer (`oidc.rs`).
     reject_query_or_fragment("CONSOLE_OIDC_ISSUER", &url)?;
-    Ok(())
+    Ok(canonical_issuer(&url))
+}
+
+/// The issuer in the form an IdP echoes it: the URL parser's (which
+/// lowercases an http(s) host), with `alaya_oidc`'s trailing-slash rule.
+/// Both issuer checks — the discovery echo and the id_token's `iss` —
+/// compare bytes against what `Config` stores, so a raw `https://ID.27B.IO`
+/// boots clean and then fails every login.
+pub(crate) fn canonical_issuer(url: &url::Url) -> String {
+    alaya_oidc::normalize_issuer(url.as_str()).to_string()
 }
 
 fn required(key: &str) -> Result<String, String> {
@@ -324,8 +336,7 @@ impl Config {
             .map_err(|e| format!("CONSOLE_PUBLIC_URL is not a valid URL: {e}"))?;
         validate_public_url(&public_url)?;
 
-        let oidc_issuer = required("CONSOLE_OIDC_ISSUER")?;
-        validate_issuer(&oidc_issuer)?;
+        let oidc_issuer = validate_issuer(&required("CONSOLE_OIDC_ISSUER")?)?;
 
         let allowed_subjects: Vec<String> = required("CONSOLE_ALLOWED_SUBJECTS")?
             .split(',')
@@ -440,6 +451,23 @@ mod tests {
         assert!(LbConfig::from_parts(Some("http://lb.example.com".into()), k(), on()).is_err());
         assert!(LbConfig::from_parts(Some("http://lb:8082".into()), k(), off()).is_err());
         assert!(LbConfig::from_parts(Some("http://lb:8082".into()), k(), on()).is_ok());
+    }
+
+    #[test]
+    fn issuer_is_stored_as_the_idp_echoes_it() {
+        let stored = |s: &str| validate_issuer(s).unwrap();
+        assert_eq!(stored("https://ID.27B.IO"), "https://id.27b.io");
+        assert_eq!(stored("https://id.test/"), "https://id.test");
+        assert_eq!(
+            stored("https://id.test/realms/ops"),
+            "https://id.test/realms/ops"
+        );
+        // Only the host folds: a path is case-sensitive, and so is the IdP's
+        // echo of it.
+        assert_eq!(
+            stored("https://ID.test/Realms/Ops"),
+            "https://id.test/Realms/Ops"
+        );
     }
 
     #[test]

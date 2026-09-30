@@ -56,12 +56,22 @@ struct IdTokenClaims {
 /// Sign an ES256 `id_token` that `verify_id_token` accepts: right issuer,
 /// right audience, five minutes of life, `kid` matching the seeded JWKS.
 pub(crate) fn mint_id_token(sub: &str, email: Option<&str>, name: Option<&str>) -> String {
+    mint_id_token_from(ISSUER, sub, email, name)
+}
+
+/// `mint_id_token`, as issued by `iss`.
+pub(crate) fn mint_id_token_from(
+    iss: &str,
+    sub: &str,
+    email: Option<&str>,
+    name: Option<&str>,
+) -> String {
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
     header.kid = Some(KID.into());
     jsonwebtoken::encode(
         &header,
         &IdTokenClaims {
-            iss: ISSUER.into(),
+            iss: iss.into(),
             aud: CLIENT_ID.into(),
             exp: crate::session::now_epoch() as u64 + 300,
             sub: sub.into(),

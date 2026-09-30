@@ -188,8 +188,10 @@ struct Jwks {
     keys: Vec<Jwk>,
 }
 
-/// Strip a single trailing slash for issuer comparison.
-fn normalize_issuer(s: &str) -> &str {
+/// Strip a single trailing slash for issuer comparison. Public so a consumer
+/// that stores a configured issuer applies this same rule on the way in,
+/// rather than keeping a second copy of it.
+pub fn normalize_issuer(s: &str) -> &str {
     s.strip_suffix('/').unwrap_or(s)
 }
 
