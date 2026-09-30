@@ -759,7 +759,7 @@ mod tests {
     /// lowercased, in discovery and in `iss`. Both checks compare bytes
     /// against the configured issuer, so the whole login runs here against
     /// a loopback IdP — `http`, because `validate_issuer` is https-only and
-    /// nothing in-process serves TLS, so `canonical_issuer` is called direct.
+    /// nothing in-process serves TLS, so `fold_host_case` is called direct.
     #[tokio::test]
     async fn a_mixed_case_issuer_completes_discovery_and_id_token_validation() {
         use crate::testkit;
@@ -797,9 +797,9 @@ mod tests {
             );
         tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
 
-        let typed: url::Url = format!("http://LOCALHOST:{port}/").parse().unwrap();
+        let typed = format!("http://LOCALHOST:{port}/");
         let rp = OidcRp::new(
-            crate::config::canonical_issuer(&typed),
+            crate::config::fold_host_case(&typed, &typed.parse().unwrap()),
             testkit::CLIENT_ID.into(),
             "secret".into(),
             "https://console.test/auth/callback".into(),
