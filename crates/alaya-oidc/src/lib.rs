@@ -49,11 +49,11 @@ const JWKS_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Minimum interval between discovery fetches per provider while no document
 /// is cached, so an unauthenticated login flood against a down IdP drives at
-/// most ~2 outbound fetches/min. Strictly shorter than [`JWKS_COOLDOWN`],
-/// with a second to spare: alaya-server reaches discovery only from a JWKS
-/// refetch, which arms that cooldown only once discovery has answered, so by
-/// the time the next refetch passes it the discovery this one ran has cooled
-/// down too.
+/// most ~2 outbound fetches/min. It alone holds a JWKS refetch while
+/// discovery keeps failing: [`JWKS_COOLDOWN`] arms only once discovery has
+/// returned a document, which then stays cached, so the two never apply to
+/// the same refetch. It stays strictly shorter all the same, as asserted
+/// below.
 const DISCOVERY_COOLDOWN: Duration = JWKS_COOLDOWN.saturating_sub(Duration::from_secs(1));
 const _: () = assert!(DISCOVERY_COOLDOWN.as_nanos() < JWKS_COOLDOWN.as_nanos());
 
@@ -279,9 +279,11 @@ pub struct Provider {
     /// kid -> JWK. Swapped wholesale on refetch, by the detached fetch it is
     /// shared with.
     keys: Arc<RwLock<HashMap<String, Jwk>>>,
-    /// Single-flight fetch gate; the inner `Instant` is the last fetch time
-    /// (cooldown). Holding the mutex serializes refetches across requests.
-    /// Shared so a detached refetch holds it to the end.
+    /// Single-flight fetch gate; the inner `Instant` is the last JWKS fetch
+    /// time (cooldown). Holding the mutex serializes refetches across
+    /// requests. The caller holds it through discovery, so a caller dropped
+    /// there releases it unarmed; the detached JWKS fetch then holds it, which
+    /// is why it is shared, until that fetch has cached or failed.
     fetch_gate: Arc<Mutex<Instant>>,
     /// Discovery's own single-flight gate and last fetch time. Not
     /// `fetch_gate`: `key_for_kid` holds that one into `discovery()`, and a
@@ -435,9 +437,7 @@ impl Provider {
     }
 
     /// Look up a key by `kid`; on a miss, single-flight refetch subject to the
-    /// per-provider cooldown. The refetch runs detached from its caller, so a
-    /// caller that goes away mid-fetch cannot leave the cooldown armed over a
-    /// fetch that never finished.
+    /// per-provider cooldown.
     async fn key_for_kid(&self, kid: &str) -> Result<Jwk, Error> {
         if let Some(jwk) = self.keys.read().await.get(kid).cloned() {
             return Ok(jwk);
@@ -458,12 +458,13 @@ impl Provider {
         // Discovery first, under this gate and before arming it (lock order:
         // this gate, then discovery's). Its fetch is detached too, so a caller
         // dropped here leaves that fetch running and this cooldown unarmed.
-        let discovery = self.discovery().await;
-        // Armed once discovery has answered, whatever it answered, so a
-        // failing or refused refetch extends the cooldown too — otherwise a
-        // bad provider becomes an unbounded outbound-fetch amplifier.
+        let jwks_uri = self.discovery().await?.jwks_uri;
+        // Armed only once discovery has returned a document, so this cooldown
+        // marks exactly the JWKS fetch it gates, failing or not. A failed or
+        // refused discovery is already held to one fetch per
+        // `DISCOVERY_COOLDOWN` by its own gate; arming here as well would
+        // stack a second window on that one and delay recovery.
         *last_fetch = Instant::now();
-        let jwks_uri = discovery?.jwks_uri;
 
         // Spawned, holding the gate until it has cached or failed, with no
         // await between arming the cooldown and the spawn. A caller dropped
@@ -999,11 +1000,11 @@ mod tests {
         );
     }
 
-    /// A refetch that completed and failed, at discovery here, arms the
-    /// cooldown as a successful one does: arming only after discovery has
-    /// answered must not let a down IdP cost one outbound fetch per call.
+    /// A refetch that failed at discovery is held by discovery's own
+    /// cooldown, not the JWKS one, which marks only a JWKS fetch: a down IdP
+    /// still costs one outbound fetch per cooldown, not one per call.
     #[tokio::test]
-    async fn a_refetch_failed_at_discovery_arms_the_jwks_cooldown() {
+    async fn a_refetch_failed_at_discovery_is_not_retried_inside_the_cooldown() {
         let (issuer, accepted, server) = loopback_idp(
             |_, _| http_response("500 Internal Server Error", ""),
             Duration::ZERO,
@@ -1016,10 +1017,58 @@ mod tests {
         let second = provider.key_for_kid("k1").await.err();
         server.abort();
         assert!(
-            matches!(second, Some(Error::Invalid("unknown kid (cooldown)"))),
+            matches!(
+                second,
+                Some(Error::Provider {
+                    op: "discovery (cooldown)",
+                    cause: Cause::Cooldown
+                })
+            ),
             "{second:?}"
         );
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    /// A refetch refused by discovery's own cooldown made no request, so it
+    /// must not arm the JWKS cooldown too: stacking that window on the
+    /// discovery one would keep refusing legitimate tokens after the IdP is
+    /// back. Once discovery's cooldown runs out, the next call is served.
+    #[tokio::test]
+    async fn a_discovery_cooldown_refusal_does_not_arm_the_jwks_cooldown() {
+        static SEEN: AtomicUsize = AtomicUsize::new(0);
+        fn fails_once(issuer: &str, path: &str) -> String {
+            if SEEN.fetch_add(1, Ordering::SeqCst) == 0 {
+                return http_response("500 Internal Server Error", "");
+            }
+            good_idp(issuer, path)
+        }
+        let (issuer, _accepted, server) =
+            loopback_idp(fails_once, Duration::from_millis(200)).await;
+        let provider = Provider::new(&issuer);
+
+        let hung_up =
+            tokio::time::timeout(Duration::from_millis(50), provider.key_for_kid("k1")).await;
+        assert!(
+            hung_up.is_err(),
+            "the first caller must be dropped mid-discovery"
+        );
+        // Let the detached discovery fail and arm its own cooldown.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let refused = provider.key_for_kid("k1").await.err();
+        assert!(
+            matches!(
+                refused,
+                Some(Error::Provider {
+                    cause: Cause::Cooldown,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        *provider.discovery_gate.lock().await = cooled_down();
+        let next = provider.key_for_kid("k1").await;
+        server.abort();
+        assert!(next.is_ok(), "{:?}", next.err());
     }
 
     fn rp_discovery(authorization_endpoint: &str) -> Discovery {
