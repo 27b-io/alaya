@@ -299,8 +299,8 @@ impl Provider {
     /// This is the resource-server role: it never calls the authorization or
     /// token endpoint, so it must not reject an IdP (e.g. a split-origin one)
     /// over them.
-    #[allow(clippy::disallowed_methods, reason = "sets .no_proxy()")]
     pub fn new(issuer: &str) -> Self {
+        #[allow(clippy::disallowed_methods, reason = "sets .no_proxy()")]
         let http = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
