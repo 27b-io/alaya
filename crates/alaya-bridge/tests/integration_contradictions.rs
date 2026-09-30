@@ -535,3 +535,44 @@ async fn keep_both_leaves_the_default_queue_survives_merge_and_is_reversible() -
     ctx.cleanup().await;
     Ok(())
 }
+
+/// LAB-6657 AC-4: a superseded endpoint on EITHER side drops the pair from
+/// the default queue, and `include_resolved` still lists it. The edges are
+/// written with `create_system_edge`, the builder `/edges/create-system-batch`
+/// runs for `mark_superseded`'s SUPERSEDES batch. Direction matters: an
+/// endpoint that *won* a supersession (outgoing edge only) is live, so its
+/// pair stays queued.
+#[tokio::test]
+async fn superseded_endpoint_on_either_side_leaves_the_default_queue() -> anyhow::Result<()> {
+    let Some(ctx) = common::TestContext::new().await else {
+        return Ok(());
+    };
+    // Pairs 1000->2000 (newest), 1001->2001, 1002->2002; none resolved yet.
+    seed_pairs(&ctx, 3, 0).await;
+    let supersede = |winner: String, loser: String| {
+        cypher::create_system_edge(
+            &winner,
+            &loser,
+            SystemRelationType::Supersedes,
+            1_900_000_000.0,
+        )
+    };
+    ctx.exec_tuple(cypher::ensure_node(&hash(3000), 1_900_000_000.0))
+        .await;
+    // a-side of pair 0 superseded, b-side of pair 1 superseded (twice, so
+    // the in-degree is 2), and a of pair 2 is the winner of a supersession.
+    ctx.exec_tuple(supersede(hash(3000), hash(1000))).await;
+    ctx.exec_tuple(supersede(hash(3000), hash(2001))).await;
+    ctx.exec_tuple(supersede(hash(1000), hash(2001))).await;
+    ctx.exec_tuple(supersede(hash(1002), hash(3000))).await;
+
+    assert_eq!(a_hashes(&default_queue(&ctx).await), [hash(1002)]);
+    assert_eq!(
+        a_hashes(&everything(&ctx).await),
+        [hash(1000), hash(1001), hash(1002)],
+        "include_resolved lists the superseded pairs"
+    );
+
+    ctx.cleanup().await;
+    Ok(())
+}
