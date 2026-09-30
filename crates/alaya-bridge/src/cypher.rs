@@ -260,8 +260,13 @@ pub fn get_all_contradictions(q: &ContradictionQuery) -> CypherQuery {
         // on 2026-09-10: 299 superseded memories, 0 without the edge). The
         // resolution verb stamps `e.resolution` (LAB-3885, keep_both): the
         // pair is settled with both memories live.
+        // `indegree()` reads the relation matrix; the equivalent pattern
+        // `NOT (a)<-[:SUPERSEDES]-()` plans a sub-query per edge, which made
+        // this the slowest clause by an order of magnitude once the graph
+        // grew (LAB-6657). Same rows, same order.
         clauses.push(
-            "NOT (a)<-[:SUPERSEDES]-() AND NOT (b)<-[:SUPERSEDES]-() AND e.resolution IS NULL",
+            "indegree(a, 'SUPERSEDES') = 0 AND indegree(b, 'SUPERSEDES') = 0 \
+             AND e.resolution IS NULL",
         );
         clauses.push(&reverse_stamped);
     }
@@ -661,8 +666,9 @@ mod tests {
             ..cq(20)
         });
         assert!(c.contains(
-            "WHERE e.verdict IN $verdicts AND NOT (a)<-[:SUPERSEDES]-() AND NOT (b)<-[:SUPERSEDES]-() \
-             AND e.resolution IS NULL AND NOT (b)-[:CONTRADICTS {resolution: 'keep_both'}]->(a) "
+            "WHERE e.verdict IN $verdicts AND indegree(a, 'SUPERSEDES') = 0 \
+             AND indegree(b, 'SUPERSEDES') = 0 AND e.resolution IS NULL \
+             AND NOT (b)-[:CONTRADICTS {resolution: 'keep_both'}]->(a) "
         ));
         // Without the flag neither resolved form is filtered (the columns
         // still carry e.resolution*, so test the clauses, not the word).
