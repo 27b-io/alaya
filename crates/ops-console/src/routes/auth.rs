@@ -195,15 +195,9 @@ const MAX_LOGGED_ERROR_CHARS: usize = 120;
 /// because `idp_error_detail` renders a fixed string for every code outside
 /// RFC 6749, so a genuine vendor code survives here and — until the request
 /// span stops recording the whole URI — nowhere else worth reading. Marked,
-/// or a clip reads as the IdP's own value. By chars: a byte split can land
-/// mid-codepoint and panic.
+/// or a clip reads as the IdP's own value.
 fn clipped_idp_error(err: &str) -> String {
-    let mut out: String = err.chars().take(MAX_LOGGED_ERROR_CHARS).collect();
-    // Exact, and O(1): `out` is by construction a byte prefix of `err`.
-    if out.len() < err.len() {
-        out.push('…');
-    }
-    out
+    super::clip(err, MAX_LOGGED_ERROR_CHARS)
 }
 
 #[cfg(test)]

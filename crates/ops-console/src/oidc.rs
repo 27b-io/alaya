@@ -25,6 +25,13 @@ use base64::Engine;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::routes::clip;
+
+/// Ceiling on an IdP failure's cause in the log line. Needed because a
+/// `Cause::Document` is IdP-supplied text whose only other bound is the
+/// 8 MiB body cap, which makes it a log-flood lever.
+const MAX_LOGGED_CAUSE_CHARS: usize = 256;
+
 /// The page-safe reason a login step failed. By the time one exists the
 /// failure has been logged, once, by the helper that built it — so, unlike
 /// `alaya_oidc::Error`, it carries no cause and no refusal-vs-outage class.
@@ -196,18 +203,10 @@ impl OidcRp {
         // line that reads like a real record; recorded as `Debug` the same
         // string is escaped and quoted onto one line. The binary's JSON
         // encoder escapes it too (`main.rs` pins that); `?` keeps this call
-        // site safe under any encoder. Capped because the only
-        // other bound on it is the 8 MiB body cap, which is a log-flood lever
-        // — by chars, since a byte split could land mid-codepoint and panic.
-        let full = cause.to_string();
-        let mut cause: String = full.chars().take(256).collect();
-        // Compared by bytes, not chars: `cause` is a char-prefix of `full`, so
-        // the two predicates are the same fact, and counting chars walks up to
-        // 8 MiB twice on the exact log-flood path this truncation bounds.
-        if cause.len() < full.len() {
-            // Marked, because a cut URL renders as a complete-looking wrong one.
-            cause.push('…');
-        }
+        // site safe under any encoder. Clipped to `MAX_LOGGED_CAUSE_CHARS`
+        // and marked, because a cut URL renders as a complete-looking wrong
+        // one.
+        let cause = clip(&cause.to_string(), MAX_LOGGED_CAUSE_CHARS);
         tracing::warn!(
             op,
             issuer = ?self.provider.issuer(),
