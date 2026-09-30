@@ -126,9 +126,10 @@ scripts/test-prompt-extraction.sh [transcript.jsonl]
 
 Runs the real Stop hook against a stub `curl` and proves what reaches the extractor: prompts are
 read whether they are strings (terminal sessions) or lists of text blocks (SDK and agent
-sessions), while tool results, `isMeta` injections such as skill bodies, and `<wrapper>` messages
-like `<system-reminder>` are left out. Pass a real transcript to also replay it and check that it
-extracts a non-zero message count.
+sessions), while tool results, `isMeta` injections such as skill bodies, `[Request interrupted
+by user]` markers, and `<wrapper>` messages like `<system-reminder>` are left out. Pass a real
+transcript to also replay it and check that it extracts a non-zero message count; the replay turns
+off the duration and message-count save gates, so a short or still-running session counts too.
 
 ## Troubleshooting
 

@@ -28,15 +28,16 @@ esac
 STUB
 chmod +x "$T/bin/curl"
 
-# run_hook <transcript> — fresh HOME per run. Leaves the extraction request in
-# cap/llm.json and the message-line count the hook checkpointed in cap/total.
+# run_hook <transcript> [VAR=value...] — fresh HOME per run. Leaves the extraction
+# request in cap/llm.json and the message-line count the hook checkpointed in cap/total.
 run_hook() {
-  local home="$T/home" cap="$T/cap"
+  local home="$T/home" cap="$T/cap" tr="$1"
+  [[ "$tr" == /* ]] || tr="$PWD/$tr" # the hook runs in $T, not the caller's dir
   rm -rf "$home" "$cap"; mkdir -p "$home" "$cap"
-  printf '{"session_id":"s1","transcript_path":"%s"}' "$1" \
+  printf '{"session_id":"s1","transcript_path":"%s"}' "$tr" \
     | (cd "$T" && env -i HOME="$home" CAP="$cap" PATH="$T/bin:$JQ_DIR:/usr/bin:/bin" \
         ALAYA_URL=http://alaya.test/store ALAYA_LLM_URL=http://llm.test/v1/chat/completions \
-        ALAYA_LLM_API_KEY=k ALAYA_API_KEY=k ALAYA_HOOK_STATE_DIR="$home/state" \
+        ALAYA_LLM_API_KEY=k ALAYA_API_KEY=k ALAYA_HOOK_STATE_DIR="$home/state" "${@:2}" \
         bash "$HOOK") >/dev/null 2>&1
   sed -n 2p "$home/state/s1" > "$cap/total" 2>/dev/null
 }
@@ -59,7 +60,11 @@ REMINDER="<system-reminder>\nREMINDER-BODY-TEXT\n</system-reminder>"
 noise() {
   entry '[{"type":"tool_result","tool_use_id":"t1","content":"TOOL-RESULT-TEXT"}]'
   entry '[{"type":"text","text":"Base directory for this skill: /s\n\nSKILL-BODY-TEXT"}]' '{"isMeta":true}'
-  jq -cn '{type:"assistant", message:{role:"assistant", content:[{type:"text", text:"assistant closing words"}]}}'
+  entry '[{"type":"text","text":"[Request interrupted by user]"}]'
+  entry '[{"type":"text","text":"[Request interrupted by user for tool use]"}]'
+  # the tool input matches the hook's '"type":"user"' grep; only its .type check keeps this out of the count
+  jq -cn '{type:"assistant", message:{role:"assistant", content:[
+    {type:"tool_use", id:"t2", name:"x", input:{type:"user"}}, {type:"text", text:"assistant closing words"}]}}'
 }
 
 # terminal session: prompts are strings
@@ -73,6 +78,7 @@ for n in one two three four five; do has "string: prompt $n extracted" "string p
 lacks "string: <system-reminder> body dropped" "REMINDER-BODY-TEXT"
 lacks "string: tool result dropped"           "TOOL-RESULT-TEXT"
 lacks "string: isMeta skill body dropped"     "SKILL-BODY-TEXT"
+lacks "string: interrupt marker dropped"      "[Request interrupted"
 has   "string: last assistant text kept"      "assistant closing words"
 total "string: 5 message lines counted" 5
 
@@ -87,15 +93,17 @@ for n in one two three four five; do has "blocks: prompt $n extracted" "block pr
 lacks "blocks: <system-reminder> block dropped" "REMINDER-BODY-TEXT"
 lacks "blocks: tool result dropped"             "TOOL-RESULT-TEXT"
 lacks "blocks: isMeta skill body dropped"       "SKILL-BODY-TEXT"
+lacks "blocks: interrupt marker dropped"        "[Request interrupted"
 total "blocks: 5 message lines counted" 5
 
-# optional replay of a real transcript: must reach the extractor with a non-zero count
+# optional replay of a real transcript: must reach the extractor with a non-zero count.
+# Save gates off, so a short or still-running session measures extraction, not eligibility.
 if [[ -n "${1:-}" ]]; then
-  run_hook "$1"
+  run_hook "$1" ALAYA_MIN_DURATION_SECS=0 ALAYA_MIN_NEW_MESSAGES=1
   got=$(cat "$T/cap/total" 2>/dev/null)
   if [[ "${got:-0}" -gt 0 ]]; then echo "ok    replay: $got message lines extracted from $(basename "$1")"
   else echo "FAIL  replay: nothing extracted from $1"; RC=1; fi
 fi
 
-[[ $RC -eq 0 ]] && echo "ALL PASS: string and block-list prompts extracted; tool results, isMeta injections and <wrapper> bodies excluded"
+[[ $RC -eq 0 ]] && echo "ALL PASS: string and block-list prompts extracted; tool results, isMeta injections, interrupt markers and <wrapper> bodies excluded"
 exit $RC
