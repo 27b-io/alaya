@@ -43,6 +43,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(handlers::contradictions::for_hashes),
         )
         .route(
+            "/contradictions/stats",
+            post(handlers::contradictions::stats),
+        )
+        .route(
             "/consolidation/decay-all",
             post(handlers::consolidation::decay_all),
         )

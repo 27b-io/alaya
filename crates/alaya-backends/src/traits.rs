@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use alaya_types::{
     Result,
     graph::{
-        CoAccessPair, Contradiction, ContradictionQuery, ContradictionRef, Direction, Edge,
-        EdgeMeta, EdgeVerdict, GraphStats, Neighbor, Resolution, SystemRelationType,
-        UserRelationType, Verdict,
+        CoAccessPair, Contradiction, ContradictionQuery, ContradictionRef, ContradictionStats,
+        Direction, Edge, EdgeMeta, EdgeVerdict, GraphStats, Neighbor, Resolution,
+        SystemRelationType, UserRelationType, Verdict,
     },
     memory::{
         HealthStatus, Memory, MetadataUpdate, PatchMemoryRequest, ScoredMemory, ScrollResult,
@@ -266,6 +266,9 @@ pub trait GraphService {
         &self,
         hashes: &[&str],
     ) -> Result<HashMap<String, Vec<ContradictionRef>>>;
+    /// Whole-graph aggregates over every CONTRADICTS edge (LAB-6881);
+    /// `judged_since` (epoch seconds) bounds the per-day series. Read-only.
+    async fn get_contradiction_stats(&self, judged_since: f64) -> Result<ContradictionStats>;
 
     // Hebbian read operations
     async fn get_neighbors(

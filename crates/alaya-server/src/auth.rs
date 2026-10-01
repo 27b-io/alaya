@@ -125,6 +125,10 @@ pub fn rest_route_op(method: &Method, path: &str) -> &'static str {
         ("POST", "/backfill/summaries") => "backfill_summaries",
         ("POST", "/backfill/contradictions") => "backfill_contradictions",
         ("GET", "/health/detail") => "check_database_health",
+        // Static-only by omission from both allowlists (LAB-6881): an
+        // operator view that carries judge failure text and this process's
+        // judge-spend counter, not something a consumer needs to read.
+        ("GET", "/stats") => "corpus_stats",
         ("GET", p) if p.starts_with("/memories/") => "get_memory",
         ("PATCH", p) if p.starts_with("/memories/") => "patch_memory",
         // Unmapped / unexpected method → fail-closed (not in allowlist).
@@ -142,6 +146,7 @@ pub const ALL_OPS: &[(&str, bool)] = &[
     ("memory_contradictions", false),
     ("find_duplicates", false),
     ("store_memory", false),
+    ("corpus_stats", false),
     ("delete_memory", true),
     ("memory_supersede", true),
     ("resolve_contradiction", true),
@@ -513,6 +518,7 @@ mod tests {
             rest_route_op(&Method::POST, "/backfill/contradictions"),
             rest_route_op(&Method::GET, "/memories/x"),
             rest_route_op(&Method::PATCH, "/memories/x"),
+            rest_route_op(&Method::GET, "/stats"),
         ];
         for op in rest_ops {
             assert!(
@@ -535,6 +541,15 @@ mod tests {
         // "__mutating__" → denied for every restricted principal. The
         // read-only bearer reads memories, not the auth configuration.
         let op = rest_route_op(&Method::GET, "/auth/config");
+        assert!(!AuthPrincipal::Oidc.allows(op));
+        assert!(!AuthPrincipal::StaticReadOnly.allows(op));
+    }
+
+    #[test]
+    fn stats_route_is_static_only() {
+        let op = rest_route_op(&Method::GET, "/stats");
+        assert_eq!(op, "corpus_stats");
+        assert!(AuthPrincipal::Static.allows(op));
         assert!(!AuthPrincipal::Oidc.allows(op));
         assert!(!AuthPrincipal::StaticReadOnly.allows(op));
     }
@@ -656,6 +671,7 @@ mod tests {
             .route("/relation", post(ok))
             .route("/duplicates/merge", post(ok))
             .route("/memories/{content_hash}", get(ok).patch(ok))
+            .route("/stats", get(ok))
             .layer(axum::middleware::from_fn_with_state(auth, require_auth))
     }
 
@@ -720,6 +736,38 @@ mod tests {
             status_for(&app, Method::POST, "/search", None).await,
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    /// `GET /stats` through the real middleware: the full bearer reads it,
+    /// an OIDC principal and the read-only bearer are 403 — authenticated,
+    /// not authorized — and never reach the handler.
+    #[tokio::test]
+    async fn stats_is_403_for_oidc_and_readonly_principals() {
+        let mut auth = state(Some("full-key"), true);
+        auth.readonly_api_key = Some("ro-key".to_string());
+        let app = test_router(auth);
+        let jwt = crate::testkit::mint(
+            jsonwebtoken::Algorithm::RS256,
+            Some(crate::testkit::KID_RSA),
+            &crate::testkit::TestClaims::valid(),
+        );
+
+        assert_eq!(
+            status_for(&app, Method::GET, "/stats", Some("full-key")).await,
+            StatusCode::OK
+        );
+        // The same JWT is accepted on an OIDC-allowlisted read, so the 403
+        // below is authorization, not a token the verifier refused.
+        assert_eq!(
+            status_for(&app, Method::POST, "/search", Some(&jwt)).await,
+            StatusCode::OK
+        );
+        for token in [jwt.as_str(), "ro-key"] {
+            assert_eq!(
+                status_for(&app, Method::GET, "/stats", Some(token)).await,
+                StatusCode::FORBIDDEN
+            );
+        }
     }
 
     #[test]

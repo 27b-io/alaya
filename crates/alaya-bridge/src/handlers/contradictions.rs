@@ -1,4 +1,4 @@
-//! Contradiction handlers — POST /contradictions/{all,for,verdict,resolution}
+//! Contradiction handlers — POST /contradictions/{all,for,verdict,resolution,stats}
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -8,11 +8,14 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use alaya_types::{
-    graph::{Contradiction, ContradictionQuery, EdgeVerdict, Resolution, Verdict},
+    graph::{
+        Contradiction, ContradictionQuery, ContradictionStats, ContradictionStatsQuery, DayTally,
+        EdgeVerdict, ReasonTally, Resolution, Verdict, VerdictCount, VerdictTally,
+    },
     memory::validate_content_hash,
 };
 
-use crate::{AppState, cypher, handlers::exec_query};
+use crate::{AppState, cypher, handlers::exec_query, resp::FalkorResult};
 
 // ─── Request types ────────────────────────────────────────────────────────────
 
@@ -193,6 +196,142 @@ pub async fn set_resolution(
     Ok(Json(json!({ "updated": count > 0 })))
 }
 
+/// POST /contradictions/stats
+///
+/// Whole-graph aggregates over every CONTRADICTS edge (LAB-6881): counts by
+/// verdict and resolved state, the most frequent stored judge failures,
+/// judgements per UTC day since `judged_since`, and degenerate reasons per
+/// verdict. Read-only (`GRAPH.RO_QUERY` throughout). The five queries are
+/// independent, so they run concurrently; any one failing fails the call —
+/// a partial tally would read as a smaller corpus.
+pub async fn stats(
+    State(state): State<Arc<AppState>>,
+    Json(query): Json<ContradictionStatsQuery>,
+) -> Result<Json<ContradictionStats>, StatusCode> {
+    if !query.judged_since.is_finite() {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let run = |(q, p, ro): cypher::CypherQuery| {
+        let state = state.clone();
+        async move { exec_query(&state, &q, p, ro).await }
+    };
+    let (counts, reverse, failures, per_day, degenerate) = tokio::try_join!(
+        run(cypher::contradiction_stats_counts()),
+        run(cypher::contradiction_stats_reverse_stamped()),
+        run(cypher::contradiction_stats_failures(
+            ContradictionStatsQuery::FAILURE_REASONS
+        )),
+        run(cypher::contradiction_stats_judged_per_day(
+            query.judged_since
+        )),
+        run(cypher::contradiction_stats_degenerate()),
+    )?;
+
+    let mut verdicts = rows(&counts, "counts", |row| {
+        Some(VerdictTally {
+            verdict: opt_str(row.first())?,
+            resolved: row.get(1)?.as_bool()?,
+            count: count_cell(row.get(2))?,
+        })
+    })?;
+    // The counts query applies the queue's direct test only; move each
+    // reverse-stamped edge from its open row to the resolved one.
+    let reverse = rows(&reverse, "reverse_stamped", |row| {
+        Some((opt_str(row.first())?, count_cell(row.get(1))?))
+    })?;
+    for (verdict, n) in reverse {
+        move_to_resolved(&mut verdicts, verdict, n);
+    }
+    verdicts.retain(|t| t.count > 0);
+
+    let failures = rows(&failures, "failures", |row| {
+        Some(ReasonTally {
+            reason: row.first()?.as_str()?.to_string(),
+            count: count_cell(row.get(1))?,
+        })
+    })?;
+    let judged_per_day = rows(&per_day, "judged_per_day", |row| {
+        Some(DayTally {
+            day: row.first()?.as_i64()?,
+            verdict: opt_str(row.get(1))?,
+            count: count_cell(row.get(2))?,
+        })
+    })?;
+    let degenerate_reasons = rows(&degenerate, "degenerate", |row| {
+        Some(VerdictCount {
+            verdict: row.first()?.as_str()?.to_string(),
+            count: count_cell(row.get(1))?,
+        })
+    })?;
+
+    Ok(Json(ContradictionStats {
+        verdicts,
+        failures,
+        judged_per_day,
+        degenerate_reasons,
+    }))
+}
+
+/// Parse every row of an aggregate, or fail the call. A tally that skipped
+/// a row it could not read would report a smaller corpus than the graph
+/// holds, so a cell of the wrong type is a 500, never a quiet undercount.
+fn rows<T>(
+    result: &FalkorResult,
+    query: &str,
+    parse: impl Fn(&[Value]) -> Option<T>,
+) -> Result<Vec<T>, StatusCode> {
+    result
+        .result_set
+        .iter()
+        .map(|row| {
+            parse(row).ok_or_else(|| {
+                tracing::error!(query, "contradiction stats: unreadable row");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })
+        })
+        .collect()
+}
+
+/// A verdict cell: `Some(None)` for NULL (never judged), `None` for a cell
+/// that is neither NULL nor a string.
+fn opt_str(v: Option<&Value>) -> Option<Option<String>> {
+    match v? {
+        Value::Null => Some(None),
+        Value::String(s) => Some(Some(s.clone())),
+        _ => None,
+    }
+}
+
+fn count_cell(v: Option<&Value>) -> Option<usize> {
+    v.and_then(Value::as_u64).map(|n| n as usize)
+}
+
+/// Shift `n` edges of `verdict` from the open tally to the resolved one.
+/// The reverse query only returns edges the counts query saw as open, so
+/// the open row holds at least `n`; `min` keeps a write landing between the
+/// two reads from driving it below zero.
+fn move_to_resolved(tallies: &mut Vec<VerdictTally>, verdict: Option<String>, n: usize) {
+    let Some(open) = tallies
+        .iter_mut()
+        .find(|t| t.verdict == verdict && !t.resolved)
+    else {
+        return;
+    };
+    let n = n.min(open.count);
+    open.count -= n;
+    match tallies
+        .iter_mut()
+        .find(|t| t.verdict == verdict && t.resolved)
+    {
+        Some(resolved) => resolved.count += n,
+        None => tallies.push(VerdictTally {
+            verdict,
+            resolved: true,
+            count: n,
+        }),
+    }
+}
+
 /// POST /contradictions/for
 ///
 /// Return CONTRADICTS pairs touching any of the supplied hashes, grouped by hash.
@@ -250,4 +389,63 @@ pub async fn for_hashes(
         map.into_iter().map(|(k, v)| (k, json!(v))).collect();
 
     Ok(Json(json!({ "contradictions": contradictions })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(verdict: Option<&str>, resolved: bool, count: usize) -> VerdictTally {
+        VerdictTally {
+            verdict: verdict.map(str::to_string),
+            resolved,
+            count,
+        }
+    }
+
+    #[test]
+    fn move_to_resolved_shifts_between_rows_and_creates_the_resolved_row() {
+        let mut v = vec![
+            t(Some("coexist"), false, 5),
+            t(None, false, 3),
+            t(None, true, 1),
+        ];
+        move_to_resolved(&mut v, Some("coexist".into()), 2);
+        move_to_resolved(&mut v, None, 1);
+        assert_eq!(
+            v,
+            [
+                t(Some("coexist"), false, 3),
+                t(None, false, 2),
+                t(None, true, 2),
+                t(Some("coexist"), true, 2),
+            ]
+        );
+    }
+
+    /// A write between the two reads can leave the reverse count above the
+    /// open count; the open row floors at zero and the total is unchanged.
+    #[test]
+    fn move_to_resolved_never_drives_a_row_below_zero() {
+        let mut v = vec![t(Some("coexist"), false, 1)];
+        move_to_resolved(&mut v, Some("coexist".into()), 4);
+        assert_eq!(
+            v,
+            [t(Some("coexist"), false, 0), t(Some("coexist"), true, 1)]
+        );
+        // No open row at all: nothing to move.
+        move_to_resolved(&mut v, Some("unrelated".into()), 2);
+        assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn opt_str_tells_null_from_a_mistyped_cell() {
+        assert_eq!(opt_str(Some(&Value::Null)), Some(None));
+        assert_eq!(
+            opt_str(Some(&json!("coexist"))),
+            Some(Some("coexist".into()))
+        );
+        assert_eq!(opt_str(Some(&json!(3))), None);
+        assert_eq!(opt_str(None), None);
+    }
 }

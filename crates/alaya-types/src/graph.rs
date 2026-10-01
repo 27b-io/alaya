@@ -329,6 +329,68 @@ pub struct GraphStats {
     pub status: String,
 }
 
+/// Aggregate counts over every `CONTRADICTS` edge (LAB-6881), from bridge
+/// `POST /contradictions/stats`. Verdicts stay the raw edge strings so
+/// nothing is folded away on the wire: `None` is an edge never judged, and
+/// a string `Verdict::parse` rejects (only reachable by a direct graph
+/// write) is reported as it is stored.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContradictionStats {
+    /// One row per `(verdict, resolved)` pair present in the graph.
+    pub verdicts: Vec<VerdictTally>,
+    /// Stored judge failures (`verdict = unjudged`) by full reason, the
+    /// `ContradictionStatsQuery::FAILURE_REASONS` most frequent first.
+    pub failures: Vec<ReasonTally>,
+    /// Edges judged on or after `judged_since`, by UTC day and verdict.
+    pub judged_per_day: Vec<DayTally>,
+    /// Per verdict class, judged edges whose trimmed reason is shorter than
+    /// 10 chars or equals `placeholder` (case-insensitive). Failure markers
+    /// are excluded: their reason is an error string, not the judge's.
+    pub degenerate_reasons: Vec<VerdictCount>,
+}
+
+/// `resolved` uses the default queue's definition exactly: either endpoint
+/// superseded (incoming `SUPERSEDES`), or a resolution stamp on this edge or
+/// on the reverse edge of the same pair.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VerdictTally {
+    pub verdict: Option<String>,
+    pub resolved: bool,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReasonTally {
+    pub reason: String,
+    pub count: usize,
+}
+
+/// `day` is whole days since the Unix epoch, UTC.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DayTally {
+    pub day: i64,
+    pub verdict: Option<String>,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VerdictCount {
+    pub verdict: String,
+    pub count: usize,
+}
+
+/// Request body of bridge `POST /contradictions/stats`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContradictionStatsQuery {
+    /// Epoch seconds; the lower bound of `judged_per_day`.
+    pub judged_since: f64,
+}
+
+impl ContradictionStatsQuery {
+    /// How many failure reasons the bridge returns, most frequent first.
+    pub const FAILURE_REASONS: usize = 10;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -44,6 +44,7 @@ use alaya_backends::{
     rerank::RerankClient,
     summary::SummaryClient,
 };
+use alaya_core::calendar::utc_date_str;
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{
     JudgeOutcome, MemoryService, OutputMode, RelationParams, SearchParams, StoreParams,
@@ -788,6 +789,11 @@ pub(crate) enum CmdInner {
         rejudge: bool,
         reply: oneshot::Sender<Value>,
     },
+    /// `GET /stats` (LAB-6881): corpus counts, contradiction-judge
+    /// aggregates and this process's judge daily cap. Read-only.
+    Stats {
+        reply: oneshot::Sender<Value>,
+    },
 }
 
 impl CmdInner {
@@ -822,6 +828,7 @@ impl Cmd {
             CmdInner::Patch { .. } => "patch",
             CmdInner::BackfillSummaries { .. } => "backfill_summaries",
             CmdInner::BackfillContradictions { .. } => "backfill_contradictions",
+            CmdInner::Stats { .. } => "stats",
         }
     }
 }
@@ -1802,6 +1809,32 @@ async fn service_worker(
                     .instrument(span),
                 );
             }
+            CmdInner::Stats { reply } => {
+                // Read here, on the worker that owns the counter; the
+                // aggregates themselves run in a spawned task below.
+                let cap = judge_cap_view(&judge_limiter.borrow(), svc.judge.is_some());
+                let span = tracing::info_span!(parent: &ps, "stats");
+                let svc = svc.clone();
+                let deadline = limits.cmd;
+                // Spawned, not awaited: the whole-graph aggregates are the
+                // slowest read this worker serves, and every store and search
+                // would queue behind them.
+                tokio::task::spawn_local(
+                    async move {
+                        let result = match timeout(deadline, svc.corpus_stats()).await {
+                            Ok(mut v) => {
+                                v["judge_daily_cap"] = cap;
+                                let errors = v["errors"].as_array().map_or(0, Vec::len);
+                                tracing::info!(op, errors, elapsed_ms = ms(start), "ok");
+                                v
+                            }
+                            Err(_) => deadline_exceeded(op, deadline, start),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    .instrument(span),
+                );
+            }
             CmdInner::BackfillContradictions {
                 limit,
                 rejudge,
@@ -1865,28 +1898,6 @@ fn parse_judge_daily_cap(raw: Option<String>) -> Result<usize, String> {
             format!("JUDGE_DAILY_CAP must be a non-negative integer (e.g. 1000): {s} ({e})")
         }),
     }
-}
-
-/// Returns (year, month, day) in UTC for a given Unix timestamp in seconds.
-/// Implements Howard Hinnant's civil calendar algorithm (pure integer math).
-fn utc_date(epoch_secs: u64) -> (i32, u32, u32) {
-    let days = (epoch_secs / 86400) as i64;
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m, d)
-}
-
-fn utc_date_str(epoch_secs: u64) -> String {
-    let (y, m, d) = utc_date(epoch_secs);
-    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// Bounds store-path contradiction judging (LAB-3895) on two independent axes:
@@ -1990,6 +2001,17 @@ impl JudgeDailyCap {
         None
     }
 
+    /// Calls billed on the UTC day `now_secs` falls in. A counter last
+    /// touched on an earlier day has not rolled yet, but that day's budget
+    /// is spent history, not today's.
+    fn admitted_on(&self, now_secs: u64) -> usize {
+        if self.current_day == now_secs / 86400 {
+            self.count
+        } else {
+            0
+        }
+    }
+
     /// Give back a unit billed by `try_admit` for a call that spent nothing.
     /// Ignored once the UTC day has rolled: that unit was drawn on a budget
     /// that has already reset, and refunding it would credit the wrong day.
@@ -1998,6 +2020,18 @@ impl JudgeDailyCap {
             self.count -= 1;
         }
     }
+}
+
+/// The `judge_daily_cap` section of `GET /stats`. `cap` is null when no
+/// judge is configured: there is no spend to bound. Per process — with N
+/// replicas each reports its own counter.
+fn judge_cap_view(limiter: &JudgeDailyCap, judge_configured: bool) -> Value {
+    let now = (limiter.clock)();
+    json!({
+        "cap": judge_configured.then_some(limiter.cap),
+        "admitted_today": limiter.admitted_on(now),
+        "utc_day": utc_date_str(now),
+    })
 }
 
 /// Spawns background contradiction judge tasks for new CONTRADICTS signals from a store result
@@ -2666,6 +2700,7 @@ fn protected_router(handle: ServiceHandle, auth_state: AuthState) -> Router {
         )
         .route("/backfill/summaries", post(backfill_summaries))
         .route("/backfill/contradictions", post(backfill_contradictions))
+        .route("/stats", get(stats))
         .layer(middleware::from_fn_with_state(
             auth_state,
             auth::require_auth,
@@ -2889,6 +2924,16 @@ async fn contradictions(
         rx,
     )
     .await
+}
+
+/// Operator stats (LAB-6881): read-only aggregates, static bearer only (see
+/// `rest_route_op`). Each backend section is null with a note in `errors`
+/// when its source is down; the call itself still answers 200.
+async fn stats(
+    axum::extract::State(h): axum::extract::State<ServiceHandle>,
+) -> (StatusCode, Json<Value>) {
+    let (tx, rx) = oneshot::channel();
+    h.call(CmdInner::Stats { reply: tx }, rx).await
 }
 
 /// `resolution` must be present: `"keep_both"` stamps, explicit `null`
@@ -3358,20 +3403,6 @@ mod tests {
     const DAY1: u64 = 1789733949; // 2026-09-18
 
     #[test]
-    fn utc_date_str_computes_civil_calendar_correctly() {
-        // Unix epoch start
-        assert_eq!(utc_date_str(0), "1970-01-01");
-        assert_eq!(utc_date_str(86399), "1970-01-01");
-        assert_eq!(utc_date_str(86400), "1970-01-02");
-        // Leap year 2024-02-29 (1709164800 is 2024-02-29 00:00:00 UTC)
-        assert_eq!(utc_date_str(1709164800), "2024-02-29");
-        assert_eq!(utc_date_str(1709251199), "2024-02-29");
-        assert_eq!(utc_date_str(1709251200), "2024-03-01");
-        // Known date: 2026-09-18
-        assert_eq!(utc_date_str(DAY1), "2026-09-18");
-    }
-
-    #[test]
     fn judge_daily_cap_cap_reached_and_rollover() {
         let mut limiter = JudgeDailyCap::new(2);
         let day1 = DAY1;
@@ -3473,6 +3504,31 @@ mod tests {
 
     fn fake_now() -> u64 {
         FAKE_NOW.get()
+    }
+
+    /// `GET /stats` reports this process's billed calls for today only, and
+    /// no cap at all when there is no judge to spend on.
+    #[test]
+    fn judge_cap_view_reports_today_and_nulls_the_cap_without_a_judge() {
+        FAKE_NOW.set(DAY1);
+        let mut limiter = JudgeDailyCap {
+            clock: fake_now,
+            ..JudgeDailyCap::new(5)
+        };
+        assert!(limiter.try_admit().is_some());
+        assert!(limiter.try_admit().is_some());
+        assert_eq!(
+            judge_cap_view(&limiter, true),
+            json!({ "cap": 5, "admitted_today": 2, "utc_day": "2026-09-18" })
+        );
+        assert_eq!(judge_cap_view(&limiter, false)["cap"], Value::Null);
+
+        // Next UTC day, before any call rolls the counter: nothing billed yet.
+        FAKE_NOW.set(DAY1 + 86400);
+        assert_eq!(
+            judge_cap_view(&limiter, true),
+            json!({ "cap": 5, "admitted_today": 0, "utc_day": "2026-09-19" })
+        );
     }
 
     /// A limiter on the test clock, shared the way `service_worker` shares it.
@@ -4391,7 +4447,7 @@ mod wedge_tests {
         );
     }
 
-    /// VectorStorage whose `delete` and `get_batch` blackhole — models a
+    /// VectorStorage whose `delete`, `count` and `get_batch` blackhole — models a
     /// backend whose pod IP vanished without an RST. `get_batch` can instead
     /// answer a fixed batch, so a judge task can run to completion. Every
     /// other method panics: no test exercises them.
@@ -4476,7 +4532,7 @@ mod wedge_tests {
             unimplemented!()
         }
         async fn count(&self) -> Result<usize> {
-            unimplemented!()
+            std::future::pending().await
         }
         async fn get_all_tags(&self) -> Result<Vec<String>> {
             unimplemented!()
@@ -4515,6 +4571,8 @@ mod wedge_tests {
         }
     }
 
+    /// Graph whose stats reads blackhole, like `HangVectors`; the rest panic
+    /// unless a test needs them.
     struct StubGraph;
 
     #[async_trait(?Send)]
@@ -4613,8 +4671,14 @@ mod wedge_tests {
         async fn hebbian_boosts_within(&self, _hashes: &[&str]) -> Result<HashMap<String, f64>> {
             unimplemented!()
         }
+        async fn get_contradiction_stats(
+            &self,
+            _since: f64,
+        ) -> Result<alaya_types::graph::ContradictionStats> {
+            std::future::pending().await
+        }
         async fn get_stats(&self) -> Result<GraphStats> {
-            unimplemented!()
+            std::future::pending().await
         }
     }
 
@@ -4664,6 +4728,56 @@ mod wedge_tests {
             Box::new(StubConsolidation),
             None,
         )
+    }
+
+    /// `GET /stats` runs off the loop: while its aggregates hang, the
+    /// worker keeps serving, and the stats reply still arrives — as a
+    /// timeout — at the command deadline.
+    #[tokio::test(start_paused = true)]
+    async fn stats_never_blocks_the_worker_and_errors_at_its_deadline() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::channel::<Cmd>(8);
+                let limits = WorkerLimits {
+                    cmd: Duration::from_millis(100),
+                    ..WorkerLimits::default()
+                };
+                tokio::task::spawn_local(service_worker(
+                    rx,
+                    hanging_service(),
+                    Arc::new(AtomicU64::new(0)),
+                    limits,
+                ));
+
+                let (stx, mut srx) = oneshot::channel();
+                tx.send(Cmd {
+                    inner: CmdInner::Stats { reply: stx },
+                    span: tracing::Span::none(),
+                })
+                .await
+                .unwrap();
+                let (ptx, prx) = oneshot::channel();
+                tx.send(Cmd {
+                    inner: CmdInner::Ping { reply: ptx },
+                    span: tracing::Span::none(),
+                })
+                .await
+                .unwrap();
+                let pong = tokio::time::timeout(Duration::from_millis(50), prx)
+                    .await
+                    .expect("ping queued behind a hanging stats call")
+                    .unwrap();
+                assert_eq!(pong["ok"], true);
+                assert!(srx.try_recv().is_err(), "stats cannot have answered yet");
+
+                let reply = tokio::time::timeout(Duration::from_secs(60), srx)
+                    .await
+                    .expect("stats never replied")
+                    .unwrap();
+                assert_eq!(reply["error_kind"], "timeout");
+            })
+            .await;
     }
 
     /// The incident scenario (#63): a backend await that never resolves.
@@ -5206,6 +5320,40 @@ mod wedge_tests {
             !log.contains("QUERY-SENTINEL"),
             "query string reached the log:\n{log}"
         );
+    }
+
+    /// `GET /stats` on the composed router: the read-only bearer is refused
+    /// before anything reaches the worker, the full bearer is served by it.
+    #[tokio::test]
+    async fn stats_route_is_wired_behind_static_only_auth() {
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = mpsc::channel::<Cmd>(4);
+        let mut auth = test_auth_state();
+        auth.readonly_api_key = Some("ro-key".into());
+        let app = protected_router(ServiceHandle { tx }, auth);
+        let get = |token: &str| {
+            axum::http::Request::get("/stats")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        let resp = app.clone().oneshot(get("ro-key")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(rx.try_recv().is_err(), "a refused call must not dispatch");
+
+        let worker = tokio::spawn(async move {
+            match rx.recv().await.map(|c| c.inner) {
+                Some(CmdInner::Stats { reply }) => {
+                    let _ = reply.send(json!({ "errors": [] }));
+                }
+                _ => panic!("expected a Stats command"),
+            }
+        });
+        let resp = app.oneshot(get(TEST_KEY)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        worker.await.unwrap();
     }
 
     /// The other half of #63's contract: a worker that IS draining must never

@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use alaya_types::{
     AlayaError, Result,
     graph::{
-        CoAccessPair, Contradiction, ContradictionQuery, ContradictionRef, Direction, Edge,
-        EdgeMeta, EdgeVerdict, GraphStats, Neighbor, Resolution, SystemRelationType,
-        UserRelationType,
+        CoAccessPair, Contradiction, ContradictionQuery, ContradictionRef, ContradictionStats,
+        ContradictionStatsQuery, Direction, Edge, EdgeMeta, EdgeVerdict, GraphStats, Neighbor,
+        Resolution, SystemRelationType, UserRelationType,
     },
 };
 
@@ -678,6 +678,18 @@ impl GraphService for GraphHttpClient {
     }
 
     #[tracing::instrument(skip(self))]
+    async fn get_contradiction_stats(&self, judged_since: f64) -> Result<ContradictionStats> {
+        let resp = self
+            .client
+            .post(format!("{}/contradictions/stats", self.base_url))
+            .json(&ContradictionStatsQuery { judged_since })
+            .send()
+            .await
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
+
+        handle_response(resp).await
+    }
+
     async fn get_stats(&self) -> Result<GraphStats> {
         let resp = self
             .client

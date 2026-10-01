@@ -120,6 +120,12 @@ macro_rules! impl_graph_service {
             > {
                 self.0.get_contradictions_for_hashes(h).await
             }
+            async fn get_contradiction_stats(
+                &self,
+                since: f64,
+            ) -> alaya_types::Result<alaya_types::graph::ContradictionStats> {
+                self.0.get_contradiction_stats(since).await
+            }
             async fn get_neighbors(
                 &self,
                 h: &str,

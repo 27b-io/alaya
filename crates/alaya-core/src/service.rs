@@ -280,7 +280,7 @@ pub struct MemoryService {
     /// MemoryService runs single-threaded on a LocalSet (`!Send`).
     tag_cache: RefCell<Option<(f64, Vec<String>)>>,
     /// Clock function for timestamps. Defaults to wall clock; injectable for tests.
-    clock: fn() -> f64,
+    pub(crate) clock: fn() -> f64,
 }
 
 impl MemoryService {
@@ -3083,6 +3083,12 @@ mod tests {
         async fn hebbian_boosts_within(&self, _h: &[&str]) -> Result<HashMap<String, f64>> {
             Ok(HashMap::new())
         }
+        async fn get_contradiction_stats(
+            &self,
+            _since: f64,
+        ) -> Result<alaya_types::graph::ContradictionStats> {
+            unimplemented!()
+        }
         async fn get_stats(&self) -> Result<GraphStats> {
             Ok(GraphStats {
                 graph_name: "mock".into(),
@@ -3844,6 +3850,12 @@ mod tests {
         }
         async fn hebbian_boosts_within(&self, _h: &[&str]) -> Result<HashMap<String, f64>> {
             Ok(HashMap::new())
+        }
+        async fn get_contradiction_stats(
+            &self,
+            _since: f64,
+        ) -> Result<alaya_types::graph::ContradictionStats> {
+            unimplemented!()
         }
         async fn get_stats(&self) -> Result<GraphStats> {
             Ok(GraphStats {
@@ -4977,6 +4989,12 @@ mod tests {
         async fn hebbian_boosts_within(&self, _h: &[&str]) -> Result<HashMap<String, f64>> {
             Ok(HashMap::new())
         }
+        async fn get_contradiction_stats(
+            &self,
+            _since: f64,
+        ) -> Result<alaya_types::graph::ContradictionStats> {
+            unimplemented!()
+        }
         async fn get_stats(&self) -> Result<GraphStats> {
             Ok(GraphStats {
                 graph_name: "mock".into(),
@@ -5804,6 +5822,12 @@ mod tests {
         }
         async fn hebbian_boosts_within(&self, _h: &[&str]) -> Result<HashMap<String, f64>> {
             Ok(HashMap::new())
+        }
+        async fn get_contradiction_stats(
+            &self,
+            _since: f64,
+        ) -> Result<alaya_types::graph::ContradictionStats> {
+            unimplemented!()
         }
         async fn get_stats(&self) -> Result<GraphStats> {
             Ok(GraphStats {
@@ -6876,6 +6900,12 @@ mod tests {
                 unimplemented!()
             }
             async fn hebbian_boosts_within(&self, _h: &[&str]) -> Result<HashMap<String, f64>> {
+                unimplemented!()
+            }
+            async fn get_contradiction_stats(
+                &self,
+                _since: f64,
+            ) -> Result<alaya_types::graph::ContradictionStats> {
                 unimplemented!()
             }
             async fn get_stats(&self) -> Result<GraphStats> {
