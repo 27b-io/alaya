@@ -9,7 +9,8 @@ Idempotent — content hashing means identical content upserts safely.
 
 `metadata.superseded_by` is reserved: /store refuses it. A source memory's
 supersession is recreated through /supersede once every memory is stored,
-so it lands with its SUPERSEDES edge and reason.
+so it lands with its SUPERSEDES edge and reason. The source keeps that
+reason in `metadata.supersession_reason`; Alaya keeps it server-side.
 
 Alaya keys a memory by its raw content; the source keys it by normalised
 content plus metadata, so several source memories can share one Alaya
@@ -17,7 +18,8 @@ record. Every supersession is resolved to Alaya record keys before any
 write. A superseded memory whose content a live one also holds is not
 stored, and its supersession is skipped: the content is live in the source.
 Superseded copies of one content that name different survivors cannot share
-one record; they are not stored, are reported, and fail the run.
+one record; they are not stored, are reported, and fail the run. Copies that
+name one survivor share one supersession carrying each distinct reason.
 
 Usage:
     python3 scripts/migrate_from_mcp.py
@@ -39,7 +41,7 @@ import hashlib
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import httpx
 from qdrant_client import QdrantClient
@@ -58,6 +60,7 @@ if BATCH_SIZE <= 0:
     sys.exit(f"BATCH_SIZE must be > 0, got {BATCH_SIZE}")
 
 METADATA_POINT_PREFIX = "00000000-0000-0000-0000-"
+DEFAULT_REASON = "migrated from mcp-memory-service"
 
 
 @dataclass
@@ -77,7 +80,7 @@ class Stats:
 class Supersession:
     index: int  # into memories
     source_new_hash: str
-    reason: str
+    reason: str | None
 
 
 def alaya_hash(content: str) -> str:
@@ -212,12 +215,13 @@ async def run() -> None:
             has_marker = "superseded_by" in metadata
             superseded_by = metadata.pop("superseded_by", None)
             if superseded_by:
+                # /supersede writes the reason; left here it would become
+                # caller metadata that nothing in Alaya reads or clears.
                 supersessions.append(
                     Supersession(
                         index=len(memories),
                         source_new_hash=str(superseded_by),
-                        reason=payload.get("supersession_reason")
-                        or "migrated from mcp-memory-service",
+                        reason=metadata.pop("supersession_reason", None),
                     )
                 )
             elif has_marker:
@@ -279,7 +283,10 @@ async def run() -> None:
             continue
         stats.supersede_skipped += len(group) - len(survivors)
         if survivors:
-            plan.append((old, survivors.pop(), group[0]))
+            # One edge for every copy, so it carries every copy's reason.
+            reasons = sorted({str(s.reason) for s in group if s.reason})
+            reason = "; ".join(reasons) or DEFAULT_REASON
+            plan.append((old, survivors.pop(), replace(group[0], reason=reason)))
 
     if shadowed:
         print(f"  {len(shadowed)} superseded memories hold live content: not stored")
