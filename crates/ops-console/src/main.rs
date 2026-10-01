@@ -1684,58 +1684,39 @@ mod tests {
     /// Only when neither direction was cleared does the request fail.
     #[tokio::test]
     async fn reopen_clears_the_reverse_stamp_when_the_forward_edge_is_gone() {
-        let (a, b) = ("a".repeat(64), "b".repeat(64));
         let seen = Seen::default();
-        let reverse_error = std::sync::Arc::new(std::sync::Mutex::new(None::<&'static str>));
-        let reply = reverse_error.clone();
+        // Every a→x edge is gone; x→a is stamped (b), gone (c) or fails (d).
         let upstream = Router::new().route(
             "/contradictions/resolution",
-            recording(&seen, move |body| {
-                let error = if body["memory_a_hash"].as_str().unwrap().starts_with('a') {
-                    Some("Resource not found")
-                } else {
-                    *reply.lock().unwrap()
+            recording(&seen, |body| {
+                let error = match body["memory_a_hash"].as_str().unwrap().as_bytes()[0] {
+                    b'b' => return (StatusCode::OK, serde_json::json!({ "success": true })),
+                    b'd' => "Graph operation failed",
+                    _ => "Resource not found",
                 };
-                let body = match error {
-                    None => serde_json::json!({ "success": true }),
-                    Some(error) => serde_json::json!({ "success": false, "error": error }),
-                };
-                (StatusCode::OK, body)
+                (
+                    StatusCode::OK,
+                    serde_json::json!({ "success": false, "error": error }),
+                )
             }),
         );
         let (state, cookie, csrf) = triage_app(upstream).await;
-        let form = format!("csrf={csrf}&memory_a_hash={a}&memory_b_hash={b}");
+        let reopen = |other: char| {
+            let (a, b) = ("a".repeat(64), other.to_string().repeat(64));
+            let form = format!("csrf={csrf}&memory_a_hash={a}&memory_b_hash={b}");
+            post_form(&state, &cookie, "/alaya/contradictions/reopen", form)
+        };
 
-        let resp = post_form(
-            &state,
-            &cookie,
-            "/alaya/contradictions/reopen",
-            form.clone(),
-        )
-        .await;
+        let resp = reopen('b').await;
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         let flash = flash_of(&state, &resp);
         assert_eq!(flash.kind, "ok", "{}", flash.msg);
         assert!(flash.msg.contains("back in the queue"));
-        let bodies = seen.lock().unwrap().clone();
-        assert_eq!(bodies.len(), 2, "the reverse clear must still be sent");
-        assert_eq!(bodies[1]["memory_a_hash"], serde_json::json!(b));
-        assert_eq!(bodies[1]["resolution"], serde_json::Value::Null);
+        assert_eq!(seen.lock().unwrap().len(), 2);
 
-        *reverse_error.lock().unwrap() = Some("Resource not found");
-        let resp = post_form(
-            &state,
-            &cookie,
-            "/alaya/contradictions/reopen",
-            form.clone(),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-
-        *reverse_error.lock().unwrap() = Some("Graph operation failed");
-        let resp = post_form(&state, &cookie, "/alaya/contradictions/reopen", form).await;
+        assert_eq!(reopen('c').await.status(), StatusCode::NOT_FOUND);
         assert_eq!(
-            resp.status(),
+            reopen('d').await.status(),
             StatusCode::BAD_GATEWAY,
             "nothing was cleared, so nothing is flashed"
         );

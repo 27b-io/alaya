@@ -1848,11 +1848,13 @@ pub async fn reopen_submit(
         Err(AppError::NotFound(_)) => false,
         Err(e) => return Err(e),
     };
-    let reverse = match state.alaya.set_resolution(b, a, None).await {
-        Ok(_) => None,
-        Err(e) if !forward_cleared => return Err(e),
-        Err(AppError::NotFound(_)) => None,
-        Err(e) => Some(e),
+    let reverse = match (
+        state.alaya.set_resolution(b, a, None).await,
+        forward_cleared,
+    ) {
+        (Ok(_), _) | (Err(AppError::NotFound(_)), true) => None,
+        (Err(e), true) => Some(e),
+        (Err(e), false) => return Err(e),
     };
     tracing::info!(sub = ?session.sub, a = %a, b = %b, forward_cleared, reverse_failed = reverse.is_some(), "contradiction reopened");
     let (kind, msg) = match reverse {
