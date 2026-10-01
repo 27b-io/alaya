@@ -277,6 +277,22 @@ def check_judge_passes() -> None:
         assert (
             ledger.rows[("judge", "claude-sonnet-5")][0] == tune.SPEND_CHECK_EVERY - 1
         )
+        # A run that fits in one chunk is never refused after it has been paid.
+        votes, ledger = [[] for _ in pairs[:20]], tune.Ledger()
+        tune.judge_pair = lambda c, m, pr, x, y, regime: verdict(tokens=(25_000, 0))
+        tune.judge_passes(
+            None,
+            "claude-sonnet-5",
+            "p",
+            memories,
+            pairs[:20],
+            1,
+            "default",
+            ledger,
+            1.05,
+            votes,
+        )
+        assert all(len(vs) == 1 for vs in votes) and abs(ledger.usd() - 1.0) < 1e-9
         # Uncapped, every pair gets every pass.
         votes, _, err = run(lambda x, n: verdict(), 1e9)
         assert err is None and all(len(vs) == 3 for vs in votes)
