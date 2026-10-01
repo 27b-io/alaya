@@ -69,6 +69,7 @@ mod tests {
 
     #[tokio::test]
     async fn reqwest_error_redacts_query() {
+        #[allow(clippy::disallowed_methods, reason = "test-only client")]
         let error = reqwest::Client::new()
             .get("http://127.0.0.1:1/?api_key=SECRET#fragment")
             .send()

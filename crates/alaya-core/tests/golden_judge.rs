@@ -105,6 +105,7 @@ async fn golden_set_precision_recall() {
     .expect("JUDGE_API_KEY rejected — must be a single line of visible ASCII");
     // Test harness: a transport failure is a failed run, so `expect` is the
     // right shape here; the timeout keeps a dead endpoint from hanging it.
+    #[allow(clippy::disallowed_methods, reason = "test-only client")]
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()

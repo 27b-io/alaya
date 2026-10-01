@@ -7909,6 +7909,8 @@ mod tests {
     // One shared ledger plays both backends, so a test can drive supersede
     // and unsupersede end to end and then read what every layer holds.
 
+    type ContradictsEdges = HashMap<(String, String), Option<(String, f64)>>;
+
     /// Qdrant and FalkorDB as a supersession round trip sees them. Memories
     /// come back from every search entry point UNFILTERED — superseded
     /// filtering is the app layer's job, as with the real backend.
@@ -7922,7 +7924,7 @@ mod tests {
         supersedes: RefCell<Vec<(String, String)>>,
         /// CONTRADICTS edges, (src, dst) -> (`resolved_via`, `resolved_at`)
         /// of a keep_both stamp.
-        contradicts: RefCell<HashMap<(String, String), Option<(String, f64)>>>,
+        contradicts: RefCell<ContradictsEdges>,
         /// Every graph write fails, as when FalkorDB is down.
         graph_down: Cell<bool>,
         /// Another writer re-supersedes the memory to this hash inside the

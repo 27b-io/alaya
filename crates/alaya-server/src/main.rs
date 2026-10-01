@@ -4265,6 +4265,10 @@ mod tests {
         // reactor.
         probe("control (default reqwest client)", &mut || {
             rt.block_on(async {
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "test-only control: must read the proxy environment"
+                )]
                 let _ = reqwest::Client::new().get(TARGET).send().await;
             });
         });
@@ -4940,6 +4944,7 @@ mod wedge_tests {
     /// a few seconds past its origin. Production reads `monotonic_secs`.
     const TEST_NOW: u64 = 1_000_000;
 
+    #[allow(clippy::disallowed_methods, reason = "test-only client")]
     fn test_checker(progress_s: u64) -> HealthChecker {
         HealthChecker {
             client: reqwest::Client::builder()

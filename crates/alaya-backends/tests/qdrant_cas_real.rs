@@ -88,6 +88,7 @@ impl Collection {
     /// The raw payload of `hash`'s point, or `None` when it is gone.
     async fn payload(&self, hash: &str) -> Option<Value> {
         let id = uuid::Uuid::parse_str(&hash[..32]).unwrap().to_string();
+        #[allow(clippy::disallowed_methods, reason = "test-only client")]
         let body: Value = reqwest::Client::new()
             .post(format!("{}/collections/{}/points", self.url, self.name))
             .json(&json!({"ids": [id], "with_payload": true}))
@@ -115,6 +116,7 @@ impl Collection {
             "updated_at": m.updated_at, "salience_score": m.salience_score,
             "access_count": 4, "access_timestamps": [1.0, 2.0, 3.0, 4.0],
         });
+        #[allow(clippy::disallowed_methods, reason = "test-only client")]
         let resp = reqwest::Client::new()
             .put(format!(
                 "{}/collections/{}/points?wait=true",
@@ -128,6 +130,7 @@ impl Collection {
     }
 
     async fn cleanup(&self) {
+        #[allow(clippy::disallowed_methods, reason = "test-only client")]
         let _ = reqwest::Client::new()
             .delete(format!("{}/collections/{}", self.url, self.name))
             .send()
