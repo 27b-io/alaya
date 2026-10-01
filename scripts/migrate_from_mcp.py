@@ -7,6 +7,10 @@ node creation, salience scoring, provenance).
 
 Idempotent — content hashing means identical content upserts safely.
 
+`metadata.superseded_by` is reserved: /store refuses it. A source memory's
+supersession is recreated through /supersede once every memory is stored,
+so it lands with its SUPERSEDES edge and reason.
+
 Usage:
     python3 scripts/migrate_from_mcp.py
 
@@ -54,6 +58,15 @@ class Stats:
     existed: int = 0
     skipped_no_content: int = 0
     failed: int = 0
+    superseded: int = 0
+    supersede_failed: int = 0
+
+
+@dataclass
+class Supersession:
+    index: int  # into memories
+    source_new_hash: str
+    reason: str
 
 
 async def store_memory(
@@ -61,7 +74,8 @@ async def store_memory(
     sem: asyncio.Semaphore,
     memory: dict,
     stats: Stats,
-) -> None:
+) -> str | None:
+    """Store one memory; its Alaya content hash, or None on failure."""
     async with sem:
         try:
             r = await client.post("/store", json=memory)
@@ -71,6 +85,7 @@ async def store_memory(
                     stats.stored += 1
                 else:
                     stats.existed += 1
+                return body["content_hash"]
             else:
                 stats.failed += 1
                 if stats.failed <= 5:
@@ -80,6 +95,39 @@ async def store_memory(
             stats.failed += 1
             if stats.failed <= 5:
                 print(f"  ERR: {e}")
+        return None
+
+
+async def supersede_memory(
+    client: httpx.AsyncClient,
+    old_hash: str | None,
+    new_hash: str | None,
+    s: Supersession,
+    stats: Stats,
+) -> None:
+    def fail(msg: str) -> None:
+        stats.supersede_failed += 1
+        if stats.supersede_failed <= 5:
+            print(f"  SUPERSEDE FAIL: {msg}")
+
+    if old_hash is None:
+        fail(f"memory #{s.index} was not stored")
+        return
+    if new_hash is None:
+        fail(f"{old_hash}: superseding memory {s.source_new_hash} was not stored")
+        return
+    try:
+        r = await client.post(
+            "/supersede",
+            json={"old_hash": old_hash, "new_hash": new_hash, "reason": s.reason},
+        )
+        body = r.json()
+        if r.status_code == 200 and body.get("success"):
+            stats.superseded += 1
+        else:
+            fail(f"{old_hash}: {body.get('error', r.text[:100])}")
+    except Exception as e:
+        fail(f"{old_hash}: {e}")
 
 
 async def run() -> None:
@@ -95,6 +143,8 @@ async def run() -> None:
     qclient = QdrantClient(url=SOURCE_QDRANT_URL, timeout=30)
     stats = Stats()
     memories: list[dict] = []
+    source_hashes: list[str | None] = []  # aligned with memories
+    supersessions: list[Supersession] = []
     next_offset = None
 
     while True:
@@ -133,6 +183,16 @@ async def run() -> None:
             # Use `is not None` so legitimate falsy values (e.g. epoch 0,
             # neutral 0.0 valence) survive the copy.
             metadata = dict(payload.get("metadata") or {})
+            superseded_by = metadata.pop("superseded_by", None)
+            if superseded_by:
+                supersessions.append(
+                    Supersession(
+                        index=len(memories),
+                        source_new_hash=str(superseded_by),
+                        reason=payload.get("supersession_reason")
+                        or "migrated from mcp-memory-service",
+                    )
+                )
             if payload.get("emotional_valence") is not None:
                 metadata["emotional_valence"] = payload["emotional_valence"]
             if payload.get("created_at") is not None:
@@ -143,6 +203,7 @@ async def run() -> None:
                 entry["metadata"] = metadata
 
             memories.append(entry)
+            source_hashes.append(payload.get("content_hash"))
 
         if next_offset is None:
             break
@@ -151,6 +212,7 @@ async def run() -> None:
     print(
         f"  Found {stats.scrolled} memories ({stats.skipped_no_content} skipped — no content)"
     )
+    print(f"  {len(supersessions)} supersessions to recreate")
 
     if DRY_RUN:
         for m in memories[:5]:
@@ -174,10 +236,11 @@ async def run() -> None:
         headers=headers,
         timeout=60.0,
     ) as client:
+        stored_hashes: list[str | None] = []  # aligned with memories
         for batch_start in range(0, len(memories), BATCH_SIZE):
             batch = memories[batch_start : batch_start + BATCH_SIZE]
             tasks = [store_memory(client, sem, m, stats) for m in batch]
-            await asyncio.gather(*tasks)
+            stored_hashes.extend(await asyncio.gather(*tasks))
 
             done = min(batch_start + BATCH_SIZE, len(memories))
             elapsed = time.monotonic() - t0
@@ -187,10 +250,31 @@ async def run() -> None:
                 f" — stored={stats.stored} existed={stats.existed} failed={stats.failed}"
             )
 
+        # ── Phase 3: Recreate supersessions ─────────────────────────
+        # Runs after every store, so each superseding memory exists. Alaya
+        # hashes raw content and the source may not, so a source hash is
+        # translated through the memory that carried it.
+        print(f"\nPhase 3: Recreating {len(supersessions)} supersessions...")
+        to_alaya: dict[str, str] = {}
+        for src, dst in zip(source_hashes, stored_hashes, strict=True):
+            if dst is not None:
+                to_alaya[dst] = dst
+                if src:
+                    to_alaya[src] = dst
+        for s in supersessions:
+            await supersede_memory(
+                client,
+                stored_hashes[s.index],
+                to_alaya.get(s.source_new_hash),
+                s,
+                stats,
+            )
+        print(f"  superseded={stats.superseded} failed={stats.supersede_failed}")
+
     total_elapsed = time.monotonic() - t0
 
-    # ── Phase 3: Verify ─────────────────────────────────────────────
-    print("\nPhase 3: Verifying...")
+    # ── Phase 4: Verify ─────────────────────────────────────────────
+    print("\nPhase 4: Verifying...")
     try:
         r = httpx.get(f"{ALAYA_URL}/health/detail", headers=headers, timeout=10)
         health = r.json()
@@ -208,8 +292,10 @@ async def run() -> None:
     print(f"  Already existed:  {stats.existed}")
     print(f"  Failed:           {stats.failed}")
     print(f"  Skipped (empty):  {stats.skipped_no_content}")
+    print(f"  Superseded:       {stats.superseded}")
+    print(f"  Supersede failed: {stats.supersede_failed}")
 
-    if stats.failed:
+    if stats.failed or stats.supersede_failed:
         sys.exit(1)
 
 
