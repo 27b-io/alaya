@@ -316,7 +316,8 @@ async def run() -> None:
         return
 
     # ── Phase 2: Store to Alaya ─────────────────────────────────────
-    to_store = [i for i in range(len(memories)) if i not in shadowed | conflicted]
+    not_stored = shadowed | conflicted
+    to_store = [i for i in range(len(memories)) if i not in not_stored]
     print(f"\nPhase 2: Storing {len(to_store)} memories to Alaya...")
     t0 = time.monotonic()
     sem = asyncio.Semaphore(CONCURRENCY)
