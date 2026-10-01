@@ -169,6 +169,7 @@ fn app(state: AppState) -> Router {
             post(routes::alaya::keep_both_submit),
         )
         .route("/alaya/auth", get(routes::alaya::auth_view))
+        .route("/alaya/health", get(routes::health::pane))
         // anthropic-lb module: GET only, by design. No POST route to the LB
         // exists and none may be added here.
         .route("/lb", get(routes::lb::pane))
@@ -1126,6 +1127,198 @@ mod tests {
             !logged.contains(NO_COOKIE_LINE),
             "a valid cookie must not log the no-cookie refusal:\n{logged}"
         );
+    }
+
+    // ─── /alaya/health (LAB-6881) ─────────────────────────────────────────
+
+    /// GET `path` as an allowlisted operator against an alaya-server that
+    /// answers `GET /stats` with `stats` (status 200).
+    async fn health_page(stats: serde_json::Value) -> (StatusCode, String) {
+        let upstream = Router::new().route(
+            "/stats",
+            get(move || std::future::ready(axum::Json(stats.clone()))),
+        );
+        let mut config = test_config();
+        config.alaya_url = fake_upstream(upstream).await.parse().unwrap();
+        render(AppState::new(config), "/alaya/health").await
+    }
+
+    async fn render(state: AppState, path: &str) -> (StatusCode, String) {
+        let sess = session::new_session("admin-sub".into(), None, None);
+        let cookie_header = session_cookie_header(&state, &sess);
+        let resp = app(state)
+            .oneshot(
+                HttpRequest::get(path)
+                    .header(header::COOKIE, cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, body_string(resp).await)
+    }
+
+    fn open_resolved(open: u64, resolved: u64) -> serde_json::Value {
+        serde_json::json!({ "open": open, "resolved": resolved })
+    }
+
+    fn full_stats() -> serde_json::Value {
+        let day = |date: &str, coexist: u64| {
+            serde_json::json!({ "date": date, "counts": {
+                "contradiction": 0, "supersession": 3, "coexist": coexist,
+                "unrelated": 0, "unjudged": 1, "unrecognised": 0,
+            }})
+        };
+        serde_json::json!({
+            "generated_at": 1_790_856_000.0,
+            "memories": { "total": 5_234 },
+            "graph": { "node_count": 5_000, "edge_counts": {
+                "CONTRADICTS": 4_589, "SUPERSEDES": 131, "HEBBIAN": 77,
+            }},
+            "contradictions": {
+                "by_verdict": {
+                    "contradiction": open_resolved(7, 3),
+                    "supersession": open_resolved(1_613, 15),
+                    "coexist": open_resolved(1_172, 36),
+                    "unrelated": open_resolved(826, 26),
+                    "unjudged": open_resolved(9, 0),
+                    "never_judged": open_resolved(1_716, 97),
+                    "unrecognised": open_resolved(0, 0),
+                },
+                "failures": {
+                    "total": 9,
+                    "top": [{ "reason": "unjudged: endpoint missing from vector store", "count": 4 }],
+                    "other": 5,
+                },
+                "judged_per_day": [day("2026-09-30", 148), day("2026-10-01", 26)],
+                "degenerate_reasons": {
+                    "contradiction": 1, "supersession": 6, "coexist": 32, "unrelated": 31,
+                },
+            },
+            "judge_daily_cap": { "cap": 1000, "admitted_today": 41, "utc_day": "2026-10-01" },
+            "errors": [],
+        })
+    }
+
+    /// Whether some `<a href="{href}" …>` in `body` has exactly `text`.
+    fn links_to(body: &str, href: &str, text: &str) -> bool {
+        let attr = format!(r#"href="{href}""#);
+        body.match_indices(&attr).any(|(i, _)| {
+            body[i..]
+                .split_once('>')
+                .is_some_and(|(_, rest)| rest.starts_with(&format!("{text}</a>")))
+        })
+    }
+
+    #[tokio::test]
+    async fn health_pane_renders_every_section_as_linked_tables() {
+        let (status, body) = health_page(full_stats()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains("unavailable"), "{body}");
+        // Each verdict count links to the contradictions filter; resolved
+        // counts add `resolved=1` (the contradictions page's URL contract).
+        // Never-judged pairs are reached through the unjudged filter.
+        for (href, text) in [
+            ("/alaya/contradictions?verdict=supersession", "1613"),
+            (
+                "/alaya/contradictions?verdict=supersession&amp;resolved=1",
+                "15",
+            ),
+            ("/alaya/contradictions?verdict=unjudged", "1716"),
+            (
+                "/alaya/contradictions?verdict=unjudged&amp;resolved=1",
+                "97",
+            ),
+            ("/alaya/contradictions?verdict=contradiction", "7"),
+        ] {
+            assert!(links_to(&body, href, text), "no link {href} -> {text}");
+        }
+        for needle in [
+            "never judged (backlog)",
+            "unjudged: endpoint missing from vector store",
+            ">5<",
+            "2026-09-30",
+            ">148<",
+            ">41<",
+            ">1000<",
+            ">5234<",
+            "CONTRADICTS",
+            ">4589<",
+            ">32<",
+        ] {
+            assert!(body.contains(needle), "missing {needle:?} in {body}");
+        }
+        // An unrecognised verdict has no filter that selects it.
+        assert!(!body.contains("verdict=unrecognised"));
+        assert!(!body.contains("<script"), "no JS on the pane");
+    }
+
+    /// AC-4/AC-6: the bridge down nulls the graph sections server-side; the
+    /// pane says so per section and never renders them as zeros.
+    #[tokio::test]
+    async fn health_pane_with_the_graph_unavailable_renders_banners_not_zeros() {
+        let (status, body) = health_page(serde_json::json!({
+            "generated_at": 1_790_856_000.0,
+            "memories": { "total": 5_234 },
+            "graph": null,
+            "contradictions": null,
+            "judge_daily_cap": { "cap": null, "admitted_today": 0, "utc_day": "2026-10-01" },
+            "errors": ["graph stats: Graph operation failed", "contradiction stats: Graph operation failed"],
+        }))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("graph stats: Graph operation failed"));
+        assert!(body.contains(">5234<"), "the vector total still renders");
+        assert!(body.contains("no judge configured"));
+        assert!(
+            body.matches("unavailable").count() >= 7,
+            "every graph-backed card and both notes must say unavailable"
+        );
+        assert!(!body.contains("never judged (backlog)"), "no verdict table");
+        assert!(
+            !body.contains("/alaya/contradictions?verdict="),
+            "no links to zeros"
+        );
+    }
+
+    /// A worker deadline (`200 {"success": false}`) and a server build with
+    /// no route are both upstream failures: an error banner, never an empty
+    /// document.
+    #[tokio::test]
+    async fn health_pane_upstream_failure_is_a_banner() {
+        let (status, body) = health_page(serde_json::json!({
+            "success": false, "error": "stats timed out after 30s", "error_kind": "timeout",
+        }))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("unavailable"));
+        assert!(body.contains("stats timed out after 30s"));
+
+        let mut config = test_config();
+        config.alaya_url = fake_upstream(Router::new()).await.parse().unwrap();
+        let (status, body) = render(AppState::new(config), "/alaya/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("older build"), "{body}");
+        assert!(!body.contains("memory not found"));
+    }
+
+    /// The pane's link targets must load on today's contradictions page:
+    /// the `verdict` / `resolved` params are tolerated, not a 400.
+    #[tokio::test]
+    async fn contradictions_page_tolerates_the_pane_link_params() {
+        let upstream = Router::new().route(
+            "/contradictions",
+            post(|| async { axum::Json(serde_json::json!({ "success": true, "pairs": [] })) }),
+        );
+        let mut config = test_config();
+        config.alaya_url = fake_upstream(upstream).await.parse().unwrap();
+        let (status, _) = render(
+            AppState::new(config),
+            "/alaya/contradictions?verdict=supersession&resolved=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     /// The first callback is parked on the token exchange when the second

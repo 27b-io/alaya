@@ -47,7 +47,7 @@ crates/
 │       ├── edges.rs     # POST /edges/create, /edges/get, /edges/delete, /edges/create-system
 │       ├── health.rs    # GET /health (unauth), GET /stats
 │       ├── hebbian.rs   # POST /hebbian/{neighbors,spreading,boosts-within,strengthen}
-│       ├── contradictions.rs  # POST /contradictions/{all,for,verdict,resolution}
+│       ├── contradictions.rs  # POST /contradictions/{all,for,verdict,resolution,stats}
 │       └── consolidation.rs   # POST /consolidation/{decay-all,decay-stale,prune,orphans}
 ├── alaya-backends/src/
 │   ├── lib.rs           # Re-exports
@@ -61,6 +61,8 @@ crates/
 ├── alaya-core/src/
 │   ├── lib.rs           # Re-exports
 │   ├── service.rs       # MemoryService — all 11 MCP tools orchestrated
+│   ├── stats.rs         # GET /stats document (corpus + contradiction-judge aggregates, read-only)
+│   ├── calendar.rs      # UTC civil dates from epoch seconds
 │   ├── hashing.rs       # SHA-256 content hashing
 │   ├── hybrid_search.rs # RRF, adaptive alpha, keyword extraction, recency decay
 │   ├── interference.rs  # Contradiction detection (negation, antonym, temporal)

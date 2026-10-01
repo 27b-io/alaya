@@ -201,9 +201,13 @@ pub async fn set_resolution(
 /// Whole-graph aggregates over every CONTRADICTS edge (LAB-6881): counts by
 /// verdict and resolved state, the most frequent stored judge failures,
 /// judgements per UTC day since `judged_since`, and degenerate reasons per
-/// verdict. Read-only (`GRAPH.RO_QUERY` throughout). The five queries are
-/// independent, so they run concurrently; any one failing fails the call —
-/// a partial tally would read as a smaller corpus.
+/// verdict. Read-only (`GRAPH.RO_QUERY` throughout). Any one query failing
+/// fails the call — a partial tally would read as a smaller corpus.
+///
+/// The queries run one after another on purpose. Each is a full pass over
+/// the relation, and run together they contend for the same graph: every
+/// one slows several-fold for no gain in total time, which pushes each
+/// toward FalkorDB's per-query timeout.
 pub async fn stats(
     State(state): State<Arc<AppState>>,
     Json(query): Json<ContradictionStatsQuery>,
@@ -215,17 +219,17 @@ pub async fn stats(
         let state = state.clone();
         async move { exec_query(&state, &q, p, ro).await }
     };
-    let (counts, reverse, failures, per_day, degenerate) = tokio::try_join!(
-        run(cypher::contradiction_stats_counts()),
-        run(cypher::contradiction_stats_reverse_stamped()),
-        run(cypher::contradiction_stats_failures(
-            ContradictionStatsQuery::FAILURE_REASONS
-        )),
-        run(cypher::contradiction_stats_judged_per_day(
-            query.judged_since
-        )),
-        run(cypher::contradiction_stats_degenerate()),
-    )?;
+    let counts = run(cypher::contradiction_stats_counts()).await?;
+    let reverse = run(cypher::contradiction_stats_reverse_stamped()).await?;
+    let failures = run(cypher::contradiction_stats_failures(
+        ContradictionStatsQuery::FAILURE_REASONS,
+    ))
+    .await?;
+    let per_day = run(cypher::contradiction_stats_judged_per_day(
+        query.judged_since,
+    ))
+    .await?;
+    let degenerate = run(cypher::contradiction_stats_degenerate()).await?;
 
     let mut verdicts = rows(&counts, "counts", |row| {
         Some(VerdictTally {
