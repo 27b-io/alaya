@@ -203,6 +203,7 @@ fn checked_otlp_endpoint(
 /// reqwest's async client panics without a tokio reactor, so this is
 /// reqwest::blocking::Client, which works on any thread. No proxy: it dials
 /// the endpoint `checked_otlp_endpoint` certified, never an env proxy.
+#[allow(clippy::disallowed_methods, reason = "sets .no_proxy()")]
 pub(crate) fn otlp_http_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .no_proxy()

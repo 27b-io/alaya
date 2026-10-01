@@ -299,13 +299,17 @@ impl Provider {
     /// `issuer` is normalised (one trailing slash stripped). Discovery is
     /// deferred to first use — a down provider degrades to a rejection, never
     /// a startup failure. The client follows no redirects (a 3xx on discovery
-    /// or JWKS would otherwise substitute keys) and is timeout-bounded.
+    /// or JWKS would otherwise substitute keys), ignores the system proxy (a
+    /// proxy named in `HTTP_PROXY` could otherwise serve its own JWKS for an
+    /// `http://` loopback issuer) and is timeout-bounded.
     ///
     /// This is the resource-server role: it never calls the authorization or
     /// token endpoint, so it must not reject an IdP (e.g. a split-origin one)
     /// over them.
     pub fn new(issuer: &str) -> Self {
+        #[allow(clippy::disallowed_methods, reason = "sets .no_proxy()")]
         let http = reqwest::Client::builder()
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))

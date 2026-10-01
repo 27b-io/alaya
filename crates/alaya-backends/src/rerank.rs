@@ -51,6 +51,7 @@ impl RerankClient {
         // at or below the budget fires in the same tick as the call-site
         // tokio timer on a blackholed connect and steals its log line, and
         // the call-site timer bounds the connect phase anyway.
+        #[allow(clippy::disallowed_methods, reason = "sets .no_proxy() below")]
         let builder = Client::builder().default_headers(headers);
 
         #[cfg(not(target_arch = "wasm32"))]

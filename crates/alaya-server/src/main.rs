@@ -381,7 +381,8 @@ enum Transport {
 /// default would hand a plaintext request to whatever `HTTP_PROXY` or
 /// `ALL_PROXY` names, absolute-form and with the credential on it, and a
 /// conventional `NO_PROXY=.svc,.cluster.local` does not exempt a single-label
-/// host like `anthropic-lb`. A client added behind this guard must set it too.
+/// host like `anthropic-lb`. A client added behind this guard must set it too;
+/// `clippy.toml` refuses a reqwest builder outside the sanctioned sites.
 /// It does not promise the host is who it claims to be over plain `http`: that
 /// is what the cluster-local rule accepts.
 fn check_credential_transport(
@@ -950,6 +951,7 @@ impl HealthChecker {
     /// Split from `new` so the no-proxy posture can be pinned without a
     /// whole `Config` (`clients_ignore_system_proxy`). No default headers:
     /// see `new` for why every credential is per request.
+    #[allow(clippy::disallowed_methods, reason = "sets .no_proxy()")]
     fn client() -> reqwest::Client {
         reqwest::Client::builder()
             // Dial the host `check_credential_transport` classified, never an
@@ -4150,6 +4152,13 @@ mod tests {
                     RerankClient::new(TARGET.into(), 1, Some("k".into()), Duration::from_secs(5))
                         .unwrap();
                 let _ = c.rerank("q", &["x"]).await;
+            });
+        });
+        // Not behind `check_credential_transport`, but a proxy answering
+        // discovery for a loopback issuer would serve its own JWKS.
+        probe("oidc", &mut || {
+            rt.block_on(async {
+                let _ = alaya_oidc::Provider::new(TARGET).discovery().await;
             });
         });
 

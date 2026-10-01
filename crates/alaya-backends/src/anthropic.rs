@@ -61,6 +61,7 @@ impl MessagesTransport {
             reqwest::header::HeaderValue::from_static("2023-06-01"),
         );
 
+        #[allow(clippy::disallowed_methods, reason = "sets .no_proxy() below")]
         let builder = Client::builder().default_headers(headers);
 
         // No redirects: reqwest strips `Authorization` on a cross-origin
