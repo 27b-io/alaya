@@ -152,18 +152,6 @@ impl PatchMemoryRequest {
                 }
             }
         }
-        // Server-maintained: set by a supersession, removed only by its
-        // audited reversal (LAB-6876). A patch could otherwise hide or restore
-        // a memory with no reason, no graph edge and no audit entry.
-        if self
-            .metadata
-            .as_ref()
-            .is_some_and(|m| m.contains_key("superseded_by"))
-        {
-            return Err("metadata.superseded_by is server-maintained: \
-                        use memory_supersede / memory_unsupersede"
-                .into());
-        }
         if let Some(ref metadata) = self.metadata
             && metadata.len() > MAX_METADATA_KEYS
         {
@@ -349,17 +337,6 @@ mod tests {
             ..Default::default()
         };
         assert!(p.validate().unwrap_err().contains("max 50"));
-    }
-
-    #[test]
-    fn patch_validate_refuses_the_supersession_marker_set_or_cleared() {
-        for v in [serde_json::json!("b".repeat(64)), serde_json::Value::Null] {
-            let p = PatchMemoryRequest {
-                metadata: Some(HashMap::from([("superseded_by".to_string(), v)])),
-                ..Default::default()
-            };
-            assert!(p.validate().unwrap_err().contains("server-maintained"));
-        }
     }
 
     #[test]

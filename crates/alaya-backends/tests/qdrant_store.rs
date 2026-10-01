@@ -266,33 +266,20 @@ async fn store_carries_supersession_marker_over_on_restore() {
 }
 
 /// The audit trail of reversed supersessions is server-written too
-/// (LAB-6876): a re-store of an unsuperseded memory keeps it. And the marker
-/// is the stored one even when absent: a caller re-storing from a copy read
-/// while the memory was superseded must not hide it again.
+/// (LAB-6876): a re-store of an unsuperseded memory keeps it.
 #[tokio::test]
-async fn store_keeps_the_log_and_drops_a_stale_caller_marker_on_restore() {
+async fn store_carries_supersession_log_over_on_restore() {
     let log = json!([{"superseded_by": "b".repeat(64), "reason": "wrong merge"}]);
     let mut unsuperseded = existing_payload();
     unsuperseded["supersession_log"] = log.clone();
     let (server, fake) = fake_with(Some(unsuperseded)).await;
-    let mut stale = incoming();
-    stale.metadata = Some(HashMap::from([
-        ("superseded_by".to_string(), json!("b".repeat(64))),
-        ("note".to_string(), json!("kept")),
-    ]));
 
     client_for(&server)
-        .store(&stale, StoreMode::Upsert)
+        .store(&incoming(), StoreMode::Upsert)
         .await
         .expect("store succeeds");
 
-    let stored = fake.point(ID).unwrap();
-    assert_eq!(stored["supersession_log"], log);
-    assert_eq!(
-        stored["metadata"],
-        json!({"note": "kept"}),
-        "the caller's marker is dropped, its other metadata kept"
-    );
+    assert_eq!(fake.point(ID).unwrap()["supersession_log"], log);
 }
 
 /// Existence is decided on the raw point, not on whether it parses as a

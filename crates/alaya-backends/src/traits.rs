@@ -86,10 +86,7 @@ pub trait VectorStorage {
     /// `supersession_reason`, `supersession_log`, `metadata.superseded_by`, and
     /// `summary_embedding` for as long as `summary` is unchanged — so a
     /// re-store never zeroes ranking inputs, resurrects a superseded memory,
-    /// or silently drops derived retrieval state (alaya#86). The marker is
-    /// the stored one even when absent: a caller's `metadata.superseded_by`
-    /// is dropped on a re-store, so a stale copy cannot re-hide a reversed
-    /// memory (LAB-6876). Every other
+    /// or silently drops derived retrieval state (alaya#86). Every other
     /// payload field is written from `memory` as given and fields absent on
     /// `memory` are removed; `updated_at` is therefore whatever the caller
     /// set. The write is conditional on the record the carry-over read (see
@@ -132,8 +129,7 @@ pub trait VectorStorage {
     /// marker still equals `expected`. Anything else leaves the memory
     /// untouched and says what it found. `AlayaError::NotFound` when the
     /// memory does not exist. The log is server-maintained like the marker:
-    /// `store` carries it over and no caller field writes it (`patch_memory`
-    /// refuses `metadata.superseded_by` too).
+    /// `store` carries it over and no caller field writes it.
     async fn reverse_supersession(
         &self,
         content_hash: &str,

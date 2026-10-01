@@ -247,7 +247,7 @@ Reverse a supersession — from `memory_supersede`, `merge_duplicates` or the co
 
 What changes, and nothing else:
 
-- `metadata.superseded_by` and the stored supersession reason are removed from the memory, and one entry is appended to its server-maintained `supersession_log`: the `superseded_by` and `supersession_reason` that were removed, `unsuperseded_at`, `unsuperseded_via` and your `reason`. The log survives a re-store of the same content, and so does the marker's absence: re-storing with a stale `metadata.superseded_by` does not hide the memory again.
+- `metadata.superseded_by` and the stored supersession reason are removed from the memory, and one entry is appended to its server-maintained `supersession_log`: the `superseded_by` and `supersession_reason` that were removed, `unsuperseded_at`, `unsuperseded_via` and your `reason`. The log survives a re-store of the same content.
 - Every `SUPERSEDES` edge into the memory is deleted. Normally there is one, from the survivor. There is more than one only when the memory was superseded again without being reversed, and the older ones were already stale.
 - The `CONTRADICTS` pair between the memory and the survivor it named, in either direction, is stamped `keep_both` with `resolved_via: "unsupersede"`, so an automatic apply of the judge's verdict never re-supersedes it. A pair that already carries a stamp keeps it. `contradictions_stamped` lists the `[memory_a_hash, memory_b_hash]` edges stamped; pass one to `resolve_contradiction` with `resolution: null` to put the pair back in the queue.
 

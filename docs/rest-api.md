@@ -253,7 +253,7 @@ Content-Type: application/json
 }
 ```
 
-Updatable fields: `summary`, `tags`, `metadata`. Content and `content_hash` are immutable by design — to change content, store a new memory and supersede the old. `metadata.superseded_by` is server-maintained: a patch that sets or clears it is a `400`; use `/supersede` and `/unsupersede`, which keep the audit trail. A re-store through `/store` likewise keeps the stored marker, present or absent, whatever the request's metadata says.
+Updatable fields: `summary`, `tags`, `metadata`. Content and `content_hash` are immutable by design — to change content, store a new memory and supersede the old.
 
 Changing `summary` also drops the stored summary embedding (the hybrid-search boost vector) so the two never disagree; the boost returns when the summary is next generated server-side.
 
