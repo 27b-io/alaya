@@ -1957,7 +1957,8 @@ impl MemoryService {
             ));
         }
         let reason = reason.trim();
-        if reason.is_empty() || reason.len() > MAX_UNSUPERSEDE_REASON_LEN {
+        // Characters, not bytes: the MCP schema's maxLength counts characters.
+        if reason.is_empty() || reason.chars().count() > MAX_UNSUPERSEDE_REASON_LEN {
             return Err(AlayaError::Validation(format!(
                 "reason is required (1..={MAX_UNSUPERSEDE_REASON_LEN} chars): it is the audit record"
             )));
@@ -8412,10 +8413,13 @@ mod tests {
     async fn unsupersede_refuses_bad_input_and_absent_memories() {
         let a = h('a');
         let svc = Ledger::with(&[&a]).service();
+        let non_hex = "g".repeat(64);
         for (hash, reason, via) in [
             ("abc", "why", "operator:test"),
+            (non_hex.as_str(), "why", "operator:test"),
             (a.as_str(), "  ", "operator:test"),
             (a.as_str(), "why", ""),
+            (a.as_str(), "why", "   "),
         ] {
             let err = svc.memory_unsupersede(hash, reason, via).await.unwrap_err();
             assert!(matches!(err, AlayaError::Validation(_)), "{err:?}");
@@ -8426,6 +8430,14 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AlayaError::Validation(_)), "{err:?}");
+        // The cap counts characters, as the MCP schema's maxLength does: a
+        // full-length multi-byte reason passes validation.
+        let cjk = "界".repeat(MAX_UNSUPERSEDE_REASON_LEN);
+        let out = svc
+            .memory_unsupersede(&a, &cjk, "operator:test")
+            .await
+            .expect("a reason at the character cap is valid");
+        assert_eq!(out["status"], "not_superseded", "{out}");
         let err = svc
             .memory_unsupersede(&h('f'), "why", "operator:test")
             .await
