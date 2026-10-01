@@ -218,6 +218,10 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "test-only control: must read the proxy environment"
+            )]
             let _ = reqwest::Client::new().get(TARGET).send().await;
         });
         assert_eq!(
