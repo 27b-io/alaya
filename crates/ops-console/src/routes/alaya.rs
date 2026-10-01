@@ -826,7 +826,7 @@ pub async fn correct_and_supersede(
     {
         tracing::error!(sub = ?session.sub, old = %hash, new = ?new_hash, "correction stored but supersede failed");
         let detail = match e {
-            AppError::Upstream(d) => d,
+            AppError::Upstream(d) | AppError::NotFound(d) => d,
             _ => "supersede failed".to_string(),
         };
         return Err(AppError::Upstream(format!(
