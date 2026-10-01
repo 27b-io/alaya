@@ -76,6 +76,8 @@ jobs:
       - name: Audit dependencies for RUSTSEC advisories
         run: cargo audit
 
+  # Pushes only the immutable sha-<short> tag. The moving main/latest tags are
+  # left to promote-image, so they follow commit order, not build-finish order.
   build-image:
     needs: [check, audit, qdrant-races]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -83,6 +85,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -99,9 +103,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
             type=sha
-            type=raw,value=latest
 
       # Build identity for GET /health/detail + MCP serverInfo (#70). Stamped here
       # rather than in the Dockerfile so the value is deterministic per run
@@ -111,6 +113,7 @@ jobs:
         run: echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
+        id: build
         with:
           context: .
           push: true
@@ -121,3 +124,54 @@ jobs:
             BUILT_AT=${{ steps.stamp.outputs.built_at }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+  # Moves main/latest to this run's build only while its commit is still the
+  # head of main. One promotion at a time, so a check and its retag never
+  # interleave with another run's. queue: max keeps every waiting run: the
+  # default keeps one and cancels the rest, which could drop the newest commit's.
+  promote-image:
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: promote-image-main
+      queue: max
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Check this commit is still the head of main
+        id: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: .github/scripts/is-branch-head.sh
+
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+        if: steps.head.outputs.current == 'true'
+
+      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        if: steps.head.outputs.current == 'true'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A single-index source is copied as-is, so main/latest carry the same
+      # digest as this run's sha-<short> tag.
+      - name: Move main and latest to this build
+        if: steps.head.outputs.current == 'true'
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ needs.build-image.outputs.digest }}
+        run: |
+          docker buildx imagetools create \
+            --tag "${IMAGE}:main" \
+            --tag "${IMAGE}:latest" \
+            "${IMAGE}@${DIGEST:?build-image produced no digest}"
