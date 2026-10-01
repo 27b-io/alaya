@@ -32,6 +32,11 @@ pub struct Memory {
     /// Stored in Qdrant payload, never exposed in API responses.
     #[serde(default, skip_serializing)]
     pub summary_embedding: Option<Vec<f32>>,
+    /// The server-maintained `supersession_log` payload key: reversed
+    /// supersessions, oldest first, entries as stored. Read-only — a store
+    /// never writes it — and returned by `get_memory` alone.
+    #[serde(default, skip_serializing)]
+    pub supersession_log: Option<Vec<serde_json::Value>>,
 }
 
 /// A memory with a similarity/relevance score from search.
@@ -106,6 +111,28 @@ const MAX_METADATA_KEYS: usize = 50;
 /// Maximum length of summary.
 const MAX_SUMMARY_LEN: usize = 2000;
 
+/// Metadata keys only the server writes. `superseded_by` is the supersession
+/// marker: a caller writing it would hide or un-hide a memory with no
+/// SUPERSEDES edge, reason or audit entry, so only supersede and merge set it.
+pub const RESERVED_METADATA_KEYS: &[&str] = &["superseded_by"];
+
+/// Refuse caller metadata carrying a reserved key, whatever its value — null
+/// included, since a PATCH null deletes the key. The one check every
+/// caller-facing write path (store, PATCH) runs.
+pub fn reject_reserved_metadata<V>(
+    metadata: &HashMap<String, V>,
+) -> std::result::Result<(), String> {
+    match RESERVED_METADATA_KEYS
+        .iter()
+        .find(|k| metadata.contains_key(**k))
+    {
+        Some(k) => Err(format!(
+            "metadata.{k} is reserved: supersession changes only through supersede or unsupersede"
+        )),
+        None => Ok(()),
+    }
+}
+
 impl PatchMemoryRequest {
     /// Returns true if no fields are set (nothing to patch).
     pub fn is_empty(&self) -> bool {
@@ -152,13 +179,14 @@ impl PatchMemoryRequest {
                 }
             }
         }
-        if let Some(ref metadata) = self.metadata
-            && metadata.len() > MAX_METADATA_KEYS
-        {
-            return Err(format!(
-                "metadata: max {MAX_METADATA_KEYS} keys, got {}",
-                metadata.len()
-            ));
+        if let Some(ref metadata) = self.metadata {
+            if metadata.len() > MAX_METADATA_KEYS {
+                return Err(format!(
+                    "metadata: max {MAX_METADATA_KEYS} keys, got {}",
+                    metadata.len()
+                ));
+            }
+            reject_reserved_metadata(metadata)?;
         }
         if let Some(ref summary) = self.summary
             && summary.len() > MAX_SUMMARY_LEN
@@ -288,6 +316,30 @@ mod tests {
             summary_embedding: None,
         };
         assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn reject_reserved_metadata_refuses_superseded_by_any_value() {
+        for v in [serde_json::Value::Null, serde_json::json!("b".repeat(64))] {
+            let md = HashMap::from([("superseded_by".to_string(), v)]);
+            let err = reject_reserved_metadata(&md).unwrap_err();
+            assert!(err.contains("metadata.superseded_by"), "{err}");
+            assert!(err.contains("supersede"), "{err}");
+        }
+        let ok = HashMap::from([("importance".to_string(), serde_json::json!(0.7))]);
+        assert!(reject_reserved_metadata(&ok).is_ok());
+    }
+
+    #[test]
+    fn patch_validate_rejects_reserved_metadata_key() {
+        // Null too: a PATCH null deletes the key, which would un-supersede.
+        for v in [serde_json::Value::Null, serde_json::json!("b".repeat(64))] {
+            let p = PatchMemoryRequest {
+                metadata: Some(HashMap::from([("superseded_by".to_string(), v)])),
+                ..Default::default()
+            };
+            assert!(p.validate().unwrap_err().contains("metadata.superseded_by"));
+        }
     }
 
     #[test]

@@ -180,6 +180,8 @@ Content-Type: application/json
 
 Required: `content`. Optional: `tags`, `memory_type` (`note`|`decision`|`task`|`reference`), `metadata`, `client_hostname`, `summary`, `dedup_threshold`.
 
+`metadata.superseded_by` is reserved: the server sets it on supersede and merge. A request carrying it returns `400` and stores nothing.
+
 **Response:**
 
 ```json
@@ -240,6 +242,8 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" \
 
 Superseded memories return `200` with `memory.metadata.superseded_by` populated.
 
+With `output=full` (the default) or `output=both`, a memory whose supersession was ever reversed also carries `memory.supersession_log`: its audit trail, oldest first, one entry per [`POST /unsupersede`](#post-unsupersede) with `superseded_by`, `supersession_reason`, `unsuperseded_at`, `unsuperseded_via` and `reason` (the shape documented under [MCP: `memory_unsupersede`](./mcp-tools.md#memory_unsupersede)). Entries come back exactly as stored. The key is absent when nothing was ever reversed, and `output=summary`, `POST /search` and the `PATCH` reply never carry it. Like the rest of the memory, it is visible to every principal that may read the memory, read-only and OIDC bearers included.
+
 ## `PATCH /memories/{content_hash}`
 
 Update mutable fields on one memory. At least one field must be present.
@@ -255,6 +259,8 @@ Content-Type: application/json
 ```
 
 Updatable fields: `summary`, `tags`, `metadata`. Content and `content_hash` are immutable by design — to change content, store a new memory and supersede the old.
+
+`metadata.superseded_by` is reserved and cannot be patched, not even to `null`: only supersede, merge and unsupersede change supersession state. A patch carrying it returns `400` and changes nothing.
 
 Changing `summary` also drops the stored summary embedding (the hybrid-search boost vector) so the two never disagree; the boost returns when the summary is next generated server-side.
 

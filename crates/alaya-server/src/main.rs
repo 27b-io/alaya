@@ -18,6 +18,8 @@ mod oidc;
 mod telemetry;
 #[cfg(test)]
 mod testkit;
+#[cfg(test)]
+mod testlog;
 mod wellknown;
 
 use axum::{
@@ -2920,6 +2922,11 @@ async fn store(
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(params): Json<StoreParams>,
 ) -> (StatusCode, Json<Value>) {
+    // Refused here, before dispatch, so the caller gets a 400 rather than an
+    // op error in a 200 body.
+    if let Err(msg) = params.validate() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg})));
+    }
     let read_only = WritePolicy::read_only_for(principal);
     let (tx, rx) = oneshot::channel();
     h.call(
@@ -4662,8 +4669,9 @@ mod wedge_tests {
 
     /// VectorStorage whose `delete`, `count` and `get_batch` blackhole — models a
     /// backend whose pod IP vanished without an RST. `get_batch` can instead
-    /// answer a fixed batch, so a judge task can run to completion. Every
-    /// other method panics: no test exercises them.
+    /// answer a fixed batch, so a judge task can run to completion, and then
+    /// `get_by_hash` and `patch_memory` answer from it too. Every other
+    /// method panics: no test exercises them.
     struct HangVectors {
         batch: Option<Vec<Memory>>,
     }
@@ -4681,8 +4689,12 @@ mod wedge_tests {
         async fn store(&self, _memory: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             unimplemented!()
         }
-        async fn get_by_hash(&self, _content_hash: &str) -> Result<Option<Memory>> {
-            unimplemented!()
+        async fn get_by_hash(&self, content_hash: &str) -> Result<Option<Memory>> {
+            let batch = self.batch.as_ref().expect("no batch: get_by_hash unused");
+            Ok(batch
+                .iter()
+                .find(|m| m.content_hash == content_hash)
+                .cloned())
         }
         async fn set_generated_summary(
             &self,
@@ -4710,10 +4722,13 @@ mod wedge_tests {
         }
         async fn patch_memory(
             &self,
-            _content_hash: &str,
+            content_hash: &str,
             _patch: &PatchMemoryRequest,
         ) -> Result<Memory> {
-            unimplemented!()
+            Ok(self
+                .get_by_hash(content_hash)
+                .await?
+                .expect("patched memory"))
         }
         async fn search_by_vector(
             &self,
@@ -4977,6 +4992,66 @@ mod wedge_tests {
             Box::new(StubConsolidation),
             None,
         )
+    }
+
+    /// `supersession_log` reaches the GET /memories/{hash} (and MCP
+    /// `get_memory`) reply and no other: PATCH replies with the whole
+    /// `Memory` serialized, so the log must not ride along there.
+    #[tokio::test]
+    async fn supersession_log_is_in_the_get_memory_reply_and_not_the_patch_reply() {
+        let hash = "a".repeat(64);
+        let entry = json!({"reason": "wrong merge", "unsuperseded_via": "operator:mcp"});
+        let mut mem: Memory = serde_json::from_value(json!({
+            "content": "c", "content_hash": hash, "tags": [], "memory_type": "note",
+            "created_at": 0.0, "updated_at": 0.0,
+        }))
+        .expect("memory");
+        mem.supersession_log = Some(vec![entry.clone()]);
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::channel::<Cmd>(8);
+                tokio::task::spawn_local(service_worker(
+                    rx,
+                    stub_service(Some(vec![mem])),
+                    Arc::new(AtomicU64::new(0)),
+                    WorkerLimits::default(),
+                ));
+
+                let (gtx, grx) = oneshot::channel();
+                tx.send(Cmd {
+                    inner: CmdInner::GetMemory {
+                        hash: hash.clone(),
+                        output: OutputMode::Full,
+                        reply: gtx,
+                    },
+                    span: tracing::Span::none(),
+                })
+                .await
+                .unwrap();
+                let got = grx.await.expect("get reply");
+                assert_eq!(got["memory"]["supersession_log"], json!([entry]), "{got}");
+
+                let (ptx, prx) = oneshot::channel();
+                tx.send(Cmd {
+                    inner: CmdInner::Patch {
+                        hash: hash.clone(),
+                        patch: PatchMemoryRequest {
+                            tags: Some(vec!["t".into()]),
+                            ..Default::default()
+                        },
+                        reply: ptx,
+                    },
+                    span: tracing::Span::none(),
+                })
+                .await
+                .unwrap();
+                let patched = prx.await.expect("patch reply");
+                assert_eq!(patched["content_hash"], json!(hash), "{patched}");
+                assert!(patched.get("supersession_log").is_none(), "{patched}");
+            })
+            .await;
     }
 
     /// `GET /stats` runs off the loop: while its aggregates hang, the
@@ -5328,6 +5403,61 @@ mod wedge_tests {
     }
 
     // ─── /health split (#77) ────────────────────────────────────────────────
+
+    /// Store and PATCH refuse a caller-set `metadata.superseded_by` with a 400
+    /// naming the key, before dispatch — the worker never sees it, so nothing
+    /// is written (LAB-6891). PATCH covers null too: null deletes the key.
+    #[tokio::test]
+    async fn rest_writes_refuse_reserved_metadata_key() {
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let app = protected_router(ServiceHandle { tx }, test_auth_state());
+        let hash = "a".repeat(64);
+        let cases = [
+            (
+                "POST",
+                "/store".to_string(),
+                json!({"content": "live fact", "metadata": {"superseded_by": "b".repeat(64)}}),
+            ),
+            (
+                "PATCH",
+                format!("/memories/{hash}"),
+                json!({"metadata": {"superseded_by": null}}),
+            ),
+            (
+                "PATCH",
+                format!("/memories/{hash}"),
+                json!({"metadata": {"superseded_by": "b".repeat(64)}}),
+            ),
+        ];
+        for (method, uri, body) in cases {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(&uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{method} {uri}");
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            let err = v["error"].as_str().unwrap_or_default();
+            assert!(
+                err.contains("metadata.superseded_by"),
+                "{method} {uri}: {v}"
+            );
+            assert!(rx.try_recv().is_err(), "{method} {uri} reached the worker");
+        }
+    }
 
     const TEST_KEY: &str = "test-api-key";
 

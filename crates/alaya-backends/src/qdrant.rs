@@ -842,6 +842,7 @@ fn parse_payload(payload: &Value) -> Option<Memory> {
                     .filter_map(|v| v.as_f64().map(|f| f as f32))
                     .collect()
             }),
+        supersession_log: payload.get(SUPERSESSION_LOG).cloned().map(log_entries),
     })
 }
 
@@ -866,7 +867,8 @@ fn top_level_payload(updates: &MetadataUpdate) -> serde_json::Map<String, Value>
     payload
 }
 
-/// Build the payload JSON for upsert from a Memory struct.
+/// Build the payload JSON for upsert from a Memory struct. Never writes
+/// `supersession_log`: on a re-store `carry_over` alone keeps it.
 fn memory_to_payload(memory: &Memory) -> Value {
     let mut payload = json!({
         "content": memory.content,
@@ -906,6 +908,16 @@ fn memory_to_payload(memory: &Memory) -> Value {
 /// `VectorStorage::reverse_supersession`). Server-maintained.
 const SUPERSESSION_LOG: &str = "supersession_log";
 
+/// The entries of a stored `supersession_log`, in stored order. An audit
+/// trail is never dropped, even one in a shape no writer makes: a value that
+/// is not an array is one entry.
+fn log_entries(log: Value) -> Vec<Value> {
+    match log {
+        Value::Array(entries) => entries,
+        other => vec![other],
+    }
+}
+
 /// The whole payload that reversing a supersession leaves on a point that
 /// held `prev`: no marker, no `supersession_reason`, and one more
 /// `supersession_log` entry recording both. Also returns the reason removed.
@@ -919,12 +931,10 @@ fn unsupersede_payload(
         .and_then(Value::as_object_mut)
         .and_then(|m| m.remove("superseded_by"));
     let reason = obj.remove("supersession_reason");
-    // An audit trail is never dropped, even one in a shape no writer makes.
-    let mut log = match obj.remove(SUPERSESSION_LOG) {
-        None => Vec::new(),
-        Some(Value::Array(entries)) => entries,
-        Some(other) => vec![other],
-    };
+    let mut log = obj
+        .remove(SUPERSESSION_LOG)
+        .map(log_entries)
+        .unwrap_or_default();
     log.push(json!({
         "superseded_by": marker,
         "supersession_reason": reason,
@@ -2077,6 +2087,7 @@ mod tests {
             encoding_context: None,
             provenance: None,
             summary_embedding: None,
+            supersession_log: None,
         };
         let payload = memory_to_payload(&mem);
         assert_eq!(payload["content"], "test content");
@@ -2084,6 +2095,21 @@ mod tests {
         assert_eq!(payload["access_count"], 5);
         assert!(payload.get("metadata").is_none());
         assert_eq!(payload["summary"], "summary");
+    }
+
+    /// The log is read-only on the write path: a store neither writes nor
+    /// clears it, whatever the `Memory` carries; `carry_over` alone keeps it.
+    #[test]
+    fn memory_to_payload_never_writes_the_supersession_log() {
+        let payload = json!({
+            "content": "c",
+            "content_hash": "c".repeat(64),
+            "supersession_log": [{"reason": "wrong merge"}],
+        });
+        let mem = parse_payload(&payload).expect("parses");
+        assert!(mem.supersession_log.is_some(), "read side sees it");
+        let written = memory_to_payload(&mem);
+        assert!(written.get("supersession_log").is_none(), "{written}");
     }
 
     #[test]

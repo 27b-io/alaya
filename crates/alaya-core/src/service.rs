@@ -141,6 +141,18 @@ pub struct StoreParams {
     pub dedup_threshold: Option<f64>,
 }
 
+impl StoreParams {
+    /// Caller-input checks, run by `store_memory_with` and — so a refusal is
+    /// a 400 / -32602 rather than an op error in a 200 body — by the REST and
+    /// MCP handlers before dispatch.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        match &self.metadata {
+            Some(md) => alaya_types::memory::reject_reserved_metadata(md),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Relation action parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelationParams {
@@ -374,6 +386,7 @@ impl MemoryService {
         if params.content.is_empty() {
             return Err(AlayaError::Validation("content cannot be empty".into()));
         }
+        params.validate().map_err(AlayaError::Validation)?;
 
         let now = (self.clock)();
         let content_hash = generate_content_hash(&params.content);
@@ -462,6 +475,7 @@ impl MemoryService {
             encoding_context: Some(enc_ctx),
             provenance: Some(prov),
             summary_embedding: None,
+            supersession_log: None,
         };
 
         // A read-only principal's store is additive only. Re-storing content
@@ -1585,18 +1599,9 @@ impl MemoryService {
         }
         // The supersession marker changes only through supersede / merge and
         // unsupersede, which keep its edge, reason and audit entry. A patch
-        // that sets or deletes it (null deletes) would keep none of them.
-        if patch
-            .metadata
-            .as_ref()
-            .is_some_and(|m| m.contains_key("superseded_by"))
-        {
-            return Err(AlayaError::Validation(
-                "metadata.superseded_by is server-maintained: use memory_supersede / \
-                 memory_unsupersede"
-                    .into(),
-            ));
-        }
+        // that sets or deletes it (null deletes) would keep none of them, so
+        // the one reserved-key check runs here as well as in the REST handler.
+        patch.validate().map_err(AlayaError::Validation)?;
 
         let mem = self.vectors.patch_memory(content_hash, patch).await?;
 
@@ -2672,7 +2677,9 @@ impl MemoryService {
     /// Superseded memories are always returned — the caller asked for a
     /// specific hash, typically to inspect before a supersede/delete, so
     /// hiding it would defeat the purpose. `metadata.superseded_by` signals
-    /// superseded status. Pure read: no access-count mutation.
+    /// superseded status, and with `full` or `both` output `supersession_log`
+    /// lists the supersessions reversed so far. Pure read: no access-count
+    /// mutation.
     #[tracing::instrument(skip(self))]
     pub async fn get_memory(&self, content_hash: &str, output: OutputMode) -> Result<Value> {
         if !alaya_types::memory::validate_content_hash(content_hash) {
@@ -2682,10 +2689,17 @@ impl MemoryService {
         }
 
         match self.vectors.get_by_hash(content_hash).await? {
-            Some(memory) => Ok(serde_json::json!({
-                "found": true,
-                "memory": format_memory_result(&memory, 1.0, output),
-            })),
+            Some(memory) => {
+                let mut v = format_memory_result(&memory, 1.0, output);
+                // Added here, not in format_memory_result, which search
+                // shares: the audit trail is for an exact lookup only.
+                if let (Some(log), OutputMode::Full | OutputMode::Both) =
+                    (&memory.supersession_log, output)
+                {
+                    v["supersession_log"] = serde_json::json!(log);
+                }
+                Ok(serde_json::json!({"found": true, "memory": v}))
+            }
             None => Ok(serde_json::json!({
                 "found": false,
                 "content_hash": content_hash,
@@ -3105,6 +3119,7 @@ mod tests {
             encoding_context: None,
             provenance: None,
             summary_embedding: None,
+            supersession_log: None,
         }
     }
 
@@ -3750,6 +3765,7 @@ mod tests {
                 encoding_context: None,
                 provenance: None,
                 summary_embedding: None,
+                supersession_log: None,
             }
         }
     }
@@ -4280,6 +4296,7 @@ mod tests {
                 encoding_context: None,
                 provenance: None,
                 summary_embedding: None,
+                supersession_log: None,
             },
             score,
         }
@@ -4709,6 +4726,92 @@ mod tests {
         assert_eq!(m.access_count, 7, "access_count must survive re-store");
         assert_eq!(m.access_timestamps, vec![first_now + 1.0, first_now + 2.0]);
         assert_eq!(m.updated_at, first_now + 3600.0, "updated_at moves to now");
+    }
+
+    /// A caller-set supersession marker is refused before anything is
+    /// written, for a new memory and for a re-store alike (LAB-6891).
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_refuses_caller_supplied_superseded_by() {
+        let stored = Rc::new(RefCell::new(HashMap::new()));
+        let svc = MemoryService::with_clock(
+            Box::new(MockVectorsPersisting {
+                stored: stored.clone(),
+                raw_only: Default::default(),
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            mock_clock,
+        );
+        let params = StoreParams {
+            content: "live fact".into(),
+            tags: None,
+            memory_type: None,
+            metadata: Some(HashMap::from([(
+                "superseded_by".to_string(),
+                serde_json::json!("b".repeat(64)),
+            )])),
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: None,
+        };
+
+        let err = svc
+            .store_memory(params)
+            .await
+            .expect_err("a caller-set superseded_by must be refused");
+        assert!(
+            matches!(&err, AlayaError::Validation(m) if m.contains("metadata.superseded_by")),
+            "got {err:?}"
+        );
+        assert!(stored.borrow().is_empty(), "nothing may be stored");
+    }
+
+    /// The core PATCH entry point refuses the marker too, so a caller that
+    /// skips the REST handler's check cannot un-supersede (LAB-6891).
+    #[tokio::test(flavor = "current_thread")]
+    async fn patch_refuses_caller_supplied_superseded_by() {
+        let stored = Rc::new(RefCell::new(HashMap::new()));
+        let svc = MemoryService::with_clock(
+            Box::new(MockVectorsPersisting {
+                stored: stored.clone(),
+                raw_only: Default::default(),
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            mock_clock,
+        );
+        let hash = generate_content_hash("live fact");
+        svc.store_memory(StoreParams {
+            content: "live fact".into(),
+            tags: None,
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: None,
+        })
+        .await
+        .expect("store");
+
+        let patch = PatchMemoryRequest {
+            metadata: Some(HashMap::from([(
+                "superseded_by".to_string(),
+                serde_json::Value::Null,
+            )])),
+            ..Default::default()
+        };
+        let err = svc
+            .patch_memory(&hash, &patch)
+            .await
+            .expect_err("a caller-set superseded_by must be refused");
+        assert!(
+            matches!(&err, AlayaError::Validation(m) if m.contains("metadata.superseded_by")),
+            "got {err:?}"
+        );
     }
 
     /// A read-only principal may add memories but never reshape an existing
@@ -5372,6 +5475,7 @@ mod tests {
                 encoding_context: None,
                 provenance: None,
                 summary_embedding: None,
+                supersession_log: None,
             },
             score,
         }
@@ -5564,6 +5668,53 @@ mod tests {
         // Exact lookup returns superseded memories — caller asked for this hash.
         assert_eq!(v["found"], true);
         assert_eq!(v["memory"]["metadata"]["superseded_by"], "e".repeat(64));
+    }
+
+    /// The reversal history rides on an exact lookup that returns content
+    /// (`full`, `both`), entries as stored, and nowhere else: not on summary
+    /// output, and not on `format_memory_result`, which every search shares.
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_memory_returns_supersession_log_with_full_and_both_output() {
+        let hash = "f".repeat(64);
+        let entry = serde_json::json!({
+            "superseded_by": "e".repeat(64),
+            "supersession_reason": null,
+            "unsuperseded_at": 2000.0,
+            "unsuperseded_via": "operator:mcp",
+            "reason": "wrong merge",
+        });
+        let mut mem = make_scored_memory(&hash, "restored decision", 0.0).memory;
+        mem.supersession_log = Some(vec![entry.clone(), serde_json::json!({"reason": "x"})]);
+        for output in [OutputMode::Full, OutputMode::Summary, OutputMode::Both] {
+            let v = format_memory_result(&mem, 1.0, output);
+            assert!(v.get("supersession_log").is_none(), "{output:?}: {v}");
+        }
+        let svc = service_with_memory(Some(mem));
+
+        for output in [OutputMode::Full, OutputMode::Both] {
+            let v = svc.get_memory(&hash, output).await.expect("found");
+            assert_eq!(
+                v["memory"]["supersession_log"],
+                serde_json::json!([entry, {"reason": "x"}]),
+                "{output:?}"
+            );
+        }
+        let v = svc.get_memory(&hash, OutputMode::Summary).await.unwrap();
+        assert!(v["memory"].get("supersession_log").is_none(), "{v}");
+    }
+
+    /// A memory never reversed carries no log key, as full output omits an
+    /// absent `summary`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_memory_without_a_log_omits_the_key() {
+        let hash = "a".repeat(64);
+        let mem = make_scored_memory(&hash, "never reversed", 0.0).memory;
+        let svc = service_with_memory(Some(mem));
+
+        for output in [OutputMode::Full, OutputMode::Both] {
+            let v = svc.get_memory(&hash, output).await.unwrap();
+            assert!(v["memory"].get("supersession_log").is_none(), "{v}");
+        }
     }
 
     // ─── Cross-encoder rerank tests ──────────────────────────────────────
@@ -6721,6 +6872,7 @@ mod tests {
                     encoding_context: None,
                     provenance: None,
                     summary_embedding: None,
+                    supersession_log: None,
                 }
             })
             .collect()
@@ -7062,6 +7214,7 @@ mod tests {
                 encoding_context: None,
                 provenance: None,
                 summary_embedding: None,
+                supersession_log: None,
             }
         }
 

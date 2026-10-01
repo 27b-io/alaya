@@ -18,7 +18,10 @@ mod common;
 use std::collections::HashMap;
 
 use alaya_backends::{ReversalOutcome, ReversalRecord, VectorStorage, qdrant::QdrantClient};
-use alaya_types::{AlayaError, memory::MetadataUpdate};
+use alaya_types::{
+    AlayaError,
+    memory::{Memory, MetadataUpdate},
+};
 use common::{FakeQdrant, PAYLOAD_PATH, external_write, is_conditional, retrieves, writes};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
@@ -632,4 +635,68 @@ async fn unsupersede_racing_a_re_supersede_stands_down() {
     assert_eq!(stored["metadata"]["superseded_by"], json!(hash('c')));
     assert_eq!(stored["supersession_reason"], json!("newer"));
     assert!(stored.get("supersession_log").is_none(), "{stored}");
+}
+
+// ─── Reading the log back: get_by_hash (LAB-6929) ────────────────────────────
+
+/// `payload`, stored as memory `c`, read back through `get_by_hash`.
+async fn read_back(c: char, payload: Value) -> Memory {
+    let (server, fake) = fake_with(&[]).await;
+    fake.insert(&id(c), payload);
+    client_for(&server)
+        .get_by_hash(&hash(c))
+        .await
+        .expect("read succeeds")
+        .expect("memory found")
+}
+
+/// The log a reversal writes is the log a read returns: one entry, with the
+/// caller's reason and every key the reversal stored.
+#[tokio::test]
+async fn reversal_log_is_read_back_by_get_by_hash() {
+    let (server, fake) = fake_with(&[('c', None)]).await;
+    fake.insert(&id('a'), superseded_payload('a', 'b', Some("r1")));
+    let client = client_for(&server);
+
+    client
+        .reverse_supersession(&hash('a'), &json!(hash('b')), &reversal())
+        .await
+        .expect("clear succeeds");
+    let mem = client.get_by_hash(&hash('a')).await.unwrap().unwrap();
+    assert_eq!(
+        mem.supersession_log,
+        Some(vec![json!({
+            "superseded_by": hash('b'),
+            "supersession_reason": "merged",
+            "unsuperseded_at": 2000.0,
+            "unsuperseded_via": "operator:test",
+            "reason": "wrong merge",
+        })])
+    );
+
+    let never_reversed = client.get_by_hash(&hash('c')).await.unwrap().unwrap();
+    assert_eq!(never_reversed.supersession_log, None, "no log, no field");
+}
+
+/// A log in a shape no writer makes still reads back whole and never hides
+/// the memory: a value that is not an array is one entry, as the next
+/// reversal treats it, and an entry missing keys comes back as stored.
+#[tokio::test]
+async fn malformed_log_reads_back_and_never_hides_the_memory() {
+    let mut payload = memory_payload('a', None);
+    payload["supersession_log"] = json!({"reason": "not an array"});
+    assert_eq!(
+        read_back('a', payload).await.supersession_log,
+        Some(vec![json!({"reason": "not an array"})])
+    );
+
+    let mut payload = memory_payload('a', None);
+    payload["supersession_log"] = json!([{"superseded_by": hash('b'), "reason": "first"}, 7]);
+    assert_eq!(
+        read_back('a', payload).await.supersession_log,
+        Some(vec![
+            json!({"superseded_by": hash('b'), "reason": "first"}),
+            json!(7),
+        ])
+    );
 }
