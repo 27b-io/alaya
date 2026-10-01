@@ -178,6 +178,8 @@ Content-Type: application/json
 
 Required: `content`. Optional: `tags`, `memory_type` (`note`|`decision`|`task`|`reference`), `metadata`, `client_hostname`, `summary`, `dedup_threshold`.
 
+`metadata.superseded_by` is reserved: the server sets it on supersede and merge. A request carrying it returns `400` and stores nothing.
+
 **Response:**
 
 ```json
@@ -253,6 +255,8 @@ Content-Type: application/json
 ```
 
 Updatable fields: `summary`, `tags`, `metadata`. Content and `content_hash` are immutable by design — to change content, store a new memory and supersede the old.
+
+`metadata.superseded_by` is reserved and cannot be patched, not even to `null`: only supersede and merge change supersession state. A patch carrying it returns `400` and changes nothing.
 
 Changing `summary` also drops the stored summary embedding (the hybrid-search boost vector) so the two never disagree; the boost returns when the summary is next generated server-side.
 
