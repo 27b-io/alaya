@@ -293,6 +293,28 @@ def check_judge_passes() -> None:
             votes,
         )
         assert all(len(vs) == 1 for vs in votes) and abs(ledger.usd() - 1.0) < 1e-9
+        # ... but with passes left after the first chunk, the projection applies.
+        votes, ledger = [[] for _ in pairs[:20]], tune.Ledger()
+        try:
+            tune.judge_passes(
+                None,
+                "claude-sonnet-5",
+                "p",
+                memories,
+                pairs[:20],
+                2,
+                "default",
+                ledger,
+                1.5,
+                votes,
+            )
+        except RuntimeError as e:
+            assert "project" in str(e), e
+        else:
+            raise AssertionError(
+                "a run of 2 passes projected at $2 must stop under a $1.50 cap"
+            )
+        assert all(len(vs) == 1 for vs in votes) and abs(ledger.usd() - 1.0) < 1e-9
         # Uncapped, every pair gets every pass.
         votes, _, err = run(lambda x, n: verdict(), 1e9)
         assert err is None and all(len(vs) == 3 for vs in votes)
