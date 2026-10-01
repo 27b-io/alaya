@@ -86,7 +86,10 @@ pub trait VectorStorage {
     /// `supersession_reason`, `supersession_log`, `metadata.superseded_by`, and
     /// `summary_embedding` for as long as `summary` is unchanged — so a
     /// re-store never zeroes ranking inputs, resurrects a superseded memory,
-    /// or silently drops derived retrieval state (alaya#86). Every other
+    /// or silently drops derived retrieval state (alaya#86). The marker is
+    /// the stored one even when absent: a caller's `metadata.superseded_by`
+    /// is dropped on a re-store, so a stale copy cannot re-hide a reversed
+    /// memory (LAB-6876). Every other
     /// payload field is written from `memory` as given and fields absent on
     /// `memory` are removed; `updated_at` is therefore whatever the caller
     /// set. The write is conditional on the record the carry-over read (see

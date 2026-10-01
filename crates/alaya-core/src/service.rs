@@ -1583,6 +1583,20 @@ impl MemoryService {
         if !alaya_types::memory::validate_content_hash(content_hash) {
             return Err(AlayaError::Validation("invalid content_hash format".into()));
         }
+        // The supersession marker changes only through supersede / merge and
+        // unsupersede, which keep its edge, reason and audit entry. A patch
+        // that sets or deletes it (null deletes) would keep none of them.
+        if patch
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m.contains_key("superseded_by"))
+        {
+            return Err(AlayaError::Validation(
+                "metadata.superseded_by is server-maintained: use memory_supersede / \
+                 memory_unsupersede"
+                    .into(),
+            ));
+        }
 
         let mem = self.vectors.patch_memory(content_hash, patch).await?;
 
@@ -8659,6 +8673,27 @@ mod tests {
             1,
             "the reversal itself landed"
         );
+    }
+
+    /// The marker is server-owned below the surfaces too: a patch that sets
+    /// it or deletes it (null) is refused before storage is touched, so a
+    /// reversal cannot be undone, nor a memory hidden, without the audit trail.
+    #[tokio::test(flavor = "current_thread")]
+    async fn patch_refuses_the_supersession_marker_set_or_deleted() {
+        let (a, b) = (h('a'), h('b'));
+        let ledger = Ledger::with(&[&a, &b]);
+        let svc = ledger.service();
+        svc.memory_supersede(&a, &b, "duplicate").await.unwrap();
+        for v in [Value::Null, serde_json::json!(h('c'))] {
+            let patch = PatchMemoryRequest {
+                metadata: Some(HashMap::from([("superseded_by".to_string(), v)])),
+                ..Default::default()
+            };
+            // LedgerVectors::patch_memory panics: reaching it fails the test.
+            let err = svc.patch_memory(&a, &patch).await.unwrap_err();
+            assert!(matches!(err, AlayaError::Validation(_)), "{err:?}");
+        }
+        assert_eq!(ledger.marker(&a), Some(serde_json::json!(b)));
     }
 
     /// A marker that names no memory (a legacy shape) still hides the memory

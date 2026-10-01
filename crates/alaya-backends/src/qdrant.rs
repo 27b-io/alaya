@@ -950,11 +950,18 @@ fn carry_over(payload: &mut Value, prev: &Value) {
             payload[key] = v.clone();
         }
     }
-    // The supersession marker is written by mark_superseded, never by a store
-    // caller, so it is server-maintained too: a re-store must not resurrect a
-    // superseded memory (alaya-core's is_superseded reads exactly this key).
-    if let Some(sb) = prev.pointer("/metadata/superseded_by") {
-        payload["metadata"]["superseded_by"] = sb.clone();
+    // The supersession marker is written by mark_superseded and removed by
+    // reverse_supersession, never by a store caller, so on a re-store it is
+    // the stored one, present or absent: a re-store neither resurrects a
+    // superseded memory (alaya-core's is_superseded reads exactly this key)
+    // nor re-hides a reversed one from a caller's stale copy of its metadata.
+    match prev.pointer("/metadata/superseded_by") {
+        Some(sb) => payload["metadata"]["superseded_by"] = sb.clone(),
+        None => {
+            if let Some(md) = payload.get_mut("metadata").and_then(Value::as_object_mut) {
+                md.remove("superseded_by");
+            }
+        }
     }
     // summary_embedding is derived server-side from the summary text. Keep it
     // only while that text is unchanged, so a re-store neither drops it
