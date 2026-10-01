@@ -171,6 +171,12 @@ struct CreateSystemEdgeReq<'a> {
 }
 
 #[derive(Serialize)]
+struct DeleteIncomingSystemEdgesReq<'a> {
+    target: &'a str,
+    relation_type: &'a str,
+}
+
+#[derive(Serialize)]
 struct LimitReq {
     limit: usize,
 }
@@ -238,6 +244,11 @@ struct BatchCreatedResp {
 struct DeletedResp {
     #[allow(dead_code)]
     deleted: bool,
+}
+
+#[derive(Deserialize)]
+struct SourcesResp {
+    sources: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -474,6 +485,26 @@ impl GraphService for GraphHttpClient {
 
         let body: CreatedResp = handle_response(resp).await?;
         Ok(body.created)
+    }
+
+    async fn delete_incoming_system_edges(
+        &self,
+        dst: &str,
+        rel: SystemRelationType,
+    ) -> Result<Vec<String>> {
+        let resp = self
+            .client
+            .post(format!("{}/edges/delete-system-incoming", self.base_url))
+            .json(&DeleteIncomingSystemEdgesReq {
+                target: dst,
+                relation_type: rel.cypher_label(),
+            })
+            .send()
+            .await
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
+
+        let body: SourcesResp = handle_response(resp).await?;
+        Ok(body.sources)
     }
 
     #[tracing::instrument(skip(self, edges), fields(n = edges.len()))]

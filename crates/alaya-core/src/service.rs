@@ -57,8 +57,8 @@ where
 use tracing;
 
 use alaya_backends::{
-    ConsolidationService, EmbeddingProvider, GraphService, HebbianService, RerankingService,
-    StoreMode, SummaryProvider, VectorStorage,
+    ClearSupersession, ConsolidationService, EmbeddingProvider, GraphService, HebbianService,
+    RerankingService, StoreMode, SummaryProvider, SupersessionReversal, VectorStorage,
 };
 use alaya_types::{
     AlayaError, Result,
@@ -216,6 +216,14 @@ pub const SHADOW_LOG_TARGET: &str = "alaya::judge";
 /// Upper bound on `resolved_via` (LAB-3885): a short principal tag, not a
 /// free-text reason — the reason for a resolution is the verdict's.
 const MAX_RESOLVED_VIA_LEN: usize = 128;
+
+/// Cap on a `memory_unsupersede` reason: it is stored on the memory for good.
+pub const MAX_UNSUPERSEDE_REASON_LEN: usize = 2000;
+
+/// `resolved_via` stamped on the CONTRADICTS pair of a reversed supersession
+/// (LAB-6876), so an automatic apply of the judge's verdict can tell the pair
+/// is settled and never re-applies it.
+pub const UNSUPERSEDE_RESOLVED_VIA: &str = "unsupersede";
 
 /// Verdict filter applied by `memory_contradictions` when the caller passes
 /// none: genuine conflicts plus pairs the judge has not seen yet. Callers
@@ -1894,6 +1902,156 @@ impl MemoryService {
         }
     }
 
+    // ─── Tool: memory_unsupersede (LAB-6876) ────────────────────────────
+
+    /// Reverse a supersession: `content_hash` returns to every search path,
+    /// and the reversal is recorded on the memory (`supersession_log`).
+    ///
+    /// Three writes, ordered so a retry converges — the marker is what every
+    /// read path consults, so it goes last:
+    ///
+    /// 1. the CONTRADICTS pair between the memory and the survivor its marker
+    ///    names is stamped `keep_both` (either direction), `resolved_via =
+    ///    unsupersede`, so a later judge run cannot re-apply the reversed
+    ///    supersession;
+    /// 2. every SUPERSEDES edge into the memory is deleted. Normally that is
+    ///    the one from the survivor; an older one exists only when the memory
+    ///    was superseded again without a reversal, and was already stale.
+    ///    Edges out of the memory stay, so a chain is reversed one link at a
+    ///    time: in A→B→C, unsuperseding B leaves A superseded by B, and
+    ///    unsuperseding A leaves B superseded by C;
+    /// 3. the marker and `supersession_reason` are removed and the audit entry
+    ///    appended, in one write that applies only while the marker is still
+    ///    the one read before step 1 (`VectorStorage::clear_superseded_by`).
+    ///
+    /// A graph failure in step 1 or 2 is an error before the marker is
+    /// touched: the memory stays superseded and the same call can be
+    /// retried. A marker that moved to another survivor meanwhile is left
+    /// whole, its edge restored, and reported as `superseded_by_changed`. A
+    /// memory that is not superseded is `not_superseded`: a typed no-op,
+    /// never a success. Nothing is deleted but SUPERSEDES edges.
+    #[tracing::instrument(skip(self))]
+    pub async fn memory_unsupersede(
+        &self,
+        content_hash: &str,
+        reason: &str,
+        via: &str,
+    ) -> Result<Value> {
+        if !alaya_types::memory::validate_content_hash(content_hash) {
+            return Err(AlayaError::Validation(
+                "invalid content_hash: expected 64-char lowercase SHA-256 hex".into(),
+            ));
+        }
+        let reason = reason.trim();
+        if reason.is_empty() || reason.len() > MAX_UNSUPERSEDE_REASON_LEN {
+            return Err(AlayaError::Validation(format!(
+                "reason is required (1..={MAX_UNSUPERSEDE_REASON_LEN} chars): it is the audit record"
+            )));
+        }
+        let via = via.trim();
+        if via.is_empty() || via.len() > MAX_RESOLVED_VIA_LEN {
+            return Err(AlayaError::Validation(format!(
+                "unsuperseded_via is required (1..={MAX_RESOLVED_VIA_LEN} chars, e.g. operator:console)"
+            )));
+        }
+
+        let memory = self
+            .vectors
+            .get_by_hash(content_hash)
+            .await?
+            .ok_or_else(|| AlayaError::NotFound(format!("memory {content_hash} not found")))?;
+        // Presence, as `is_superseded` reads it: a marker of any shape hides
+        // the memory, so any shape can be reversed.
+        let Some(marker) = memory
+            .metadata
+            .as_ref()
+            .and_then(|md| md.get("superseded_by"))
+            .cloned()
+        else {
+            return Ok(not_superseded(content_hash));
+        };
+        let survivor = marker
+            .as_str()
+            .filter(|s| alaya_types::memory::validate_content_hash(s) && *s != content_hash);
+
+        let now = (self.clock)();
+        let mut pairs_stamped = 0;
+        if let Some(survivor) = survivor {
+            for (a, b) in [(content_hash, survivor), (survivor, content_hash)] {
+                let stamped = self
+                    .graph
+                    .set_contradiction_resolution(
+                        a,
+                        b,
+                        Some(Resolution::KeepBoth),
+                        UNSUPERSEDE_RESOLVED_VIA,
+                        now,
+                    )
+                    .await?;
+                pairs_stamped += usize::from(stamped);
+            }
+        }
+        let edges_removed = self
+            .graph
+            .delete_incoming_system_edges(content_hash, SystemRelationType::Supersedes)
+            .await?;
+
+        let reversal = SupersessionReversal {
+            at: now,
+            via: via.to_string(),
+            reason: reason.to_string(),
+        };
+        match self
+            .vectors
+            .clear_superseded_by(content_hash, &marker, &reversal)
+            .await?
+        {
+            ClearSupersession::Cleared {
+                supersession_reason,
+            } => {
+                tracing::info!(
+                    target: "alaya::supersession",
+                    hash = content_hash,
+                    superseded_by = %marker,
+                    via,
+                    reason,
+                    edges_removed = ?edges_removed,
+                    pairs_stamped,
+                    "supersession reversed"
+                );
+                Ok(serde_json::json!({
+                    "success": true,
+                    "status": "unsuperseded",
+                    "content_hash": content_hash,
+                    "superseded_by": marker,
+                    "supersession_reason": supersession_reason,
+                    "reason": reason,
+                    "unsuperseded_via": via,
+                    "unsuperseded_at": now,
+                    "supersedes_edges_removed": edges_removed,
+                    "contradictions_stamped": pairs_stamped,
+                }))
+            }
+            ClearSupersession::NotSuperseded => Ok(not_superseded(content_hash)),
+            ClearSupersession::SupersededByOther(current) => {
+                if let Some(s) = current
+                    .as_str()
+                    .filter(|s| alaya_types::memory::validate_content_hash(s) && *s != content_hash)
+                {
+                    self.write_supersedes_edges(&[content_hash], s).await;
+                }
+                Ok(serde_json::json!({
+                    "success": false,
+                    "status": "superseded_by_changed",
+                    "content_hash": content_hash,
+                    "superseded_by": current,
+                    "error": "Superseded again while being restored; nothing reversed. \
+                              Inspect the memory and retry if still intended",
+                }))
+            }
+        }
+    }
+
     // ─── Contradiction judge (LAB-3283, Phase 1: advisory) ──────────────
 
     /// Judge one `src -> dst` CONTRADICTS pair, off the request path.
@@ -2689,6 +2847,16 @@ fn is_superseded(m: &Memory) -> bool {
         .is_some()
 }
 
+/// `memory_unsupersede` on a memory with no marker: nothing to reverse.
+fn not_superseded(content_hash: &str) -> Value {
+    serde_json::json!({
+        "success": false,
+        "status": "not_superseded",
+        "content_hash": content_hash,
+        "error": "Memory is not superseded; nothing to reverse",
+    })
+}
+
 /// A supersession that failed part-way (see `mark_superseded`).
 struct SupersedeFailure {
     /// Memories that carry the marker anyway; their edges are written.
@@ -2879,6 +3047,14 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MockVectors {
+        async fn clear_superseded_by(
+            &self,
+            _h: &str,
+            _e: &serde_json::Value,
+            _r: &alaya_backends::SupersessionReversal,
+        ) -> Result<alaya_backends::ClearSupersession> {
+            unimplemented!()
+        }
         async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             Ok((true, "mock".into()))
         }
@@ -2989,6 +3165,13 @@ mod tests {
 
     #[async_trait(?Send)]
     impl GraphService for MockGraph {
+        async fn delete_incoming_system_edges(
+            &self,
+            _d: &str,
+            _r: alaya_types::graph::SystemRelationType,
+        ) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
         async fn ensure_node(&self, _h: &str, _t: f64) -> Result<()> {
             Ok(())
         }
@@ -3486,6 +3669,14 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MockVectorsWithMemories {
+        async fn clear_superseded_by(
+            &self,
+            _h: &str,
+            _e: &serde_json::Value,
+            _r: &alaya_backends::SupersessionReversal,
+        ) -> Result<alaya_backends::ClearSupersession> {
+            unimplemented!()
+        }
         async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             Ok((true, "mock".into()))
         }
@@ -3741,6 +3932,13 @@ mod tests {
 
     #[async_trait(?Send)]
     impl GraphService for MockGraphBatchTracker {
+        async fn delete_incoming_system_edges(
+            &self,
+            _d: &str,
+            _r: alaya_types::graph::SystemRelationType,
+        ) -> Result<Vec<String>> {
+            unimplemented!()
+        }
         async fn ensure_node(&self, _h: &str, _t: f64) -> Result<()> {
             Ok(())
         }
@@ -3864,6 +4062,14 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MockVectorsWithSimilar {
+        async fn clear_superseded_by(
+            &self,
+            _h: &str,
+            _e: &serde_json::Value,
+            _r: &alaya_backends::SupersessionReversal,
+        ) -> Result<alaya_backends::ClearSupersession> {
+            unimplemented!()
+        }
         async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             Ok((true, "mock".into()))
         }
@@ -4205,6 +4411,14 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MockVectorsPersisting {
+        async fn clear_superseded_by(
+            &self,
+            _h: &str,
+            _e: &serde_json::Value,
+            _r: &alaya_backends::SupersessionReversal,
+        ) -> Result<alaya_backends::ClearSupersession> {
+            unimplemented!()
+        }
         async fn store(&self, m: &Memory, mode: StoreMode) -> Result<(bool, String)> {
             let mut stored = self.stored.borrow_mut();
             let exists =
@@ -4793,6 +5007,14 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MockVectorsWithInjection {
+        async fn clear_superseded_by(
+            &self,
+            _h: &str,
+            _e: &serde_json::Value,
+            _r: &alaya_backends::SupersessionReversal,
+        ) -> Result<alaya_backends::ClearSupersession> {
+            unimplemented!()
+        }
         async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             Ok((true, "mock".into()))
         }
@@ -4883,6 +5105,13 @@ mod tests {
 
     #[async_trait(?Send)]
     impl GraphService for MockGraphWithActivation {
+        async fn delete_incoming_system_edges(
+            &self,
+            _d: &str,
+            _r: alaya_types::graph::SystemRelationType,
+        ) -> Result<Vec<String>> {
+            unimplemented!()
+        }
         async fn ensure_node(&self, _h: &str, _t: f64) -> Result<()> {
             Ok(())
         }
@@ -5561,6 +5790,14 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MergeVectors {
+        async fn clear_superseded_by(
+            &self,
+            _h: &str,
+            _e: &serde_json::Value,
+            _r: &alaya_backends::SupersessionReversal,
+        ) -> Result<alaya_backends::ClearSupersession> {
+            unimplemented!()
+        }
         async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             Ok((true, "mock".into()))
         }
@@ -5694,6 +5931,13 @@ mod tests {
 
     #[async_trait(?Send)]
     impl GraphService for MergeGraph {
+        async fn delete_incoming_system_edges(
+            &self,
+            _d: &str,
+            _r: alaya_types::graph::SystemRelationType,
+        ) -> Result<Vec<String>> {
+            unimplemented!()
+        }
         async fn ensure_node(&self, _h: &str, _t: f64) -> Result<()> {
             Ok(())
         }
@@ -6148,6 +6392,14 @@ mod tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for MockVectorsCorpus {
+        async fn clear_superseded_by(
+            &self,
+            _h: &str,
+            _e: &serde_json::Value,
+            _r: &alaya_backends::SupersessionReversal,
+        ) -> Result<alaya_backends::ClearSupersession> {
+            unimplemented!()
+        }
         async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             Ok((true, "mock".into()))
         }
@@ -6671,6 +6923,14 @@ mod tests {
 
         #[async_trait(?Send)]
         impl VectorStorage for PairVectors {
+            async fn clear_superseded_by(
+                &self,
+                _h: &str,
+                _e: &serde_json::Value,
+                _r: &alaya_backends::SupersessionReversal,
+            ) -> Result<alaya_backends::ClearSupersession> {
+                unimplemented!()
+            }
             async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
                 unreachable!("judge must never write to the vector store")
             }
@@ -6765,6 +7025,13 @@ mod tests {
 
         #[async_trait(?Send)]
         impl GraphService for RecordingGraph {
+            async fn delete_incoming_system_edges(
+                &self,
+                _d: &str,
+                _r: alaya_types::graph::SystemRelationType,
+            ) -> Result<Vec<String>> {
+                unimplemented!()
+            }
             async fn ensure_node(&self, _h: &str, _t: f64) -> Result<()> {
                 unimplemented!()
             }
@@ -7457,6 +7724,686 @@ mod tests {
             };
             assert_eq!(keys(&with_judge), keys(&without));
             assert_eq!(with_judge["content_hash"], without["content_hash"]);
+        }
+    }
+
+    // ─── memory_unsupersede (LAB-6876) ──────────────────────────────────
+    //
+    // One shared ledger plays both backends, so a test can drive supersede
+    // and unsupersede end to end and then read what every layer holds.
+
+    /// Qdrant and FalkorDB as a supersession round trip sees them. Memories
+    /// come back from every search entry point UNFILTERED — superseded
+    /// filtering is the app layer's job, as with the real backend.
+    #[derive(Default)]
+    struct Ledger {
+        memories: RefCell<Vec<Memory>>,
+        /// Payload fields `Memory` does not carry, per hash.
+        reasons: RefCell<HashMap<String, Value>>,
+        logs: RefCell<HashMap<String, Vec<Value>>>,
+        /// SUPERSEDES edges, (src, dst).
+        supersedes: RefCell<Vec<(String, String)>>,
+        /// CONTRADICTS edges, (src, dst) -> `resolved_via` of a keep_both stamp.
+        contradicts: RefCell<HashMap<(String, String), Option<String>>>,
+        /// Every graph write fails, as when FalkorDB is down.
+        graph_down: Cell<bool>,
+        /// Another writer re-supersedes the memory to this hash inside the
+        /// next `clear_superseded_by`'s read→write window.
+        resupersede: RefCell<Option<String>>,
+    }
+
+    impl Ledger {
+        fn with(hashes: &[&str]) -> Rc<Self> {
+            let ledger = Self::default();
+            for (i, h) in hashes.iter().enumerate() {
+                let mut m = dummy_memory();
+                m.content = format!("ledger memory {i}");
+                m.content_hash = (*h).to_string();
+                m.tags = vec!["ledger".into()];
+                m.created_at = 1_000_000.0 + i as f64;
+                m.updated_at = m.created_at;
+                ledger.memories.borrow_mut().push(m);
+            }
+            Rc::new(ledger)
+        }
+
+        fn service(self: &Rc<Self>) -> MemoryService {
+            MemoryService::new(
+                Box::new(LedgerVectors(self.clone())),
+                Box::new(MockEmbeddings),
+                Box::new(LedgerGraph(self.clone())),
+                Box::new(MockHebbian),
+                Box::new(MockConsolidation),
+                None,
+            )
+        }
+
+        fn marker(&self, h: &str) -> Option<Value> {
+            self.memories
+                .borrow()
+                .iter()
+                .find(|m| m.content_hash == h)?
+                .metadata
+                .as_ref()?
+                .get("superseded_by")
+                .cloned()
+        }
+
+        fn set_marker(&self, h: &str, marker: Option<Value>) {
+            let mut mems = self.memories.borrow_mut();
+            let m = mems.iter_mut().find(|m| m.content_hash == h).unwrap();
+            let md = m.metadata.get_or_insert_with(HashMap::new);
+            match marker {
+                Some(v) => md.insert("superseded_by".into(), v),
+                None => md.remove("superseded_by"),
+            };
+        }
+
+        fn edges(&self) -> Vec<(String, String)> {
+            let mut e = self.supersedes.borrow().clone();
+            e.sort();
+            e
+        }
+
+        fn graph_write(&self) -> Result<()> {
+            if self.graph_down.get() {
+                return Err(AlayaError::Graph("ledger graph down".into()));
+            }
+            Ok(())
+        }
+
+        fn scored(&self, limit: usize) -> Vec<ScoredMemory> {
+            self.memories
+                .borrow()
+                .iter()
+                .take(limit)
+                .enumerate()
+                .map(|(i, m)| ScoredMemory {
+                    memory: m.clone(),
+                    score: 0.9 - i as f64 * 0.01,
+                })
+                .collect()
+        }
+    }
+
+    struct LedgerVectors(Rc<Ledger>);
+
+    #[async_trait(?Send)]
+    impl VectorStorage for LedgerVectors {
+        async fn clear_superseded_by(
+            &self,
+            h: &str,
+            expected: &Value,
+            r: &SupersessionReversal,
+        ) -> Result<ClearSupersession> {
+            let l = &self.0;
+            if let Some(other) = l.resupersede.borrow_mut().take() {
+                l.set_marker(h, Some(serde_json::json!(other)));
+            }
+            if !l.memories.borrow().iter().any(|m| m.content_hash == h) {
+                return Err(AlayaError::NotFound(h.into()));
+            }
+            let Some(marker) = l.marker(h) else {
+                return Ok(ClearSupersession::NotSuperseded);
+            };
+            if &marker != expected {
+                return Ok(ClearSupersession::SupersededByOther(marker));
+            }
+            l.set_marker(h, None);
+            let reason = l.reasons.borrow_mut().remove(h);
+            l.logs
+                .borrow_mut()
+                .entry(h.into())
+                .or_default()
+                .push(serde_json::json!({
+                    "superseded_by": marker,
+                    "supersession_reason": reason,
+                    "unsuperseded_at": r.at,
+                    "unsuperseded_via": r.via,
+                    "reason": r.reason,
+                }));
+            Ok(ClearSupersession::Cleared {
+                supersession_reason: reason,
+            })
+        }
+        async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
+            unimplemented!()
+        }
+        async fn get_by_hash(&self, h: &str) -> Result<Option<Memory>> {
+            Ok(self
+                .0
+                .memories
+                .borrow()
+                .iter()
+                .find(|m| m.content_hash == h)
+                .cloned())
+        }
+        async fn set_generated_summary(
+            &self,
+            _h: &str,
+            _s: &str,
+            _e: Option<Vec<f32>>,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+        async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>> {
+            Ok(self
+                .0
+                .memories
+                .borrow()
+                .iter()
+                .filter(|m| hashes.contains(&m.content_hash.as_str()))
+                .cloned()
+                .collect())
+        }
+        async fn delete(&self, _h: &str) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn update_metadata(&self, h: &str, u: MetadataUpdate) -> Result<()> {
+            self.update_metadata_batch(&[h], u).await
+        }
+        async fn update_metadata_batch(&self, hashes: &[&str], u: MetadataUpdate) -> Result<()> {
+            for h in hashes {
+                if self.get_by_hash(h).await?.is_none() {
+                    return Err(AlayaError::NotFound((*h).into()));
+                }
+            }
+            for h in hashes {
+                if let Some(ref by) = u.superseded_by {
+                    self.0.set_marker(h, Some(serde_json::json!(by)));
+                }
+                if let Some(reason) = u.extra.as_ref().and_then(|e| e.get("supersession_reason")) {
+                    self.0
+                        .reasons
+                        .borrow_mut()
+                        .insert((*h).into(), reason.clone());
+                }
+            }
+            Ok(())
+        }
+        async fn patch_memory(&self, _h: &str, _p: &PatchMemoryRequest) -> Result<Memory> {
+            unimplemented!()
+        }
+        async fn search_by_vector(
+            &self,
+            _e: &[f32],
+            limit: usize,
+            _f: Option<PayloadFilter>,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(self.0.scored(limit))
+        }
+        async fn search_by_tags(
+            &self,
+            _t: &[&str],
+            _m: bool,
+            limit: usize,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(self.0.scored(limit))
+        }
+        async fn search_similar_tags(&self, _e: &[f32], _l: usize) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
+            Ok(())
+        }
+        async fn get_all(&self, limit: usize, offset: Option<&str>) -> Result<ScrollResult> {
+            let mems = self.0.memories.borrow();
+            let start: usize = offset.and_then(|o| o.parse().ok()).unwrap_or(0);
+            let end = (start + limit).min(mems.len());
+            Ok(ScrollResult {
+                memories: mems[start..end].to_vec(),
+                next_offset: (end < mems.len()).then(|| end.to_string()),
+            })
+        }
+        async fn get_recent(
+            &self,
+            limit: usize,
+            start_from: Option<f64>,
+            _t: Option<&str>,
+        ) -> Result<Vec<Memory>> {
+            let mut sorted = self.0.memories.borrow().clone();
+            sorted.sort_by(|a, b| b.created_at.total_cmp(&a.created_at));
+            Ok(sorted
+                .into_iter()
+                .filter(|m| start_from.is_none_or(|ts| m.created_at < ts))
+                .take(limit)
+                .collect())
+        }
+        async fn count(&self) -> Result<usize> {
+            Ok(self.0.memories.borrow().len())
+        }
+        async fn get_all_tags(&self) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn increment_access_count(&self, _h: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            unimplemented!()
+        }
+    }
+
+    struct LedgerGraph(Rc<Ledger>);
+
+    #[async_trait(?Send)]
+    impl GraphService for LedgerGraph {
+        async fn delete_incoming_system_edges(
+            &self,
+            dst: &str,
+            _r: SystemRelationType,
+        ) -> Result<Vec<String>> {
+            self.0.graph_write()?;
+            let mut sources = Vec::new();
+            self.0.supersedes.borrow_mut().retain(|(s, d)| {
+                let into = d == dst;
+                if into {
+                    sources.push(s.clone());
+                }
+                !into
+            });
+            Ok(sources)
+        }
+        async fn ensure_node(&self, _h: &str, _t: f64) -> Result<()> {
+            Ok(())
+        }
+        async fn delete_node(&self, _h: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn create_typed_edge(
+            &self,
+            _s: &str,
+            _d: &str,
+            _r: UserRelationType,
+            _m: EdgeMeta,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn get_typed_edges(
+            &self,
+            _h: &str,
+            _r: Option<UserRelationType>,
+            _d: Direction,
+            _l: usize,
+        ) -> Result<Vec<Edge>> {
+            Ok(vec![])
+        }
+        async fn delete_typed_edge(
+            &self,
+            _s: &str,
+            _d: &str,
+            _r: UserRelationType,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn create_system_edge(
+            &self,
+            s: &str,
+            d: &str,
+            _r: SystemRelationType,
+            _t: f64,
+        ) -> Result<bool> {
+            self.0.graph_write()?;
+            let edge = (s.to_string(), d.to_string());
+            let mut edges = self.0.supersedes.borrow_mut();
+            if edges.contains(&edge) {
+                return Ok(false);
+            }
+            edges.push(edge);
+            Ok(true)
+        }
+        async fn get_all_contradictions(
+            &self,
+            _q: &alaya_types::graph::ContradictionQuery,
+        ) -> Result<Vec<Contradiction>> {
+            Ok(vec![])
+        }
+        async fn set_contradiction_verdict(
+            &self,
+            _s: &str,
+            _d: &str,
+            _v: &alaya_types::graph::EdgeVerdict,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn set_contradiction_resolution(
+            &self,
+            s: &str,
+            d: &str,
+            r: Option<Resolution>,
+            via: &str,
+            _t: f64,
+        ) -> Result<bool> {
+            self.0.graph_write()?;
+            let mut pairs = self.0.contradicts.borrow_mut();
+            let Some(stamp) = pairs.get_mut(&(s.to_string(), d.to_string())) else {
+                return Ok(false);
+            };
+            assert_eq!(r, Some(Resolution::KeepBoth), "only keep_both stamps here");
+            *stamp = Some(via.to_string());
+            Ok(true)
+        }
+        async fn get_contradictions_for_hashes(
+            &self,
+            _h: &[&str],
+        ) -> Result<HashMap<String, Vec<ContradictionRef>>> {
+            Ok(HashMap::new())
+        }
+        async fn get_neighbors(
+            &self,
+            _h: &str,
+            _m: u8,
+            _w: f64,
+            _l: usize,
+        ) -> Result<Vec<Neighbor>> {
+            Ok(vec![])
+        }
+        async fn spreading_activation(
+            &self,
+            _s: &[&str],
+            _m: u8,
+            _d: f64,
+            _a: f64,
+            _l: usize,
+        ) -> Result<HashMap<String, f64>> {
+            Ok(HashMap::new())
+        }
+        async fn hebbian_boosts_within(&self, _h: &[&str]) -> Result<HashMap<String, f64>> {
+            Ok(HashMap::new())
+        }
+        async fn get_stats(&self) -> Result<GraphStats> {
+            unimplemented!()
+        }
+    }
+
+    fn h(c: char) -> String {
+        c.to_string().repeat(64)
+    }
+
+    /// Hashes `svc` returns for a default (superseded-hidden) search per mode.
+    async fn visible(svc: &MemoryService) -> Vec<std::collections::HashSet<String>> {
+        let mut per_mode = Vec::new();
+        for mode in ALL_MODES {
+            let params = SearchParams {
+                query: "ledger memory".into(),
+                mode,
+                page: 1,
+                page_size: 10,
+                tags: Some(vec!["ledger".into()]),
+                match_all: false,
+                k: 10,
+                min_similarity: None,
+                memory_type: None,
+                encoding_context: None,
+                include_superseded: false,
+                min_trust_score: None,
+                output: OutputMode::Full,
+                cursor: None,
+            };
+            let hashes = svc.search(params).await.expect("search succeeds")["results"]
+                .as_array()
+                .expect("results array")
+                .iter()
+                .filter_map(|x| x["content_hash"].as_str().map(String::from))
+                .collect();
+            per_mode.push(hashes);
+        }
+        per_mode
+    }
+
+    fn set_of(hashes: &[&str]) -> std::collections::HashSet<String> {
+        hashes.iter().map(|s| s.to_string()).collect()
+    }
+
+    async fn unsupersede(svc: &MemoryService, hash: &str) -> Value {
+        svc.memory_unsupersede(hash, "wrong merge", "operator:test")
+            .await
+            .expect("unsupersede returns an outcome")
+    }
+
+    /// Supersede → unsupersede → the memory is back in every search mode, the
+    /// marker, reason and SUPERSEDES edge are gone, and the audit entry
+    /// records who, when, why and what was reversed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsupersede_round_trips_search_visibility_in_every_mode() {
+        let (a, b) = (h('a'), h('b'));
+        let ledger = Ledger::with(&[&a, &b]);
+        let svc = ledger.service();
+
+        svc.memory_supersede(&a, &b, "duplicate").await.unwrap();
+        for (mode, seen) in ALL_MODES.iter().zip(visible(&svc).await) {
+            assert_eq!(seen, set_of(&[&b]), "{mode:?}: superseded memory hidden");
+        }
+        assert_eq!(ledger.edges(), [(b.clone(), a.clone())]);
+
+        let (out, events) = captured("alaya::supersession", unsupersede(&svc, &a)).await;
+        assert_eq!(out["success"], true, "{out}");
+        assert_eq!(out["status"], "unsuperseded");
+        assert_eq!(out["superseded_by"], serde_json::json!(b));
+        assert_eq!(out["supersession_reason"], "duplicate");
+        assert_eq!(out["supersedes_edges_removed"], serde_json::json!([b]));
+        for (mode, seen) in ALL_MODES.iter().zip(visible(&svc).await) {
+            assert_eq!(seen, set_of(&[&a, &b]), "{mode:?}: restored memory visible");
+        }
+
+        assert_eq!(ledger.marker(&a), None);
+        assert!(!ledger.reasons.borrow().contains_key(&a));
+        assert!(ledger.edges().is_empty());
+        assert_eq!(
+            ledger.logs.borrow()[&a],
+            [serde_json::json!({
+                "superseded_by": b,
+                "supersession_reason": "duplicate",
+                "unsuperseded_at": out["unsuperseded_at"],
+                "unsuperseded_via": "operator:test",
+                "reason": "wrong merge",
+            })]
+        );
+        assert_eq!(events.len(), 1, "one audit event: {events:?}");
+        assert_eq!(events[0]["hash"], a);
+        assert_eq!(events[0]["via"], "operator:test");
+        assert_eq!(events[0]["reason"], "wrong merge");
+    }
+
+    /// Not superseded is a typed no-op: `success: false`, a status saying
+    /// why, and no write to either backend.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsupersede_of_a_live_memory_is_a_typed_no_op_that_writes_nothing() {
+        let (a, b) = (h('a'), h('b'));
+        let ledger = Ledger::with(&[&a, &b]);
+        ledger
+            .contradicts
+            .borrow_mut()
+            .insert((a.clone(), b.clone()), None);
+        ledger.supersedes.borrow_mut().push((a.clone(), b.clone()));
+        let svc = ledger.service();
+
+        let out = unsupersede(&svc, &a).await;
+        assert_eq!(out["success"], false, "{out}");
+        assert_eq!(out["status"], "not_superseded");
+        assert_eq!(ledger.edges(), [(a.clone(), b.clone())], "untouched");
+        assert_eq!(ledger.contradicts.borrow()[&(a.clone(), b)], None);
+        assert!(ledger.logs.borrow().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsupersede_refuses_bad_input_and_absent_memories() {
+        let a = h('a');
+        let svc = Ledger::with(&[&a]).service();
+        for (hash, reason, via) in [
+            ("abc", "why", "operator:test"),
+            (a.as_str(), "  ", "operator:test"),
+            (a.as_str(), "why", ""),
+        ] {
+            let err = svc.memory_unsupersede(hash, reason, via).await.unwrap_err();
+            assert!(matches!(err, AlayaError::Validation(_)), "{err:?}");
+        }
+        let long = "x".repeat(MAX_UNSUPERSEDE_REASON_LEN + 1);
+        let err = svc
+            .memory_unsupersede(&a, &long, "operator:test")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AlayaError::Validation(_)), "{err:?}");
+        let err = svc
+            .memory_unsupersede(&h('f'), "why", "operator:test")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AlayaError::NotFound(_)), "{err:?}");
+    }
+
+    /// AC-5: the CONTRADICTS pair behind the reversed supersession is stamped
+    /// keep_both by `unsupersede`, in whichever direction it was detected, so
+    /// the judge's apply path skips it. Other pairs of the memory are not.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsupersede_stamps_the_reversed_pair_so_the_judge_cannot_reapply_it() {
+        let (a, b, c) = (h('a'), h('b'), h('c'));
+        let ledger = Ledger::with(&[&a, &b, &c]);
+        for pair in [(b.clone(), a.clone()), (a.clone(), c.clone())] {
+            ledger.contradicts.borrow_mut().insert(pair, None);
+        }
+        let svc = ledger.service();
+        svc.memory_supersede(&a, &b, "judge said so").await.unwrap();
+
+        let out = unsupersede(&svc, &a).await;
+        assert_eq!(out["contradictions_stamped"], 1, "{out}");
+        let pairs = ledger.contradicts.borrow();
+        assert_eq!(
+            pairs[&(b.clone(), a.clone())].as_deref(),
+            Some(UNSUPERSEDE_RESOLVED_VIA)
+        );
+        assert_eq!(pairs[&(a, c)], None, "an unrelated pair stays in the queue");
+    }
+
+    /// AC-3, middle link: in A→B→C, unsuperseding B restores B alone. A stays
+    /// superseded by B (its marker and the B→A edge are untouched) and B's
+    /// own edge from C goes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsuperseding_a_middle_link_leaves_the_links_around_it() {
+        let (a, b, c) = (h('a'), h('b'), h('c'));
+        let ledger = Ledger::with(&[&a, &b, &c]);
+        let svc = ledger.service();
+        svc.memory_supersede(&a, &b, "a→b").await.unwrap();
+        svc.memory_supersede(&b, &c, "b→c").await.unwrap();
+
+        let out = unsupersede(&svc, &b).await;
+        assert_eq!(out["status"], "unsuperseded", "{out}");
+        assert_eq!(ledger.marker(&a), Some(serde_json::json!(b)));
+        assert_eq!(ledger.marker(&b), None);
+        assert_eq!(ledger.edges(), [(b.clone(), a.clone())]);
+        for (mode, seen) in ALL_MODES.iter().zip(visible(&svc).await) {
+            assert_eq!(seen, set_of(&[&b, &c]), "{mode:?}");
+        }
+    }
+
+    /// AC-3, survivor superseded since: A→B, then B→C. Unsuperseding A
+    /// restores A without following the chain — B stays superseded by C.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsuperseding_a_memory_whose_survivor_was_superseded_since_leaves_the_survivor_alone()
+    {
+        let (a, b, c) = (h('a'), h('b'), h('c'));
+        let ledger = Ledger::with(&[&a, &b, &c]);
+        let svc = ledger.service();
+        svc.memory_supersede(&a, &b, "a→b").await.unwrap();
+        svc.memory_supersede(&b, &c, "b→c").await.unwrap();
+
+        let out = unsupersede(&svc, &a).await;
+        assert_eq!(out["status"], "unsuperseded", "{out}");
+        assert_eq!(ledger.marker(&a), None);
+        assert_eq!(ledger.marker(&b), Some(serde_json::json!(c)));
+        assert_eq!(ledger.edges(), [(c.clone(), b.clone())]);
+        for (mode, seen) in ALL_MODES.iter().zip(visible(&svc).await) {
+            assert_eq!(seen, set_of(&[&a, &c]), "{mode:?}");
+        }
+    }
+
+    /// A memory superseded again to another survivor holds two incoming
+    /// SUPERSEDES edges. Both go — one left behind would keep its pairs out of
+    /// the contradiction queue (`indegree(SUPERSEDES)`) though it is live —
+    /// while an edge OUT of it (a memory it supersedes) stays.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsupersede_removes_every_incoming_supersedes_edge_and_no_outgoing_one() {
+        let (a, b, c, d) = (h('a'), h('b'), h('c'), h('d'));
+        let ledger = Ledger::with(&[&a, &b, &c, &d]);
+        let svc = ledger.service();
+        svc.memory_supersede(&a, &b, "first").await.unwrap();
+        svc.memory_supersede(&a, &c, "second").await.unwrap();
+        svc.memory_supersede(&d, &a, "a supersedes d")
+            .await
+            .unwrap();
+
+        let out = unsupersede(&svc, &a).await;
+        assert_eq!(out["superseded_by"], serde_json::json!(c), "{out}");
+        let mut removed: Vec<String> =
+            serde_json::from_value(out["supersedes_edges_removed"].clone()).unwrap();
+        removed.sort();
+        assert_eq!(removed, [b, c]);
+        assert_eq!(ledger.edges(), [(a.clone(), d.clone())]);
+        assert_eq!(ledger.marker(&d), Some(serde_json::json!(a)));
+    }
+
+    /// A graph failure aborts BEFORE the marker is touched: the memory stays
+    /// superseded with its reason, nothing is logged, and the same call
+    /// converges once the graph is back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsupersede_graph_failure_leaves_it_superseded_and_a_retry_converges() {
+        let (a, b) = (h('a'), h('b'));
+        let ledger = Ledger::with(&[&a, &b]);
+        let svc = ledger.service();
+        svc.memory_supersede(&a, &b, "duplicate").await.unwrap();
+
+        ledger.graph_down.set(true);
+        let err = svc
+            .memory_unsupersede(&a, "wrong merge", "operator:test")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AlayaError::Graph(_)), "{err:?}");
+        assert_eq!(ledger.marker(&a), Some(serde_json::json!(b)));
+        assert_eq!(ledger.reasons.borrow()[&a], "duplicate");
+        assert!(ledger.logs.borrow().is_empty());
+
+        ledger.graph_down.set(false);
+        let out = unsupersede(&svc, &a).await;
+        assert_eq!(out["status"], "unsuperseded", "{out}");
+        assert_eq!(ledger.marker(&a), None);
+        assert!(ledger.edges().is_empty());
+    }
+
+    /// Another writer re-supersedes the memory to C between the read and the
+    /// conditional write: C's supersession stands, its edge (removed with the
+    /// rest) is put back, and the caller is told rather than handed a success.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsupersede_racing_a_re_supersede_leaves_it_whole_and_says_so() {
+        let (a, b, c) = (h('a'), h('b'), h('c'));
+        let ledger = Ledger::with(&[&a, &b, &c]);
+        let svc = ledger.service();
+        svc.memory_supersede(&a, &b, "duplicate").await.unwrap();
+        *ledger.resupersede.borrow_mut() = Some(c.clone());
+
+        let out = unsupersede(&svc, &a).await;
+        assert_eq!(out["success"], false, "{out}");
+        assert_eq!(out["status"], "superseded_by_changed");
+        assert_eq!(out["superseded_by"], serde_json::json!(c));
+        assert_eq!(ledger.marker(&a), Some(serde_json::json!(c)));
+        assert_eq!(ledger.edges(), [(c, a.clone())]);
+        assert!(ledger.logs.borrow().is_empty());
+    }
+
+    /// A marker that names no memory (a legacy shape) still hides the memory
+    /// — `is_superseded` tests presence — so it can still be reversed; there
+    /// is just no pair to stamp.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsupersede_reverses_a_marker_that_names_no_memory() {
+        let a = h('a');
+        let ledger = Ledger::with(&[&a]);
+        ledger.set_marker(&a, Some(Value::Null));
+        let svc = ledger.service();
+        assert!(visible(&svc).await.iter().all(|seen| seen.is_empty()));
+
+        let out = unsupersede(&svc, &a).await;
+        assert_eq!(out["status"], "unsuperseded", "{out}");
+        assert_eq!(out["contradictions_stamped"], 0);
+        assert_eq!(ledger.marker(&a), None);
+        for seen in visible(&svc).await {
+            assert_eq!(seen, set_of(&[&a]));
         }
     }
 }

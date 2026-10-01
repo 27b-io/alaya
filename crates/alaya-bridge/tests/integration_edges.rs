@@ -274,6 +274,70 @@ async fn create_supersedes_system_edge() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Every SUPERSEDES edge INTO the target goes, from any source (LAB-6876:
+/// a re-supersede to another survivor leaves two); edges out of it and
+/// edges into other nodes stay.
+#[tokio::test]
+async fn delete_incoming_system_edges_removes_every_source_into_target_only() -> anyhow::Result<()>
+{
+    let ctx = match common::TestContext::new().await {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+    seed_nodes(&ctx).await;
+    let ts = 1_710_000_055.0_f64;
+    let supersedes = SystemRelationType::Supersedes;
+    // B -> A and C -> A (A re-superseded), A -> C (A supersedes C), C -> B.
+    for (src, dst) in [
+        (HASH_B, HASH_A),
+        (HASH_C, HASH_A),
+        (HASH_A, HASH_C),
+        (HASH_C, HASH_B),
+    ] {
+        ctx.exec_tuple(cypher::create_system_edge(src, dst, supersedes, ts))
+            .await;
+    }
+
+    let deleted = ctx
+        .exec_tuple(cypher::delete_incoming_system_edges(HASH_A, supersedes))
+        .await;
+    let mut sources: Vec<&str> = deleted
+        .result_set
+        .iter()
+        .filter_map(|row| row.first().and_then(serde_json::Value::as_str))
+        .collect();
+    sources.sort_unstable();
+    assert_eq!(sources, [HASH_B, HASH_C], "one row per deleted edge");
+
+    let left = ctx
+        .exec(
+            "MATCH (a:Memory)-[e:SUPERSEDES]->(b:Memory) \
+             RETURN a.content_hash, b.content_hash ORDER BY a.content_hash",
+            Default::default(),
+            true,
+        )
+        .await;
+    let left: Vec<(&str, &str)> = left
+        .result_set
+        .iter()
+        .map(|r| (r[0].as_str().unwrap(), r[1].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        left,
+        [(HASH_A, HASH_C), (HASH_C, HASH_B)],
+        "edges out of the target, and into other nodes, survive"
+    );
+
+    // Nothing left to delete: no rows, not an error.
+    let again = ctx
+        .exec_tuple(cypher::delete_incoming_system_edges(HASH_A, supersedes))
+        .await;
+    assert!(again.result_set.is_empty(), "{:?}", again.result_set);
+
+    ctx.cleanup().await;
+    Ok(())
+}
+
 // ─── contradictions ───────────────────────────────────────────────────────────
 
 #[tokio::test]

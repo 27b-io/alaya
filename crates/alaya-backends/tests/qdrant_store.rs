@@ -265,6 +265,29 @@ async fn store_carries_supersession_marker_over_on_restore() {
     );
 }
 
+/// The audit trail of reversed supersessions is server-written too
+/// (LAB-6876): a re-store of an unsuperseded memory keeps it, and does not
+/// bring the reversed marker back.
+#[tokio::test]
+async fn store_carries_supersession_log_over_on_restore() {
+    let log = json!([{"superseded_by": "b".repeat(64), "reason": "wrong merge"}]);
+    let mut unsuperseded = existing_payload();
+    unsuperseded["supersession_log"] = log.clone();
+    let (server, fake) = fake_with(Some(unsuperseded)).await;
+
+    client_for(&server)
+        .store(&incoming(), StoreMode::Upsert)
+        .await
+        .expect("store succeeds");
+
+    let stored = fake.point(ID).unwrap();
+    assert_eq!(stored["supersession_log"], log);
+    assert!(
+        stored["metadata"].get("superseded_by").is_none(),
+        "{stored}"
+    );
+}
+
 /// Existence is decided on the raw point, not on whether it parses as a
 /// `Memory`: a present-but-malformed point must not be overwritten as new.
 #[tokio::test]

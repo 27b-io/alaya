@@ -21,7 +21,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use alaya_backends::{StoreMode, VectorStorage, qdrant::QdrantClient};
+use alaya_backends::{
+    ClearSupersession, StoreMode, SupersessionReversal, VectorStorage, qdrant::QdrantClient,
+};
 use alaya_types::{AlayaError, memory::Memory, memory::MetadataUpdate};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -338,6 +340,18 @@ async fn race<T>(
     op: impl AsyncFnOnce(QdrantClient) -> T,
 ) -> (T, Value, usize) {
     let prefix = format!("PUT /collections/{}/points?", coll.name);
+    race_on(coll, url, prefix, child, op).await
+}
+
+/// `race`, holding A's first request whose request line starts with `prefix`
+/// and counting those.
+async fn race_on<T>(
+    coll: &Collection,
+    url: &str,
+    prefix: String,
+    child: (&str, &str, &str),
+    op: impl AsyncFnOnce(QdrantClient) -> T,
+) -> (T, Value, usize) {
     let mut proxy = Proxy::start(url, prefix.clone()).await;
     let a = coll.client(&proxy.url);
     let (role, hash, content) = child;
@@ -498,6 +512,179 @@ async fn insert_only_store_that_loses_the_insert_race_writes_nothing() {
     assert_eq!(upserts, 1, "no second write after the lost insert");
     let p = coll.payload(&hash).await.unwrap();
     assert_eq!(p["tags"], json!(["from-b"]), "{p}");
+    coll.cleanup().await;
+}
+
+// ─── Reversing a supersession (LAB-6876) ────────────────────────────────────
+
+fn reversal() -> SupersessionReversal {
+    SupersessionReversal {
+        at: 2000.0,
+        via: "operator:test".into(),
+        reason: "wrong merge".into(),
+    }
+}
+
+/// Store `content` and supersede it by `by` with reason `merged`.
+async fn superseded(coll: &Collection, url: &str, content: &str, by: &str) -> String {
+    let client = coll.client(url);
+    let (_, hash) = client
+        .store(&memory(content, &["seed"]), StoreMode::Upsert)
+        .await
+        .unwrap();
+    let mut extra = std::collections::HashMap::new();
+    extra.insert("supersession_reason".to_string(), json!("merged"));
+    client
+        .update_metadata(
+            &hash,
+            MetadataUpdate {
+                superseded_by: Some(by.into()),
+                extra: Some(extra),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    hash
+}
+
+fn marker_of(m: &Memory) -> Option<&Value> {
+    m.metadata.as_ref()?.get("superseded_by")
+}
+
+/// Supersede -> unsupersede on a real Qdrant. Visibility is decided at the
+/// app layer from the marker (`is_superseded`), so what has to round-trip is
+/// the marker as every read path parses it: get, vector search, re-store.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs QDRANT_TEST_URL"]
+async fn supersede_then_unsupersede_round_trips_the_marker_every_read_sees() {
+    let url = qdrant_url();
+    let coll = Collection::new(&url, "unsupersede").await;
+    let client = coll.client(&url);
+    let (_, survivor) = client
+        .store(
+            &memory("unsupersede survivor", &["seed"]),
+            StoreMode::Upsert,
+        )
+        .await
+        .unwrap();
+    let hash = superseded(&coll, &url, "unsupersede probe", &survivor).await;
+    let searched = |hits: Vec<alaya_types::memory::ScoredMemory>| {
+        hits.into_iter()
+            .map(|s| s.memory)
+            .find(|m| m.content_hash == hash)
+            .expect("vector search returns the memory either way")
+    };
+    let hits = client
+        .search_by_vector(&[0.5, 0.75], 10, None)
+        .await
+        .unwrap();
+    assert_eq!(marker_of(&searched(hits)), Some(&json!(survivor)));
+
+    let outcome = client
+        .clear_superseded_by(&hash, &json!(survivor), &reversal())
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        ClearSupersession::Cleared {
+            supersession_reason: Some(json!("merged"))
+        }
+    );
+
+    let got = client.get_by_hash(&hash).await.unwrap().unwrap();
+    assert_eq!(marker_of(&got), None, "{:?}", got.metadata);
+    let hits = client
+        .search_by_vector(&[0.5, 0.75], 10, None)
+        .await
+        .unwrap();
+    assert_eq!(marker_of(&searched(hits)), None);
+    let p = coll.payload(&hash).await.unwrap();
+    assert!(p.get("supersession_reason").is_none(), "{p}");
+    assert_eq!(
+        p["supersession_log"],
+        json!([{
+            "superseded_by": survivor,
+            "supersession_reason": "merged",
+            "unsuperseded_at": 2000.0,
+            "unsuperseded_via": "operator:test",
+            "reason": "wrong merge",
+        }])
+    );
+
+    // A re-store keeps the trail and does not bring the marker back.
+    client
+        .store(&memory("unsupersede probe", &["again"]), StoreMode::Upsert)
+        .await
+        .unwrap();
+    let p = coll.payload(&hash).await.unwrap();
+    assert_eq!(p["supersession_log"].as_array().unwrap().len(), 1, "{p}");
+    assert!(p["metadata"].get("superseded_by").is_none(), "{p}");
+
+    let again = client
+        .clear_superseded_by(&hash, &json!(survivor), &reversal())
+        .await
+        .unwrap();
+    assert_eq!(again, ClearSupersession::NotSuperseded);
+    coll.cleanup().await;
+}
+
+/// Unsupersede vs a re-supersede to another survivor: B's supersession
+/// stands whole and A reports what it found instead of reversing it.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs QDRANT_TEST_URL"]
+async fn unsupersede_racing_a_re_supersede_stands_down() {
+    let url = qdrant_url();
+    let coll = Collection::new(&url, "unsupersede_resupersede").await;
+    let first = "c".repeat(64);
+    let hash = superseded(&coll, &url, "re-supersede probe", &first).await;
+
+    let prefix = format!("PUT /collections/{}/points/payload?", coll.name);
+    let (a, b, overwrites) = race_on(&coll, &url, prefix, ("supersede", &hash, ""), async |a| {
+        a.clear_superseded_by(&hash, &json!(first), &reversal())
+            .await
+    })
+    .await;
+
+    assert_eq!(b, json!("ok"));
+    assert_eq!(
+        a.unwrap(),
+        ClearSupersession::SupersededByOther(json!("b".repeat(64)))
+    );
+    assert_eq!(overwrites, 1, "no second write once the marker moved");
+    let p = coll.payload(&hash).await.unwrap();
+    assert_eq!(p["metadata"]["superseded_by"], json!("b".repeat(64)), "{p}");
+    assert_eq!(p["supersession_reason"], json!("merged"), "{p}");
+    assert!(p.get("supersession_log").is_none(), "{p}");
+    coll.cleanup().await;
+}
+
+/// Unsupersede vs access increments: the whole-payload overwrite is rebuilt
+/// from a fresh read, so three accesses counted inside A's window survive.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs QDRANT_TEST_URL"]
+async fn unsupersede_racing_access_increments_keeps_every_count() {
+    let url = qdrant_url();
+    let coll = Collection::new(&url, "unsupersede_increment").await;
+    let survivor = "c".repeat(64);
+    let hash = superseded(&coll, &url, "unsupersede increment probe", &survivor).await;
+
+    let prefix = format!("PUT /collections/{}/points/payload?", coll.name);
+    let (a, b, overwrites) = race_on(&coll, &url, prefix, ("increment", &hash, ""), async |a| {
+        a.clear_superseded_by(&hash, &json!(survivor), &reversal())
+            .await
+    })
+    .await;
+
+    assert_eq!(b, json!("ok"));
+    assert!(matches!(a, Ok(ClearSupersession::Cleared { .. })), "{a:?}");
+    assert_eq!(
+        overwrites, 2,
+        "A's first write lost the race and was rebuilt"
+    );
+    let p = coll.payload(&hash).await.unwrap();
+    assert_eq!(p["access_count"], json!(3), "{p}");
+    assert!(p["metadata"].get("superseded_by").is_none(), "{p}");
     coll.cleanup().await;
 }
 

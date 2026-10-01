@@ -21,6 +21,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/edges/get", post(handlers::edges::get))
         .route("/edges/delete", post(handlers::edges::delete))
+        .route(
+            "/edges/delete-system-incoming",
+            post(handlers::edges::delete_system_incoming),
+        )
         .route("/stats", get(handlers::health::stats))
         .route("/hebbian/neighbors", post(handlers::hebbian::neighbors))
         .route("/hebbian/spreading", post(handlers::hebbian::spreading))

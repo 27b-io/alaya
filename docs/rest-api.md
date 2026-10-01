@@ -53,6 +53,7 @@ Failed auth returns `401 Unauthorized` with a `WWW-Authenticate: Bearer …` hea
 | `POST` | `/delete` | Hard-delete a memory | yes |
 | `POST` | `/relation` | Manage graph edges | yes |
 | `POST` | `/supersede` | Mark old → new | yes |
+| `POST` | `/unsupersede` | Reverse a supersession | yes |
 | `POST` | `/contradictions` | List contradiction pairs with judge verdicts | yes |
 | `POST` | `/contradictions/resolution` | Keep both memories of a pair, or undo that | yes |
 | `POST` | `/duplicates/find` | Scan for near-duplicates | yes |
@@ -311,7 +312,26 @@ Content-Type: application/json
 
 `reason` is optional. Returns `{ "superseded": true, "old_hash": "...", "new_hash": "..." }`.
 
-Supersession is idempotent. After an error, the memory may already be superseded, so retry the same call: it converges and writes any missing audit edge.
+Supersession is idempotent. After an error, the memory may already be superseded, so retry the same call: it converges and writes any missing audit edge. A wrong supersession is reversed with [`POST /unsupersede`](#post-unsupersede).
+
+## `POST /unsupersede`
+
+Reverse a supersession — from `/supersede`, `/duplicates/merge` or the console — that was wrong. The memory returns to default search results and its contradiction pairs return to the queue. See [MCP: `memory_unsupersede`](./mcp-tools.md#memory_unsupersede) for exactly what changes, the chain semantics, and the `status` values; REST is the same operation.
+
+```http
+POST /unsupersede
+Content-Type: application/json
+
+{
+  "content_hash": "a3f4...",
+  "reason": "Not a duplicate: the two notes cover different caches.",
+  "unsuperseded_via": "operator:console"
+}
+```
+
+All three fields are required. `reason` (1–2000 chars) and `unsuperseded_via` (1–128 chars, who is reversing it, recorded verbatim) are the audit entry appended to the memory's `supersession_log`, together with the `superseded_by` and supersession reason that were removed. The `CONTRADICTS` pair with the former survivor is stamped `keep_both` with `resolved_via: "unsupersede"`, so an automatic apply of the judge's verdict never re-supersedes it.
+
+Returns `{ "success": true, "status": "unsuperseded", "content_hash", "superseded_by", "supersession_reason", "reason", "unsuperseded_via", "unsuperseded_at", "supersedes_edges_removed", "contradictions_stamped" }`. A call that changes nothing returns `"success": false` with `"status": "not_superseded"` (nothing to reverse — also what a retry of a call that already landed gets) or `"status": "superseded_by_changed"` (superseded to another survivor while the call ran; that supersession is left whole and `superseded_by` names it). If the graph is unreachable the call fails before the marker is touched and the memory stays superseded; retry the same call. Mutating — static bearer only.
 
 ## `POST /contradictions`
 
@@ -362,7 +382,7 @@ Each pair carries the lexical detector's `confidence` plus the judge's advisory 
 
 `verdict` is one of `contradiction`, `supersession`, `coexist`, `unrelated`, or `unjudged`. An edge the judge has never seen has `null` for the other verdict fields; an edge the judge failed on deterministically (unparseable or empty answer, request rejected, endpoint missing) is `unjudged` with `verdict_reason` starting `unjudged:` and `verdict_model` set. `next_offset` is set whenever the graph page was full (an exactly-full last page yields a cursor to an empty page) and `null` once the server knows nothing follows. A page can hold fewer than `limit` pairs when Qdrant marks a memory superseded that the graph does not yet know about; the cursor still advances. Pure read — the read-only bearer may call it.
 
-`resolution` / `resolved_at` / `resolved_via` carry the `keep_both` stamp written by `POST /contradictions/resolution` (all `null` when unresolved; only visible with `include_resolved: true`). A pair leaves the default page one of three ways: **supersede** (`POST /supersede` — destructive with an audit trail, no un-supersede), **keep both** (`POST /contradictions/resolution` — non-destructive, reversed by the same route with `resolution: null`), or **hidden by the verdict filter** (the default `verdicts` omit `coexist` / `unrelated`; nothing is written).
+`resolution` / `resolved_at` / `resolved_via` carry the `keep_both` stamp written by `POST /contradictions/resolution` (all `null` when unresolved; only visible with `include_resolved: true`). A pair leaves the default page one of three ways: **supersede** (`POST /supersede` — destructive with an audit trail, reversed by `POST /unsupersede`), **keep both** (`POST /contradictions/resolution` — non-destructive, reversed by the same route with `resolution: null`), or **hidden by the verdict filter** (the default `verdicts` omit `coexist` / `unrelated`; nothing is written).
 
 ## `POST /contradictions/resolution`
 
@@ -484,7 +504,7 @@ REST endpoints use HTTP status codes plus a JSON body:
 |:--|:--|
 | `400` | Malformed JSON, invalid `content_hash`, missing required field. Body: `{"error": "..."}`. |
 | `401` | Missing or wrong bearer token. |
-| `403` | Authenticated, but the principal is not authorized for this endpoint: the `ALAYA_READONLY_API_KEY` bearer on anything but a pure read, or an OIDC bearer on a mutating route (delete / supersede / contradictions/resolution / merge / relation / patch / backfill). OAuth scopes are not evaluated. |
+| `403` | Authenticated, but the principal is not authorized for this endpoint: the `ALAYA_READONLY_API_KEY` bearer on anything but a pure read, or an OIDC bearer on a mutating route (delete / supersede / unsupersede / contradictions/resolution / merge / relation / patch / backfill). OAuth scopes are not evaluated. |
 | `404` | Memory doesn't exist (`get_memory`, `patch_memory`). |
 | `413` | Request body over 1 MB. |
 | `429` | Rate limited (only when running behind a rate-limiting proxy). |

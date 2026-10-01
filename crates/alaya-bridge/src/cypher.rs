@@ -183,6 +183,18 @@ pub fn create_system_edge(src: &str, dst: &str, rel: SystemRelationType, ts: f64
     )
 }
 
+/// DELETE every `rel` edge pointing into `dst`, from any source, returning
+/// one row per deleted edge: its source hash. Edges out of `dst` are not
+/// matched (the pattern is directed).
+pub fn delete_incoming_system_edges(dst: &str, rel: SystemRelationType) -> CypherQuery {
+    let label = rel.cypher_label();
+    let q = format!(
+        "MATCH (a:Memory)-[e:{label}]->(b:Memory {{content_hash: $dst}}) \
+         DELETE e RETURN a.content_hash"
+    );
+    (q, params(&[("dst", json!(dst))]), false)
+}
+
 // ─── contradiction operations ─────────────────────────────────────────────────
 
 /// Row layout of `get_all_contradictions`, in this order.
@@ -889,6 +901,19 @@ mod tests {
         assert!(p.contains_key("src"));
         assert!(p.contains_key("dst"));
         assert!(p.contains_key("ts"));
+        assert!(!ro);
+    }
+
+    #[test]
+    fn delete_incoming_system_edges_matches_into_dst_only() {
+        let (q, p, ro) = delete_incoming_system_edges("d", SystemRelationType::Supersedes);
+        assert_eq!(
+            q,
+            "MATCH (a:Memory)-[e:SUPERSEDES]->(b:Memory {content_hash: $dst}) \
+             DELETE e RETURN a.content_hash"
+        );
+        assert_eq!(p.len(), 1, "only the target travels: {p:?}");
+        assert_eq!(p["dst"], json!("d"));
         assert!(!ro);
     }
 

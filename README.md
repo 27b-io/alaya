@@ -106,6 +106,7 @@ Connect any MCP client to `http://localhost:3001/mcp` (Streamable HTTP with SSE)
 | `delete_memory` | Delete by content hash |
 | `relation` | Create / get / delete typed edges (RELATES_TO, PRECEDES, CONTRADICTS) |
 | `memory_supersede` | Mark one memory as superseded by another |
+| `memory_unsupersede` | Reverse a supersession, with an audit entry |
 | `memory_contradictions` | List unresolved contradiction pairs with judge verdicts |
 | `resolve_contradiction` | Keep both memories of a contradiction pair — non-destructive, reversible |
 | `find_duplicates` | Cosine similarity scan for near-duplicate memories |

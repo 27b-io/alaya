@@ -8,12 +8,18 @@
 //! conditional on the revision the metadata was read at (alaya#130): the pair
 //! lands together or not at all, and sibling metadata keys written by anyone
 //! in between are never dropped by the rewrite.
+//!
+//! `clear_superseded_by` is the reverse (LAB-6876): marker and reason leave in
+//! one conditional overwrite that also appends the audit entry, and only while
+//! the marker still names the survivor the caller read.
 
 mod common;
 
 use std::collections::HashMap;
 
-use alaya_backends::{VectorStorage, qdrant::QdrantClient};
+use alaya_backends::{
+    ClearSupersession, SupersessionReversal, VectorStorage, qdrant::QdrantClient,
+};
 use alaya_types::{AlayaError, memory::MetadataUpdate};
 use common::{FakeQdrant, PAYLOAD_PATH, external_write, is_conditional, retrieves, writes};
 use serde_json::{Value, json};
@@ -437,4 +443,198 @@ async fn batch_update_that_cannot_build_one_write_sends_none() {
         .await;
     assert!(matches!(result, Err(AlayaError::Storage(_))), "{result:?}");
     assert!(writes(&server).await.is_empty(), "nothing may be marked");
+}
+
+// ─── Reversal: clear_superseded_by (LAB-6876) ───────────────────────────────
+
+fn reversal() -> SupersessionReversal {
+    SupersessionReversal {
+        at: 2000.0,
+        via: "operator:test".into(),
+        reason: "wrong merge".into(),
+    }
+}
+
+/// `a` superseded by `by`, with a reason, at revision `rev`.
+fn superseded_payload(c: char, by: char, rev: Option<&str>) -> Value {
+    let mut payload = memory_payload(c, rev);
+    payload["metadata"]["superseded_by"] = json!(hash(by));
+    payload["supersession_reason"] = json!("merged");
+    payload
+}
+
+/// The reverse of a supersession is ONE whole-payload overwrite, conditional
+/// on the revision read: marker and reason leave together, the audit entry
+/// arrives in the same write, and every other field is the copy just read.
+#[tokio::test]
+async fn unsupersede_clears_marker_and_reason_and_logs_them_in_one_conditional_write() {
+    let (server, fake) = fake_with(&[]).await;
+    fake.insert(&id('a'), superseded_payload('a', 'b', Some("r1")));
+
+    let outcome = client_for(&server)
+        .clear_superseded_by(&hash('a'), &json!(hash('b')), &reversal())
+        .await
+        .expect("clear succeeds");
+    assert_eq!(
+        outcome,
+        ClearSupersession::Cleared {
+            supersession_reason: Some(json!("merged"))
+        }
+    );
+
+    let w = writes(&server).await;
+    assert_eq!(w.len(), 1, "one write: {w:?}");
+    let (line, body) = &w[0];
+    assert_eq!(
+        line,
+        &format!("PUT {PAYLOAD_PATH}?wait=true"),
+        "an overwrite: a merge cannot remove a key"
+    );
+    assert!(is_conditional(line, body), "{line} {body}");
+    assert_eq!(body["filter"]["must"][1], common::rev_cond(Some("r1")));
+
+    let stored = fake.point(&id('a')).unwrap();
+    assert_eq!(
+        stored["metadata"],
+        json!({"source": "import", "provenance": {"trust": 0.9}}),
+        "marker gone, siblings kept"
+    );
+    assert!(stored.get("supersession_reason").is_none(), "{stored}");
+    assert_eq!(
+        stored["supersession_log"],
+        json!([{
+            "superseded_by": hash('b'),
+            "supersession_reason": "merged",
+            "unsuperseded_at": 2000.0,
+            "unsuperseded_via": "operator:test",
+            "reason": "wrong merge",
+        }])
+    );
+    assert_eq!(stored["content"], json!("memory a"));
+    assert_eq!(stored["access_count"], json!(2));
+    assert_eq!(stored["rev_log"][0], json!("r1"));
+    assert_eq!(stored["rev_log"][1], stored["rev"]);
+}
+
+/// A second reversal appends: the audit trail only grows.
+#[tokio::test]
+async fn unsupersede_appends_to_an_existing_log() {
+    let (server, fake) = fake_with(&[]).await;
+    let mut payload = superseded_payload('a', 'c', None);
+    payload["supersession_log"] = json!([{"superseded_by": hash('b'), "reason": "first"}]);
+    fake.insert(&id('a'), payload);
+
+    client_for(&server)
+        .clear_superseded_by(&hash('a'), &json!(hash('c')), &reversal())
+        .await
+        .expect("clear succeeds");
+
+    let log = fake.point(&id('a')).unwrap()["supersession_log"].clone();
+    assert_eq!(log.as_array().unwrap().len(), 2, "{log}");
+    assert_eq!(
+        log[0],
+        json!({"superseded_by": hash('b'), "reason": "first"})
+    );
+    assert_eq!(log[1]["superseded_by"], json!(hash('c')));
+}
+
+/// A live memory, or one superseded by something other than what the caller
+/// read, is reported as found and never written.
+#[tokio::test]
+async fn unsupersede_writes_nothing_unless_the_marker_is_the_expected_one() {
+    let (server, fake) = fake_with(&[('a', Some("r1"))]).await;
+    let superseded = superseded_payload('c', 'd', None);
+    fake.insert(&id('c'), superseded.clone());
+    let client = client_for(&server);
+
+    let live = client
+        .clear_superseded_by(&hash('a'), &json!(hash('b')), &reversal())
+        .await
+        .expect("a live memory is an outcome, not an error");
+    assert_eq!(live, ClearSupersession::NotSuperseded);
+
+    let other = client
+        .clear_superseded_by(&hash('c'), &json!(hash('b')), &reversal())
+        .await
+        .expect("another survivor is an outcome, not an error");
+    assert_eq!(
+        other,
+        ClearSupersession::SupersededByOther(json!(hash('d')))
+    );
+
+    assert!(writes(&server).await.is_empty());
+    assert_eq!(fake.point(&id('c')).unwrap(), superseded);
+}
+
+#[tokio::test]
+async fn unsupersede_of_an_absent_memory_is_not_found() {
+    let (server, _fake) = fake_with(&[]).await;
+
+    let result = client_for(&server)
+        .clear_superseded_by(&hash('a'), &json!(hash('b')), &reversal())
+        .await;
+    assert!(matches!(result, Err(AlayaError::NotFound(_))), "{result:?}");
+    assert!(writes(&server).await.is_empty());
+}
+
+/// Another process counts an access inside the read→write window: the
+/// overwrite built from the stale copy is rejected and rebuilt, so the
+/// reversal lands without rolling the count back.
+#[tokio::test]
+async fn unsupersede_lost_race_is_rebuilt_and_keeps_the_other_writers_fields() {
+    let (server, fake) = fake_with(&[]).await;
+    fake.insert(&id('a'), superseded_payload('a', 'b', Some("r1")));
+    let a = id('a');
+    fake.before_writes(1, move |points| {
+        external_write(points, &a, json!({"access_count": 11}));
+    });
+
+    client_for(&server)
+        .clear_superseded_by(&hash('a'), &json!(hash('b')), &reversal())
+        .await
+        .expect("lands on its second round");
+
+    let stored = fake.point(&id('a')).unwrap();
+    assert_eq!(
+        stored["access_count"],
+        json!(11),
+        "other writer's count kept"
+    );
+    assert!(
+        stored["metadata"].get("superseded_by").is_none(),
+        "{stored}"
+    );
+    assert_eq!(writes(&server).await.len(), 2);
+}
+
+/// A re-supersede to another survivor lands inside the window: the rebuilt
+/// write sees the new marker and stands down, leaving that supersession whole.
+#[tokio::test]
+async fn unsupersede_racing_a_re_supersede_stands_down() {
+    let (server, fake) = fake_with(&[]).await;
+    fake.insert(&id('a'), superseded_payload('a', 'b', Some("r1")));
+    let a = id('a');
+    fake.before_writes(1, move |points| {
+        let mut metadata = points[&a]["metadata"].clone();
+        metadata["superseded_by"] = json!(hash('c'));
+        external_write(
+            points,
+            &a,
+            json!({"metadata": metadata, "supersession_reason": "newer"}),
+        );
+    });
+
+    let outcome = client_for(&server)
+        .clear_superseded_by(&hash('a'), &json!(hash('b')), &reversal())
+        .await
+        .expect("an outcome, not an error");
+    assert_eq!(
+        outcome,
+        ClearSupersession::SupersededByOther(json!(hash('c')))
+    );
+
+    let stored = fake.point(&id('a')).unwrap();
+    assert_eq!(stored["metadata"]["superseded_by"], json!(hash('c')));
+    assert_eq!(stored["supersession_reason"], json!("newer"));
+    assert!(stored.get("supersession_log").is_none(), "{stored}");
 }

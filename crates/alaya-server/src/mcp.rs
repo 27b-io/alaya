@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use alaya_core::deduplication::CanonicalStrategy;
-use alaya_core::service::{OutputMode, RelationParams, SearchParams, StoreParams};
+use alaya_core::service::{
+    MAX_UNSUPERSEDE_REASON_LEN, OutputMode, RelationParams, SearchParams, StoreParams,
+};
 
 use alaya_types::graph::Resolution;
 
@@ -36,6 +38,12 @@ struct SupersedeParams {
     old_id: String,
     new_id: String,
     #[serde(default)]
+    reason: String,
+}
+
+#[derive(Deserialize)]
+struct UnsupersedeParams {
+    content_hash: String,
     reason: String,
 }
 
@@ -267,7 +275,7 @@ fn make_response(resp: JsonRpcResponse, sse: bool) -> Response {
 /// without it the rule is only stated per-input-field and never as a whole.
 const SERVER_INSTRUCTIONS: &str = "Ālaya is a persistent semantic memory service (vector search + knowledge graph).
 
-Memory identifiers: every memory is keyed by `content_hash`, a full 64-character SHA-256 hex string. `store_memory` and `search` return this hash on every result — pass it back verbatim to `get_memory`, `memory_supersede`, `delete_memory`, `relation`, and `merge_duplicates`. Never truncate or abbreviate it; the 8-character prefixes shown in log lines and display output are not valid identifiers and will be rejected.
+Memory identifiers: every memory is keyed by `content_hash`, a full 64-character SHA-256 hex string. `store_memory` and `search` return this hash on every result — pass it back verbatim to `get_memory`, `memory_supersede`, `memory_unsupersede`, `delete_memory`, `relation`, and `merge_duplicates`. Never truncate or abbreviate it; the 8-character prefixes shown in log lines and display output are not valid identifiers and will be rejected.
 
 Inspect before mutating: use `get_memory` to read a memory by hash before `memory_supersede` or `delete_memory`.";
 
@@ -430,6 +438,24 @@ async fn dispatch_tool(
                         old_hash: p.old_id,
                         new_hash: p.new_id,
                         reason: p.reason,
+                        reply: tx,
+                    },
+                    rx,
+                )
+                .await
+        }
+        "memory_unsupersede" => {
+            let p: UnsupersedeParams = serde_json::from_value(args)
+                .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
+            let (tx, rx) = oneshot::channel();
+            handle
+                .call_rpc(
+                    CmdInner::Unsupersede {
+                        hash: p.content_hash,
+                        reason: p.reason,
+                        // Fixed, like resolve_contradiction's: a tool call
+                        // cannot record itself as the console or a person.
+                        via: "operator:mcp".to_string(),
                         reply: tx,
                     },
                     rx,
@@ -622,7 +648,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "memory_supersede",
-            "description": "Mark one memory as superseded by another, resolving a contradiction destructively: the old memory leaves default search results (it stays retrievable with an audit trail) and every pair it is in leaves the contradiction queue. Use only when one memory misleads. When both are true (verdict coexist) or the pair is detector noise (verdict unrelated), call resolve_contradiction with resolution keep_both instead — nothing is superseded and it is reversible.",
+            "description": "Mark one memory as superseded by another, resolving a contradiction destructively: the old memory leaves default search results (it stays retrievable with an audit trail) and every pair it is in leaves the contradiction queue. Use only when one memory misleads. When both are true (verdict coexist) or the pair is detector noise (verdict unrelated), call resolve_contradiction with resolution keep_both instead — nothing is superseded. A wrong supersession is reversed with memory_unsupersede.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -643,6 +669,29 @@ fn tool_schemas() -> Value {
                     "reason": { "type": "string", "default": "" }
                 },
                 "required": ["old_id", "new_id"]
+            }
+        },
+        {
+            "name": "memory_unsupersede",
+            "description": "Reverse a memory_supersede (or merge_duplicates) that was wrong: the memory returns to default search results and its contradiction pairs return to the queue. The reversal is recorded on the memory with your reason, the prior superseded_by and supersession_reason; the pair with the former survivor is stamped keep_both (resolved_via unsupersede) so the judge never re-applies it. Only that memory changes: in a chain A→B→C, unsuperseding B leaves A superseded by B. A memory that is not superseded returns {success: false, status: not_superseded}; one superseded again while this ran returns {success: false, status: superseded_by_changed}. Recorded as unsuperseded_via operator:mcp.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content_hash": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "Full 64-char SHA-256 hex content_hash of the superseded memory to restore. Do not pass truncated display/log prefixes."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_UNSUPERSEDE_REASON_LEN,
+                        "description": "Why the supersession was wrong. Required: it is the audit record."
+                    }
+                },
+                "required": ["content_hash", "reason"]
             }
         },
         {
@@ -784,11 +833,11 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_11_tools() {
+    fn tools_list_returns_12_tools() {
         let resp = handle_tools_list(json!(2));
         let v = serde_json::to_value(&resp).unwrap();
         let tools = v["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
     }
 
     #[test]
@@ -807,6 +856,7 @@ mod tests {
         assert!(names.contains(&"check_database_health"));
         assert!(names.contains(&"relation"));
         assert!(names.contains(&"memory_supersede"));
+        assert!(names.contains(&"memory_unsupersede"));
         assert!(names.contains(&"memory_contradictions"));
         assert!(names.contains(&"resolve_contradiction"));
         assert!(names.contains(&"find_duplicates"));
@@ -873,6 +923,39 @@ mod tests {
             assert!(d.contains("resolve_contradiction"), "{name}: {d}");
             assert!(d.contains("keep_both"), "{name}: {d}");
         }
+    }
+
+    /// The reason is the audit record, so the wire requires it; who reversed
+    /// it is fixed by the surface, never taken from the caller.
+    #[test]
+    fn unsupersede_params_require_reason_and_ignore_a_caller_via() {
+        let h = "a".repeat(64);
+        assert!(
+            serde_json::from_value::<UnsupersedeParams>(json!({"content_hash": h})).is_err(),
+            "a missing reason is -32602"
+        );
+        let p: UnsupersedeParams = serde_json::from_value(
+            json!({"content_hash": h, "reason": "wrong merge", "unsuperseded_via": "operator:console"}),
+        )
+        .unwrap();
+        assert_eq!(p.reason, "wrong merge");
+
+        let schema = tool_schemas()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "memory_unsupersede")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            schema["inputSchema"]["required"],
+            json!(["content_hash", "reason"])
+        );
+        assert!(
+            schema["inputSchema"]["properties"]
+                .get("unsuperseded_via")
+                .is_none()
+        );
     }
 
     #[test]
@@ -970,6 +1053,7 @@ mod tests {
             ("relation", "content_hash"),
             ("memory_supersede", "old_id"),
             ("memory_supersede", "new_id"),
+            ("memory_unsupersede", "content_hash"),
             ("resolve_contradiction", "memory_a_hash"),
             ("resolve_contradiction", "memory_b_hash"),
         ] {
