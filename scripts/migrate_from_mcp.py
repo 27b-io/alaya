@@ -154,6 +154,7 @@ async def run() -> None:
     memories: list[dict] = []
     source_hashes: list[str | None] = []  # aligned with memories
     supersessions: list[Supersession] = []
+    empty_markers = 0
     next_offset = None
 
     while True:
@@ -192,6 +193,7 @@ async def run() -> None:
             # Use `is not None` so legitimate falsy values (e.g. epoch 0,
             # neutral 0.0 valence) survive the copy.
             metadata = dict(payload.get("metadata") or {})
+            has_marker = "superseded_by" in metadata
             superseded_by = metadata.pop("superseded_by", None)
             if superseded_by:
                 supersessions.append(
@@ -202,6 +204,10 @@ async def run() -> None:
                         or "migrated from mcp-memory-service",
                     )
                 )
+            elif has_marker:
+                # The source filters on a truthy marker, so an empty one is
+                # live there and migrates live.
+                empty_markers += 1
             if payload.get("emotional_valence") is not None:
                 metadata["emotional_valence"] = payload["emotional_valence"]
             if payload.get("created_at") is not None:
@@ -222,6 +228,10 @@ async def run() -> None:
         f"  Found {stats.scrolled} memories ({stats.skipped_no_content} skipped — no content)"
     )
     print(f"  {len(supersessions)} supersessions to recreate")
+    if empty_markers:
+        print(
+            f"  {empty_markers} memories carry an empty superseded_by: live, migrated live"
+        )
 
     superseded = {s.index for s in supersessions}
     live_contents = {
