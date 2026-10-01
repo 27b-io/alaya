@@ -743,6 +743,13 @@ pub(crate) enum CmdInner {
         reason: String,
         reply: oneshot::Sender<Value>,
     },
+    /// Reverse a supersession (LAB-6876). `via` is who, recorded verbatim.
+    Unsupersede {
+        hash: String,
+        reason: String,
+        via: String,
+        reply: oneshot::Sender<Value>,
+    },
     Contradictions {
         limit: usize,
         offset: usize,
@@ -751,7 +758,8 @@ pub(crate) enum CmdInner {
         reply: oneshot::Sender<Value>,
     },
     /// Stamp (`Some`) or clear (`None`) the operator's resolution on a
-    /// CONTRADICTS pair (LAB-3885). The only write path to `e.resolution*`.
+    /// CONTRADICTS pair (LAB-3885). With `Unsupersede`, the only writer of
+    /// `e.resolution*`.
     ResolveContradiction {
         memory_a_hash: String,
         memory_b_hash: String,
@@ -815,6 +823,7 @@ impl Cmd {
             CmdInner::GetMemory { .. } => "get_memory",
             CmdInner::Relation { .. } => "relation",
             CmdInner::Supersede { .. } => "supersede",
+            CmdInner::Unsupersede { .. } => "unsupersede",
             CmdInner::Contradictions { .. } => "contradictions",
             CmdInner::ResolveContradiction { .. } => "resolve_contradiction",
             CmdInner::FindDuplicates { .. } => "find_duplicates",
@@ -1527,6 +1536,47 @@ async fn service_worker(
                             new = new_h.as_str(),
                             old_len = old_hash.len(),
                             new_len = new_hash.len(),
+                            elapsed_ms = ms(start),
+                            "failed"
+                        );
+                        json!({"success": false, "error": e.safe_message()})
+                    }
+                    Err(_) => deadline_exceeded(op, limits.cmd, start),
+                };
+                let _ = reply.send(result);
+            }
+            CmdInner::Unsupersede {
+                hash,
+                reason,
+                via,
+                reply,
+            } => {
+                let span = tracing::info_span!(parent: &ps, "unsupersede");
+                let h = truncate_hash(&hash);
+                let result = match timeout(
+                    limits.cmd,
+                    svc.memory_unsupersede(&hash, &reason, &via)
+                        .instrument(span),
+                )
+                .await
+                {
+                    Ok(Ok(r)) => {
+                        tracing::info!(
+                            op,
+                            hash = h.as_str(),
+                            status = r["status"].as_str().unwrap_or_default(),
+                            via = via.as_str(),
+                            elapsed_ms = ms(start),
+                            "ok"
+                        );
+                        r
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(
+                            op,
+                            error = %e,
+                            hash = h.as_str(),
+                            hash_len = hash.len(),
                             elapsed_ms = ms(start),
                             "failed"
                         );
@@ -2656,6 +2706,7 @@ fn protected_router(handle: ServiceHandle, auth_state: AuthState) -> Router {
         .route("/delete", post(delete))
         .route("/relation", post(relation))
         .route("/supersede", post(supersede))
+        .route("/unsupersede", post(unsupersede))
         .route("/contradictions", post(contradictions))
         .route("/contradictions/resolution", post(resolve_contradiction))
         .route("/duplicates/find", post(find_duplicates))
@@ -2848,6 +2899,32 @@ async fn supersede(
             old_hash: req.old_hash,
             new_hash: req.new_hash,
             reason: req.reason,
+            reply: tx,
+        },
+        rx,
+    )
+    .await
+}
+
+/// `reason` and `unsuperseded_via` are the audit record: both required.
+#[derive(Deserialize)]
+struct UnsupersedeReq {
+    content_hash: String,
+    reason: String,
+    /// Who reversed it, recorded verbatim (`operator:console`, `operator:ray`).
+    unsuperseded_via: String,
+}
+
+async fn unsupersede(
+    axum::extract::State(h): axum::extract::State<ServiceHandle>,
+    Json(req): Json<UnsupersedeReq>,
+) -> (StatusCode, Json<Value>) {
+    let (tx, rx) = oneshot::channel();
+    h.call(
+        CmdInner::Unsupersede {
+            hash: req.content_hash,
+            reason: req.reason,
+            via: req.unsuperseded_via,
             reply: tx,
         },
         rx,
@@ -3181,6 +3258,30 @@ mod tests {
             "memory_a_hash": a, "memory_b_hash": b, "resolution": "keep_both"
         }));
         assert!(no_via.is_err(), "resolved_via is required on REST");
+    }
+
+    // ─── unsupersede wire shape (LAB-6876 AC-4) ──────────────────────────
+
+    /// Who and why are the audit record: REST refuses a request without
+    /// either rather than recording a blank.
+    #[test]
+    fn unsupersede_req_requires_reason_and_unsuperseded_via() {
+        let h = "a".repeat(64);
+        let ok: UnsupersedeReq = serde_json::from_value(json!({
+            "content_hash": h, "reason": "wrong merge", "unsuperseded_via": "operator:console"
+        }))
+        .unwrap();
+        assert_eq!(ok.unsuperseded_via, "operator:console");
+        for missing in ["reason", "unsuperseded_via"] {
+            let mut body = json!({
+                "content_hash": h, "reason": "wrong merge", "unsuperseded_via": "operator:console"
+            });
+            body.as_object_mut().unwrap().remove(missing);
+            assert!(
+                serde_json::from_value::<UnsupersedeReq>(body).is_err(),
+                "{missing} is required on REST"
+            );
+        }
     }
 
     // ─── Contradiction judge plumbing (LAB-3283 AC-4, AC-5, AC-9) ─────────
@@ -4401,6 +4502,14 @@ mod wedge_tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for HangVectors {
+        async fn reverse_supersession(
+            &self,
+            _h: &str,
+            _e: &serde_json::Value,
+            _r: &alaya_backends::ReversalRecord,
+        ) -> Result<alaya_backends::ReversalOutcome> {
+            unimplemented!()
+        }
         async fn store(&self, _memory: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             unimplemented!()
         }
@@ -4519,6 +4628,31 @@ mod wedge_tests {
 
     #[async_trait(?Send)]
     impl GraphService for StubGraph {
+        async fn unsettle_contradiction(
+            &self,
+            _s: &str,
+            _d: &str,
+            _v: &str,
+            _t: f64,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn settle_contradiction(
+            &self,
+            _s: &str,
+            _d: &str,
+            _v: &str,
+            _t: f64,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn delete_incoming_system_edges(
+            &self,
+            _d: &str,
+            _r: alaya_types::graph::SystemRelationType,
+        ) -> Result<Vec<String>> {
+            unimplemented!()
+        }
         async fn ensure_node(&self, _content_hash: &str, _created_at: f64) -> Result<()> {
             unimplemented!()
         }

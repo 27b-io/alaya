@@ -1,4 +1,5 @@
-//! Edge handlers — POST /edges/create, POST /edges/create-batch, POST /edges/get, POST /edges/delete
+//! Edge handlers — POST /edges/create, POST /edges/create-batch, POST /edges/get, POST /edges/delete,
+//! POST /edges/create-system{,-batch}, POST /edges/delete-system-incoming
 
 use std::sync::Arc;
 
@@ -46,6 +47,12 @@ pub struct CreateSystemEdgeRequest {
     pub target: String,
     pub relation_type: String,
     pub created_at: f64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteIncomingSystemEdgesRequest {
+    pub target: String,
+    pub relation_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -305,6 +312,33 @@ pub async fn create_system_batch(
     }
 
     Ok(Json(json!({ "created": created })))
+}
+
+/// POST /edges/delete-system-incoming
+///
+/// Delete every system edge of `relation_type` pointing INTO `target`,
+/// whatever its source, and return the sources. Un-superseding a memory
+/// (LAB-6876) removes all its incoming `SUPERSEDES` edges: the marker that
+/// edges are derived from is gone, and one left behind would keep the memory
+/// resolved in the contradiction queue.
+pub async fn delete_system_incoming(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DeleteIncomingSystemEdgesRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    if !validate_content_hash(&req.target) {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let rel = parse_system_relation(&req.relation_type)?;
+    let (cypher, params, readonly) = cypher::delete_incoming_system_edges(&req.target, rel);
+    let result = exec_query(&state, &cypher, params, readonly).await?;
+
+    let sources: Vec<&str> = result
+        .result_set
+        .iter()
+        .filter_map(|row| row.first().and_then(Value::as_str))
+        .collect();
+    Ok(Json(json!({ "sources": sources })))
 }
 
 /// POST /edges/create-system

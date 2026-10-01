@@ -118,6 +118,7 @@ pub fn rest_route_op(method: &Method, path: &str) -> &'static str {
         ("POST", "/delete") => "delete_memory",
         ("POST", "/relation") => "relation",
         ("POST", "/supersede") => "memory_supersede",
+        ("POST", "/unsupersede") => "memory_unsupersede",
         ("POST", "/contradictions") => "memory_contradictions",
         ("POST", "/contradictions/resolution") => "resolve_contradiction",
         ("POST", "/duplicates/find") => "find_duplicates",
@@ -144,6 +145,7 @@ pub const ALL_OPS: &[(&str, bool)] = &[
     ("store_memory", false),
     ("delete_memory", true),
     ("memory_supersede", true),
+    ("memory_unsupersede", true),
     ("resolve_contradiction", true),
     ("merge_duplicates", true),
     ("relation", true),
@@ -372,6 +374,7 @@ mod tests {
         for op in [
             "delete_memory",
             "memory_supersede",
+            "memory_unsupersede",
             "merge_duplicates",
             "patch_memory",
             "relation",
@@ -420,6 +423,10 @@ mod tests {
         assert_eq!(rest_route_op(&Method::POST, "/store"), "store_memory");
         assert_eq!(rest_route_op(&Method::POST, "/search"), "search");
         assert_eq!(rest_route_op(&Method::POST, "/delete"), "delete_memory");
+        assert_eq!(
+            rest_route_op(&Method::POST, "/unsupersede"),
+            "memory_unsupersede"
+        );
         assert_eq!(
             rest_route_op(&Method::POST, "/duplicates/find"),
             "find_duplicates"
@@ -505,6 +512,7 @@ mod tests {
             rest_route_op(&Method::POST, "/delete"),
             rest_route_op(&Method::POST, "/relation"),
             rest_route_op(&Method::POST, "/supersede"),
+            rest_route_op(&Method::POST, "/unsupersede"),
             rest_route_op(&Method::POST, "/contradictions"),
             rest_route_op(&Method::POST, "/contradictions/resolution"),
             rest_route_op(&Method::POST, "/duplicates/find"),
@@ -653,6 +661,7 @@ mod tests {
             .route("/store", post(ok))
             .route("/delete", post(ok))
             .route("/supersede", post(ok))
+            .route("/unsupersede", post(ok))
             .route("/relation", post(ok))
             .route("/duplicates/merge", post(ok))
             .route("/memories/{content_hash}", get(ok).patch(ok))
@@ -695,6 +704,7 @@ mod tests {
             (Method::POST, "/store"),
             (Method::POST, "/delete"),
             (Method::POST, "/supersede"),
+            (Method::POST, "/unsupersede"),
             (Method::POST, "/relation"),
             (Method::POST, "/duplicates/merge"),
             (Method::PATCH, "/memories/abc"),
