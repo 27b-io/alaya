@@ -118,8 +118,13 @@ impl ChatResponse {
             return Err(err("chat completion stopped by the content filter".into()));
         }
         // The refusal text is the model's prose; it is not echoed into an
-        // error that lands on an edge and in the log.
-        if message.refusal.is_some() {
+        // error that lands on an edge and in the log. An empty string is not
+        // a refusal: a server that sends `""` for "none" must not fail every call.
+        if message
+            .refusal
+            .as_deref()
+            .is_some_and(|r| !r.trim().is_empty())
+        {
             return Err(err(format!(
                 "model refused the request (finish_reason={:?})",
                 choice.finish_reason.unwrap_or_default()
@@ -186,6 +191,16 @@ mod tests {
             r#"{"choices":[{"finish_reason":"stop"}]}"#,
         ] {
             assert!(parse(json).unwrap().text.is_none(), "{json}");
+        }
+    }
+
+    #[test]
+    fn empty_refusal_is_not_a_refusal() {
+        for refusal in ["\"\"", "\" \"", "null"] {
+            let json = format!(
+                r#"{{"choices":[{{"message":{{"content":"x","refusal":{refusal}}},"finish_reason":"stop"}}]}}"#
+            );
+            assert_eq!(parse(&json).unwrap().text.as_deref(), Some("x"), "{json}");
         }
     }
 

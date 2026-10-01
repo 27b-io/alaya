@@ -155,11 +155,9 @@ impl ContradictionJudge for JudgeClient {
 
         let resp = self.transport.complete(&prompt, AlayaError::Judge).await?;
         let stop = resp.stop_reason.clone().unwrap_or_default();
-        let text = resp.text.ok_or_else(|| {
-            AlayaError::Judge(format!(
-                "empty response from messages API (stop_reason={stop:?})"
-            ))
-        })?;
+        let text = resp
+            .text
+            .ok_or_else(|| AlayaError::Judge(format!("empty completion (stop_reason={stop:?})")))?;
         let raw: RawVerdict = serde_json::from_str(&text).map_err(|e| {
             AlayaError::Judge(format!(
                 "verdict is not valid JSON (stop_reason={stop:?}): {e}"
@@ -358,7 +356,8 @@ mod tests {
         /// Short timeout so the timeout path runs in milliseconds.
         fn client(server: &MockServer) -> JudgeClient {
             JudgeClient {
-                transport: MessagesTransport::new(
+                transport: MessagesTransport::for_provider(
+                    Provider::Anthropic,
                     server.uri(),
                     Some("test-key".into()),
                     std::time::Duration::from_millis(300),
@@ -491,7 +490,8 @@ mod tests {
                 .expect("addr")
                 .port();
             let client = JudgeClient {
-                transport: MessagesTransport::new(
+                transport: MessagesTransport::for_provider(
+                    Provider::Anthropic,
                     format!("http://127.0.0.1:{port}"),
                     Some("test-key".into()),
                     std::time::Duration::from_millis(300),
@@ -570,7 +570,9 @@ mod tests {
         }
     }
 
-    // ── OpenAI-compatible wire (LAB-6877): same classification, one validator ──
+    // ── OpenAI-compatible wire (LAB-6877): what only this wire does ────────
+    // Status and decode classification is shared (`MessagesTransport::post`)
+    // and covered by `mod http` above; validation by the unit tests.
 
     #[cfg(not(target_arch = "wasm32"))]
     mod http_openai {
@@ -578,21 +580,17 @@ mod tests {
         use wiremock::matchers::{body_partial_json, header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        fn client_at(uri: String) -> JudgeClient {
+        fn client(server: &MockServer) -> JudgeClient {
             JudgeClient {
                 transport: MessagesTransport::for_provider(
                     Provider::OpenAi,
-                    uri,
+                    server.uri(),
                     Some("test-key".into()),
                     std::time::Duration::from_millis(300),
                 )
                 .expect("test transport"),
                 model: "test-model".into(),
             }
-        }
-
-        fn client(server: &MockServer) -> JudgeClient {
-            client_at(server.uri())
         }
 
         fn chat(content: serde_json::Value, finish: &str) -> serde_json::Value {
@@ -655,45 +653,6 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn no_key_sends_no_authorization() {
-            let server = respond(ResponseTemplate::new(200).set_body_json(chat(
-                json!(r#"{"verdict":"unrelated","survivor":null,"reason":"r","confidence":0.5}"#),
-                "stop",
-            )))
-            .await;
-            let c = JudgeClient::new(Provider::OpenAi, server.uri(), "m".into(), None).unwrap();
-            c.judge(&mem("a", 1.0), &mem("b", 2.0)).await.unwrap();
-            let req = &server.received_requests().await.unwrap()[0];
-            assert!(req.headers.get("authorization").is_none());
-        }
-
-        #[tokio::test]
-        async fn missing_usage_is_zero_not_an_error() {
-            let server = respond(ResponseTemplate::new(200).set_body_json(json!({"choices": [
-                {"message": {"content": r#"{"verdict":"coexist","survivor":null,"reason":"r","confidence":0.7}"#}}
-            ]})))
-            .await;
-            let j = judge_once(&server).await.unwrap();
-            assert_eq!((j.input_tokens, j.output_tokens), (0, 0));
-        }
-
-        #[tokio::test]
-        async fn validation_is_the_shared_path() {
-            for text in [
-                r#"{"verdict":"supersession","survivor":null,"reason":"x","confidence":0.9}"#,
-                r#"{"verdict":"contradiction","survivor":"a","reason":"x","confidence":7}"#,
-                r#"{"verdict":"unjudged","survivor":null,"reason":"x","confidence":0.5}"#,
-                "I think B wins.",
-            ] {
-                let server =
-                    respond(ResponseTemplate::new(200).set_body_json(chat(json!(text), "stop")))
-                        .await;
-                let e = judge_once(&server).await.unwrap_err();
-                assert!(matches!(e, AlayaError::Judge(_)), "{text}: {e:?}");
-            }
-        }
-
-        #[tokio::test]
         async fn content_filter_refusal_and_empty_are_deterministic() {
             let refusal = json!({"choices": [{"finish_reason": "stop",
                 "message": {"content": null, "refusal": "I can't help with that."}}]});
@@ -714,63 +673,6 @@ mod tests {
             let server = respond(ResponseTemplate::new(200).set_body_string("not json")).await;
             let e = judge_once(&server).await.unwrap_err();
             assert!(matches!(e, AlayaError::Judge(_)), "{e:?}");
-        }
-
-        #[tokio::test]
-        async fn request_fault_4xx_is_deterministic() {
-            for status in [400u16, 413, 422] {
-                let server = respond(ResponseTemplate::new(status).set_body_string("bad")).await;
-                let e = judge_once(&server).await.unwrap_err();
-                assert!(matches!(e, AlayaError::Judge(_)), "{status}: {e:?}");
-            }
-        }
-
-        #[tokio::test]
-        async fn server_errors_and_misconfiguration_are_transient() {
-            for status in [500u16, 502, 503, 401, 403, 404] {
-                let server = respond(ResponseTemplate::new(status).set_body_string("boom")).await;
-                let e = judge_once(&server).await.unwrap_err();
-                let billed = status >= 500;
-                assert!(
-                    matches!(e, AlayaError::Unavailable { spent, .. } if spent == billed),
-                    "{status}: {e:?}"
-                );
-                assert!(!e.to_string().contains("test-key"), "key leaked: {e}");
-            }
-        }
-
-        #[tokio::test]
-        async fn rate_limit_surfaces_retry_after() {
-            let server =
-                respond(ResponseTemplate::new(429).insert_header("retry-after", "7")).await;
-            let e = judge_once(&server).await.unwrap_err();
-            assert!(
-                matches!(
-                    e,
-                    AlayaError::RateLimited {
-                        retry_after_secs: Some(7)
-                    }
-                ),
-                "{e:?}"
-            );
-        }
-
-        #[tokio::test]
-        async fn refused_connect_is_transient_and_free() {
-            let port = std::net::TcpListener::bind("127.0.0.1:0")
-                .expect("bind")
-                .local_addr()
-                .expect("addr")
-                .port();
-            let e = client_at(format!("http://127.0.0.1:{port}"))
-                .judge(&mem("a", 1.0), &mem("b", 2.0))
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(e, AlayaError::Unavailable { spent: false, .. }),
-                "{e:?}"
-            );
-            assert!(!e.to_string().contains("test-key"), "key leaked: {e}");
         }
 
         #[tokio::test]

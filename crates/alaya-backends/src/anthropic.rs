@@ -62,16 +62,6 @@ pub(crate) struct MessagesTransport {
 }
 
 impl MessagesTransport {
-    /// Anthropic shorthand for the tests that build a role client by hand.
-    #[cfg(test)]
-    pub(crate) fn new(
-        base_url: String,
-        api_key: Option<String>,
-        request_timeout: std::time::Duration,
-    ) -> Result<Self> {
-        Self::for_provider(Provider::Anthropic, base_url, api_key, request_timeout)
-    }
-
     /// `request_timeout` only applies natively; reqwest-wasm has no timeouts.
     ///
     /// Fails with `Config` on key material that is not a valid header value

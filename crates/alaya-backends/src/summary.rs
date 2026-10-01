@@ -57,7 +57,7 @@ impl SummaryProvider for SummaryClient {
 
         parsed
             .text
-            .ok_or_else(|| AlayaError::Summary("empty response from messages API".into()))
+            .ok_or_else(|| AlayaError::Summary("empty completion".into()))
     }
 }
 

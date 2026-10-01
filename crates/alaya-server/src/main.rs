@@ -1873,14 +1873,13 @@ fn contradicted_hashes(store_result: &std::collections::HashMap<String, Value>) 
     hashes
 }
 
-/// `*_PROVIDER`: unset or blank is `fallback`, anything but `anthropic` /
-/// `openai` refuses boot naming the variable.
+/// `*_PROVIDER`, read through `env_non_empty` (so blank is unset): unset is
+/// `fallback`, anything but `anthropic` / `openai` refuses boot naming the
+/// variable.
 fn parse_provider(var: &str, raw: Option<String>, fallback: Provider) -> Result<Provider, String> {
-    match raw {
-        None => Ok(fallback),
-        Some(s) if s.trim().is_empty() => Ok(fallback),
-        Some(s) => s.parse().map_err(|e| format!("{var}: {e}")),
-    }
+    raw.map_or(Ok(fallback), |s| {
+        s.parse().map_err(|e| format!("{var}: {e}"))
+    })
 }
 
 /// Default daily cap for store-path judge calls (LAB-3895).
@@ -3372,12 +3371,8 @@ mod tests {
     fn parse_provider_defaults_falls_back_and_refuses_unknown() {
         let a = Provider::Anthropic;
         let o = Provider::OpenAi;
-        // Default: unset or blank is the fallback (anthropic for SUMMARY_*).
+        // Default: unset is the fallback (anthropic for SUMMARY_*).
         assert_eq!(parse_provider("SUMMARY_PROVIDER", None, a), Ok(a));
-        assert_eq!(
-            parse_provider("SUMMARY_PROVIDER", Some(" ".into()), a),
-            Ok(a)
-        );
         // Override.
         assert_eq!(
             parse_provider("SUMMARY_PROVIDER", Some("openai".into()), a),
