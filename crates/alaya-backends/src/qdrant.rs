@@ -2,6 +2,7 @@
 //!
 //! All calls use raw `reqwest` HTTP to stay WASM-compatible (no qdrant-client crate).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,7 +21,7 @@ use alaya_types::{
     search::PayloadFilter,
 };
 
-use crate::{StoreMode, VectorStorage};
+use crate::{ReversalOutcome, ReversalRecord, StoreMode, VectorStorage};
 
 // ─── Client ──────────────────────────────────────────────────────────────────
 
@@ -901,6 +902,40 @@ fn memory_to_payload(memory: &Memory) -> Value {
     payload
 }
 
+/// Payload key: the reversed supersessions of a memory, oldest first (see
+/// `VectorStorage::reverse_supersession`). Server-maintained.
+const SUPERSESSION_LOG: &str = "supersession_log";
+
+/// The whole payload that reversing a supersession leaves on a point that
+/// held `prev`: no marker, no `supersession_reason`, and one more
+/// `supersession_log` entry recording both. Also returns the reason removed.
+fn unsupersede_payload(
+    prev: &serde_json::Map<String, Value>,
+    reversal: &ReversalRecord,
+) -> (Value, Option<Value>) {
+    let mut obj = prev.clone();
+    let marker = obj
+        .get_mut("metadata")
+        .and_then(Value::as_object_mut)
+        .and_then(|m| m.remove("superseded_by"));
+    let reason = obj.remove("supersession_reason");
+    // An audit trail is never dropped, even one in a shape no writer makes.
+    let mut log = match obj.remove(SUPERSESSION_LOG) {
+        None => Vec::new(),
+        Some(Value::Array(entries)) => entries,
+        Some(other) => vec![other],
+    };
+    log.push(json!({
+        "superseded_by": marker,
+        "supersession_reason": reason,
+        "unsuperseded_at": reversal.at,
+        "unsuperseded_via": reversal.via,
+        "reason": reversal.reason,
+    }));
+    obj.insert(SUPERSESSION_LOG.into(), Value::Array(log));
+    (Value::Object(obj), reason)
+}
+
 /// Carry the server-maintained fields of `prev`, the stored payload, over the
 /// caller's `payload` on a re-store (see `VectorStorage::store`).
 fn carry_over(payload: &mut Value, prev: &Value) {
@@ -909,16 +944,24 @@ fn carry_over(payload: &mut Value, prev: &Value) {
         "access_count",
         "access_timestamps",
         "supersession_reason",
+        SUPERSESSION_LOG,
     ] {
         if let Some(v) = prev.get(key) {
             payload[key] = v.clone();
         }
     }
-    // The supersession marker is written by mark_superseded, never by a store
-    // caller, so it is server-maintained too: a re-store must not resurrect a
-    // superseded memory (alaya-core's is_superseded reads exactly this key).
-    if let Some(sb) = prev.pointer("/metadata/superseded_by") {
-        payload["metadata"]["superseded_by"] = sb.clone();
+    // The supersession marker is written by mark_superseded and removed by
+    // reverse_supersession, never by a store caller, so on a re-store it is
+    // the stored one, present or absent: a re-store neither resurrects a
+    // superseded memory (alaya-core's is_superseded reads exactly this key)
+    // nor re-hides a reversed one from a caller's stale copy of its metadata.
+    match prev.pointer("/metadata/superseded_by") {
+        Some(sb) => payload["metadata"]["superseded_by"] = sb.clone(),
+        None => {
+            if let Some(md) = payload.get_mut("metadata").and_then(Value::as_object_mut) {
+                md.remove("superseded_by");
+            }
+        }
     }
     // summary_embedding is derived server-side from the summary text. Keep it
     // only while that text is unchanged, so a re-store neither drops it
@@ -1187,6 +1230,57 @@ impl VectorStorage for QdrantClient {
             }
         }
         Ok(())
+    }
+
+    #[tracing::instrument(skip(self, expected, reversal), fields(hash = %content_hash))]
+    async fn reverse_supersession(
+        &self,
+        content_hash: &str,
+        expected: &Value,
+        reversal: &ReversalRecord,
+    ) -> Result<ReversalOutcome> {
+        let point_id = hash_to_uuid(content_hash)?;
+        let not_found = || AlayaError::NotFound(format!("memory {content_hash} not found"));
+
+        let _write = self.write_lock.lock().await;
+
+        // Removing keys takes a whole-payload overwrite, rebuilt from the
+        // copy the write is conditional on. `found` keeps what the latest
+        // read held: a race re-runs the closure, so for the one point here
+        // the last run describes the write that landed or the reason none did.
+        let found: RefCell<Option<Value>> = RefCell::new(None);
+        let removed: RefCell<Option<Value>> = RefCell::new(None);
+        let mut outcome = self
+            .update_points(
+                std::slice::from_ref(&point_id),
+                None,
+                Commit::Payload(PayloadWrite::Replace, Batch::Strict),
+                |prev| {
+                    let marker = prev.pointer("/metadata/superseded_by").cloned();
+                    let take = marker.as_ref() == Some(expected);
+                    *found.borrow_mut() = marker;
+                    let Some(prev) = prev.as_object().filter(|_| take) else {
+                        return Ok(None);
+                    };
+                    let (next, reason) = unsupersede_payload(prev, reversal);
+                    *removed.borrow_mut() = reason;
+                    Ok(Some(next))
+                },
+            )
+            .await?;
+        match outcome.remove(&point_id) {
+            Some(Update::Landed { .. }) => Ok(ReversalOutcome::Cleared {
+                supersession_reason: removed.take(),
+            }),
+            Some(Update::Skipped) => Ok(match found.take() {
+                None => ReversalOutcome::NotSuperseded,
+                Some(other) => ReversalOutcome::SupersededByOther(other),
+            }),
+            Some(Update::Unconfirmed(why)) => Err(AlayaError::Storage(format!(
+                "unsupersede of {content_hash}: {why}"
+            ))),
+            Some(Update::Absent | Update::Deleted) | None => Err(not_found()),
+        }
     }
 
     #[tracing::instrument(skip(self, patch), fields(hash = %content_hash))]

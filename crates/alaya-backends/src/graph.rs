@@ -171,6 +171,12 @@ struct CreateSystemEdgeReq<'a> {
 }
 
 #[derive(Serialize)]
+struct DeleteIncomingSystemEdgesReq<'a> {
+    target: &'a str,
+    relation_type: &'a str,
+}
+
+#[derive(Serialize)]
 struct LimitReq {
     limit: usize,
 }
@@ -241,6 +247,11 @@ struct DeletedResp {
 }
 
 #[derive(Deserialize)]
+struct SourcesResp {
+    sources: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct EdgesResp {
     edges: Vec<Edge>,
 }
@@ -260,6 +271,10 @@ struct SetResolutionReq<'a> {
     resolution: Option<Resolution>,
     resolved_via: &'a str,
     resolved_at: f64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    if_unresolved: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    if_stamped: bool,
 }
 
 #[derive(Deserialize)]
@@ -476,6 +491,26 @@ impl GraphService for GraphHttpClient {
         Ok(body.created)
     }
 
+    async fn delete_incoming_system_edges(
+        &self,
+        dst: &str,
+        rel: SystemRelationType,
+    ) -> Result<Vec<String>> {
+        let resp = self
+            .client
+            .post(format!("{}/edges/delete-system-incoming", self.base_url))
+            .json(&DeleteIncomingSystemEdgesReq {
+                target: dst,
+                relation_type: rel.cypher_label(),
+            })
+            .send()
+            .await
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
+
+        let body: SourcesResp = handle_response(resp).await?;
+        Ok(body.sources)
+    }
+
     #[tracing::instrument(skip(self, edges), fields(n = edges.len()))]
     async fn create_system_edges_batch(
         &self,
@@ -562,10 +597,66 @@ impl GraphService for GraphHttpClient {
                 resolution,
                 resolved_via,
                 resolved_at,
+                if_unresolved: false,
+                if_stamped: false,
             })
             .send()
             .await
             .map_err(|e| AlayaError::Graph(e.to_string()))?;
+
+        let body: UpdatedResp = handle_response(resp).await?;
+        Ok(body.updated)
+    }
+
+    async fn settle_contradiction(
+        &self,
+        src: &str,
+        dst: &str,
+        resolved_via: &str,
+        resolved_at: f64,
+    ) -> Result<bool> {
+        let resp = self
+            .client
+            .post(format!("{}/contradictions/resolution", self.base_url))
+            .json(&SetResolutionReq {
+                source: src,
+                target: dst,
+                resolution: Some(Resolution::KeepBoth),
+                resolved_via,
+                resolved_at,
+                if_unresolved: true,
+                if_stamped: false,
+            })
+            .send()
+            .await
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
+
+        let body: UpdatedResp = handle_response(resp).await?;
+        Ok(body.updated)
+    }
+
+    async fn unsettle_contradiction(
+        &self,
+        src: &str,
+        dst: &str,
+        resolved_via: &str,
+        resolved_at: f64,
+    ) -> Result<bool> {
+        let resp = self
+            .client
+            .post(format!("{}/contradictions/resolution", self.base_url))
+            .json(&SetResolutionReq {
+                source: src,
+                target: dst,
+                resolution: None,
+                resolved_via,
+                resolved_at,
+                if_unresolved: false,
+                if_stamped: true,
+            })
+            .send()
+            .await
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         let body: UpdatedResp = handle_response(resp).await?;
         Ok(body.updated)

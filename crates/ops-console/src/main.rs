@@ -164,9 +164,18 @@ fn app(state: AppState) -> Router {
         .route("/alaya/duplicates", get(routes::alaya::duplicates))
         .route("/alaya/duplicates/merge", post(routes::alaya::merge_submit))
         .route("/alaya/contradictions", get(routes::alaya::contradictions))
+        .route("/alaya/contradictions/pair", get(routes::alaya::pair_page))
         .route(
             "/alaya/contradictions/keep-both",
             post(routes::alaya::keep_both_submit),
+        )
+        .route(
+            "/alaya/contradictions/keep-both/bulk",
+            post(routes::alaya::keep_both_bulk),
+        )
+        .route(
+            "/alaya/contradictions/reopen",
+            post(routes::alaya::reopen_submit),
         )
         .route("/alaya/auth", get(routes::alaya::auth_view))
         .route("/alaya/health", get(routes::health::pane))
@@ -1326,5 +1335,569 @@ mod tests {
         statuses.sort();
         assert_eq!(statuses, [StatusCode::BAD_REQUEST, StatusCode::FORBIDDEN]);
         assert_eq!(token_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ─── Contradictions triage ─────────────────────────────────────────────
+
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+    /// A POST route that records every JSON body it receives and answers
+    /// with `reply(body)`.
+    fn recording<F>(seen: &Seen, reply: F) -> axum::routing::MethodRouter
+    where
+        F: Fn(&serde_json::Value) -> (StatusCode, serde_json::Value)
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        let seen = seen.clone();
+        post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let (seen, reply) = (seen.clone(), reply.clone());
+            async move {
+                let (status, out) = reply(&body);
+                seen.lock().unwrap().push(body);
+                (status, axum::Json(out))
+            }
+        })
+    }
+
+    /// App state wired to `upstream`, plus a valid session cookie and its
+    /// CSRF token.
+    async fn triage_app(upstream: Router) -> (AppState, String, String) {
+        let mut config = test_config();
+        config.alaya_url = fake_upstream(upstream).await.parse().unwrap();
+        let state = AppState::new(config);
+        let sess = session::new_session("admin-sub".into(), None, None);
+        let cookie = session_cookie_header(&state, &sess);
+        (state, cookie, sess.csrf)
+    }
+
+    async fn get_page(state: &AppState, cookie: &str, uri: &str) -> (StatusCode, String) {
+        let resp = app(state.clone())
+            .oneshot(
+                HttpRequest::get(uri)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        (resp.status(), body_string(resp).await)
+    }
+
+    async fn post_form(state: &AppState, cookie: &str, uri: &str, form: String) -> Response {
+        app(state.clone())
+            .oneshot(
+                HttpRequest::post(uri)
+                    .header(header::ORIGIN, "https://console.test")
+                    .header(header::COOKIE, cookie)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Decrypt the flash a handler set, the way the next GET would read it.
+    /// axum-extra percent-encodes the value it writes but leaves `+` raw, so
+    /// `+` is escaped first or form decoding would read it as a space.
+    fn flash_of(state: &AppState, resp: &Response) -> session::Flash {
+        use sha2::Digest;
+        let key = cookie::Key::from(&sha2::Sha512::digest(&state.config.session_secret));
+        let encoded = resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| cookie::Cookie::parse(v.to_str().ok()?.to_string()).ok())
+            .find(|c| c.name() == session::FLASH_COOKIE)
+            .expect("a flash cookie");
+        let pair = format!("v={}", encoded.value().replace('+', "%2B"));
+        let (_, value) = url::form_urlencoded::parse(pair.as_bytes()).next().unwrap();
+        let mut jar = cookie::CookieJar::new();
+        jar.add_original(cookie::Cookie::new(
+            session::FLASH_COOKIE,
+            value.into_owned(),
+        ));
+        let plain = jar
+            .private(&key)
+            .get(session::FLASH_COOKIE)
+            .expect("decrypts");
+        serde_json::from_str(plain.value()).unwrap()
+    }
+
+    fn location(resp: &Response) -> &str {
+        resp.headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+    }
+
+    fn queue_pair(a: &str, b: &str) -> serde_json::Value {
+        serde_json::json!({
+            "memory_a_hash": a, "memory_b_hash": b, "confidence": 0.61,
+            "created_at": 1788265604.0, "memory_a_content": "a summary",
+            "memory_b_content": "b summary", "verdict": "supersession",
+            "verdict_reason": "B is newer", "survivor": b, "verdict_confidence": 0.87,
+            "verdict_model": "judge-model-x", "judged_at": 1788265700.0,
+            "resolution": null, "resolved_at": null, "resolved_via": null,
+        })
+    }
+
+    /// AC-1: the queue pages from the server's `next_offset`, carries the
+    /// filters on both links, and offers Next only when the server said so.
+    #[tokio::test]
+    async fn queue_pages_from_next_offset_and_drops_next_without_it() {
+        let seen = Seen::default();
+        let upstream = Router::new().route(
+            "/contradictions",
+            recording(&seen, |body| {
+                let next = (body["offset"] == 0).then_some(50);
+                let pair = queue_pair(&"a".repeat(64), &"b".repeat(64));
+                (
+                    StatusCode::OK,
+                    serde_json::json!({ "pairs": [pair], "next_offset": next }),
+                )
+            }),
+        );
+        let (state, cookie, _) = triage_app(upstream).await;
+
+        let (status, first) =
+            get_page(&state, &cookie, "/alaya/contradictions?verdict=coexist").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            first.contains("href=\"/alaya/contradictions?verdict=coexist&amp;offset=50\""),
+            "{first}"
+        );
+        assert!(!first.contains("← Prev"));
+
+        let (status, second) = get_page(
+            &state,
+            &cookie,
+            "/alaya/contradictions?verdict=coexist&offset=50",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !second.contains("Next →"),
+            "no next_offset, no Next: {second}"
+        );
+        assert!(
+            second.contains("href=\"/alaya/contradictions?verdict=coexist\""),
+            "Prev back to page 1"
+        );
+        assert!(second.contains("1 pairs from offset 50"));
+
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(
+            bodies[1],
+            serde_json::json!({ "limit": 50, "offset": 50, "include_resolved": false, "verdicts": ["coexist"] })
+        );
+    }
+
+    /// AC-2: the URL contract reaches the server unchanged; no `verdict`
+    /// means the server default, and an unknown one never leaves the console.
+    #[tokio::test]
+    async fn queue_filters_reach_the_server_unchanged() {
+        let seen = Seen::default();
+        let upstream = Router::new().route(
+            "/contradictions",
+            recording(&seen, |_| {
+                (StatusCode::OK, serde_json::json!({ "pairs": [] }))
+            }),
+        );
+        let (state, cookie, _) = triage_app(upstream).await;
+
+        let (status, _) = get_page(
+            &state,
+            &cookie,
+            "/alaya/contradictions?verdict=unjudged&verdict=contradiction&resolved=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = get_page(&state, &cookie, "/alaya/contradictions").await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = get_page(&state, &cookie, "/alaya/contradictions?verdict=bogus").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("unknown verdict filter"));
+
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "the bad filter made no upstream call");
+        assert_eq!(
+            bodies[0],
+            serde_json::json!({
+                "limit": 50, "offset": 0, "include_resolved": true,
+                "verdicts": ["unjudged", "contradiction"],
+            })
+        );
+        assert_eq!(
+            bodies[1],
+            serde_json::json!({ "limit": 50, "offset": 0, "include_resolved": false })
+        );
+    }
+
+    /// AC-4: both memories in full, the edge's verdict from the page it was
+    /// opened from, and a failed fetch that says so in its own column.
+    #[tokio::test]
+    async fn pair_page_renders_both_memories_in_full_and_marks_a_failed_fetch() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let long = format!("{} END-OF-A", "x".repeat(400));
+        let seen = Seen::default();
+        let (pa, pb, long_c) = (a.clone(), b.clone(), long.clone());
+        let upstream = Router::new()
+            .route(
+                "/contradictions",
+                recording(&seen, move |_| {
+                    (
+                        StatusCode::OK,
+                        serde_json::json!({ "pairs": [queue_pair(&pa, &pb)] }),
+                    )
+                }),
+            )
+            .route(
+                "/memories/{hash}",
+                get(move |axum::extract::Path(h): axum::extract::Path<String>| {
+                    let long = long_c.clone();
+                    async move {
+                        if h.starts_with('a') {
+                            (
+                                StatusCode::OK,
+                                axum::Json(serde_json::json!({ "found": true, "memory": {
+                                    "content_hash": h, "content": long, "summary": "short a",
+                                    "tags": ["tag-a"], "created_at": 1788265604.0,
+                                    "metadata": { "superseded_by": "c".repeat(64) },
+                                }})),
+                            )
+                        } else {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                axum::Json(serde_json::json!({ "error": "qdrant down" })),
+                            )
+                        }
+                    }
+                }),
+            );
+        let (state, cookie, _) = triage_app(upstream).await;
+
+        let uri = format!("/alaya/contradictions/pair?a={a}&b={b}&verdict=supersession&offset=50");
+        let (status, html) = get_page(&state, &cookie, &uri).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains(&long), "A's content in full, not clipped");
+        assert!(html.contains("short a") && html.contains("tag-a"));
+        assert!(
+            html.contains(&format!("href=\"/alaya/memory/{}\"", "c".repeat(64))),
+            "superseded_by links on"
+        );
+        assert!(
+            html.contains("Could not load this memory: alaya-server 500"),
+            "{html}"
+        );
+        assert!(html.contains("judge-model-x"), "edge verdict fields render");
+        assert!(html.contains("Keep B (supersede A)… — recommended"));
+        // Every action returns to the page the pair came from.
+        assert!(
+            html.contains("value=\"/alaya/contradictions?verdict=supersession&amp;offset=50\"")
+        );
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            serde_json::json!({ "limit": 50, "offset": 50, "include_resolved": false, "verdicts": ["supersession"] })
+        );
+
+        let (status, _) = get_page(
+            &state,
+            &cookie,
+            &format!("/alaya/contradictions/pair?a={a}&b=nope"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// AC-5: every decision lands back on the queue view it was taken from,
+    /// with a flash naming the pair — and `back` cannot leave the origin.
+    #[tokio::test]
+    async fn decisions_return_to_the_queue_view_and_never_off_site() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let seen = Seen::default();
+        let ok = |_: &serde_json::Value| (StatusCode::OK, serde_json::json!({ "success": true }));
+        let upstream = Router::new()
+            .route("/contradictions/resolution", recording(&seen, ok))
+            .route("/supersede", recording(&seen, ok));
+        let (state, cookie, csrf) = triage_app(upstream).await;
+        let back = "/alaya/contradictions?verdict=coexist&offset=50";
+        let back_enc: String = url::form_urlencoded::byte_serialize(back.as_bytes()).collect();
+
+        let resp = post_form(
+            &state,
+            &cookie,
+            "/alaya/contradictions/keep-both",
+            format!("csrf={csrf}&memory_a_hash={a}&memory_b_hash={b}&back={back_enc}"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&resp), back);
+        let flash = flash_of(&state, &resp);
+        assert!(
+            flash.msg.contains(&a[..12]) && flash.msg.contains(&b[..12]),
+            "{}",
+            flash.msg
+        );
+
+        let resp = post_form(
+            &state,
+            &cookie,
+            "/alaya/supersede",
+            format!("csrf={csrf}&old_hash={a}&new_hash={b}&reason=stale&back={back_enc}"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&resp), back);
+        assert!(flash_of(&state, &resp).msg.contains(&a[..12]));
+
+        let resp = post_form(
+            &state,
+            &cookie,
+            "/alaya/contradictions/keep-both",
+            format!("csrf={csrf}&memory_a_hash={a}&memory_b_hash={b}&back=%2F%2Fevil.test"),
+        )
+        .await;
+        assert_eq!(location(&resp), "/", "safe_next refuses an off-site back");
+    }
+
+    /// AC-6: a bad CSRF token writes nothing, however many pairs it carries.
+    #[tokio::test]
+    async fn bulk_keep_both_with_a_bad_csrf_makes_no_upstream_call() {
+        let seen = Seen::default();
+        let upstream = Router::new().route(
+            "/contradictions/resolution",
+            recording(&seen, |_| {
+                (StatusCode::OK, serde_json::json!({ "success": true }))
+            }),
+        );
+        let (state, cookie, _) = triage_app(upstream).await;
+        let pair = format!("{}:{}", "a".repeat(64), "b".repeat(64));
+        let resp = post_form(
+            &state,
+            &cookie,
+            "/alaya/contradictions/keep-both/bulk",
+            format!("csrf=WRONG&pair={pair}&pair={pair}"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// AC-6: a partial failure names every failed pair and its cause — a
+    /// `200 {"success": false}` included — and is flashed as an error.
+    #[tokio::test]
+    async fn bulk_keep_both_reports_each_failed_pair() {
+        let (a, b, c, d) = (
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+        );
+        let seen = Seen::default();
+        let upstream = Router::new().route(
+            "/contradictions/resolution",
+            recording(&seen, |body| {
+                match body["memory_a_hash"].as_str().unwrap().as_bytes()[0] {
+                    b'a' => (StatusCode::OK, serde_json::json!({ "success": true })),
+                    b'b' => (
+                        StatusCode::NOT_FOUND,
+                        serde_json::json!({ "error": "no CONTRADICTS edge" }),
+                    ),
+                    _ => (
+                        StatusCode::OK,
+                        serde_json::json!({ "success": false, "error": "graph down" }),
+                    ),
+                }
+            }),
+        );
+        let (state, cookie, csrf) = triage_app(upstream).await;
+        let resp = post_form(
+            &state,
+            &cookie,
+            "/alaya/contradictions/keep-both/bulk",
+            format!("csrf={csrf}&pair={a}:{b}&pair={b}:{c}&pair={c}:{d}"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&resp), "/alaya/contradictions");
+        let flash = flash_of(&state, &resp);
+        assert_eq!(flash.kind, "error");
+        assert!(
+            flash
+                .msg
+                .starts_with("Kept both for 1 of 3 pairs. 2 not confirmed"),
+            "{}",
+            flash.msg
+        );
+        assert!(flash.msg.contains(&format!("{}↔{}", &b[..12], &c[..12])));
+        assert!(flash.msg.contains("no CONTRADICTS edge"));
+        assert!(flash.msg.contains(&format!(
+            "{}↔{} (alaya-server: graph down)",
+            &c[..12],
+            &d[..12]
+        )));
+
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 3, "one call per selected pair");
+        for body in &bodies {
+            assert_eq!(body["resolution"], "keep_both");
+            assert_eq!(body["resolved_via"], "operator:console");
+        }
+    }
+
+    /// AC-6: a malformed selection or one over the page size writes nothing.
+    #[tokio::test]
+    async fn bulk_keep_both_refuses_a_bad_selection_before_any_write() {
+        let seen = Seen::default();
+        let upstream = Router::new().route(
+            "/contradictions/resolution",
+            recording(&seen, |_| {
+                (StatusCode::OK, serde_json::json!({ "success": true }))
+            }),
+        );
+        let (state, cookie, csrf) = triage_app(upstream).await;
+        let good = format!("{}:{}", "a".repeat(64), "b".repeat(64));
+        for form in [
+            format!("csrf={csrf}&pair={good}&pair=nothex:{}", "b".repeat(64)),
+            format!("csrf={csrf}{}", format!("&pair={good}").repeat(51)),
+            format!("csrf={csrf}"),
+        ] {
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/alaya/contradictions/keep-both/bulk",
+                form,
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// AC-7: Reopen clears the stamp with an explicit `resolution: null`,
+    /// in both directions (a stamp on either edge settles the pair), behind
+    /// the same CSRF check. No reverse edge is the normal case; a real
+    /// failure clearing it is reported, never flashed as success.
+    #[tokio::test]
+    async fn reopen_clears_both_directions_with_a_null_resolution() {
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let seen = Seen::default();
+        let reverse_fails = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = reverse_fails.clone();
+        let upstream = Router::new().route(
+            "/contradictions/resolution",
+            recording(&seen, move |body| {
+                if body["memory_a_hash"].as_str().unwrap().starts_with('a') {
+                    return (StatusCode::OK, serde_json::json!({ "success": true }));
+                }
+                let error = if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    "Graph operation failed"
+                } else {
+                    "Resource not found"
+                };
+                (
+                    StatusCode::OK,
+                    serde_json::json!({ "success": false, "error": error }),
+                )
+            }),
+        );
+        let (state, cookie, csrf) = triage_app(upstream).await;
+        let form = |token: &str| {
+            format!(
+                "csrf={token}&memory_a_hash={a}&memory_b_hash={b}&back=%2Falaya%2Fcontradictions%3Fresolved%3D1"
+            )
+        };
+
+        let resp = post_form(
+            &state,
+            &cookie,
+            "/alaya/contradictions/reopen",
+            form("WRONG"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(seen.lock().unwrap().is_empty());
+
+        let resp = post_form(&state, &cookie, "/alaya/contradictions/reopen", form(&csrf)).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&resp), "/alaya/contradictions?resolved=1");
+        let flash = flash_of(&state, &resp);
+        assert_eq!(flash.kind, "ok", "{}", flash.msg);
+        assert!(flash.msg.contains("back in the queue"));
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(
+            bodies,
+            [
+                serde_json::json!({
+                    "memory_a_hash": a, "memory_b_hash": b,
+                    "resolution": null, "resolved_via": "operator:console",
+                }),
+                serde_json::json!({
+                    "memory_a_hash": b, "memory_b_hash": a,
+                    "resolution": null, "resolved_via": "operator:console",
+                }),
+            ]
+        );
+
+        reverse_fails.store(true, std::sync::atomic::Ordering::SeqCst);
+        let resp = post_form(&state, &cookie, "/alaya/contradictions/reopen", form(&csrf)).await;
+        let flash = flash_of(&state, &resp);
+        assert_eq!(flash.kind, "error");
+        assert!(
+            flash.msg.contains("Graph operation failed"),
+            "{}",
+            flash.msg
+        );
+        assert!(!flash.msg.contains("back in the queue"));
+    }
+
+    /// A gone a→b edge (a stale pair page, or deleted since) must not stop
+    /// Reopen clearing a stamp on b→a, which alone keeps the pair hidden.
+    /// Only when neither direction was cleared does the request fail.
+    #[tokio::test]
+    async fn reopen_clears_the_reverse_stamp_when_the_forward_edge_is_gone() {
+        let seen = Seen::default();
+        // Every a→x edge is gone; x→a is stamped (b), gone (c) or fails (d).
+        let upstream = Router::new().route(
+            "/contradictions/resolution",
+            recording(&seen, |body| {
+                let error = match body["memory_a_hash"].as_str().unwrap().as_bytes()[0] {
+                    b'b' => return (StatusCode::OK, serde_json::json!({ "success": true })),
+                    b'd' => "Graph operation failed",
+                    _ => "Resource not found",
+                };
+                (
+                    StatusCode::OK,
+                    serde_json::json!({ "success": false, "error": error }),
+                )
+            }),
+        );
+        let (state, cookie, csrf) = triage_app(upstream).await;
+        let reopen = |other: char| {
+            let (a, b) = ("a".repeat(64), other.to_string().repeat(64));
+            let form = format!("csrf={csrf}&memory_a_hash={a}&memory_b_hash={b}");
+            post_form(&state, &cookie, "/alaya/contradictions/reopen", form)
+        };
+
+        let resp = reopen('b').await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let flash = flash_of(&state, &resp);
+        assert_eq!(flash.kind, "ok", "{}", flash.msg);
+        assert!(flash.msg.contains("back in the queue"));
+        assert_eq!(seen.lock().unwrap().len(), 2);
+
+        assert_eq!(reopen('c').await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            reopen('d').await.status(),
+            StatusCode::BAD_GATEWAY,
+            "nothing was cleared, so nothing is flashed"
+        );
     }
 }

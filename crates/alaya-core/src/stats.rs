@@ -222,6 +222,15 @@ mod tests {
             bump(&self.writes);
             Ok(())
         }
+        async fn reverse_supersession(
+            &self,
+            _h: &str,
+            _e: &Value,
+            _r: &alaya_backends::ReversalRecord,
+        ) -> Result<alaya_backends::ReversalOutcome> {
+            bump(&self.writes);
+            Err(AlayaError::NotFound("mock".into()))
+        }
         async fn patch_memory(&self, _h: &str, _p: &PatchMemoryRequest) -> Result<Memory> {
             bump(&self.writes);
             Err(AlayaError::NotFound("mock".into()))
@@ -412,6 +421,34 @@ mod tests {
             _s: &str,
             _d: &str,
             _r: Option<Resolution>,
+            _v: &str,
+            _t: f64,
+        ) -> Result<bool> {
+            bump(&self.writes);
+            Ok(true)
+        }
+        async fn delete_incoming_system_edges(
+            &self,
+            _d: &str,
+            _r: SystemRelationType,
+        ) -> Result<Vec<String>> {
+            bump(&self.writes);
+            Ok(vec![])
+        }
+        async fn settle_contradiction(
+            &self,
+            _s: &str,
+            _d: &str,
+            _v: &str,
+            _t: f64,
+        ) -> Result<bool> {
+            bump(&self.writes);
+            Ok(true)
+        }
+        async fn unsettle_contradiction(
+            &self,
+            _s: &str,
+            _d: &str,
             _v: &str,
             _t: f64,
         ) -> Result<bool> {

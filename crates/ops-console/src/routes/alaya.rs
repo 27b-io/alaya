@@ -3,7 +3,7 @@
 //! (AC2–AC7). Every mutation is a POST form carrying the session CSRF token;
 //! results follow POST-redirect-GET with a flash banner.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum_extra::extract::cookie::PrivateCookieJar;
 use leptos::either::Either;
@@ -614,6 +614,10 @@ pub struct SupersedeQuery {
     old: String,
     #[serde(default)]
     new: String,
+    /// Where to land after the supersede (the contradictions queue passes
+    /// itself). Checked by `safe_next` on submit, not here.
+    #[serde(default)]
+    back: String,
 }
 
 pub async fn supersede_form(
@@ -680,6 +684,7 @@ pub async fn supersede_form(
                         <label class=LABEL_CLASS for="reason">"Reason (audit trail)"</label>
                         <input class=INPUT_CLASS id="reason" name="reason" placeholder="why the old memory is superseded" required />
                     </div>
+                    <input type="hidden" name="back" value=q.back />
                     <button type="submit" class=btn(Btn::Default)>"Supersede"</button>
                 </form>
             </CardContent>
@@ -700,6 +705,8 @@ pub struct SupersedeForm {
     new_hash: String,
     #[serde(default)]
     reason: String,
+    #[serde(default)]
+    back: String,
 }
 
 pub async fn supersede_submit(
@@ -721,6 +728,7 @@ pub async fn supersede_submit(
         .supersede(&form.old_hash, &form.new_hash, form.reason.trim())
         .await?;
     tracing::info!(sub = ?session.sub, old = %form.old_hash, new = %form.new_hash, "memory superseded");
+    let to = crate::routes::return_to(&form.back, &memory_href(&form.old_hash));
     Ok(flash_redirect(
         jar,
         state.secure_cookies(),
@@ -730,7 +738,7 @@ pub async fn supersede_submit(
             short_hash(&form.old_hash),
             short_hash(&form.new_hash)
         ),
-        &memory_href(&form.old_hash),
+        &to,
     ))
 }
 
@@ -818,7 +826,7 @@ pub async fn correct_and_supersede(
     {
         tracing::error!(sub = ?session.sub, old = %hash, new = ?new_hash, "correction stored but supersede failed");
         let detail = match e {
-            AppError::Upstream(d) => d,
+            AppError::Upstream(d) | AppError::NotFound(d) => d,
             _ => "supersede failed".to_string(),
         };
         return Err(AppError::Upstream(format!(
@@ -1166,15 +1174,14 @@ pub async fn merge_submit(
     ))
 }
 
-// ─── Contradictions (AC6 + LAB-3283 AC-7: judge verdicts) ──────────────────
+// ─── Contradictions triage (AC6, LAB-3283 verdicts) ────────────────────────
 
-#[derive(Deserialize)]
-pub struct ContradictionsQuery {
-    /// `all=true` also shows pairs the judge called coexist / unrelated.
-    all: Option<bool>,
-}
+/// Queue page size, and so the cap on one bulk keep-both submit: the bulk
+/// form can only carry what one page rendered.
+const QUEUE_PAGE: usize = 50;
 
-/// Every verdict class plus the unjudged sentinel — the "show all" filter.
+/// Every verdict class plus the unjudged sentinel — the values `verdict`
+/// may take in the queue URL.
 const ALL_VERDICTS: [&str; 5] = [
     "contradiction",
     "supersession",
@@ -1182,6 +1189,106 @@ const ALL_VERDICTS: [&str; 5] = [
     "unrelated",
     "unjudged",
 ];
+
+const QUEUE_PATH: &str = "/alaya/contradictions";
+
+/// The queue's URL contract — repeatable `verdict`, `resolved=1`, `offset` —
+/// shared by the queue, the pair page, and any pane that links into either,
+/// so a refresh or a return keeps the operator's place. Parsed by hand
+/// because axum's `Query` cannot take a repeated key.
+#[derive(Default)]
+struct QueueView {
+    verdicts: Vec<String>,
+    resolved: bool,
+    offset: usize,
+}
+
+impl QueueView {
+    /// Unknown keys are ignored (the pair page adds `a` and `b`); a bad
+    /// value for a known key is a 400, before any upstream call.
+    fn parse(raw: Option<&str>) -> Result<Self, AppError> {
+        let mut view = QueueView::default();
+        for (key, value) in url::form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
+            match &*key {
+                "verdict" => {
+                    if !ALL_VERDICTS.contains(&&*value) {
+                        return Err(AppError::BadRequest(format!(
+                            "unknown verdict filter (expected one of {})",
+                            ALL_VERDICTS.join(", ")
+                        )));
+                    }
+                    view.verdicts.push(value.into_owned());
+                }
+                "resolved" if value == "1" => view.resolved = true,
+                "resolved" => {
+                    return Err(AppError::BadRequest("resolved must be 1".into()));
+                }
+                "offset" => {
+                    view.offset = value.parse().map_err(|_| {
+                        AppError::BadRequest("offset must be a non-negative integer".into())
+                    })?;
+                }
+                _ => {}
+            }
+        }
+        Ok(view)
+    }
+
+    /// The query string for this view at `offset`, without the `?`.
+    fn query(&self, offset: usize) -> String {
+        let mut qs = url::form_urlencoded::Serializer::new(String::new());
+        for v in &self.verdicts {
+            qs.append_pair("verdict", v);
+        }
+        if self.resolved {
+            qs.append_pair("resolved", "1");
+        }
+        if offset > 0 {
+            qs.append_pair("offset", &offset.to_string());
+        }
+        qs.finish()
+    }
+
+    fn href(&self, offset: usize) -> String {
+        match self.query(offset) {
+            qs if qs.is_empty() => QUEUE_PATH.to_string(),
+            qs => format!("{QUEUE_PATH}?{qs}"),
+        }
+    }
+
+    /// The current view at its own offset.
+    fn here(&self) -> String {
+        self.href(self.offset)
+    }
+
+    async fn fetch(&self, alaya: &crate::alaya::AlayaClient) -> Result<Value, AppError> {
+        alaya
+            .contradictions(QUEUE_PAGE, self.offset, self.resolved, &self.verdicts)
+            .await
+    }
+}
+
+/// A stored judge failure and a never-judged edge both read `unjudged` on
+/// the wire. The failure marker carries a reason and `judged_at`; an edge
+/// the judge never reached carries neither.
+enum JudgeState {
+    Judged(String),
+    Failed,
+    Never,
+}
+
+fn judge_state(p: &Value) -> JudgeState {
+    let verdict = vs(p, "verdict");
+    if !verdict.is_empty() && verdict != "unjudged" {
+        return JudgeState::Judged(verdict);
+    }
+    let judged_at = p.get("judged_at").is_some_and(|x| !x.is_null());
+    if judged_at || !vs(p, "verdict_reason").is_empty() {
+        JudgeState::Failed
+    } else {
+        JudgeState::Never
+    }
+}
 
 fn verdict_badge(verdict: &str) -> BadgeKind {
     match verdict {
@@ -1193,130 +1300,320 @@ fn verdict_badge(verdict: &str) -> BadgeKind {
     }
 }
 
+fn is_kept_both(p: &Value) -> bool {
+    vs(p, "resolution") == crate::alaya::KEEP_BOTH
+}
+
+/// `f64` field as fixed-point, or "—" when absent or null — a missing
+/// confidence must never render as a real 0.00.
+fn fixed2(p: &Value, key: &str) -> String {
+    p.get(key)
+        .and_then(Value::as_f64)
+        .map(|x| format!("{x:.2}"))
+        .unwrap_or_else(|| "—".into())
+}
+
+fn or_dash(s: String) -> String {
+    if s.is_empty() { "—".into() } else { s }
+}
+
+/// The edge's judge and resolution fields, each under its own label.
+/// Shared by the queue card and the pair page.
+fn edge_facts(p: &Value) -> impl IntoView + use<> {
+    let a = vs(p, "memory_a_hash");
+    let b = vs(p, "memory_b_hash");
+    let state = judge_state(p);
+    let failed = matches!(state, JudgeState::Failed);
+    let (badge_class, badge_text) = match state {
+        JudgeState::Judged(v) => (badge(verdict_badge(&v)), v),
+        JudgeState::Failed => (badge(BadgeKind::Destructive), "judge error".into()),
+        JudgeState::Never => (badge(BadgeKind::Muted), "not yet judged".into()),
+    };
+    let reason = vs(p, "verdict_reason");
+    let survivor = vs(p, "survivor");
+    let survivor_side = match survivor.as_str() {
+        "" => None,
+        s if s == a => Some("A"),
+        s if s == b => Some("B"),
+        _ => Some("?"),
+    };
+    let judge_conf = fixed2(p, "verdict_confidence");
+    let detector_conf = fixed2(p, "confidence");
+    let model = or_dash(vs(p, "verdict_model"));
+    let judged_at = fmt_epoch(vf(p, "judged_at"));
+    let detected_at = fmt_epoch(vf(p, "created_at"));
+    let resolution = vs(p, "resolution");
+    let resolved = !resolution.is_empty() || p.get("resolved_at").is_some_and(|x| !x.is_null());
+    let resolved_at = fmt_epoch(vf(p, "resolved_at"));
+    let resolved_via = or_dash(vs(p, "resolved_via"));
+    let fact = |label: &'static str, value: String| {
+        view! {
+            <div><dt class="text-muted-foreground text-xs">{label}</dt><dd>{value}</dd></div>
+        }
+    };
+    view! {
+        <div class="space-y-3">
+            <div class="flex flex-wrap items-center gap-2">
+                <span class=badge_class>{badge_text}</span>
+                {resolved.then(|| view! {
+                    <span class=badge(BadgeKind::Info)>{format!("resolved: {}", or_dash(resolution.clone()))}</span>
+                })}
+            </div>
+            {(!reason.is_empty()).then(|| {
+                let class = if failed { "text-sm text-destructive" } else { "text-sm" };
+                view! { <p class=class>{reason}</p> }
+            })}
+            <dl class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
+                {fact("Judge confidence", judge_conf)}
+                {fact("Detector confidence", detector_conf)}
+                <div>
+                    <dt class="text-muted-foreground text-xs">"Recommended survivor"</dt>
+                    <dd class="flex items-center gap-2">
+                        {match survivor_side {
+                            Some(side) => Either::Left(view! {
+                                <span>{side}</span>
+                                <HashLink hash=survivor />
+                            }),
+                            None => Either::Right("—"),
+                        }}
+                    </dd>
+                </div>
+                {fact("Judge model", model)}
+                {fact("Judged at", judged_at)}
+                {fact("Detected at", detected_at)}
+                {resolved.then(|| view! {
+                    {fact("Resolved at", resolved_at)}
+                    {fact("Resolved via", resolved_via)}
+                })}
+            </dl>
+        </div>
+    }
+}
+
+/// Keep both (or Reopen, for a pair stamped `keep_both`), Keep A, Keep B.
+/// Every action carries `back`, so the operator lands where they started.
+fn pair_actions(p: &Value, csrf: &str, back: &str) -> impl IntoView + use<> {
+    let a = vs(p, "memory_a_hash");
+    let b = vs(p, "memory_b_hash");
+    let survivor = vs(p, "survivor");
+    let recommend_a = !survivor.is_empty() && survivor == a;
+    let recommend_b = !survivor.is_empty() && survivor == b;
+    let recommend_keep_both = matches!(
+        judge_state(p),
+        JudgeState::Judged(ref v) if v == "coexist" || v == "unrelated"
+    );
+    let supersede = |old: &str, new: &str| {
+        format!("/alaya/supersede?old={old}&new={new}&back={}", urlenc(back))
+    };
+    let keep_a = supersede(&b, &a);
+    let keep_b = supersede(&a, &b);
+    let keep = |href: String, label: &'static str, recommended: bool| {
+        let class = btn_sm(if recommended {
+            Btn::Default
+        } else {
+            Btn::Outline
+        });
+        let text = if recommended {
+            format!("{label} — recommended")
+        } else {
+            label.to_string()
+        };
+        view! { <a href=href class=class>{text}</a> }
+    };
+    // Non-destructive first (LAB-3885): one click, no reason — the verdict
+    // already carries it. Supersede stays two-step with a reason.
+    let (action, label, class) = if is_kept_both(p) {
+        (
+            "/alaya/contradictions/reopen",
+            "Reopen",
+            btn_sm(Btn::Outline),
+        )
+    } else {
+        (
+            "/alaya/contradictions/keep-both",
+            if recommend_keep_both {
+                "Keep both — recommended"
+            } else {
+                "Keep both"
+            },
+            btn_sm(if recommend_keep_both {
+                Btn::Default
+            } else {
+                Btn::Outline
+            }),
+        )
+    };
+    let (csrf, back) = (csrf.to_string(), back.to_string());
+    view! {
+        <div class="flex flex-wrap items-center gap-3">
+            <form method="post" action=action class="inline">
+                <input type="hidden" name="csrf" value=csrf />
+                <input type="hidden" name="memory_a_hash" value=a />
+                <input type="hidden" name="memory_b_hash" value=b />
+                <input type="hidden" name="back" value=back />
+                <button type="submit" class=class>{label}</button>
+            </form>
+            {keep(keep_a, "Keep A (supersede B)…", recommend_a)}
+            {keep(keep_b, "Keep B (supersede A)…", recommend_b)}
+        </div>
+    }
+}
+
+fn pair_href(a: &str, b: &str, view: &QueueView) -> String {
+    let ctx = view.query(view.offset);
+    let sep = if ctx.is_empty() { "" } else { "&" };
+    format!("{QUEUE_PATH}/pair?a={a}&b={b}{sep}{ctx}")
+}
+
+fn queue_card(p: &Value, csrf: &str, view: &QueueView, back: &str) -> impl IntoView + use<> {
+    let a = vs(p, "memory_a_hash");
+    let b = vs(p, "memory_b_hash");
+    let review = pair_href(&a, &b, view);
+    let selectable = !is_kept_both(p);
+    let pair_value = format!("{a}:{b}");
+    let side = |hash: String, text: String, sup: bool, label: &'static str| {
+        view! {
+            <div class="rounded-md border p-4">
+                <div class="flex items-center gap-2 mb-2">
+                    <span class="text-xs font-medium text-muted-foreground">{label}</span>
+                    <HashLink hash=hash />
+                    {sup.then(|| view! { <span class=badge(BadgeKind::Warning)>"superseded"</span> })}
+                </div>
+                <p class="text-sm">{text}</p>
+            </div>
+        }
+    };
+    let a_side = side(
+        a.clone(),
+        vs(p, "memory_a_content"),
+        p.get("memory_a_superseded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "A",
+    );
+    let b_side = side(
+        b.clone(),
+        vs(p, "memory_b_content"),
+        p.get("memory_b_superseded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "B",
+    );
+    let facts = edge_facts(p);
+    let actions = pair_actions(p, csrf, back);
+    view! {
+        <Card>
+            <CardHeader>
+                <div class="flex w-full items-center gap-3">
+                    {selectable.then(|| view! {
+                        // `form=` ties the box to the page's one bulk form
+                        // without nesting forms — no JS needed.
+                        <input type="checkbox" form="bulk" name="pair" value=pair_value aria-label="select for bulk keep both" />
+                    })}
+                    <CardTitle>"Contradiction"</CardTitle>
+                    <a class="ml-auto text-sm text-primary underline-offset-4 hover:underline" href=review>
+                        "Review in full →"
+                    </a>
+                </div>
+            </CardHeader>
+            <CardContent>
+                <div class="mb-4">{facts}</div>
+                <div class="grid gap-4 sm:grid-cols-2 mb-4">{a_side}{b_side}</div>
+                {actions}
+            </CardContent>
+        </Card>
+    }
+}
+
 pub async fn contradictions(
     State(state): State<AppState>,
     session: Session,
-    Query(q): Query<ContradictionsQuery>,
+    RawQuery(raw): RawQuery,
     jar: PrivateCookieJar,
 ) -> Result<(PrivateCookieJar, Html<String>), AppError> {
+    let view = QueueView::parse(raw.as_deref())?;
     let (jar, flash) = take_flash(jar);
-    let show_all = q.all.unwrap_or(false);
-    let res = state
-        .alaya
-        .contradictions(50, show_all.then_some(&ALL_VERDICTS[..]))
-        .await?;
+    let res = view.fetch(&state.alaya).await?;
     let pairs = res
         .get("pairs")
         .and_then(|p| p.as_array())
         .cloned()
         .unwrap_or_default();
+    // Next only on the server's word: a short page can still have more
+    // behind it (superseded endpoints are dropped after the graph read).
+    let next_href = res
+        .get("next_offset")
+        .and_then(Value::as_u64)
+        .map(|n| view.href(n as usize));
+    let prev_href = (view.offset > 0).then(|| view.href(view.offset.saturating_sub(QUEUE_PAGE)));
 
     let csrf = session.csrf.clone();
+    let back = view.here();
+    let any_selectable = pairs.iter().any(|p| !is_kept_both(p));
     let cards = pairs
         .iter()
-        .map(|p| {
-            let csrf = csrf.clone();
-            let a = vs(p, "memory_a_hash");
-            let b = vs(p, "memory_b_hash");
-            let a_text = vs(p, "memory_a_content");
-            let b_text = vs(p, "memory_b_content");
-            let a_sup = p.get("memory_a_superseded").and_then(|x| x.as_bool()).unwrap_or(false);
-            let b_sup = p.get("memory_b_superseded").and_then(|x| x.as_bool()).unwrap_or(false);
-            let confidence = format!("{:.2}", vf(p, "confidence"));
-            let keep_a = format!("/alaya/supersede?old={b}&new={a}");
-            let keep_b = format!("/alaya/supersede?old={a}&new={b}");
+        .map(|p| queue_card(p, &csrf, &view, &back))
+        .collect_view();
 
-            // Judge verdict (advisory). Absent field = older server = unjudged.
-            let verdict = match vs(p, "verdict") {
-                v if v.is_empty() => "unjudged".to_string(),
-                v => v,
-            };
-            let reason = vs(p, "verdict_reason");
-            let survivor = vs(p, "survivor");
-            let verdict_label = match p.get("verdict_confidence").and_then(|x| x.as_f64()) {
-                Some(c) => format!("{verdict} · {c:.2}"),
-                None => verdict.clone(),
-            };
-            let recommend_a = !survivor.is_empty() && survivor == a;
-            let recommend_b = !survivor.is_empty() && survivor == b;
-            let recommend_keep_both = matches!(verdict.as_str(), "coexist" | "unrelated");
-            let keep = |href: String, label: &'static str, recommended: bool| {
-                let class = btn_sm(if recommended { Btn::Default } else { Btn::Outline });
-                view! {
-                    <a href=href class=class>
-                        {label}
-                        {recommended.then_some(" — recommended")}
-                    </a>
-                }
-            };
-            let side = |hash: String, text: String, sup: bool, label: &'static str| {
-                view! {
-                    <div class="rounded-md border p-4">
-                        <div class="flex items-center gap-2 mb-2">
-                            <span class="text-xs font-medium text-muted-foreground">{label}</span>
-                            <HashLink hash=hash />
-                            {sup.then(|| view! { <span class=badge(BadgeKind::Warning)>"superseded"</span> })}
-                        </div>
-                        <p class="text-sm">{text}</p>
-                    </div>
-                }
-            };
+    let position = if pairs.is_empty() {
+        "No pairs match these filters at this offset.".to_string()
+    } else {
+        // Not "pairs N–M": the server drops pairs with a superseded endpoint
+        // after it pages, so a page can hold fewer than it skipped past.
+        format!(
+            "{} pairs from offset {} (newest first).",
+            pairs.len(),
+            view.offset
+        )
+    };
+    let verdict_boxes = ALL_VERDICTS
+        .iter()
+        .map(|v| {
+            let checked = view.verdicts.iter().any(|x| x == v);
             view! {
-                <Card>
-                    <CardHeader>
-                        <div class="flex items-center gap-3">
-                            <CardTitle>{format!("Contradiction — detector confidence {confidence}")}</CardTitle>
-                            <span class=badge(verdict_badge(&verdict))>{verdict_label}</span>
-                        </div>
-                        {(!reason.is_empty()).then(|| view! { <CardDescription>{reason}</CardDescription> })}
-                    </CardHeader>
-                    <CardContent>
-                        <div class="grid gap-4 sm:grid-cols-2 mb-4">
-                            {side(a.clone(), a_text, a_sup, "A")}
-                            {side(b.clone(), b_text, b_sup, "B")}
-                        </div>
-                        <div class="flex flex-wrap items-center gap-3">
-                            // Non-destructive first (LAB-3885): one click, no
-                            // reason — the verdict already carries it. Supersede
-                            // stays two-step with a reason.
-                            <form method="post" action="/alaya/contradictions/keep-both" class="inline">
-                                <input type="hidden" name="csrf" value=csrf />
-                                <input type="hidden" name="memory_a_hash" value=a.clone() />
-                                <input type="hidden" name="memory_b_hash" value=b.clone() />
-                                <button type="submit" class=btn_sm(if recommend_keep_both { Btn::Default } else { Btn::Outline })>
-                                    "Keep both"
-                                    {recommend_keep_both.then_some(" — recommended")}
-                                </button>
-                            </form>
-                            {keep(keep_a, "Keep A (supersede B)…", recommend_a)}
-                            {keep(keep_b, "Keep B (supersede A)…", recommend_b)}
-                        </div>
-                    </CardContent>
-                </Card>
+                <label class=LABEL_CLASS>
+                    <input type="checkbox" name="verdict" value=*v checked=checked />
+                    {*v}
+                </label>
             }
         })
         .collect_view();
-
-    let intro = if pairs.is_empty() {
-        "No unresolved contradictions."
-    } else {
-        "Verdicts are advisory: the judge recommends a survivor, you decide. Keep both when both memories are true or the pair is detector noise — nothing is superseded and it is reversible. Otherwise choose which memory survives — the loser is superseded with a reason, never dropped."
-    };
-    let toggle = if show_all {
-        view! { <a class="text-sm text-primary underline-offset-4 hover:underline" href="/alaya/contradictions">"Hide coexist / unrelated"</a> }
-    } else {
-        view! { <a class="text-sm text-primary underline-offset-4 hover:underline" href="/alaya/contradictions?all=true">"Show coexist / unrelated"</a> }
-    };
+    let resolved = view.resolved;
     let content = view! {
         <div class="space-y-6">
             <Card>
                 <CardHeader>
                     <CardTitle>"Contradictions"</CardTitle>
-                    <CardDescription>{intro}</CardDescription>
-                    {toggle}
+                    <CardDescription>
+                        "Verdicts are advisory: the judge recommends a survivor, you decide. Keep both when both memories are true or the pair is detector noise — nothing is superseded and Reopen undoes it. Otherwise choose which memory survives — the loser is superseded with a reason, never dropped."
+                    </CardDescription>
                 </CardHeader>
+                <CardContent>
+                    <form method="get" action=QUEUE_PATH class="flex flex-wrap items-center gap-4">
+                        {verdict_boxes}
+                        <label class=LABEL_CLASS>
+                            <input type="checkbox" name="resolved" value="1" checked=resolved />
+                            "include resolved"
+                        </label>
+                        <button type="submit" class=btn_sm(Btn::Secondary)>"Apply"</button>
+                    </form>
+                    <p class="text-xs text-muted-foreground mt-3">"No verdict ticked shows the server's default filter."</p>
+                    <p class="text-sm text-muted-foreground mt-3">{position}</p>
+                </CardContent>
             </Card>
+            {any_selectable.then(|| view! {
+                <form id="bulk" method="post" action="/alaya/contradictions/keep-both/bulk" class="flex items-center gap-3">
+                    <input type="hidden" name="csrf" value=csrf.clone() />
+                    <input type="hidden" name="back" value=back.clone() />
+                    <button type="submit" class=btn_sm(Btn::Secondary)>"Keep both for selected"</button>
+                    <span class="text-xs text-muted-foreground">"Tick pairs below; one submit settles them all."</span>
+                </form>
+            })}
             {cards}
+            <div class="flex gap-3">
+                {prev_href.map(|h| view! { <a class=btn_sm(Btn::Outline) href=h>"← Prev"</a> })}
+                {next_href.map(|h| view! { <a class=btn_sm(Btn::Outline) href=h>"Next →"</a> })}
+            </div>
         </div>
     };
 
@@ -1332,28 +1629,188 @@ pub async fn contradictions(
 }
 
 #[derive(Deserialize)]
-pub struct KeepBothForm {
+pub struct PairQuery {
+    #[serde(default)]
+    a: String,
+    #[serde(default)]
+    b: String,
+}
+
+/// One memory of a pair, in full. A failed fetch says so in its column —
+/// never a blank that reads as an empty memory.
+fn memory_column(label: &'static str, hash: String, res: Result<Value, AppError>) -> impl IntoView {
+    let header = {
+        let hash = hash.clone();
+        view! {
+            <div class="flex items-center gap-2 mb-2">
+                <span class="text-xs font-medium text-muted-foreground">{label}</span>
+                <HashLink hash=hash />
+            </div>
+        }
+    };
+    let body = match res.and_then(|r| {
+        r.get("memory")
+            .cloned()
+            .ok_or_else(|| AppError::NotFound("memory not found".into()))
+    }) {
+        Err(e) => Either::Left(view! {
+            <p class="text-sm text-destructive" role="alert">
+                {format!("Could not load this memory: {}", e.detail())}
+            </p>
+        }),
+        Ok(m) => {
+            let content = vs(&m, "content");
+            let summary = vs(&m, "summary");
+            let created = fmt_epoch(vf(&m, "created_at"));
+            let superseded_by = m
+                .get("metadata")
+                .and_then(|md| md.get("superseded_by"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            let tags: Vec<String> = m
+                .get("tags")
+                .and_then(|t| t.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Either::Right(view! {
+                <div class="space-y-3">
+                    <div class="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                        <span>{format!("created {created}")}</span>
+                        {superseded_by.map(|by| view! {
+                            <span class=badge(BadgeKind::Warning)>"superseded"</span>
+                            {validate_hash(&by).is_ok().then(|| view! { <HashLink hash=by.clone() /> })}
+                        })}
+                    </div>
+                    <pre class="whitespace-pre-wrap text-sm font-sans">{content}</pre>
+                    <div class="border-t pt-4">
+                        <div class="text-xs font-medium text-muted-foreground mb-1">"Summary"</div>
+                        <p class="text-sm">{or_dash(summary)}</p>
+                    </div>
+                    <div class="flex flex-wrap gap-1">
+                        {tags.into_iter().map(|t| view! { <span class=badge(BadgeKind::Muted)>{t}</span> }).collect_view()}
+                    </div>
+                </div>
+            })
+        }
+    };
+    view! { <div class="rounded-md border p-4">{header}{body}</div> }
+}
+
+/// Both memories of one pair side by side, in full. The edge's own fields
+/// come from the queue page the operator opened it from (its `verdict` /
+/// `resolved` / `offset` ride along): the server has no single-pair read,
+/// and re-reading that page is the only source that is upstream's word
+/// rather than the link's.
+pub async fn pair_page(
+    State(state): State<AppState>,
+    session: Session,
+    Query(q): Query<PairQuery>,
+    RawQuery(raw): RawQuery,
+    jar: PrivateCookieJar,
+) -> Result<(PrivateCookieJar, Html<String>), AppError> {
+    validate_hash(&q.a)?;
+    validate_hash(&q.b)?;
+    let view = QueueView::parse(raw.as_deref())?;
+    let (jar, flash) = take_flash(jar);
+
+    let (mem_a, mem_b, queue) = tokio::join!(
+        state.alaya.get_memory(&q.a),
+        state.alaya.get_memory(&q.b),
+        view.fetch(&state.alaya),
+    );
+    let edge = queue.map(|res| {
+        res.get("pairs")
+            .and_then(|p| p.as_array())
+            .and_then(|pairs| {
+                pairs
+                    .iter()
+                    .find(|p| vs(p, "memory_a_hash") == q.a && vs(p, "memory_b_hash") == q.b)
+                    .cloned()
+            })
+    });
+
+    let csrf = session.csrf.clone();
+    let back = view.here();
+    let back_link = back.clone();
+    let offset = view.offset;
+    // Without the edge the actions still work — they name the pair, not
+    // the verdict — so Keep both stays offered and the server is the judge
+    // of whether the edge exists.
+    let fallback_edge = json!({ "memory_a_hash": q.a, "memory_b_hash": q.b });
+    let (edge_view, action_edge) = match edge {
+        Ok(Some(p)) => (Either::Left(edge_facts(&p)), p),
+        Ok(None) => (
+            Either::Right(format!(
+                "This pair is not on the queue page it was opened from (offset {offset}, same filters): it was settled, or the queue moved, so its verdict and resolution are unknown here. The memories below are live; to reopen a keep-both, find the pair in the queue with resolved pairs included."
+            )),
+            fallback_edge,
+        ),
+        Err(e) => (
+            Either::Right(format!("Could not load the verdict: {}", e.detail())),
+            fallback_edge,
+        ),
+    };
+    let actions = pair_actions(&action_edge, &csrf, &back);
+    let col_a = memory_column("A", q.a.clone(), mem_a);
+    let col_b = memory_column("B", q.b.clone(), mem_b);
+    let content = view! {
+        <div class="space-y-6">
+            <a class="text-sm text-primary underline-offset-4 hover:underline" href=back_link>"← Back to the queue"</a>
+            <Card>
+                <CardHeader><CardTitle>"Contradiction pair"</CardTitle></CardHeader>
+                <CardContent>
+                    <div class="mb-4 text-sm">{edge_view}</div>
+                    {actions}
+                </CardContent>
+            </Card>
+            <div class="grid gap-4 sm:grid-cols-2">{col_a}{col_b}</div>
+        </div>
+    };
+
+    Ok((
+        jar,
+        Html(page(
+            "Contradiction pair — ops console",
+            &session,
+            flash,
+            content,
+        )),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct ResolutionForm {
     #[serde(default)]
     csrf: String,
     memory_a_hash: String,
     memory_b_hash: String,
+    #[serde(default)]
+    back: String,
 }
 
 /// "Keep both" (LAB-3885): stamp the pair resolved without superseding
-/// either memory. POST-redirect-GET back to the queue, which no longer
-/// lists the pair.
+/// either memory. POST-redirect-GET back to the queue view it came from,
+/// which no longer lists the pair.
 pub async fn keep_both_submit(
     State(state): State<AppState>,
     session: Session,
     jar: PrivateCookieJar,
-    axum::Form(form): axum::Form<KeepBothForm>,
+    axum::Form(form): axum::Form<ResolutionForm>,
 ) -> Result<Response, AppError> {
     session.verify_csrf(&form.csrf)?;
     validate_hash(&form.memory_a_hash)?;
     validate_hash(&form.memory_b_hash)?;
     state
         .alaya
-        .keep_both(&form.memory_a_hash, &form.memory_b_hash)
+        .set_resolution(
+            &form.memory_a_hash,
+            &form.memory_b_hash,
+            Some(crate::alaya::KEEP_BOTH),
+        )
         .await?;
     tracing::info!(sub = ?session.sub, a = %form.memory_a_hash, b = %form.memory_b_hash, "contradiction kept both");
     Ok(flash_redirect(
@@ -1365,7 +1822,194 @@ pub async fn keep_both_submit(
             short_hash(&form.memory_a_hash),
             short_hash(&form.memory_b_hash)
         ),
-        "/alaya/contradictions",
+        &crate::routes::return_to(&form.back, QUEUE_PATH),
+    ))
+}
+
+/// Undo a keep-both. The server counts a stamp in EITHER direction as
+/// settling the pair, and a re-store can leave one on each edge, so both
+/// directions are cleared. Either edge may be missing (the reverse one
+/// usually is; the forward one after a stale pair page) and the other is
+/// still cleared. The request fails only when neither direction was
+/// cleared; a failure on the reverse after the forward cleared is
+/// reported, because the pair would stay hidden.
+pub async fn reopen_submit(
+    State(state): State<AppState>,
+    session: Session,
+    jar: PrivateCookieJar,
+    axum::Form(form): axum::Form<ResolutionForm>,
+) -> Result<Response, AppError> {
+    session.verify_csrf(&form.csrf)?;
+    validate_hash(&form.memory_a_hash)?;
+    validate_hash(&form.memory_b_hash)?;
+    let (a, b) = (&form.memory_a_hash, &form.memory_b_hash);
+    let forward_cleared = match state.alaya.set_resolution(a, b, None).await {
+        Ok(_) => true,
+        Err(AppError::NotFound(_)) => false,
+        Err(e) => return Err(e),
+    };
+    let reverse = match (
+        state.alaya.set_resolution(b, a, None).await,
+        forward_cleared,
+    ) {
+        (Ok(_), _) | (Err(AppError::NotFound(_)), true) => None,
+        (Err(e), true) => Some(e),
+        (Err(e), false) => return Err(e),
+    };
+    tracing::info!(sub = ?session.sub, a = %a, b = %b, forward_cleared, reverse_failed = reverse.is_some(), "contradiction reopened");
+    let (kind, msg) = match reverse {
+        None => (
+            "ok",
+            format!(
+                "Reopened {} and {} — the pair is back in the queue.",
+                short_hash(a),
+                short_hash(b)
+            ),
+        ),
+        Some(e) => (
+            "error",
+            format!(
+                "Cleared the stamp on {} → {}, but clearing the reverse edge failed ({}) — \
+                 if that edge is stamped the pair stays out of the queue; retry Reopen.",
+                short_hash(a),
+                short_hash(b),
+                clip(e.detail(), MAX_CAUSE_CHARS)
+            ),
+        ),
+    };
+    Ok(flash_redirect(
+        jar,
+        state.secure_cookies(),
+        kind,
+        msg,
+        &crate::routes::return_to(&form.back, QUEUE_PATH),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct BulkKeepBothForm {
+    #[serde(default)]
+    csrf: String,
+    /// `<memory_a_hash>:<memory_b_hash>`, one per ticked card.
+    #[serde(default)]
+    pair: Vec<String>,
+    #[serde(default)]
+    back: String,
+}
+
+/// Distinct failure causes the bulk report spells out; pairs failing for
+/// any other cause are still named, under "other errors". Bounded because
+/// the report rides in the flash cookie, which a browser drops silently
+/// past 4 KiB — and a dropped report is exactly the silent partial failure
+/// this exists to prevent.
+const MAX_REPORTED_CAUSES: usize = 3;
+/// Calls are sequential (alaya-server's command channel fast-fails when
+/// full), so a wedged upstream would hold the request for one client
+/// timeout per pair. The whole batch, the call in flight included, gets
+/// this long; what is left over is reported as not attempted.
+const BULK_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_CAUSE_CHARS: usize = 100;
+
+/// The bulk flash: how many settled, and every failed pair by name,
+/// grouped under its cause.
+fn bulk_report(total: usize, failed: &[(String, String)]) -> Flash {
+    if failed.is_empty() {
+        return Flash {
+            kind: "ok".into(),
+            msg: format!("Kept both for {total} pairs — nothing superseded."),
+        };
+    }
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+    for (pair, cause) in failed {
+        match groups.iter_mut().find(|(c, _)| c == cause) {
+            Some((_, pairs)) => pairs.push(pair),
+            None => groups.push((cause, vec![pair])),
+        }
+    }
+    let mut parts: Vec<String> = groups
+        .iter()
+        .take(MAX_REPORTED_CAUSES)
+        .map(|(cause, pairs)| format!("{} ({})", pairs.join(", "), clip(cause, MAX_CAUSE_CHARS)))
+        .collect();
+    let others: Vec<&str> = groups
+        .iter()
+        .skip(MAX_REPORTED_CAUSES)
+        .flat_map(|(_, pairs)| pairs.iter().copied())
+        .collect();
+    if !others.is_empty() {
+        parts.push(format!("{} (other errors)", others.join(", ")));
+    }
+    Flash {
+        kind: "error".into(),
+        msg: format!(
+            "Kept both for {} of {total} pairs. {} not confirmed — reload the queue to check them: {}.",
+            total - failed.len(),
+            failed.len(),
+            parts.join("; ")
+        ),
+    }
+}
+
+/// Bulk keep-both: one resolution call per ticked pair. The single-pair
+/// verb in a loop, not a bulk endpoint — the page size caps it, and every
+/// stamp is reversible with Reopen. Every pair is validated before the
+/// first call, so a malformed selection writes nothing.
+pub async fn keep_both_bulk(
+    State(state): State<AppState>,
+    session: Session,
+    jar: PrivateCookieJar,
+    axum_extra::extract::Form(form): axum_extra::extract::Form<BulkKeepBothForm>,
+) -> Result<Response, AppError> {
+    session.verify_csrf(&form.csrf)?;
+    if form.pair.is_empty() {
+        return Err(AppError::BadRequest("select at least one pair".into()));
+    }
+    if form.pair.len() > QUEUE_PAGE {
+        return Err(AppError::BadRequest(format!(
+            "at most {QUEUE_PAGE} pairs per submit"
+        )));
+    }
+    let pairs = form
+        .pair
+        .iter()
+        .map(|p| {
+            let (a, b) = p
+                .split_once(':')
+                .ok_or_else(|| AppError::BadRequest("malformed pair".into()))?;
+            Ok((validate_hash(a)?, validate_hash(b)?))
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+
+    let started = std::time::Instant::now();
+    let mut failed: Vec<(String, String)> = Vec::new();
+    for (a, b) in &pairs {
+        let label = format!("{}↔{}", short_hash(a), short_hash(b));
+        let left = BULK_BUDGET.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            failed.push((label, "not attempted: the batch ran out of time".into()));
+            continue;
+        }
+        let call = state
+            .alaya
+            .set_resolution(a, b, Some(crate::alaya::KEEP_BOTH));
+        // A call cut off after it was sent may still land upstream, so its
+        // cause says the outcome is unknown, not that it failed.
+        let cause = match tokio::time::timeout(left, call).await {
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => e.detail().to_string(),
+            Err(_) => "no answer in time: outcome unknown".to_string(),
+        };
+        tracing::warn!(sub = ?session.sub, a = %a, b = %b, cause = ?clip(&cause, MAX_CAUSE_CHARS), "bulk keep both: pair not confirmed");
+        failed.push((label, cause));
+    }
+    tracing::info!(sub = ?session.sub, total = pairs.len(), failed = failed.len(), "contradictions kept both in bulk");
+    let report = bulk_report(pairs.len(), &failed);
+    Ok(flash_redirect(
+        jar,
+        state.secure_cookies(),
+        &report.kind,
+        report.msg,
+        &crate::routes::return_to(&form.back, QUEUE_PATH),
     ))
 }
 
@@ -1478,4 +2122,164 @@ pub async fn auth_view(
         jar,
         Html(page("Auth state — ops console", &session, flash, content)),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair(extra: Value) -> Value {
+        let mut p = json!({
+            "memory_a_hash": "a".repeat(64),
+            "memory_b_hash": "b".repeat(64),
+            "confidence": 0.61,
+            "created_at": 1788265604.0,
+            "memory_a_content": "a summary",
+            "memory_b_content": "b summary",
+            "verdict": "unjudged",
+            "verdict_reason": null,
+            "survivor": null,
+            "verdict_confidence": null,
+            "verdict_model": null,
+            "judged_at": null,
+            "resolution": null,
+            "resolved_at": null,
+            "resolved_via": null,
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            p[k] = v.clone();
+        }
+        p
+    }
+
+    fn card(p: &Value) -> String {
+        queue_card(p, "tok", &QueueView::default(), QUEUE_PATH).to_html()
+    }
+
+    #[test]
+    fn queue_view_round_trips_its_url_contract() {
+        let raw = "verdict=coexist&verdict=unrelated&resolved=1&offset=100&a=ignored";
+        let Ok(view) = QueueView::parse(Some(raw)) else {
+            panic!("valid view refused")
+        };
+        assert_eq!(view.verdicts, ["coexist", "unrelated"]);
+        assert!(view.resolved);
+        assert_eq!(
+            view.href(view.offset),
+            "/alaya/contradictions?verdict=coexist&verdict=unrelated&resolved=1&offset=100"
+        );
+        assert_eq!(QueueView::default().href(0), "/alaya/contradictions");
+    }
+
+    #[test]
+    fn queue_view_refuses_bad_values() {
+        for raw in ["verdict=bogus", "resolved=true", "offset=-1", "offset=x"] {
+            assert!(QueueView::parse(Some(raw)).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_judged_card_labels_both_confidences_and_the_survivor() {
+        let html = card(&pair(json!({
+            "verdict": "supersession",
+            "verdict_reason": "B is newer",
+            "survivor": "b".repeat(64),
+            "verdict_confidence": 0.87,
+            "verdict_model": "judge-model-x",
+            "judged_at": 1788265700.0,
+        })));
+        assert!(html.contains(">supersession<"));
+        assert!(html.contains("Judge confidence</dt><dd>0.87"), "{html}");
+        assert!(html.contains("Detector confidence</dt><dd>0.61"));
+        assert!(html.contains("judge-model-x"));
+        assert!(html.contains("2026-09-01 12:28"), "judged_at");
+        assert!(html.contains("2026-09-01 12:26"), "created_at");
+        assert!(html.contains("B is newer"));
+        assert!(
+            html.contains("Keep B (supersede A)… — recommended"),
+            "{html}"
+        );
+        assert!(html.contains("form=\"bulk\""), "selectable for bulk");
+        assert!(!html.contains("judge error") && !html.contains("Resolved via"));
+    }
+
+    #[test]
+    fn a_stored_judge_failure_renders_as_an_error_with_its_reason() {
+        let html = card(&pair(json!({
+            "verdict_reason": "unjudged: schema violation",
+            "verdict_confidence": 0.0,
+            "verdict_model": "judge-model-x",
+            "judged_at": 1788265700.0,
+        })));
+        assert!(html.contains("judge error"));
+        assert!(
+            html.contains("text-destructive\">unjudged: schema violation"),
+            "{html}"
+        );
+        assert!(!html.contains("not yet judged"));
+    }
+
+    #[test]
+    fn a_never_judged_card_says_so_and_invents_nothing() {
+        let html = card(&pair(json!({})));
+        assert!(html.contains("not yet judged"));
+        assert!(!html.contains("judge error"));
+        assert!(html.contains("Judge confidence</dt><dd>—"), "{html}");
+        assert!(html.contains("Judged at</dt><dd>—"));
+    }
+
+    #[test]
+    fn a_resolved_card_shows_its_stamp_and_offers_reopen_not_bulk() {
+        let html = card(&pair(json!({
+            "verdict": "coexist",
+            "resolution": "keep_both",
+            "resolved_at": 1788265800.0,
+            "resolved_via": "operator:console",
+        })));
+        assert!(html.contains("resolved: keep_both"));
+        assert!(
+            html.contains("Resolved at</dt><dd>2026-09-01 12:30"),
+            "{html}"
+        );
+        assert!(html.contains("Resolved via</dt><dd>operator:console"));
+        assert!(html.contains("action=\"/alaya/contradictions/reopen\""));
+        assert!(!html.contains("form=\"bulk\""));
+        assert!(!html.contains("/alaya/contradictions/keep-both\""));
+    }
+
+    #[test]
+    fn bulk_report_names_every_failed_pair_under_its_cause() {
+        assert_eq!(bulk_report(3, &[]).kind, "ok");
+        let failed = [
+            ("p1".to_string(), "down".to_string()),
+            ("p2".to_string(), "gone".to_string()),
+            ("p3".to_string(), "down".to_string()),
+        ];
+        let f = bulk_report(5, &failed);
+        assert_eq!(f.kind, "error");
+        assert_eq!(
+            f.msg,
+            "Kept both for 2 of 5 pairs. 3 not confirmed — reload the queue to check them: p1, p3 (down); p2 (gone)."
+        );
+    }
+
+    /// Fifty failures, each with its own long cause, still fit the flash
+    /// cookie and still name every pair.
+    #[test]
+    fn bulk_report_stays_bounded_and_names_every_pair() {
+        let failed: Vec<(String, String)> = (0..QUEUE_PAGE)
+            .map(|i| {
+                (
+                    format!("{i:012}↔{i:012}"),
+                    format!("cause {i} {}", "x".repeat(300)),
+                )
+            })
+            .collect();
+        let f = bulk_report(QUEUE_PAGE, &failed);
+        assert!(f.msg.len() < 2048, "{} bytes", f.msg.len());
+        for (pair, _) in &failed {
+            assert!(f.msg.contains(pair.as_str()));
+        }
+        assert!(f.msg.contains("(other errors)"));
+    }
 }

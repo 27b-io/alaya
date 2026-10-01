@@ -74,7 +74,27 @@ is `user-123`, not `"user-123"`.
 - **Curation** — supersede (reason required), correct-&-supersede (store a
   fixed copy, then supersede the original), delete (two-step confirm),
   merge duplicates (dry-run preview before commit), relations
-  create/delete, contradiction resolution via supersede.
+  create/delete.
+- **Contradictions triage** — the CONTRADICTS queue, 50 pairs a page,
+  newest first, paged with the server's `next_offset` (Next appears only
+  when the server returns one). The view lives in the URL, so a refresh or
+  a return keeps the operator's place, and other panes may link into it:
+  `verdict` (repeatable: `contradiction`, `supersession`, `coexist`,
+  `unrelated`, `unjudged`; absent = the server default), `resolved=1`
+  (include resolved pairs) and `offset`. An unknown value is a 400. Each
+  card shows the judge's verdict and confidence, the detector's confidence,
+  the recommended survivor, the reason, model and timestamps, and a
+  resolved pair's stamp. A stored judge failure renders as an error;
+  a pair the judge never reached says so. *Review in full* opens
+  `/alaya/contradictions/pair?a=…&b=…` (plus the queue view): both memories
+  side by side in full, read live, with the verdict re-read from the queue
+  page it was opened from. Decisions — *Keep A* / *Keep B* (supersede with
+  a reason), *Keep both* (stamp the pair, nothing superseded), *Reopen*
+  (clear a keep-both, in both edge directions) — all land back on the same queue view with a flash
+  naming the pair. Tick cards and *Keep both for selected* settles a page in
+  one submit, one resolution call per pair within a 30 s budget; the flash
+  names every pair it could not confirm, and why. Supersede is never offered
+  in bulk.
 - **Auth state** — read-only view of alaya-server's `GET /auth/config`:
   principal × operation matrix + OIDC issuer/audience/allowlist.
 - **Judge health** (`/alaya/health`) — read-only view of alaya-server's

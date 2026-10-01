@@ -88,6 +88,13 @@ macro_rules! impl_graph_service {
             ) -> alaya_types::Result<usize> {
                 self.0.create_system_edges_batch(e).await
             }
+            async fn delete_incoming_system_edges(
+                &self,
+                d: &str,
+                r: alaya_types::graph::SystemRelationType,
+            ) -> alaya_types::Result<Vec<String>> {
+                self.0.delete_incoming_system_edges(d, r).await
+            }
             async fn get_all_contradictions(
                 &self,
                 q: &alaya_types::graph::ContradictionQuery,
@@ -111,6 +118,24 @@ macro_rules! impl_graph_service {
                 at: f64,
             ) -> alaya_types::Result<bool> {
                 self.0.set_contradiction_resolution(s, d, r, via, at).await
+            }
+            async fn settle_contradiction(
+                &self,
+                s: &str,
+                d: &str,
+                via: &str,
+                at: f64,
+            ) -> alaya_types::Result<bool> {
+                self.0.settle_contradiction(s, d, via, at).await
+            }
+            async fn unsettle_contradiction(
+                &self,
+                s: &str,
+                d: &str,
+                via: &str,
+                at: f64,
+            ) -> alaya_types::Result<bool> {
+                self.0.unsettle_contradiction(s, d, via, at).await
             }
             async fn get_contradictions_for_hashes(
                 &self,

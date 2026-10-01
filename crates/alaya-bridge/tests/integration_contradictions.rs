@@ -576,3 +576,127 @@ async fn superseded_endpoint_on_either_side_leaves_the_default_queue() -> anyhow
     ctx.cleanup().await;
     Ok(())
 }
+
+/// LAB-6876: `settle_contradiction` stamps an unresolved pair and leaves a
+/// stamped one exactly as it was — the operator's who and when included —
+/// and creates nothing where there is no edge.
+#[tokio::test]
+async fn settle_stamps_only_an_unresolved_pair() -> anyhow::Result<()> {
+    let Some(ctx) = common::TestContext::new().await else {
+        return Ok(());
+    };
+    seed_pairs(&ctx, 2, 0).await;
+    let (a0, b0, a1, b1) = (hash(1000), hash(2000), hash(1001), hash(2001));
+    ctx.exec_tuple(cypher::set_contradiction_resolution(
+        &a1,
+        &b1,
+        Some(Resolution::KeepBoth),
+        "operator:console",
+        42.0,
+    ))
+    .await;
+
+    let fresh = ctx
+        .exec_tuple(cypher::settle_contradiction(&a0, &b0, "unsupersede", 7.0))
+        .await;
+    assert_eq!(fresh.count(), Some(1), "an unresolved pair is stamped");
+    let kept = ctx
+        .exec_tuple(cypher::settle_contradiction(&a1, &b1, "unsupersede", 7.0))
+        .await;
+    assert_eq!(kept.count(), Some(0), "a stamped pair is not touched");
+    let none = ctx
+        .exec_tuple(cypher::settle_contradiction(
+            &hash(1009),
+            &hash(2009),
+            "unsupersede",
+            7.0,
+        ))
+        .await;
+    assert_eq!(none.count(), Some(0));
+
+    let all = everything(&ctx).await;
+    assert_eq!(all.result_set.len(), 2, "nothing created");
+    assert_eq!(
+        resolution_cells(&all, &a0),
+        (json!("keep_both"), json!(7.0), json!("unsupersede"))
+    );
+    assert_eq!(
+        resolution_cells(&all, &a1),
+        (json!("keep_both"), json!(42.0), json!("operator:console"))
+    );
+
+    ctx.cleanup().await;
+    Ok(())
+}
+
+/// LAB-6876: `unsettle_contradiction` clears a stamp only while it is still
+/// exactly the one that call wrote — same via, same timestamp to the last
+/// bit — and leaves a stamp written since by anyone else.
+#[tokio::test]
+async fn unsettle_clears_only_its_own_exact_stamp() -> anyhow::Result<()> {
+    let Some(ctx) = common::TestContext::new().await else {
+        return Ok(());
+    };
+    seed_pairs(&ctx, 2, 0).await;
+    let (a0, b0, a1, b1) = (hash(1000), hash(2000), hash(1001), hash(2001));
+    let at = 1_790_827_958.288_099_8_f64;
+    for (a, b) in [(&a0, &b0), (&a1, &b1)] {
+        ctx.exec_tuple(cypher::settle_contradiction(a, b, "unsupersede", at))
+            .await;
+    }
+    // Someone else re-stamps the second pair after it.
+    ctx.exec_tuple(cypher::set_contradiction_resolution(
+        &a1,
+        &b1,
+        Some(Resolution::KeepBoth),
+        "operator:console",
+        at,
+    ))
+    .await;
+
+    let other_time = ctx
+        .exec_tuple(cypher::unsettle_contradiction(
+            &a0,
+            &b0,
+            "unsupersede",
+            at + 1e-6,
+        ))
+        .await;
+    assert_eq!(
+        other_time.count(),
+        Some(0),
+        "a different timestamp is not ours"
+    );
+    let mine = ctx
+        .exec_tuple(cypher::unsettle_contradiction(&a0, &b0, "unsupersede", at))
+        .await;
+    assert_eq!(
+        mine.count(),
+        Some(1),
+        "the exact stamp round-trips and clears"
+    );
+    let theirs = ctx
+        .exec_tuple(cypher::unsettle_contradiction(&a1, &b1, "unsupersede", at))
+        .await;
+    assert_eq!(theirs.count(), Some(0), "an operator's stamp is not ours");
+
+    let all = everything(&ctx).await;
+    assert_eq!(
+        resolution_cells(&all, &a0),
+        (Value::Null, Value::Null, Value::Null)
+    );
+    // The read path prints doubles to fewer digits than they are stored
+    // with (the match above proves the stored value exact), so compare loosely.
+    let (resolution, resolved_at, via) = resolution_cells(&all, &a1);
+    assert_eq!(
+        (resolution, via),
+        (json!("keep_both"), json!("operator:console"))
+    );
+    assert!(
+        (resolved_at.as_f64().unwrap() - at).abs() < 1e-3,
+        "{resolved_at}"
+    );
+
+    ctx.cleanup().await;
+    Ok(())
+}

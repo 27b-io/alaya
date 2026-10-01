@@ -183,6 +183,18 @@ pub fn create_system_edge(src: &str, dst: &str, rel: SystemRelationType, ts: f64
     )
 }
 
+/// DELETE every `rel` edge pointing into `dst`, from any source, returning
+/// one row per deleted edge: its source hash. Edges out of `dst` are not
+/// matched (the pattern is directed).
+pub fn delete_incoming_system_edges(dst: &str, rel: SystemRelationType) -> CypherQuery {
+    let label = rel.cypher_label();
+    let q = format!(
+        "MATCH (a:Memory)-[e:{label}]->(b:Memory {{content_hash: $dst}}) \
+         DELETE e RETURN a.content_hash"
+    );
+    (q, params(&[("dst", json!(dst))]), false)
+}
+
 // ─── contradiction operations ─────────────────────────────────────────────────
 
 /// Row layout of `get_all_contradictions`, in this order.
@@ -352,6 +364,60 @@ pub fn set_contradiction_resolution(
             ("resolution", res),
             ("via", via),
             ("ts", ts),
+        ]),
+        false,
+    )
+}
+
+/// Stamp `keep_both` on an existing `src -> dst` CONTRADICTS edge that has no
+/// resolution yet; one that has one keeps it, who and when included. Settles
+/// the pair of a reversed supersession (LAB-6876) without overwriting an
+/// operator's earlier call. MATCH-only, like `set_contradiction_resolution`.
+pub fn settle_contradiction(
+    src: &str,
+    dst: &str,
+    resolved_via: &str,
+    resolved_at: f64,
+) -> CypherQuery {
+    let q = "MATCH (a:Memory {content_hash: $src})-[e:CONTRADICTS]->(b:Memory {content_hash: $dst}) \
+             WHERE e.resolution IS NULL \
+             SET e.resolution = $resolution, e.resolved_at = $ts, e.resolved_via = $via \
+             RETURN count(e)";
+    (
+        q.to_string(),
+        params(&[
+            ("src", json!(src)),
+            ("dst", json!(dst)),
+            ("resolution", json!(Resolution::KeepBoth.as_str())),
+            ("via", json!(resolved_via)),
+            ("ts", json!(resolved_at)),
+        ]),
+        false,
+    )
+}
+
+/// Clear the `src -> dst` CONTRADICTS stamp only while it is still exactly
+/// `keep_both` by `resolved_via` at `resolved_at` — the stamp one
+/// `settle_contradiction` call wrote. A stamp written since by anyone else
+/// stays. Lets an unsupersede that reversed nothing take back only its own.
+pub fn unsettle_contradiction(
+    src: &str,
+    dst: &str,
+    resolved_via: &str,
+    resolved_at: f64,
+) -> CypherQuery {
+    let q = "MATCH (a:Memory {content_hash: $src})-[e:CONTRADICTS]->(b:Memory {content_hash: $dst}) \
+             WHERE e.resolution = $resolution AND e.resolved_via = $via AND e.resolved_at = $ts \
+             SET e.resolution = null, e.resolved_at = null, e.resolved_via = null \
+             RETURN count(e)";
+    (
+        q.to_string(),
+        params(&[
+            ("src", json!(src)),
+            ("dst", json!(dst)),
+            ("resolution", json!(Resolution::KeepBoth.as_str())),
+            ("via", json!(resolved_via)),
+            ("ts", json!(resolved_at)),
         ]),
         false,
     )
@@ -799,6 +865,32 @@ mod tests {
     }
 
     #[test]
+    fn settle_contradiction_stamps_keep_both_only_where_unresolved() {
+        let (q, p, ro) = settle_contradiction("a", "b", "unsupersede", 7.0);
+        assert!(q.starts_with("MATCH (a:Memory {content_hash: $src})-[e:CONTRADICTS]->"));
+        assert!(q.contains("WHERE e.resolution IS NULL SET e.resolution = $resolution"));
+        assert!(!q.contains("MERGE") && !q.contains("CREATE"));
+        assert_eq!(p["resolution"], json!("keep_both"));
+        assert_eq!(p["via"], json!("unsupersede"));
+        assert_eq!(p["ts"], json!(7.0));
+        assert!(!ro);
+    }
+
+    #[test]
+    fn unsettle_contradiction_clears_only_the_exact_stamp() {
+        let (q, p, ro) = unsettle_contradiction("a", "b", "unsupersede", 7.5);
+        assert!(q.contains(
+            "WHERE e.resolution = $resolution AND e.resolved_via = $via AND e.resolved_at = $ts \
+             SET e.resolution = null"
+        ));
+        assert!(!q.contains("MERGE") && !q.contains("DELETE"));
+        assert_eq!(p["resolution"], json!("keep_both"));
+        assert_eq!(p["via"], json!("unsupersede"));
+        assert_eq!(p["ts"], json!(7.5));
+        assert!(!ro);
+    }
+
+    #[test]
     fn count_judged_or_resolved_contradiction_is_a_read_over_verdict_or_resolution() {
         let (q, p, ro) = count_judged_or_resolved_contradiction(&"a".repeat(64), &"b".repeat(64));
         assert!(q.starts_with("MATCH"));
@@ -964,6 +1056,19 @@ mod tests {
         assert!(p.contains_key("src"));
         assert!(p.contains_key("dst"));
         assert!(p.contains_key("ts"));
+        assert!(!ro);
+    }
+
+    #[test]
+    fn delete_incoming_system_edges_matches_into_dst_only() {
+        let (q, p, ro) = delete_incoming_system_edges("d", SystemRelationType::Supersedes);
+        assert_eq!(
+            q,
+            "MATCH (a:Memory)-[e:SUPERSEDES]->(b:Memory {content_hash: $dst}) \
+             DELETE e RETURN a.content_hash"
+        );
+        assert_eq!(p.len(), 1, "only the target travels: {p:?}");
+        assert_eq!(p["dst"], json!("d"));
         assert!(!ro);
     }
 
