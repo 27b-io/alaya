@@ -1828,9 +1828,11 @@ pub async fn keep_both_submit(
 
 /// Undo a keep-both. The server counts a stamp in EITHER direction as
 /// settling the pair, and a re-store can leave one on each edge, so both
-/// directions are cleared. A missing reverse edge is the common case and
-/// is fine; any other failure there is reported, because the pair would
-/// stay hidden.
+/// directions are cleared. Either edge may be missing (the reverse one
+/// usually is; the forward one after a stale pair page) and the other is
+/// still cleared. The request fails only when neither direction was
+/// cleared; a failure on the reverse after the forward cleared is
+/// reported, because the pair would stay hidden.
 pub async fn reopen_submit(
     State(state): State<AppState>,
     session: Session,
@@ -1841,12 +1843,18 @@ pub async fn reopen_submit(
     validate_hash(&form.memory_a_hash)?;
     validate_hash(&form.memory_b_hash)?;
     let (a, b) = (&form.memory_a_hash, &form.memory_b_hash);
-    state.alaya.set_resolution(a, b, None).await?;
+    let forward_cleared = match state.alaya.set_resolution(a, b, None).await {
+        Ok(_) => true,
+        Err(AppError::NotFound(_)) => false,
+        Err(e) => return Err(e),
+    };
     let reverse = match state.alaya.set_resolution(b, a, None).await {
-        Ok(_) | Err(AppError::NotFound(_)) => None,
+        Ok(_) => None,
+        Err(e) if !forward_cleared => return Err(e),
+        Err(AppError::NotFound(_)) => None,
         Err(e) => Some(e),
     };
-    tracing::info!(sub = ?session.sub, a = %a, b = %b, reverse_failed = reverse.is_some(), "contradiction reopened");
+    tracing::info!(sub = ?session.sub, a = %a, b = %b, forward_cleared, reverse_failed = reverse.is_some(), "contradiction reopened");
     let (kind, msg) = match reverse {
         None => (
             "ok",
