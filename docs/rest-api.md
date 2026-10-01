@@ -301,7 +301,7 @@ Authorization is by route, not by `action`: `POST /relation` needs the full key 
 
 ## `GET /memories/{content_hash}/relations`
 
-List a memory's typed edges, in both directions. The same read as `POST /relation` with `"action": "get"`: same response body, same 50-edge cap, same errors. Unlike `POST /relation`, the read-only bearer may call it.
+List a memory's typed edges, in both directions. The same read as `POST /relation` with `"action": "get"`: same response body, same 50-edge cap. Unlike `POST /relation`, the read-only bearer may call it, and errors come back as HTTP status codes.
 
 ```bash
 curl -H "Authorization: Bearer $ALAYA_READONLY_API_KEY" \
@@ -310,7 +310,7 @@ curl -H "Authorization: Bearer $ALAYA_READONLY_API_KEY" \
 
 Optional query parameter `relation_type` (`RELATES_TO`, `PRECEDES`, `CONTRADICTS`) filters the edges.
 
-Response: `{ "relations": [...], "content_hash": "a3f4...", "count": 2 }`. As with `POST /relation`, an invalid hash or relation type returns `200` with `{ "success": false, "error": "..." }`.
+Response: `{ "relations": [...], "content_hash": "a3f4...", "count": 2 }`. An invalid `content_hash` returns `400` with `{ "error": "invalid content_hash format" }`, and an invalid `relation_type` returns `400` with `{ "error": "invalid relation_type" }`. Neither reaches the graph. A graph read that fails or times out returns `500` with `{ "success": false, "error": "..." }`. `POST /relation` reports all of these as `200` with `{ "success": false, "error": "..." }`.
 
 ## `POST /supersede`
 
@@ -520,7 +520,7 @@ REST endpoints use HTTP status codes plus a JSON body:
 
 | Status | When |
 |:--|:--|
-| `400` | Malformed JSON, invalid `content_hash`, missing required field. Body: `{"error": "..."}`. |
+| `400` | Malformed JSON, invalid `content_hash` or `relation_type`, missing required field. Body: `{"error": "..."}`. |
 | `401` | Missing or wrong bearer token. |
 | `403` | Authenticated, but the principal is not authorized for this endpoint: the `ALAYA_READONLY_API_KEY` bearer on anything but a pure read, or an OIDC bearer on a mutating route (delete / supersede / unsupersede / contradictions/resolution / merge / relation / patch / backfill) or on `GET /memories/{content_hash}/relations`. OAuth scopes are not evaluated. |
 | `404` | Memory doesn't exist (`get_memory`, `patch_memory`). |

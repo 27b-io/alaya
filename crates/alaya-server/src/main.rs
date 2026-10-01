@@ -50,6 +50,7 @@ use alaya_backends::{
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{
     JudgeOutcome, MemoryService, OutputMode, RelationParams, SearchParams, StoreParams,
+    parse_user_relation,
 };
 use alaya_types::graph::{Contradiction, ContradictionQuery, Resolution};
 use alaya_types::memory::PatchMemoryRequest;
@@ -2928,13 +2929,32 @@ struct RelationsQuery {
 
 /// `GET /memories/{content_hash}/relations`: `POST /relation` `get` as a
 /// route of its own, so the read-only bearer can be authorized for it while
-/// every relation write stays refused (see `rest_route_op`). Same command,
-/// same body, same status codes.
+/// every relation write stays refused (see `rest_route_op`). Same command and
+/// success body. Errors differ: `POST /relation` reports them in a 200 body,
+/// this route by status, like `GET /memories/{content_hash}`.
 async fn get_relations(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
     axum::extract::Path(content_hash): axum::extract::Path<String>,
     axum::extract::Query(q): axum::extract::Query<RelationsQuery>,
 ) -> (StatusCode, Json<Value>) {
+    // The service runs these same checks; making them here first is what
+    // lets a caller's mistake answer 400 rather than an op error in a 200.
+    if !alaya_types::memory::validate_content_hash(&content_hash) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid content_hash format"})),
+        );
+    }
+    if q.relation_type
+        .as_deref()
+        .is_some_and(|r| parse_user_relation(r).is_err())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid relation_type"})),
+        );
+    }
+
     let params = RelationParams {
         action: "get".into(),
         content_hash,
@@ -2942,7 +2962,21 @@ async fn get_relations(
         relation_type: q.relation_type,
     };
     let (tx, rx) = oneshot::channel();
-    h.call(CmdInner::Relation { params, reply: tx }, rx).await
+    let v = match h
+        .call_rpc(CmdInner::Relation { params, reply: tx }, rx)
+        .await
+    {
+        Ok(v) => v,
+        Err((_code, msg)) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": msg})));
+        }
+    };
+    // Inputs are valid by now, so any error left is a backend failure or the
+    // command deadline.
+    if v.get("error").is_some() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(v));
+    }
+    (StatusCode::OK, Json(v))
 }
 
 #[derive(Deserialize)]
@@ -5189,7 +5223,8 @@ mod wedge_tests {
     }
 
     /// `GET /memories/{hash}/relations` dispatches exactly the command
-    /// `POST /relation` `get` does, and answers with the same status and body.
+    /// `POST /relation` `get` does, and on success answers with the same
+    /// status and body.
     #[tokio::test]
     async fn get_relations_route_matches_post_relation_get() {
         use tower::ServiceExt;
@@ -5244,6 +5279,80 @@ mod wedge_tests {
             assert_eq!(via_get.0["relation_type"], json!(rel));
             assert_eq!(via_get.1, StatusCode::OK);
             assert_eq!(via_get.2, reply_body);
+        }
+    }
+
+    /// Unlike `POST /relation`, the GET route reports errors by status: a bad
+    /// hash or relation type is a 400 that never reaches the worker, and a
+    /// failed read is a 500, not a 200 carrying `success: false`.
+    #[tokio::test]
+    async fn get_relations_route_reports_errors_by_status() {
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let app = protected_router(ServiceHandle { tx }, test_auth_state());
+        let send = |uri: String| {
+            let app = app.clone();
+            tokio::spawn(async move {
+                let req = axum::http::Request::get(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            })
+        };
+        let hash = "a".repeat(64);
+
+        for (uri, error) in [
+            (
+                "/memories/abc/relations".to_string(),
+                "invalid content_hash format",
+            ),
+            (
+                "/memories//relations".to_string(),
+                "invalid content_hash format",
+            ),
+            (
+                format!("/memories/{}/relations", "A".repeat(64)),
+                "invalid content_hash format",
+            ),
+            (
+                format!("/memories/{hash}/relations?relation_type=SUPERSEDES"),
+                "invalid relation_type",
+            ),
+            (
+                format!("/memories/{hash}/relations?relation_type=precedes"),
+                "invalid relation_type",
+            ),
+        ] {
+            // A dispatched command would leave the request waiting on a reply
+            // that never comes, so fail on the dispatch, not on a timeout.
+            let (status, body) = tokio::select! {
+                resp = send(uri.clone()) => resp.unwrap(),
+                _ = rx.recv() => panic!("{uri} reached the worker"),
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(body, json!({"error": error}), "{uri}");
+        }
+
+        for reply_body in [
+            json!({"success": false, "error": "Graph operation failed"}),
+            json!({"success": false, "error": "relation timed out after 30s", "error_kind": "timeout"}),
+        ] {
+            let resp = send(format!("/memories/{hash}/relations"));
+            let cmd = rx.recv().await.expect("command dispatched");
+            let CmdInner::Relation { reply, .. } = cmd.inner else {
+                panic!("expected CmdInner::Relation");
+            };
+            reply.send(reply_body.clone()).unwrap();
+            let (status, body) = resp.await.unwrap();
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{reply_body}");
+            assert_eq!(body, reply_body);
         }
     }
 
