@@ -585,7 +585,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "get_memory",
-            "description": "Retrieve a single memory by its exact content_hash. Returns {\"found\": true, \"memory\": {...}} or {\"found\": false}. Use this to inspect a memory before supersede/delete/relation when you already hold its hash — e.g. from search results or a memory_contradictions report. Superseded memories are returned; check metadata.superseded_by.",
+            "description": "Retrieve a single memory by its exact content_hash. Returns {\"found\": true, \"memory\": {...}} or {\"found\": false}. Use this to inspect a memory before supersede/delete/relation when you already hold its hash — e.g. from search results or a memory_contradictions report. Superseded memories are returned; check metadata.superseded_by. With full or both output, memory.supersession_log lists the supersessions reversed by memory_unsupersede, oldest first (who, when, why); absent when none.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

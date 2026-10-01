@@ -475,6 +475,7 @@ impl MemoryService {
             encoding_context: Some(enc_ctx),
             provenance: Some(prov),
             summary_embedding: None,
+            supersession_log: None,
         };
 
         // A read-only principal's store is additive only. Re-storing content
@@ -2676,7 +2677,9 @@ impl MemoryService {
     /// Superseded memories are always returned — the caller asked for a
     /// specific hash, typically to inspect before a supersede/delete, so
     /// hiding it would defeat the purpose. `metadata.superseded_by` signals
-    /// superseded status. Pure read: no access-count mutation.
+    /// superseded status, and with `full` or `both` output `supersession_log`
+    /// lists the supersessions reversed so far. Pure read: no access-count
+    /// mutation.
     #[tracing::instrument(skip(self))]
     pub async fn get_memory(&self, content_hash: &str, output: OutputMode) -> Result<Value> {
         if !alaya_types::memory::validate_content_hash(content_hash) {
@@ -2686,10 +2689,17 @@ impl MemoryService {
         }
 
         match self.vectors.get_by_hash(content_hash).await? {
-            Some(memory) => Ok(serde_json::json!({
-                "found": true,
-                "memory": format_memory_result(&memory, 1.0, output),
-            })),
+            Some(memory) => {
+                let mut v = format_memory_result(&memory, 1.0, output);
+                // Added here, not in format_memory_result, which search
+                // shares: the audit trail is for an exact lookup only.
+                if let (Some(log), OutputMode::Full | OutputMode::Both) =
+                    (&memory.supersession_log, output)
+                {
+                    v["supersession_log"] = serde_json::json!(log);
+                }
+                Ok(serde_json::json!({"found": true, "memory": v}))
+            }
             None => Ok(serde_json::json!({
                 "found": false,
                 "content_hash": content_hash,
@@ -3109,6 +3119,7 @@ mod tests {
             encoding_context: None,
             provenance: None,
             summary_embedding: None,
+            supersession_log: None,
         }
     }
 
@@ -3748,6 +3759,7 @@ mod tests {
                 encoding_context: None,
                 provenance: None,
                 summary_embedding: None,
+                supersession_log: None,
             }
         }
     }
@@ -4272,6 +4284,7 @@ mod tests {
                 encoding_context: None,
                 provenance: None,
                 summary_embedding: None,
+                supersession_log: None,
             },
             score,
         }
@@ -5444,6 +5457,7 @@ mod tests {
                 encoding_context: None,
                 provenance: None,
                 summary_embedding: None,
+                supersession_log: None,
             },
             score,
         }
@@ -5636,6 +5650,53 @@ mod tests {
         // Exact lookup returns superseded memories — caller asked for this hash.
         assert_eq!(v["found"], true);
         assert_eq!(v["memory"]["metadata"]["superseded_by"], "e".repeat(64));
+    }
+
+    /// The reversal history rides on an exact lookup that returns content
+    /// (`full`, `both`), entries as stored, and nowhere else: not on summary
+    /// output, and not on `format_memory_result`, which every search shares.
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_memory_returns_supersession_log_with_full_and_both_output() {
+        let hash = "f".repeat(64);
+        let entry = serde_json::json!({
+            "superseded_by": "e".repeat(64),
+            "supersession_reason": null,
+            "unsuperseded_at": 2000.0,
+            "unsuperseded_via": "operator:mcp",
+            "reason": "wrong merge",
+        });
+        let mut mem = make_scored_memory(&hash, "restored decision", 0.0).memory;
+        mem.supersession_log = Some(vec![entry.clone(), serde_json::json!({"reason": "x"})]);
+        for output in [OutputMode::Full, OutputMode::Summary, OutputMode::Both] {
+            let v = format_memory_result(&mem, 1.0, output);
+            assert!(v.get("supersession_log").is_none(), "{output:?}: {v}");
+        }
+        let svc = service_with_memory(Some(mem));
+
+        for output in [OutputMode::Full, OutputMode::Both] {
+            let v = svc.get_memory(&hash, output).await.expect("found");
+            assert_eq!(
+                v["memory"]["supersession_log"],
+                serde_json::json!([entry, {"reason": "x"}]),
+                "{output:?}"
+            );
+        }
+        let v = svc.get_memory(&hash, OutputMode::Summary).await.unwrap();
+        assert!(v["memory"].get("supersession_log").is_none(), "{v}");
+    }
+
+    /// A memory never reversed carries no log key, as full output omits an
+    /// absent `summary`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_memory_without_a_log_omits_the_key() {
+        let hash = "a".repeat(64);
+        let mem = make_scored_memory(&hash, "never reversed", 0.0).memory;
+        let svc = service_with_memory(Some(mem));
+
+        for output in [OutputMode::Full, OutputMode::Both] {
+            let v = svc.get_memory(&hash, output).await.unwrap();
+            assert!(v["memory"].get("supersession_log").is_none(), "{v}");
+        }
     }
 
     // ─── Cross-encoder rerank tests ──────────────────────────────────────
@@ -6787,6 +6848,7 @@ mod tests {
                     encoding_context: None,
                     provenance: None,
                     summary_embedding: None,
+                    supersession_log: None,
                 }
             })
             .collect()
@@ -7128,6 +7190,7 @@ mod tests {
                 encoding_context: None,
                 provenance: None,
                 summary_embedding: None,
+                supersession_log: None,
             }
         }
 

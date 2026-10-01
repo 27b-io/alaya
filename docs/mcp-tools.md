@@ -119,6 +119,8 @@ Fetch a single memory by its exact hash. Returns `{"found": false}` if it doesn'
 | `content_hash` | string | ✓ | | Full 64-char SHA-256 hex. |
 | `output` | enum | | `full` | `full`, `summary`, or `both`. |
 
+With `full` or `both` output, a memory whose supersession was ever reversed also carries `memory.supersession_log`: its audit trail, oldest first, one entry per [`memory_unsupersede`](#memory_unsupersede) in the shape documented there (`superseded_by`, `supersession_reason`, `unsuperseded_at`, `unsuperseded_via`, `reason`). Entries come back exactly as stored. A memory never reversed has no `supersession_log` key, and `summary` output and `search` results never carry it.
+
 **Use when** you already hold a hash — typically from a `search` result, a `memory_contradictions` pair, or a `find_duplicates` cluster — and want to re-inspect it without searching again.
 
 **Example:**
@@ -247,7 +249,7 @@ Reverse a supersession — from `memory_supersede`, `merge_duplicates` or the co
 
 What changes, and nothing else:
 
-- `metadata.superseded_by` and the stored supersession reason are removed from the memory, and one entry is appended to its server-maintained `supersession_log`: the `superseded_by` and `supersession_reason` that were removed, `unsuperseded_at`, `unsuperseded_via` and your `reason`. The log survives a re-store of the same content.
+- `metadata.superseded_by` and the stored supersession reason are removed from the memory, and one entry is appended to its server-maintained `supersession_log`: the `superseded_by` and `supersession_reason` that were removed, `unsuperseded_at`, `unsuperseded_via` and your `reason`. The log survives a re-store of the same content, and [`get_memory`](#get_memory) returns it as `memory.supersession_log`.
 - Every `SUPERSEDES` edge into the memory is deleted. Normally there is one, from the survivor. There is more than one only when the memory was superseded again without being reversed, and the older ones were already stale.
 - The `CONTRADICTS` pair between the memory and the survivor it named, in either direction, is stamped `keep_both` with `resolved_via: "unsupersede"`, so an automatic apply of the judge's verdict never re-supersedes it. A pair that already carries a stamp keeps it. `contradictions_stamped` lists the `[memory_a_hash, memory_b_hash]` edges stamped; pass one to `resolve_contradiction` with `resolution: null` to put the pair back in the queue.
 

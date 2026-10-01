@@ -56,6 +56,7 @@ fn memory(content: &str, tags: &[&str]) -> Memory {
         encoding_context: None,
         provenance: None,
         summary_embedding: None,
+        supersession_log: None,
     }
 }
 
