@@ -9,6 +9,12 @@ use serde_json::{Value, json};
 
 use crate::error::AppError;
 
+/// `AlayaError::NotFound`'s `safe_message` on alaya-server.
+const NOT_FOUND_MESSAGE: &str = "Resource not found";
+
+/// The one non-null resolution the server accepts.
+pub const KEEP_BOTH: &str = "keep_both";
+
 #[derive(Clone)]
 pub struct AlayaClient {
     base: url::Url,
@@ -52,6 +58,12 @@ impl AlayaClient {
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("operation failed");
+            // The server reports a missing target only as this fixed
+            // `safe_message`, in a 200 body. Typed, because Reopen expects
+            // it for a pair with no reverse edge.
+            if detail == NOT_FOUND_MESSAGE {
+                return Err(AppError::NotFound(format!("alaya-server: {detail}")));
+            }
             return Err(AppError::Upstream(format!("alaya-server: {detail}")));
         }
         Ok(body)
@@ -128,36 +140,45 @@ impl AlayaClient {
         .await
     }
 
-    /// Stamp a CONTRADICTS pair `keep_both` (LAB-3885): non-destructive,
-    /// reversible, leaves the default queue. `resolved_via` is fixed to the
-    /// console's tag — the server records it verbatim.
-    pub async fn keep_both(
+    /// Stamp (`Some("keep_both")`) or clear (`None`) a CONTRADICTS pair's
+    /// operator resolution (LAB-3885). Non-destructive either way: neither
+    /// memory is touched, and a stamped pair leaves the default queue.
+    /// `resolved_via` is fixed to the console's tag — the server records it
+    /// verbatim, and requires it on a clear too.
+    pub async fn set_resolution(
         &self,
         memory_a_hash: &str,
         memory_b_hash: &str,
+        resolution: Option<&str>,
     ) -> Result<Value, AppError> {
         self.post(
             "/contradictions/resolution",
             json!({
                 "memory_a_hash": memory_a_hash,
                 "memory_b_hash": memory_b_hash,
-                "resolution": "keep_both",
+                "resolution": resolution,
                 "resolved_via": "operator:console",
             }),
         )
         .await
     }
 
-    /// `verdicts = None` lets the server apply its default filter
-    /// (contradiction, supersession, unjudged).
+    /// One queue page. Empty `verdicts` lets the server apply its default
+    /// filter (contradiction, supersession, unjudged).
     pub async fn contradictions(
         &self,
         limit: usize,
-        verdicts: Option<&[&str]>,
+        offset: usize,
+        include_resolved: bool,
+        verdicts: &[String],
     ) -> Result<Value, AppError> {
-        let mut body = json!({ "limit": limit });
-        if let Some(v) = verdicts {
-            body["verdicts"] = json!(v);
+        let mut body = json!({
+            "limit": limit,
+            "offset": offset,
+            "include_resolved": include_resolved,
+        });
+        if !verdicts.is_empty() {
+            body["verdicts"] = json!(verdicts);
         }
         self.post("/contradictions", body).await
     }
