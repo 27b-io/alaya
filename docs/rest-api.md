@@ -18,7 +18,7 @@ If the server has `OIDC_ISSUER` set, clients use an OAuth access token instead o
 
 ### Read-only bearer (optional)
 
-Set `ALAYA_READONLY_API_KEY` (must differ from `ALAYA_API_KEY`) to mint a second static bearer for headless service consumers that must never mutate the corpus (e.g. a read-only dashboard). It authenticates the same way but is authorized for pure reads only — `POST /search`, `GET /memories/{content_hash}`, `POST /contradictions`, `POST /duplicates/find`, `GET /health/detail` — and receives `403 Forbidden` on every mutating route, including `POST /store`:
+Set `ALAYA_READONLY_API_KEY` (must differ from `ALAYA_API_KEY`) to mint a second static bearer for headless service consumers that must never mutate the corpus (e.g. a read-only dashboard). It authenticates the same way but is authorized for pure reads only — `POST /search`, `GET /memories/{content_hash}`, `GET /memories/{content_hash}/relations`, `POST /contradictions`, `POST /duplicates/find`, `GET /health/detail` — and receives `403 Forbidden` on every mutating route, including `POST /store`:
 
 ```bash
 # succeeds
@@ -50,6 +50,7 @@ Failed auth returns `401 Unauthorized` with a `WWW-Authenticate: Bearer …` hea
 | `POST` | `/search` | Retrieve memories | yes |
 | `GET`  | `/memories/{content_hash}` | Fetch one memory | yes |
 | `PATCH`| `/memories/{content_hash}` | Update fields on one memory | yes |
+| `GET`  | `/memories/{content_hash}/relations` | List one memory's graph edges (read-only) | yes |
 | `POST` | `/delete` | Hard-delete a memory | yes |
 | `POST` | `/relation` | Manage graph edges | yes |
 | `POST` | `/supersede` | Mark old → new | yes |
@@ -296,6 +297,21 @@ Content-Type: application/json
 
 `action`: `create`, `get`, or `delete`. Relation types: `RELATES_TO`, `PRECEDES`, `CONTRADICTS`.
 
+Authorization is by route, not by `action`: `POST /relation` needs the full key for every action, `get` included. To read relations with the read-only bearer, use [`GET /memories/{content_hash}/relations`](#get-memoriescontent_hashrelations).
+
+## `GET /memories/{content_hash}/relations`
+
+List a memory's typed edges, in both directions. The same read as `POST /relation` with `"action": "get"`: same body, same 50-edge cap, same errors. Unlike `POST /relation`, the read-only bearer may call it.
+
+```bash
+curl -H "Authorization: Bearer $ALAYA_READONLY_API_KEY" \
+     "http://localhost:3001/memories/a3f4e891.../relations?relation_type=PRECEDES"
+```
+
+Optional query parameter `relation_type` (`RELATES_TO`, `PRECEDES`, `CONTRADICTS`) filters the edges.
+
+Response: `{ "relations": [...], "content_hash": "a3f4...", "count": 2 }`. As with `POST /relation`, an invalid hash or relation type returns `200` with `{ "success": false, "error": "..." }`.
+
 ## `POST /supersede`
 
 > [!IMPORTANT]
@@ -506,7 +522,7 @@ REST endpoints use HTTP status codes plus a JSON body:
 |:--|:--|
 | `400` | Malformed JSON, invalid `content_hash`, missing required field. Body: `{"error": "..."}`. |
 | `401` | Missing or wrong bearer token. |
-| `403` | Authenticated, but the principal is not authorized for this endpoint: the `ALAYA_READONLY_API_KEY` bearer on anything but a pure read, or an OIDC bearer on a mutating route (delete / supersede / unsupersede / contradictions/resolution / merge / relation / patch / backfill). OAuth scopes are not evaluated. |
+| `403` | Authenticated, but the principal is not authorized for this endpoint: the `ALAYA_READONLY_API_KEY` bearer on anything but a pure read, or an OIDC bearer on a mutating route (delete / supersede / unsupersede / contradictions/resolution / merge / relation / patch / backfill) or on `GET /memories/{content_hash}/relations`. OAuth scopes are not evaluated. |
 | `404` | Memory doesn't exist (`get_memory`, `patch_memory`). |
 | `413` | Request body over 1 MB. |
 | `429` | Rate limited (only when running behind a rate-limiting proxy). |

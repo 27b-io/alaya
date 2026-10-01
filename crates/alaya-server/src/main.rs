@@ -2749,6 +2749,7 @@ fn protected_router(handle: ServiceHandle, auth_state: AuthState) -> Router {
             "/memories/{content_hash}",
             get(get_memory).patch(patch_memory),
         )
+        .route("/memories/{content_hash}/relations", get(get_relations))
         .route("/backfill/summaries", post(backfill_summaries))
         .route("/backfill/contradictions", post(backfill_contradictions))
         .layer(middleware::from_fn_with_state(
@@ -2916,6 +2917,30 @@ async fn relation(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
     Json(params): Json<RelationParams>,
 ) -> (StatusCode, Json<Value>) {
+    let (tx, rx) = oneshot::channel();
+    h.call(CmdInner::Relation { params, reply: tx }, rx).await
+}
+
+#[derive(Deserialize)]
+struct RelationsQuery {
+    relation_type: Option<String>,
+}
+
+/// `GET /memories/{content_hash}/relations`: `POST /relation` `get` as a
+/// route of its own, so the read-only bearer can be authorized for it while
+/// every relation write stays refused (see `rest_route_op`). Same command,
+/// same body, same status codes.
+async fn get_relations(
+    axum::extract::State(h): axum::extract::State<ServiceHandle>,
+    axum::extract::Path(content_hash): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<RelationsQuery>,
+) -> (StatusCode, Json<Value>) {
+    let params = RelationParams {
+        action: "get".into(),
+        content_hash,
+        target_hash: None,
+        relation_type: q.relation_type,
+    };
     let (tx, rx) = oneshot::channel();
     h.call(CmdInner::Relation { params, reply: tx }, rx).await
 }
@@ -5160,6 +5185,65 @@ mod wedge_tests {
                 "{method} {uri}: {v}"
             );
             assert!(rx.try_recv().is_err(), "{method} {uri} reached the worker");
+        }
+    }
+
+    /// `GET /memories/{hash}/relations` dispatches exactly the command
+    /// `POST /relation` `get` does, and answers with the same status and body.
+    #[tokio::test]
+    async fn get_relations_route_matches_post_relation_get() {
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let app = protected_router(ServiceHandle { tx }, test_auth_state());
+        let hash = "a".repeat(64);
+        let reply_body = json!({"relations": [], "content_hash": hash, "count": 0});
+
+        let mut call = async |req: axum::http::Request<axum::body::Body>| {
+            let resp = tokio::spawn(app.clone().oneshot(req));
+            let cmd = rx.recv().await.expect("command dispatched");
+            let CmdInner::Relation { params, reply } = cmd.inner else {
+                panic!("expected CmdInner::Relation");
+            };
+            reply.send(reply_body.clone()).unwrap();
+            let resp = resp.await.unwrap().unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            (serde_json::to_value(params).unwrap(), status, body)
+        };
+        let get = |uri: String| {
+            axum::http::Request::get(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let post = |body: Value| {
+            axum::http::Request::post("/relation")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        for rel in [None, Some("PRECEDES")] {
+            let uri = match rel {
+                None => format!("/memories/{hash}/relations"),
+                Some(r) => format!("/memories/{hash}/relations?relation_type={r}"),
+            };
+            let mut body = json!({"action": "get", "content_hash": hash});
+            if let Some(r) = rel {
+                body["relation_type"] = json!(r);
+            }
+            let via_get = call(get(uri)).await;
+            let via_post = call(post(body)).await;
+            assert_eq!(via_get, via_post, "relation_type={rel:?}");
+            assert_eq!(via_get.0["action"], "get");
+            assert_eq!(via_get.0["relation_type"], json!(rel));
+            assert_eq!(via_get.1, StatusCode::OK);
+            assert_eq!(via_get.2, reply_body);
         }
     }
 

@@ -45,6 +45,7 @@ pub const READONLY_ALLOWLIST: &[&str] = &[
     "check_database_health",
     "memory_contradictions",
     "find_duplicates",
+    "get_relations",
 ];
 
 /// Authenticated principal, inserted into request extensions by `require_auth`.
@@ -131,11 +132,22 @@ pub fn rest_route_op(method: &Method, path: &str) -> &'static str {
         ("POST", "/backfill/summaries") => "backfill_summaries",
         ("POST", "/backfill/contradictions") => "backfill_contradictions",
         ("GET", "/health/detail") => "check_database_health",
+        // Must precede the `/memories/` prefix arm: a relations read gets its
+        // own op so a later edit to `get_memory` cannot change who reads edges.
+        ("GET", p) if is_relations_path(p) => "get_relations",
         ("GET", p) if p.starts_with("/memories/") => "get_memory",
         ("PATCH", p) if p.starts_with("/memories/") => "patch_memory",
         // Unmapped / unexpected method → fail-closed (not in allowlist).
         _ => "__mutating__",
     }
+}
+
+/// `/memories/{content_hash}/relations` — exactly one hash segment, so the
+/// match is no wider than the axum route it authorizes.
+fn is_relations_path(path: &str) -> bool {
+    path.strip_prefix("/memories/")
+        .and_then(|rest| rest.strip_suffix("/relations"))
+        .is_some_and(|hash| !hash.is_empty() && !hash.contains('/'))
 }
 
 /// Every canonical op with its write classification, for the read-only
@@ -148,6 +160,7 @@ pub const ALL_OPS: &[(&str, bool)] = &[
     ("memory_contradictions", false),
     ("find_duplicates", false),
     ("store_memory", false),
+    ("get_relations", false),
     ("delete_memory", true),
     ("memory_supersede", true),
     ("memory_unsupersede", true),
@@ -422,6 +435,7 @@ mod tests {
             "check_database_health",
             "memory_contradictions",
             "find_duplicates",
+            "get_relations",
         ] {
             assert!(
                 AuthPrincipal::StaticReadOnly.allows(op),
@@ -481,6 +495,32 @@ mod tests {
             assert!(p.allows(rest_route_op(&Method::GET, "/memories/abc123")));
             assert!(!p.allows(rest_route_op(&Method::PATCH, "/memories/abc123")));
         }
+    }
+
+    #[test]
+    fn rest_route_op_maps_relations_read_before_the_memories_prefix() {
+        assert_eq!(
+            rest_route_op(&Method::GET, "/memories/abc123/relations"),
+            "get_relations"
+        );
+        // Only the exact one-segment shape; lookalikes keep their old op.
+        for p in [
+            "/memories/relations",
+            "/memories//relations",
+            "/memories/a/b/relations",
+            "/memories/abc123/relations/",
+        ] {
+            assert_eq!(rest_route_op(&Method::GET, p), "get_memory", "{p}");
+        }
+        // Only GET reads relations; the write paths stay unmapped or mutating.
+        assert_eq!(
+            rest_route_op(&Method::PATCH, "/memories/abc123/relations"),
+            "patch_memory"
+        );
+        assert_eq!(
+            rest_route_op(&Method::POST, "/memories/abc123/relations"),
+            "__mutating__"
+        );
     }
 
     #[test]
@@ -586,6 +626,7 @@ mod tests {
             rest_route_op(&Method::POST, "/backfill/contradictions"),
             rest_route_op(&Method::GET, "/memories/x"),
             rest_route_op(&Method::PATCH, "/memories/x"),
+            rest_route_op(&Method::GET, "/memories/x/relations"),
         ];
         for op in rest_ops {
             assert!(
@@ -730,6 +771,7 @@ mod tests {
             .route("/relation", post(ok))
             .route("/duplicates/merge", post(ok))
             .route("/memories/{content_hash}", get(ok).patch(ok))
+            .route("/memories/{content_hash}/relations", get(ok))
             .layer(axum::middleware::from_fn_with_state(auth, require_auth))
     }
 
@@ -739,12 +781,22 @@ mod tests {
         path: &str,
         token: Option<&str>,
     ) -> StatusCode {
+        status_with_body(router, method, path, token, axum::body::Body::empty()).await
+    }
+
+    async fn status_with_body(
+        router: &axum::Router,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+        body: axum::body::Body,
+    ) -> StatusCode {
         use tower::ServiceExt;
         let mut builder = axum::http::Request::builder().method(method).uri(path);
         if let Some(t) = token {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
         }
-        let req = builder.body(axum::body::Body::empty()).unwrap();
+        let req = builder.body(body).unwrap();
         router.clone().oneshot(req).await.unwrap().status()
     }
 
@@ -793,6 +845,65 @@ mod tests {
         );
         assert_eq!(
             status_for(&app, Method::POST, "/search", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// `GET /memories/{hash}/relations` through the real middleware: the
+    /// read-only bearer reads relations here, while `POST /relation` stays
+    /// 403 for it whatever the body's `action` — the gate is by route.
+    #[tokio::test]
+    async fn readonly_bearer_reads_relations_only_through_the_get_route() {
+        let mut auth = state(Some("full-key"), true);
+        auth.readonly_api_key = Some("ro-key".to_string());
+        let app = test_router(auth);
+        let path = "/memories/abc/relations";
+
+        assert_eq!(
+            status_for(&app, Method::GET, path, Some("ro-key")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_for(&app, Method::GET, path, Some("full-key")).await,
+            StatusCode::OK
+        );
+
+        for action in ["get", "create", "delete"] {
+            let body = format!(
+                r#"{{"action":"{action}","content_hash":"abc","target_hash":"def","relation_type":"RELATES_TO"}}"#
+            );
+            assert_eq!(
+                status_with_body(
+                    &app,
+                    Method::POST,
+                    "/relation",
+                    Some("ro-key"),
+                    axum::body::Body::from(body),
+                )
+                .await,
+                StatusCode::FORBIDDEN,
+                "POST /relation {action} must be 403 for the readonly bearer"
+            );
+        }
+
+        // OIDC is unchanged: the same JWT passes an OIDC-allowlisted read, so
+        // the 403 is authorization, not a token the verifier refused.
+        let jwt = crate::testkit::mint(
+            jsonwebtoken::Algorithm::RS256,
+            Some(crate::testkit::KID_RSA),
+            &crate::testkit::TestClaims::valid(),
+        );
+        assert_eq!(
+            status_for(&app, Method::GET, "/memories/abc", Some(&jwt)).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_for(&app, Method::GET, path, Some(&jwt)).await,
+            StatusCode::FORBIDDEN
+        );
+
+        assert_eq!(
+            status_for(&app, Method::GET, path, None).await,
             StatusCode::UNAUTHORIZED
         );
     }
