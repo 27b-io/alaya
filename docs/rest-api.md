@@ -329,7 +329,7 @@ Content-Type: application/json
 }
 ```
 
-All three fields are required: `reason` (1–2000 chars) and `unsuperseded_via` (1–128 chars, who is reversing it, recorded verbatim) form the audit entry. Returns `{ "success": true, "status": "unsuperseded", "content_hash", "superseded_by", "supersession_reason", "reason", "unsuperseded_via", "unsuperseded_at", "supersedes_edges_removed", "contradictions_stamped" }`, or `"success": false` with a `status` of `not_superseded` or `superseded_by_changed`. Mutating — static bearer only.
+All three fields are required: `reason` (1–2000 chars) and `unsuperseded_via` (1–128 chars, who is reversing it, recorded verbatim) form the audit entry. Returns `{ "success": true, "status": "unsuperseded", "content_hash", "superseded_by", "supersession_reason", "reason", "unsuperseded_via", "unsuperseded_at", "supersedes_edges_removed", "contradictions_stamped", "now_superseded_by" }`, or `"success": false` with a `status` of `not_superseded` or `superseded_by_changed`. Mutating — static bearer only.
 
 ## `POST /contradictions`
 

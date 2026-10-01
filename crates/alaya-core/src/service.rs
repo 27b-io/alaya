@@ -2008,6 +2008,28 @@ impl MemoryService {
                         "unsupersede: second SUPERSEDES sweep failed; a stale edge may remain"
                     ),
                 }
+                // That sweep can also take the edge of a supersede that landed
+                // after the reversal. Its marker is written before its edge,
+                // so any such edge the sweep could reach has a marker this
+                // read sees: put its edge back.
+                let now_superseded_by = match self.vectors.get_by_hash(content_hash).await {
+                    Ok(m) => m.as_ref().and_then(supersession_marker).cloned(),
+                    Err(e) => {
+                        tracing::warn!(
+                            hash = content_hash,
+                            error = %e,
+                            "unsupersede: re-read after the sweep failed; a new supersession \
+                             may have lost its edge (scripts/backfill_graph.py restores it)"
+                        );
+                        None
+                    }
+                };
+                if let Some(s) = now_superseded_by
+                    .as_ref()
+                    .and_then(|m| survivor_of(m, content_hash))
+                {
+                    self.write_supersedes_edges(&[content_hash], s).await;
+                }
                 tracing::info!(
                     target: "alaya::supersession",
                     hash = content_hash,
@@ -2029,17 +2051,19 @@ impl MemoryService {
                     "unsuperseded_at": now,
                     "supersedes_edges_removed": edges_removed,
                     "contradictions_stamped": stamped,
+                    "now_superseded_by": now_superseded_by,
                 }))
             }
             ReversalOutcome::NotSuperseded => Ok(not_superseded(content_hash)),
             ReversalOutcome::SupersededByOther(current) => {
-                // Nothing was reversed, so undo this call's graph writes: the
-                // stamps it made (an earlier stamp was never touched) and the
-                // current survivor's edge.
+                // Nothing was reversed, so undo this call's graph writes: each
+                // stamp it made, only while that stamp is still its own (an
+                // operator may have resolved the pair since), and the current
+                // survivor's edge.
                 for [a, b] in &stamped {
                     if let Err(e) = self
                         .graph
-                        .set_contradiction_resolution(a, b, None, UNSUPERSEDE_RESOLVED_VIA, now)
+                        .unsettle_contradiction(a, b, UNSUPERSEDE_RESOLVED_VIA, now)
                         .await
                     {
                         tracing::warn!(a, b, error = %e, "unsupersede: could not clear its stamp");
@@ -3189,6 +3213,15 @@ mod tests {
 
     #[async_trait(?Send)]
     impl GraphService for MockGraph {
+        async fn unsettle_contradiction(
+            &self,
+            _s: &str,
+            _d: &str,
+            _v: &str,
+            _t: f64,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
         async fn settle_contradiction(
             &self,
             _s: &str,
@@ -3965,6 +3998,15 @@ mod tests {
 
     #[async_trait(?Send)]
     impl GraphService for MockGraphBatchTracker {
+        async fn unsettle_contradiction(
+            &self,
+            _s: &str,
+            _d: &str,
+            _v: &str,
+            _t: f64,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
         async fn settle_contradiction(
             &self,
             _s: &str,
@@ -5147,6 +5189,15 @@ mod tests {
 
     #[async_trait(?Send)]
     impl GraphService for MockGraphWithActivation {
+        async fn unsettle_contradiction(
+            &self,
+            _s: &str,
+            _d: &str,
+            _v: &str,
+            _t: f64,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
         async fn settle_contradiction(
             &self,
             _s: &str,
@@ -5982,6 +6033,15 @@ mod tests {
 
     #[async_trait(?Send)]
     impl GraphService for MergeGraph {
+        async fn unsettle_contradiction(
+            &self,
+            _s: &str,
+            _d: &str,
+            _v: &str,
+            _t: f64,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
         async fn settle_contradiction(
             &self,
             _s: &str,
@@ -7109,6 +7169,15 @@ mod tests {
 
         #[async_trait(?Send)]
         impl GraphService for RecordingGraph {
+            async fn unsettle_contradiction(
+                &self,
+                _s: &str,
+                _d: &str,
+                _v: &str,
+                _t: f64,
+            ) -> Result<bool> {
+                unimplemented!()
+            }
             async fn settle_contradiction(
                 &self,
                 _s: &str,
@@ -7836,8 +7905,9 @@ mod tests {
         logs: RefCell<HashMap<String, Vec<Value>>>,
         /// SUPERSEDES edges, (src, dst).
         supersedes: RefCell<Vec<(String, String)>>,
-        /// CONTRADICTS edges, (src, dst) -> `resolved_via` of a keep_both stamp.
-        contradicts: RefCell<HashMap<(String, String), Option<String>>>,
+        /// CONTRADICTS edges, (src, dst) -> (`resolved_via`, `resolved_at`)
+        /// of a keep_both stamp.
+        contradicts: RefCell<HashMap<(String, String), Option<(String, f64)>>>,
         /// Every graph write fails, as when FalkorDB is down.
         graph_down: Cell<bool>,
         /// Another writer re-supersedes the memory to this hash inside the
@@ -7846,6 +7916,11 @@ mod tests {
         /// A concurrent supersede to the SAME survivor writes this SUPERSEDES
         /// edge inside that window (after unsupersede's edge sweep).
         late_edge: RefCell<Option<(String, String)>>,
+        /// An operator stamps this pair inside that window.
+        operator_stamp: RefCell<Option<(String, String)>>,
+        /// Another writer supersedes the memory to this hash right AFTER a
+        /// reversal lands: marker, then edge.
+        resupersede_after: RefCell<Option<String>>,
     }
 
     impl Ledger {
@@ -7894,6 +7969,13 @@ mod tests {
             };
         }
 
+        /// Who stamped the `a -> b` pair, if anyone.
+        fn stamped_by(&self, a: &str, b: &str) -> Option<String> {
+            self.contradicts.borrow()[&(a.to_string(), b.to_string())]
+                .as_ref()
+                .map(|(via, _)| via.clone())
+        }
+
         fn edges(&self) -> Vec<(String, String)> {
             let mut e = self.supersedes.borrow().clone();
             e.sort();
@@ -7925,6 +8007,11 @@ mod tests {
             if let Some(edge) = l.late_edge.borrow_mut().take() {
                 l.supersedes.borrow_mut().push(edge);
             }
+            if let Some(pair) = l.operator_stamp.borrow_mut().take() {
+                l.contradicts
+                    .borrow_mut()
+                    .insert(pair, Some(("operator:console".into(), 1.0)));
+            }
             if !l.memories.borrow().iter().any(|m| m.content_hash == h) {
                 return Err(AlayaError::NotFound(h.into()));
             }
@@ -7947,6 +8034,10 @@ mod tests {
                     "unsuperseded_via": r.via,
                     "reason": r.reason,
                 }));
+            if let Some(by) = l.resupersede_after.borrow_mut().take() {
+                l.set_marker(h, Some(serde_json::json!(by)));
+                l.supersedes.borrow_mut().push((by, h.to_string()));
+            }
             Ok(ReversalOutcome::Cleared {
                 supersession_reason: reason,
             })
@@ -8144,22 +8235,39 @@ mod tests {
             d: &str,
             r: Option<Resolution>,
             via: &str,
-            _t: f64,
+            t: f64,
         ) -> Result<bool> {
             self.0.graph_write()?;
             let mut pairs = self.0.contradicts.borrow_mut();
             let Some(stamp) = pairs.get_mut(&(s.to_string(), d.to_string())) else {
                 return Ok(false);
             };
-            *stamp = r.map(|_| via.to_string());
+            *stamp = r.map(|_| (via.to_string(), t));
             Ok(true)
         }
-        async fn settle_contradiction(&self, s: &str, d: &str, via: &str, _t: f64) -> Result<bool> {
+        async fn settle_contradiction(&self, s: &str, d: &str, via: &str, t: f64) -> Result<bool> {
             self.0.graph_write()?;
             let mut pairs = self.0.contradicts.borrow_mut();
             match pairs.get_mut(&(s.to_string(), d.to_string())) {
                 Some(stamp @ None) => {
-                    *stamp = Some(via.to_string());
+                    *stamp = Some((via.to_string(), t));
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
+        async fn unsettle_contradiction(
+            &self,
+            s: &str,
+            d: &str,
+            via: &str,
+            t: f64,
+        ) -> Result<bool> {
+            self.0.graph_write()?;
+            let mut pairs = self.0.contradicts.borrow_mut();
+            match pairs.get_mut(&(s.to_string(), d.to_string())) {
+                Some(stamp) if *stamp == Some((via.to_string(), t)) => {
+                    *stamp = None;
                     Ok(true)
                 }
                 _ => Ok(false),
@@ -8282,7 +8390,7 @@ mod tests {
         assert_eq!(out["success"], false, "{out}");
         assert_eq!(out["status"], "not_superseded");
         assert_eq!(ledger.edges(), [(a.clone(), b.clone())], "untouched");
-        assert_eq!(ledger.contradicts.borrow()[&(a.clone(), b)], None);
+        assert_eq!(ledger.stamped_by(&a, &b), None);
         assert!(ledger.logs.borrow().is_empty());
     }
 
@@ -8330,12 +8438,15 @@ mod tests {
             serde_json::json!([[b, a]]),
             "{out}"
         );
-        let pairs = ledger.contradicts.borrow();
         assert_eq!(
-            pairs[&(b.clone(), a.clone())].as_deref(),
+            ledger.stamped_by(&b, &a).as_deref(),
             Some(UNSUPERSEDE_RESOLVED_VIA)
         );
-        assert_eq!(pairs[&(a, c)], None, "an unrelated pair stays in the queue");
+        assert_eq!(
+            ledger.stamped_by(&a, &c),
+            None,
+            "an unrelated pair stays in the queue"
+        );
     }
 
     /// A pair an operator already settled keeps that stamp, who and when
@@ -8344,10 +8455,10 @@ mod tests {
     async fn unsupersede_keeps_an_operators_earlier_stamp_on_the_pair() {
         let (a, b) = (h('a'), h('b'));
         let ledger = Ledger::with(&[&a, &b]);
-        ledger
-            .contradicts
-            .borrow_mut()
-            .insert((a.clone(), b.clone()), Some("operator:console".into()));
+        ledger.contradicts.borrow_mut().insert(
+            (a.clone(), b.clone()),
+            Some(("operator:console".into(), 1.0)),
+        );
         let svc = ledger.service();
         svc.memory_supersede(&a, &b, "overrode keep-both")
             .await
@@ -8357,7 +8468,7 @@ mod tests {
         assert_eq!(out["status"], "unsuperseded", "{out}");
         assert_eq!(out["contradictions_stamped"], serde_json::json!([]));
         assert_eq!(
-            ledger.contradicts.borrow()[&(a, b)].as_deref(),
+            ledger.stamped_by(&a, &b).as_deref(),
             Some("operator:console")
         );
     }
@@ -8496,11 +8607,58 @@ mod tests {
         assert_eq!(ledger.marker(&a), Some(serde_json::json!(c)));
         assert_eq!(ledger.edges(), [(c, a.clone())]);
         assert_eq!(
-            ledger.contradicts.borrow()[&(a, b)],
+            ledger.stamped_by(&a, &b),
             None,
             "its stamp is undone: no reversal stands behind it"
         );
         assert!(ledger.logs.borrow().is_empty());
+    }
+
+    /// An operator resolves the pair after this call stamped it, then the
+    /// reversal finds the memory superseded to someone else. Undoing the
+    /// call's stamp must not take the operator's with it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsupersede_compensation_keeps_a_stamp_written_after_its_own() {
+        let (a, b, c) = (h('a'), h('b'), h('c'));
+        let ledger = Ledger::with(&[&a, &b, &c]);
+        ledger
+            .contradicts
+            .borrow_mut()
+            .insert((a.clone(), b.clone()), None);
+        let svc = ledger.service();
+        svc.memory_supersede(&a, &b, "duplicate").await.unwrap();
+        *ledger.resupersede.borrow_mut() = Some(c.clone());
+        *ledger.operator_stamp.borrow_mut() = Some((a.clone(), b.clone()));
+
+        let out = unsupersede(&svc, &a).await;
+        assert_eq!(out["status"], "superseded_by_changed", "{out}");
+        assert_eq!(
+            ledger.stamped_by(&a, &b).as_deref(),
+            Some("operator:console")
+        );
+    }
+
+    /// Another supersede lands right after the reversal: marker, then edge.
+    /// The second sweep takes that edge, so the re-read puts it back, and the
+    /// caller is told the memory is superseded again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsupersede_restores_the_edge_of_a_supersede_that_lands_right_after() {
+        let (a, b, c) = (h('a'), h('b'), h('c'));
+        let ledger = Ledger::with(&[&a, &b, &c]);
+        let svc = ledger.service();
+        svc.memory_supersede(&a, &b, "duplicate").await.unwrap();
+        *ledger.resupersede_after.borrow_mut() = Some(c.clone());
+
+        let out = unsupersede(&svc, &a).await;
+        assert_eq!(out["status"], "unsuperseded", "{out}");
+        assert_eq!(out["now_superseded_by"], serde_json::json!(c));
+        assert_eq!(ledger.marker(&a), Some(serde_json::json!(c)));
+        assert_eq!(ledger.edges(), [(c, a.clone())], "the new edge survives");
+        assert_eq!(
+            ledger.logs.borrow()[&a].len(),
+            1,
+            "the reversal itself landed"
+        );
     }
 
     /// A marker that names no memory (a legacy shape) still hides the memory

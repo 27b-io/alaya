@@ -323,6 +323,16 @@ pub trait GraphService {
         resolved_via: &str,
         resolved_at: f64,
     ) -> Result<bool>;
+    /// Clear the `src -> dst` stamp only while it is still exactly the one
+    /// `settle_contradiction(src, dst, resolved_via, resolved_at)` wrote; a
+    /// stamp written since is kept. Returns whether it cleared.
+    async fn unsettle_contradiction(
+        &self,
+        src: &str,
+        dst: &str,
+        resolved_via: &str,
+        resolved_at: f64,
+    ) -> Result<bool>;
     async fn get_contradictions_for_hashes(
         &self,
         hashes: &[&str],

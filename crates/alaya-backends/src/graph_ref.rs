@@ -128,6 +128,15 @@ macro_rules! impl_graph_service {
             ) -> alaya_types::Result<bool> {
                 self.0.settle_contradiction(s, d, via, at).await
             }
+            async fn unsettle_contradiction(
+                &self,
+                s: &str,
+                d: &str,
+                via: &str,
+                at: f64,
+            ) -> alaya_types::Result<bool> {
+                self.0.unsettle_contradiction(s, d, via, at).await
+            }
             async fn get_contradictions_for_hashes(
                 &self,
                 h: &[&str],

@@ -4628,6 +4628,15 @@ mod wedge_tests {
 
     #[async_trait(?Send)]
     impl GraphService for StubGraph {
+        async fn unsettle_contradiction(
+            &self,
+            _s: &str,
+            _d: &str,
+            _v: &str,
+            _t: f64,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
         async fn settle_contradiction(
             &self,
             _s: &str,

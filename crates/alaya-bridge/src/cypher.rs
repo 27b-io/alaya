@@ -396,6 +396,33 @@ pub fn settle_contradiction(
     )
 }
 
+/// Clear the `src -> dst` CONTRADICTS stamp only while it is still exactly
+/// `keep_both` by `resolved_via` at `resolved_at` — the stamp one
+/// `settle_contradiction` call wrote. A stamp written since by anyone else
+/// stays. Lets an unsupersede that reversed nothing take back only its own.
+pub fn unsettle_contradiction(
+    src: &str,
+    dst: &str,
+    resolved_via: &str,
+    resolved_at: f64,
+) -> CypherQuery {
+    let q = "MATCH (a:Memory {content_hash: $src})-[e:CONTRADICTS]->(b:Memory {content_hash: $dst}) \
+             WHERE e.resolution = $resolution AND e.resolved_via = $via AND e.resolved_at = $ts \
+             SET e.resolution = null, e.resolved_at = null, e.resolved_via = null \
+             RETURN count(e)";
+    (
+        q.to_string(),
+        params(&[
+            ("src", json!(src)),
+            ("dst", json!(dst)),
+            ("resolution", json!(Resolution::KeepBoth.as_str())),
+            ("via", json!(resolved_via)),
+            ("ts", json!(resolved_at)),
+        ]),
+        false,
+    )
+}
+
 /// Count `src -> dst` CONTRADICTS edges that carry a judge verdict or an
 /// operator resolution (LAB-3885 AC-6). `POST /edges/delete` refuses such
 /// an edge: it is the queue item and its audit trail, so it is resolved
@@ -771,6 +798,20 @@ mod tests {
         assert_eq!(p["resolution"], json!("keep_both"));
         assert_eq!(p["via"], json!("unsupersede"));
         assert_eq!(p["ts"], json!(7.0));
+        assert!(!ro);
+    }
+
+    #[test]
+    fn unsettle_contradiction_clears_only_the_exact_stamp() {
+        let (q, p, ro) = unsettle_contradiction("a", "b", "unsupersede", 7.5);
+        assert!(q.contains(
+            "WHERE e.resolution = $resolution AND e.resolved_via = $via AND e.resolved_at = $ts \
+             SET e.resolution = null"
+        ));
+        assert!(!q.contains("MERGE") && !q.contains("DELETE"));
+        assert_eq!(p["resolution"], json!("keep_both"));
+        assert_eq!(p["via"], json!("unsupersede"));
+        assert_eq!(p["ts"], json!(7.5));
         assert!(!ro);
     }
 

@@ -255,12 +255,12 @@ Only that one memory changes. In a chain A → B → C (A superseded by B, B by 
 
 The reversal is recorded as `unsuperseded_via: "operator:mcp"`; the MCP surface does not accept a caller-supplied value.
 
-**Returns:** `{ success: true, status: "unsuperseded", content_hash, superseded_by, supersession_reason, reason, unsuperseded_via, unsuperseded_at, supersedes_edges_removed, contradictions_stamped }`. `superseded_by` and `supersession_reason` are what was reversed. A call that changes nothing returns `success: false` with a `status` saying why:
+**Returns:** `{ success: true, status: "unsuperseded", content_hash, superseded_by, supersession_reason, reason, unsuperseded_via, unsuperseded_at, supersedes_edges_removed, contradictions_stamped, now_superseded_by }`. `superseded_by` and `supersession_reason` are what was reversed. `now_superseded_by` is `null` unless another supersede landed right after the reversal; the reversal is still recorded, but the memory is hidden again. A call that changes nothing returns `success: false` with a `status` saying why:
 
 | `status` | Meaning |
 |:--|:--|
 | `not_superseded` | The memory carries no supersession. Nothing was written. A retry of a call that already landed gets this. |
-| `superseded_by_changed` | The memory was superseded to another survivor while the call ran. Nothing was reversed: that supersession is left whole with its edge, and the call's own stamps are cleared. `superseded_by` names the new survivor. Inspect, and retry if you still mean it. |
+| `superseded_by_changed` | The memory was superseded to another survivor while the call ran. Nothing was reversed: that supersession is left whole with its edge, and the call's own stamps are cleared unless someone has re-stamped the pair since. `superseded_by` names the new survivor. Inspect, and retry if you still mean it. |
 
 **Example:**
 
