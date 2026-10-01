@@ -20,7 +20,9 @@
 //! - discovery and the JWKS cache each fetch single-flight behind their own
 //!   per-provider cooldown, extended *before* the fetch, so a down or refused
 //!   IdP or an unknown-`kid` flood can't turn either binary into an
-//!   outbound-fetch amplifier
+//!   outbound-fetch amplifier; each fetch runs detached from its caller, so
+//!   one that goes away mid-fetch cannot arm a cooldown over a fetch that
+//!   never finished
 //! - one [`Provider::verify`] pipeline: alg allowlist {RS256, ES256} before any
 //!   key lookup, JWK → key refusing alg/key-type mismatches, signature plus
 //!   `exp` and `aud` with 60 s leeway, then `iss` compared trailing-slash
@@ -47,10 +49,11 @@ const JWKS_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Minimum interval between discovery fetches per provider while no document
 /// is cached, so an unauthenticated login flood against a down IdP drives at
-/// most ~2 outbound fetches/min. Strictly shorter than [`JWKS_COOLDOWN`]:
-/// alaya-server reaches discovery only from a JWKS refetch that has just
-/// passed that cooldown, and stamps this gate just after that one, so an
-/// equal or longer cooldown here could refuse the refetch.
+/// most ~2 outbound fetches/min. It alone holds a JWKS refetch while
+/// discovery keeps failing: [`JWKS_COOLDOWN`] arms only once discovery has
+/// returned a document, which then stays cached, so the two never apply to
+/// the same refetch. It stays strictly shorter all the same, as asserted
+/// below.
 const DISCOVERY_COOLDOWN: Duration = JWKS_COOLDOWN.saturating_sub(Duration::from_secs(1));
 const _: () = assert!(DISCOVERY_COOLDOWN.as_nanos() < JWKS_COOLDOWN.as_nanos());
 
@@ -273,11 +276,15 @@ pub struct Provider {
     /// Discovery document, filled lazily on first use. Shared with the
     /// detached fetch that fills it.
     discovery: Arc<RwLock<Option<Discovery>>>,
-    /// kid -> JWK. Swapped wholesale on refetch.
-    keys: RwLock<HashMap<String, Jwk>>,
-    /// Single-flight fetch gate; the inner `Instant` is the last fetch time
-    /// (cooldown). Holding the mutex serializes refetches across requests.
-    fetch_gate: Mutex<Instant>,
+    /// kid -> JWK. Swapped wholesale on refetch, by the detached fetch it is
+    /// shared with.
+    keys: Arc<RwLock<HashMap<String, Jwk>>>,
+    /// Single-flight fetch gate; the inner `Instant` is the last JWKS fetch
+    /// time (cooldown). Holding the mutex serializes refetches across
+    /// requests. The caller holds it through discovery, so a caller dropped
+    /// there releases it unarmed; the detached JWKS fetch then holds it, which
+    /// is why it is shared, until that fetch has cached or failed.
+    fetch_gate: Arc<Mutex<Instant>>,
     /// Discovery's own single-flight gate and last fetch time. Not
     /// `fetch_gate`: `key_for_kid` holds that one into `discovery()`, and a
     /// tokio mutex is not reentrant. Lock order is `fetch_gate`, then this,
@@ -315,7 +322,10 @@ impl Provider {
     /// Over the consumer's own client, for a consumer whose every upstream
     /// shares one builder so a hardening knob added there cannot miss the IdP.
     /// The client MUST refuse redirects and bound its timeouts, as `new`'s
-    /// does; passing one is taking that on.
+    /// does; passing one is taking that on. Its timeout is the only bound on
+    /// how long a detached discovery or JWKS fetch holds its gate, which every
+    /// login or unknown-`kid` verification behind it waits on: without one, a
+    /// stalled IdP would wedge them all on `lock_owned()`.
     pub fn for_relying_party(issuer: &str, http: reqwest::Client) -> Self {
         Self::build(issuer, http, true)
     }
@@ -325,9 +335,9 @@ impl Provider {
             issuer: normalize_issuer(issuer).to_string(),
             http,
             discovery: Arc::new(RwLock::new(None)),
-            keys: RwLock::new(HashMap::new()),
+            keys: Arc::new(RwLock::new(HashMap::new())),
             // Seeded in the past so neither cooldown blocks the first real fetch.
-            fetch_gate: Mutex::new(cooled_down()),
+            fetch_gate: Arc::new(Mutex::new(cooled_down())),
             discovery_gate: Arc::new(Mutex::new(cooled_down())),
             relying_party,
         }
@@ -357,7 +367,8 @@ impl Provider {
             return Ok(d);
         }
 
-        // Miss: serialize fetches behind the gate, as `key_for_kid` does.
+        // Miss: serialize fetches behind the gate. Its owned guard moves into
+        // the detached fetch below, as `key_for_kid`'s does.
         let mut last_fetch = self.discovery_gate.clone().lock_owned().await;
         // Double-check: a fetch that succeeded while this call waited must
         // be served, not refused by the cooldown it just set.
@@ -389,11 +400,7 @@ impl Provider {
             *cache.write().await = Some(disc.clone());
             Ok(disc)
         });
-        // Never aborted, so a join error is the task's panic: re-raise it
-        // here, as the fetch would have panicked inline.
-        fetch
-            .await
-            .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+        joined(fetch).await
     }
 
     /// Verify a compact JWS against this provider and decode its claims:
@@ -436,8 +443,9 @@ impl Provider {
             return Ok(jwk);
         }
 
-        // Miss: serialize refetch attempts behind the gate.
-        let mut last_fetch = self.fetch_gate.lock().await;
+        // Miss: serialize refetch attempts behind the gate. Its owned guard
+        // moves into the detached fetch below, as `discovery()`'s does.
+        let mut last_fetch = self.fetch_gate.clone().lock_owned().await;
         // Double-check: another task may have just populated the cache.
         if let Some(jwk) = self.keys.read().await.get(kid).cloned() {
             return Ok(jwk);
@@ -447,32 +455,51 @@ impl Provider {
             return Err(Error::Invalid("unknown kid (cooldown)"));
         }
 
-        // Set the cooldown BEFORE attempting the fetch. If the IdP is down,
-        // every failing refetch must still extend the cooldown — otherwise a
-        // bad provider becomes an unbounded outbound-fetch amplifier.
-        *last_fetch = Instant::now();
-        self.refetch_jwks().await?;
-
-        self.keys
-            .read()
-            .await
-            .get(kid)
-            .cloned()
-            .ok_or(Error::Invalid("unknown kid"))
-    }
-
-    /// Discover (if needed) and fetch the JWKS, swapping the key cache.
-    async fn refetch_jwks(&self) -> Result<(), Error> {
+        // Discovery first, under this gate and before arming it (lock order:
+        // this gate, then discovery's). Its fetch is detached too, so a caller
+        // dropped here leaves that fetch running and this cooldown unarmed.
         let jwks_uri = self.discovery().await?.jwks_uri;
-        let jwks: Jwks = fetch_json(&self.http, &jwks_uri, &JWKS_OPS).await?;
-        *self.keys.write().await = key_map(jwks.keys);
-        Ok(())
+        // Armed only once discovery has returned a document, so this cooldown
+        // marks exactly the JWKS fetch it gates, failing or not. A failed or
+        // refused discovery is already held to one fetch per
+        // `DISCOVERY_COOLDOWN` by its own gate; arming here as well would
+        // stack a second window on that one and delay recovery.
+        *last_fetch = Instant::now();
+
+        // Spawned, holding the gate until it has cached or failed, with no
+        // await between arming the cooldown and the spawn. A caller dropped
+        // mid-fetch (a client hanging up) must neither abort the fetch, which
+        // would arm the cooldown over a fetch that never finished, nor release
+        // the gate early, which would let a hang-up flood drive one outbound
+        // fetch per request.
+        let (http, cache, kid) = (self.http.clone(), self.keys.clone(), kid.to_owned());
+        let fetch = tokio::spawn(async move {
+            let _gate = last_fetch;
+            let jwks: Jwks = fetch_json(&http, &jwks_uri, &JWKS_OPS).await?;
+            let keys = key_map(jwks.keys);
+            let jwk = keys.get(&kid).cloned();
+            *cache.write().await = keys;
+            jwk.ok_or(Error::Invalid("unknown kid"))
+        });
+        joined(fetch).await
     }
+}
+
+/// Await a detached fetch. Nothing aborts one, so a join error is the task's
+/// panic, re-raised here as the fetch would have panicked inline — or its
+/// cancellation at runtime shutdown, where `into_panic` panics in turn
+/// ("`JoinError` reason is not a panic"). Either way the caller unwinds.
+async fn joined<T>(fetch: tokio::task::JoinHandle<T>) -> T {
+    fetch
+        .await
+        .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
 }
 
 /// GET `issuer`'s discovery document and apply every rule to it: the issuer
 /// echo, same-origin-https on `jwks_uri`, and, for a relying party, its two
-/// endpoints. The caller caches only what this returns.
+/// endpoints. The caller caches only what this returns. `issuer` must be
+/// normalised already, as [`Provider`] stores it: the URL is built on it and
+/// the echo compared to it verbatim.
 async fn fetch_discovery(
     http: &reqwest::Client,
     issuer: &str,
@@ -740,29 +767,37 @@ mod tests {
     }
 
     /// A loopback IdP answering every connection, after `delay`, with the
-    /// response `respond` builds for its issuer, then closing it — so each
-    /// fetch costs exactly one accepted connection and a reused one cannot
-    /// hide a request.
+    /// response `respond` builds for its issuer and the request path, then
+    /// closing it — so each fetch costs exactly one accepted connection and a
+    /// reused one cannot hide a request. Each connection is served on its own
+    /// task, so one in flight never holds a later one out of the count.
     async fn loopback_idp(
-        respond: fn(&str) -> String,
+        respond: fn(&str, &str) -> String,
         delay: Duration,
     ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let issuer = format!("http://{}", listener.local_addr().unwrap());
-        let response = respond(&issuer);
         let accepted = Arc::new(AtomicUsize::new(0));
-        let count = accepted.clone();
+        let (count, served) = (accepted.clone(), issuer.clone());
         let server = tokio::spawn(async move {
             loop {
                 let (mut sock, _) = listener.accept().await.unwrap();
                 count.fetch_add(1, Ordering::SeqCst);
-                let mut req = [0u8; 1024];
-                let _request_len = sock.read(&mut req).await.unwrap();
-                tokio::time::sleep(delay).await;
-                sock.write_all(response.as_bytes()).await.unwrap();
-                let _closed = sock.shutdown().await;
+                let issuer = served.clone();
+                tokio::spawn(async move {
+                    let mut req = [0u8; 1024];
+                    let request_len = sock.read(&mut req).await.unwrap();
+                    let request = String::from_utf8_lossy(&req[..request_len]);
+                    let path = request.split_whitespace().nth(1).unwrap_or_default();
+                    let response = respond(&issuer, path);
+                    tokio::time::sleep(delay).await;
+                    // A caller dropped mid-fetch may take its connection with
+                    // it, so a failed write is a case under test, not an error.
+                    let _hung_up = sock.write_all(response.as_bytes()).await;
+                    let _closed = sock.shutdown().await;
+                });
             }
         });
         (issuer, accepted, server)
@@ -776,7 +811,7 @@ mod tests {
     }
 
     /// A resource-server discovery document that passes every rule.
-    fn good_discovery(issuer: &str) -> String {
+    fn good_discovery(issuer: &str, _path: &str) -> String {
         let doc = serde_json::json!({
             "issuer": issuer,
             "jwks_uri": format!("{issuer}/jwks"),
@@ -784,12 +819,24 @@ mod tests {
         http_response("200 OK", &doc.to_string())
     }
 
+    /// A healthy IdP: the JWKS, holding the one key `k1`, at the `jwks_uri`
+    /// its discovery document advertises, and that document on any other path.
+    fn good_idp(issuer: &str, path: &str) -> String {
+        if path != "/jwks" {
+            return good_discovery(issuer, path);
+        }
+        let jwks = serde_json::json!({
+            "keys": [{"kty": "RSA", "kid": "k1", "n": "AQAB", "e": "AQAB"}],
+        });
+        http_response("200 OK", &jwks.to_string())
+    }
+
     /// A down IdP costs one outbound fetch per cooldown, not one per call:
     /// the unauthenticated login path must not amplify an outage.
     #[tokio::test]
     async fn a_failed_discovery_is_not_retried_inside_the_cooldown() {
         let (issuer, accepted, server) = loopback_idp(
-            |_| http_response("500 Internal Server Error", ""),
+            |_, _| http_response("500 Internal Server Error", ""),
             Duration::ZERO,
         )
         .await;
@@ -863,6 +910,165 @@ mod tests {
         server.abort();
         assert!(a.is_ok() && b.is_ok(), "{:?} / {:?}", a.err(), b.err());
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    /// A caller dropped mid-JWKS-fetch — a client hanging up on an
+    /// unknown-`kid` bearer — neither aborts the fetch nor leaves the cooldown
+    /// armed over one that never finished: the next call is served the key
+    /// the detached fetch cached.
+    #[tokio::test]
+    async fn a_key_for_kid_cancelled_mid_jwks_fetch_does_not_lock_out_the_next_call() {
+        let (issuer, accepted, server) = loopback_idp(good_idp, Duration::from_millis(200)).await;
+        let provider = Provider::new(&issuer);
+        provider.discovery().await.expect("discovery succeeds");
+
+        let hung_up =
+            tokio::time::timeout(Duration::from_millis(50), provider.key_for_kid("k1")).await;
+        assert!(
+            hung_up.is_err(),
+            "the first caller must be dropped mid-fetch"
+        );
+        let next = provider.key_for_kid("k1").await;
+        server.abort();
+        assert!(next.is_ok(), "{:?}", next.err());
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "one discovery, one JWKS fetch"
+        );
+    }
+
+    /// The same for a caller dropped while the refetch is still resolving
+    /// discovery on a cold cache: the cooldown is not armed until discovery
+    /// has answered, and the discovery fetch itself runs on.
+    #[tokio::test]
+    async fn a_key_for_kid_cancelled_mid_discovery_does_not_lock_out_the_next_call() {
+        let (issuer, accepted, server) = loopback_idp(good_idp, Duration::from_millis(200)).await;
+        let provider = Provider::new(&issuer);
+
+        let hung_up =
+            tokio::time::timeout(Duration::from_millis(50), provider.key_for_kid("k1")).await;
+        assert!(
+            hung_up.is_err(),
+            "the first caller must be dropped mid-discovery"
+        );
+        let next = provider.key_for_kid("k1").await;
+        server.abort();
+        assert!(next.is_ok(), "{:?}", next.err());
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "one discovery, one JWKS fetch"
+        );
+    }
+
+    /// An unknown-`kid` flood drives one JWKS fetch per cooldown however many
+    /// of its callers hang up, whether mid-fetch or waiting on the gate: the
+    /// fetch the first one started keeps the gate until it has cached, and the
+    /// legitimate key it cached is served.
+    #[tokio::test]
+    async fn an_unknown_kid_flood_with_hang_ups_fetches_jwks_once() {
+        let (issuer, accepted, server) = loopback_idp(good_idp, Duration::from_millis(200)).await;
+        let provider = Provider::new(&issuer);
+        provider.discovery().await.expect("discovery succeeds");
+
+        for i in 0..5 {
+            let kid = format!("forged-{i}");
+            let hung_up =
+                tokio::time::timeout(Duration::from_millis(20), provider.key_for_kid(&kid)).await;
+            assert!(hung_up.is_err(), "caller {i} must be dropped mid-refetch");
+        }
+        let flood = tokio::join!(
+            provider.key_for_kid("forged-a"),
+            provider.key_for_kid("forged-b"),
+            provider.key_for_kid("forged-c"),
+        );
+        let legit = provider.key_for_kid("k1").await;
+        server.abort();
+        for refused in [flood.0, flood.1, flood.2] {
+            assert!(
+                matches!(refused, Err(Error::Invalid("unknown kid (cooldown)"))),
+                "{:?}",
+                refused.err()
+            );
+        }
+        assert!(legit.is_ok(), "{:?}", legit.err());
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "one discovery, one JWKS fetch"
+        );
+    }
+
+    /// A refetch that failed at discovery is held by discovery's own
+    /// cooldown, not the JWKS one, which marks only a JWKS fetch: a down IdP
+    /// still costs one outbound fetch per cooldown, not one per call.
+    #[tokio::test]
+    async fn a_refetch_failed_at_discovery_is_not_retried_inside_the_cooldown() {
+        let (issuer, accepted, server) = loopback_idp(
+            |_, _| http_response("500 Internal Server Error", ""),
+            Duration::ZERO,
+        )
+        .await;
+        let provider = Provider::new(&issuer);
+
+        let first = provider.key_for_kid("k1").await.err();
+        assert!(matches!(first, Some(Error::Provider { .. })), "{first:?}");
+        let second = provider.key_for_kid("k1").await.err();
+        server.abort();
+        assert!(
+            matches!(
+                second,
+                Some(Error::Provider {
+                    op: "discovery (cooldown)",
+                    cause: Cause::Cooldown
+                })
+            ),
+            "{second:?}"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    /// A refetch refused by discovery's own cooldown made no request, so it
+    /// must not arm the JWKS cooldown too: stacking that window on the
+    /// discovery one would keep refusing legitimate tokens after the IdP is
+    /// back. Once discovery's cooldown runs out, the next call is served.
+    #[tokio::test]
+    async fn a_discovery_cooldown_refusal_does_not_arm_the_jwks_cooldown() {
+        static SEEN: AtomicUsize = AtomicUsize::new(0);
+        fn fails_once(issuer: &str, path: &str) -> String {
+            if SEEN.fetch_add(1, Ordering::SeqCst) == 0 {
+                return http_response("500 Internal Server Error", "");
+            }
+            good_idp(issuer, path)
+        }
+        let (issuer, _accepted, server) =
+            loopback_idp(fails_once, Duration::from_millis(200)).await;
+        let provider = Provider::new(&issuer);
+
+        let hung_up =
+            tokio::time::timeout(Duration::from_millis(50), provider.key_for_kid("k1")).await;
+        assert!(
+            hung_up.is_err(),
+            "the first caller must be dropped mid-discovery"
+        );
+        // Let the detached discovery fail and arm its own cooldown.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let refused = provider.key_for_kid("k1").await.err();
+        assert!(
+            matches!(
+                refused,
+                Some(Error::Provider {
+                    cause: Cause::Cooldown,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        *provider.discovery_gate.lock().await = cooled_down();
+        let next = provider.key_for_kid("k1").await;
+        server.abort();
+        assert!(next.is_ok(), "{:?}", next.err());
     }
 
     fn rp_discovery(authorization_endpoint: &str) -> Discovery {
