@@ -13,8 +13,11 @@ so it lands with its SUPERSEDES edge and reason.
 
 Alaya keys a memory by its raw content; the source keys it by normalised
 content plus metadata, so several source memories can share one Alaya
-record. A superseded memory whose content a live one also holds is not
+record. Every supersession is resolved to Alaya record keys before any
+write. A superseded memory whose content a live one also holds is not
 stored, and its supersession is skipped: the content is live in the source.
+Superseded copies of one content that name different survivors cannot share
+one record; they are not stored, are reported, and fail the run.
 
 Usage:
     python3 scripts/migrate_from_mcp.py
@@ -32,6 +35,7 @@ Environment:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import sys
 import time
@@ -66,6 +70,7 @@ class Stats:
     superseded: int = 0
     supersede_skipped: int = 0
     supersede_failed: int = 0
+    conflicted: int = 0
 
 
 @dataclass
@@ -75,41 +80,52 @@ class Supersession:
     reason: str
 
 
+def alaya_hash(content: str) -> str:
+    """Alaya's record key: SHA-256 of the raw content, not normalised."""
+    return hashlib.sha256(content.encode()).hexdigest()
+
+
 async def store_memory(
     client: httpx.AsyncClient,
     sem: asyncio.Semaphore,
     memory: dict,
+    key: str,
     stats: Stats,
-) -> str | None:
-    """Store one memory; its Alaya content hash, or None on failure."""
+) -> bool:
+    """Store one memory under its expected Alaya key; whether it landed there."""
+
+    def fail(msg: str) -> bool:
+        stats.failed += 1
+        if stats.failed <= 5:
+            print(f"  FAIL: {msg}")
+        return False
+
     async with sem:
         try:
             r = await client.post("/store", json=memory)
             body = r.json()
         except (httpx.HTTPError, ValueError) as e:
-            stats.failed += 1
-            if stats.failed <= 5:
-                print(f"  ERR: {e}")
-            return None
-    content_hash = body.get("content_hash")
-    if r.status_code == 200 and body.get("success") and content_hash:
-        if body.get("created"):
-            stats.stored += 1
-        else:
-            stats.existed += 1
-        return content_hash
-    stats.failed += 1
-    if stats.failed <= 5:
-        print(f"  FAIL: {body.get('error') or r.text[:100]}")
-    return None
+            return fail(str(e))
+    if not (r.status_code == 200 and body.get("success") and body.get("content_hash")):
+        return fail(body.get("error") or r.text[:100])
+    # Supersessions are planned on locally computed keys; a different
+    # key means Alaya's hashing changed and that plan is wrong.
+    if body["content_hash"] != key:
+        return fail(f"stored as {body['content_hash']}, expected {key}")
+    if body.get("created"):
+        stats.stored += 1
+    else:
+        stats.existed += 1
+    return True
 
 
 async def supersede_memory(
     client: httpx.AsyncClient,
     sem: asyncio.Semaphore,
-    old_hash: str | None,
-    new_hash: str | None,
+    old_hash: str,
+    new_hash: str,
     s: Supersession,
+    stored: set[str],
     stats: Stats,
 ) -> None:
     def fail(msg: str) -> None:
@@ -117,10 +133,10 @@ async def supersede_memory(
         if stats.supersede_failed <= 5:
             print(f"  SUPERSEDE FAIL: {msg}")
 
-    if old_hash is None:
-        fail(f"memory #{s.index} was not stored")
+    if old_hash not in stored:
+        fail(f"{old_hash} was not stored")
         return
-    if new_hash is None:
+    if new_hash not in stored:
         fail(f"{old_hash}: superseding memory {s.source_new_hash} was not stored")
         return
     async with sem:
@@ -233,17 +249,56 @@ async def run() -> None:
             f"  {empty_markers} memories carry an empty superseded_by: live, migrated live"
         )
 
+    # Plan every supersession on Alaya record keys, so source memories that
+    # collapse onto one record are settled before anything is written.
+    keys = [alaya_hash(m["content"]) for m in memories]
+    to_alaya = {k: k for k in keys}
+    to_alaya.update((src, k) for src, k in zip(source_hashes, keys, strict=True) if src)
     superseded = {s.index for s in supersessions}
-    live_contents = {
-        m["content"] for i, m in enumerate(memories) if i not in superseded
-    }
-    # Storing one of these would re-store the live record with the
-    # superseded copy's tags and metadata, and superseding it would hide it.
-    shadowed = {i for i in superseded if memories[i]["content"] in live_contents}
+    live = {k for i, k in enumerate(keys) if i not in superseded}
+    by_record: dict[str, list[Supersession]] = {}
+    for s in supersessions:
+        by_record.setdefault(keys[s.index], []).append(s)
+
+    shadowed: set[int] = set()
+    conflicts: dict[str, list[Supersession]] = {}
+    plan: list[tuple[str, str, Supersession]] = []  # one per superseded record
+    for old, group in by_record.items():
+        # Storing a shadowed copy would re-store the live record with its
+        # tags and metadata, and superseding it would hide live content.
+        if old in live:
+            shadowed.update(s.index for s in group)
+            stats.supersede_skipped += len(group)
+            continue
+        # A survivor with the same content is this record: nothing to do.
+        survivors = {to_alaya.get(s.source_new_hash, s.source_new_hash) for s in group}
+        survivors.discard(old)
+        # One record holds one marker, so it cannot keep both histories.
+        if len(survivors) > 1:
+            conflicts[old] = group
+            continue
+        stats.supersede_skipped += len(group) - len(survivors)
+        if survivors:
+            plan.append((old, survivors.pop(), group[0]))
+
     if shadowed:
         print(f"  {len(shadowed)} superseded memories hold live content: not stored")
         for i in sorted(shadowed)[:5]:
             print(f"    {source_hashes[i] or f'memory #{i}'}")
+    conflicted = {s.index for group in conflicts.values() for s in group}
+    stats.conflicted = len(conflicted)
+    if conflicts:
+        print(
+            f"  {stats.conflicted} superseded memories share content but name"
+            " different survivors: not stored"
+        )
+        for old, group in list(conflicts.items())[:5]:
+            print(f"    {old}:")
+            for s in group:
+                print(
+                    f"      {source_hashes[s.index] or f'memory #{s.index}'}"
+                    f" -> {s.source_new_hash}"
+                )
 
     if DRY_RUN:
         for m in memories[:5]:
@@ -254,7 +309,7 @@ async def run() -> None:
         return
 
     # ── Phase 2: Store to Alaya ─────────────────────────────────────
-    to_store = [i for i in range(len(memories)) if i not in shadowed]
+    to_store = [i for i in range(len(memories)) if i not in shadowed | conflicted]
     print(f"\nPhase 2: Storing {len(to_store)} memories to Alaya...")
     t0 = time.monotonic()
     sem = asyncio.Semaphore(CONCURRENCY)
@@ -268,13 +323,15 @@ async def run() -> None:
         headers=headers,
         timeout=60.0,
     ) as client:
-        # Aligned with memories; a shadowed memory gets its hash in Phase 3.
-        stored_hashes: list[str | None] = [None] * len(memories)
+        stored: set[str] = set()
         for batch_start in range(0, len(to_store), BATCH_SIZE):
             batch = to_store[batch_start : batch_start + BATCH_SIZE]
-            tasks = [store_memory(client, sem, memories[i], stats) for i in batch]
-            for i, h in zip(batch, await asyncio.gather(*tasks), strict=True):
-                stored_hashes[i] = h
+            tasks = [
+                store_memory(client, sem, memories[i], keys[i], stats) for i in batch
+            ]
+            for i, ok in zip(batch, await asyncio.gather(*tasks), strict=True):
+                if ok:
+                    stored.add(keys[i])
 
             done = min(batch_start + BATCH_SIZE, len(to_store))
             elapsed = time.monotonic() - t0
@@ -285,34 +342,14 @@ async def run() -> None:
             )
 
         # ── Phase 3: Recreate supersessions ─────────────────────────
-        # Runs after every store, so each superseding memory exists. Alaya
-        # hashes raw content and the source may not, so a source hash is
-        # translated through the memory that carried it. A shadowed memory's
-        # record is the live one holding its content.
-        print(f"\nPhase 3: Recreating {len(supersessions)} supersessions...")
-        by_content = {
-            memories[i]["content"]: h
-            for i, h in enumerate(stored_hashes)
-            if h is not None
-        }
-        for i in shadowed:
-            stored_hashes[i] = by_content.get(memories[i]["content"])
-        to_alaya: dict[str, str] = {}
-        for src, dst in zip(source_hashes, stored_hashes, strict=True):
-            if dst is not None:
-                to_alaya[dst] = dst
-                if src:
-                    to_alaya[src] = dst
-        tasks = []
-        for s in supersessions:
-            old, new = stored_hashes[s.index], to_alaya.get(s.source_new_hash)
-            # Shadowed, or the same content as its replacement: one record,
-            # so there is nothing to supersede.
-            if s.index in shadowed or (old is not None and old == new):
-                stats.supersede_skipped += 1
-                continue
-            tasks.append(supersede_memory(client, sem, old, new, s, stats))
-        await asyncio.gather(*tasks)
+        # Runs after every store, so each superseding record exists.
+        print(f"\nPhase 3: Recreating {len(plan)} supersessions...")
+        await asyncio.gather(
+            *(
+                supersede_memory(client, sem, old, new, s, stored, stats)
+                for old, new, s in plan
+            )
+        )
         print(
             f"  superseded={stats.superseded} skipped={stats.supersede_skipped}"
             f" failed={stats.supersede_failed}"
@@ -342,8 +379,9 @@ async def run() -> None:
     print(f"  Superseded:       {stats.superseded}")
     print(f"  Supersede skipped: {stats.supersede_skipped}")
     print(f"  Supersede failed: {stats.supersede_failed}")
+    print(f"  Conflicted:       {stats.conflicted}")
 
-    if stats.failed or stats.supersede_failed:
+    if stats.failed or stats.supersede_failed or stats.conflicted:
         sys.exit(1)
 
 
