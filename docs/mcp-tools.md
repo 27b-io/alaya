@@ -39,7 +39,7 @@ Embed text and persist it. Returns the new memory's `content_hash`.
 | `content` | string | ✓ | | The text to store. Embedded for semantic search. |
 | `tags` | string[] or string | | | Labels for tag-mode search. Accepts `["a","b"]` or `"a,b"`. |
 | `memory_type` | enum | | `note` | One of `note`, `decision`, `task`, `reference`. Used by `memory_type` filter on `search`. |
-| `metadata` | object | | | Arbitrary structured data. Special key: `importance` (float 0–1) boosts salience. |
+| `metadata` | object | | | Arbitrary structured data. Special key: `importance` (float 0–1) boosts salience. Reserved key: `superseded_by` is set only by supersede and merge; sending it is a `-32602` error and nothing is stored. |
 | `client_hostname` | string | | | Tagged on the memory for provenance / multi-host setups. |
 | `summary` | string | | | One-line summary (~50 tokens). Auto-generated if `SUMMARY_URL` is configured on the server. |
 | `dedup_threshold` | number | | | If set, skip storage when nearest neighbour cosine similarity ≥ threshold. Use `0.95` for near-exact dedup. |

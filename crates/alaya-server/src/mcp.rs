@@ -360,6 +360,9 @@ async fn dispatch_tool(
         "store_memory" => {
             let params: StoreParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
+            params
+                .validate()
+                .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
             let (tx, rx) = oneshot::channel();
             handle
                 .call_rpc(
@@ -786,6 +789,24 @@ mod tests {
             "application/json, text/event-stream".parse().unwrap(),
         );
         headers
+    }
+
+    /// A caller-set supersession marker is -32602 and never reaches the
+    /// worker, so nothing is stored (LAB-6891).
+    #[tokio::test]
+    async fn store_memory_refuses_reserved_metadata_key() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let handle = ServiceHandle { tx };
+        let args = json!({
+            "content": "live fact",
+            "metadata": {"superseded_by": "b".repeat(64)},
+        });
+        let (code, msg) = dispatch_tool("store_memory", args, &handle, AuthPrincipal::Static)
+            .await
+            .expect_err("reserved key must be refused");
+        assert_eq!(code, -32602);
+        assert!(msg.contains("metadata.superseded_by"), "{msg}");
+        assert!(rx.try_recv().is_err(), "nothing may be dispatched");
     }
 
     #[test]

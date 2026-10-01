@@ -141,6 +141,18 @@ pub struct StoreParams {
     pub dedup_threshold: Option<f64>,
 }
 
+impl StoreParams {
+    /// Caller-input checks, run by `store_memory_with` and — so a refusal is
+    /// a 400 / -32602 rather than an op error in a 200 body — by the REST and
+    /// MCP handlers before dispatch.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        match &self.metadata {
+            Some(md) => alaya_types::memory::reject_reserved_metadata(md),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Relation action parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelationParams {
@@ -374,6 +386,7 @@ impl MemoryService {
         if params.content.is_empty() {
             return Err(AlayaError::Validation("content cannot be empty".into()));
         }
+        params.validate().map_err(AlayaError::Validation)?;
 
         let now = (self.clock)();
         let content_hash = generate_content_hash(&params.content);
@@ -1585,18 +1598,9 @@ impl MemoryService {
         }
         // The supersession marker changes only through supersede / merge and
         // unsupersede, which keep its edge, reason and audit entry. A patch
-        // that sets or deletes it (null deletes) would keep none of them.
-        if patch
-            .metadata
-            .as_ref()
-            .is_some_and(|m| m.contains_key("superseded_by"))
-        {
-            return Err(AlayaError::Validation(
-                "metadata.superseded_by is server-maintained: use memory_supersede / \
-                 memory_unsupersede"
-                    .into(),
-            ));
-        }
+        // that sets or deletes it (null deletes) would keep none of them, so
+        // the one reserved-key check runs here as well as in the REST handler.
+        patch.validate().map_err(AlayaError::Validation)?;
 
         let mem = self.vectors.patch_memory(content_hash, patch).await?;
 
@@ -4697,6 +4701,92 @@ mod tests {
         assert_eq!(m.access_count, 7, "access_count must survive re-store");
         assert_eq!(m.access_timestamps, vec![first_now + 1.0, first_now + 2.0]);
         assert_eq!(m.updated_at, first_now + 3600.0, "updated_at moves to now");
+    }
+
+    /// A caller-set supersession marker is refused before anything is
+    /// written, for a new memory and for a re-store alike (LAB-6891).
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_refuses_caller_supplied_superseded_by() {
+        let stored = Rc::new(RefCell::new(HashMap::new()));
+        let svc = MemoryService::with_clock(
+            Box::new(MockVectorsPersisting {
+                stored: stored.clone(),
+                raw_only: Default::default(),
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            mock_clock,
+        );
+        let params = StoreParams {
+            content: "live fact".into(),
+            tags: None,
+            memory_type: None,
+            metadata: Some(HashMap::from([(
+                "superseded_by".to_string(),
+                serde_json::json!("b".repeat(64)),
+            )])),
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: None,
+        };
+
+        let err = svc
+            .store_memory(params)
+            .await
+            .expect_err("a caller-set superseded_by must be refused");
+        assert!(
+            matches!(&err, AlayaError::Validation(m) if m.contains("metadata.superseded_by")),
+            "got {err:?}"
+        );
+        assert!(stored.borrow().is_empty(), "nothing may be stored");
+    }
+
+    /// The core PATCH entry point refuses the marker too, so a caller that
+    /// skips the REST handler's check cannot un-supersede (LAB-6891).
+    #[tokio::test(flavor = "current_thread")]
+    async fn patch_refuses_caller_supplied_superseded_by() {
+        let stored = Rc::new(RefCell::new(HashMap::new()));
+        let svc = MemoryService::with_clock(
+            Box::new(MockVectorsPersisting {
+                stored: stored.clone(),
+                raw_only: Default::default(),
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            mock_clock,
+        );
+        let hash = generate_content_hash("live fact");
+        svc.store_memory(StoreParams {
+            content: "live fact".into(),
+            tags: None,
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: None,
+        })
+        .await
+        .expect("store");
+
+        let patch = PatchMemoryRequest {
+            metadata: Some(HashMap::from([(
+                "superseded_by".to_string(),
+                serde_json::Value::Null,
+            )])),
+            ..Default::default()
+        };
+        let err = svc
+            .patch_memory(&hash, &patch)
+            .await
+            .expect_err("a caller-set superseded_by must be refused");
+        assert!(
+            matches!(&err, AlayaError::Validation(m) if m.contains("metadata.superseded_by")),
+            "got {err:?}"
+        );
     }
 
     /// A read-only principal may add memories but never reshape an existing

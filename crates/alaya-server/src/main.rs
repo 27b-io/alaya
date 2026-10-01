@@ -2856,6 +2856,11 @@ async fn store(
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
     Json(params): Json<StoreParams>,
 ) -> (StatusCode, Json<Value>) {
+    // Refused here, before dispatch, so the caller gets a 400 rather than an
+    // op error in a 200 body.
+    if let Err(msg) = params.validate() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg})));
+    }
     let read_only = WritePolicy::read_only_for(principal);
     let (tx, rx) = oneshot::channel();
     h.call(
@@ -5102,6 +5107,61 @@ mod wedge_tests {
     }
 
     // ─── /health split (#77) ────────────────────────────────────────────────
+
+    /// Store and PATCH refuse a caller-set `metadata.superseded_by` with a 400
+    /// naming the key, before dispatch — the worker never sees it, so nothing
+    /// is written (LAB-6891). PATCH covers null too: null deletes the key.
+    #[tokio::test]
+    async fn rest_writes_refuse_reserved_metadata_key() {
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let app = protected_router(ServiceHandle { tx }, test_auth_state());
+        let hash = "a".repeat(64);
+        let cases = [
+            (
+                "POST",
+                "/store".to_string(),
+                json!({"content": "live fact", "metadata": {"superseded_by": "b".repeat(64)}}),
+            ),
+            (
+                "PATCH",
+                format!("/memories/{hash}"),
+                json!({"metadata": {"superseded_by": null}}),
+            ),
+            (
+                "PATCH",
+                format!("/memories/{hash}"),
+                json!({"metadata": {"superseded_by": "b".repeat(64)}}),
+            ),
+        ];
+        for (method, uri, body) in cases {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(&uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{method} {uri}");
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            let err = v["error"].as_str().unwrap_or_default();
+            assert!(
+                err.contains("metadata.superseded_by"),
+                "{method} {uri}: {v}"
+            );
+            assert!(rx.try_recv().is_err(), "{method} {uri} reached the worker");
+        }
+    }
 
     const TEST_KEY: &str = "test-api-key";
 
