@@ -1265,9 +1265,11 @@ def judge_passes(
                 raise errors[0]
             done += len(chunk)
             projected = ledger.usd() / done * total
-            if done == len(chunk) and projected > max_usd * 1.1:
+            # 10 % headroom, so a run the projection admits does not trip the cap late
+            if done == len(chunk) and projected * 1.1 > max_usd:
                 raise RuntimeError(
-                    f"spend cap: {total} calls project to ${projected:.2f} > ${max_usd}"
+                    f"spend cap: {total} calls project to ${projected:.2f}, "
+                    f"too close to ${max_usd} (10 % headroom)"
                 )
         log(f"pass {k + 1}/{passes} done: spend ${ledger.usd():.2f}")
 

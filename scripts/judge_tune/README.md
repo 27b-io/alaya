@@ -120,8 +120,8 @@ as a supersession by the newer memory. The `contradiction` class has `n = 0`,
 that is unmeasured, while no pair carries the label.
 
 `--max-usd` is checked between chunks of 20 calls. The first chunk's cost is
-projected over the whole run, so a run the cap cannot cover stops after one
-chunk. An API error aborts the run once every call that returned is booked.
+projected over the whole run, so a run the cap cannot cover with 10 % headroom
+stops after one chunk. An API error aborts the run once every call that returned is booked.
 
 `--regime default` is the production request (no `thinking` parameter, so
 `claude-sonnet-5` runs adaptive thinking). `--regime thinking-off` adds

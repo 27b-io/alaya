@@ -235,6 +235,11 @@ def check_judge_passes() -> None:
             == tune.SPEND_CHECK_EVERY
             == ledger.rows[("judge", "claude-sonnet-5")][0]
         )
+        # A run projected just under the cap (cap = 1.05x the projection) is refused
+        # up front, not killed late.
+        calls = itertools.count()
+        votes, ledger, err = run(lambda x, n: verdict(tokens=(5_000, 0)), 1.35 * 1.05)
+        assert err and "project" in err, err
         # A run whose cost rises later still stops on the hard cap, at a chunk edge.
         calls = itertools.count()
         votes, ledger, err = run(
