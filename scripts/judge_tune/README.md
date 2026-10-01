@@ -93,19 +93,10 @@ rather than re-cutting.
 ## The fixture
 
 `contradiction_golden.json` holds hashes and labels only. Each pair records
-what an operator did with it apart from what the label rule says:
-
-| field | meaning |
-|---|---|
-| `action`, `action_survivor` | `superseded` and the memory the operator kept, or `none` |
-| `label` | `supersession`, `coexist`, `unrelated` or `contradiction`; what the Rust harness scores |
-| `sub_label` | `S`, `P` or `C` under the rule in `label_rule`; `null` when the pair has not been read under it, or is unrelated |
-| `survivor` | the memory that stays current; set only on `supersession` |
-| `tags` | `partial` (the newer memory corrects a side claim of the older one), `near-duplicate`, `newer-revoked` |
-| `source` | `operator`, `queue-read`, `agreed` or `adjudicated` (see the fixture's `fields`) |
-| `dispute` | present while a blind reading disagrees with the label; the pair stays out of the headline bars |
-
-`rule_version` and `label_rule` state the rule the labels follow.
+what an operator did with it (`action`, `action_survivor`) apart from what the
+label rule says (`label`, `sub_label`, `survivor`, `tags`, `source`). The
+fixture's own `fields`, `rule_version` and `label_rule` keys define them. The
+Rust harness reads `label`, `survivor` and `source` and ignores the rest.
 
 ## What eval reports
 
@@ -125,14 +116,19 @@ skips `dispute` pairs, and gives every rate a 95 % Wilson interval:
   abstention is a yield loss, never a correct non-supersession.
 
 Every headline is computed twice, with `partial` pairs counted as coexist and
-as a supersession by the newer memory. The `contradiction` class is reported
-as unmeasured while it has no labelled pairs.
+as a supersession by the newer memory. The `contradiction` class has `n = 0`,
+that is unmeasured, while no pair carries the label.
+
+`--max-usd` is checked between chunks of 20 calls. The first chunk's cost is
+projected over the whole run, so a run the cap cannot cover stops after one
+chunk. An API error aborts the run once every call that returned is booked.
 
 `--regime default` is the production request (no `thinking` parameter, so
 `claude-sonnet-5` runs adaptive thinking). `--regime thinking-off` adds
 `thinking: {"type": "disabled"}`. Neither sets `temperature`:
 `claude-sonnet-5` rejects any value but the default 1.0, with or without
 thinking, so a temperature-0 regime cannot be sent. The output records the
-exact request parameters. The unanimity rate is reported for the default
-regime only, as its variance diagnostic: a near-deterministic regime scores
-close to 100 % on it by construction, so it never compares regimes.
+exact request parameters. The unanimity rate (pairs whose passes all agree on
+a verdict) is reported for the default regime at k ≥ 2 only, as its variance
+diagnostic: a near-deterministic regime scores close to 100 % on it by
+construction, so it never compares regimes.

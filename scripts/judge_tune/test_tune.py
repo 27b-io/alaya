@@ -9,8 +9,12 @@ No network, no keys. Mirrors the unit tests in judge.rs so the Python port
 and the Rust stay in step.
 """
 
+import argparse
+import itertools
 import json
 import sys
+
+import anthropic
 
 import tune
 
@@ -173,12 +177,13 @@ def check_consensus_scoring() -> None:
     )
     assert ps["by_label"] == {"supersession": 2} and ps["recall_supersession"]["k"] == 2
     assert ps["false_supersede_rate"]["n"] == 0 and ps["yield"]["k"] == 2
-    assert pc["contradiction"].startswith("unmeasured")
+    assert pc["contradiction"]["n"] == 0 and pc["contradiction"]["rate"] is None
     # Wilson: 2/35 spans about 1.6 % to 18.6 %; 0/n has a lower bound of 0.
     lo, hi = tune.wilson(2, 35)
     assert abs(lo - 0.0158) < 5e-4 and abs(hi - 0.1858) < 5e-4, (lo, hi)
     assert tune.wilson(0, 110)[0] == 0.0 and tune.wilson(0, 0) is None
-    assert tune.unanimity([[sup, sup, sup], [sup, co, co]]) == tune.rate(1, 2)
+    decided = [tune.consensus(vs) for vs in ([sup] * 3, [sup, co, co], [unj] * 3)]
+    assert tune.unanimity(decided) == tune.rate(1, 3)
 
     # Regimes: default is the production request; neither sets temperature.
     assert "thinking" not in tune.request_params("claude-sonnet-5", "default")
@@ -186,51 +191,99 @@ def check_consensus_scoring() -> None:
     assert off["thinking"] == {"type": "disabled"} and "temperature" not in off
     assert tune.newer_memory(s_pair, {a: mem("x", 1.0), b: mem("y", 2.0)}) == b
 
-    # Spend cap: checked between chunks; the verdicts already paid for survive.
-    real = tune.judge_batch
-    try:
-        tune.judge_batch = lambda c, m, pr, mm, batch, regime: [
-            verdict(tokens=(250_000, 0)) for _ in batch
-        ]
-        pairs = [tune.Pair(i, a, b, "coexist", None, "agreed") for i in range(45)]
+    check_judge_passes()
+
+
+def check_judge_passes() -> None:
+    """Spend cap, cost projection and API errors in `judge_passes`."""
+    hashes = [f"{i:064x}" for i in range(45)]
+    memories = {h: mem(h, 0.0) for h in hashes}
+    pairs = [
+        tune.Pair(i, h, h, "coexist", None, "agreed") for i, h in enumerate(hashes)
+    ]
+    calls = itertools.count()
+
+    def run(cost, max_usd: float) -> tuple[list, tune.Ledger, str | None]:
         votes: list = [[] for _ in pairs]
         ledger = tune.Ledger()
+        tune.judge_pair = lambda c, m, pr, x, y, regime: cost(x, next(calls))
         try:
             tune.judge_passes(
                 None,
                 "claude-sonnet-5",
                 "p",
-                {},
+                memories,
                 pairs,
                 3,
                 "default",
                 ledger,
-                15.0,
+                max_usd,
                 votes,
             )
         except RuntimeError as e:
-            assert "spend cap" in str(e), e
-        else:
-            raise AssertionError("spend cap must abort")
+            return votes, ledger, str(e)
+        return votes, ledger, None
+
+    real = tune.judge_pair
+    try:
+        # A run the cap cannot cover stops after its first chunk ($0.50 a call,
+        # 135 calls, $15 cap).
+        votes, ledger, err = run(lambda x, n: verdict(tokens=(250_000, 0)), 15.0)
+        assert err and "project" in err, err
         assert (
-            sum(map(len, votes)) == 2 * tune.SPEND_CHECK_EVERY and ledger.usd() >= 15.0
+            sum(map(len, votes))
+            == tune.SPEND_CHECK_EVERY
+            == ledger.rows[("judge", "claude-sonnet-5")][0]
         )
-        votes = [[] for _ in pairs]
-        tune.judge_passes(
-            None,
-            "claude-sonnet-5",
-            "p",
-            {},
-            pairs,
-            3,
-            "default",
-            tune.Ledger(),
-            1e9,
-            votes,
+        # A run whose cost rises later still stops on the hard cap, at a chunk edge.
+        calls = itertools.count()
+        votes, ledger, err = run(
+            lambda x, n: verdict(tokens=(5_000 if n < 20 else 500_000, 0)), 15.0
         )
-        assert all(len(vs) == 3 for vs in votes)
+        assert err and ">= $15.0" in err and sum(map(len, votes)) == 40, err
+
+        # An API error is re-raised only after every call that returned is booked.
+        def flaky(x, n):
+            if x["content"] == hashes[7]:
+                raise anthropic.APIConnectionError(request=None)
+            return verdict(tokens=(1_000, 10))
+
+        votes: list = [[] for _ in pairs]
+        ledger = tune.Ledger()
+        tune.judge_pair = lambda c, m, pr, x, y, regime: flaky(x, 0)
+        try:
+            tune.judge_passes(
+                None,
+                "claude-sonnet-5",
+                "p",
+                memories,
+                pairs,
+                3,
+                "default",
+                ledger,
+                1e9,
+                votes,
+            )
+        except anthropic.APIConnectionError:
+            pass
+        else:
+            raise AssertionError("an API error must abort the run")
+        assert sum(map(len, votes)) == tune.SPEND_CHECK_EVERY - 1 and not votes[7]
+        assert (
+            ledger.rows[("judge", "claude-sonnet-5")][0] == tune.SPEND_CHECK_EVERY - 1
+        )
+        # Uncapped, every pair gets every pass.
+        votes, _, err = run(lambda x, n: verdict(), 1e9)
+        assert err is None and all(len(vs) == 3 for vs in votes)
     finally:
-        tune.judge_batch = real
+        tune.judge_pair = real
+    assert tune.positive_int("3") == 3
+    try:
+        tune.positive_int("0")
+    except argparse.ArgumentTypeError:
+        pass
+    else:
+        raise AssertionError("--passes 0 must be rejected")
 
 
 def main() -> None:
@@ -315,7 +368,6 @@ def main() -> None:
         tune.metrics([(pair, ok), (co, verdict())], "claude-sonnet-5")["meets_bar"]
         is True
     )
-    assert len(tune.disagreements(rows)) == 1
 
     # feedback names the label, the source and the rule; never the memory.
     fb = tune.feedback(

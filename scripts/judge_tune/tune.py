@@ -529,34 +529,19 @@ def metrics(rows: list[tuple[Pair, dict]], model: str) -> dict:
     }
 
 
-def disagreements(rows: list[tuple[Pair, dict]]) -> list[dict]:
-    return [
-        {
-            "a": p.a,
-            "b": p.b,
-            "label": p.label,
-            "label_survivor": p.survivor_letter(),
-            "verdict": v["verdict"],
-            "survivor": v["survivor"],
-            "confidence": v["confidence"],
-            "reason": v["reason"],
-        }
-        for p, v in rows
-        if score(p, v) < 1.0
-    ]
-
-
 # ── k-pass consensus and interval scoring (eval) ─────────────────────────────
 
+Z95 = 1.96
 
-def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float] | None:
+
+def wilson(k: int, n: int) -> tuple[float, float] | None:
     """95 % Wilson score interval for k successes in n trials."""
     if n == 0:
         return None
     p = k / n
-    d = 1 + z * z / n
-    centre = (p + z * z / (2 * n)) / d
-    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    d = 1 + Z95 * Z95 / n
+    centre = (p + Z95 * Z95 / (2 * n)) / d
+    half = Z95 * math.sqrt(p * (1 - p) / n + Z95 * Z95 / (4 * n * n)) / d
     return (max(0.0, centre - half), min(1.0, centre + half))
 
 
@@ -583,71 +568,54 @@ def consensus(votes: list[dict]) -> dict:
     return {"verdict": verdict, "survivor": survivor}
 
 
-def as_supersession(pair: Pair, newer: str) -> Pair:
-    """A `partial` coexist pair read the other way: the newer memory corrects a
-    claim in the older one, so it is the survivor."""
-    return dataclasses.replace(pair, label="supersession", survivor=newer)
-
-
 def consensus_metrics(rows: list[tuple[Pair, dict]]) -> dict:
-    """Headline rates over consensus verdicts, each with a 95 % Wilson interval.
-
-    - false_supersede_rate: coexist pairs given a supersession verdict, plus
-      supersession pairs given the wrong survivor (that write hides the memory
-      that should stay), over coexist pairs plus those wrong-survivor pairs.
-    - coexist_to_conflict: the coexist bar, as in the Rust harness.
-    - recall_supersession: supersession pairs given a supersession verdict;
-      an abstention is a miss.
-    - yield: pairs the consensus resolves correctly (class, and survivor on a
-      supersession), over all pairs; an abstention is a loss.
-    """
+    """Headline rates over consensus verdicts; definitions in README.md."""
     by_label: dict[str, list[tuple[Pair, dict]]] = defaultdict(list)
     for p, v in rows:
         by_label[p.label].append((p, v))
-    counts = {
-        k: len(v) for k, v in sorted(by_label.items())
-    }  # before reads add empty keys
     coexist, sup = by_label["coexist"], by_label["supersession"]
+    unrelated, contradiction = by_label["unrelated"], by_label["contradiction"]
     coexist_sup = sum(1 for _, v in coexist if v["verdict"] == "supersession")
-    coexist_conflict = sum(1 for _, v in coexist if v["verdict"] in CONFLICT)
-    unrelated_conflict = sum(
-        1 for _, v in by_label["unrelated"] if v["verdict"] in CONFLICT
-    )
     called = [(p, v) for p, v in sup if v["verdict"] == "supersession"]
     wrong = sum(1 for p, v in called if predicted_survivor(p, v) != p.survivor)
     predicted = sum(1 for _, v in rows if v["verdict"] == "supersession")
+
+    def escalated(group: list[tuple[Pair, dict]]) -> dict:
+        return rate(sum(1 for _, v in group if v["verdict"] in CONFLICT), len(group))
+
     return {
         "pairs": len(rows),
-        "by_label": counts,
+        "by_label": dict(sorted(Counter(p.label for p, _ in rows).items())),
         "abstained": sum(1 for _, v in rows if v["verdict"] == ABSTAIN),
         "false_supersede_rate": rate(coexist_sup + wrong, len(coexist) + wrong),
         "false_supersedes": {
             "coexist_called_supersession": coexist_sup,
             "wrong_survivor": wrong,
         },
-        "coexist_to_conflict": rate(coexist_conflict, len(coexist)),
-        "unrelated_to_conflict": rate(unrelated_conflict, len(by_label["unrelated"])),
+        "coexist_to_conflict": escalated(coexist),
+        "unrelated_to_conflict": escalated(unrelated),
         "recall_supersession": rate(len(called), len(sup)),
         "precision_supersession": rate(len(called), predicted),
         "survivor_accuracy": rate(len(called) - wrong, len(called)),
         "yield": rate(int(sum(score(p, v) for p, v in rows)), len(rows)),
-        "contradiction": "unmeasured: no labelled pairs"
-        if not by_label["contradiction"]
-        else rate(
-            sum(
-                1
-                for _, v in by_label["contradiction"]
-                if v["verdict"] == "contradiction"
-            ),
-            len(by_label["contradiction"]),
+        # n = 0 while no pair carries the label: the class is unmeasured.
+        "contradiction": rate(
+            sum(1 for _, v in contradiction if v["verdict"] == "contradiction"),
+            len(contradiction),
         ),
     }
 
 
 def both_ways(rows: list[tuple[Pair, dict]], newer: dict[int, str]) -> dict:
-    """Headline metrics with `partial` pairs counted as coexist, then as supersession."""
+    """Headline metrics with `partial` pairs counted as coexist, then as a
+    supersession by the newer memory (it corrects a claim in the older one)."""
     flipped = [
-        (as_supersession(p, newer[p.id]) if "partial" in p.tags else p, v)
+        (
+            dataclasses.replace(p, label="supersession", survivor=newer[p.id])
+            if "partial" in p.tags
+            else p,
+            v,
+        )
         for p, v in rows
     ]
     return {
@@ -656,14 +624,14 @@ def both_ways(rows: list[tuple[Pair, dict]], newer: dict[int, str]) -> dict:
     }
 
 
-def unanimity(votes: list[list[dict]]) -> dict:
-    """Share of pairs whose passes all agree: the default arm's variance diagnostic.
+def unanimity(decided: list[dict]) -> dict:
+    """Share of pairs whose passes all agreed on a verdict: the default arm's
+    variance diagnostic.
 
     Never a comparison metric across regimes: a near-deterministic regime
     scores ~100 % on it by construction.
     """
-    same = sum(1 for vs in votes if len({vote_key(v) for v in vs}) == 1)
-    return rate(same, len(votes))
+    return rate(sum(1 for c in decided if c["verdict"] != ABSTAIN), len(decided))
 
 
 # ── Feedback for the reflection model ────────────────────────────────────────
@@ -1259,11 +1227,14 @@ def judge_passes(
 ) -> None:
     """Fill `votes[pair]` with `passes` independent verdicts per pair.
 
-    The caller owns `votes`, so verdicts already paid for survive an abort.
-    Spend is checked between chunks of SPEND_CHECK_EVERY calls, so the cap is
-    overshot by at most one chunk. Hitting it raises: a partial pass cannot be
-    scored.
+    The caller owns `votes`, so verdicts already paid for survive an abort:
+    every call that returned is booked before an API error is re-raised. Spend
+    is checked between chunks of SPEND_CHECK_EVERY calls, so the cap is
+    overshot by at most one chunk, and the first chunk's cost is projected over
+    the whole run, so a run the cap cannot cover stops after one chunk rather
+    than mid-pass with nothing scorable.
     """
+    total, done = passes * len(pairs), 0
     for k in range(passes):
         for i in range(0, len(pairs), SPEND_CHECK_EVERY):
             if ledger.usd() >= max_usd:
@@ -1271,11 +1242,33 @@ def judge_passes(
                     f"spend cap: ${ledger.usd():.2f} >= ${max_usd} in pass {k + 1}"
                 )
             chunk = pairs[i : i + SPEND_CHECK_EVERY]
-            for j, v in enumerate(
-                judge_batch(client, model, prompt, memories, chunk, regime)
-            ):
-                ledger.add("judge", model, *v["tokens"])
-                votes[i + j].append(v)
+            with ThreadPoolExecutor(CONCURRENCY) as pool:
+                futures = [
+                    pool.submit(
+                        judge_pair,
+                        client,
+                        model,
+                        prompt,
+                        memories[p.a],
+                        memories[p.b],
+                        regime,
+                    )
+                    for p in chunk
+                ]
+            errors = [f.exception() for f in futures if f.exception() is not None]
+            for j, f in enumerate(futures):
+                if f.exception() is None:
+                    v = f.result()
+                    ledger.add("judge", model, *v["tokens"])
+                    votes[i + j].append(v)
+            if errors:
+                raise errors[0]
+            done += len(chunk)
+            projected = ledger.usd() / done * total
+            if done == len(chunk) and projected > max_usd * 1.1:
+                raise RuntimeError(
+                    f"spend cap: {total} calls project to ${projected:.2f} > ${max_usd}"
+                )
         log(f"pass {k + 1}/{passes} done: spend ${ledger.usd():.2f}")
 
 
@@ -1327,8 +1320,6 @@ def cmd_eval(args) -> None:
     out = HERE / "runs" / args.run
     out.mkdir(parents=True, exist_ok=True)
     stem = f"eval_{args.pairs}_{args.regime}_k{args.passes}_{sha(prompt)[:8]}"
-    params = request_params(model, args.regime)
-    params["output_config"] = "json_schema: VERDICT_SCHEMA"  # the schema is in tune.py
     log(
         f"eval: {len(chosen)} pairs x {args.passes} passes, regime={args.regime}, max_usd={args.max_usd}"
     )
@@ -1367,7 +1358,7 @@ def cmd_eval(args) -> None:
         "pairs": args.pairs,
         "regime": args.regime,
         "passes": args.passes,
-        "request_params": params,
+        "request_params": request_params(model, args.regime),
         "prompt_sha256": sha(prompt),
         "fixture_sha256": fixture_sha(),
         "hygiene_problems": problems,
@@ -1375,8 +1366,9 @@ def cmd_eval(args) -> None:
             "excluded_disputed": len(chosen) - len(headline),
             **both_ways(headline, newer),
         },
-        # The default arm's variance diagnostic only; never compared across arms.
-        "unanimity": unanimity(votes) if args.regime == "default" else None,
+        "unanimity": unanimity(decided)
+        if args.regime == "default" and args.passes > 1
+        else None,
         "per_pass": [
             metrics([(p, vs[k]) for p, vs in zip(chosen, votes)], model)
             for k in range(args.passes)
@@ -1393,6 +1385,13 @@ def cmd_eval(args) -> None:
         )
     )
     print(f"disagreements: {len(result['disagreements'])} (see {path})")
+
+
+def positive_int(text: str) -> int:
+    n = int(text)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {n}")
+    return n
 
 
 def main() -> None:
@@ -1417,7 +1416,10 @@ def main() -> None:
     e.add_argument("--pairs", choices=("val", "train", "all"), default="val")
     e.add_argument("--run", default="eval", help="outputs go under runs/<name>/")
     e.add_argument(
-        "--passes", type=int, default=1, help="verdicts per pair; any dissent abstains"
+        "--passes",
+        type=positive_int,
+        default=1,
+        help="verdicts per pair; any dissent abstains",
     )
     e.add_argument("--regime", choices=sorted(REGIMES), default="default")
     e.add_argument("--max-usd", type=float, default=15.0)
