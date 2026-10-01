@@ -11,9 +11,22 @@ use crate::{Provider, SummaryProvider};
 const SYSTEM_PROMPT: &str = "Summarize the following in one concise sentence of approximately 50 tokens. \
      Return only the summary, no preamble.";
 
+/// Output budget per wire. The Anthropic wire keeps the 100 it sent before
+/// the provider switch (LAB-6877 AC-7). A reasoning model on the OpenAI wire
+/// spends `max_completion_tokens` on hidden reasoning first, and 100 can
+/// leave no room for the summary (`finish_reason: "length"`, no content).
+/// The cap is an upper bound, not a spend: a ~50-token summary costs the same.
+const fn max_output_tokens(provider: Provider) -> u32 {
+    match provider {
+        Provider::Anthropic => 100,
+        Provider::OpenAi => 1024,
+    }
+}
+
 pub struct SummaryClient {
     transport: MessagesTransport,
     model: String,
+    max_tokens: u32,
 }
 
 impl SummaryClient {
@@ -34,6 +47,7 @@ impl SummaryClient {
                 DEFAULT_REQUEST_TIMEOUT,
             )?,
             model,
+            max_tokens: max_output_tokens(provider),
         })
     }
 }
@@ -46,7 +60,7 @@ impl SummaryProvider for SummaryClient {
             model: &self.model,
             system: SYSTEM_PROMPT,
             user: truncate_chars(content),
-            max_tokens: 100,
+            max_tokens: self.max_tokens,
             schema: None,
         };
 
@@ -55,9 +69,10 @@ impl SummaryProvider for SummaryClient {
             .complete(&prompt, AlayaError::Summary)
             .await?;
 
+        let stop = parsed.stop_reason.unwrap_or_default();
         parsed
             .text
-            .ok_or_else(|| AlayaError::Summary("empty completion".into()))
+            .ok_or_else(|| AlayaError::Summary(format!("empty completion (stop_reason={stop:?})")))
     }
 }
 
@@ -80,6 +95,14 @@ mod tests {
         let msg = err.to_string();
         assert!(matches!(err, AlayaError::Config(_)), "{msg}");
         assert!(!msg.contains("abc"), "error echoed the key: {msg}");
+    }
+
+    /// LAB-6877 AC-7: the default wire's summary budget is what it was before
+    /// the provider switch; only the openai wire gets reasoning headroom.
+    #[test]
+    fn budget_is_raised_on_the_openai_wire_only() {
+        assert_eq!(max_output_tokens(Provider::Anthropic), 100);
+        assert_eq!(max_output_tokens(Provider::OpenAi), 1024);
     }
 
     /// LAB-6877 AC-5: the openai wire carries the same prompt as system and
@@ -109,7 +132,7 @@ mod tests {
                 .and(header("authorization", "Bearer test-key"))
                 .and(body_partial_json(json!({
                     "model": "test-model",
-                    "max_completion_tokens": 100,
+                    "max_completion_tokens": 1024,
                     "messages": [
                         {"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user", "content": "the memory"},
@@ -148,6 +171,22 @@ mod tests {
                 .await;
             let e = client(&server).summarize("x").await.unwrap_err();
             assert!(matches!(e, AlayaError::Summary(_)), "{e:?}");
+        }
+
+        /// Reasoning ate the budget: no content, `finish_reason: "length"`.
+        /// The stop reason must reach the error, as it does for the judge.
+        #[tokio::test]
+        async fn empty_completion_names_the_stop_reason() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "choices": [{"message": {"content": null}, "finish_reason": "length"}]
+                })))
+                .mount(&server)
+                .await;
+            let e = client(&server).summarize("x").await.unwrap_err();
+            assert!(matches!(e, AlayaError::Summary(_)), "{e:?}");
+            assert!(e.to_string().contains(r#"stop_reason="length""#), "{e}");
         }
     }
 }
