@@ -1588,6 +1588,7 @@ impl MemoryService {
         if !alaya_types::memory::validate_content_hash(content_hash) {
             return Err(AlayaError::Validation("invalid content_hash format".into()));
         }
+        patch.validate().map_err(AlayaError::Validation)?;
 
         let mem = self.vectors.patch_memory(content_hash, patch).await?;
 
@@ -4437,6 +4438,52 @@ mod tests {
             "got {err:?}"
         );
         assert!(stored.borrow().is_empty(), "nothing may be stored");
+    }
+
+    /// The core PATCH entry point refuses the marker too, so a caller that
+    /// skips the REST handler's check cannot un-supersede (LAB-6891).
+    #[tokio::test(flavor = "current_thread")]
+    async fn patch_refuses_caller_supplied_superseded_by() {
+        let stored = Rc::new(RefCell::new(HashMap::new()));
+        let svc = MemoryService::with_clock(
+            Box::new(MockVectorsPersisting {
+                stored: stored.clone(),
+                raw_only: Default::default(),
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            mock_clock,
+        );
+        let hash = generate_content_hash("live fact");
+        svc.store_memory(StoreParams {
+            content: "live fact".into(),
+            tags: None,
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: None,
+        })
+        .await
+        .expect("store");
+
+        let patch = PatchMemoryRequest {
+            metadata: Some(HashMap::from([(
+                "superseded_by".to_string(),
+                serde_json::Value::Null,
+            )])),
+            ..Default::default()
+        };
+        let err = svc
+            .patch_memory(&hash, &patch)
+            .await
+            .expect_err("a caller-set superseded_by must be refused");
+        assert!(
+            matches!(&err, AlayaError::Validation(m) if m.contains("metadata.superseded_by")),
+            "got {err:?}"
+        );
     }
 
     /// A read-only principal may add memories but never reshape an existing
