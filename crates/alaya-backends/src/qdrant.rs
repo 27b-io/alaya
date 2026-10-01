@@ -21,7 +21,7 @@ use alaya_types::{
     search::PayloadFilter,
 };
 
-use crate::{ClearSupersession, StoreMode, SupersessionReversal, VectorStorage};
+use crate::{ReversalOutcome, ReversalRecord, StoreMode, VectorStorage};
 
 // ─── Client ──────────────────────────────────────────────────────────────────
 
@@ -903,21 +903,21 @@ fn memory_to_payload(memory: &Memory) -> Value {
 }
 
 /// Payload key: the reversed supersessions of a memory, oldest first (see
-/// `VectorStorage::clear_superseded_by`). Server-maintained.
+/// `VectorStorage::reverse_supersession`). Server-maintained.
 const SUPERSESSION_LOG: &str = "supersession_log";
 
 /// The whole payload that reversing a supersession leaves on a point that
 /// held `prev`: no marker, no `supersession_reason`, and one more
 /// `supersession_log` entry recording both. Also returns the reason removed.
-fn unsupersede_payload(prev: &Value, reversal: &SupersessionReversal) -> (Value, Option<Value>) {
-    let mut next = prev.clone();
-    let marker = next
+fn unsupersede_payload(
+    prev: &serde_json::Map<String, Value>,
+    reversal: &ReversalRecord,
+) -> (Value, Option<Value>) {
+    let mut obj = prev.clone();
+    let marker = obj
         .get_mut("metadata")
         .and_then(Value::as_object_mut)
         .and_then(|m| m.remove("superseded_by"));
-    let Some(obj) = next.as_object_mut() else {
-        return (next, None);
-    };
     let reason = obj.remove("supersession_reason");
     // An audit trail is never dropped, even one in a shape no writer makes.
     let mut log = match obj.remove(SUPERSESSION_LOG) {
@@ -933,7 +933,7 @@ fn unsupersede_payload(prev: &Value, reversal: &SupersessionReversal) -> (Value,
         "reason": reversal.reason,
     }));
     obj.insert(SUPERSESSION_LOG.into(), Value::Array(log));
-    (next, reason)
+    (Value::Object(obj), reason)
 }
 
 /// Carry the server-maintained fields of `prev`, the stored payload, over the
@@ -950,11 +950,18 @@ fn carry_over(payload: &mut Value, prev: &Value) {
             payload[key] = v.clone();
         }
     }
-    // The supersession marker is written by mark_superseded, never by a store
-    // caller, so it is server-maintained too: a re-store must not resurrect a
-    // superseded memory (alaya-core's is_superseded reads exactly this key).
-    if let Some(sb) = prev.pointer("/metadata/superseded_by") {
-        payload["metadata"]["superseded_by"] = sb.clone();
+    // The supersession marker is written by mark_superseded and removed by
+    // reverse_supersession, never by a store caller, so on a re-store it is
+    // the stored one, present or absent: a re-store neither resurrects a
+    // superseded memory (alaya-core's is_superseded reads exactly this key)
+    // nor re-hides a reversed one from a caller's stale copy of its metadata.
+    match prev.pointer("/metadata/superseded_by") {
+        Some(sb) => payload["metadata"]["superseded_by"] = sb.clone(),
+        None => {
+            if let Some(md) = payload.get_mut("metadata").and_then(Value::as_object_mut) {
+                md.remove("superseded_by");
+            }
+        }
     }
     // summary_embedding is derived server-side from the summary text. Keep it
     // only while that text is unchanged, so a re-store neither drops it
@@ -1226,12 +1233,12 @@ impl VectorStorage for QdrantClient {
     }
 
     #[tracing::instrument(skip(self, expected, reversal), fields(hash = %content_hash))]
-    async fn clear_superseded_by(
+    async fn reverse_supersession(
         &self,
         content_hash: &str,
         expected: &Value,
-        reversal: &SupersessionReversal,
-    ) -> Result<ClearSupersession> {
+        reversal: &ReversalRecord,
+    ) -> Result<ReversalOutcome> {
         let point_id = hash_to_uuid(content_hash)?;
         let not_found = || AlayaError::NotFound(format!("memory {content_hash} not found"));
 
@@ -1252,9 +1259,9 @@ impl VectorStorage for QdrantClient {
                     let marker = prev.pointer("/metadata/superseded_by").cloned();
                     let take = marker.as_ref() == Some(expected);
                     *found.borrow_mut() = marker;
-                    if !take {
+                    let Some(prev) = prev.as_object().filter(|_| take) else {
                         return Ok(None);
-                    }
+                    };
                     let (next, reason) = unsupersede_payload(prev, reversal);
                     *removed.borrow_mut() = reason;
                     Ok(Some(next))
@@ -1262,12 +1269,12 @@ impl VectorStorage for QdrantClient {
             )
             .await?;
         match outcome.remove(&point_id) {
-            Some(Update::Landed { .. }) => Ok(ClearSupersession::Cleared {
+            Some(Update::Landed { .. }) => Ok(ReversalOutcome::Cleared {
                 supersession_reason: removed.take(),
             }),
             Some(Update::Skipped) => Ok(match found.take() {
-                None => ClearSupersession::NotSuperseded,
-                Some(other) => ClearSupersession::SupersededByOther(other),
+                None => ReversalOutcome::NotSuperseded,
+                Some(other) => ReversalOutcome::SupersededByOther(other),
             }),
             Some(Update::Unconfirmed(why)) => Err(AlayaError::Storage(format!(
                 "unsupersede of {content_hash}: {why}"

@@ -27,18 +27,18 @@ pub enum StoreMode {
 }
 
 /// Who reversed a supersession, when, and why (LAB-6876). Recorded in the
-/// memory's `supersession_log` by `VectorStorage::clear_superseded_by`.
+/// memory's `supersession_log` by `VectorStorage::reverse_supersession`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SupersessionReversal {
+pub struct ReversalRecord {
     pub at: f64,
     /// Who reversed it, verbatim (`operator:mcp`, `operator:console`).
     pub via: String,
     pub reason: String,
 }
 
-/// What `VectorStorage::clear_superseded_by` found on the memory.
+/// What `VectorStorage::reverse_supersession` found on the memory.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ClearSupersession {
+pub enum ReversalOutcome {
     /// The marker named the expected survivor and is gone, together with
     /// `supersession_reason` (the reason removed, if there was one).
     Cleared {
@@ -86,7 +86,10 @@ pub trait VectorStorage {
     /// `supersession_reason`, `supersession_log`, `metadata.superseded_by`, and
     /// `summary_embedding` for as long as `summary` is unchanged — so a
     /// re-store never zeroes ranking inputs, resurrects a superseded memory,
-    /// or silently drops derived retrieval state (alaya#86). Every other
+    /// or silently drops derived retrieval state (alaya#86). The marker is
+    /// the stored one even when absent: a caller's `metadata.superseded_by`
+    /// is dropped on a re-store, so a stale copy cannot re-hide a reversed
+    /// memory (LAB-6876). Every other
     /// payload field is written from `memory` as given and fields absent on
     /// `memory` are removed; `updated_at` is therefore whatever the caller
     /// set. The write is conditional on the record the carry-over read (see
@@ -129,13 +132,14 @@ pub trait VectorStorage {
     /// marker still equals `expected`. Anything else leaves the memory
     /// untouched and says what it found. `AlayaError::NotFound` when the
     /// memory does not exist. The log is server-maintained like the marker:
-    /// `store` carries it over and no caller field writes it.
-    async fn clear_superseded_by(
+    /// `store` carries it over and no caller field writes it (`patch_memory`
+    /// refuses `metadata.superseded_by` too).
+    async fn reverse_supersession(
         &self,
         content_hash: &str,
         expected: &serde_json::Value,
-        reversal: &SupersessionReversal,
-    ) -> Result<ClearSupersession>;
+        reversal: &ReversalRecord,
+    ) -> Result<ReversalOutcome>;
 
     /// Patch mutable fields on an existing memory.
     ///
@@ -300,14 +304,26 @@ pub trait GraphService {
         verdict: &EdgeVerdict,
     ) -> Result<bool>;
     /// Stamp (`Some`) or clear (`None`) the operator's resolution on the
-    /// existing `src -> dst` CONTRADICTS edge (LAB-3885). The only write
-    /// path to `e.resolution*`. Never creates or deletes an edge; returns
-    /// whether one matched.
+    /// existing `src -> dst` CONTRADICTS edge (LAB-3885). With
+    /// `settle_contradiction`, the only write path to `e.resolution*`.
+    /// Never creates or deletes an edge; returns whether one matched.
     async fn set_contradiction_resolution(
         &self,
         src: &str,
         dst: &str,
         resolution: Option<Resolution>,
+        resolved_via: &str,
+        resolved_at: f64,
+    ) -> Result<bool>;
+    /// Stamp `keep_both` on the existing `src -> dst` CONTRADICTS edge only
+    /// if it carries no resolution yet; an existing stamp, who and when
+    /// included, is kept. Returns whether it stamped. Settles the pair of a
+    /// reversed supersession (LAB-6876) — the one other write path to
+    /// `e.resolution*`, through the same bridge route.
+    async fn settle_contradiction(
+        &self,
+        src: &str,
+        dst: &str,
         resolved_via: &str,
         resolved_at: f64,
     ) -> Result<bool>;

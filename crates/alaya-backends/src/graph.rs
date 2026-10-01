@@ -271,6 +271,8 @@ struct SetResolutionReq<'a> {
     resolution: Option<Resolution>,
     resolved_via: &'a str,
     resolved_at: f64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    if_unresolved: bool,
 }
 
 #[derive(Deserialize)]
@@ -593,10 +595,37 @@ impl GraphService for GraphHttpClient {
                 resolution,
                 resolved_via,
                 resolved_at,
+                if_unresolved: false,
             })
             .send()
             .await
             .map_err(|e| AlayaError::Graph(e.to_string()))?;
+
+        let body: UpdatedResp = handle_response(resp).await?;
+        Ok(body.updated)
+    }
+
+    async fn settle_contradiction(
+        &self,
+        src: &str,
+        dst: &str,
+        resolved_via: &str,
+        resolved_at: f64,
+    ) -> Result<bool> {
+        let resp = self
+            .client
+            .post(format!("{}/contradictions/resolution", self.base_url))
+            .json(&SetResolutionReq {
+                source: src,
+                target: dst,
+                resolution: Some(Resolution::KeepBoth),
+                resolved_via,
+                resolved_at,
+                if_unresolved: true,
+            })
+            .send()
+            .await
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         let body: UpdatedResp = handle_response(resp).await?;
         Ok(body.updated)

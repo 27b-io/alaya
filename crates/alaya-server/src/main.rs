@@ -758,7 +758,8 @@ pub(crate) enum CmdInner {
         reply: oneshot::Sender<Value>,
     },
     /// Stamp (`Some`) or clear (`None`) the operator's resolution on a
-    /// CONTRADICTS pair (LAB-3885). The only write path to `e.resolution*`.
+    /// CONTRADICTS pair (LAB-3885). With `Unsupersede`, the only writer of
+    /// `e.resolution*`.
     ResolveContradiction {
         memory_a_hash: String,
         memory_b_hash: String,
@@ -4501,12 +4502,12 @@ mod wedge_tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for HangVectors {
-        async fn clear_superseded_by(
+        async fn reverse_supersession(
             &self,
             _h: &str,
             _e: &serde_json::Value,
-            _r: &alaya_backends::SupersessionReversal,
-        ) -> Result<alaya_backends::ClearSupersession> {
+            _r: &alaya_backends::ReversalRecord,
+        ) -> Result<alaya_backends::ReversalOutcome> {
             unimplemented!()
         }
         async fn store(&self, _memory: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
@@ -4627,6 +4628,15 @@ mod wedge_tests {
 
     #[async_trait(?Send)]
     impl GraphService for StubGraph {
+        async fn settle_contradiction(
+            &self,
+            _s: &str,
+            _d: &str,
+            _v: &str,
+            _t: f64,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
         async fn delete_incoming_system_edges(
             &self,
             _d: &str,

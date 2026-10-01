@@ -369,6 +369,33 @@ pub fn set_contradiction_resolution(
     )
 }
 
+/// Stamp `keep_both` on an existing `src -> dst` CONTRADICTS edge that has no
+/// resolution yet; one that has one keeps it, who and when included. Settles
+/// the pair of a reversed supersession (LAB-6876) without overwriting an
+/// operator's earlier call. MATCH-only, like `set_contradiction_resolution`.
+pub fn settle_contradiction(
+    src: &str,
+    dst: &str,
+    resolved_via: &str,
+    resolved_at: f64,
+) -> CypherQuery {
+    let q = "MATCH (a:Memory {content_hash: $src})-[e:CONTRADICTS]->(b:Memory {content_hash: $dst}) \
+             WHERE e.resolution IS NULL \
+             SET e.resolution = $resolution, e.resolved_at = $ts, e.resolved_via = $via \
+             RETURN count(e)";
+    (
+        q.to_string(),
+        params(&[
+            ("src", json!(src)),
+            ("dst", json!(dst)),
+            ("resolution", json!(Resolution::KeepBoth.as_str())),
+            ("via", json!(resolved_via)),
+            ("ts", json!(resolved_at)),
+        ]),
+        false,
+    )
+}
+
 /// Count `src -> dst` CONTRADICTS edges that carry a judge verdict or an
 /// operator resolution (LAB-3885 AC-6). `POST /edges/delete` refuses such
 /// an edge: it is the queue item and its audit trail, so it is resolved
@@ -733,6 +760,18 @@ mod tests {
             "who cleared is not recorded: the stamp is gone"
         );
         assert_eq!(p["ts"], Value::Null);
+    }
+
+    #[test]
+    fn settle_contradiction_stamps_keep_both_only_where_unresolved() {
+        let (q, p, ro) = settle_contradiction("a", "b", "unsupersede", 7.0);
+        assert!(q.starts_with("MATCH (a:Memory {content_hash: $src})-[e:CONTRADICTS]->"));
+        assert!(q.contains("WHERE e.resolution IS NULL SET e.resolution = $resolution"));
+        assert!(!q.contains("MERGE") && !q.contains("CREATE"));
+        assert_eq!(p["resolution"], json!("keep_both"));
+        assert_eq!(p["via"], json!("unsupersede"));
+        assert_eq!(p["ts"], json!(7.0));
+        assert!(!ro);
     }
 
     #[test]

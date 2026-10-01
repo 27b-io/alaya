@@ -22,7 +22,7 @@
 use std::sync::{Arc, Mutex};
 
 use alaya_backends::{
-    ClearSupersession, StoreMode, SupersessionReversal, VectorStorage, qdrant::QdrantClient,
+    ReversalOutcome, ReversalRecord, StoreMode, VectorStorage, qdrant::QdrantClient,
 };
 use alaya_types::{AlayaError, memory::Memory, memory::MetadataUpdate};
 use serde_json::{Value, json};
@@ -517,8 +517,8 @@ async fn insert_only_store_that_loses_the_insert_race_writes_nothing() {
 
 // ─── Reversing a supersession (LAB-6876) ────────────────────────────────────
 
-fn reversal() -> SupersessionReversal {
-    SupersessionReversal {
+fn reversal() -> ReversalRecord {
+    ReversalRecord {
         at: 2000.0,
         via: "operator:test".into(),
         reason: "wrong merge".into(),
@@ -582,12 +582,12 @@ async fn supersede_then_unsupersede_round_trips_the_marker_every_read_sees() {
     assert_eq!(marker_of(&searched(hits)), Some(&json!(survivor)));
 
     let outcome = client
-        .clear_superseded_by(&hash, &json!(survivor), &reversal())
+        .reverse_supersession(&hash, &json!(survivor), &reversal())
         .await
         .unwrap();
     assert_eq!(
         outcome,
-        ClearSupersession::Cleared {
+        ReversalOutcome::Cleared {
             supersession_reason: Some(json!("merged"))
         }
     );
@@ -622,10 +622,10 @@ async fn supersede_then_unsupersede_round_trips_the_marker_every_read_sees() {
     assert!(p["metadata"].get("superseded_by").is_none(), "{p}");
 
     let again = client
-        .clear_superseded_by(&hash, &json!(survivor), &reversal())
+        .reverse_supersession(&hash, &json!(survivor), &reversal())
         .await
         .unwrap();
-    assert_eq!(again, ClearSupersession::NotSuperseded);
+    assert_eq!(again, ReversalOutcome::NotSuperseded);
     coll.cleanup().await;
 }
 
@@ -641,7 +641,7 @@ async fn unsupersede_racing_a_re_supersede_stands_down() {
 
     let prefix = format!("PUT /collections/{}/points/payload?", coll.name);
     let (a, b, overwrites) = race_on(&coll, &url, prefix, ("supersede", &hash, ""), async |a| {
-        a.clear_superseded_by(&hash, &json!(first), &reversal())
+        a.reverse_supersession(&hash, &json!(first), &reversal())
             .await
     })
     .await;
@@ -649,7 +649,7 @@ async fn unsupersede_racing_a_re_supersede_stands_down() {
     assert_eq!(b, json!("ok"));
     assert_eq!(
         a.unwrap(),
-        ClearSupersession::SupersededByOther(json!("b".repeat(64)))
+        ReversalOutcome::SupersededByOther(json!("b".repeat(64)))
     );
     assert_eq!(overwrites, 1, "no second write once the marker moved");
     let p = coll.payload(&hash).await.unwrap();
@@ -671,13 +671,13 @@ async fn unsupersede_racing_access_increments_keeps_every_count() {
 
     let prefix = format!("PUT /collections/{}/points/payload?", coll.name);
     let (a, b, overwrites) = race_on(&coll, &url, prefix, ("increment", &hash, ""), async |a| {
-        a.clear_superseded_by(&hash, &json!(survivor), &reversal())
+        a.reverse_supersession(&hash, &json!(survivor), &reversal())
             .await
     })
     .await;
 
     assert_eq!(b, json!("ok"));
-    assert!(matches!(a, Ok(ClearSupersession::Cleared { .. })), "{a:?}");
+    assert!(matches!(a, Ok(ReversalOutcome::Cleared { .. })), "{a:?}");
     assert_eq!(
         overwrites, 2,
         "A's first write lost the race and was rebuilt"

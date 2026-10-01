@@ -9,7 +9,7 @@
 //! lands together or not at all, and sibling metadata keys written by anyone
 //! in between are never dropped by the rewrite.
 //!
-//! `clear_superseded_by` is the reverse (LAB-6876): marker and reason leave in
+//! `reverse_supersession` is the reverse (LAB-6876): marker and reason leave in
 //! one conditional overwrite that also appends the audit entry, and only while
 //! the marker still names the survivor the caller read.
 
@@ -17,9 +17,7 @@ mod common;
 
 use std::collections::HashMap;
 
-use alaya_backends::{
-    ClearSupersession, SupersessionReversal, VectorStorage, qdrant::QdrantClient,
-};
+use alaya_backends::{ReversalOutcome, ReversalRecord, VectorStorage, qdrant::QdrantClient};
 use alaya_types::{AlayaError, memory::MetadataUpdate};
 use common::{FakeQdrant, PAYLOAD_PATH, external_write, is_conditional, retrieves, writes};
 use serde_json::{Value, json};
@@ -445,10 +443,10 @@ async fn batch_update_that_cannot_build_one_write_sends_none() {
     assert!(writes(&server).await.is_empty(), "nothing may be marked");
 }
 
-// ─── Reversal: clear_superseded_by (LAB-6876) ───────────────────────────────
+// ─── Reversal: reverse_supersession (LAB-6876) ───────────────────────────────
 
-fn reversal() -> SupersessionReversal {
-    SupersessionReversal {
+fn reversal() -> ReversalRecord {
+    ReversalRecord {
         at: 2000.0,
         via: "operator:test".into(),
         reason: "wrong merge".into(),
@@ -472,12 +470,12 @@ async fn unsupersede_clears_marker_and_reason_and_logs_them_in_one_conditional_w
     fake.insert(&id('a'), superseded_payload('a', 'b', Some("r1")));
 
     let outcome = client_for(&server)
-        .clear_superseded_by(&hash('a'), &json!(hash('b')), &reversal())
+        .reverse_supersession(&hash('a'), &json!(hash('b')), &reversal())
         .await
         .expect("clear succeeds");
     assert_eq!(
         outcome,
-        ClearSupersession::Cleared {
+        ReversalOutcome::Cleared {
             supersession_reason: Some(json!("merged"))
         }
     );
@@ -525,7 +523,7 @@ async fn unsupersede_appends_to_an_existing_log() {
     fake.insert(&id('a'), payload);
 
     client_for(&server)
-        .clear_superseded_by(&hash('a'), &json!(hash('c')), &reversal())
+        .reverse_supersession(&hash('a'), &json!(hash('c')), &reversal())
         .await
         .expect("clear succeeds");
 
@@ -548,19 +546,16 @@ async fn unsupersede_writes_nothing_unless_the_marker_is_the_expected_one() {
     let client = client_for(&server);
 
     let live = client
-        .clear_superseded_by(&hash('a'), &json!(hash('b')), &reversal())
+        .reverse_supersession(&hash('a'), &json!(hash('b')), &reversal())
         .await
         .expect("a live memory is an outcome, not an error");
-    assert_eq!(live, ClearSupersession::NotSuperseded);
+    assert_eq!(live, ReversalOutcome::NotSuperseded);
 
     let other = client
-        .clear_superseded_by(&hash('c'), &json!(hash('b')), &reversal())
+        .reverse_supersession(&hash('c'), &json!(hash('b')), &reversal())
         .await
         .expect("another survivor is an outcome, not an error");
-    assert_eq!(
-        other,
-        ClearSupersession::SupersededByOther(json!(hash('d')))
-    );
+    assert_eq!(other, ReversalOutcome::SupersededByOther(json!(hash('d'))));
 
     assert!(writes(&server).await.is_empty());
     assert_eq!(fake.point(&id('c')).unwrap(), superseded);
@@ -571,7 +566,7 @@ async fn unsupersede_of_an_absent_memory_is_not_found() {
     let (server, _fake) = fake_with(&[]).await;
 
     let result = client_for(&server)
-        .clear_superseded_by(&hash('a'), &json!(hash('b')), &reversal())
+        .reverse_supersession(&hash('a'), &json!(hash('b')), &reversal())
         .await;
     assert!(matches!(result, Err(AlayaError::NotFound(_))), "{result:?}");
     assert!(writes(&server).await.is_empty());
@@ -590,7 +585,7 @@ async fn unsupersede_lost_race_is_rebuilt_and_keeps_the_other_writers_fields() {
     });
 
     client_for(&server)
-        .clear_superseded_by(&hash('a'), &json!(hash('b')), &reversal())
+        .reverse_supersession(&hash('a'), &json!(hash('b')), &reversal())
         .await
         .expect("lands on its second round");
 
@@ -625,12 +620,12 @@ async fn unsupersede_racing_a_re_supersede_stands_down() {
     });
 
     let outcome = client_for(&server)
-        .clear_superseded_by(&hash('a'), &json!(hash('b')), &reversal())
+        .reverse_supersession(&hash('a'), &json!(hash('b')), &reversal())
         .await
         .expect("an outcome, not an error");
     assert_eq!(
         outcome,
-        ClearSupersession::SupersededByOther(json!(hash('c')))
+        ReversalOutcome::SupersededByOther(json!(hash('c')))
     );
 
     let stored = fake.point(&id('a')).unwrap();

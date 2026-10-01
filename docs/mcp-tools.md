@@ -247,9 +247,9 @@ Reverse a supersession — from `memory_supersede`, `merge_duplicates` or the co
 
 What changes, and nothing else:
 
-- `metadata.superseded_by` and the stored supersession reason are removed from the memory, and one entry is appended to its server-maintained `supersession_log`: the `superseded_by` and `supersession_reason` that were removed, `unsuperseded_at`, `unsuperseded_via` and your `reason`. The log survives a re-store of the same content.
+- `metadata.superseded_by` and the stored supersession reason are removed from the memory, and one entry is appended to its server-maintained `supersession_log`: the `superseded_by` and `supersession_reason` that were removed, `unsuperseded_at`, `unsuperseded_via` and your `reason`. The log survives a re-store of the same content, and so does the marker's absence: re-storing with a stale `metadata.superseded_by` does not hide the memory again.
 - Every `SUPERSEDES` edge into the memory is deleted. Normally there is one, from the survivor. There is more than one only when the memory was superseded again without being reversed, and the older ones were already stale.
-- The `CONTRADICTS` pair between the memory and the survivor it named, in either direction, is stamped `keep_both` with `resolved_via: "unsupersede"`, so an automatic apply of the judge's verdict never re-supersedes it. Clear the stamp with `resolve_contradiction` and `resolution: null` to put the pair back in the queue.
+- The `CONTRADICTS` pair between the memory and the survivor it named, in either direction, is stamped `keep_both` with `resolved_via: "unsupersede"`, so an automatic apply of the judge's verdict never re-supersedes it. A pair that already carries a stamp keeps it. `contradictions_stamped` lists the `[memory_a_hash, memory_b_hash]` edges stamped; pass one to `resolve_contradiction` with `resolution: null` to put the pair back in the queue.
 
 Only that one memory changes. In a chain A → B → C (A superseded by B, B by C), unsuperseding B restores B and leaves A superseded by B. Unsuperseding A restores A and leaves B superseded by C. The graph is written before the marker is removed, so if the graph is down the call fails and the memory stays superseded; retrying the same call converges.
 
@@ -260,7 +260,7 @@ The reversal is recorded as `unsuperseded_via: "operator:mcp"`; the MCP surface 
 | `status` | Meaning |
 |:--|:--|
 | `not_superseded` | The memory carries no supersession. Nothing was written. A retry of a call that already landed gets this. |
-| `superseded_by_changed` | The memory was superseded to another survivor while the call ran. That supersession is left whole; `superseded_by` names it. Inspect, and retry if you still mean it. |
+| `superseded_by_changed` | The memory was superseded to another survivor while the call ran. Nothing was reversed: that supersession is left whole with its edge, and the call's own stamps are cleared. `superseded_by` names the new survivor. Inspect, and retry if you still mean it. |
 
 **Example:**
 
@@ -299,7 +299,7 @@ List pairs of memories the contradiction detector has flagged (via negation, ant
 | `verdict_reason` | One line from the judge; `null` when never judged, `unjudged: <error>` when the judge failed on this pair. |
 | `survivor` | `content_hash` the judge recommends keeping, or `null`. Advisory — pass it to `memory_supersede` yourself. |
 | `verdict_confidence`, `verdict_model`, `judged_at` | Judge self-reported confidence (0–1), model id, epoch seconds. |
-| `resolution`, `resolved_at`, `resolved_via` | `keep_both` stamp from `resolve_contradiction`, when it was set (epoch seconds, server clock) and by whom (`operator:mcp`, `operator:console`, …). All `null` on an unresolved pair. Only visible with `include_resolved: true`. |
+| `resolution`, `resolved_at`, `resolved_via` | `keep_both` stamp from `resolve_contradiction` or `memory_unsupersede`, when it was set (epoch seconds, server clock) and by whom (`operator:mcp`, `operator:console`, `unsupersede`, …). All `null` on an unresolved pair. Only visible with `include_resolved: true`. |
 
 The judge never writes to a memory: verdicts live on the graph edge, and resolution stays a human/agent call. A pair leaves the default page one of three ways:
 
@@ -313,7 +313,7 @@ The judge never writes to a memory: verdicts live on the graph edge, and resolut
 
 ## `resolve_contradiction`
 
-Resolve a pair from `memory_contradictions` **without superseding or deleting anything**. `resolution: "keep_both"` stamps the pair as settled — both memories are true, or the pair is detector noise — so it leaves the default queue while both memories stay searchable and the judge's verdict stays on the edge. `resolution: null` clears the stamp and the pair returns to the queue. This is the only way to write the stamp: `relation` cannot set it and the judge never touches it, so no agent's ordinary graph write can retire a pair from the human queue.
+Resolve a pair from `memory_contradictions` **without superseding or deleting anything**. `resolution: "keep_both"` stamps the pair as settled — both memories are true, or the pair is detector noise — so it leaves the default queue while both memories stay searchable and the judge's verdict stays on the edge. `resolution: null` clears the stamp and the pair returns to the queue. This and [`memory_unsupersede`](#memory_unsupersede), which stamps only an unresolved pair, are the only ways to write the stamp: `relation` cannot set it and the judge never touches it, so no agent's ordinary graph write can retire a pair from the human queue.
 
 | Param | Type | Required | Notes |
 |:--|:--|:-:|:--|

@@ -253,7 +253,7 @@ Content-Type: application/json
 }
 ```
 
-Updatable fields: `summary`, `tags`, `metadata`. Content and `content_hash` are immutable by design — to change content, store a new memory and supersede the old.
+Updatable fields: `summary`, `tags`, `metadata`. Content and `content_hash` are immutable by design — to change content, store a new memory and supersede the old. `metadata.superseded_by` is server-maintained: a patch that sets or clears it is a `400`; use `/supersede` and `/unsupersede`, which keep the audit trail. A re-store through `/store` likewise keeps the stored marker, present or absent, whatever the request's metadata says.
 
 Changing `summary` also drops the stored summary embedding (the hybrid-search boost vector) so the two never disagree; the boost returns when the summary is next generated server-side.
 
@@ -329,9 +329,7 @@ Content-Type: application/json
 }
 ```
 
-All three fields are required. `reason` (1–2000 chars) and `unsuperseded_via` (1–128 chars, who is reversing it, recorded verbatim) are the audit entry appended to the memory's `supersession_log`, together with the `superseded_by` and supersession reason that were removed. The `CONTRADICTS` pair with the former survivor is stamped `keep_both` with `resolved_via: "unsupersede"`, so an automatic apply of the judge's verdict never re-supersedes it.
-
-Returns `{ "success": true, "status": "unsuperseded", "content_hash", "superseded_by", "supersession_reason", "reason", "unsuperseded_via", "unsuperseded_at", "supersedes_edges_removed", "contradictions_stamped" }`. A call that changes nothing returns `"success": false` with `"status": "not_superseded"` (nothing to reverse — also what a retry of a call that already landed gets) or `"status": "superseded_by_changed"` (superseded to another survivor while the call ran; that supersession is left whole and `superseded_by` names it). If the graph is unreachable the call fails before the marker is touched and the memory stays superseded; retry the same call. Mutating — static bearer only.
+All three fields are required: `reason` (1–2000 chars) and `unsuperseded_via` (1–128 chars, who is reversing it, recorded verbatim) form the audit entry. Returns `{ "success": true, "status": "unsuperseded", "content_hash", "superseded_by", "supersession_reason", "reason", "unsuperseded_via", "unsuperseded_at", "supersedes_edges_removed", "contradictions_stamped" }`, or `"success": false` with a `status` of `not_superseded` or `superseded_by_changed`. Mutating — static bearer only.
 
 ## `POST /contradictions`
 
@@ -386,7 +384,7 @@ Each pair carries the lexical detector's `confidence` plus the judge's advisory 
 
 ## `POST /contradictions/resolution`
 
-Resolve a pair from `POST /contradictions` **without superseding or deleting anything**. `"keep_both"` stamps the `memory_a_hash -> memory_b_hash` `CONTRADICTS` edge so the pair leaves the default queue while both memories stay searchable and the judge's verdict stays put; `null` clears the stamp and the pair returns. This route is the only writer of the stamp — `POST /relation` cannot set it and the judge never touches it. A `CONTRADICTS` edge carrying a verdict or a resolution also cannot be deleted through `POST /relation` (`delete`): it is the queue item and its audit trail, and the call fails with `Edge carries a verdict or resolution; resolve it (keep_both / supersede) instead of deleting`.
+Resolve a pair from `POST /contradictions` **without superseding or deleting anything**. `"keep_both"` stamps the `memory_a_hash -> memory_b_hash` `CONTRADICTS` edge so the pair leaves the default queue while both memories stay searchable and the judge's verdict stays put; `null` clears the stamp and the pair returns. This route and [`POST /unsupersede`](#post-unsupersede) (which stamps only an unresolved pair) are the only writers of the stamp — `POST /relation` cannot set it and the judge never touches it. A `CONTRADICTS` edge carrying a verdict or a resolution also cannot be deleted through `POST /relation` (`delete`): it is the queue item and its audit trail, and the call fails with `Edge carries a verdict or resolution; resolve it (keep_both / supersede) instead of deleting`.
 
 ```http
 POST /contradictions/resolution

@@ -576,3 +576,55 @@ async fn superseded_endpoint_on_either_side_leaves_the_default_queue() -> anyhow
     ctx.cleanup().await;
     Ok(())
 }
+
+/// LAB-6876: `settle_contradiction` stamps an unresolved pair and leaves a
+/// stamped one exactly as it was — the operator's who and when included —
+/// and creates nothing where there is no edge.
+#[tokio::test]
+async fn settle_stamps_only_an_unresolved_pair() -> anyhow::Result<()> {
+    let Some(ctx) = common::TestContext::new().await else {
+        return Ok(());
+    };
+    seed_pairs(&ctx, 2, 0).await;
+    let (a0, b0, a1, b1) = (hash(1000), hash(2000), hash(1001), hash(2001));
+    ctx.exec_tuple(cypher::set_contradiction_resolution(
+        &a1,
+        &b1,
+        Some(Resolution::KeepBoth),
+        "operator:console",
+        42.0,
+    ))
+    .await;
+
+    let fresh = ctx
+        .exec_tuple(cypher::settle_contradiction(&a0, &b0, "unsupersede", 7.0))
+        .await;
+    assert_eq!(fresh.count(), Some(1), "an unresolved pair is stamped");
+    let kept = ctx
+        .exec_tuple(cypher::settle_contradiction(&a1, &b1, "unsupersede", 7.0))
+        .await;
+    assert_eq!(kept.count(), Some(0), "a stamped pair is not touched");
+    let none = ctx
+        .exec_tuple(cypher::settle_contradiction(
+            &hash(1009),
+            &hash(2009),
+            "unsupersede",
+            7.0,
+        ))
+        .await;
+    assert_eq!(none.count(), Some(0));
+
+    let all = everything(&ctx).await;
+    assert_eq!(all.result_set.len(), 2, "nothing created");
+    assert_eq!(
+        resolution_cells(&all, &a0),
+        (json!("keep_both"), json!(7.0), json!("unsupersede"))
+    );
+    assert_eq!(
+        resolution_cells(&all, &a1),
+        (json!("keep_both"), json!(42.0), json!("operator:console"))
+    );
+
+    ctx.cleanup().await;
+    Ok(())
+}

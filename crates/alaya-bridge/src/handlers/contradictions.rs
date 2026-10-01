@@ -44,6 +44,10 @@ pub struct SetResolutionRequest {
     pub resolution: Option<Resolution>,
     pub resolved_via: String,
     pub resolved_at: f64,
+    /// Stamp only an edge with no resolution yet (`settle_contradiction`):
+    /// an existing stamp, and its who and when, is kept.
+    #[serde(default)]
+    pub if_unresolved: bool,
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -180,13 +184,23 @@ pub async fn set_resolution(
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    let (cypher, params, readonly) = cypher::set_contradiction_resolution(
-        &req.source,
-        &req.target,
-        req.resolution,
-        req.resolved_via.trim(),
-        req.resolved_at,
-    );
+    let (cypher, params, readonly) = match (req.if_unresolved, req.resolution) {
+        (false, resolution) => cypher::set_contradiction_resolution(
+            &req.source,
+            &req.target,
+            resolution,
+            req.resolved_via.trim(),
+            req.resolved_at,
+        ),
+        (true, Some(Resolution::KeepBoth)) => cypher::settle_contradiction(
+            &req.source,
+            &req.target,
+            req.resolved_via.trim(),
+            req.resolved_at,
+        ),
+        // Clearing "only if unresolved" is a no-op by definition: refuse it.
+        (true, None) => return Err(StatusCode::UNPROCESSABLE_ENTITY),
+    };
     let result = exec_query(&state, &cypher, params, readonly).await?;
 
     let count = result.count().unwrap_or(0);
