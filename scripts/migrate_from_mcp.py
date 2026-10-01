@@ -10,7 +10,8 @@ Idempotent — content hashing means identical content upserts safely.
 `metadata.superseded_by` is reserved: /store refuses it. A source memory's
 supersession is recreated through /supersede once every memory is stored,
 so it lands with its SUPERSEDES edge and reason. The source keeps that
-reason in `metadata.supersession_reason`; Alaya keeps it server-side.
+reason in `metadata.supersession_reason`; a record Alaya superseded keeps
+it top-level, which is read when metadata has none.
 
 Alaya keys a memory by its raw content; the source keys it by normalised
 content plus metadata, so several source memories can share one Alaya
@@ -221,7 +222,8 @@ async def run() -> None:
                     Supersession(
                         index=len(memories),
                         source_new_hash=str(superseded_by),
-                        reason=metadata.pop("supersession_reason", None),
+                        reason=metadata.pop("supersession_reason", None)
+                        or payload.get("supersession_reason"),
                     )
                 )
             elif has_marker:
