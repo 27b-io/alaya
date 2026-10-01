@@ -301,7 +301,7 @@ Authorization is by route, not by `action`: `POST /relation` needs the full key 
 
 ## `GET /memories/{content_hash}/relations`
 
-List a memory's typed edges, in both directions. The same read as `POST /relation` with `"action": "get"`: same body, same 50-edge cap, same errors. Unlike `POST /relation`, the read-only bearer may call it.
+List a memory's typed edges, in both directions. The same read as `POST /relation` with `"action": "get"`: same response body, same 50-edge cap, same errors. Unlike `POST /relation`, the read-only bearer may call it.
 
 ```bash
 curl -H "Authorization: Bearer $ALAYA_READONLY_API_KEY" \

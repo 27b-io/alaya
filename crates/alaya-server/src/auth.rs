@@ -36,9 +36,10 @@ pub const OIDC_ALLOWLIST: &[&str] = &[
     "store_memory",
 ];
 
-/// Pure-read ops a `StaticReadOnly` principal may invoke. Stricter than
-/// `OIDC_ALLOWLIST`: no `store_memory` — the read-only bearer exists for
-/// consumers (radar) that must never mutate the corpus, additively or not.
+/// Pure-read ops a `StaticReadOnly` principal may invoke. Differs from
+/// `OIDC_ALLOWLIST` both ways: no `store_memory` — the read-only bearer exists
+/// for consumers (radar) that must never mutate the corpus, additively or not
+/// — and `get_relations`, which `Oidc` deliberately does not get.
 pub const READONLY_ALLOWLIST: &[&str] = &[
     "search",
     "get_memory",
@@ -142,12 +143,13 @@ pub fn rest_route_op(method: &Method, path: &str) -> &'static str {
     }
 }
 
-/// `/memories/{content_hash}/relations` — exactly one hash segment, so the
-/// match is no wider than the axum route it authorizes.
+/// `/memories/{content_hash}/relations` — exactly one hash segment, empty
+/// included, because axum routes `/memories//relations` to that handler too:
+/// the op must label every path the handler can receive.
 fn is_relations_path(path: &str) -> bool {
     path.strip_prefix("/memories/")
         .and_then(|rest| rest.strip_suffix("/relations"))
-        .is_some_and(|hash| !hash.is_empty() && !hash.contains('/'))
+        .is_some_and(|hash| !hash.contains('/'))
 }
 
 /// Every canonical op with its write classification, for the read-only
@@ -442,8 +444,9 @@ mod tests {
                 "{op} should be allowed for StaticReadOnly"
             );
         }
-        // Stricter than Oidc: no additive writes either.
+        // Unlike Oidc: no additive writes, but relation reads.
         assert!(!AuthPrincipal::StaticReadOnly.allows("store_memory"));
+        assert!(!AuthPrincipal::Oidc.allows("get_relations"));
     }
 
     #[test]
@@ -499,14 +502,12 @@ mod tests {
 
     #[test]
     fn rest_route_op_maps_relations_read_before_the_memories_prefix() {
-        assert_eq!(
-            rest_route_op(&Method::GET, "/memories/abc123/relations"),
-            "get_relations"
-        );
+        for p in ["/memories/abc123/relations", "/memories//relations"] {
+            assert_eq!(rest_route_op(&Method::GET, p), "get_relations", "{p}");
+        }
         // Only the exact one-segment shape; lookalikes keep their old op.
         for p in [
             "/memories/relations",
-            "/memories//relations",
             "/memories/a/b/relations",
             "/memories/abc123/relations/",
         ] {
@@ -897,10 +898,15 @@ mod tests {
             status_for(&app, Method::GET, "/memories/abc", Some(&jwt)).await,
             StatusCode::OK
         );
-        assert_eq!(
-            status_for(&app, Method::GET, path, Some(&jwt)).await,
-            StatusCode::FORBIDDEN
-        );
+        // An empty segment still reaches the relations handler in axum, so it
+        // must carry the relations op too, not `get_memory`'s OIDC grant.
+        for p in [path, "/memories//relations"] {
+            assert_eq!(
+                status_for(&app, Method::GET, p, Some(&jwt)).await,
+                StatusCode::FORBIDDEN,
+                "{p}"
+            );
+        }
 
         assert_eq!(
             status_for(&app, Method::GET, path, None).await,
