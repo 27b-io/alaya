@@ -129,6 +129,7 @@ All endpoints accept/return JSON. Auth via `Authorization: Bearer` with either s
 | POST | `/duplicates/find` | Find duplicates |
 | POST | `/duplicates/merge` | Merge duplicates |
 | PATCH | `/memories/{hash}` | Update memory metadata |
+| GET | `/memories/{hash}/relations` | List a memory's graph edges (read-only bearer allowed) |
 | POST | `/backfill/summaries` | Batch-generate missing summaries |
 | GET | `/health` | Liveness probe — status only (no auth) |
 | GET | `/health/detail` | Backend health, capacity, build identity |

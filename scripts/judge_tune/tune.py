@@ -18,7 +18,8 @@ Subcommands (see README.md):
 
     split   write split.json (stratified by label, fixed seed)
     tune    run GEPA on the train split; validation pairs are only ever scored
-    eval    score one prompt file on val / train / all pairs, list disagreements
+    eval    score one prompt file on val / train / all pairs over k passes in
+            one decoding regime, with 95 % Wilson intervals; list disagreements
 
 Memory contents are fetched from Ālaya at run time; this script writes none of
 them to disk. The run directory (gitignored) holds model output about them:
@@ -28,8 +29,10 @@ candidate prompts, verdict reasons and GEPA's own logs.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -61,6 +64,19 @@ JUDGE_TIMEOUT_S = 90
 CONCURRENCY = 4
 MINIBATCH = 6  # the seed scores ~0.9; GEPA's default 3 is all-correct most rounds
 TRAIN_FRAC = 0.6
+SPEND_CHECK_EVERY = 20  # eval checks --max-usd between chunks of this many calls
+
+# Decoding regimes for `eval --regime`: extra Messages API parameters on top of
+# the production request. `default` is what JudgeClient sends (no `thinking`,
+# so claude-sonnet-5 runs adaptive thinking). `thinking-off` disables it.
+# Neither sets `temperature`: claude-sonnet-5 rejects any value but the
+# default 1.0, with or without thinking (400 "`temperature` is deprecated for
+# this model", checked 2026-10-01), so a temperature-0 regime cannot be sent.
+REGIMES: dict[str, dict] = {
+    "default": {},
+    "thinking-off": {"thinking": {"type": "disabled"}},
+}
+ABSTAIN = "abstain"
 
 VERDICT_SCHEMA = {
     "type": "object",
@@ -179,6 +195,11 @@ class Pair:
     label: str
     survivor: str | None
     source: str
+    sub_label: str | None = None
+    tags: tuple[str, ...] = ()
+    # A label still awaiting adjudication: scored per pass, kept out of the
+    # headline bars.
+    disputed: bool = False
 
     def survivor_letter(self) -> str | None:
         if self.survivor is None:
@@ -189,7 +210,17 @@ class Pair:
 def load_fixture() -> list[Pair]:
     raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
     return [
-        Pair(i, p["a"], p["b"], p["label"], p.get("survivor"), p.get("source", ""))
+        Pair(
+            i,
+            p["a"],
+            p["b"],
+            p["label"],
+            p.get("survivor"),
+            p.get("source", ""),
+            p.get("sub_label"),
+            tuple(p.get("tags", ())),
+            "dispute" in p,
+        )
         for i, p in enumerate(raw["pairs"])
     ]
 
@@ -378,17 +409,30 @@ def validate(raw: Any, tokens: tuple[int, int]) -> dict:
     }
 
 
+def request_params(model: str, regime: str = "default") -> dict:
+    """Every Messages API parameter the judge sends except `system` and `messages`."""
+    return {
+        "model": model,
+        "max_tokens": MAX_OUTPUT_TOKENS,
+        "output_config": {"format": {"type": "json_schema", "schema": VERDICT_SCHEMA}},
+        **REGIMES[regime],
+    }
+
+
 def judge_pair(
-    client: anthropic.Anthropic, model: str, prompt: str, a: dict, b: dict
+    client: anthropic.Anthropic,
+    model: str,
+    prompt: str,
+    a: dict,
+    b: dict,
+    regime: str = "default",
 ) -> dict:
     # An API error that survives the SDK's retries aborts the run: an
     # infrastructure fault must not be scored as a prompt failure.
     resp = client.messages.create(
-        model=model,
-        max_tokens=MAX_OUTPUT_TOKENS,
         system=prompt,
         messages=[{"role": "user", "content": render_pair(a, b)}],
-        output_config={"format": {"type": "json_schema", "schema": VERDICT_SCHEMA}},
+        **request_params(model, regime),
     )
     u = resp.usage
     tokens = (
@@ -485,21 +529,109 @@ def metrics(rows: list[tuple[Pair, dict]], model: str) -> dict:
     }
 
 
-def disagreements(rows: list[tuple[Pair, dict]]) -> list[dict]:
-    return [
-        {
-            "a": p.a,
-            "b": p.b,
-            "label": p.label,
-            "label_survivor": p.survivor_letter(),
-            "verdict": v["verdict"],
-            "survivor": v["survivor"],
-            "confidence": v["confidence"],
-            "reason": v["reason"],
-        }
+# ── k-pass consensus and interval scoring (eval) ─────────────────────────────
+
+Z95 = 1.96
+
+
+def wilson(k: int, n: int) -> tuple[float, float] | None:
+    """95 % Wilson score interval for k successes in n trials."""
+    if n == 0:
+        return None
+    p = k / n
+    d = 1 + Z95 * Z95 / n
+    centre = (p + Z95 * Z95 / (2 * n)) / d
+    half = Z95 * math.sqrt(p * (1 - p) / n + Z95 * Z95 / (4 * n * n)) / d
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
+def rate(k: int, n: int) -> dict:
+    return {"k": k, "n": n, "rate": ratio(k, n), "ci95": wilson(k, n)}
+
+
+def vote_key(v: dict) -> tuple[str, str | None]:
+    """What a pass decided: the class, plus the survivor when it would supersede."""
+    return v["verdict"], v["survivor"] if v["verdict"] == "supersession" else None
+
+
+def consensus(votes: list[dict]) -> dict:
+    """The k passes' common verdict, or an abstention.
+
+    Any dissent abstains (so at k = 3 a 2-1 split goes to the operator), and so
+    does a pass that produced no verdict. An abstention is never a correct
+    non-supersession: it scores 0 against every label.
+    """
+    keys = {vote_key(v) for v in votes}
+    if len(keys) != 1 or votes[0]["verdict"] == "unjudged":
+        return {"verdict": ABSTAIN, "survivor": None}
+    verdict, survivor = keys.pop()
+    return {"verdict": verdict, "survivor": survivor}
+
+
+def consensus_metrics(rows: list[tuple[Pair, dict]]) -> dict:
+    """Headline rates over consensus verdicts; definitions in README.md."""
+    by_label: dict[str, list[tuple[Pair, dict]]] = defaultdict(list)
+    for p, v in rows:
+        by_label[p.label].append((p, v))
+    coexist, sup = by_label["coexist"], by_label["supersession"]
+    unrelated, contradiction = by_label["unrelated"], by_label["contradiction"]
+    coexist_sup = sum(1 for _, v in coexist if v["verdict"] == "supersession")
+    called = [(p, v) for p, v in sup if v["verdict"] == "supersession"]
+    wrong = sum(1 for p, v in called if predicted_survivor(p, v) != p.survivor)
+    predicted = sum(1 for _, v in rows if v["verdict"] == "supersession")
+
+    def escalated(group: list[tuple[Pair, dict]]) -> dict:
+        return rate(sum(1 for _, v in group if v["verdict"] in CONFLICT), len(group))
+
+    return {
+        "pairs": len(rows),
+        "by_label": dict(sorted(Counter(p.label for p, _ in rows).items())),
+        "abstained": sum(1 for _, v in rows if v["verdict"] == ABSTAIN),
+        "false_supersede_rate": rate(coexist_sup + wrong, len(coexist) + wrong),
+        "false_supersedes": {
+            "coexist_called_supersession": coexist_sup,
+            "wrong_survivor": wrong,
+        },
+        "coexist_to_conflict": escalated(coexist),
+        "unrelated_to_conflict": escalated(unrelated),
+        "recall_supersession": rate(len(called), len(sup)),
+        "precision_supersession": rate(len(called), predicted),
+        "survivor_accuracy": rate(len(called) - wrong, len(called)),
+        "yield": rate(int(sum(score(p, v) for p, v in rows)), len(rows)),
+        # n = 0 while no pair carries the label: the class is unmeasured.
+        "contradiction": rate(
+            sum(1 for _, v in contradiction if v["verdict"] == "contradiction"),
+            len(contradiction),
+        ),
+    }
+
+
+def both_ways(rows: list[tuple[Pair, dict]], newer: dict[int, str]) -> dict:
+    """Headline metrics with `partial` pairs counted as coexist, then as a
+    supersession by the newer memory (it corrects a claim in the older one)."""
+    flipped = [
+        (
+            dataclasses.replace(p, label="supersession", survivor=newer[p.id])
+            if "partial" in p.tags
+            else p,
+            v,
+        )
         for p, v in rows
-        if score(p, v) < 1.0
     ]
+    return {
+        "partial_as_coexist": consensus_metrics(rows),
+        "partial_as_supersession": consensus_metrics(flipped),
+    }
+
+
+def unanimity(decided: list[dict]) -> dict:
+    """Share of pairs whose passes all agreed on a verdict: the default arm's
+    variance diagnostic.
+
+    Never a comparison metric across regimes: a near-deterministic regime
+    scores ~100 % on it by construction.
+    """
+    return rate(sum(1 for c in decided if c["verdict"] != ABSTAIN), len(decided))
 
 
 # ── Feedback for the reflection model ────────────────────────────────────────
@@ -519,11 +651,13 @@ LABEL_RULE = {
     "contradiction": "both claim to be current and cannot both be true",
 }
 SOURCE_NOTE = {
-    "resolved-by-operator": (
+    "operator": (
         "an operator resolved this pair by superseding one memory with the other "
         "(verified: the loser's superseded_by points at the survivor)"
     ),
-    "queue-2026-09-10": "a reviewer read the unresolved queue and labelled the pair",
+    "queue-read": "a reviewer read the unresolved queue and labelled the pair",
+    "agreed": "a blind full-text reading under the rule agreed with the earlier label",
+    "adjudicated": "the label was settled by adjudication after reviewers disagreed",
 }
 
 
@@ -675,12 +809,13 @@ def judge_batch(
     prompt: str,
     memories: dict,
     batch: list[Pair],
+    regime: str = "default",
 ) -> list[dict]:
     with ThreadPoolExecutor(CONCURRENCY) as pool:
         return list(
             pool.map(
                 lambda p: judge_pair(
-                    client, model, prompt, memories[p.a], memories[p.b]
+                    client, model, prompt, memories[p.a], memories[p.b], regime
                 ),
                 batch,
             )
@@ -1078,6 +1213,99 @@ def cmd_tune(args) -> None:
         sys.exit(1)
 
 
+def judge_passes(
+    client: anthropic.Anthropic,
+    model: str,
+    prompt: str,
+    memories: dict,
+    pairs: list[Pair],
+    passes: int,
+    regime: str,
+    ledger: Ledger,
+    max_usd: float,
+    votes: list[list[dict]],
+) -> None:
+    """Fill `votes[pair]` with `passes` independent verdicts per pair.
+
+    The caller owns `votes`, so verdicts already paid for survive an abort:
+    every call that returned is booked before an API error is re-raised. Spend
+    is checked between chunks of SPEND_CHECK_EVERY calls, so the cap is
+    overshot by at most one chunk, and the first chunk's cost is projected over
+    the whole run, so a run the cap cannot cover stops after one chunk rather
+    than mid-pass with nothing scorable.
+    """
+    total, done = passes * len(pairs), 0
+    for k in range(passes):
+        for i in range(0, len(pairs), SPEND_CHECK_EVERY):
+            if ledger.usd() >= max_usd:
+                raise RuntimeError(
+                    f"spend cap: ${ledger.usd():.2f} >= ${max_usd} in pass {k + 1}"
+                )
+            chunk = pairs[i : i + SPEND_CHECK_EVERY]
+            with ThreadPoolExecutor(CONCURRENCY) as pool:
+                futures = [
+                    pool.submit(
+                        judge_pair,
+                        client,
+                        model,
+                        prompt,
+                        memories[p.a],
+                        memories[p.b],
+                        regime,
+                    )
+                    for p in chunk
+                ]
+            errors = [f.exception() for f in futures if f.exception() is not None]
+            for j, f in enumerate(futures):
+                if f.exception() is None:
+                    v = f.result()
+                    ledger.add("judge", model, *v["tokens"])
+                    votes[i + j].append(v)
+            if errors:
+                raise errors[0]
+            done += len(chunk)
+            projected = ledger.usd() / done * total
+            # 10 % headroom, so a run the projection admits does not trip the cap
+            # late; a run that fit in its first chunk is already paid for.
+            if done == len(chunk) and done < total and projected * 1.1 > max_usd:
+                raise RuntimeError(
+                    f"spend cap: {total} calls project to ${projected:.2f}, "
+                    f"too close to ${max_usd} (10 % headroom)"
+                )
+        log(f"pass {k + 1}/{passes} done: spend ${ledger.usd():.2f}")
+
+
+def newer_memory(pair: Pair, memories: dict[str, dict]) -> str:
+    a, b = memories[pair.a], memories[pair.b]
+    return pair.a if a["created_at"] >= b["created_at"] else pair.b
+
+
+def consensus_disagreements(
+    pairs: list[Pair], votes: list[list[dict]], decided: list[dict]
+) -> list[dict]:
+    """Every pair whose consensus differs from its label, abstentions included."""
+    return [
+        {
+            "a": p.a,
+            "b": p.b,
+            "label": p.label,
+            "sub_label": p.sub_label,
+            "tags": list(p.tags),
+            "label_survivor": p.survivor_letter(),
+            "disputed_label": p.disputed,
+            "verdict": c["verdict"],
+            "survivor": c["survivor"],
+            "votes": [
+                f"{v['verdict']}:{v['survivor']}" if v["survivor"] else v["verdict"]
+                for v in vs
+            ],
+            "reasons": [v["reason"] for v in vs],
+        }
+        for p, vs, c in zip(pairs, votes, decided)
+        if score(p, c) < 1.0
+    ]
+
+
 def cmd_eval(args) -> None:
     prompt = Path(args.prompt_file).read_text(encoding="utf-8")
     model = os.environ.get("JUDGE_MODEL", "claude-sonnet-5")
@@ -1092,27 +1320,81 @@ def cmd_eval(args) -> None:
         log("prompt hygiene problems: " + "; ".join(problems))
     client = make_client(env("JUDGE_URL"), env("JUDGE_API_KEY"))
     ledger = Ledger()
-    verdicts = judge_batch(client, model, prompt, memories, chosen)
-    for v in verdicts:
-        ledger.add("judge", model, *v["tokens"])
-    rows = list(zip(chosen, verdicts))
+    out = HERE / "runs" / args.run
+    out.mkdir(parents=True, exist_ok=True)
+    stem = f"eval_{args.pairs}_{args.regime}_k{args.passes}_{sha(prompt)[:8]}"
+    log(
+        f"eval: {len(chosen)} pairs x {args.passes} passes, regime={args.regime}, max_usd={args.max_usd}"
+    )
+    votes: list[list[dict]] = [[] for _ in chosen]
+    try:
+        judge_passes(
+            client,
+            model,
+            prompt,
+            memories,
+            chosen,
+            args.passes,
+            args.regime,
+            ledger,
+            args.max_usd,
+            votes,
+        )
+    finally:  # paid verdicts and spend are written before any exit path
+        (out / f"{stem}_spend.json").write_text(
+            json.dumps(ledger.summary(), indent=2) + "\n"
+        )
+        with (out / f"{stem}_records.jsonl").open("w", encoding="utf-8") as f:
+            for p, vs in zip(chosen, votes):
+                for k, v in enumerate(vs):
+                    row = {"pair": p.id, "pass": k + 1, "label": p.label}
+                    row |= {
+                        key: v[key]
+                        for key in ("verdict", "survivor", "confidence", "reason")
+                    }
+                    f.write(json.dumps(row) + "\n")
+    decided = [consensus(vs) for vs in votes]
+    headline = [(p, c) for p, c in zip(chosen, decided) if not p.disputed]
+    newer = {p.id: newer_memory(p, memories) for p in chosen}
     result = {
         "judge_model": model,
         "pairs": args.pairs,
+        "regime": args.regime,
+        "passes": args.passes,
+        "request_params": request_params(model, args.regime),
         "prompt_sha256": sha(prompt),
+        "fixture_sha256": fixture_sha(),
         "hygiene_problems": problems,
-        "metrics": metrics(rows, model),
+        "headline": {
+            "excluded_disputed": len(chosen) - len(headline),
+            **both_ways(headline, newer),
+        },
+        "unanimity": unanimity(decided)
+        if args.regime == "default" and args.passes > 1
+        else None,
+        "per_pass": [
+            metrics([(p, vs[k]) for p, vs in zip(chosen, votes)], model)
+            for k in range(args.passes)
+        ],
         "spend": ledger.summary(),
-        "disagreements": disagreements(rows),
+        "disagreements": consensus_disagreements(chosen, votes, decided),
     }
-    out = HERE / "runs" / args.run
-    out.mkdir(parents=True, exist_ok=True)
-    path = out / f"eval_{args.pairs}_{sha(prompt)[:8]}.json"
+    path = out / f"{stem}.json"
     path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(
-        json.dumps({k: v for k, v in result.items() if k != "disagreements"}, indent=2)
+        json.dumps(
+            {k: v for k, v in result.items() if k not in ("disagreements", "per_pass")},
+            indent=2,
+        )
     )
     print(f"disagreements: {len(result['disagreements'])} (see {path})")
+
+
+def positive_int(text: str) -> int:
+    n = int(text)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {n}")
+    return n
 
 
 def main() -> None:
@@ -1136,6 +1418,14 @@ def main() -> None:
     e.add_argument("--prompt-file", required=True)
     e.add_argument("--pairs", choices=("val", "train", "all"), default="val")
     e.add_argument("--run", default="eval", help="outputs go under runs/<name>/")
+    e.add_argument(
+        "--passes",
+        type=positive_int,
+        default=1,
+        help="verdicts per pair; any dissent abstains",
+    )
+    e.add_argument("--regime", choices=sorted(REGIMES), default="default")
+    e.add_argument("--max-usd", type=float, default=15.0)
     e.set_defaults(fn=cmd_eval)
     args = ap.parse_args()
     args.fn(args)

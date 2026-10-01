@@ -2878,7 +2878,7 @@ fn current_timestamp() -> f64 {
         .as_secs_f64()
 }
 
-fn parse_user_relation(s: &str) -> Result<UserRelationType> {
+pub fn parse_user_relation(s: &str) -> Result<UserRelationType> {
     match s {
         "RELATES_TO" => Ok(UserRelationType::RelatesTo),
         "PRECEDES" => Ok(UserRelationType::Precedes),

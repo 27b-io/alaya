@@ -39,14 +39,18 @@ uv run scripts/judge_tune/tune.py split
 uv run scripts/judge_tune/tune.py tune --run $(date +%Y%m%d)
 
 # 3. Score a prompt on val / train / all pairs and list every disagreement.
+#    --passes k judges every pair k times; --regime picks the decoding
+#    regime; --max-usd caps judge spend for the run.
 uv run scripts/judge_tune/tune.py eval \
-  --prompt-file scripts/judge_tune/runs/<run>/best_prompt.txt --pairs all --run <run>
+  --prompt-file scripts/judge_tune/runs/<run>/best_prompt.txt --pairs all --run <run> \
+  --passes 3 --regime default --max-usd 15
 ```
 
 Every output lands under `scripts/judge_tune/runs/<name>/`, which is gitignored:
 `tune` writes `report.md`, `report.json`, `records.jsonl` (every verdict),
 `spend.json`, `best_prompt.txt` and GEPA's own state and logs; `eval` writes
-`eval_<pairs>_<sha>.json`. The harness writes no memory content to disk, but the
+`eval_<pairs>_<regime>_k<passes>_<sha>.json` plus `_records.jsonl` (every
+verdict of every pass) and `_spend.json`. The harness writes no memory content to disk, but the
 run directory holds model output about it (candidate prompts, verdict reasons),
 so it stays out of git.
 
@@ -85,3 +89,46 @@ so it stays out of git.
 
 One seed, one split. If a result looks split-sensitive, say so in the report
 rather than re-cutting.
+
+## The fixture
+
+`contradiction_golden.json` holds hashes and labels only. Each pair records
+what an operator did with it (`action`, `action_survivor`) apart from what the
+label rule says (`label`, `sub_label`, `survivor`, `tags`, `source`). The
+fixture's own `fields`, `rule_version` and `label_rule` keys define them. The
+Rust harness reads `label`, `survivor` and `source` and ignores the rest.
+
+## What eval reports
+
+`eval --passes k` judges every pair k times. A pair's verdict is the passes'
+common verdict; any dissent abstains (at k = 3 a 2-1 split goes to the
+operator), and so does a pass with no valid verdict. Per-pass scoring is the
+Rust harness's (`per_pass` in the output). The headline scores the consensus,
+skips `dispute` pairs, and gives every rate a 95 % Wilson interval:
+
+- **false-supersede rate**: coexist pairs given a supersession verdict, plus
+  supersession pairs given the wrong survivor (that write hides the memory
+  that should stay), over coexist pairs plus those wrong-survivor pairs;
+- **coexist to conflict**: the coexist bar, as in the Rust harness;
+- **recall(supersession)**, **precision(supersession)** and **survivor
+  accuracy**; an abstention is a recall miss;
+- **yield**: pairs the consensus resolves correctly, over all pairs; an
+  abstention is a yield loss, never a correct non-supersession.
+
+Every headline is computed twice, with `partial` pairs counted as coexist and
+as a supersession by the newer memory. The `contradiction` class has `n = 0`,
+that is unmeasured, while no pair carries the label.
+
+`--max-usd` is checked between chunks of 20 calls. The first chunk's cost is
+projected over the whole run, so a run the cap cannot cover with 10 % headroom
+stops after one chunk. An API error aborts the run once every call that returned is booked.
+
+`--regime default` is the production request (no `thinking` parameter, so
+`claude-sonnet-5` runs adaptive thinking). `--regime thinking-off` adds
+`thinking: {"type": "disabled"}`. Neither sets `temperature`:
+`claude-sonnet-5` rejects any value but the default 1.0, with or without
+thinking, so a temperature-0 regime cannot be sent. The output records the
+exact request parameters. The unanimity rate (pairs whose passes all agree on
+a verdict) is reported for the default regime at k ≥ 2 only, as its variance
+diagnostic: a near-deterministic regime scores close to 100 % on it by
+construction, so it never compares regimes.
