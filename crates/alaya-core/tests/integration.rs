@@ -305,6 +305,7 @@ async fn health_check() {
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 async fn ensure_test_collection(qdrant_url: &str) {
+    #[allow(clippy::disallowed_methods, reason = "test-only client")]
     let client = reqwest::Client::new();
 
     // Check if collection exists

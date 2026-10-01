@@ -249,7 +249,7 @@ mod tests {
     #[test]
     fn key_must_be_one_line_of_visible_ascii_and_is_never_echoed() {
         for bad in ["sk-abc\n", "sk abc", "sk-\tabc", "sk-é", ""] {
-            let e = headers(Some(bad.into())).err().expect(bad);
+            let e = headers(Some(bad.into())).expect_err(bad);
             assert!(matches!(e, AlayaError::Config(_)), "{bad:?}: {e:?}");
             assert!(!e.to_string().contains("abc"), "echoed key: {e}");
         }
