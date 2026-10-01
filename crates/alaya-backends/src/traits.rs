@@ -361,7 +361,8 @@ pub struct Judgement {
 }
 
 /// Pairwise contradiction judge (LAB-3283). Pluggable via env in the server;
-/// the one production impl is `JudgeClient` (Anthropic Messages API).
+/// the one production impl is `JudgeClient` (Anthropic Messages API or any
+/// OpenAI-compatible chat-completions endpoint, per `JUDGE_PROVIDER`).
 ///
 /// Optional — when absent, CONTRADICTS edges are never annotated and the
 /// read surfaces report every pair as `unjudged`.
