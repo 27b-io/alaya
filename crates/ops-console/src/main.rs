@@ -164,7 +164,7 @@ fn app(state: AppState) -> Router {
         .route("/alaya/duplicates", get(routes::alaya::duplicates))
         .route("/alaya/duplicates/merge", post(routes::alaya::merge_submit))
         .route("/alaya/contradictions", get(routes::alaya::contradictions))
-        .route("/alaya/contradictions/pair", get(routes::alaya::pair))
+        .route("/alaya/contradictions/pair", get(routes::alaya::pair_page))
         .route(
             "/alaya/contradictions/keep-both",
             post(routes::alaya::keep_both_submit),
@@ -1309,7 +1309,7 @@ mod tests {
             second.contains("href=\"/alaya/contradictions?verdict=coexist\""),
             "Prev back to page 1"
         );
-        assert!(second.contains("Pairs 51–51"));
+        assert!(second.contains("1 pairs from offset 50"));
 
         let bodies = seen.lock().unwrap().clone();
         assert_eq!(
@@ -1408,7 +1408,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains(&long), "A's content in full, not clipped");
         assert!(html.contains("short a") && html.contains("tag-a"));
-        assert!(html.contains("superseded by"));
+        assert!(
+            html.contains(&format!("href=\"/alaya/memory/{}\"", "c".repeat(64))),
+            "superseded_by links on"
+        );
         assert!(
             html.contains("Could not load this memory: alaya-server 500"),
             "{html}"
@@ -1550,7 +1553,7 @@ mod tests {
         assert!(
             flash
                 .msg
-                .starts_with("Kept both for 1 of 3 pairs. 2 failed"),
+                .starts_with("Kept both for 1 of 3 pairs. 2 not confirmed"),
             "{}",
             flash.msg
         );
@@ -1600,15 +1603,30 @@ mod tests {
     }
 
     /// AC-7: Reopen clears the stamp with an explicit `resolution: null`,
-    /// behind the same CSRF check.
+    /// in both directions (a stamp on either edge settles the pair), behind
+    /// the same CSRF check. No reverse edge is the normal case; a real
+    /// failure clearing it is reported, never flashed as success.
     #[tokio::test]
-    async fn reopen_posts_a_null_resolution() {
+    async fn reopen_clears_both_directions_with_a_null_resolution() {
         let (a, b) = ("a".repeat(64), "b".repeat(64));
         let seen = Seen::default();
+        let reverse_fails = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = reverse_fails.clone();
         let upstream = Router::new().route(
             "/contradictions/resolution",
-            recording(&seen, |_| {
-                (StatusCode::OK, serde_json::json!({ "success": true }))
+            recording(&seen, move |body| {
+                if body["memory_a_hash"].as_str().unwrap().starts_with('a') {
+                    return (StatusCode::OK, serde_json::json!({ "success": true }));
+                }
+                let error = if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    "Graph operation failed"
+                } else {
+                    "Resource not found"
+                };
+                (
+                    StatusCode::OK,
+                    serde_json::json!({ "success": false, "error": error }),
+                )
             }),
         );
         let (state, cookie, csrf) = triage_app(upstream).await;
@@ -1631,14 +1649,33 @@ mod tests {
         let resp = post_form(&state, &cookie, "/alaya/contradictions/reopen", form(&csrf)).await;
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         assert_eq!(location(&resp), "/alaya/contradictions?resolved=1");
-        assert!(flash_of(&state, &resp).msg.contains("back in the queue"));
-        let body = seen.lock().unwrap()[0].clone();
+        let flash = flash_of(&state, &resp);
+        assert_eq!(flash.kind, "ok", "{}", flash.msg);
+        assert!(flash.msg.contains("back in the queue"));
+        let bodies = seen.lock().unwrap().clone();
         assert_eq!(
-            body,
-            serde_json::json!({
-                "memory_a_hash": a, "memory_b_hash": b,
-                "resolution": null, "resolved_via": "operator:console",
-            })
+            bodies,
+            [
+                serde_json::json!({
+                    "memory_a_hash": a, "memory_b_hash": b,
+                    "resolution": null, "resolved_via": "operator:console",
+                }),
+                serde_json::json!({
+                    "memory_a_hash": b, "memory_b_hash": a,
+                    "resolution": null, "resolved_via": "operator:console",
+                }),
+            ]
         );
+
+        reverse_fails.store(true, std::sync::atomic::Ordering::SeqCst);
+        let resp = post_form(&state, &cookie, "/alaya/contradictions/reopen", form(&csrf)).await;
+        let flash = flash_of(&state, &resp);
+        assert_eq!(flash.kind, "error");
+        assert!(
+            flash.msg.contains("Graph operation failed"),
+            "{}",
+            flash.msg
+        );
+        assert!(!flash.msg.contains("back in the queue"));
     }
 }

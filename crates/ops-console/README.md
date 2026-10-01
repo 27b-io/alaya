@@ -90,10 +90,11 @@ is `user-123`, not `"user-123"`.
   side by side in full, read live, with the verdict re-read from the queue
   page it was opened from. Decisions — *Keep A* / *Keep B* (supersede with
   a reason), *Keep both* (stamp the pair, nothing superseded), *Reopen*
-  (clear a keep-both) — all land back on the same queue view with a flash
+  (clear a keep-both, in both edge directions) — all land back on the same queue view with a flash
   naming the pair. Tick cards and *Keep both for selected* settles a page in
-  one submit, one resolution call per pair; the flash names every pair that
-  failed and why. Supersede is never offered in bulk.
+  one submit, one resolution call per pair within a 30 s budget; the flash
+  names every pair it could not confirm, and why. Supersede is never offered
+  in bulk.
 - **Auth state** — read-only view of alaya-server's `GET /auth/config`:
   principal × operation matrix + OIDC issuer/audience/allowlist.
 

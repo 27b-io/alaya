@@ -9,6 +9,12 @@ use serde_json::{Value, json};
 
 use crate::error::AppError;
 
+/// `AlayaError::NotFound`'s `safe_message` on alaya-server.
+const NOT_FOUND_MESSAGE: &str = "Resource not found";
+
+/// The one non-null resolution the server accepts.
+pub const KEEP_BOTH: &str = "keep_both";
+
 #[derive(Clone)]
 pub struct AlayaClient {
     base: url::Url,
@@ -52,6 +58,12 @@ impl AlayaClient {
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("operation failed");
+            // The server reports a missing target only as this fixed
+            // `safe_message`, in a 200 body. Typed, because Reopen expects
+            // it for a pair with no reverse edge.
+            if detail == NOT_FOUND_MESSAGE {
+                return Err(AppError::NotFound(format!("alaya-server: {detail}")));
+            }
             return Err(AppError::Upstream(format!("alaya-server: {detail}")));
         }
         Ok(body)

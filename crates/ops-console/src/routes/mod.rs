@@ -40,6 +40,16 @@ pub fn safe_next(next: &str) -> String {
     }
 }
 
+/// A form's `back` target through `safe_next`, or `default` when the form
+/// carried none.
+pub fn return_to(back: &str, default: &str) -> String {
+    if back.is_empty() {
+        default.to_string()
+    } else {
+        safe_next(back)
+    }
+}
+
 /// 64-char lowercase hex content hash — reject anything else before it
 /// reaches a URL or an upstream call.
 pub fn validate_hash(hash: &str) -> Result<&str, AppError> {
