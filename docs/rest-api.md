@@ -312,7 +312,7 @@ curl -H "Authorization: Bearer $ALAYA_READONLY_API_KEY" \
 
 Optional query parameter `relation_type` (`RELATES_TO`, `PRECEDES`, `CONTRADICTS`) filters the edges.
 
-Response: `{ "relations": [...], "content_hash": "a3f4...", "count": 2 }`. An invalid `content_hash` returns `400` with `{ "error": "invalid content_hash format" }`, and an invalid `relation_type` returns `400` with `{ "error": "invalid relation_type" }`. Neither reaches the graph. A graph read that fails or times out returns `500` with `{ "success": false, "error": "..." }`. `POST /relation` reports all of these as `200` with `{ "success": false, "error": "..." }`.
+Response: `{ "relations": [...], "content_hash": "a3f4...", "count": 2 }`. An invalid `content_hash` returns `400` with `{ "error": "invalid content_hash format" }`, and an invalid `relation_type` returns `400` with `{ "error": "invalid relation_type" }`. Neither reaches the graph. A graph read that fails or times out returns `500` with `{ "success": false, "error": "..." }`; when the read blew its command deadline, the body also carries `"error_kind": "timeout"`. If the server cannot take or answer the request (its work queue is full, or the worker is unavailable or did not reply in time), the route returns `503` with `{ "error": "..." }`; retry with backoff. `POST /relation` reports all of these as `200` with `{ "success": false, "error": "..." }`.
 
 ## `POST /supersede`
 
@@ -529,4 +529,4 @@ REST endpoints use HTTP status codes plus a JSON body:
 | `413` | Request body over 1 MB. |
 | `429` | Rate limited (only when running behind a rate-limiting proxy). |
 | `500` | Backend failure — Qdrant/FalkorDB/TEI unreachable, embedding timeout. Body is sanitized; check server logs for detail. |
-| `503` | Server's internal work queue is saturated. Retry with backoff. |
+| `503` | Server could not take or answer the request: its internal work queue is saturated, or the worker is unavailable or did not reply within its deadline. Retry with backoff. |
