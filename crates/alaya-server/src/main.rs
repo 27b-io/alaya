@@ -18,6 +18,8 @@ mod oidc;
 mod telemetry;
 #[cfg(test)]
 mod testkit;
+#[cfg(test)]
+mod testlog;
 mod wellknown;
 
 use axum::{

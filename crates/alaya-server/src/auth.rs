@@ -7,6 +7,7 @@
 //! ops, `StaticReadOnly` only pure reads; every other op — current or future —
 //! requires the full `Static` principal.
 
+use alaya_oidc::{Cause, Error as OidcError};
 use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode, header};
 use axum::middleware::Next;
@@ -18,6 +19,10 @@ use crate::oidc::OidcVerifier;
 /// Max accepted `Authorization` token length (cheap CPU-DoS guard — the body
 /// limit covers payloads, not headers).
 const MAX_TOKEN_LEN: usize = 8 * 1024;
+
+/// Ceiling on a provider failure's cause in the log line. A `Cause::Document`
+/// is IdP-supplied text whose only other bound is the 8 MiB body cap.
+const MAX_LOGGED_CAUSE_CHARS: usize = 256;
 
 /// Read/additive ops an `Oidc` principal may invoke. Everything not listed is
 /// `Static`-only by default (default-deny). Values are canonical op-names =
@@ -221,13 +226,73 @@ async fn authenticate(auth: &AuthState, token: &str) -> Option<AuthPrincipal> {
     {
         match verifier.validate(token).await {
             Ok(()) => return Some(AuthPrincipal::Oidc),
-            // The reason string is already a server-safe &'static str (no
-            // token internals leaked). Log so operators can diagnose
-            // "claude.ai stopped working" without grepping silence.
-            Err(e) => tracing::debug!(reason = %e, "OIDC validation failed"),
+            Err(e) => log_oidc_failure(verifier.issuer(), e),
         }
     }
     None
+}
+
+/// Record a failed bearer verification by class. The client sees a generic
+/// 401 whatever happened, so this line is the only place an operator can
+/// tell a bad token from an issuer outage.
+///
+/// - `Invalid` — a refused token — stays at `debug`: it is client-driven, and
+///   at `warn` any caller could flood the log.
+/// - `Provider` with `Cause::Cooldown` stays at `debug` too: no request was
+///   made, and the fetch that armed the cooldown already warned. That keeps
+///   provider warns at one per outbound fetch whatever the request rate.
+/// - Every other `Provider` failure is a real fetch that failed, and warns.
+///
+/// Untrusted text (`issuer`, `cause`) is recorded with `?`, never `%`, so a
+/// newline in it cannot forge a second record, and `cause` is clipped. A
+/// parse failure logs its shape only (see `alaya_oidc::ParseFailure`). The
+/// match is exhaustive on purpose: a new `Cause` must pick its line here.
+fn log_oidc_failure(issuer: &str, e: OidcError) {
+    let (op, cause) = match e {
+        OidcError::Invalid(reason) => {
+            tracing::debug!(reason, "OIDC validation failed");
+            return;
+        }
+        OidcError::Provider { op, cause } => (op, cause),
+    };
+    let cause = match cause {
+        Cause::Cooldown => {
+            tracing::debug!(op, "OIDC provider not retried inside its cooldown");
+            return;
+        }
+        Cause::Parse(shape) => {
+            tracing::warn!(
+                op,
+                issuer = ?issuer,
+                category = ?shape.category,
+                line = shape.line,
+                column = shape.column,
+                "OIDC provider response did not parse"
+            );
+            return;
+        }
+        Cause::Transport(e) => e.to_string(),
+        Cause::Status(status) => status.to_string(),
+        Cause::TooLarge => "response body exceeded the cap".to_string(),
+        Cause::Document(value) => value,
+        Cause::Missing => "absent".to_string(),
+    };
+    tracing::warn!(
+        op,
+        issuer = ?issuer,
+        cause = ?clip(&cause, MAX_LOGGED_CAUSE_CHARS),
+        "OIDC provider request failed"
+    );
+}
+
+/// The first `max` chars of `s`, marked when cut — a cut URL otherwise reads
+/// as a complete, wrong one.
+fn clip(s: &str, max: usize) -> String {
+    let mut out: String = s.chars().take(max).collect();
+    if out.len() < s.len() {
+        out.push('…');
+    }
+    out
 }
 
 fn challenge_401(auth: &AuthState) -> Response {
@@ -745,5 +810,81 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(bearer(&not_bearer), None);
+    }
+
+    // ── OIDC failure logging: an outage warns, a bad token does not ──────────
+
+    fn live_oidc_state(issuer: &str) -> AuthState {
+        let mut auth = state(None, false);
+        auth.oidc = Some(OidcVerifier::new(
+            issuer.to_string(),
+            crate::testkit::AUDIENCE.to_string(),
+        ));
+        auth
+    }
+
+    fn live_token(issuer: &str, kid: &str) -> String {
+        let mut c = crate::testkit::TestClaims::valid();
+        c.iss = issuer.to_string();
+        crate::testkit::mint(jsonwebtoken::Algorithm::RS256, Some(kid), &c)
+    }
+
+    fn warns(log: &str) -> Vec<&str> {
+        log.lines().filter(|l| l.contains(" WARN ")).collect()
+    }
+
+    /// AC-1 + AC-2: an issuer outage warns once, naming the op and issuer,
+    /// and a second JWT inside the discovery cooldown adds no warn — so the
+    /// warn rate is bounded by outbound fetches, not by request rate.
+    #[tokio::test]
+    async fn issuer_outage_warns_once_per_fetch() {
+        use crate::testkit::{IdpFault, KID_RSA, spawn_idp};
+        let base = spawn_idp(IdpFault::Down).await;
+        let auth = live_oidc_state(&base);
+        let token = live_token(&base, KID_RSA);
+        let log = crate::testlog::LogBuf::default();
+        let _guard = log.capture();
+
+        assert_eq!(authenticate(&auth, &token).await, None);
+        let text = log.text();
+        let first = warns(&text);
+        assert_eq!(first.len(), 1, "one warn per failed fetch: {text}");
+        assert!(first[0].contains("alaya_server::auth"), "{text}");
+        assert!(first[0].contains("discovery status"), "{text}");
+        assert!(first[0].contains("500"), "{text}");
+        assert!(first[0].contains(&base), "{text}");
+        assert!(!text.contains(&token), "token reached the log: {text}");
+
+        // Inside DISCOVERY_COOLDOWN: refused without a request, so no warn.
+        assert_eq!(authenticate(&auth, &token).await, None);
+        let text = log.text();
+        assert_eq!(warns(&text).len(), 1, "cooldown refusal warned: {text}");
+    }
+
+    /// AC-3: a refused token against a healthy issuer stays at debug. The
+    /// forged `kid` makes the verifier fetch discovery + JWKS for real and
+    /// still refuse, so the healthy fetch path is covered too.
+    #[tokio::test]
+    async fn bad_token_against_healthy_issuer_does_not_warn() {
+        use crate::testkit::{IdpFault, spawn_idp};
+        let base = spawn_idp(IdpFault::None).await;
+        let auth = live_oidc_state(&base);
+        let log = crate::testlog::LogBuf::default();
+        let _guard = log.capture();
+
+        let token = live_token(&base, "forged-kid");
+        assert_eq!(authenticate(&auth, &token).await, None);
+        let text = log.text();
+        assert!(warns(&text).is_empty(), "bad token warned: {text}");
+        // The refusal came from the key lookup after a real JWKS fetch: that
+        // fetch armed the JWKS cooldown, which only a fetched document arms.
+        let err = auth
+            .oidc
+            .as_ref()
+            .unwrap()
+            .validate(&token)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "unknown kid (cooldown)");
     }
 }

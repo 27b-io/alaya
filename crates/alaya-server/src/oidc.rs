@@ -167,62 +167,13 @@ mod tests {
     // touches the network) and exercise the security-critical claim/signature
     // path with real signed tokens minted by `testkit`.
 
-    use crate::testkit::{self, TestClaims, mint};
+    use crate::testkit::{self, IdpFault, TestClaims, mint, spawn_idp};
 
     fn rsa_verifier() -> OidcVerifier {
         OidcVerifier::test_with_rsa_key()
     }
     fn ec_verifier() -> OidcVerifier {
         OidcVerifier::test_with_ec_key()
-    }
-
-    /// Which discovery defect the mock IdP serves, to exercise each rejection
-    /// branch independently. (Fieldless; `Copy` so `spawn_idp` can match it
-    /// twice without a move.)
-    #[derive(Clone, Copy)]
-    enum IdpFault {
-        /// Correct discovery + JWKS (happy path).
-        None,
-        /// discovery `issuer` != configured issuer (OIDC Core §4.3).
-        Issuer,
-        /// `jwks_uri` on a different origin than the issuer (key substitution).
-        JwksOrigin,
-    }
-
-    /// Spawn a loopback OIDC provider serving discovery + JWKS for the RSA test
-    /// key. Returns the base URL (a loopback issuer, so http is accepted).
-    async fn spawn_idp(fault: IdpFault) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let issuer = match fault {
-            IdpFault::Issuer => "https://attacker.test".to_string(),
-            _ => base.clone(),
-        };
-        let jwks_uri = match fault {
-            IdpFault::JwksOrigin => "https://attacker.test/jwks".to_string(),
-            _ => format!("{base}/jwks"),
-        };
-        let discovery = serde_json::json!({ "issuer": issuer, "jwks_uri": jwks_uri }).to_string();
-        let jwks = serde_json::json!({
-            "keys": [{
-                "kty": "RSA", "kid": testkit::KID_RSA,
-                "n": testkit::RSA_N, "e": testkit::RSA_E,
-            }]
-        })
-        .to_string();
-        let app = axum::Router::new()
-            .route(
-                "/.well-known/openid-configuration",
-                axum::routing::get(move || std::future::ready(discovery.clone())),
-            )
-            .route(
-                "/jwks",
-                axum::routing::get(move || std::future::ready(jwks.clone())),
-            );
-        // The listener is already bound, so the OS accept-backlog absorbs the
-        // verifier's connect even before axum's accept loop runs — no sleep.
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        base
     }
 
     /// Assert the verifier rejected with EXACTLY this reason. Exact-match (not
