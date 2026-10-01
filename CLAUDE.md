@@ -54,7 +54,8 @@ crates/
 │   ├── traits.rs        # VectorStorage, EmbeddingProvider, GraphService, HebbianService, ConsolidationService, SummaryProvider, ContradictionJudge
 │   ├── qdrant.rs        # QdrantClient — Qdrant REST API (WASM-compat)
 │   ├── embedding.rs     # EmbeddingClient — OpenAI-compat /v1/embeddings
-│   ├── anthropic.rs     # Shared raw-HTTP Anthropic Messages transport (no SDK; 429 → RateLimited)
+│   ├── anthropic.rs     # Shared raw-HTTP LLM transport + Anthropic Messages wire (no SDK; 429 → RateLimited)
+│   ├── openai.rs        # OpenAI-compatible chat-completions wire for the same transport (LAB-6877)
 │   ├── summary.rs       # SummaryClient — one-line summaries over anthropic.rs
 │   ├── judge.rs         # JudgeClient — CONTRADICTS pair verdicts via structured output (LAB-3283)
 │   └── graph.rs         # GraphHttpClient — bridge HTTP wrapper (3 trait impls)
@@ -150,11 +151,14 @@ OTEL_EXPORTER_OTLP_HEADERS=                                     #   Boot is refu
                                                                 #   exactly as the exporter resolves them; only the pair it
                                                                 #   will actually use is checked.
 OTEL_SERVICE_NAME=alaya-server
-SUMMARY_URL=                             # optional — Anthropic API origin; client appends /v1/messages. https:// required off-cluster
+SUMMARY_PROVIDER=anthropic               # wire protocol: anthropic (/v1/messages, x-api-key) | openai (any OpenAI-compatible
+                                         #   endpoint, e.g. a LiteLLM proxy or vLLM: /v1/chat/completions, Bearer). Other values refuse boot
+SUMMARY_URL=                             # optional — API origin; client appends the wire's path. https:// required off-cluster
                                          #   (https://api.anthropic.com); plain http only for a cluster-local proxy (http://anthropic-lb:8082).
                                          #   Boot is refused when a key would go over http to any other host (applies to JUDGE_URL too)
 SUMMARY_API_KEY=
 SUMMARY_MODEL=claude-haiku-4-5-20251001
+JUDGE_PROVIDER=                          # falls back to SUMMARY_PROVIDER; same prompt, schema and validation on either wire
 JUDGE_URL=                               # contradiction judge; URL and key fall back to their SUMMARY_* twin
 JUDGE_API_KEY=                           #   (so SUMMARY_URL alone enables the judge). Both unset = judge disabled.
 JUDGE_MODEL=claude-sonnet-5              #   Own default, not SUMMARY_MODEL: Haiku fails the golden-set precision bar.
