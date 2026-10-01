@@ -201,14 +201,7 @@ impl AlayaClient {
     /// A worker deadline answers `200 {"success": false}`, which must read
     /// as a failure, never as an empty document.
     pub async fn stats(&self) -> Result<Value, AppError> {
-        match self.get("/stats").await {
-            // `get`'s 404 means "no such memory"; here it means a server
-            // build without the route.
-            Err(AppError::NotFound(_)) => Err(AppError::Upstream(
-                "alaya-server has no GET /stats (older build)".into(),
-            )),
-            r => op_failure(r?),
-        }
+        op_failure(self.get("/stats").await?)
     }
 }
 

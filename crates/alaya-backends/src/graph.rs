@@ -690,6 +690,7 @@ impl GraphService for GraphHttpClient {
         handle_response(resp).await
     }
 
+    #[tracing::instrument(skip(self))]
     async fn get_stats(&self) -> Result<GraphStats> {
         let resp = self
             .client

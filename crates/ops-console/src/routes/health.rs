@@ -14,7 +14,7 @@ use leptos::prelude::*;
 use serde_json::Value;
 
 use crate::error::AppError;
-use crate::routes::{fmt_epoch, vf, vs};
+use crate::routes::vs;
 use crate::session::{Session, take_flash};
 use crate::state::AppState;
 use crate::ui::*;
@@ -23,26 +23,23 @@ const TITLE: &str = "Ālaya health — ops console";
 
 /// Verdict rows in display order: `(key in by_verdict, label, the
 /// contradictions page's `verdict` filter)`. A stored failure and a pair
-/// never judged share the `unjudged` filter, which matches both; an
-/// unrecognised verdict has no filter that selects it.
-const VERDICT_ROWS: [(&str, &str, Option<&str>); 7] = [
-    ("contradiction", "contradiction", Some("contradiction")),
-    ("supersession", "supersession", Some("supersession")),
-    ("coexist", "coexist", Some("coexist")),
-    ("unrelated", "unrelated", Some("unrelated")),
-    ("unjudged", "stored judge failure", Some("unjudged")),
-    ("never_judged", "never judged (backlog)", Some("unjudged")),
-    ("unrecognised", "unrecognised verdict", None),
+/// never judged share the `unjudged` filter, which matches both.
+const VERDICT_ROWS: [(&str, &str, &str); 6] = [
+    ("contradiction", "contradiction", "contradiction"),
+    ("supersession", "supersession", "supersession"),
+    ("coexist", "coexist", "coexist"),
+    ("unrelated", "unrelated", "unrelated"),
+    ("unjudged", "stored judge failure", "unjudged"),
+    ("never_judged", "never judged (backlog)", "unjudged"),
 ];
 
 /// Columns of the per-day table, in the server's key names.
-const DAY_COLUMNS: [&str; 6] = [
+const DAY_COLUMNS: [&str; 5] = [
     "contradiction",
     "supersession",
     "coexist",
     "unrelated",
     "unjudged",
-    "unrecognised",
 ];
 
 /// The four classes the judge answers with — the degenerate-reason rows.
@@ -88,7 +85,10 @@ fn count(v: Option<&Value>) -> String {
 }
 
 fn unavailable(what: &str, detail: &str) -> impl IntoView + use<> {
-    let msg = format!("{what}: {detail}");
+    banner(format!("{what}: {detail}"))
+}
+
+fn banner(msg: String) -> impl IntoView + use<> {
     view! {
         <p class="text-sm" role="alert">
             <span class=badge(BadgeKind::Destructive)>"unavailable"</span>
@@ -107,10 +107,9 @@ fn link(href: String, text: String) -> impl IntoView + use<> {
     view! { <a class="text-primary underline-offset-4 hover:underline" href=href>{text}</a> }
 }
 
-// ─── Summary: freshness, errors, judge daily cap ────────────────────────────
+// ─── Summary: errors, vector total, judge daily cap ──────────────────────────
 
 fn summary_card(s: &Value) -> impl IntoView + use<> {
-    let generated = fmt_epoch(vf(s, "generated_at"));
     let errors: Vec<String> = s
         .get("errors")
         .and_then(Value::as_array)
@@ -133,20 +132,9 @@ fn summary_card(s: &Value) -> impl IntoView + use<> {
         <Card>
             <CardHeader>
                 <CardTitle>"Ālaya health"</CardTitle>
-                <CardDescription>{format!("Generated {generated} UTC")}</CardDescription>
             </CardHeader>
             <CardContent>
-                <div class="space-y-2 mb-4">
-                    {errors
-                        .into_iter()
-                        .map(|e| view! {
-                            <p class="text-sm" role="alert">
-                                <span class=badge(BadgeKind::Destructive)>"unavailable"</span>
-                                " "{e}
-                            </p>
-                        })
-                        .collect_view()}
-                </div>
+                <div class="space-y-2 mb-4">{errors.into_iter().map(banner).collect_view()}</div>
                 <dl class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
                     <div>
                         <dt class="text-muted-foreground text-xs">"Memories (vector store)"</dt>
@@ -186,23 +174,16 @@ fn verdicts_card(s: &Value) -> impl IntoView + use<> {
                     let row = by.get(*key);
                     let open = row.and_then(|r| r.get("open"));
                     let resolved = row.and_then(|r| r.get("resolved"));
-                    let total = match (
-                        open.and_then(Value::as_u64),
-                        resolved.and_then(Value::as_u64),
-                    ) {
-                        (Some(o), Some(r)) => (o + r).to_string(),
-                        _ => "—".into(),
-                    };
-                    let cell = |n: String, resolved: bool| match filter {
-                        Some(f) if n != "—" => {
-                            let href = if resolved {
-                                format!("/alaya/contradictions?verdict={f}&resolved=1")
-                            } else {
-                                format!("/alaya/contradictions?verdict={f}")
-                            };
-                            Either::Left(link(href, n))
+                    // A dash is a missing count: nothing to link to.
+                    let cell = |n: String, resolved: bool| match n.as_str() {
+                        "—" => Either::Right(n),
+                        _ if resolved => Either::Left(link(
+                            format!("/alaya/contradictions?verdict={filter}&resolved=1"),
+                            n,
+                        )),
+                        _ => {
+                            Either::Left(link(format!("/alaya/contradictions?verdict={filter}"), n))
                         }
-                        _ => Either::Right(n),
                     };
                     let (label, open, resolved) = (
                         label.to_string(),
@@ -214,7 +195,6 @@ fn verdicts_card(s: &Value) -> impl IntoView + use<> {
                             <TableCell>{label}</TableCell>
                             <TableCell>{open}</TableCell>
                             <TableCell>{resolved}</TableCell>
-                            <TableCell>{total}</TableCell>
                         </TableRow>
                     }
                 })
@@ -227,7 +207,6 @@ fn verdicts_card(s: &Value) -> impl IntoView + use<> {
                                 <TableHead>"Verdict"</TableHead>
                                 <TableHead>"Open"</TableHead>
                                 <TableHead>"Resolved"</TableHead>
-                                <TableHead>"Total"</TableHead>
                             </TableRow>
                         </TableHeader>
                         <TableBody>{rows}</TableBody>
@@ -274,7 +253,6 @@ fn failures_card(s: &Value) -> impl IntoView + use<> {
                 })
                 .collect_view();
             let other = count(f.get("other"));
-            let total = count(f.get("total"));
             Either::Right(view! {
                 <TableWrapper>
                     <Table>
@@ -289,10 +267,6 @@ fn failures_card(s: &Value) -> impl IntoView + use<> {
                             <TableRow>
                                 <TableCell>"other"</TableCell>
                                 <TableCell>{other}</TableCell>
-                            </TableRow>
-                            <TableRow>
-                                <TableCell><span class="font-medium">"total"</span></TableCell>
-                                <TableCell><span class="font-medium">{total}</span></TableCell>
                             </TableRow>
                         </TableBody>
                     </Table>
@@ -378,28 +352,18 @@ fn per_day_card(s: &Value) -> impl IntoView + use<> {
 // ─── Degenerate reasons ─────────────────────────────────────────────────────
 
 fn degenerate_card(s: &Value) -> impl IntoView + use<> {
-    let c = section(s, "contradictions");
-    let body = match c.and_then(|c| c.get("degenerate_reasons")) {
+    let d = section(s, "contradictions").and_then(|c| c.get("degenerate_reasons"));
+    let body = match d {
         None => Either::Left(unavailable("contradiction stats", "see the errors above")),
         Some(d) => {
-            let by = c.and_then(|c| c.get("by_verdict"));
             let rows = JUDGE_CLASSES
                 .iter()
                 .map(|k| {
-                    let row = by.and_then(|b| b.get(*k));
-                    let judged = match (
-                        row.and_then(|r| r.get("open")).and_then(Value::as_u64),
-                        row.and_then(|r| r.get("resolved")).and_then(Value::as_u64),
-                    ) {
-                        (Some(o), Some(r)) => (o + r).to_string(),
-                        _ => "—".into(),
-                    };
                     let (verdict, n) = (k.to_string(), count(d.get(*k)));
                     view! {
                         <TableRow>
                             <TableCell>{verdict}</TableCell>
                             <TableCell>{n}</TableCell>
-                            <TableCell>{judged}</TableCell>
                         </TableRow>
                     }
                 })
@@ -411,7 +375,6 @@ fn degenerate_card(s: &Value) -> impl IntoView + use<> {
                             <TableRow>
                                 <TableHead>"Verdict"</TableHead>
                                 <TableHead>"Degenerate reasons"</TableHead>
-                                <TableHead>"Judged"</TableHead>
                             </TableRow>
                         </TableHeader>
                         <TableBody>{rows}</TableBody>

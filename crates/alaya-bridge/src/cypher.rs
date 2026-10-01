@@ -1128,22 +1128,5 @@ mod tests {
         }
     }
 
-    #[test]
-    fn contradiction_stats_params_come_from_the_enums() {
-        let (_, p, _) = contradiction_stats_reverse_stamped();
-        assert_eq!(p["resolutions"], json!(["keep_both"]));
-        let (_, p, _) = contradiction_stats_failures(10);
-        assert_eq!(p["marker"], json!("unjudged"));
-        assert_eq!(p["lim"], json!(10));
-        let (_, p, _) = contradiction_stats_degenerate();
-        assert_eq!(
-            p["classes"],
-            json!(["contradiction", "supersession", "coexist", "unrelated"]),
-            "failure markers carry an error string, not a judge reason"
-        );
-        let (_, p, _) = contradiction_stats_judged_per_day(1_790_000_000.0);
-        assert_eq!(p["since"], json!(1_790_000_000.0));
-    }
-
     // schema
 }

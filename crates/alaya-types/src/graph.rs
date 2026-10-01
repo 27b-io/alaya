@@ -331,9 +331,7 @@ pub struct GraphStats {
 
 /// Aggregate counts over every `CONTRADICTS` edge (LAB-6881), from bridge
 /// `POST /contradictions/stats`. Verdicts stay the raw edge strings so
-/// nothing is folded away on the wire: `None` is an edge never judged, and
-/// a string `Verdict::parse` rejects (only reachable by a direct graph
-/// write) is reported as it is stored.
+/// nothing is folded away on the wire: `None` is an edge never judged.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContradictionStats {
     /// One row per `(verdict, resolved)` pair present in the graph.
@@ -380,7 +378,7 @@ pub struct VerdictCount {
 }
 
 /// Request body of bridge `POST /contradictions/stats`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContradictionStatsQuery {
     /// Epoch seconds; the lower bound of `judged_per_day`.
     pub judged_since: f64,

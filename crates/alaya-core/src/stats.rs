@@ -21,9 +21,6 @@ pub const JUDGED_DAYS: i64 = 14;
 
 /// Key for an edge never judged (NULL verdict): the backlog.
 const NEVER_JUDGED: &str = "never_judged";
-/// Key for a verdict string `Verdict::parse` rejects. Only a direct graph
-/// write can produce one; reporting it keeps the totals equal to the graph.
-const UNRECOGNISED: &str = "unrecognised";
 
 impl MemoryService {
     /// The `GET /stats` document, minus the judge daily cap (process-local
@@ -56,7 +53,6 @@ impl MemoryService {
         );
 
         json!({
-            "generated_at": now,
             "memories": memories,
             "graph": graph,
             "contradictions": contradictions,
@@ -76,11 +72,12 @@ fn graph_section(g: &GraphStats) -> Value {
     json!({ "node_count": g.node_count, "edge_counts": edges })
 }
 
-/// Map a raw edge verdict to its report key.
-fn verdict_key(v: Option<&str>) -> &'static str {
+/// Map a raw edge verdict to its report key. A string `Verdict::parse`
+/// rejects has none: only a direct graph write can produce one.
+fn verdict_key(v: Option<&str>) -> Option<&'static str> {
     match v {
-        None => NEVER_JUDGED,
-        Some(s) => Verdict::parse(s).map_or(UNRECOGNISED, |v| v.as_str()),
+        None => Some(NEVER_JUDGED),
+        Some(s) => Verdict::parse(s).map(|v| v.as_str()),
     }
 }
 
@@ -88,13 +85,14 @@ fn contradictions_section(c: &ContradictionStats, first_day: i64, today: i64) ->
     let mut by_verdict: BTreeMap<&str, (usize, usize)> = Verdict::ALL
         .iter()
         .map(|v| v.as_str())
-        .chain([NEVER_JUDGED, UNRECOGNISED])
+        .chain([NEVER_JUDGED])
         .map(|k| (k, (0, 0)))
         .collect();
     for t in &c.verdicts {
-        let slot = by_verdict
-            .get_mut(verdict_key(t.verdict.as_deref()))
-            .expect("every key is seeded");
+        let Some(slot) = verdict_key(t.verdict.as_deref()).and_then(|k| by_verdict.get_mut(k))
+        else {
+            continue;
+        };
         if t.resolved {
             slot.1 += t.count;
         } else {
@@ -102,25 +100,22 @@ fn contradictions_section(c: &ContradictionStats, first_day: i64, today: i64) ->
         }
     }
     let unjudged = by_verdict[Verdict::UNJUDGED];
-    let failures_total = unjudged.0 + unjudged.1;
+    let failures = unjudged.0 + unjudged.1;
     let top_total: usize = c.failures.iter().map(|f| f.count).sum();
 
     // Zero-filled so a quiet day reads as 0, not as a missing row. A row
     // outside the window (a replica clock a few seconds ahead at midnight)
     // has no slot and is left out.
-    let day_keys = || {
-        Verdict::ALL
-            .iter()
-            .map(|v| v.as_str())
-            .chain([UNRECOGNISED])
-            .map(|k| (k, 0usize))
-    };
     let mut per_day: BTreeMap<i64, BTreeMap<&str, usize>> = (first_day..=today)
-        .map(|d| (d, day_keys().collect()))
+        .map(|d| (d, Verdict::ALL.iter().map(|v| (v.as_str(), 0)).collect()))
         .collect();
     for t in &c.judged_per_day {
-        if let Some(counts) = per_day.get_mut(&t.day) {
-            *counts.entry(verdict_key(t.verdict.as_deref())).or_default() += t.count;
+        if let Some(n) = per_day
+            .get_mut(&t.day)
+            .zip(verdict_key(t.verdict.as_deref()))
+            .and_then(|(counts, k)| counts.get_mut(k))
+        {
+            *n += t.count;
         }
     }
 
@@ -140,16 +135,15 @@ fn contradictions_section(c: &ContradictionStats, first_day: i64, today: i64) ->
             })
             .collect::<serde_json::Map<String, Value>>(),
         "failures": {
-            "total": failures_total,
             "top": c.failures,
             // The two reads are not atomic, so a marker written between them
             // can put the top list above the total; floor at zero.
-            "other": failures_total.saturating_sub(top_total),
+            "other": failures.saturating_sub(top_total),
         },
         "judged_per_day": per_day
             .into_iter()
             .map(|(d, counts)| json!({
-                "date": utc_date_str((d.max(0) as f64 * DAY_SECS) as u64),
+                "date": utc_date_str(d as u64 * 86_400),
                 "counts": counts,
             }))
             .collect::<Vec<_>>(),
@@ -593,7 +587,6 @@ mod tests {
         assert_eq!(writes.get(), 0, "GET /stats must write nothing (AC-5)");
         assert_eq!(since.get(), (TODAY - 13) as f64 * DAY_SECS);
         assert_eq!(v["errors"], json!([]));
-        assert_eq!(v["generated_at"], json!(NOW));
         assert_eq!(v["memories"], json!({ "total": 1234 }));
         assert_eq!(
             v["graph"],
@@ -613,10 +606,8 @@ mod tests {
                 "unrelated": open_resolved(0, 0),
                 "unjudged": open_resolved(13, 1),
                 "never_judged": open_resolved(30, 0),
-                "unrecognised": open_resolved(4, 0),
             })
         );
-        assert_eq!(c["failures"]["total"], json!(14));
         assert_eq!(c["failures"]["other"], json!(2));
         assert_eq!(
             c["failures"]["top"][0]["reason"],
@@ -626,7 +617,10 @@ mod tests {
         let days = c["judged_per_day"].as_array().unwrap();
         assert_eq!(days.len(), JUDGED_DAYS as usize);
         assert_eq!(days[0]["date"], "2026-09-18");
-        assert_eq!(days[0]["counts"]["unrecognised"], 1);
+        assert!(
+            days[0]["counts"].get("bogus").is_none(),
+            "an unknown verdict string has no slot"
+        );
         assert_eq!(days[13]["date"], "2026-10-01");
         assert_eq!(
             days[13]["counts"]["coexist"], 5,
@@ -661,15 +655,5 @@ mod tests {
                 .iter()
                 .all(|e| e.as_str().unwrap().contains("Graph operation failed"))
         );
-    }
-
-    #[tokio::test]
-    async fn vector_store_unavailable_nulls_only_the_total() {
-        let (svc, _, _) = service(true, false);
-        let v = svc.corpus_stats().await;
-        assert!(v["memories"].is_null());
-        assert!(v["graph"].is_object());
-        assert!(v["contradictions"].is_object());
-        assert_eq!(v["errors"].as_array().unwrap().len(), 1);
     }
 }

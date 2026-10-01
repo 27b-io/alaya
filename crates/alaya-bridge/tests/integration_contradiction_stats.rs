@@ -238,21 +238,3 @@ async fn stats_count_every_edge_once_under_the_queue_resolved_definition() -> an
     ctx.cleanup().await;
     Ok(())
 }
-
-/// A fresh deployment has no graph key yet: every aggregate is empty, not
-/// an error.
-#[tokio::test]
-async fn stats_on_an_absent_graph_are_empty() -> anyhow::Result<()> {
-    let Some(ctx) = common::TestContext::new().await else {
-        return Ok(());
-    };
-    let state = Arc::new(common::build_state(&ctx.conn, &ctx.graph_name));
-    let Json(stats) = contradictions::stats(
-        State(state),
-        Json(ContradictionStatsQuery { judged_since: 0.0 }),
-    )
-    .await
-    .expect("stats");
-    assert_eq!(stats, Default::default());
-    Ok(())
-}

@@ -1167,11 +1167,10 @@ mod tests {
         let day = |date: &str, coexist: u64| {
             serde_json::json!({ "date": date, "counts": {
                 "contradiction": 0, "supersession": 3, "coexist": coexist,
-                "unrelated": 0, "unjudged": 1, "unrecognised": 0,
+                "unrelated": 0, "unjudged": 1,
             }})
         };
         serde_json::json!({
-            "generated_at": 1_790_856_000.0,
             "memories": { "total": 5_234 },
             "graph": { "node_count": 5_000, "edge_counts": {
                 "CONTRADICTS": 4_589, "SUPERSEDES": 131, "HEBBIAN": 77,
@@ -1184,10 +1183,8 @@ mod tests {
                     "unrelated": open_resolved(826, 26),
                     "unjudged": open_resolved(9, 0),
                     "never_judged": open_resolved(1_716, 97),
-                    "unrecognised": open_resolved(0, 0),
                 },
                 "failures": {
-                    "total": 9,
                     "top": [{ "reason": "unjudged: endpoint missing from vector store", "count": 4 }],
                     "other": 5,
                 },
@@ -1249,8 +1246,6 @@ mod tests {
         ] {
             assert!(body.contains(needle), "missing {needle:?} in {body}");
         }
-        // An unrecognised verdict has no filter that selects it.
-        assert!(!body.contains("verdict=unrecognised"));
         assert!(!body.contains("<script"), "no JS on the pane");
     }
 
@@ -1259,7 +1254,6 @@ mod tests {
     #[tokio::test]
     async fn health_pane_with_the_graph_unavailable_renders_banners_not_zeros() {
         let (status, body) = health_page(serde_json::json!({
-            "generated_at": 1_790_856_000.0,
             "memories": { "total": 5_234 },
             "graph": null,
             "contradictions": null,
@@ -1282,9 +1276,8 @@ mod tests {
         );
     }
 
-    /// A worker deadline (`200 {"success": false}`) and a server build with
-    /// no route are both upstream failures: an error banner, never an empty
-    /// document.
+    /// A worker deadline (`200 {"success": false}`) is an upstream failure:
+    /// an error banner, never an empty document.
     #[tokio::test]
     async fn health_pane_upstream_failure_is_a_banner() {
         let (status, body) = health_page(serde_json::json!({
@@ -1294,13 +1287,6 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("unavailable"));
         assert!(body.contains("stats timed out after 30s"));
-
-        let mut config = test_config();
-        config.alaya_url = fake_upstream(Router::new()).await.parse().unwrap();
-        let (status, body) = render(AppState::new(config), "/alaya/health").await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("older build"), "{body}");
-        assert!(!body.contains("memory not found"));
     }
 
     /// The pane's link targets must load on today's contradictions page:

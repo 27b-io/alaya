@@ -471,7 +471,6 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" http://localhost:3001/stats
 
 ```json
 {
-  "generated_at": 1790856000.0,
   "memories": {"total": 5234},
   "graph": {
     "node_count": 5000,
@@ -484,16 +483,14 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" http://localhost:3001/stats
       "coexist": {"open": 1172, "resolved": 36},
       "unrelated": {"open": 826, "resolved": 26},
       "unjudged": {"open": 9, "resolved": 0},
-      "never_judged": {"open": 1716, "resolved": 97},
-      "unrecognised": {"open": 0, "resolved": 0}
+      "never_judged": {"open": 1716, "resolved": 97}
     },
     "failures": {
-      "total": 9,
       "top": [{"reason": "unjudged: endpoint missing from vector store", "count": 4}],
       "other": 5
     },
     "judged_per_day": [
-      {"date": "2026-09-18", "counts": {"contradiction": 0, "supersession": 3, "coexist": 41, "unrelated": 30, "unjudged": 1, "unrecognised": 0}}
+      {"date": "2026-09-18", "counts": {"contradiction": 0, "supersession": 3, "coexist": 41, "unrelated": 30, "unjudged": 1}}
     ],
     "degenerate_reasons": {"contradiction": 1, "supersession": 6, "coexist": 32, "unrelated": 31}
   },
@@ -504,11 +501,10 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" http://localhost:3001/stats
 
 | Field | Meaning |
 |:--|:--|
-| `generated_at` | Server clock, epoch seconds. |
 | `memories.total` | Points in the vector store, superseded memories included. |
 | `graph.node_count`, `graph.edge_counts` | Graph nodes, and edges per relationship type (`HEBBIAN` is the co-access edge). |
-| `contradictions.by_verdict` | Every `CONTRADICTS` edge, keyed by the verdict it carries now, split `open` / `resolved`. **Resolved** is exactly the default `POST /contradictions` queue's rule: either endpoint superseded (an incoming `SUPERSEDES` edge), or the pair stamped `keep_both` on either of its two edges. `unjudged` is a stored judge failure; `never_judged` is an edge with no verdict at all: the backlog of pairs the store path did not judge (daily cap, backlog bound, a transient judge failure), waiting for `POST /backfill/contradictions`. `unrecognised` is a verdict string the server does not know (only a direct graph write produces one); it is reported so the counts always add up to the edge total. Edges, not pairs: a pair detected in both directions counts twice. |
-| `contradictions.failures` | Stored judge failures (`verdict = unjudged`) grouped by full `verdict_reason`: the ten most frequent in `top`, the rest summed in `other`, all of them in `total`. Transient failures (`429`, timeouts, cap refusals) are retried and stored nowhere, so they are not counted. |
+| `contradictions.by_verdict` | Every `CONTRADICTS` edge, keyed by the verdict it carries now, split `open` / `resolved`. **Resolved** is exactly the default `POST /contradictions` queue's rule: either endpoint superseded (an incoming `SUPERSEDES` edge), or the pair stamped `keep_both` on either of its two edges. `unjudged` is a stored judge failure; `never_judged` is an edge with no verdict at all: the backlog of pairs the store path did not judge (daily cap, backlog bound, a transient judge failure), waiting for `POST /backfill/contradictions`. A verdict string the server does not know (only a direct graph write produces one) is left out. Edges, not pairs: a pair detected in both directions counts twice. |
+| `contradictions.failures` | Stored judge failures (`verdict = unjudged`) grouped by full `verdict_reason`: the ten most frequent in `top`, the rest summed in `other`; together they equal `by_verdict.unjudged`. Transient failures (`429`, timeouts, cap refusals) are retried and stored nowhere, so they are not counted. |
 | `contradictions.judged_per_day` | The last 14 UTC days, oldest first, each zero-filled: edges per verdict whose `judged_at` falls on that day. An edge keeps only its latest verdict, so a re-judged edge counts once, on the day of its last judgement. |
 | `contradictions.degenerate_reasons` | Per judge class, judged edges whose trimmed `verdict_reason` is shorter than 10 characters or equals `placeholder` (any case). Display only — nothing acts on it. Failure markers are excluded: their reason is an error string, not the judge's. |
 | `judge_daily_cap.cap` | `JUDGE_DAILY_CAP`, or `null` when no judge is configured. |
@@ -517,7 +513,7 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" http://localhost:3001/stats
 
 Two different confidences exist on a pair and must not be read as one: `verdict_confidence` (on `POST /contradictions`) is the **judge's** confidence in its verdict, while `confidence` is the lexical **detector's** score for the edge when it was written. This endpoint aggregates neither; it counts verdicts and reasons only.
 
-Every aggregate is one read-only pass over the `CONTRADICTS` relationship, using property tests and `indegree()` only (no per-edge pattern predicates). The graph sections are computed fresh per call, so poll it at human rates, not as a metrics scrape. A reply past the command deadline is `{"success": false, "error_kind": "timeout"}`.
+Every aggregate is one read-only pass over the `CONTRADICTS` relationship, using property tests and `indegree()` only (no per-edge pattern predicates). The graph sections are computed fresh per call, so poll it at human rates, not as a metrics scrape. One call runs at a time per process: a call while one is in flight answers `{"success": false, "error": "stats already running"}`. A reply past the command deadline is `{"success": false, "error_kind": "timeout"}`.
 
 ## `POST /mcp`
 

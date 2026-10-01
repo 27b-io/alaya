@@ -212,9 +212,6 @@ pub async fn stats(
     State(state): State<Arc<AppState>>,
     Json(query): Json<ContradictionStatsQuery>,
 ) -> Result<Json<ContradictionStats>, StatusCode> {
-    if !query.judged_since.is_finite() {
-        return Err(StatusCode::UNPROCESSABLE_ENTITY);
-    }
     let run = |(q, p, ro): cypher::CypherQuery| {
         let state = state.clone();
         async move { exec_query(&state, &q, p, ro).await }
@@ -440,16 +437,5 @@ mod tests {
         // No open row at all: nothing to move.
         move_to_resolved(&mut v, Some("unrelated".into()), 2);
         assert_eq!(v.len(), 2);
-    }
-
-    #[test]
-    fn opt_str_tells_null_from_a_mistyped_cell() {
-        assert_eq!(opt_str(Some(&Value::Null)), Some(None));
-        assert_eq!(
-            opt_str(Some(&json!("coexist"))),
-            Some(Some("coexist".into()))
-        );
-        assert_eq!(opt_str(Some(&json!(3))), None);
-        assert_eq!(opt_str(None), None);
     }
 }

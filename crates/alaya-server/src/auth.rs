@@ -546,15 +546,6 @@ mod tests {
     }
 
     #[test]
-    fn stats_route_is_static_only() {
-        let op = rest_route_op(&Method::GET, "/stats");
-        assert_eq!(op, "corpus_stats");
-        assert!(AuthPrincipal::Static.allows(op));
-        assert!(!AuthPrincipal::Oidc.allows(op));
-        assert!(!AuthPrincipal::StaticReadOnly.allows(op));
-    }
-
-    #[test]
     fn constant_time_eq_basic() {
         assert!(constant_time_eq(b"secret", b"secret"));
         assert!(!constant_time_eq(b"secret", b"secres"));

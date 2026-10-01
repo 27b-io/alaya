@@ -1250,6 +1250,10 @@ async fn service_worker(
     // rather than coordinated across processes.
     let judge_gate = std::rc::Rc::new(tokio::sync::Semaphore::new(JUDGE_CONCURRENCY));
     let backfill_running = std::rc::Rc::new(std::cell::Cell::new(false));
+    // GET /stats single-flight: each call is several whole-relation scans,
+    // and overlapping runs contend for the graph (see the bridge handler),
+    // so a refresh while one is in flight is refused rather than stacked.
+    let stats_running = std::rc::Rc::new(std::cell::Cell::new(false));
     let judge_limiter = std::rc::Rc::new(std::cell::RefCell::new(JudgeDailyCap::new(
         limits.judge_daily_cap,
     )));
@@ -1809,7 +1813,15 @@ async fn service_worker(
                     .instrument(span),
                 );
             }
+            CmdInner::Stats { reply } if stats_running.get() => {
+                let _ = reply.send(json!({
+                    "success": false,
+                    "error": "stats already running"
+                }));
+            }
             CmdInner::Stats { reply } => {
+                stats_running.set(true);
+                let running = stats_running.clone();
                 // Read here, on the worker that owns the counter; the
                 // aggregates themselves run in a spawned task below.
                 let cap = judge_cap_view(&judge_limiter.borrow(), svc.judge.is_some());
@@ -1830,6 +1842,7 @@ async fn service_worker(
                             }
                             Err(_) => deadline_exceeded(op, deadline, start),
                         };
+                        running.set(false);
                         let _ = reply.send(result);
                     }
                     .instrument(span),
@@ -4771,11 +4784,32 @@ mod wedge_tests {
                 assert_eq!(pong["ok"], true);
                 assert!(srx.try_recv().is_err(), "stats cannot have answered yet");
 
+                // Single-flight: a second call while the first runs is refused.
+                let send_stats = || async {
+                    let (tx2, rx2) = oneshot::channel();
+                    tx.send(Cmd {
+                        inner: CmdInner::Stats { reply: tx2 },
+                        span: tracing::Span::none(),
+                    })
+                    .await
+                    .unwrap();
+                    rx2
+                };
+                let refused = send_stats().await.await.unwrap();
+                assert_eq!(refused["error"], "stats already running");
+
                 let reply = tokio::time::timeout(Duration::from_secs(60), srx)
                     .await
                     .expect("stats never replied")
                     .unwrap();
                 assert_eq!(reply["error_kind"], "timeout");
+
+                // The guard is released when the run ends, even on timeout.
+                let again = tokio::time::timeout(Duration::from_secs(60), send_stats().await)
+                    .await
+                    .expect("stats never replied")
+                    .unwrap();
+                assert_eq!(again["error_kind"], "timeout", "{again}");
             })
             .await;
     }
