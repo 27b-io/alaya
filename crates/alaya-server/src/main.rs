@@ -5029,9 +5029,9 @@ mod wedge_tests {
                     })
                     .await
                     .unwrap();
-                    rx2
+                    rx2.await.unwrap()
                 };
-                let refused = send_stats().await.await.unwrap();
+                let refused = send_stats().await;
                 assert_eq!(refused["error"], "stats already running");
 
                 let reply = tokio::time::timeout(Duration::from_secs(60), srx)
@@ -5041,10 +5041,9 @@ mod wedge_tests {
                 assert_eq!(reply["error_kind"], "timeout");
 
                 // The guard is released when the run ends, even on timeout.
-                let again = tokio::time::timeout(Duration::from_secs(60), send_stats().await)
+                let again = tokio::time::timeout(Duration::from_secs(60), send_stats())
                     .await
-                    .expect("stats never replied")
-                    .unwrap();
+                    .expect("stats never replied");
                 assert_eq!(again["error_kind"], "timeout", "{again}");
             })
             .await;
