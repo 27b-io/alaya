@@ -36,6 +36,7 @@ use tokio::sync::{mpsc, oneshot};
 use tower_http::trace::TraceLayer;
 
 use alaya_backends::{
+    Provider,
     embedding::EmbeddingClient,
     graph::GraphHttpClient,
     graph_ref::{ConsolidationRef, GraphRef, HebbianRef},
@@ -73,6 +74,10 @@ struct Config {
     summary_url: Option<String>,
     summary_api_key: Option<String>,
     summary_model: String,
+    /// Wire protocol per LLM role (LAB-6877): `SUMMARY_PROVIDER`, and
+    /// `JUDGE_PROVIDER` falling back to it, like the URL and key below.
+    summary_provider: Provider,
+    judge_provider: Provider,
     /// Contradiction judge (LAB-3283, LAB-3895). URL and key fall back to the
     /// SUMMARY_* counterpart; with neither set the engine is disabled. The
     /// model has its own default: summaries are priced for volume, verdicts
@@ -90,6 +95,18 @@ struct Config {
 
 impl Config {
     fn from_env() -> Self {
+        let summary_provider = parse_provider(
+            "SUMMARY_PROVIDER",
+            env_non_empty("SUMMARY_PROVIDER"),
+            Provider::default(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let judge_provider = parse_provider(
+            "JUDGE_PROVIDER",
+            env_non_empty("JUDGE_PROVIDER"),
+            summary_provider,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         let cfg = Self {
             qdrant_url: env_required("QDRANT_URL"),
             qdrant_collection: env_or("QDRANT_COLLECTION", "memories_arctic1024"),
@@ -120,6 +137,8 @@ impl Config {
             summary_url: env_non_empty("SUMMARY_URL"),
             summary_api_key: env_non_empty("SUMMARY_API_KEY"),
             summary_model: env_or("SUMMARY_MODEL", "claude-haiku-4-5-20251001"),
+            summary_provider,
+            judge_provider,
             judge_url: env_non_empty("JUDGE_URL").or_else(|| env_non_empty("SUMMARY_URL")),
             judge_api_key: env_non_empty("JUDGE_API_KEY")
                 .or_else(|| env_non_empty("SUMMARY_API_KEY")),
@@ -743,6 +762,13 @@ pub(crate) enum CmdInner {
         reason: String,
         reply: oneshot::Sender<Value>,
     },
+    /// Reverse a supersession (LAB-6876). `via` is who, recorded verbatim.
+    Unsupersede {
+        hash: String,
+        reason: String,
+        via: String,
+        reply: oneshot::Sender<Value>,
+    },
     Contradictions {
         limit: usize,
         offset: usize,
@@ -751,7 +777,8 @@ pub(crate) enum CmdInner {
         reply: oneshot::Sender<Value>,
     },
     /// Stamp (`Some`) or clear (`None`) the operator's resolution on a
-    /// CONTRADICTS pair (LAB-3885). The only write path to `e.resolution*`.
+    /// CONTRADICTS pair (LAB-3885). With `Unsupersede`, the only writer of
+    /// `e.resolution*`.
     ResolveContradiction {
         memory_a_hash: String,
         memory_b_hash: String,
@@ -815,6 +842,7 @@ impl Cmd {
             CmdInner::GetMemory { .. } => "get_memory",
             CmdInner::Relation { .. } => "relation",
             CmdInner::Supersede { .. } => "supersede",
+            CmdInner::Unsupersede { .. } => "unsupersede",
             CmdInner::Contradictions { .. } => "contradictions",
             CmdInner::ResolveContradiction { .. } => "resolve_contradiction",
             CmdInner::FindDuplicates { .. } => "find_duplicates",
@@ -1536,6 +1564,47 @@ async fn service_worker(
                 };
                 let _ = reply.send(result);
             }
+            CmdInner::Unsupersede {
+                hash,
+                reason,
+                via,
+                reply,
+            } => {
+                let span = tracing::info_span!(parent: &ps, "unsupersede");
+                let h = truncate_hash(&hash);
+                let result = match timeout(
+                    limits.cmd,
+                    svc.memory_unsupersede(&hash, &reason, &via)
+                        .instrument(span),
+                )
+                .await
+                {
+                    Ok(Ok(r)) => {
+                        tracing::info!(
+                            op,
+                            hash = h.as_str(),
+                            status = r["status"].as_str().unwrap_or_default(),
+                            via = via.as_str(),
+                            elapsed_ms = ms(start),
+                            "ok"
+                        );
+                        r
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(
+                            op,
+                            error = %e,
+                            hash = h.as_str(),
+                            hash_len = hash.len(),
+                            elapsed_ms = ms(start),
+                            "failed"
+                        );
+                        json!({"success": false, "error": e.safe_message()})
+                    }
+                    Err(_) => deadline_exceeded(op, limits.cmd, start),
+                };
+                let _ = reply.send(result);
+            }
             CmdInner::Contradictions {
                 limit,
                 offset,
@@ -1852,6 +1921,15 @@ fn contradicted_hashes(store_result: &std::collections::HashMap<String, Value>) 
     hashes.sort();
     hashes.dedup();
     hashes
+}
+
+/// `*_PROVIDER`, read through `env_non_empty` (so blank is unset): unset is
+/// `fallback`, anything but `anthropic` / `openai` refuses boot naming the
+/// variable.
+fn parse_provider(var: &str, raw: Option<String>, fallback: Provider) -> Result<Provider, String> {
+    raw.map_or(Ok(fallback), |s| {
+        s.parse().map_err(|e| format!("{var}: {e}"))
+    })
 }
 
 /// Default daily cap for store-path judge calls (LAB-3895).
@@ -2416,12 +2494,14 @@ fn main() {
         let summary: Option<SummaryClient> = if let Some(url) = &config.summary_url {
             tracing::info!(
                 origin = log_safe_origin(url).as_str(),
+                provider = config.summary_provider.as_str(),
                 model = config.summary_model.as_str(),
                 has_api_key = config.summary_api_key.is_some(),
                 "summary provider enabled"
             );
             Some(
                 SummaryClient::new(
+                    config.summary_provider,
                     url.clone(),
                     config.summary_model.clone(),
                     config.summary_api_key.clone(),
@@ -2458,6 +2538,7 @@ fn main() {
         let judge: Option<JudgeClient> = if let Some(url) = &config.judge_url {
             tracing::info!(
                 origin = log_safe_origin(url).as_str(),
+                provider = config.judge_provider.as_str(),
                 model = config.judge_model.as_str(),
                 has_api_key = config.judge_api_key.is_some(),
                 daily_cap = config.judge_daily_cap,
@@ -2465,6 +2546,7 @@ fn main() {
             );
             Some(
                 JudgeClient::new(
+                    config.judge_provider,
                     url.clone(),
                     config.judge_model.clone(),
                     config.judge_api_key.clone(),
@@ -2656,6 +2738,7 @@ fn protected_router(handle: ServiceHandle, auth_state: AuthState) -> Router {
         .route("/delete", post(delete))
         .route("/relation", post(relation))
         .route("/supersede", post(supersede))
+        .route("/unsupersede", post(unsupersede))
         .route("/contradictions", post(contradictions))
         .route("/contradictions/resolution", post(resolve_contradiction))
         .route("/duplicates/find", post(find_duplicates))
@@ -2853,6 +2936,32 @@ async fn supersede(
             old_hash: req.old_hash,
             new_hash: req.new_hash,
             reason: req.reason,
+            reply: tx,
+        },
+        rx,
+    )
+    .await
+}
+
+/// `reason` and `unsuperseded_via` are the audit record: both required.
+#[derive(Deserialize)]
+struct UnsupersedeReq {
+    content_hash: String,
+    reason: String,
+    /// Who reversed it, recorded verbatim (`operator:console`, `operator:ray`).
+    unsuperseded_via: String,
+}
+
+async fn unsupersede(
+    axum::extract::State(h): axum::extract::State<ServiceHandle>,
+    Json(req): Json<UnsupersedeReq>,
+) -> (StatusCode, Json<Value>) {
+    let (tx, rx) = oneshot::channel();
+    h.call(
+        CmdInner::Unsupersede {
+            hash: req.content_hash,
+            reason: req.reason,
+            via: req.unsuperseded_via,
             reply: tx,
         },
         rx,
@@ -3188,6 +3297,30 @@ mod tests {
         assert!(no_via.is_err(), "resolved_via is required on REST");
     }
 
+    // ─── unsupersede wire shape (LAB-6876 AC-4) ──────────────────────────
+
+    /// Who and why are the audit record: REST refuses a request without
+    /// either rather than recording a blank.
+    #[test]
+    fn unsupersede_req_requires_reason_and_unsuperseded_via() {
+        let h = "a".repeat(64);
+        let ok: UnsupersedeReq = serde_json::from_value(json!({
+            "content_hash": h, "reason": "wrong merge", "unsuperseded_via": "operator:console"
+        }))
+        .unwrap();
+        assert_eq!(ok.unsuperseded_via, "operator:console");
+        for missing in ["reason", "unsuperseded_via"] {
+            let mut body = json!({
+                "content_hash": h, "reason": "wrong merge", "unsuperseded_via": "operator:console"
+            });
+            body.as_object_mut().unwrap().remove(missing);
+            assert!(
+                serde_json::from_value::<UnsupersedeReq>(body).is_err(),
+                "{missing} is required on REST"
+            );
+        }
+    }
+
     // ─── Contradiction judge plumbing (LAB-3283 AC-4, AC-5, AC-9) ─────────
 
     #[test]
@@ -3339,6 +3472,29 @@ mod tests {
     }
 
     // ─── Daily judge spend cap (LAB-3895) ──────────────────────────────────
+
+    #[test]
+    fn parse_provider_defaults_falls_back_and_refuses_unknown() {
+        let a = Provider::Anthropic;
+        let o = Provider::OpenAi;
+        // Default: unset is the fallback (anthropic for SUMMARY_*).
+        assert_eq!(parse_provider("SUMMARY_PROVIDER", None, a), Ok(a));
+        // Override.
+        assert_eq!(
+            parse_provider("SUMMARY_PROVIDER", Some("openai".into()), a),
+            Ok(o)
+        );
+        assert_eq!(
+            parse_provider("JUDGE_PROVIDER", Some("anthropic".into()), o),
+            Ok(a)
+        );
+        // Fallback: an unset JUDGE_PROVIDER takes SUMMARY_PROVIDER's value.
+        assert_eq!(parse_provider("JUDGE_PROVIDER", None, o), Ok(o));
+        // Bad value names the variable.
+        let err = parse_provider("JUDGE_PROVIDER", Some("litellm".into()), a).unwrap_err();
+        assert!(err.starts_with("JUDGE_PROVIDER: "), "{err}");
+        assert!(err.contains("litellm"), "{err}");
+    }
 
     #[test]
     fn parse_judge_daily_cap_defaults_and_validates() {
@@ -4144,13 +4300,20 @@ mod tests {
                     .await;
             });
         });
-        // Summary and judge share the one Messages transport builder.
-        probe("anthropic transport", &mut || {
-            rt.block_on(async {
-                let c = SummaryClient::new(TARGET.into(), "m".into(), Some("k".into())).unwrap();
-                let _ = c.summarize("x").await;
+        // Summary and judge share the one LLM transport builder; probe each wire.
+        for (name, provider) in [
+            ("anthropic transport", Provider::Anthropic),
+            ("openai transport", Provider::OpenAi),
+        ] {
+            probe(name, &mut || {
+                rt.block_on(async {
+                    let c =
+                        SummaryClient::new(provider, TARGET.into(), "m".into(), Some("k".into()))
+                            .unwrap();
+                    let _ = c.summarize("x").await;
+                });
             });
-        });
+        }
         probe("rerank", &mut || {
             rt.block_on(async {
                 let c =
@@ -4406,6 +4569,14 @@ mod wedge_tests {
 
     #[async_trait(?Send)]
     impl VectorStorage for HangVectors {
+        async fn reverse_supersession(
+            &self,
+            _h: &str,
+            _e: &serde_json::Value,
+            _r: &alaya_backends::ReversalRecord,
+        ) -> Result<alaya_backends::ReversalOutcome> {
+            unimplemented!()
+        }
         async fn store(&self, _memory: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             unimplemented!()
         }
@@ -4524,6 +4695,31 @@ mod wedge_tests {
 
     #[async_trait(?Send)]
     impl GraphService for StubGraph {
+        async fn unsettle_contradiction(
+            &self,
+            _s: &str,
+            _d: &str,
+            _v: &str,
+            _t: f64,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn settle_contradiction(
+            &self,
+            _s: &str,
+            _d: &str,
+            _v: &str,
+            _t: f64,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn delete_incoming_system_edges(
+            &self,
+            _d: &str,
+            _r: alaya_types::graph::SystemRelationType,
+        ) -> Result<Vec<String>> {
+            unimplemented!()
+        }
         async fn ensure_node(&self, _content_hash: &str, _created_at: f64) -> Result<()> {
             unimplemented!()
         }
@@ -5152,6 +5348,8 @@ mod wedge_tests {
             summary_url: None,
             summary_api_key: None,
             summary_model: String::new(),
+            summary_provider: Provider::Anthropic,
+            judge_provider: Provider::Anthropic,
             judge_url: None,
             judge_api_key: None,
             judge_model: String::new(),

@@ -53,7 +53,9 @@ const JWKS_COOLDOWN: Duration = Duration::from_secs(30);
 /// discovery keeps failing: [`JWKS_COOLDOWN`] arms only once discovery has
 /// returned a document, which then stays cached, so the two never apply to
 /// the same refetch. It stays strictly shorter all the same, as asserted
-/// below.
+/// below. The assert also covers the seeding in `cooled_down`, which puts
+/// both gates `2 × JWKS_COOLDOWN` in the past: a discovery cooldown at or past
+/// that age would refuse the first discovery after a start.
 const DISCOVERY_COOLDOWN: Duration = JWKS_COOLDOWN.saturating_sub(Duration::from_secs(1));
 const _: () = assert!(DISCOVERY_COOLDOWN.as_nanos() < JWKS_COOLDOWN.as_nanos());
 
@@ -944,7 +946,7 @@ mod tests {
 
     /// The same for a caller dropped while the refetch is still resolving
     /// discovery on a cold cache: the cooldown is not armed until discovery
-    /// has answered, and the discovery fetch itself runs on.
+    /// has returned a document, and the discovery fetch itself runs on.
     #[tokio::test]
     async fn a_key_for_kid_cancelled_mid_discovery_does_not_lock_out_the_next_call() {
         let (issuer, accepted, server) = loopback_idp(good_idp, Duration::from_millis(200)).await;
@@ -972,7 +974,7 @@ mod tests {
     /// legitimate key it cached is served.
     #[tokio::test]
     async fn an_unknown_kid_flood_with_hang_ups_fetches_jwks_once() {
-        let (issuer, accepted, server) = loopback_idp(good_idp, Duration::from_millis(200)).await;
+        let (issuer, accepted, server) = loopback_idp(good_idp, Duration::from_millis(1000)).await;
         let provider = Provider::new(&issuer);
         provider.discovery().await.expect("discovery succeeds");
 
@@ -1056,8 +1058,6 @@ mod tests {
             hung_up.is_err(),
             "the first caller must be dropped mid-discovery"
         );
-        // Let the detached discovery fail and arm its own cooldown.
-        tokio::time::sleep(Duration::from_millis(300)).await;
         let refused = provider.key_for_kid("k1").await.err();
         assert!(
             matches!(

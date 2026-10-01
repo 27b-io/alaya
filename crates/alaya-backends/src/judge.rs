@@ -1,8 +1,10 @@
-//! JudgeClient — `ContradictionJudge` over the Anthropic Messages API with
+//! JudgeClient — `ContradictionJudge` over the shared LLM transport with
 //! structured output (LAB-3283 Phase 1, advisory).
 //!
-//! Rides the same transport as `SummaryClient` (`anthropic.rs`). The
-//! verdict comes back as JSON constrained by `output_config.format`; anything
+//! Rides the same transport as `SummaryClient` (`anthropic.rs`), on either
+//! wire. The verdict comes back as JSON constrained by `verdict_schema()`
+//! (`output_config.format` on Anthropic, `response_format` on an
+//! OpenAI-compatible endpoint) and is validated by one path; anything
 //! that is not a well-formed verdict is an `AlayaError::Judge`, which the
 //! caller records as *unjudged* — never a graph or vector write.
 
@@ -12,8 +14,8 @@ use serde_json::{Value, json};
 
 use alaya_types::{AlayaError, Result, graph::Verdict, memory::Memory};
 
-use crate::anthropic::{MessagesTransport, Usage, truncate_chars};
-use crate::{ContradictionJudge, Judgement, Survivor};
+use crate::anthropic::{MessagesTransport, Prompt, Usage, truncate_chars};
+use crate::{ContradictionJudge, Judgement, Provider, Survivor};
 
 const SYSTEM_PROMPT: &str = "You judge whether two memories from an engineering team's long-term memory store conflict. \
 Classify the pair as exactly one verdict:\n\
@@ -64,18 +66,29 @@ pub struct JudgeClient {
 impl JudgeClient {
     /// Fails with `Config` on key material that is not a valid header value
     /// or on a client build error; never echoes the key (see
-    /// `MessagesTransport::new`).
-    pub fn new(base_url: String, model: String, api_key: Option<String>) -> Result<Self> {
+    /// `MessagesTransport::for_provider`).
+    pub fn new(
+        provider: Provider,
+        base_url: String,
+        model: String,
+        api_key: Option<String>,
+    ) -> Result<Self> {
         Ok(Self {
-            transport: MessagesTransport::new(base_url, api_key, JUDGE_REQUEST_TIMEOUT)?,
+            transport: MessagesTransport::for_provider(
+                provider,
+                base_url,
+                api_key,
+                JUDGE_REQUEST_TIMEOUT,
+            )?,
             model,
         })
     }
 }
 
-/// JSON schema the response is constrained to (`output_config.format`).
-/// Kept to the widely supported subset: enum, anyOf/null, required,
-/// additionalProperties. Range and length are enforced in `RawVerdict::validate`.
+/// JSON schema the response is constrained to, on both wires. Kept to the
+/// widely supported subset (enum, anyOf/null, required, additionalProperties;
+/// every property required, as OpenAI strict mode demands). Range and length
+/// are enforced in `RawVerdict::validate`.
 fn verdict_schema() -> Value {
     json!({
         "type": "object",
@@ -131,21 +144,20 @@ fn describe(label: &str, m: &Memory) -> String {
 impl ContradictionJudge for JudgeClient {
     #[tracing::instrument(skip(self, a, b), fields(a = %&a.content_hash[..8.min(a.content_hash.len())], b = %&b.content_hash[..8.min(b.content_hash.len())]))]
     async fn judge(&self, a: &Memory, b: &Memory) -> Result<Judgement> {
-        let body = json!({
-            "model": self.model,
-            "max_tokens": MAX_OUTPUT_TOKENS,
-            "system": SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": render_pair(a, b)}],
-            "output_config": {"format": {"type": "json_schema", "schema": verdict_schema()}},
-        });
+        let user = render_pair(a, b);
+        let prompt = Prompt {
+            model: &self.model,
+            system: SYSTEM_PROMPT,
+            user: &user,
+            max_tokens: MAX_OUTPUT_TOKENS,
+            schema: Some(("verdict", verdict_schema())),
+        };
 
-        let resp = self.transport.messages(&body, AlayaError::Judge).await?;
+        let resp = self.transport.complete(&prompt, AlayaError::Judge).await?;
         let stop = resp.stop_reason.clone().unwrap_or_default();
-        let text = resp.first_text().ok_or_else(|| {
-            AlayaError::Judge(format!(
-                "empty response from messages API (stop_reason={stop:?})"
-            ))
-        })?;
+        let text = resp
+            .text
+            .ok_or_else(|| AlayaError::Judge(format!("empty completion (stop_reason={stop:?})")))?;
         let raw: RawVerdict = serde_json::from_str(&text).map_err(|e| {
             AlayaError::Judge(format!(
                 "verdict is not valid JSON (stop_reason={stop:?}): {e}"
@@ -193,8 +205,8 @@ impl RawVerdict {
                 self.survivor
                     .ok_or_else(|| AlayaError::Judge("supersession without a survivor".into()))?,
             ),
-            // The schema's enum excludes it; a proxy that drops
-            // `output_config` could let it through, and it is not the
+            // The schema's enum excludes it; a proxy that drops the
+            // structured-output field could let it through, and it is not the
             // model's to say.
             Verdict::Unjudged => {
                 return Err(AlayaError::Judge(
@@ -344,7 +356,8 @@ mod tests {
         /// Short timeout so the timeout path runs in milliseconds.
         fn client(server: &MockServer) -> JudgeClient {
             JudgeClient {
-                transport: MessagesTransport::new(
+                transport: MessagesTransport::for_provider(
+                    Provider::Anthropic,
                     server.uri(),
                     Some("test-key".into()),
                     std::time::Duration::from_millis(300),
@@ -477,7 +490,8 @@ mod tests {
                 .expect("addr")
                 .port();
             let client = JudgeClient {
-                transport: MessagesTransport::new(
+                transport: MessagesTransport::for_provider(
+                    Provider::Anthropic,
                     format!("http://127.0.0.1:{port}"),
                     Some("test-key".into()),
                     std::time::Duration::from_millis(300),
@@ -553,6 +567,123 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(e, AlayaError::Judge(_)), "{e:?}");
+        }
+    }
+
+    // ── OpenAI-compatible wire (LAB-6877): what only this wire does ────────
+    // Status and decode classification is shared (`MessagesTransport::post`)
+    // and covered by `mod http` above; validation by the unit tests.
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod http_openai {
+        use super::*;
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn client(server: &MockServer) -> JudgeClient {
+            JudgeClient {
+                transport: MessagesTransport::for_provider(
+                    Provider::OpenAi,
+                    server.uri(),
+                    Some("test-key".into()),
+                    std::time::Duration::from_millis(300),
+                )
+                .expect("test transport"),
+                model: "test-model".into(),
+            }
+        }
+
+        fn chat(content: serde_json::Value, finish: &str) -> serde_json::Value {
+            json!({"choices": [{"index": 0, "finish_reason": finish,
+                                "message": {"role": "assistant", "content": content, "refusal": null}}],
+                   "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150}})
+        }
+
+        async fn judge_once(server: &MockServer) -> Result<Judgement> {
+            client(server).judge(&mem("a", 1.0), &mem("b", 2.0)).await
+        }
+
+        async fn respond(template: ResponseTemplate) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(template)
+                .mount(&server)
+                .await;
+            server
+        }
+
+        #[tokio::test]
+        async fn request_shape_and_valid_verdict() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .and(header("authorization", "Bearer test-key"))
+                .and(body_partial_json(json!({
+                    "model": "test-model",
+                    "max_completion_tokens": MAX_OUTPUT_TOKENS,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": render_pair(&mem("a", 1.0), &mem("b", 2.0))},
+                    ],
+                    "response_format": {"type": "json_schema", "json_schema": {
+                        "name": "verdict", "strict": true, "schema": verdict_schema()}},
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(chat(
+                    json!(r#"{"verdict":"supersession","survivor":"b","reason":"B replaces A","confidence":0.92}"#),
+                    "stop",
+                )))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let j = judge_once(&server).await.unwrap();
+            assert_eq!(
+                (j.verdict, j.survivor),
+                (Verdict::Supersession, Some(Survivor::B))
+            );
+            assert_eq!(j.model, "test-model");
+            assert_eq!((j.input_tokens, j.output_tokens), (120, 30));
+
+            let req = &server.received_requests().await.unwrap()[0];
+            assert!(req.headers.get("x-api-key").is_none());
+            assert!(req.headers.get("anthropic-version").is_none());
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            assert!(body.get("max_tokens").is_none(), "{body}");
+            assert!(body.get("temperature").is_none(), "{body}");
+            assert!(body.get("output_config").is_none(), "{body}");
+        }
+
+        #[tokio::test]
+        async fn content_filter_refusal_and_empty_are_deterministic() {
+            let refusal = json!({"choices": [{"finish_reason": "stop",
+                "message": {"content": null, "refusal": "I can't help with that."}}]});
+            for body in [
+                chat(serde_json::Value::Null, "content_filter"),
+                refusal,
+                chat(serde_json::Value::Null, "length"),
+                json!({"choices": []}),
+            ] {
+                let server = respond(ResponseTemplate::new(200).set_body_json(body.clone())).await;
+                let e = judge_once(&server).await.unwrap_err();
+                assert!(matches!(e, AlayaError::Judge(_)), "{body}: {e:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn undecodable_body_is_deterministic() {
+            let server = respond(ResponseTemplate::new(200).set_body_string("not json")).await;
+            let e = judge_once(&server).await.unwrap_err();
+            assert!(matches!(e, AlayaError::Judge(_)), "{e:?}");
+        }
+
+        #[tokio::test]
+        async fn redirect_is_not_followed() {
+            let server = respond(
+                ResponseTemplate::new(307).insert_header("location", "http://127.0.0.1:1/steal"),
+            )
+            .await;
+            let e = judge_once(&server).await.unwrap_err();
+            assert!(matches!(e, AlayaError::Unavailable { .. }), "{e:?}");
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
         }
     }
 }

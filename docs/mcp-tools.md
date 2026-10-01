@@ -1,6 +1,6 @@
 # MCP tool reference
 
-Ten tools, grouped by what they do. The authoritative JSON schemas live in [`crates/alaya-server/src/mcp.rs`](../crates/alaya-server/src/mcp.rs) — if anything below disagrees with the source, the source wins.
+Twelve tools, grouped by what they do. The authoritative JSON schemas live in [`crates/alaya-server/src/mcp.rs`](../crates/alaya-server/src/mcp.rs) — if anything below disagrees with the source, the source wins.
 
 For wiring an MCP client to a running server, see [Quickstart: MCP clients](./quickstart-mcp.md). For the REST equivalents (different field names in a few places), see [REST API reference](./rest-api.md).
 
@@ -22,6 +22,7 @@ Almost every tool below either returns or takes a `content_hash`. Two rules that
 | [`check_database_health`](#check_database_health) | Backend health + storage stats | |
 | [`relation`](#relation) | Create / read / delete typed edges between memories | ✓ (`create`/`delete`) |
 | [`memory_supersede`](#memory_supersede) | Mark old memory as superseded by new | ✓ |
+| [`memory_unsupersede`](#memory_unsupersede) | Reverse a supersession, with an audit entry | ✓ |
 | [`memory_contradictions`](#memory_contradictions) | List contradiction pairs with judge verdicts | |
 | [`resolve_contradiction`](#resolve_contradiction) | Keep both memories of a contradiction pair — non-destructive, reversible | ✓ (edge stamp only) |
 | [`find_duplicates`](#find_duplicates) | Scan for near-duplicate memories | |
@@ -207,7 +208,7 @@ Manage typed edges between two memories in the knowledge graph. One tool with th
 
 ## `memory_supersede`
 
-Mark `old_id` as superseded by `new_id`. The old memory stays in storage (so the history is auditable) but is filtered out of default `search` results, and every contradiction pair it is in leaves the queue. Use this to resolve a contradiction when one memory misleads. It is the destructive option — there is no un-supersede — so when both memories are true (verdict `coexist`) or the pair is detector noise (`unrelated`), use [`resolve_contradiction`](#resolve_contradiction) instead.
+Mark `old_id` as superseded by `new_id`. The old memory stays in storage (so the history is auditable) but is filtered out of default `search` results, and every contradiction pair it is in leaves the queue. Use this to resolve a contradiction when one memory misleads. It is the destructive option, so when both memories are true (verdict `coexist`) or the pair is detector noise (`unrelated`), use [`resolve_contradiction`](#resolve_contradiction) instead. A wrong supersession is reversed with [`memory_unsupersede`](#memory_unsupersede).
 
 | Param | Type | Required | Default |
 |:--|:--|:-:|:--|
@@ -229,6 +230,46 @@ See [REST: `POST /supersede`](rest-api.md#post-supersede) for the REST equivalen
     "old_id": "a3f4...e891",
     "new_id": "c0de...beef",
     "reason": "Switched from pnpm back to npm after migration was reverted."
+  }
+}
+```
+
+---
+
+## `memory_unsupersede`
+
+Reverse a supersession — from `memory_supersede`, `merge_duplicates` or the console — that was wrong. The memory returns to default `search` results, and its contradiction pairs return to the queue.
+
+| Param | Type | Required | Notes |
+|:--|:--|:-:|:--|
+| `content_hash` | string | ✓ | The superseded memory to restore. |
+| `reason` | string | ✓ | Why the supersession was wrong (1–2000 chars). It is the audit record. |
+
+What changes, and nothing else:
+
+- `metadata.superseded_by` and the stored supersession reason are removed from the memory, and one entry is appended to its server-maintained `supersession_log`: the `superseded_by` and `supersession_reason` that were removed, `unsuperseded_at`, `unsuperseded_via` and your `reason`. The log survives a re-store of the same content.
+- Every `SUPERSEDES` edge into the memory is deleted. Normally there is one, from the survivor. There is more than one only when the memory was superseded again without being reversed, and the older ones were already stale.
+- The `CONTRADICTS` pair between the memory and the survivor it named, in either direction, is stamped `keep_both` with `resolved_via: "unsupersede"`, so an automatic apply of the judge's verdict never re-supersedes it. A pair that already carries a stamp keeps it. `contradictions_stamped` lists the `[memory_a_hash, memory_b_hash]` edges stamped; pass one to `resolve_contradiction` with `resolution: null` to put the pair back in the queue.
+
+Only that one memory changes. In a chain A → B → C (A superseded by B, B by C), unsuperseding B restores B and leaves A superseded by B. Unsuperseding A restores A and leaves B superseded by C. The graph is written before the marker is removed, so if the graph is down the call fails and the memory stays superseded; retrying the same call converges.
+
+The reversal is recorded as `unsuperseded_via: "operator:mcp"`; the MCP surface does not accept a caller-supplied value.
+
+**Returns:** `{ success: true, status: "unsuperseded", content_hash, superseded_by, supersession_reason, reason, unsuperseded_via, unsuperseded_at, supersedes_edges_removed, contradictions_stamped, now_superseded_by }`. `superseded_by` and `supersession_reason` are what was reversed. `now_superseded_by` is `null` unless another supersede landed right after the reversal; the reversal is still recorded, but the memory is hidden again. A call that changes nothing returns `success: false` with a `status` saying why:
+
+| `status` | Meaning |
+|:--|:--|
+| `not_superseded` | The memory carries no supersession. Nothing was written. A retry of a call that already landed gets this. |
+| `superseded_by_changed` | The memory was superseded to another survivor while the call ran. Nothing was reversed: that supersession is left whole with its edge, and the call's own stamps are cleared unless someone has re-stamped the pair since. `superseded_by` names the new survivor. Inspect, and retry if you still mean it. |
+
+**Example:**
+
+```json
+{
+  "name": "memory_unsupersede",
+  "arguments": {
+    "content_hash": "a3f4...e891",
+    "reason": "Not a duplicate: the two notes cover different caches."
   }
 }
 ```
@@ -258,13 +299,13 @@ List pairs of memories the contradiction detector has flagged (via negation, ant
 | `verdict_reason` | One line from the judge; `null` when never judged, `unjudged: <error>` when the judge failed on this pair. |
 | `survivor` | `content_hash` the judge recommends keeping, or `null`. Advisory — pass it to `memory_supersede` yourself. |
 | `verdict_confidence`, `verdict_model`, `judged_at` | Judge self-reported confidence (0–1), model id, epoch seconds. |
-| `resolution`, `resolved_at`, `resolved_via` | `keep_both` stamp from `resolve_contradiction`, when it was set (epoch seconds, server clock) and by whom (`operator:mcp`, `operator:console`, …). All `null` on an unresolved pair. Only visible with `include_resolved: true`. |
+| `resolution`, `resolved_at`, `resolved_via` | `keep_both` stamp from `resolve_contradiction` or `memory_unsupersede`, when it was set (epoch seconds, server clock) and by whom (`operator:mcp`, `operator:console`, `unsupersede`, …). All `null` on an unresolved pair. Only visible with `include_resolved: true`. |
 
 The judge never writes to a memory: verdicts live on the graph edge, and resolution stays a human/agent call. A pair leaves the default page one of three ways:
 
 | Exit | Verb | Destructive? | Reverse |
 |:--|:--|:-:|:--|
-| Supersede | `memory_supersede` — the loser leaves default search, a `SUPERSEDES` edge is written | yes (audit trail kept) | none — store the memory again |
+| Supersede | `memory_supersede` — the loser leaves default search, a `SUPERSEDES` edge is written | yes (audit trail kept) | `memory_unsupersede` |
 | Keep both | `resolve_contradiction` `keep_both` — stamps the edge, both memories stay live | no | `resolve_contradiction` with `resolution: null` |
 | Hidden by filter | default `verdicts` omit `coexist` / `unrelated` — nothing is written | no | pass `verdicts` including them |
 
@@ -272,7 +313,7 @@ The judge never writes to a memory: verdicts live on the graph edge, and resolut
 
 ## `resolve_contradiction`
 
-Resolve a pair from `memory_contradictions` **without superseding or deleting anything**. `resolution: "keep_both"` stamps the pair as settled — both memories are true, or the pair is detector noise — so it leaves the default queue while both memories stay searchable and the judge's verdict stays on the edge. `resolution: null` clears the stamp and the pair returns to the queue. This is the only way to write the stamp: `relation` cannot set it and the judge never touches it, so no agent's ordinary graph write can retire a pair from the human queue.
+Resolve a pair from `memory_contradictions` **without superseding or deleting anything**. `resolution: "keep_both"` stamps the pair as settled — both memories are true, or the pair is detector noise — so it leaves the default queue while both memories stay searchable and the judge's verdict stays on the edge. `resolution: null` clears the stamp and the pair returns to the queue. This and [`memory_unsupersede`](#memory_unsupersede), which stamps only an unresolved pair, are the only ways to write the stamp: `relation` cannot set it and the judge never touches it, so no agent's ordinary graph write can retire a pair from the human queue.
 
 | Param | Type | Required | Notes |
 |:--|:--|:-:|:--|

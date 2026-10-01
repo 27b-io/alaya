@@ -10,6 +10,17 @@
 //!   cargo test -p alaya-core --test golden_judge -- --ignored --nocapture
 //! ```
 //!
+//! Any OpenAI-compatible endpoint (e.g. a LiteLLM proxy or vLLM) instead,
+//! with the same prompt, schema and validation:
+//!
+//! ```bash
+//! ALAYA_URL=http://localhost:13001 ALAYA_API_KEY=... \
+//! JUDGE_PROVIDER=openai JUDGE_URL=http://localhost:4000 JUDGE_API_KEY=... JUDGE_MODEL=gpt-5.5 \
+//!   cargo test -p alaya-core --test golden_judge -- --ignored --nocapture
+//! ```
+//!
+//! `JUDGE_PROVIDER` is `anthropic` when unset, as in the server.
+//!
 //! Prints the confusion matrix, per-class precision/recall, survivor
 //! accuracy and token totals (price them at the current list rate; a price
 //! table here would rot). It does NOT assert the quality bar: missing it
@@ -21,7 +32,7 @@ use futures::StreamExt;
 use serde::Deserialize;
 
 use alaya_backends::judge::JudgeClient;
-use alaya_backends::{ContradictionJudge, Survivor};
+use alaya_backends::{ContradictionJudge, Provider, Survivor};
 use alaya_types::graph::Verdict;
 use alaya_types::memory::Memory;
 
@@ -80,8 +91,18 @@ async fn golden_set_precision_recall() {
     let alaya_url = env("ALAYA_URL");
     let alaya_key = env("ALAYA_API_KEY");
     let model = env("JUDGE_MODEL");
-    let judge = JudgeClient::new(env("JUDGE_URL"), model.clone(), Some(env("JUDGE_API_KEY")))
-        .expect("JUDGE_API_KEY rejected — must be a single line of visible ASCII");
+    let provider: Provider = std::env::var("JUDGE_PROVIDER")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.parse().unwrap_or_else(|e| panic!("JUDGE_PROVIDER: {e}")))
+        .unwrap_or_default();
+    let judge = JudgeClient::new(
+        provider,
+        env("JUDGE_URL"),
+        model.clone(),
+        Some(env("JUDGE_API_KEY")),
+    )
+    .expect("JUDGE_API_KEY rejected — must be a single line of visible ASCII");
     // Test harness: a transport failure is a failed run, so `expect` is the
     // right shape here; the timeout keeps a dead endpoint from hanging it.
     let http = reqwest::Client::builder()

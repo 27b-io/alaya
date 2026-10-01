@@ -1,14 +1,21 @@
-//! Shared raw-HTTP transport for the Anthropic Messages API.
+//! Shared raw-HTTP transport for the two LLM roles.
 //!
 //! Rust has no official Anthropic SDK; this thin `reqwest` wrapper is the
 //! sanctioned shape in this repo. `SummaryClient` and `JudgeClient` both ride
-//! it so the headers, the timeouts and the wasm32 cfg-gate live in one place.
+//! it so the headers, the timeouts, the failure classification and the
+//! wasm32 cfg-gate live in one place. It speaks the Anthropic Messages API
+//! (here) or an OpenAI-compatible chat-completions endpoint (`openai.rs`),
+//! chosen per role by `Provider`; the role clients build one provider-neutral
+//! `Prompt` and read one `Completion`.
 
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::Value;
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
 
 use alaya_types::{AlayaError, Result};
+
+use crate::{Provider, openai};
 
 /// Request timeout for one-line summaries. (Ignored on wasm32, where
 /// reqwest has no timeouts — the const still compiles there.)
@@ -28,9 +35,30 @@ pub(crate) fn truncate_chars(content: &str) -> &str {
     }
 }
 
+/// One single-turn request, independent of the wire it goes out on.
+pub(crate) struct Prompt<'a> {
+    pub(crate) model: &'a str,
+    pub(crate) system: &'a str,
+    pub(crate) user: &'a str,
+    /// Output budget: `max_tokens` (Anthropic) or `max_completion_tokens`.
+    pub(crate) max_tokens: u32,
+    /// `(name, schema)` to constrain the reply to; the name is only sent on
+    /// the OpenAI wire, which requires one.
+    pub(crate) schema: Option<(&'static str, Value)>,
+}
+
+/// What came back: the first non-empty text, the usage, and the stop or
+/// finish reason for diagnostics.
+pub(crate) struct Completion {
+    pub(crate) text: Option<String>,
+    pub(crate) usage: Usage,
+    pub(crate) stop_reason: Option<String>,
+}
+
 pub(crate) struct MessagesTransport {
     client: Client,
     base_url: String,
+    provider: Provider,
 }
 
 impl MessagesTransport {
@@ -40,34 +68,26 @@ impl MessagesTransport {
     /// (e.g. a trailing newline, #97) or on a client build error, so a bad
     /// secret is a fail-closed startup error rather than a worker-thread
     /// panic. Never echoes `api_key`: `InvalidHeaderValue` carries no payload
-    /// and neither message interpolates the key.
-    pub(crate) fn new(
+    /// and no message interpolates the key.
+    pub(crate) fn for_provider(
+        provider: Provider,
         base_url: String,
         api_key: Option<String>,
         #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
         request_timeout: std::time::Duration,
     ) -> Result<Self> {
-        let mut headers = reqwest::header::HeaderMap::new();
-        if let Some(key) = api_key {
-            let val = reqwest::header::HeaderValue::from_str(&key).map_err(|e| {
-                AlayaError::Config(format!(
-                    "anthropic api key is not valid HTTP header material: {e}"
-                ))
-            })?;
-            headers.insert("x-api-key", val);
-        }
-        headers.insert(
-            "anthropic-version",
-            reqwest::header::HeaderValue::from_static("2023-06-01"),
-        );
+        let headers = match provider {
+            Provider::Anthropic => anthropic_headers(api_key)?,
+            Provider::OpenAi => openai::headers(api_key)?,
+        };
 
         #[allow(clippy::disallowed_methods, reason = "sets .no_proxy() below")]
         let builder = Client::builder().default_headers(headers);
 
         // No redirects: reqwest strips `Authorization` on a cross-origin
         // redirect but not a custom `x-api-key`, so a redirecting endpoint
-        // could exfiltrate the key. The Messages API never redirects; a 3xx
-        // surfaces as `Unavailable`.
+        // could exfiltrate the key. Neither API redirects; a 3xx surfaces as
+        // `Unavailable`.
         #[cfg(not(target_arch = "wasm32"))]
         let builder = builder
             .http1_only()
@@ -80,17 +100,55 @@ impl MessagesTransport {
 
         let client = builder.build().map_err(|e| {
             AlayaError::Config(format!(
-                "anthropic HTTP client: {}",
+                "{} HTTP client: {}",
+                provider.as_str(),
                 crate::redact_reqwest_error(e)
             ))
         })?;
 
-        Ok(Self { client, base_url })
+        Ok(Self {
+            client,
+            base_url,
+            provider,
+        })
     }
 
-    /// POST `/v1/messages`. Failures are classified so callers can tell a
-    /// per-request (deterministic) failure from one that has nothing to do
-    /// with the request:
+    /// Send `prompt` on this transport's wire. Failures are classified the
+    /// same on both (see `post`), plus what only the OpenAI wire reports: a
+    /// content-filter stop or a refusal is `err(..)`, deterministic.
+    pub(crate) async fn complete(
+        &self,
+        prompt: &Prompt<'_>,
+        err: fn(String) -> AlayaError,
+    ) -> Result<Completion> {
+        match self.provider {
+            Provider::Anthropic => {
+                let resp: MessagesResponse = self
+                    .post("/v1/messages", "messages API", &anthropic_body(prompt), err)
+                    .await?;
+                Ok(Completion {
+                    text: resp.first_text(),
+                    usage: resp.usage,
+                    stop_reason: resp.stop_reason,
+                })
+            }
+            Provider::OpenAi => {
+                let resp: openai::ChatResponse = self
+                    .post(
+                        "/v1/chat/completions",
+                        "chat completions API",
+                        &openai::body(prompt),
+                        err,
+                    )
+                    .await?;
+                resp.into_completion(err)
+            }
+        }
+    }
+
+    /// POST `path` and decode the reply. Failures are classified so callers
+    /// can tell a per-request (deterministic) failure from one that has
+    /// nothing to do with the request:
     /// - 429 → `AlayaError::RateLimited` (with the `retry-after` hint);
     /// - connect/timeout, 5xx, and auth/model misconfiguration
     ///   (401/403/404) → `AlayaError::Unavailable` (transient), `spent`
@@ -98,12 +156,14 @@ impl MessagesTransport {
     ///   (post-send timeout, reset, body cut after 2xx, 5xx);
     /// - 400/413/422 and an unparseable body → `err(..)`, the caller's own
     ///   variant, meaning *this request* will fail the same way again.
-    pub(crate) async fn messages(
+    async fn post<T: DeserializeOwned>(
         &self,
+        path: &str,
+        api: &str,
         body: &Value,
         err: fn(String) -> AlayaError,
-    ) -> Result<MessagesResponse> {
-        let url = format!("{}/v1/messages", self.base_url);
+    ) -> Result<T> {
+        let url = format!("{}{path}", self.base_url);
         let resp = self
             .client
             .post(&url)
@@ -126,7 +186,7 @@ impl MessagesTransport {
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_else(|_| "<unreadable>".into());
-            let msg = format!("messages API returned {status}: {body}");
+            let msg = format!("{api} returned {status}: {body}");
             return Err(if is_request_fault(status) {
                 err(msg)
             } else {
@@ -141,7 +201,7 @@ impl MessagesTransport {
 
         // A body that will not decode is the request's fault; a body cut
         // mid-read (reset, idle timeout after the 2xx headers) is not.
-        resp.json::<MessagesResponse>().await.map_err(|e| {
+        resp.json::<T>().await.map_err(|e| {
             if e.is_decode() {
                 err(format!(
                     "failed to parse response: {}",
@@ -156,6 +216,37 @@ impl MessagesTransport {
             }
         })
     }
+}
+
+fn anthropic_headers(api_key: Option<String>) -> Result<reqwest::header::HeaderMap> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(key) = api_key {
+        let val = reqwest::header::HeaderValue::from_str(&key).map_err(|e| {
+            AlayaError::Config(format!(
+                "anthropic api key is not valid HTTP header material: {e}"
+            ))
+        })?;
+        headers.insert("x-api-key", val);
+    }
+    headers.insert(
+        "anthropic-version",
+        reqwest::header::HeaderValue::from_static("2023-06-01"),
+    );
+    Ok(headers)
+}
+
+/// Messages API body. Structured output rides `output_config.format`.
+fn anthropic_body(p: &Prompt<'_>) -> Value {
+    let mut body = json!({
+        "model": p.model,
+        "max_tokens": p.max_tokens,
+        "system": p.system,
+        "messages": [{"role": "user", "content": p.user}],
+    });
+    if let Some((_, schema)) = &p.schema {
+        body["output_config"] = json!({"format": {"type": "json_schema", "schema": schema}});
+    }
+    body
 }
 
 /// Statuses that mean the request itself is unacceptable and will be again:
@@ -280,6 +371,46 @@ mod tests {
         let json = r#"{"content":[{"type":"thinking","thinking":""},{"type":"text","text":" {\"a\":1} "}]}"#;
         let parsed: MessagesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.first_text().as_deref(), Some("{\"a\":1}"));
+    }
+
+    /// LAB-6877 AC-7: the default wire sends what it sent before the
+    /// provider switch, byte for byte (the pre-switch `json!` literals).
+    #[test]
+    fn anthropic_body_is_unchanged() {
+        let schema = json!({"type": "object"});
+        let judge = Prompt {
+            model: "m",
+            system: "sys",
+            user: "usr",
+            max_tokens: 4096,
+            schema: Some(("verdict", schema.clone())),
+        };
+        let before = json!({
+            "model": "m",
+            "max_tokens": 4096,
+            "system": "sys",
+            "messages": [{"role": "user", "content": "usr"}],
+            "output_config": {"format": {"type": "json_schema", "schema": schema}},
+        });
+        assert_eq!(
+            serde_json::to_vec(&anthropic_body(&judge)).unwrap(),
+            serde_json::to_vec(&before).unwrap()
+        );
+        let summary = Prompt {
+            max_tokens: 100,
+            schema: None,
+            ..judge
+        };
+        let before = json!({
+            "model": "m",
+            "max_tokens": 100,
+            "system": "sys",
+            "messages": [{"role": "user", "content": "usr"}],
+        });
+        assert_eq!(
+            serde_json::to_vec(&anthropic_body(&summary)).unwrap(),
+            serde_json::to_vec(&before).unwrap()
+        );
     }
 
     #[test]

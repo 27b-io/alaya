@@ -44,6 +44,14 @@ pub struct SetResolutionRequest {
     pub resolution: Option<Resolution>,
     pub resolved_via: String,
     pub resolved_at: f64,
+    /// Stamp only an edge with no resolution yet (`settle_contradiction`):
+    /// an existing stamp, and its who and when, is kept.
+    #[serde(default)]
+    pub if_unresolved: bool,
+    /// Clear only while the stamp is exactly `resolved_via` at `resolved_at`
+    /// (`unsettle_contradiction`): a stamp written since is kept.
+    #[serde(default)]
+    pub if_stamped: bool,
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -180,13 +188,25 @@ pub async fn set_resolution(
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    let (cypher, params, readonly) = cypher::set_contradiction_resolution(
-        &req.source,
-        &req.target,
-        req.resolution,
-        req.resolved_via.trim(),
-        req.resolved_at,
-    );
+    let via = req.resolved_via.trim();
+    let (cypher, params, readonly) = match (req.if_unresolved, req.if_stamped, req.resolution) {
+        (false, false, resolution) => cypher::set_contradiction_resolution(
+            &req.source,
+            &req.target,
+            resolution,
+            via,
+            req.resolved_at,
+        ),
+        (true, false, Some(Resolution::KeepBoth)) => {
+            cypher::settle_contradiction(&req.source, &req.target, via, req.resolved_at)
+        }
+        (false, true, None) if !via.is_empty() => {
+            cypher::unsettle_contradiction(&req.source, &req.target, via, req.resolved_at)
+        }
+        // "Set only if unresolved" needs a stamp, "clear only if stamped"
+        // needs the stamp to match; anything else is malformed.
+        _ => return Err(StatusCode::UNPROCESSABLE_ENTITY),
+    };
     let result = exec_query(&state, &cypher, params, readonly).await?;
 
     let count = result.count().unwrap_or(0);
