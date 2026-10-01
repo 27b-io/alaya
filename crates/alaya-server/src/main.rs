@@ -1219,6 +1219,25 @@ fn deadline_exceeded(op: &str, deadline: std::time::Duration, start: std::time::
     })
 }
 
+/// A single-flight flag held set for as long as this guard lives. The
+/// spawned task owns it, so every way the task ends (return, timeout, panic,
+/// drop) clears the flag; a reset written as the task's last line never runs
+/// after a panic, and the command would be refused until restart.
+struct InFlight(std::rc::Rc<std::cell::Cell<bool>>);
+
+impl InFlight {
+    fn start(flag: &std::rc::Rc<std::cell::Cell<bool>>) -> Self {
+        flag.set(true);
+        Self(flag.clone())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 /// Runs MemoryService on a LocalSet, processing commands from the channel.
 ///
 /// Wraps the service in `Rc` so long-running operations (find_duplicates,
@@ -1820,8 +1839,7 @@ async fn service_worker(
                 }));
             }
             CmdInner::Stats { reply } => {
-                stats_running.set(true);
-                let running = stats_running.clone();
+                let flight = InFlight::start(&stats_running);
                 // Read here, on the worker that owns the counter; the
                 // aggregates themselves run in a spawned task below.
                 let cap = judge_cap_view(&judge_limiter.borrow(), svc.judge.is_some());
@@ -1833,6 +1851,7 @@ async fn service_worker(
                 // would queue behind them.
                 tokio::task::spawn_local(
                     async move {
+                        let _flight = flight;
                         let result = match timeout(deadline, svc.corpus_stats()).await {
                             Ok(mut v) => {
                                 v["judge_daily_cap"] = cap;
@@ -1842,7 +1861,6 @@ async fn service_worker(
                             }
                             Err(_) => deadline_exceeded(op, deadline, start),
                         };
-                        running.set(false);
                         let _ = reply.send(result);
                     }
                     .instrument(span),
@@ -1853,7 +1871,7 @@ async fn service_worker(
                 rejudge,
                 reply,
             } => {
-                if backfill_running.replace(true) {
+                if backfill_running.get() {
                     let _ = reply.send(json!({
                         "success": false,
                         "error": "backfill already running"
@@ -1862,11 +1880,11 @@ async fn service_worker(
                     let span = tracing::info_span!(parent: &ps, "backfill_contradictions");
                     let svc = svc.clone();
                     let gate = judge_gate.clone();
-                    let running = backfill_running.clone();
+                    let flight = InFlight::start(&backfill_running);
                     tokio::task::spawn_local(
                         async move {
+                            let _flight = flight;
                             run_backfill_contradictions(&svc, &gate, limit, rejudge, reply).await;
-                            running.set(false);
                         }
                         .instrument(span),
                     );
@@ -3589,6 +3607,21 @@ mod tests {
         r
     }
 
+    /// The stub graph's `get_all_contradictions` panics, so the backfill
+    /// task dies before it replies.
+    #[tokio::test]
+    async fn backfill_single_flight_clears_when_the_task_panics() {
+        let svc = wedge_tests::hanging_service().with_judge(Box::new(StubJudge));
+        wedge_tests::single_flight_survives_a_panic(svc, |reply| {
+            CmdInner::BackfillContradictions {
+                limit: 1,
+                rejudge: false,
+                reply,
+            }
+        })
+        .await;
+    }
+
     /// Run the spawned local tasks: `run_until` polls every ready local task
     /// each time the inner future returns Pending, so one yield is one tick.
     async fn settle() {
@@ -4584,9 +4617,11 @@ mod wedge_tests {
         }
     }
 
-    /// Graph whose stats reads blackhole, like `HangVectors`; the rest panic
-    /// unless a test needs them.
-    struct StubGraph;
+    /// Graph whose stats reads blackhole, like `HangVectors`, or panic with
+    /// `panic_stats` set; the rest panic unless a test needs them.
+    struct StubGraph {
+        panic_stats: bool,
+    }
 
     #[async_trait(?Send)]
     impl GraphService for StubGraph {
@@ -4691,6 +4726,7 @@ mod wedge_tests {
             std::future::pending().await
         }
         async fn get_stats(&self) -> Result<GraphStats> {
+            assert!(!self.panic_stats, "stub graph stats read panicked");
             std::future::pending().await
         }
     }
@@ -4736,7 +4772,7 @@ mod wedge_tests {
         MemoryService::new(
             Box::new(HangVectors { batch }),
             Box::new(StubEmbeddings),
-            Box::new(StubGraph),
+            Box::new(StubGraph { panic_stats: false }),
             Box::new(StubHebbian),
             Box::new(StubConsolidation),
             None,
@@ -4812,6 +4848,51 @@ mod wedge_tests {
                 assert_eq!(again["error_kind"], "timeout", "{again}");
             })
             .await;
+    }
+
+    /// Sends `cmd` twice to a worker over `svc`, whose spawned task for it
+    /// panics. A panicked task drops its reply; a single-flight flag left set
+    /// by the first would answer the second with a refusal instead.
+    pub(super) async fn single_flight_survives_a_panic(
+        svc: MemoryService,
+        cmd: impl Fn(oneshot::Sender<Value>) -> CmdInner,
+    ) {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::channel::<Cmd>(8);
+                tokio::task::spawn_local(service_worker(
+                    rx,
+                    svc,
+                    Arc::new(AtomicU64::new(0)),
+                    WorkerLimits::default(),
+                ));
+                for call in 1..=2 {
+                    let (reply, answer) = oneshot::channel();
+                    tx.send(Cmd {
+                        inner: cmd(reply),
+                        span: tracing::Span::none(),
+                    })
+                    .await
+                    .unwrap();
+                    let answer = answer.await;
+                    assert!(answer.is_err(), "call {call} was answered: {answer:?}");
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn stats_single_flight_clears_when_the_task_panics() {
+        let svc = MemoryService::new(
+            Box::new(HangVectors { batch: None }),
+            Box::new(StubEmbeddings),
+            Box::new(StubGraph { panic_stats: true }),
+            Box::new(StubHebbian),
+            Box::new(StubConsolidation),
+            None,
+        );
+        single_flight_survives_a_panic(svc, |reply| CmdInner::Stats { reply }).await;
     }
 
     /// The incident scenario (#63): a backend await that never resolves.
