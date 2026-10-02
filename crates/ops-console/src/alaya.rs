@@ -33,6 +33,14 @@ impl AlayaClient {
     }
 
     async fn post(&self, path: &str, body: Value) -> Result<Value, AppError> {
+        // Surfaced, or the operator gets a green flash for a write that
+        // never happened (panel, LAB-3885).
+        op_failure(self.post_json(path, body).await?)
+    }
+
+    /// `post` without the `success: false` guard, for the one caller that
+    /// reads a typed `status` first.
+    async fn post_json(&self, path: &str, body: Value) -> Result<Value, AppError> {
         let resp = self
             .http
             .post(self.url(path))
@@ -48,11 +56,8 @@ impl AlayaClient {
         if !status.is_success() {
             return Err(AppError::non_success("alaya-server", status, &text));
         }
-        let body: Value = serde_json::from_str(&text)
-            .map_err(|_| AppError::Upstream("alaya-server returned non-JSON".into()))?;
-        // Surfaced, or the operator gets a green flash for a write that
-        // never happened (panel, LAB-3885).
-        op_failure(body)
+        serde_json::from_str(&text)
+            .map_err(|_| AppError::Upstream("alaya-server returned non-JSON".into()))
     }
 
     async fn get(&self, path: &str) -> Result<Value, AppError> {
@@ -105,6 +110,41 @@ impl AlayaClient {
             json!({ "old_hash": old_hash, "new_hash": new_hash, "reason": reason }),
         )
         .await
+    }
+
+    /// Reverse a wrong supersession (LAB-6876). The two typed
+    /// `success: false` answers are outcomes the operator acts on, so they
+    /// are read before the guard; every other answer still goes through it.
+    pub async fn unsupersede(
+        &self,
+        content_hash: &str,
+        reason: &str,
+    ) -> Result<Unsupersede, AppError> {
+        let body = self
+            .post_json(
+                "/unsupersede",
+                json!({
+                    "content_hash": content_hash,
+                    "reason": reason,
+                    "unsuperseded_via": "operator:console",
+                }),
+            )
+            .await?;
+        let success = body.get("success").and_then(Value::as_bool);
+        match (success, body.get("status").and_then(Value::as_str)) {
+            (Some(true), Some("unsuperseded")) => Ok(Unsupersede::Reversed {
+                superseded_again: body.get("now_superseded_by").is_some_and(|v| !v.is_null()),
+            }),
+            (Some(false), Some("not_superseded")) => Ok(Unsupersede::NotSuperseded),
+            (Some(false), Some("superseded_by_changed")) => Ok(Unsupersede::SupersededByChanged),
+            _ => {
+                op_failure(body)?;
+                // A reversal is reported only when the server says it landed.
+                Err(AppError::Upstream(
+                    "alaya-server: unrecognized unsupersede answer".into(),
+                ))
+            }
+        }
     }
 
     pub async fn relation(
@@ -218,6 +258,17 @@ impl AlayaClient {
     pub async fn stats(&self) -> Result<Value, AppError> {
         op_failure(self.get("/stats").await?)
     }
+}
+
+/// What `POST /unsupersede` answered.
+pub enum Unsupersede {
+    /// Reversed. `superseded_again`: a supersession landed straight after
+    /// the reversal (a non-null `now_superseded_by`).
+    Reversed { superseded_again: bool },
+    /// Nothing to reverse.
+    NotSuperseded,
+    /// Superseded again before the reversal ran; nothing was reversed.
+    SupersededByChanged,
 }
 
 /// Op-level failures come back `200 {"success": false, "error": …}`; turn

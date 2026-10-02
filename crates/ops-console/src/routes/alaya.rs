@@ -11,6 +11,7 @@ use leptos::prelude::*;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::alaya::Unsupersede;
 use crate::error::AppError;
 use crate::routes::{clip, fmt_epoch, short_hash, validate_hash, vf, vs};
 use crate::session::{Flash, Session, flash_cookie, take_flash};
@@ -39,11 +40,13 @@ fn excerpt(v: &Value, max: usize) -> String {
     clip(text, max)
 }
 
+/// The marker's presence, whatever its value, as on the server: a `null`
+/// marker still hides the memory from search, so it must still offer the
+/// reversal.
 fn is_superseded(v: &Value) -> bool {
     v.get("metadata")
         .and_then(|m| m.get("superseded_by"))
-        .map(|s| !s.is_null())
-        .unwrap_or(false)
+        .is_some()
 }
 
 fn flash_redirect(
@@ -294,15 +297,20 @@ fn urlenc(s: &str) -> String {
 
 // ─── Detail (AC3) ───────────────────────────────────────────────────────────
 
+/// One hop of a supersession chain. `superseded` is whether that memory is
+/// itself superseded; false when it could not be read.
+struct Hop {
+    hash: String,
+    label: String,
+    superseded: bool,
+}
+
 /// Forward walk of the supersession chain from a memory's
-/// `metadata.superseded_by`: `(hash, excerpt)` per hop, bounded to 10 hops,
-/// cycle-proof. Fetch failures render as "(unavailable)" — the audit trail is
-/// shown even when a link is unreadable, never silently dropped.
-async fn supersession_chain(
-    alaya: &crate::alaya::AlayaClient,
-    mem: &Value,
-) -> Vec<(String, String)> {
-    let mut chain: Vec<(String, String)> = Vec::new();
+/// `metadata.superseded_by`, bounded to 10 hops, cycle-proof. Fetch failures
+/// render as "(unavailable)" — the audit trail is shown even when a link is
+/// unreadable, never silently dropped.
+async fn supersession_chain(alaya: &crate::alaya::AlayaClient, mem: &Value) -> Vec<Hop> {
+    let mut chain: Vec<Hop> = Vec::new();
     let mut cursor = mem
         .get("metadata")
         .and_then(|m| m.get("superseded_by"))
@@ -312,25 +320,42 @@ async fn supersession_chain(
         if chain.len() >= 10 || validate_hash(&next).is_err() {
             break;
         }
-        let label = match alaya.get_memory(&next).await {
+        let (label, superseded) = match alaya.get_memory(&next).await {
             Ok(r) => {
                 if let Some(m) = r.get("memory") {
                     cursor = m
                         .get("metadata")
                         .and_then(|md| md.get("superseded_by"))
                         .and_then(|s| s.as_str())
-                        .filter(|h| *h != next && !chain.iter().any(|(seen, _)| seen == h))
+                        .filter(|h| *h != next && !chain.iter().any(|hop| hop.hash == *h))
                         .map(String::from);
-                    excerpt(m, 100)
+                    (excerpt(m, 100), is_superseded(m))
                 } else {
-                    "(unavailable)".to_string()
+                    ("(unavailable)".to_string(), false)
                 }
             }
-            Err(_) => "(unavailable)".to_string(),
+            Err(_) => ("(unavailable)".to_string(), false),
         };
-        chain.push((next, label));
+        chain.push(Hop {
+            hash: next,
+            label,
+            superseded,
+        });
     }
     chain
+}
+
+/// Where a memory's un-supersede form lives: its own detail page.
+fn unsupersede_href(hash: &str) -> String {
+    format!("{}#unsupersede", memory_href(hash))
+}
+
+/// A stored JSON value as display text: a string as itself, anything else
+/// as its JSON.
+fn as_text(v: &Value) -> String {
+    v.as_str()
+        .map(String::from)
+        .unwrap_or_else(|| v.to_string())
 }
 
 pub async fn detail(
@@ -391,6 +416,20 @@ pub async fn detail(
         .map(|m| serde_json::to_string_pretty(m).unwrap_or_default())
         .unwrap_or_else(|| "null".into());
     let superseded = is_superseded(&mem);
+    // The survivor as a link when it is a hash, else as stored text: an
+    // unusable value is still shown, never hidden.
+    let superseded_by = mem
+        .get("metadata")
+        .and_then(|m| m.get("superseded_by"))
+        .map(|v| match v.as_str().filter(|h| validate_hash(h).is_ok()) {
+            Some(h) => Either::Left(view! { <HashLink hash=h.to_string() /> }),
+            None => Either::Right(view! { <span class="font-mono text-xs">{as_text(v)}</span> }),
+        });
+    let supersession_reason = match mem.get("supersession_reason") {
+        None => "(not recorded)".to_string(),
+        Some(v) if v.as_str() == Some("") => "(none given)".to_string(),
+        Some(v) => as_text(v),
+    };
     let csrf = session.csrf.clone();
 
     let relation_rows = relations
@@ -435,7 +474,9 @@ pub async fn detail(
     let hash_hidden = hash.clone();
     let content_for_edit = content_text.clone();
     let summary_text = summary.clone();
-    let (csrf_rel, csrf_correct, csrf_delete) = (csrf.clone(), csrf.clone(), csrf.clone());
+    let unsupersede_action = format!("/alaya/memory/{hash}/unsupersede");
+    let (csrf_rel, csrf_correct, csrf_delete, csrf_unsupersede) =
+        (csrf.clone(), csrf.clone(), csrf.clone(), csrf.clone());
     let content = view! {
         <div class="space-y-6">
             <div class="flex items-center gap-3 flex-wrap">
@@ -474,26 +515,43 @@ pub async fn detail(
                 </CardContent>
             </Card>
 
-            {(!chain.is_empty()).then(|| view! {
+            {superseded.then(|| view! {
                 <Card>
                     <CardHeader>
-                        <CardTitle>"Supersession chain"</CardTitle>
+                        <CardTitle>"Supersession"</CardTitle>
                         <CardDescription>"This memory was superseded — the audit trail is preserved; nothing is dropped."</CardDescription>
                     </CardHeader>
                     <CardContent>
-                        <ol class="space-y-2 text-sm">
-                            {chain.iter().map(|(h, label)| {
-                                let h = h.clone();
-                                let label = label.clone();
+                        <dl class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm mb-4">
+                            <div><dt class="text-muted-foreground text-xs">"Superseded by"</dt><dd>{superseded_by}</dd></div>
+                            <div><dt class="text-muted-foreground text-xs">"Reason"</dt><dd>{supersession_reason}</dd></div>
+                        </dl>
+                        <ol class="space-y-2 text-sm mb-6">
+                            {chain.into_iter().map(|hop| {
+                                let action = hop.superseded.then(|| {
+                                    let href = unsupersede_href(&hop.hash);
+                                    view! {
+                                        <a class="text-xs text-primary underline-offset-4 hover:underline" href=href>"Un-supersede…"</a>
+                                    }
+                                });
                                 view! {
                                     <li class="flex gap-2 items-baseline">
                                         <span class="text-muted-foreground">"↳"</span>
-                                        <HashLink hash=h />
-                                        <span class="text-muted-foreground">{label}</span>
+                                        <HashLink hash=hop.hash />
+                                        <span class="text-muted-foreground">{hop.label}</span>
+                                        {action}
                                     </li>
                                 }
                             }).collect_view()}
                         </ol>
+                        <form method="post" action=unsupersede_action id="unsupersede" class="flex flex-wrap items-end gap-3">
+                            <input type="hidden" name="csrf" value=csrf_unsupersede />
+                            <div class="flex flex-col gap-1.5 grow min-w-72">
+                                <label class=LABEL_CLASS for="unsupersede_reason">"Reason to un-supersede (audit trail)"</label>
+                                <input class=INPUT_CLASS id="unsupersede_reason" name="reason" maxlength="2000" placeholder="why this supersession was wrong" required />
+                            </div>
+                            <button type="submit" class=btn(Btn::Default)>"Un-supersede"</button>
+                        </form>
                     </CardContent>
                 </Card>
             })}
@@ -740,6 +798,77 @@ pub async fn supersede_submit(
         ),
         &to,
     ))
+}
+
+#[derive(Deserialize)]
+pub struct UnsupersedeForm {
+    #[serde(default)]
+    csrf: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// Reverse a wrong supersession through `POST /unsupersede` (LAB-6876).
+/// The console adds no rule of its own: only this memory changes, and the
+/// page shows what the server answered. A typed "nothing reversed" answer
+/// is a message, not an error page.
+pub async fn unsupersede_submit(
+    State(state): State<AppState>,
+    session: Session,
+    Path(hash): Path<String>,
+    jar: PrivateCookieJar,
+    axum::Form(form): axum::Form<UnsupersedeForm>,
+) -> Result<Response, AppError> {
+    session.verify_csrf(&form.csrf)?;
+    validate_hash(&hash)?;
+    let secure = state.secure_cookies();
+    let reason = form.reason.trim();
+    if reason.is_empty() {
+        return Ok(flash_redirect(
+            jar,
+            secure,
+            "error",
+            "A reason is required to un-supersede: it is the audit record.".into(),
+            &unsupersede_href(&hash),
+        ));
+    }
+    // Every outcome lands on the memory's page, whose Supersession card
+    // links the current survivor whenever it is still superseded.
+    let short = short_hash(&hash);
+    let (outcome, kind, msg) = match state.alaya.unsupersede(&hash, reason).await? {
+        Unsupersede::Reversed {
+            superseded_again: false,
+        } => (
+            "reversed",
+            "ok",
+            format!("Un-superseded {short} — it is back in default search results."),
+        ),
+        Unsupersede::Reversed {
+            superseded_again: true,
+        } => (
+            "reversed, superseded again",
+            "error",
+            format!(
+                "Un-superseded {short}, but it was superseded again straight after the \
+                 reversal, so it is still superseded — see its survivor below."
+            ),
+        ),
+        Unsupersede::NotSuperseded => (
+            "not superseded",
+            "error",
+            format!("{short} is not superseded — nothing to reverse."),
+        ),
+        Unsupersede::SupersededByChanged => (
+            "superseded by changed",
+            "error",
+            format!(
+                "Nothing reversed: {short} was superseded again before the reversal ran. \
+                 Check its new survivor below before retrying."
+            ),
+        ),
+    };
+    tracing::info!(sub = ?session.sub, hash = %hash, outcome, "unsupersede");
+    Ok(flash_redirect(jar, secure, kind, msg, &memory_href(&hash)))
 }
 
 #[derive(Deserialize)]
@@ -2154,6 +2283,21 @@ mod tests {
 
     fn card(p: &Value) -> String {
         queue_card(p, "tok", &QueueView::default(), QUEUE_PATH).to_html()
+    }
+
+    /// A `null` marker is still a supersession: the server keys on presence.
+    #[test]
+    fn is_superseded_keys_on_marker_presence_like_the_server() {
+        assert!(is_superseded(
+            &json!({ "metadata": { "superseded_by": "b".repeat(64) } })
+        ));
+        assert!(is_superseded(
+            &json!({ "metadata": { "superseded_by": null } })
+        ));
+        assert!(!is_superseded(
+            &json!({ "metadata": { "source": "import" } })
+        ));
+        assert!(!is_superseded(&json!({ "metadata": null })));
     }
 
     #[test]

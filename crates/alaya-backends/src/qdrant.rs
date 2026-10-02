@@ -843,6 +843,7 @@ fn parse_payload(payload: &Value) -> Option<Memory> {
                     .collect()
             }),
         supersession_log: payload.get(SUPERSESSION_LOG).cloned().map(log_entries),
+        supersession_reason: payload.get(SUPERSESSION_REASON).cloned(),
     })
 }
 
@@ -868,7 +869,8 @@ fn top_level_payload(updates: &MetadataUpdate) -> serde_json::Map<String, Value>
 }
 
 /// Build the payload JSON for upsert from a Memory struct. Never writes
-/// `supersession_log`: on a re-store `carry_over` alone keeps it.
+/// `supersession_log` or `supersession_reason`: on a re-store `carry_over`
+/// alone keeps them.
 fn memory_to_payload(memory: &Memory) -> Value {
     let mut payload = json!({
         "content": memory.content,
@@ -908,6 +910,10 @@ fn memory_to_payload(memory: &Memory) -> Value {
 /// `VectorStorage::reverse_supersession`). Server-maintained.
 const SUPERSESSION_LOG: &str = "supersession_log";
 
+/// Payload key: why a memory was superseded. Written by `mark_superseded`'s
+/// metadata update, removed by `reverse_supersession`. Server-maintained.
+const SUPERSESSION_REASON: &str = "supersession_reason";
+
 /// The entries of a stored `supersession_log`, in stored order. An audit
 /// trail is never dropped, even one in a shape no writer makes: a value that
 /// is not an array is one entry.
@@ -930,7 +936,7 @@ fn unsupersede_payload(
         .get_mut("metadata")
         .and_then(Value::as_object_mut)
         .and_then(|m| m.remove("superseded_by"));
-    let reason = obj.remove("supersession_reason");
+    let reason = obj.remove(SUPERSESSION_REASON);
     let mut log = obj
         .remove(SUPERSESSION_LOG)
         .map(log_entries)
@@ -953,7 +959,7 @@ fn carry_over(payload: &mut Value, prev: &Value) {
         "created_at",
         "access_count",
         "access_timestamps",
-        "supersession_reason",
+        SUPERSESSION_REASON,
         SUPERSESSION_LOG,
     ] {
         if let Some(v) = prev.get(key) {
@@ -2088,6 +2094,7 @@ mod tests {
             provenance: None,
             summary_embedding: None,
             supersession_log: None,
+            supersession_reason: None,
         };
         let payload = memory_to_payload(&mem);
         assert_eq!(payload["content"], "test content");
@@ -2110,6 +2117,23 @@ mod tests {
         assert!(mem.supersession_log.is_some(), "read side sees it");
         let written = memory_to_payload(&mem);
         assert!(written.get("supersession_log").is_none(), "{written}");
+    }
+
+    /// The reason is read-only on the write path too: `parse_payload` reads
+    /// it from the payload root, `memory_to_payload` never emits the key, so
+    /// a store neither writes nor clears it.
+    #[test]
+    fn memory_to_payload_never_writes_the_supersession_reason() {
+        let payload = json!({
+            "content": "c",
+            "content_hash": "c".repeat(64),
+            "metadata": {"superseded_by": "d".repeat(64)},
+            "supersession_reason": "wrong merge",
+        });
+        let mem = parse_payload(&payload).expect("parses");
+        assert_eq!(mem.supersession_reason, Some(json!("wrong merge")));
+        let written = memory_to_payload(&mem);
+        assert!(written.get("supersession_reason").is_none(), "{written}");
     }
 
     #[test]

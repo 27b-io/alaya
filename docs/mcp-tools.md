@@ -119,7 +119,9 @@ Fetch a single memory by its exact hash. Returns `{"found": false}` if it doesn'
 | `content_hash` | string | ✓ | | Full 64-char SHA-256 hex. |
 | `output` | enum | | `full` | `full`, `summary`, or `both`. |
 
-With `full` or `both` output, a memory whose supersession was ever reversed also carries `memory.supersession_log`: its audit trail, oldest first, one entry per [`memory_unsupersede`](#memory_unsupersede) in the shape documented there (`superseded_by`, `supersession_reason`, `unsuperseded_at`, `unsuperseded_via`, `reason`). Entries come back exactly as stored. A memory never reversed has no `supersession_log` key, and `summary` output and `search` results never carry it.
+With `full` or `both` output, a superseded memory also carries `memory.supersession_reason`: the reason given to [`memory_supersede`](#memory_supersede) or [`merge_duplicates`](#merge_duplicates), as stored (`""` when none was given). The key is absent when no reason is stored, which includes every memory that is not superseded, since [`memory_unsupersede`](#memory_unsupersede) moves the reason into the log below. `summary` output and `search` results never carry it.
+
+With `full` or `both` output, a memory whose supersession was ever reversed also carries `memory.supersession_log`: its audit trail, oldest first, one entry per [`memory_unsupersede`](#memory_unsupersede) in the shape documented there. Entries come back in stored order; a stored value that is not an array comes back as one entry. A memory never reversed has no `supersession_log` key, and `summary` output and `search` results never carry it.
 
 **Use when** you already hold a hash — typically from a `search` result, a `memory_contradictions` pair, or a `find_duplicates` cluster — and want to re-inspect it without searching again.
 
