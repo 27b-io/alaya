@@ -163,7 +163,6 @@ pub async fn logout(
         &Flash {
             kind: "ok".into(),
             msg: "Logged out.".into(),
-            link: None,
         },
         state.secure_cookies(),
     );

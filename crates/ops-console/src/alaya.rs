@@ -130,20 +130,20 @@ impl AlayaClient {
                 }),
             )
             .await?;
-        let field = |key: &str| body.get(key).cloned().unwrap_or(Value::Null);
         let success = body.get("success").and_then(Value::as_bool);
         match (success, body.get("status").and_then(Value::as_str)) {
             (Some(true), Some("unsuperseded")) => Ok(Unsupersede::Reversed {
-                now_superseded_by: field("now_superseded_by"),
+                superseded_again: body.get("now_superseded_by").is_some_and(|v| !v.is_null()),
             }),
             (Some(false), Some("not_superseded")) => Ok(Unsupersede::NotSuperseded),
-            (Some(false), Some("superseded_by_changed")) => Ok(Unsupersede::SupersededByChanged {
-                superseded_by: field("superseded_by"),
-            }),
-            // A reversal is reported only when the server says it landed.
-            _ => op_failure(body).and(Err(AppError::Upstream(
-                "alaya-server: unrecognized unsupersede answer".into(),
-            ))),
+            (Some(false), Some("superseded_by_changed")) => Ok(Unsupersede::SupersededByChanged),
+            _ => {
+                op_failure(body)?;
+                // A reversal is reported only when the server says it landed.
+                Err(AppError::Upstream(
+                    "alaya-server: unrecognized unsupersede answer".into(),
+                ))
+            }
         }
     }
 
@@ -260,17 +260,15 @@ impl AlayaClient {
     }
 }
 
-/// What `POST /unsupersede` answered. Survivor fields are upstream JSON,
-/// as sent: `null` when absent, and not yet checked to be a hash.
+/// What `POST /unsupersede` answered.
 pub enum Unsupersede {
-    /// Reversed. A non-null `now_superseded_by` is a supersession that
-    /// landed straight after the reversal.
-    Reversed { now_superseded_by: Value },
+    /// Reversed. `superseded_again`: a supersession landed straight after
+    /// the reversal (a non-null `now_superseded_by`).
+    Reversed { superseded_again: bool },
     /// Nothing to reverse.
     NotSuperseded,
-    /// Superseded again, by `superseded_by`, before the reversal ran;
-    /// nothing was reversed.
-    SupersededByChanged { superseded_by: Value },
+    /// Superseded again before the reversal ran; nothing was reversed.
+    SupersededByChanged,
 }
 
 /// Op-level failures come back `200 {"success": false, "error": …}`; turn

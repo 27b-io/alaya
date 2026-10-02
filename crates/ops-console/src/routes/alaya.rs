@@ -40,11 +40,13 @@ fn excerpt(v: &Value, max: usize) -> String {
     clip(text, max)
 }
 
+/// The marker's presence, whatever its value, as on the server: a `null`
+/// marker still hides the memory from search, so it must still offer the
+/// reversal.
 fn is_superseded(v: &Value) -> bool {
     v.get("metadata")
         .and_then(|m| m.get("superseded_by"))
-        .map(|s| !s.is_null())
-        .unwrap_or(false)
+        .is_some()
 }
 
 fn flash_redirect(
@@ -54,16 +56,15 @@ fn flash_redirect(
     msg: String,
     to: &str,
 ) -> Response {
-    let flash = Flash {
-        kind: kind.into(),
-        msg,
-        link: None,
-    };
-    redirect_with(jar, secure, &flash, to)
-}
-
-fn redirect_with(jar: PrivateCookieJar, secure: bool, flash: &Flash, to: &str) -> Response {
-    (flash_cookie(jar, flash, secure), Redirect::to(to)).into_response()
+    let jar = flash_cookie(
+        jar,
+        &Flash {
+            kind: kind.into(),
+            msg,
+        },
+        secure,
+    );
+    (jar, Redirect::to(to)).into_response()
 }
 
 fn memory_href(hash: &str) -> String {
@@ -799,28 +800,6 @@ pub async fn supersede_submit(
     ))
 }
 
-/// An error flash: `msg`, then the survivor `v` the server named — a link
-/// when it is a hash, else its clipped text, so an unusable value still says
-/// the memory is superseded.
-fn naming_survivor(msg: String, v: &Value) -> Flash {
-    let link = v
-        .as_str()
-        .filter(|h| validate_hash(h).is_ok())
-        .map(String::from);
-    let msg = match link {
-        Some(_) => msg,
-        None => format!(
-            "{msg} an id the console cannot link: {}",
-            clip(&as_text(v), MAX_LOGGED_HASH_CHARS)
-        ),
-    };
-    Flash {
-        kind: "error".into(),
-        msg,
-        link,
-    }
-}
-
 #[derive(Deserialize)]
 pub struct UnsupersedeForm {
     #[serde(default)]
@@ -853,47 +832,43 @@ pub async fn unsupersede_submit(
             &unsupersede_href(&hash),
         ));
     }
+    // Every outcome lands on the memory's page, whose Supersession card
+    // links the current survivor whenever it is still superseded.
     let short = short_hash(&hash);
-    let (outcome, flash) = match state.alaya.unsupersede(&hash, reason).await? {
-        Unsupersede::Reversed { now_superseded_by } if now_superseded_by.is_null() => (
+    let (outcome, kind, msg) = match state.alaya.unsupersede(&hash, reason).await? {
+        Unsupersede::Reversed {
+            superseded_again: false,
+        } => (
             "reversed",
-            Flash {
-                kind: "ok".into(),
-                msg: format!("Un-superseded {short} — it is back in default search results."),
-                link: None,
-            },
+            "ok",
+            format!("Un-superseded {short} — it is back in default search results."),
         ),
-        Unsupersede::Reversed { now_superseded_by } => (
+        Unsupersede::Reversed {
+            superseded_again: true,
+        } => (
             "reversed, superseded again",
-            naming_survivor(
-                format!(
-                    "Un-superseded {short}, but it was superseded again straight after the \
-                     reversal, so it is still superseded — by"
-                ),
-                &now_superseded_by,
+            "error",
+            format!(
+                "Un-superseded {short}, but it was superseded again straight after the \
+                 reversal, so it is still superseded — see its survivor below."
             ),
         ),
         Unsupersede::NotSuperseded => (
             "not superseded",
-            Flash {
-                kind: "error".into(),
-                msg: format!("{short} is not superseded — nothing to reverse."),
-                link: None,
-            },
+            "error",
+            format!("{short} is not superseded — nothing to reverse."),
         ),
-        Unsupersede::SupersededByChanged { superseded_by } => (
+        Unsupersede::SupersededByChanged => (
             "superseded by changed",
-            naming_survivor(
-                format!(
-                    "Nothing reversed: {short} was superseded again before the reversal ran. \
-                     Check the new supersession before retrying — it is superseded by"
-                ),
-                &superseded_by,
+            "error",
+            format!(
+                "Nothing reversed: {short} was superseded again before the reversal ran. \
+                 Check its new survivor below before retrying."
             ),
         ),
     };
     tracing::info!(sub = ?session.sub, hash = %hash, outcome, "unsupersede");
-    Ok(redirect_with(jar, secure, &flash, &memory_href(&hash)))
+    Ok(flash_redirect(jar, secure, kind, msg, &memory_href(&hash)))
 }
 
 #[derive(Deserialize)]
@@ -2071,7 +2046,6 @@ fn bulk_report(total: usize, failed: &[(String, String)]) -> Flash {
         return Flash {
             kind: "ok".into(),
             msg: format!("Kept both for {total} pairs — nothing superseded."),
-            link: None,
         };
     }
     let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
@@ -2102,7 +2076,6 @@ fn bulk_report(total: usize, failed: &[(String, String)]) -> Flash {
             failed.len(),
             parts.join("; ")
         ),
-        link: None,
     }
 }
 
@@ -2310,6 +2283,21 @@ mod tests {
 
     fn card(p: &Value) -> String {
         queue_card(p, "tok", &QueueView::default(), QUEUE_PATH).to_html()
+    }
+
+    /// A `null` marker is still a supersession: the server keys on presence.
+    #[test]
+    fn is_superseded_keys_on_marker_presence_like_the_server() {
+        assert!(is_superseded(
+            &json!({ "metadata": { "superseded_by": "b".repeat(64) } })
+        ));
+        assert!(is_superseded(
+            &json!({ "metadata": { "superseded_by": null } })
+        ));
+        assert!(!is_superseded(
+            &json!({ "metadata": { "source": "import" } })
+        ));
+        assert!(!is_superseded(&json!({ "metadata": null })));
     }
 
     #[test]

@@ -128,10 +128,6 @@ pub struct LoginState {
 pub struct Flash {
     pub kind: String, // "ok" | "error"
     pub msg: String,
-    /// A memory the message names, rendered as a link after it. Always a
-    /// `validate_hash`-checked hash.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub link: Option<String>,
 }
 
 fn base_cookie(

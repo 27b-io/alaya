@@ -1919,8 +1919,13 @@ mod tests {
                 };
                 let mut memory = serde_json::json!({
                     "content_hash": h, "content": format!("memory {}", &h[..1]),
-                    "metadata": { "superseded_by": next },
+                    "metadata": {},
                 });
+                // A live memory has no marker key at all: a `null` one is a
+                // supersession, as on the server.
+                if let Some(next) = next {
+                    memory["metadata"]["superseded_by"] = serde_json::json!(next);
+                }
                 if h.starts_with('a') {
                     memory["supersession_reason"] = serde_json::json!("merged as a duplicate");
                 }
@@ -2004,19 +2009,19 @@ mod tests {
 
     /// AC-2: the documented body goes upstream, success redirects back to the
     /// memory with a flash, and a supersession that landed straight after the
-    /// reversal is said, with its survivor linked.
+    /// reversal is said.
     #[tokio::test]
     async fn unsupersede_posts_the_documented_body_and_flashes_the_outcome() {
-        let (a, d) = ("a".repeat(64), "d".repeat(64));
+        let a = "a".repeat(64);
         let seen = Seen::default();
         let again = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (flag, survivor) = (again.clone(), d.clone());
+        let flag = again.clone();
         let upstream = Router::new().route(
             "/unsupersede",
             recording(&seen, move |body| {
                 let now = flag
                     .load(std::sync::atomic::Ordering::SeqCst)
-                    .then(|| survivor.clone());
+                    .then(|| "d".repeat(64));
                 (
                     StatusCode::OK,
                     serde_json::json!({
@@ -2036,7 +2041,6 @@ mod tests {
         let flash = flash_of(&state, &resp);
         assert_eq!(flash.kind, "ok", "{}", flash.msg);
         assert!(flash.msg.contains(&a[..12]) && flash.msg.contains("back in default search"));
-        assert_eq!(flash.link, None);
         assert_eq!(
             seen.lock().unwrap()[0],
             serde_json::json!({
@@ -2046,48 +2050,60 @@ mod tests {
         );
 
         again.store(true, std::sync::atomic::Ordering::SeqCst);
-        let flash = flash_of(&state, &post_form(&state, &cookie, &uri, form).await);
+        let resp = post_form(&state, &cookie, &uri, form).await;
+        assert_eq!(location(&resp), format!("/alaya/memory/{a}"));
+        let flash = flash_of(&state, &resp);
         assert_eq!(flash.kind, "error");
         assert!(
             flash.msg.contains("superseded again straight after"),
             "{}",
             flash.msg
         );
-        assert_eq!(flash.link.as_deref(), Some(d.as_str()));
     }
 
     /// AC-4: the two typed `success: false` answers are messages on the
-    /// memory's page, not 502s, and `superseded_by_changed` links the new
-    /// survivor. Any other `success: false` still fails through the guard.
+    /// memory's page, not 502s, and after `superseded_by_changed` that page
+    /// links the new survivor. Any other `success: false` still fails
+    /// through the guard.
     #[tokio::test]
     async fn unsupersede_typed_answers_are_messages_and_others_still_fail() {
-        let d = "d".repeat(64);
-        let survivor = d.clone();
-        let upstream = Router::new().route(
-            "/unsupersede",
-            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
-                let survivor = survivor.clone();
-                async move {
-                    let hash = body["content_hash"].as_str().unwrap().to_string();
-                    axum::Json(match hash.as_bytes()[0] {
-                        b'a' => serde_json::json!({
-                            "success": false, "status": "not_superseded", "content_hash": hash,
-                            "error": "Memory is not superseded; nothing to reverse",
-                        }),
-                        b'b' => serde_json::json!({
-                            "success": false, "status": "superseded_by_changed",
-                            "content_hash": hash, "superseded_by": survivor,
-                            "error": "Superseded again while being restored; nothing reversed",
-                        }),
-                        b'c' => serde_json::json!({
-                            "success": false, "status": "superseded_by_changed",
-                            "content_hash": hash, "superseded_by": "not-a-hash",
-                        }),
-                        _ => serde_json::json!({ "success": false, "error": "graph down" }),
-                    })
-                }
-            }),
-        );
+        let (b, d) = ("b".repeat(64), "d".repeat(64));
+        let (page_b, page_d, survivor) = (b.clone(), d.clone(), d.clone());
+        let upstream = Router::new()
+            .route(
+                "/memories/{hash}",
+                get(move || {
+                    let (b, d) = (page_b.clone(), page_d.clone());
+                    async move {
+                        axum::Json(serde_json::json!({ "found": true, "memory": {
+                            "content_hash": b, "content": "memory b",
+                            "metadata": { "superseded_by": d },
+                        }}))
+                    }
+                }),
+            )
+            .route(
+                "/unsupersede",
+                post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let survivor = survivor.clone();
+                    async move {
+                        let hash = body["content_hash"].as_str().unwrap().to_string();
+                        axum::Json(match hash.as_bytes()[0] {
+                            b'a' => serde_json::json!({
+                                "success": false, "status": "not_superseded",
+                                "content_hash": hash,
+                                "error": "Memory is not superseded; nothing to reverse",
+                            }),
+                            b'b' => serde_json::json!({
+                                "success": false, "status": "superseded_by_changed",
+                                "content_hash": hash, "superseded_by": survivor,
+                                "error": "Superseded again while being restored; nothing reversed",
+                            }),
+                            _ => serde_json::json!({ "success": false, "error": "graph down" }),
+                        })
+                    }
+                }),
+            );
         let (state, cookie, csrf) = triage_app(upstream).await;
         let submit = |c: char| {
             let (state, cookie, csrf) = (state.clone(), cookie.clone(), csrf.clone());
@@ -2104,47 +2120,17 @@ mod tests {
 
         let resp = submit('b').await;
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-        assert_eq!(location(&resp), format!("/alaya/memory/{}", "b".repeat(64)));
+        assert_eq!(location(&resp), format!("/alaya/memory/{b}"));
         let flash = flash_of(&state, &resp);
         assert!(flash.msg.starts_with("Nothing reversed"), "{}", flash.msg);
-        assert_eq!(flash.link.as_deref(), Some(d.as_str()));
-
-        let flash = flash_of(&state, &submit('c').await);
-        assert_eq!(flash.link, None, "an unusable survivor is never a link");
+        let (_, page) = get_page(&state, &cookie, location(&resp)).await;
         assert!(
-            flash.msg.contains("cannot link: not-a-hash"),
-            "{}",
-            flash.msg
+            page.contains(&format!("href=\"/alaya/memory/{d}\"")),
+            "the page it lands on links the new survivor: {page}"
         );
 
         let resp = submit('e').await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         assert!(body_string(resp).await.contains("alaya-server: graph down"));
-    }
-
-    /// A flash's link renders after its message, so the operator can open
-    /// the survivor it names.
-    #[tokio::test]
-    async fn a_flash_link_renders_as_a_memory_link() {
-        let (c, d) = ("c".repeat(64), "d".repeat(64));
-        let upstream = Router::new().route("/memories/{hash}", chain_memories());
-        let (state, cookie, _) = triage_app(upstream).await;
-        let flash = session::Flash {
-            kind: "error".into(),
-            msg: "superseded by".into(),
-            link: Some(d.clone()),
-        };
-        let flash_cookie = encrypted_cookie_header(
-            &state,
-            session::FLASH_COOKIE,
-            serde_json::to_string(&flash).unwrap(),
-        );
-        let both = format!("{cookie}; {flash_cookie}");
-        let (_, html) = get_page(&state, &both, &format!("/alaya/memory/{c}")).await;
-        assert!(html.contains("superseded by"), "{html}");
-        assert!(
-            html.contains(&format!("href=\"/alaya/memory/{d}\"")),
-            "{html}"
-        );
     }
 }

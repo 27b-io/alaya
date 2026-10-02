@@ -202,13 +202,7 @@ fn flash_banner(flash: &Flash) -> impl IntoView + use<> {
         }
     };
     let msg = flash.msg.clone();
-    let link = flash.link.clone();
-    view! {
-        <div class=class role="status">
-            {msg}
-            {link.map(|hash| view! { " " <HashLink hash=hash /> })}
-        </div>
-    }
+    view! { <div class=class role="status">{msg}</div> }
 }
 
 /// Authenticated page shell: top nav (two-tenant module bar — Ālaya and the
