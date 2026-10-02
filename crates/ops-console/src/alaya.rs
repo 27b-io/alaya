@@ -50,23 +50,9 @@ impl AlayaClient {
         }
         let body: Value = serde_json::from_str(&text)
             .map_err(|_| AppError::Upstream("alaya-server returned non-JSON".into()))?;
-        // Op-level failures come back `200 {"success": false, "error": …}`.
-        // Surface them, or the operator gets a green flash for a write that
+        // Surfaced, or the operator gets a green flash for a write that
         // never happened (panel, LAB-3885).
-        if body.get("success").and_then(Value::as_bool) == Some(false) {
-            let detail = body
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("operation failed");
-            // The server reports a missing target only as this fixed
-            // `safe_message`, in a 200 body. Typed, because Reopen expects
-            // it for a pair with no reverse edge.
-            if detail == NOT_FOUND_MESSAGE {
-                return Err(AppError::NotFound(format!("alaya-server: {detail}")));
-            }
-            return Err(AppError::Upstream(format!("alaya-server: {detail}")));
-        }
-        Ok(body)
+        op_failure(body)
     }
 
     async fn get(&self, path: &str) -> Result<Value, AppError> {
@@ -225,4 +211,30 @@ impl AlayaClient {
     pub async fn auth_config(&self) -> Result<Value, AppError> {
         self.get("/auth/config").await
     }
+
+    /// `GET /stats` (LAB-6881): corpus and contradiction-judge aggregates.
+    /// A worker deadline answers `200 {"success": false}`, which must read
+    /// as a failure, never as an empty document.
+    pub async fn stats(&self) -> Result<Value, AppError> {
+        op_failure(self.get("/stats").await?)
+    }
+}
+
+/// Op-level failures come back `200 {"success": false, "error": …}`; turn
+/// one into an error so no caller renders it as a result.
+fn op_failure(body: Value) -> Result<Value, AppError> {
+    if body.get("success").and_then(Value::as_bool) == Some(false) {
+        let detail = body
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("operation failed");
+        // The server reports a missing target only as this fixed
+        // `safe_message`, in a 200 body. Typed, because Reopen expects
+        // it for a pair with no reverse edge.
+        if detail == NOT_FOUND_MESSAGE {
+            return Err(AppError::NotFound(format!("alaya-server: {detail}")));
+        }
+        return Err(AppError::Upstream(format!("alaya-server: {detail}")));
+    }
+    Ok(body)
 }

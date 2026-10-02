@@ -224,6 +224,7 @@ pub fn page(
                         <a class="hover:text-foreground" href="/alaya">"Memories"</a>
                         <a class="hover:text-foreground" href="/alaya/duplicates">"Duplicates"</a>
                         <a class="hover:text-foreground" href="/alaya/contradictions">"Contradictions"</a>
+                        <a class="hover:text-foreground" href="/alaya/health">"Judge health"</a>
                         <a class="hover:text-foreground" href="/alaya/auth">"Auth state"</a>
                         <a class="hover:text-foreground" href="/lb">"anthropic-lb"</a>
                     </nav>

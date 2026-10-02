@@ -97,6 +97,11 @@ is `user-123`, not `"user-123"`.
   in bulk.
 - **Auth state** — read-only view of alaya-server's `GET /auth/config`:
   principal × operation matrix + OIDC issuer/audience/allowlist.
+- **Judge health** (`/alaya/health`) — read-only view of alaya-server's
+  `GET /stats`: verdict mix (each count links to the contradictions
+  filter), stored judge failures, judgements per day, degenerate reasons,
+  daily-cap usage and graph edges by type. A source that is down renders
+  as an "unavailable" banner, never as zeros.
 
 ## anthropic-lb module (read-only)
 

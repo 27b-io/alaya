@@ -448,6 +448,81 @@ pub fn get_contradictions_for_hashes(hashes: &[&str]) -> CypherQuery {
     (q, params(&[("hashes", Value::Array(hash_list))]), true)
 }
 
+// ─── contradiction stats (LAB-6881) ───────────────────────────────────────────
+//
+// Five whole-graph aggregates behind bridge `POST /contradictions/stats`.
+// Each is one pass over the CONTRADICTS relation using property tests and
+// `indegree()` only: a per-row pattern predicate such as
+// `NOT (b)-[:CONTRADICTS {...}]->(a)` plans a sub-query per edge, which on
+// a whole-relation scan costs far more than the scan itself. The endpoints carry
+// no `:Memory` label test: every node is a Memory (`ensure_node` is the only
+// node writer), and on a whole-relation scan the label checks are pure cost.
+
+/// Rows `(verdict, resolved, count)`. `resolved` is the queue's direct test:
+/// a stamp on this edge, or either endpoint superseded. The reverse-edge
+/// half of the queue's definition is `contradiction_stats_reverse_stamped`.
+pub fn contradiction_stats_counts() -> CypherQuery {
+    let q = "MATCH (a)-[e:CONTRADICTS]->(b) \
+             RETURN e.verdict, \
+             e.resolution IS NOT NULL OR indegree(a, 'SUPERSEDES') > 0 \
+             OR indegree(b, 'SUPERSEDES') > 0, \
+             count(e)";
+    (q.to_string(), HashMap::new(), true)
+}
+
+/// Rows `(verdict, count)`: edges the counts query calls open whose pair is
+/// settled by a stamp on the REVERSE edge — the queue's "stamp in either
+/// direction" rule. Driven from the stamped edges, which are few, so the
+/// reverse test is one expansion per stamp rather than a pattern per edge.
+pub fn contradiction_stats_reverse_stamped() -> CypherQuery {
+    let resolutions: Vec<&str> = Resolution::ALL.iter().map(|r| r.as_str()).collect();
+    let q = "MATCH (b)-[s:CONTRADICTS]->(a) WHERE s.resolution IN $resolutions \
+             MATCH (a)-[e:CONTRADICTS]->(b) \
+             WHERE e.resolution IS NULL \
+             AND indegree(a, 'SUPERSEDES') = 0 AND indegree(b, 'SUPERSEDES') = 0 \
+             RETURN e.verdict, count(DISTINCT e)";
+    (
+        q.to_string(),
+        params(&[("resolutions", json!(resolutions))]),
+        true,
+    )
+}
+
+/// Rows `(reason, count)`: stored judge failures by full reason, the `lim`
+/// most frequent first. The total is the counts query's `unjudged` rows, so
+/// the remainder needs no second scan.
+pub fn contradiction_stats_failures(lim: usize) -> CypherQuery {
+    let q = "MATCH ()-[e:CONTRADICTS]->() WHERE e.verdict = $marker \
+             RETURN coalesce(e.verdict_reason, '') AS reason, count(e) AS n \
+             ORDER BY n DESC, reason LIMIT $lim";
+    (
+        q.to_string(),
+        params(&[("marker", json!(Verdict::UNJUDGED)), ("lim", json!(lim))]),
+        true,
+    )
+}
+
+/// Rows `(day, verdict, count)`, `day` = whole UTC days since the epoch,
+/// for edges judged at or after `since` (epoch seconds).
+pub fn contradiction_stats_judged_per_day(since: f64) -> CypherQuery {
+    let q = "MATCH ()-[e:CONTRADICTS]->() WHERE e.judged_at >= $since \
+             RETURN toInteger(floor(e.judged_at / 86400)), e.verdict, count(e)";
+    (q.to_string(), params(&[("since", json!(since))]), true)
+}
+
+/// Rows `(verdict, count)`: judged edges (failure markers excluded) whose
+/// trimmed reason is shorter than 10 chars or is `placeholder` in any case.
+/// Display only: empty, one-character and `placeholder` reasons are the
+/// shapes a model emits when it skips the explanation.
+pub fn contradiction_stats_degenerate() -> CypherQuery {
+    let classes: Vec<&str> = Verdict::CLASSES.iter().map(|v| v.as_str()).collect();
+    let q = "MATCH ()-[e:CONTRADICTS]->() WHERE e.verdict IN $classes \
+             WITH e.verdict AS verdict, trim(coalesce(e.verdict_reason, '')) AS r \
+             WHERE size(r) < 10 OR toLower(r) = 'placeholder' \
+             RETURN verdict, count(*)";
+    (q.to_string(), params(&[("classes", json!(classes))]), true)
+}
+
 // ─── Hebbian read operations ──────────────────────────────────────────────────
 
 /// Walk HEBBIAN edges up to `max_hops` (capped at 3) from a source node.
@@ -1129,6 +1204,33 @@ mod tests {
         // Returns kind + cnt columns
         assert!(q.contains("kind"));
         assert!(q.contains("AS cnt"));
+    }
+
+    // contradiction stats (LAB-6881)
+
+    fn stats_queries() -> Vec<CypherQuery> {
+        vec![
+            contradiction_stats_counts(),
+            contradiction_stats_reverse_stamped(),
+            contradiction_stats_failures(10),
+            contradiction_stats_judged_per_day(1.0),
+            contradiction_stats_degenerate(),
+        ]
+    }
+
+    /// Every stats query is a read, and none carries a per-row pattern
+    /// predicate (`NOT (...)` / `EXISTS`) — the shape that made the queue's
+    /// resolved filter cost a sub-query per edge.
+    #[test]
+    fn contradiction_stats_queries_are_readonly_scans_without_pattern_predicates() {
+        for (q, _, ro) in stats_queries() {
+            assert!(ro, "{q}");
+            assert!(!q.contains("NOT ("), "{q}");
+            assert!(!q.to_uppercase().contains("EXISTS"), "{q}");
+            for write in ["CREATE", "MERGE", "SET ", "DELETE", "REMOVE"] {
+                assert!(!q.contains(write), "{write} in {q}");
+            }
+        }
     }
 
     // schema

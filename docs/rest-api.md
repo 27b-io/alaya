@@ -61,6 +61,7 @@ Failed auth returns `401 Unauthorized` with a `WWW-Authenticate: Bearer …` hea
 | `POST` | `/duplicates/merge` | Supersede a duplicate cluster | yes |
 | `POST` | `/backfill/summaries` | Generate missing summaries | yes |
 | `POST` | `/backfill/contradictions` | Judge unjudged contradiction pairs | yes |
+| `GET`  | `/stats` | Corpus counts and contradiction-judge aggregates | yes |
 | `POST` | `/mcp` | MCP JSON-RPC entry point | yes |
 | `GET`  | `/.well-known/oauth-protected-resource[/mcp]` | OAuth resource metadata (404 unless `OIDC_ISSUER` set) | no |
 
@@ -499,6 +500,60 @@ Failures are classified so one poison pair cannot stall the pass or re-bill fore
 Re-running is idempotent: only edges with no verdict at all are selected. **Switching `JUDGE_MODEL`** (or `JUDGE_PROVIDER` with it) does not touch existing verdicts; run with `"rejudge": true` to also re-annotate every edge whose `verdict_model` differs from the configured model **and every `unjudged` marker** (the operator's way to retry deterministic failures after a fix), paging with `limit` until `queued` is `0`. A marker never overwrites a real verdict — if a re-judge fails on a pair that already has one, the old verdict stands. Verdicts are written onto the graph edge only; no memory record is modified.
 
 One pass at a time per `alaya-server` process: a second call to the same process while one is running returns `{"success": false, "error": "backfill already running"}`. With more than one replica behind the Service, a second call can land on another process and run alongside the first. The two passes select the same unjudged pairs, so some pairs are judged, and billed, twice; each verdict write is last-writer-wins on the edge and touches no memory, so nothing is corrupted. Send backfills to one pod (`kubectl port-forward pod/...`) to avoid the double spend. The HTTP reply waits at most 630 s, so keep `limit` around 200 per call; a pass that outlives the reply still runs to completion and the next call is refused until it finishes.
+
+## `GET /stats`
+
+Operator view of the corpus and the contradiction judge: the verdict mix, stored judge failures, the never-judged backlog, judge daily-cap usage, and graph edges by type. Full static bearer only — OIDC principals and the read-only bearer get `403` (it carries judge failure text and process-local spend state). Pure read: no access-count bump, no edge write.
+
+```bash
+curl -H "Authorization: Bearer $ALAYA_API_KEY" http://localhost:3001/stats
+```
+
+```json
+{
+  "memories": {"total": 5234},
+  "graph": {
+    "node_count": 5000,
+    "edge_counts": {"CONTRADICTS": 4589, "HEBBIAN": 77, "PRECEDES": 3, "RELATES_TO": 12, "SUPERSEDES": 131}
+  },
+  "contradictions": {
+    "by_verdict": {
+      "contradiction": {"open": 7, "resolved": 3},
+      "supersession": {"open": 161, "resolved": 15},
+      "coexist": {"open": 1172, "resolved": 36},
+      "unrelated": {"open": 826, "resolved": 26},
+      "unjudged": {"open": 9, "resolved": 0},
+      "never_judged": {"open": 1716, "resolved": 97}
+    },
+    "failures": {
+      "top": [{"reason": "unjudged: endpoint missing from vector store", "count": 4}],
+      "other": 5
+    },
+    "judged_per_day": [
+      {"date": "2026-09-18", "counts": {"contradiction": 0, "supersession": 3, "coexist": 41, "unrelated": 30, "unjudged": 1}}
+    ],
+    "degenerate_reasons": {"contradiction": 1, "supersession": 6, "coexist": 32, "unrelated": 31}
+  },
+  "judge_daily_cap": {"cap": 1000, "admitted_today": 41, "utc_day": "2026-10-01"},
+  "errors": []
+}
+```
+
+| Field | Meaning |
+|:--|:--|
+| `memories.total` | Points in the vector store, superseded memories included. |
+| `graph.node_count`, `graph.edge_counts` | Graph nodes, and edges per relationship type (`HEBBIAN` is the co-access edge). |
+| `contradictions.by_verdict` | Every `CONTRADICTS` edge, keyed by the verdict it carries now, split `open` / `resolved`. **Resolved** is exactly the default `POST /contradictions` queue's rule: either endpoint superseded (an incoming `SUPERSEDES` edge), or the pair stamped `keep_both` on either of its two edges. `unjudged` is a stored judge failure; `never_judged` is an edge with no verdict at all: the backlog of pairs the store path did not judge (daily cap, backlog bound, a transient judge failure), waiting for `POST /backfill/contradictions`. A verdict string the server does not know (only a direct graph write produces one) is left out. Edges, not pairs: a pair detected in both directions counts twice. |
+| `contradictions.failures` | Stored judge failures (`verdict = unjudged`) grouped by full `verdict_reason`: the ten most frequent in `top`, the rest summed in `other`; together they equal `by_verdict.unjudged`. Transient failures (`429`, timeouts, cap refusals) are retried and stored nowhere, so they are not counted. |
+| `contradictions.judged_per_day` | The last 14 UTC days, oldest first, each zero-filled: edges per verdict whose `judged_at` falls on that day. An edge keeps only its latest verdict, so a re-judged edge counts once, on the day of its last judgement. |
+| `contradictions.degenerate_reasons` | Per judge class, judged edges whose trimmed `verdict_reason` is shorter than 10 characters or equals `placeholder` (any case). Display only — nothing acts on it. Failure markers are excluded: their reason is an error string, not the judge's. |
+| `judge_daily_cap.cap` | `JUDGE_DAILY_CAP`, or `null` when no judge is configured. |
+| `judge_daily_cap.admitted_today`, `utc_day` | Store-path judge calls billed today (UTC) **by the process that answered** — the counter is per process, so with several replicas each reports its own. `POST /backfill/contradictions` is not counted. |
+| `errors` | One note per failed source. A section whose source failed is `null` — `memories` for the vector store, `graph` and `contradictions` for the graph — and never zeros; the call still answers `200`. |
+
+Two different confidences exist on a pair and must not be read as one: `verdict_confidence` (on `POST /contradictions`) is the **judge's** confidence in its verdict, while `confidence` is the lexical **detector's** score for the edge when it was written. This endpoint aggregates neither; it counts verdicts and reasons only.
+
+Every aggregate is one read-only pass over the `CONTRADICTS` relationship, using property tests and `indegree()` only (no per-edge pattern predicates). The graph sections are computed fresh per call, so poll it at human rates, not as a metrics scrape. One call runs at a time per process: a call while one is in flight answers `{"success": false, "error": "stats already running"}`. A reply past the command deadline is `{"success": false, "error_kind": "timeout"}`.
 
 ## `POST /mcp`
 
