@@ -255,25 +255,24 @@ impl BrowseView {
 
     /// The search body: only what the mode applies, so the request says
     /// exactly what the server will do.
-    fn upstream(&self) -> Value {
-        let mut params = json!({
-            "mode": self.mode.as_str(),
-            "page": self.page,
-            "page_size": PAGE_SIZE,
-            "include_superseded": self.include_superseded,
-            "output": "both",
-        });
-        if !self.q.is_empty() {
-            params["query"] = json!(self.q);
-        }
-        if !self.memory_type.is_empty() {
-            params["memory_type"] = json!(self.memory_type);
-        }
-        if !self.tags.is_empty() {
-            params["tags"] = json!(self.tags);
+    fn upstream(&self) -> serde_json::Map<String, Value> {
+        let mut params = serde_json::Map::new();
+        params.insert("mode".into(), json!(self.mode.as_str()));
+        params.insert("page".into(), json!(self.page));
+        params.insert("page_size".into(), json!(PAGE_SIZE));
+        params.insert("include_superseded".into(), json!(self.include_superseded));
+        params.insert("output".into(), json!("both"));
+        for (key, value) in [
+            ("query", &self.q),
+            ("memory_type", &self.memory_type),
+            ("tags", &self.tags),
+        ] {
+            if !value.is_empty() {
+                params.insert(key.into(), json!(value));
+            }
         }
         if let Some(c) = self.cursor {
-            params["cursor"] = json!(c);
+            params.insert("cursor".into(), json!(c));
         }
         params
     }
