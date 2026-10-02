@@ -241,9 +241,9 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" \
 | `404 Not Found` | `{ "found": false }` |
 | `400 Bad Request` | `{ "error": "invalid content_hash format" }` — hash isn't 64 lowercase hex chars |
 
-Superseded memories return `200` with `memory.metadata.superseded_by` populated.
+Superseded memories return `200` with `memory.metadata.superseded_by` populated. With `output=full` (the default) or `output=both`, they also carry `memory.supersession_reason`: the reason given to [`POST /supersede`](#post-supersede) or [`POST /duplicates/merge`](#post-duplicatesmerge), as stored (`""` when none was given). It is optional and read-only: the key is absent when no reason is stored, which includes every memory that is not superseded, since [`POST /unsupersede`](#post-unsupersede) moves the reason into the log below. `output=summary`, `POST /search` and the `PATCH` reply never carry it.
 
-With `output=full` (the default) or `output=both`, a memory whose supersession was ever reversed also carries `memory.supersession_log`: its audit trail, oldest first, one entry per [`POST /unsupersede`](#post-unsupersede) with `superseded_by`, `supersession_reason`, `unsuperseded_at`, `unsuperseded_via` and `reason` (the shape documented under [MCP: `memory_unsupersede`](./mcp-tools.md#memory_unsupersede)). Entries come back exactly as stored. The key is absent when nothing was ever reversed, and `output=summary`, `POST /search` and the `PATCH` reply never carry it. Like the rest of the memory, it is visible to every principal that may read the memory, read-only and OIDC bearers included.
+With `output=full` or `output=both`, a memory whose supersession was ever reversed also carries `memory.supersession_log`: its audit trail, oldest first, one entry per [`POST /unsupersede`](#post-unsupersede) in the shape documented under [MCP: `memory_unsupersede`](./mcp-tools.md#memory_unsupersede). Entries come back in stored order; a stored value that is not an array comes back as one entry. The key is absent when nothing was ever reversed, and `output=summary`, `POST /search` and the `PATCH` reply never carry it. Like the rest of the memory, it is visible to every principal that may read the memory, read-only and OIDC bearers included.
 
 ## `PATCH /memories/{content_hash}`
 

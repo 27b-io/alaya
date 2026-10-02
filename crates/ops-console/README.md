@@ -70,11 +70,22 @@ is `user-123`, not `"user-123"`.
 - **Browse/search** — hybrid / scan / recent / tag modes, type + tag filters,
   superseded-visibility toggle, pagination.
 - **Detail** — full content, metadata, salience/access/trust stats,
-  relations, supersession chain (audit trail rendered, never hidden).
+  relations, supersession chain (audit trail rendered, never hidden). A
+  superseded memory shows what superseded it (a link) and the stored
+  `supersession_reason`.
 - **Curation** — supersede (reason required), correct-&-supersede (store a
   fixed copy, then supersede the original), delete (two-step confirm),
   merge duplicates (dry-run preview before commit), relations
   create/delete.
+- **Un-supersede** — reverse a wrong supersession from the memory's detail
+  page: a reason is required (it is the audit record), and the form posts
+  alaya-server's `POST /unsupersede` with `unsuperseded_via:
+  "operator:console"`. Each superseded hop in the chain links to its own
+  form. Only the named memory changes, as the API defines; the console adds
+  no rule. The server's typed answers are messages, not errors: *not
+  superseded*, and *superseded again before the reversal ran*, which links
+  the new survivor. A reversal followed at once by a new supersession says
+  so, with that survivor linked.
 - **Contradictions triage** — the CONTRADICTS queue, 50 pairs a page,
   newest first, paged with the server's `next_offset` (Next appears only
   when the server returns one). The view lives in the URL, so a refresh or

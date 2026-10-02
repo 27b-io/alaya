@@ -31,7 +31,7 @@ crates/
 │   ├── lib.rs          # Re-exports
 │   ├── error.rs        # AlayaError (JSON-RPC codes, safe_message())
 │   ├── graph.rs        # UserRelationType, SystemRelationType, Edge, Neighbor, etc.
-│   ├── memory.rs       # Memory (17 fields), ScoredMemory, ScrollResult, MetadataUpdate
+│   ├── memory.rs       # Memory (18 fields), ScoredMemory, ScrollResult, MetadataUpdate
 │   └── search.rs       # SearchMode (5 modes), PromptName, PayloadFilter
 ├── alaya-bridge/src/
 │   ├── lib.rs           # Library target (re-exports for integration tests)

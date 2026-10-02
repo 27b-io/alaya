@@ -33,10 +33,16 @@ pub struct Memory {
     #[serde(default, skip_serializing)]
     pub summary_embedding: Option<Vec<f32>>,
     /// The server-maintained `supersession_log` payload key: reversed
-    /// supersessions, oldest first, entries as stored. Read-only — a store
-    /// never writes it — and returned by `get_memory` alone.
+    /// supersessions, oldest first, in stored order; a stored value that is
+    /// not an array comes back as one entry. Read-only — a store never
+    /// writes it — and returned by `get_memory` alone.
     #[serde(default, skip_serializing)]
     pub supersession_log: Option<Vec<serde_json::Value>>,
+    /// The `supersession_reason` payload key, as stored: why the memory was
+    /// superseded. Written by supersede, removed by unsupersede, never by a
+    /// store — and, like the log, returned by `get_memory` alone.
+    #[serde(default, skip_serializing)]
+    pub supersession_reason: Option<serde_json::Value>,
 }
 
 /// A memory with a similarity/relevance score from search.

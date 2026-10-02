@@ -651,18 +651,25 @@ async fn read_back(c: char, payload: Value) -> Memory {
 }
 
 /// The log a reversal writes is the log a read returns: one entry, with the
-/// caller's reason and every key the reversal stored.
+/// caller's reason and every key the reversal stored. The supersession
+/// reason reads back while the memory is superseded, and not after.
 #[tokio::test]
 async fn reversal_log_is_read_back_by_get_by_hash() {
     let (server, fake) = fake_with(&[('c', None)]).await;
     fake.insert(&id('a'), superseded_payload('a', 'b', Some("r1")));
     let client = client_for(&server);
+    let superseded = client.get_by_hash(&hash('a')).await.unwrap().unwrap();
+    assert_eq!(superseded.supersession_reason, Some(json!("merged")));
 
     client
         .reverse_supersession(&hash('a'), &json!(hash('b')), &reversal())
         .await
         .expect("clear succeeds");
     let mem = client.get_by_hash(&hash('a')).await.unwrap().unwrap();
+    assert_eq!(
+        mem.supersession_reason, None,
+        "the reason moved into the log"
+    );
     assert_eq!(
         mem.supersession_log,
         Some(vec![json!({

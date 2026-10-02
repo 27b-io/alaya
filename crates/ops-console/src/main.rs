@@ -150,6 +150,10 @@ fn app(state: AppState) -> Router {
             post(routes::alaya::correct_and_supersede),
         )
         .route(
+            "/alaya/memory/{hash}/unsupersede",
+            post(routes::alaya::unsupersede_submit),
+        )
+        .route(
             "/alaya/supersede",
             get(routes::alaya::supersede_form).post(routes::alaya::supersede_submit),
         )
@@ -1898,6 +1902,249 @@ mod tests {
             reopen('d').await.status(),
             StatusCode::BAD_GATEWAY,
             "nothing was cleared, so nothing is flashed"
+        );
+    }
+
+    // ─── Un-supersede (LAB-6880) ───────────────────────────────────────────
+
+    /// A `/memories/{hash}` upstream for the chain A→B→C: A superseded by B
+    /// with a reason, B by C, C live.
+    fn chain_memories() -> axum::routing::MethodRouter {
+        get(
+            |axum::extract::Path(h): axum::extract::Path<String>| async move {
+                let next = match h.as_bytes()[0] {
+                    b'a' => Some("b".repeat(64)),
+                    b'b' => Some("c".repeat(64)),
+                    _ => None,
+                };
+                let mut memory = serde_json::json!({
+                    "content_hash": h, "content": format!("memory {}", &h[..1]),
+                    "metadata": { "superseded_by": next },
+                });
+                if h.starts_with('a') {
+                    memory["supersession_reason"] = serde_json::json!("merged as a duplicate");
+                }
+                axum::Json(serde_json::json!({ "found": true, "memory": memory }))
+            },
+        )
+    }
+
+    /// AC-1 / AC-3: a superseded memory's page names its survivor and why,
+    /// carries the form, and every superseded hop down the chain links to its
+    /// own form; the live end of the chain offers nothing.
+    #[tokio::test]
+    async fn detail_shows_why_and_offers_unsupersede_down_the_chain() {
+        let (a, b, c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        let upstream = Router::new().route("/memories/{hash}", chain_memories());
+        let (state, cookie, _) = triage_app(upstream).await;
+
+        let (status, html) = get_page(&state, &cookie, &format!("/alaya/memory/{a}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Superseded by"), "{html}");
+        assert!(html.contains("merged as a duplicate"), "the reason renders");
+        assert!(html.contains(&format!("href=\"/alaya/memory/{b}\"")));
+        assert!(html.contains(&format!("action=\"/alaya/memory/{a}/unsupersede\"")));
+        assert!(html.contains(&format!("href=\"/alaya/memory/{b}#unsupersede\"")));
+        assert!(
+            html.contains(&format!("href=\"/alaya/memory/{c}\"")),
+            "C is in the chain"
+        );
+        assert!(!html.contains(&format!("/alaya/memory/{c}#unsupersede")));
+
+        let (_, html) = get_page(&state, &cookie, &format!("/alaya/memory/{c}")).await;
+        assert!(
+            !html.contains("unsupersede"),
+            "a live memory offers no reversal"
+        );
+    }
+
+    /// AC-2: a bad CSRF token and an empty reason both write nothing; the
+    /// empty reason lands back on the form with an error.
+    #[tokio::test]
+    async fn unsupersede_without_csrf_or_reason_makes_no_upstream_call() {
+        let a = "a".repeat(64);
+        let seen = Seen::default();
+        let upstream = Router::new().route(
+            "/unsupersede",
+            recording(&seen, |_| {
+                (
+                    StatusCode::OK,
+                    serde_json::json!({ "success": true, "status": "unsuperseded" }),
+                )
+            }),
+        );
+        let (state, cookie, csrf) = triage_app(upstream).await;
+        let uri = format!("/alaya/memory/{a}/unsupersede");
+
+        let resp = post_form(
+            &state,
+            &cookie,
+            &uri,
+            "csrf=WRONG&reason=wrong+merge".into(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        for reason in ["", "+++"] {
+            let resp = post_form(
+                &state,
+                &cookie,
+                &uri,
+                format!("csrf={csrf}&reason={reason}"),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            assert_eq!(location(&resp), format!("/alaya/memory/{a}#unsupersede"));
+            let flash = flash_of(&state, &resp);
+            assert_eq!(flash.kind, "error");
+            assert!(flash.msg.contains("reason is required"), "{}", flash.msg);
+        }
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// AC-2: the documented body goes upstream, success redirects back to the
+    /// memory with a flash, and a supersession that landed straight after the
+    /// reversal is said, with its survivor linked.
+    #[tokio::test]
+    async fn unsupersede_posts_the_documented_body_and_flashes_the_outcome() {
+        let (a, d) = ("a".repeat(64), "d".repeat(64));
+        let seen = Seen::default();
+        let again = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (flag, survivor) = (again.clone(), d.clone());
+        let upstream = Router::new().route(
+            "/unsupersede",
+            recording(&seen, move |body| {
+                let now = flag
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .then(|| survivor.clone());
+                (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "success": true, "status": "unsuperseded",
+                        "content_hash": body["content_hash"], "now_superseded_by": now,
+                    }),
+                )
+            }),
+        );
+        let (state, cookie, csrf) = triage_app(upstream).await;
+        let uri = format!("/alaya/memory/{a}/unsupersede");
+        let form = format!("csrf={csrf}&reason=+not+a+duplicate+");
+
+        let resp = post_form(&state, &cookie, &uri, form.clone()).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&resp), format!("/alaya/memory/{a}"));
+        let flash = flash_of(&state, &resp);
+        assert_eq!(flash.kind, "ok", "{}", flash.msg);
+        assert!(flash.msg.contains(&a[..12]) && flash.msg.contains("back in default search"));
+        assert_eq!(flash.link, None);
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            serde_json::json!({
+                "content_hash": a, "reason": "not a duplicate",
+                "unsuperseded_via": "operator:console",
+            })
+        );
+
+        again.store(true, std::sync::atomic::Ordering::SeqCst);
+        let flash = flash_of(&state, &post_form(&state, &cookie, &uri, form).await);
+        assert_eq!(flash.kind, "error");
+        assert!(
+            flash.msg.contains("superseded again straight after"),
+            "{}",
+            flash.msg
+        );
+        assert_eq!(flash.link.as_deref(), Some(d.as_str()));
+    }
+
+    /// AC-4: the two typed `success: false` answers are messages on the
+    /// memory's page, not 502s, and `superseded_by_changed` links the new
+    /// survivor. Any other `success: false` still fails through the guard.
+    #[tokio::test]
+    async fn unsupersede_typed_answers_are_messages_and_others_still_fail() {
+        let d = "d".repeat(64);
+        let survivor = d.clone();
+        let upstream = Router::new().route(
+            "/unsupersede",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let survivor = survivor.clone();
+                async move {
+                    let hash = body["content_hash"].as_str().unwrap().to_string();
+                    axum::Json(match hash.as_bytes()[0] {
+                        b'a' => serde_json::json!({
+                            "success": false, "status": "not_superseded", "content_hash": hash,
+                            "error": "Memory is not superseded; nothing to reverse",
+                        }),
+                        b'b' => serde_json::json!({
+                            "success": false, "status": "superseded_by_changed",
+                            "content_hash": hash, "superseded_by": survivor,
+                            "error": "Superseded again while being restored; nothing reversed",
+                        }),
+                        b'c' => serde_json::json!({
+                            "success": false, "status": "superseded_by_changed",
+                            "content_hash": hash, "superseded_by": "not-a-hash",
+                        }),
+                        _ => serde_json::json!({ "success": false, "error": "graph down" }),
+                    })
+                }
+            }),
+        );
+        let (state, cookie, csrf) = triage_app(upstream).await;
+        let submit = |c: char| {
+            let (state, cookie, csrf) = (state.clone(), cookie.clone(), csrf.clone());
+            async move {
+                let uri = format!("/alaya/memory/{}/unsupersede", c.to_string().repeat(64));
+                post_form(&state, &cookie, &uri, format!("csrf={csrf}&reason=wrong")).await
+            }
+        };
+
+        let resp = submit('a').await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let flash = flash_of(&state, &resp);
+        assert!(flash.msg.contains("is not superseded"), "{}", flash.msg);
+
+        let resp = submit('b').await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&resp), format!("/alaya/memory/{}", "b".repeat(64)));
+        let flash = flash_of(&state, &resp);
+        assert!(flash.msg.starts_with("Nothing reversed"), "{}", flash.msg);
+        assert_eq!(flash.link.as_deref(), Some(d.as_str()));
+
+        let flash = flash_of(&state, &submit('c').await);
+        assert_eq!(flash.link, None, "an unusable survivor is never a link");
+        assert!(
+            flash.msg.contains("cannot link: not-a-hash"),
+            "{}",
+            flash.msg
+        );
+
+        let resp = submit('e').await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(body_string(resp).await.contains("alaya-server: graph down"));
+    }
+
+    /// A flash's link renders after its message, so the operator can open
+    /// the survivor it names.
+    #[tokio::test]
+    async fn a_flash_link_renders_as_a_memory_link() {
+        let (c, d) = ("c".repeat(64), "d".repeat(64));
+        let upstream = Router::new().route("/memories/{hash}", chain_memories());
+        let (state, cookie, _) = triage_app(upstream).await;
+        let flash = session::Flash {
+            kind: "error".into(),
+            msg: "superseded by".into(),
+            link: Some(d.clone()),
+        };
+        let flash_cookie = encrypted_cookie_header(
+            &state,
+            session::FLASH_COOKIE,
+            serde_json::to_string(&flash).unwrap(),
+        );
+        let both = format!("{cookie}; {flash_cookie}");
+        let (_, html) = get_page(&state, &both, &format!("/alaya/memory/{c}")).await;
+        assert!(html.contains("superseded by"), "{html}");
+        assert!(
+            html.contains(&format!("href=\"/alaya/memory/{d}\"")),
+            "{html}"
         );
     }
 }
