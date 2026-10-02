@@ -837,9 +837,12 @@ impl MemoryService {
                     Vec::new()
                 } else {
                     let keyword_refs: Vec<&str> = keywords.iter().map(|s| s.as_str()).collect();
-                    let search = self
-                        .vectors
-                        .search_by_tags(&keyword_refs, false, fetch_size);
+                    let search = self.vectors.search_by_tags(
+                        &keyword_refs,
+                        false,
+                        fetch_size,
+                        params.memory_type.as_deref(),
+                    );
                     stages
                         .time(Stage::TagSearch, search)
                         .await
@@ -887,7 +890,7 @@ impl MemoryService {
                 }
                 let refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
                 self.vectors
-                    .search_by_tags(&refs, false, fetch_size)
+                    .search_by_tags(&refs, false, fetch_size, params.memory_type.as_deref())
                     .await
                     .unwrap_or_default()
             };
@@ -910,10 +913,12 @@ impl MemoryService {
         }
 
         // Drop superseded and wrong-type memories from every candidate pool
-        // before fusion. Neither search_by_vector nor search_by_tags filters
-        // supersession (see is_superseded), and search_by_tags takes no type
-        // filter, so excluded entries must not consume RRF ranks, rerank
-        // slots, or spreading-activation seeds.
+        // before fusion, so excluded entries consume no RRF ranks, rerank
+        // slots, or spreading-activation seeds. Neither search_by_vector nor
+        // search_by_tags filters supersession (see is_superseded). Both apply
+        // memory_type Qdrant-side, so wrong-type hits cannot crowd the right
+        // type out of fetch_size; checking it again here keeps one predicate
+        // for every pool, graph injection included.
         let admits = |m: &Memory| {
             (params.include_superseded || !is_superseded(m))
                 && params
@@ -986,7 +991,10 @@ impl MemoryService {
             let fused_hashes: std::collections::HashSet<&str> =
                 fused.iter().map(|(h, _, _)| h.as_str()).collect();
 
-            // Top-10 activated neighbors not already in results
+            // Activated neighbors not already in results, strongest first.
+            // All are fetched (spreading_activation returns at most 50) so
+            // the top-10 cap counts only neighbours `admits` keeps: a
+            // wrong-type or superseded one must not take a weaker one's slot.
             let mut inject_candidates: Vec<(&str, f64)> = spreading
                 .iter()
                 .filter(|(h, _)| !fused_hashes.contains(h.as_str()))
@@ -994,14 +1002,12 @@ impl MemoryService {
                 .collect();
             inject_candidates
                 .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            inject_candidates.truncate(10);
 
             if inject_candidates.is_empty() {
                 Vec::new()
             } else {
                 let neighbor_hashes: Vec<&str> =
                     inject_candidates.iter().map(|(h, _)| *h).collect();
-                let activation_map: HashMap<&str, f64> = inject_candidates.into_iter().collect();
 
                 // Use the minimum existing display score as a floor so
                 // injected memories don't get filtered by min_similarity.
@@ -1013,21 +1019,20 @@ impl MemoryService {
 
                 match self.vectors.get_batch(&neighbor_hashes).await {
                     Ok(memories) => {
-                        let mut result = Vec::with_capacity(memories.len());
-                        for mem in memories {
-                            if !admits(&mem) {
-                                continue;
-                            }
-                            let activation = activation_map
-                                .get(mem.content_hash.as_str())
-                                .copied()
-                                .unwrap_or(0.0);
-                            let display_score = min_existing.max(activation);
-                            result.push(ScoredMemory {
-                                memory: mem,
-                                score: display_score,
-                            });
-                        }
+                        let mut fetched: HashMap<String, Memory> = memories
+                            .into_iter()
+                            .map(|m| (m.content_hash.clone(), m))
+                            .collect();
+                        let result: Vec<ScoredMemory> = inject_candidates
+                            .iter()
+                            .filter_map(|(h, activation)| Some((fetched.remove(*h)?, *activation)))
+                            .filter(|(mem, _)| admits(mem))
+                            .take(10)
+                            .map(|(memory, activation)| ScoredMemory {
+                                memory,
+                                score: min_existing.max(activation),
+                            })
+                            .collect();
                         tracing::debug!(
                             injected = result.len(),
                             "graph injection: added neighbors from spreading activation"
@@ -1470,7 +1475,11 @@ impl MemoryService {
             target,
             MAX_TAG_FETCH,
             params.include_superseded,
-            |n| self.vectors.search_by_tags(&tag_refs, params.match_all, n),
+            // Tag mode does not read memory_type (the console says so).
+            |n| {
+                self.vectors
+                    .search_by_tags(&tag_refs, params.match_all, n, None)
+            },
         )
         .await?;
 
@@ -3190,6 +3199,7 @@ mod tests {
             _t: &[&str],
             _m: bool,
             _l: usize,
+            _mt: Option<&str>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -3838,6 +3848,7 @@ mod tests {
             _t: &[&str],
             _m: bool,
             _l: usize,
+            _mt: Option<&str>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -4255,6 +4266,7 @@ mod tests {
             _t: &[&str],
             _m: bool,
             _l: usize,
+            _mt: Option<&str>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -4648,6 +4660,7 @@ mod tests {
             _t: &[&str],
             _m: bool,
             _l: usize,
+            _mt: Option<&str>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -5234,8 +5247,9 @@ mod tests {
 
     /// Mock VectorStorage that returns pre-configured vector search results
     /// and can serve specific memories from get_batch (for graph injection).
-    /// `tag_pools` answers search_by_tags per tag, and `similar_tags` is what
-    /// search_similar_tags returns. Neither search applies a filter.
+    /// `tag_pools` answers search_by_tags per tag, honouring its limit and
+    /// memory_type as Qdrant does, and `similar_tags` is what
+    /// search_similar_tags returns.
     /// Counts access-count increments, so a test can see search's writes.
     #[derive(Default)]
     struct MockVectorsWithInjection {
@@ -5297,12 +5311,15 @@ mod tests {
             &self,
             tags: &[&str],
             _m: bool,
-            _l: usize,
+            limit: usize,
+            memory_type: Option<&str>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(tags
                 .iter()
                 .filter_map(|t| self.tag_pools.get(*t))
                 .flatten()
+                .filter(|sm| memory_type.is_none_or(|t| sm.memory.memory_type == t))
+                .take(limit)
                 .cloned()
                 .collect())
         }
@@ -5595,8 +5612,9 @@ mod tests {
     /// With `memory_type` set, hybrid returns only that type from every
     /// candidate pool. Each non-vector pool (keyword tag, semantic tag, graph
     /// injection) is seeded with one memory of the type and one of another
-    /// type; the mocks apply no filter, so only the service can drop them.
-    /// The unfiltered run proves every wrong-type memory reached its pool.
+    /// type. The tag mock filters the type as Qdrant does; graph neighbours
+    /// are filtered by the service alone. The unfiltered run proves every
+    /// wrong-type memory reached its pool.
     #[tokio::test(flavor = "current_thread")]
     async fn hybrid_memory_type_filters_every_candidate_pool() {
         let typed = |hash: char, memory_type: &str| {
@@ -5683,6 +5701,125 @@ mod tests {
             .await
             .expect("search succeeds");
         assert_eq!(returned(filtered), wanted);
+    }
+
+    /// A typed hybrid search passes the type to both tag searches, so
+    /// wrong-type tag matches cannot fill fetch_size ahead of the right type.
+    /// Each pool holds 100 wrong-type matches (fetch_size never exceeds 100)
+    /// before its one decision, and the mock honours its limit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_memory_type_reaches_both_tag_searches() {
+        let typed = |hash: String, memory_type: &str| {
+            let mut sm = make_scored_memory(&hash, "pool member", 0.5);
+            sm.memory.memory_type = memory_type.into();
+            sm
+        };
+        let keyword_ok = typed("b".repeat(64), "decision");
+        let semantic_ok = typed("d".repeat(64), "decision");
+        let pool = |memory_type: &str, offset: usize, ok: &ScoredMemory| {
+            (offset..offset + 100)
+                .map(|i| typed(format!("{i:064x}"), memory_type))
+                .chain([ok.clone()])
+                .collect::<Vec<_>>()
+        };
+
+        let svc = MemoryService::new(
+            Box::new(MockVectorsWithInjection {
+                tag_pools: HashMap::from([
+                    ("stability".into(), pool("note", 0, &keyword_ok)),
+                    ("semantic".into(), pool("task", 100, &semantic_ok)),
+                ]),
+                similar_tags: vec!["semantic".into()],
+                ..Default::default()
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraphWithActivation {
+                activation: HashMap::new(),
+            }),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        );
+
+        let result = svc
+            .search(SearchParams {
+                memory_type: Some("decision".into()),
+                ..search_params("stability notes")
+            })
+            .await
+            .expect("search succeeds");
+        let returned: std::collections::HashSet<&str> = result["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .filter_map(|r| r["content_hash"].as_str())
+            .collect();
+        assert_eq!(
+            returned,
+            std::collections::HashSet::from([
+                keyword_ok.memory.content_hash.as_str(),
+                semantic_ok.memory.content_hash.as_str(),
+            ])
+        );
+    }
+
+    /// Graph injection applies `admits` before its ten-neighbour cap. Ten
+    /// wrong-type neighbours outrank eleven decisions; the ten strongest
+    /// decisions are injected and the eleventh is still capped out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn graph_injection_caps_only_admitted_neighbours() {
+        let neighbour = |i: usize, memory_type: &str, activation: f64| {
+            let mut sm = make_scored_memory(&format!("{i:064x}"), "neighbour", 0.0);
+            sm.memory.memory_type = memory_type.into();
+            (sm.memory, activation)
+        };
+        let seed = make_scored_memory(&"a".repeat(64), "seed", 0.6);
+        let notes = (0..10).map(|i| neighbour(i, "note", 0.99 - i as f64 * 0.01));
+        let decisions: Vec<(Memory, f64)> = (0..11)
+            .map(|i| neighbour(100 + i, "decision", 0.80 - i as f64 * 0.01))
+            .collect();
+        let neighbours: Vec<(Memory, f64)> = notes.chain(decisions.iter().cloned()).collect();
+
+        let svc = MemoryService::new(
+            Box::new(MockVectorsWithInjection {
+                search_results: vec![seed.clone()],
+                injectable_memories: neighbours
+                    .iter()
+                    .map(|(m, _)| (m.content_hash.clone(), m.clone()))
+                    .collect(),
+                ..Default::default()
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraphWithActivation {
+                activation: neighbours
+                    .iter()
+                    .map(|(m, a)| (m.content_hash.clone(), *a))
+                    .collect(),
+            }),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        );
+
+        let result = svc
+            .search(SearchParams {
+                memory_type: Some("decision".into()),
+                page_size: 20,
+                ..search_params("stability notes")
+            })
+            .await
+            .expect("search succeeds");
+        let returned: std::collections::HashSet<&str> = result["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .filter_map(|r| r["content_hash"].as_str())
+            .collect();
+        let expected: std::collections::HashSet<&str> =
+            std::iter::once(seed.memory.content_hash.as_str())
+                .chain(decisions[..10].iter().map(|(m, _)| m.content_hash.as_str()))
+                .collect();
+        assert_eq!(returned, expected);
     }
 
     // ─── get_memory (Tool 10) tests ──────────────────────────────────────
@@ -6388,6 +6525,7 @@ mod tests {
             _t: &[&str],
             _m: bool,
             _l: usize,
+            _mt: Option<&str>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -7021,6 +7159,7 @@ mod tests {
             _t: &[&str],
             _m: bool,
             limit: usize,
+            _mt: Option<&str>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(self.scored(limit))
         }
@@ -7530,6 +7669,7 @@ mod tests {
                 _t: &[&str],
                 _a: bool,
                 _l: usize,
+                _mt: Option<&str>,
             ) -> Result<Vec<ScoredMemory>> {
                 unimplemented!()
             }
@@ -8532,6 +8672,7 @@ mod tests {
             _t: &[&str],
             _m: bool,
             limit: usize,
+            _mt: Option<&str>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(scored_from(&self.0.memories.borrow(), limit))
         }

@@ -1439,23 +1439,18 @@ impl VectorStorage for QdrantClient {
         tags: &[&str],
         match_all: bool,
         limit: usize,
+        memory_type: Option<&str>,
     ) -> Result<Vec<ScoredMemory>> {
-        let filter = if match_all {
-            let must: Vec<Value> = tags
-                .iter()
-                .map(|t| json!({"key": "tags", "match": {"value": t}}))
-                .collect();
-            json!({"must": must})
-        } else {
-            let should: Vec<Value> = tags
-                .iter()
-                .map(|t| json!({"key": "tags", "match": {"value": t}}))
-                .collect();
-            json!({"should": should})
+        // Qdrant applies memory_type before `limit`, so wrong-type tag matches
+        // cannot fill the page ahead of the requested type.
+        let filter = PayloadFilter {
+            memory_type: memory_type.map(String::from),
+            tags: Some(tags.iter().map(|t| t.to_string()).collect()),
+            tags_match_all: match_all,
+            ..Default::default()
         };
-
         let body = json!({
-            "filter": filter,
+            "filter": build_filter(&filter),
             "limit": limit,
             "with_payload": true,
             "with_vector": false,
@@ -2019,6 +2014,30 @@ mod tests {
         };
         let filter = build_filter(&f);
         assert_eq!(filter, json!({}));
+    }
+
+    /// The tag-search shape: the type is a `must` beside the tag clauses, so
+    /// Qdrant returns only that type, any tag (or every tag) matching.
+    #[test]
+    fn build_filter_tags_with_type() {
+        let tag = |t: &str| json!({"key": "tags", "match": {"value": t}});
+        let decision = json!({"key": "memory_type", "match": {"value": "decision"}});
+        let filter = |tags_match_all| {
+            build_filter(&PayloadFilter {
+                memory_type: Some("decision".into()),
+                tags: Some(vec!["rust".into(), "wasm".into()]),
+                tags_match_all,
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            filter(false),
+            json!({"must": [decision], "should": [tag("rust"), tag("wasm")]})
+        );
+        assert_eq!(
+            filter(true),
+            json!({"must": [decision, tag("rust"), tag("wasm")]})
+        );
     }
 
     #[test]
