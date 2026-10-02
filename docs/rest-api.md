@@ -312,7 +312,7 @@ curl -H "Authorization: Bearer $ALAYA_READONLY_API_KEY" \
 
 Optional query parameter `relation_type` (`RELATES_TO`, `PRECEDES`, `CONTRADICTS`) filters the edges.
 
-Response: `{ "relations": [...], "content_hash": "a3f4...", "count": 2 }`. An invalid `content_hash` returns `400` with `{ "error": "invalid content_hash format" }`, and an invalid `relation_type` returns `400` with `{ "error": "invalid relation_type" }`. Neither reaches the graph. A graph read that fails or times out returns `500` with `{ "success": false, "error": "..." }`; when the read blew its command deadline, the body also carries `"error_kind": "timeout"`. If the server cannot take or answer the request (its work queue is full, or the worker is unavailable or did not reply in time), the route returns `503` with `{ "error": "..." }`; retry with backoff. `POST /relation` reports all of these as `200` with `{ "success": false, "error": "..." }`.
+Response: `{ "relations": [...], "content_hash": "a3f4...", "count": 2 }`. An invalid `content_hash` returns `400` with `{ "error": "invalid content_hash format" }`, and an invalid `relation_type` returns `400` with `{ "error": "invalid relation_type" }`. Neither reaches the graph. A graph read that fails or times out returns `500` with `{ "success": false, "error": "..." }`; when the read blew its command deadline, the body also carries `"error_kind": "timeout"`. If the server cannot take or answer the request (its work queue is full, or the worker is unavailable or did not reply in time), the route returns `503` with `{ "error": "..." }`; retry with backoff. `POST /relation` reports the `400` and `500` cases as `200` with `{ "success": false, "error": "..." }`, but returns the same `503`.
 
 ## `POST /supersede`
 
