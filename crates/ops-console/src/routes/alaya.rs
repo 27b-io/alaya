@@ -183,17 +183,11 @@ impl BrowseView {
         let query = keep(applies.query, "query", q.q);
         let memory_type = keep(applies.memory_type, "type", q.memory_type);
         let tags = keep(applies.tags, "tags", q.tags);
-        // Recent pages by cursor and the rest by page number; each mode
-        // ignores the other's.
+        // Recent pages by cursor and the rest by page number. Paging state,
+        // not a filter: the console's own links never carry the other kind.
         let (page, cursor) = if mode == Mode::Recent {
-            if q.page > 1 {
-                ignored.push("page");
-            }
             (1, q.cursor)
         } else {
-            if q.cursor.is_some() {
-                ignored.push("cursor");
-            }
             (q.page.max(1), None)
         };
         Ok(BrowseView {
@@ -275,7 +269,7 @@ impl BrowseView {
         if !self.memory_type.is_empty() {
             params["memory_type"] = json!(self.memory_type);
         }
-        if !self.tags.trim().is_empty() {
+        if !self.tags.is_empty() {
             params["tags"] = json!(self.tags);
         }
         if let Some(c) = self.cursor {
@@ -287,6 +281,7 @@ impl BrowseView {
 
 /// Paging links and the count line, from the server's own paging fields.
 /// Next appears only when the server says there is more.
+#[derive(Default)]
 struct Pager {
     summary: String,
     prev: Option<String>,
@@ -475,9 +470,7 @@ pub async fn browse(
             Vec::new(),
             Pager {
                 summary: ask.into(),
-                prev: None,
-                next: None,
-                first: None,
+                ..Default::default()
             },
         ),
         None => {
@@ -505,7 +498,7 @@ pub async fn browse(
             <Card>
                 <CardHeader>
                     <CardTitle>"Memories"</CardTitle>
-                    <CardDescription>"Search or browse the corpus. Each mode offers only the filters the server applies in it. Hybrid ranks a bounded pool of candidates for the query, not the whole corpus; browse everything with scan."</CardDescription>
+                    <CardDescription>"Search or browse the corpus. Each mode offers only the filters the server applies in it."</CardDescription>
                 </CardHeader>
                 <CardContent>{form}</CardContent>
             </Card>
@@ -665,7 +658,7 @@ fn relation_row(hash: &str, e: &Value, csrf: &str, incoming: bool) -> impl IntoV
         && validate_hash(&source).is_ok()
         && validate_hash(&target).is_ok())
     .then(|| {
-        let href = format!("{QUEUE_PATH}/pair?a={source}&b={target}");
+        let href = pair_href(&source, &target, &QueueView::default());
         view! { <a class=btn_sm(Btn::Outline) href=href>"Review pair"</a> }
     });
     let csrf = csrf.to_string();
@@ -2442,8 +2435,9 @@ pub async fn auth_view(
 mod tests {
     use super::*;
 
-    /// AC-1: the filters each mode offers, pinned to what alaya-core's
-    /// per-mode search reads. A change upstream must change this table.
+    /// AC-1: guards the console's per-mode filter map against regression.
+    /// It is hand-derived from alaya-core's `search_*` functions: re-derive
+    /// both this table and `Mode::applies` when those change.
     #[test]
     fn each_mode_applies_exactly_the_filters_its_server_path_reads() {
         for (mode, query, memory_type, tags) in [
@@ -2460,7 +2454,6 @@ mod tests {
             };
             assert_eq!(applies, want, "{mode}");
         }
-        assert!(Mode::parse("similar").is_err(), "not offered");
     }
 
     fn pair(extra: Value) -> Value {

@@ -70,15 +70,12 @@ is `user-123`, not `"user-123"`.
 - **Browse/search** — the mode is picked by link, and its form offers only
   the filters the server applies in it: hybrid takes a query and a type,
   scan and recent a type, tag its tags; all four take the
-  superseded-visibility toggle. The map (`Mode::applies`) is pinned to
-  alaya-core's per-mode search by a table test. A filter a request carries
-  that its mode ignores is named in a "not applied" notice, never dropped
-  silently, and hybrid says that its type filter reaches only the semantic
-  matches. Paging follows the server: Next appears only when it reports
-  `has_more` (recent also needs its `next_cursor`). Scan, tag and hybrid page
-  by number with Prev; recent pages forward by cursor and offers "first page"
-  instead. Hybrid ranks a bounded candidate pool, not the corpus, and its
-  count line says "Top N candidates". Every search is sent with
+  superseded-visibility toggle. A filter a request carries that its mode
+  ignores is named in a "not applied" notice, never dropped silently, and
+  hybrid says that its type filter reaches only the semantic matches. Paging
+  comes only from the server's `has_more` / `next_cursor`. Hybrid ranks a
+  bounded candidate pool, not the corpus, and its count line says "Top N
+  candidates". Every search is sent with
   `read_only: true`, so browsing never bumps `access_count` or queues Hebbian
   co-access updates. That needs an alaya-server that knows the flag; an
   older one ignores it and writes. Both ship in the same image.

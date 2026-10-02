@@ -101,9 +101,11 @@ pub fn get_typed_edges(
              RETURN a.content_hash, b.content_hash, e.created_at \
              LIMIT $lim"
         ),
+        // Undirected, so `a` is always the queried node: return the edge's
+        // own endpoints, or an incoming edge reads as outgoing.
         Direction::Both => format!(
             "MATCH (a:Memory {{content_hash: $hash}})-[e:{label}]-(b:Memory) \
-             RETURN a.content_hash, b.content_hash, e.created_at \
+             RETURN startNode(e).content_hash, endNode(e).content_hash, e.created_at \
              LIMIT $lim"
         ),
     };
@@ -136,9 +138,11 @@ pub fn get_all_typed_edges(
                     format!("(a:Memory {{content_hash: $hash}})-[e:{label}]-(b:Memory)")
                 }
             };
+            // `startNode`/`endNode`, not `a`/`b`: under `Both` the match is
+            // undirected and `a` is always the queried node.
             format!(
                 "MATCH {pattern} \
-                 RETURN a.content_hash, b.content_hash, e.created_at, '{label}' AS rel_type \
+                 RETURN startNode(e).content_hash, endNode(e).content_hash, e.created_at, '{label}' AS rel_type \
                  LIMIT $lim"
             )
         })

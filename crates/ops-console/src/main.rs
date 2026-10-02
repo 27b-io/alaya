@@ -1968,7 +1968,10 @@ mod tests {
         assert!(html.contains("semantic matches only"), "{html}");
 
         let (_, html) = get_page(&state, &cookie, "/alaya?mode=recent&page=3&cursor=5").await;
-        assert!(html.contains("recent mode does not apply: page."), "{html}");
+        assert!(
+            !html.contains("not applied"),
+            "paging state is not a filter"
+        );
 
         // A mode missing its required input asks for it and calls nothing.
         let (status, html) = get_page(&state, &cookie, "/alaya?mode=hybrid").await;
