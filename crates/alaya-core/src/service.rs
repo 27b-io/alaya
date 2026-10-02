@@ -476,6 +476,7 @@ impl MemoryService {
             provenance: Some(prov),
             summary_embedding: None,
             supersession_log: None,
+            supersession_reason: None,
         };
 
         // A read-only principal's store is additive only. Re-storing content
@@ -2677,9 +2678,9 @@ impl MemoryService {
     /// Superseded memories are always returned — the caller asked for a
     /// specific hash, typically to inspect before a supersede/delete, so
     /// hiding it would defeat the purpose. `metadata.superseded_by` signals
-    /// superseded status, and with `full` or `both` output `supersession_log`
-    /// lists the supersessions reversed so far. Pure read: no access-count
-    /// mutation.
+    /// superseded status. With `full` or `both` output, `supersession_reason`
+    /// says why, and `supersession_log` lists the supersessions reversed so
+    /// far. Pure read: no access-count mutation.
     #[tracing::instrument(skip(self))]
     pub async fn get_memory(&self, content_hash: &str, output: OutputMode) -> Result<Value> {
         if !alaya_types::memory::validate_content_hash(content_hash) {
@@ -2693,10 +2694,8 @@ impl MemoryService {
                 let mut v = format_memory_result(&memory, 1.0, output);
                 // Added here, not in format_memory_result, which search
                 // shares: the audit trail is for an exact lookup only.
-                if let (Some(log), OutputMode::Full | OutputMode::Both) =
-                    (&memory.supersession_log, output)
-                {
-                    v["supersession_log"] = serde_json::json!(log);
+                if matches!(output, OutputMode::Full | OutputMode::Both) {
+                    add_supersession_audit(&mut v, &memory);
                 }
                 Ok(serde_json::json!({"found": true, "memory": v}))
             }
@@ -3027,6 +3026,18 @@ fn format_memory_result(memory: &Memory, score: f64, output: OutputMode) -> Valu
     v
 }
 
+/// The read-only supersession audit fields of `memory`, each added to `v`
+/// only when stored: `supersession_reason` (why it is superseded) and
+/// `supersession_log` (the supersessions reversed so far).
+fn add_supersession_audit(v: &mut Value, memory: &Memory) {
+    if let Some(reason) = &memory.supersession_reason {
+        v["supersession_reason"] = reason.clone();
+    }
+    if let Some(log) = &memory.supersession_log {
+        v["supersession_log"] = serde_json::json!(log);
+    }
+}
+
 fn truncate(s: &str, max_chars: usize) -> String {
     let char_count = s.chars().count();
     if char_count <= max_chars {
@@ -3120,6 +3131,7 @@ mod tests {
             provenance: None,
             summary_embedding: None,
             supersession_log: None,
+            supersession_reason: None,
         }
     }
 
@@ -3766,6 +3778,7 @@ mod tests {
                 provenance: None,
                 summary_embedding: None,
                 supersession_log: None,
+                supersession_reason: None,
             }
         }
     }
@@ -4297,6 +4310,7 @@ mod tests {
                 provenance: None,
                 summary_embedding: None,
                 supersession_log: None,
+                supersession_reason: None,
             },
             score,
         }
@@ -5480,6 +5494,7 @@ mod tests {
                 provenance: None,
                 summary_embedding: None,
                 supersession_log: None,
+                supersession_reason: None,
             },
             score,
         }
@@ -5677,7 +5692,7 @@ mod tests {
     }
 
     /// The reversal history rides on an exact lookup that returns content
-    /// (`full`, `both`), entries as stored, and nowhere else: not on summary
+    /// (`full`, `both`), in stored order, and nowhere else: not on summary
     /// output, and not on `format_memory_result`, which every search shares.
     #[tokio::test(flavor = "current_thread")]
     async fn get_memory_returns_supersession_log_with_full_and_both_output() {
@@ -5709,8 +5724,7 @@ mod tests {
         assert!(v["memory"].get("supersession_log").is_none(), "{v}");
     }
 
-    /// A memory never reversed carries no log key, as full output omits an
-    /// absent `summary`.
+    /// A memory never reversed carries no log key.
     #[tokio::test(flavor = "current_thread")]
     async fn get_memory_without_a_log_omits_the_key() {
         let hash = "a".repeat(64);
@@ -5720,6 +5734,43 @@ mod tests {
         for output in [OutputMode::Full, OutputMode::Both] {
             let v = svc.get_memory(&hash, output).await.unwrap();
             assert!(v["memory"].get("supersession_log").is_none(), "{v}");
+        }
+    }
+
+    /// Why a memory was superseded rides on the same exact lookups as the
+    /// log (`full`, `both`) and nowhere else: not on summary output, and not
+    /// on `format_memory_result`, which every search shares. A memory with
+    /// no stored reason carries no key.
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_memory_returns_supersession_reason_with_full_and_both_output() {
+        let hash = "f".repeat(64);
+        let mut mem = make_scored_memory(&hash, "superseded decision", 0.0).memory;
+        mem.metadata = Some(HashMap::from([(
+            "superseded_by".to_string(),
+            serde_json::json!("e".repeat(64)),
+        )]));
+        mem.supersession_reason = Some(serde_json::json!("wrong merge"));
+        for output in [OutputMode::Full, OutputMode::Summary, OutputMode::Both] {
+            let v = format_memory_result(&mem, 1.0, output);
+            assert!(v.get("supersession_reason").is_none(), "{output:?}: {v}");
+        }
+        let svc = service_with_memory(Some(mem));
+
+        for output in [OutputMode::Full, OutputMode::Both] {
+            let v = svc.get_memory(&hash, output).await.expect("found");
+            assert_eq!(
+                v["memory"]["supersession_reason"], "wrong merge",
+                "{output:?}"
+            );
+        }
+        let v = svc.get_memory(&hash, OutputMode::Summary).await.unwrap();
+        assert!(v["memory"].get("supersession_reason").is_none(), "{v}");
+
+        let live = make_scored_memory(&hash, "never superseded", 0.0).memory;
+        let svc = service_with_memory(Some(live));
+        for output in [OutputMode::Full, OutputMode::Both] {
+            let v = svc.get_memory(&hash, output).await.unwrap();
+            assert!(v["memory"].get("supersession_reason").is_none(), "{v}");
         }
     }
 
@@ -6930,6 +6981,7 @@ mod tests {
                     provenance: None,
                     summary_embedding: None,
                     supersession_log: None,
+                    supersession_reason: None,
                 }
             })
             .collect()
@@ -7273,6 +7325,7 @@ mod tests {
                 provenance: None,
                 summary_embedding: None,
                 supersession_log: None,
+                supersession_reason: None,
             }
         }
 

@@ -5065,11 +5065,12 @@ mod wedge_tests {
         )
     }
 
-    /// `supersession_log` reaches the GET /memories/{hash} (and MCP
-    /// `get_memory`) reply and no other: PATCH replies with the whole
-    /// `Memory` serialized, so the log must not ride along there.
+    /// `supersession_log` and `supersession_reason` reach the
+    /// GET /memories/{hash} (and MCP `get_memory`) reply and no other: PATCH
+    /// replies with the whole `Memory` serialized, so neither may ride along
+    /// there.
     #[tokio::test]
-    async fn supersession_log_is_in_the_get_memory_reply_and_not_the_patch_reply() {
+    async fn supersession_audit_is_in_the_get_memory_reply_and_not_the_patch_reply() {
         let hash = "a".repeat(64);
         let entry = json!({"reason": "wrong merge", "unsuperseded_via": "operator:mcp"});
         let mut mem: Memory = serde_json::from_value(json!({
@@ -5078,6 +5079,7 @@ mod wedge_tests {
         }))
         .expect("memory");
         mem.supersession_log = Some(vec![entry.clone()]);
+        mem.supersession_reason = Some(json!("merged"));
 
         let local = tokio::task::LocalSet::new();
         local
@@ -5103,6 +5105,7 @@ mod wedge_tests {
                 .unwrap();
                 let got = grx.await.expect("get reply");
                 assert_eq!(got["memory"]["supersession_log"], json!([entry]), "{got}");
+                assert_eq!(got["memory"]["supersession_reason"], "merged", "{got}");
 
                 let (ptx, prx) = oneshot::channel();
                 tx.send(Cmd {
@@ -5121,6 +5124,7 @@ mod wedge_tests {
                 let patched = prx.await.expect("patch reply");
                 assert_eq!(patched["content_hash"], json!(hash), "{patched}");
                 assert!(patched.get("supersession_log").is_none(), "{patched}");
+                assert!(patched.get("supersession_reason").is_none(), "{patched}");
             })
             .await;
     }

@@ -343,6 +343,7 @@ mod tests {
             provenance: None,
             summary_embedding: None,
             supersession_log: None,
+            supersession_reason: None,
         }
     }
 

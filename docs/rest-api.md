@@ -243,9 +243,9 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" \
 | `404 Not Found` | `{ "found": false }` |
 | `400 Bad Request` | `{ "error": "invalid content_hash format" }` — hash isn't 64 lowercase hex chars |
 
-Superseded memories return `200` with `memory.metadata.superseded_by` populated.
+Superseded memories return `200` with `memory.metadata.superseded_by` populated. With `output=full` (the default) or `output=both`, they also carry `memory.supersession_reason`: the reason given to [`POST /supersede`](#post-supersede) or [`POST /duplicates/merge`](#post-duplicatesmerge), as stored (`""` when none was given). It is optional and read-only: the key is absent when no reason is stored, which includes every memory that is not superseded, since [`POST /unsupersede`](#post-unsupersede) moves the reason into the log below. `output=summary`, `POST /search` and the `PATCH` reply never carry it.
 
-With `output=full` (the default) or `output=both`, a memory whose supersession was ever reversed also carries `memory.supersession_log`: its audit trail, oldest first, one entry per [`POST /unsupersede`](#post-unsupersede) with `superseded_by`, `supersession_reason`, `unsuperseded_at`, `unsuperseded_via` and `reason` (the shape documented under [MCP: `memory_unsupersede`](./mcp-tools.md#memory_unsupersede)). Entries come back exactly as stored. The key is absent when nothing was ever reversed, and `output=summary`, `POST /search` and the `PATCH` reply never carry it. Like the rest of the memory, it is visible to every principal that may read the memory, read-only and OIDC bearers included.
+With `output=full` or `output=both`, a memory whose supersession was ever reversed also carries `memory.supersession_log`: its audit trail, oldest first, one entry per [`POST /unsupersede`](#post-unsupersede) in the shape documented under [MCP: `memory_unsupersede`](./mcp-tools.md#memory_unsupersede). Entries come back in stored order; a stored value that is not an array comes back as one entry. The key is absent when nothing was ever reversed, and `output=summary`, `POST /search` and the `PATCH` reply never carry it. Like the rest of the memory, it is visible to every principal that may read the memory, read-only and OIDC bearers included.
 
 ## `PATCH /memories/{content_hash}`
 
@@ -315,7 +315,7 @@ curl -H "Authorization: Bearer $ALAYA_READONLY_API_KEY" \
 
 Optional query parameter `relation_type` (`RELATES_TO`, `PRECEDES`, `CONTRADICTS`) filters the edges.
 
-Response: `{ "relations": [...], "content_hash": "a3f4...", "count": 2 }`. An invalid `content_hash` returns `400` with `{ "error": "invalid content_hash format" }`, and an invalid `relation_type` returns `400` with `{ "error": "invalid relation_type" }`. Neither reaches the graph. A graph read that fails or times out returns `500` with `{ "success": false, "error": "..." }`. `POST /relation` reports all of these as `200` with `{ "success": false, "error": "..." }`.
+Response: `{ "relations": [...], "content_hash": "a3f4...", "count": 2 }`. An invalid `content_hash` returns `400` with `{ "error": "invalid content_hash format" }`, and an invalid `relation_type` returns `400` with `{ "error": "invalid relation_type" }`. Neither reaches the graph. A graph read that fails or times out returns `500` with `{ "success": false, "error": "..." }`; when the read blew its command deadline, the body also carries `"error_kind": "timeout"`. If the server cannot take or answer the request (its work queue is full, or the worker is unavailable or did not reply in time), the route returns `503` with `{ "error": "..." }`; retry with backoff. `POST /relation` reports the `400` and `500` cases as `200` with `{ "success": false, "error": "..." }`, but returns the same `503`.
 
 ## `POST /supersede`
 
@@ -586,4 +586,4 @@ REST endpoints use HTTP status codes plus a JSON body:
 | `413` | Request body over 1 MB. |
 | `429` | Rate limited (only when running behind a rate-limiting proxy). |
 | `500` | Backend failure — Qdrant/FalkorDB/TEI unreachable, embedding timeout. Body is sanitized; check server logs for detail. |
-| `503` | Server's internal work queue is saturated. Retry with backoff. |
+| `503` | Server could not take or answer the request: its internal work queue is saturated, or the worker is unavailable or did not reply within its deadline. Retry with backoff. |

@@ -83,11 +83,17 @@ is `user-123`, not `"user-123"`.
   supersession chain (audit trail rendered, never hidden), and relations
   grouped by type and direction, each CONTRADICTS edge linking to its pair
   page. A failed relations read renders as "unavailable", never as
-  "No relations.".
+  "No relations.". A superseded memory shows what superseded it (a link)
+  and the stored `supersession_reason`.
 - **Curation** — supersede (reason required), correct-&-supersede (store a
   fixed copy, then supersede the original), delete (two-step confirm),
   merge duplicates (dry-run preview before commit), relations
   create/delete.
+- **Un-supersede** — reverse a wrong supersession from the memory's detail
+  page, reason required: posts `POST /unsupersede` with `unsuperseded_via:
+  "operator:console"`. Each superseded hop in the chain links to its own
+  form. The server's typed answers (*not superseded*, *superseded again*)
+  show as messages, not errors.
 - **Contradictions triage** — the CONTRADICTS queue, 50 pairs a page,
   newest first, paged with the server's `next_offset` (Next appears only
   when the server returns one). The view lives in the URL, so a refresh or
