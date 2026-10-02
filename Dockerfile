@@ -1,4 +1,7 @@
-FROM docker.io/library/rust:1.87-bookworm AS builder
+# The compiler version comes from rust-toolchain.toml (COPY'd below; rustup
+# installs it on first cargo call), so the base tag names none. Keep that file
+# in the build context — .dockerignore must not exclude it.
+FROM docker.io/library/rust:bookworm AS builder
 
 # Build identity surfaced by GET /health/detail and MCP serverInfo (#70). Both are
 # optional: an unset arg yields a null git_sha/built_at, never a build or
