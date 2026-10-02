@@ -140,12 +140,14 @@ fn contradictions_section(c: &ContradictionStats, first_day: i64, today: i64) ->
             // can put the top list above the total; floor at zero.
             "other": failures.saturating_sub(top_total),
         },
+        // A clock within 13 days of the epoch starts the window before it;
+        // those days have no date and are left out.
         "judged_per_day": per_day
             .into_iter()
-            .map(|(d, counts)| json!({
-                "date": utc_date_str(d as u64 * 86_400),
-                "counts": counts,
-            }))
+            .filter_map(|(d, counts)| {
+                let epoch_secs = u64::try_from(d).ok()?.checked_mul(86_400)?;
+                Some(json!({ "date": utc_date_str(epoch_secs), "counts": counts }))
+            })
             .collect::<Vec<_>>(),
         "degenerate_reasons": degenerate,
     })
@@ -672,6 +674,16 @@ mod tests {
             c["degenerate_reasons"],
             json!({ "contradiction": 0, "supersession": 2, "coexist": 0, "unrelated": 0 })
         );
+    }
+
+    /// A clock at the epoch (the wall clock's pre-1970 fallback) starts the
+    /// window 13 days before it. Those days have no date and are left out.
+    #[test]
+    fn pre_epoch_window_days_are_left_out() {
+        let c = contradictions_section(&sample(), -(JUDGED_DAYS - 1), 0);
+        let days = c["judged_per_day"].as_array().unwrap();
+        assert_eq!(days.len(), 1, "{days:?}");
+        assert_eq!(days[0]["date"], "1970-01-01");
     }
 
     /// AC-4: the bridge down nulls the graph sections with a note, keeps the
