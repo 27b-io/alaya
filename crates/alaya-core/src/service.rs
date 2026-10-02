@@ -909,14 +909,20 @@ impl MemoryService {
             }
         }
 
-        // Drop superseded memories from every candidate pool before fusion —
-        // neither search_by_vector nor search_by_tags filters them (see
-        // is_superseded), and superseded entries must not consume RRF ranks,
-        // rerank slots, or spreading-activation seeds.
-        if !params.include_superseded {
-            vector_results.retain(|sm| !is_superseded(&sm.memory));
-            tag_results.retain(|sm| !is_superseded(&sm.memory));
-        }
+        // Drop superseded and wrong-type memories from every candidate pool
+        // before fusion. Neither search_by_vector nor search_by_tags filters
+        // supersession (see is_superseded), and search_by_tags takes no type
+        // filter, so excluded entries must not consume RRF ranks, rerank
+        // slots, or spreading-activation seeds.
+        let admits = |m: &Memory| {
+            (params.include_superseded || !is_superseded(m))
+                && params
+                    .memory_type
+                    .as_ref()
+                    .is_none_or(|t| m.memory_type == *t)
+        };
+        vector_results.retain(|sm| admits(&sm.memory));
+        tag_results.retain(|sm| admits(&sm.memory));
 
         // Stage 3: Fuse (RRF) — pure computation
         let mut fused = {
@@ -1009,7 +1015,7 @@ impl MemoryService {
                     Ok(memories) => {
                         let mut result = Vec::with_capacity(memories.len());
                         for mem in memories {
-                            if !params.include_superseded && is_superseded(&mem) {
+                            if !admits(&mem) {
                                 continue;
                             }
                             let activation = activation_map
@@ -5228,11 +5234,15 @@ mod tests {
 
     /// Mock VectorStorage that returns pre-configured vector search results
     /// and can serve specific memories from get_batch (for graph injection).
+    /// `tag_pools` answers search_by_tags per tag, and `similar_tags` is what
+    /// search_similar_tags returns. Neither search applies a filter.
     /// Counts access-count increments, so a test can see search's writes.
     #[derive(Default)]
     struct MockVectorsWithInjection {
         search_results: Vec<ScoredMemory>,
         injectable_memories: HashMap<String, Memory>,
+        tag_pools: HashMap<String, Vec<ScoredMemory>>,
+        similar_tags: Vec<String>,
         access_increments: Rc<Cell<usize>>,
     }
 
@@ -5285,14 +5295,19 @@ mod tests {
         }
         async fn search_by_tags(
             &self,
-            _t: &[&str],
+            tags: &[&str],
             _m: bool,
             _l: usize,
         ) -> Result<Vec<ScoredMemory>> {
-            Ok(vec![])
+            Ok(tags
+                .iter()
+                .filter_map(|t| self.tag_pools.get(*t))
+                .flatten()
+                .cloned()
+                .collect())
         }
         async fn search_similar_tags(&self, _e: &[f32], _l: usize) -> Result<Vec<String>> {
-            Ok(vec![])
+            Ok(self.similar_tags.clone())
         }
         async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
             Ok(())
@@ -5575,6 +5590,99 @@ mod tests {
             neighbor_hash,
             result_hashes,
         );
+    }
+
+    /// With `memory_type` set, hybrid returns only that type from every
+    /// candidate pool. Each non-vector pool (keyword tag, semantic tag, graph
+    /// injection) is seeded with one memory of the type and one of another
+    /// type; the mocks apply no filter, so only the service can drop them.
+    /// The unfiltered run proves every wrong-type memory reached its pool.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_memory_type_filters_every_candidate_pool() {
+        let typed = |hash: char, memory_type: &str| {
+            let mut sm = make_scored_memory(&hash.to_string().repeat(64), "pool member", 0.5);
+            sm.memory.memory_type = memory_type.into();
+            sm
+        };
+        let vector_ok = typed('a', "decision");
+        let keyword_ok = typed('b', "decision");
+        let keyword_bad = typed('c', "note");
+        let semantic_ok = typed('d', "decision");
+        let semantic_bad = typed('e', "task");
+        let graph_ok = typed('f', "decision");
+        let graph_bad = typed('1', "reference");
+        let hashes = |sms: &[&ScoredMemory]| -> std::collections::HashSet<String> {
+            sms.iter()
+                .map(|sm| sm.memory.content_hash.clone())
+                .collect()
+        };
+        let wanted = hashes(&[&vector_ok, &keyword_ok, &semantic_ok, &graph_ok]);
+        let everything = hashes(&[
+            &vector_ok,
+            &keyword_ok,
+            &keyword_bad,
+            &semantic_ok,
+            &semantic_bad,
+            &graph_ok,
+            &graph_bad,
+        ]);
+
+        let svc = MemoryService::new(
+            Box::new(MockVectorsWithInjection {
+                search_results: vec![vector_ok.clone()],
+                injectable_memories: [&graph_ok, &graph_bad]
+                    .into_iter()
+                    .map(|sm| (sm.memory.content_hash.clone(), sm.memory.clone()))
+                    .collect(),
+                // "stability" is a known tag, so the query hits the keyword pool.
+                tag_pools: HashMap::from([
+                    (
+                        "stability".into(),
+                        vec![keyword_ok.clone(), keyword_bad.clone()],
+                    ),
+                    (
+                        "semantic".into(),
+                        vec![semantic_ok.clone(), semantic_bad.clone()],
+                    ),
+                ]),
+                similar_tags: vec!["semantic".into()],
+                ..Default::default()
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraphWithActivation {
+                activation: [&graph_ok, &graph_bad]
+                    .into_iter()
+                    .map(|sm| (sm.memory.content_hash.clone(), 0.8))
+                    .collect(),
+            }),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        );
+
+        let returned = |result: Value| -> std::collections::HashSet<String> {
+            result["results"]
+                .as_array()
+                .expect("results array")
+                .iter()
+                .filter_map(|r| r["content_hash"].as_str().map(String::from))
+                .collect()
+        };
+
+        let unfiltered = svc
+            .search(search_params("stability notes"))
+            .await
+            .expect("search succeeds");
+        assert_eq!(returned(unfiltered), everything);
+
+        let filtered = svc
+            .search(SearchParams {
+                memory_type: Some("decision".into()),
+                ..search_params("stability notes")
+            })
+            .await
+            .expect("search succeeds");
+        assert_eq!(returned(filtered), wanted);
     }
 
     // ─── get_memory (Tool 10) tests ──────────────────────────────────────
