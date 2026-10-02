@@ -1,3 +1,8 @@
+# Keep this a concrete release, never "stable". A new compiler can add clippy
+# lints that fail untouched code under -D warnings; a pinned version moves that
+# breakage into its own Renovate PR instead of turning main red. This file also
+# sets the compiler for the Docker builder and every CI cargo call.
 [toolchain]
-channel = "stable"
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
 targets = ["wasm32-unknown-unknown"]
