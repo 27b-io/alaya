@@ -67,12 +67,24 @@ is `user-123`, not `"user-123"`.
 
 ## Ālaya module
 
-- **Browse/search** — hybrid / scan / recent / tag modes, type + tag filters,
-  superseded-visibility toggle, pagination.
+- **Browse/search** — the mode is picked by link, and its form offers only
+  the filters the server applies in it: hybrid takes a query and a type,
+  scan and recent a type, tag its tags; all four take the
+  superseded-visibility toggle. A filter a request carries that its mode
+  ignores is named in a "not applied" notice, never dropped silently, and
+  hybrid says that its type filter reaches only the semantic matches. Paging
+  comes only from the server's `has_more` / `next_cursor`. Hybrid ranks a
+  bounded candidate pool, not the corpus, and its count line says "Top N
+  candidates". Every search is sent with
+  `read_only: true`, so browsing never bumps `access_count` or queues Hebbian
+  co-access updates. That needs an alaya-server that knows the flag; an
+  older one ignores it and writes. Both ship in the same image.
 - **Detail** — full content, metadata, salience/access/trust stats,
-  relations, supersession chain (audit trail rendered, never hidden). A
-  superseded memory shows what superseded it (a link) and the stored
-  `supersession_reason`.
+  supersession chain (audit trail rendered, never hidden), and relations
+  grouped by type and direction, each CONTRADICTS edge linking to its pair
+  page. A failed relations read renders as "unavailable", never as
+  "No relations.". A superseded memory shows what superseded it (a link)
+  and the stored `supersession_reason`.
 - **Curation** — supersede (reason required), correct-&-supersede (store a
   fixed copy, then supersede the original), delete (two-step confirm),
   merge duplicates (dry-run preview before commit), relations

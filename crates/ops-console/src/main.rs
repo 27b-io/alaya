@@ -1905,6 +1905,280 @@ mod tests {
         );
     }
 
+    // ─── Browse and detail ─────────────────────────────────────────────────
+
+    fn search_rows(n: usize, created_at: f64) -> Vec<serde_json::Value> {
+        (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "content_hash": format!("{i:064x}"), "memory_type": "note",
+                    "content": format!("row {i}"), "created_at": created_at,
+                })
+            })
+            .collect()
+    }
+
+    /// AC-1 + AC-3: each mode sends only the filters it applies, names the
+    /// rest on the page, offers only its own fields, and every search the
+    /// console sends is read-only.
+    #[tokio::test]
+    async fn browse_sends_each_mode_only_its_filters_and_names_the_rest() {
+        let seen = Seen::default();
+        let upstream = Router::new().route(
+            "/search",
+            recording(&seen, |_| {
+                (
+                    StatusCode::OK,
+                    serde_json::json!({ "results": [], "has_more": false }),
+                )
+            }),
+        );
+        let (state, cookie, _) = triage_app(upstream).await;
+        let base = |mode: &str| {
+            serde_json::json!({
+                "mode": mode, "page": 1, "page_size": 20, "include_superseded": false,
+                "output": "both", "read_only": true,
+            })
+        };
+
+        let (status, html) = get_page(
+            &state,
+            &cookie,
+            "/alaya?mode=scan&q=foo&memory_type=note&tags=x",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains("scan mode does not apply: query, tags."),
+            "{html}"
+        );
+        assert!(html.contains("name=\"memory_type\""));
+        assert!(!html.contains("name=\"q\"") && !html.contains("name=\"tags\""));
+        assert!(!html.contains("Filters apply in every mode"));
+
+        let (_, html) =
+            get_page(&state, &cookie, "/alaya?mode=tag&tags=a,b&memory_type=note").await;
+        assert!(html.contains("tag mode does not apply: type."), "{html}");
+        assert!(html.contains("name=\"tags\"") && !html.contains("name=\"memory_type\""));
+
+        let (_, html) = get_page(&state, &cookie, "/alaya?q=hello").await;
+        assert!(
+            !html.contains("not applied"),
+            "default hybrid drops nothing"
+        );
+        assert!(html.contains("name=\"q\"") && !html.contains("name=\"tags\""));
+
+        let (_, html) = get_page(&state, &cookie, "/alaya?mode=hybrid&q=x&memory_type=task").await;
+        assert!(html.contains("semantic matches only"), "{html}");
+
+        let (_, html) = get_page(&state, &cookie, "/alaya?mode=recent&page=3&cursor=5").await;
+        assert!(
+            !html.contains("not applied"),
+            "paging state is not a filter"
+        );
+
+        // A mode missing its required input asks for it and calls nothing.
+        let (status, html) = get_page(&state, &cookie, "/alaya?mode=hybrid").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Enter a query to run a hybrid search."));
+        let (status, _) = get_page(&state, &cookie, "/alaya?mode=similar").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let mut want = vec![
+            base("scan"),
+            base("tag"),
+            base("hybrid"),
+            base("hybrid"),
+            base("recent"),
+        ];
+        want[0]["memory_type"] = "note".into();
+        want[1]["tags"] = "a,b".into();
+        want[2]["query"] = "hello".into();
+        want[3]["query"] = "x".into();
+        want[3]["memory_type"] = "task".into();
+        want[4]["cursor"] = 5.0.into();
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies, want);
+        assert!(bodies.iter().all(|b| b["read_only"] == true));
+    }
+
+    /// AC-2: Next follows the server's paging fields, never a full page.
+    /// Recent pages with the server's `next_cursor` and offers "first page"
+    /// instead of Prev; hybrid is labelled as its candidate pool.
+    #[tokio::test]
+    async fn browse_pages_from_the_servers_paging_fields() {
+        let upstream = Router::new().route(
+            "/search",
+            post(|axum::Json(b): axum::Json<serde_json::Value>| async move {
+                let page = b["page"].as_u64().unwrap_or(1);
+                let reply = match b["mode"].as_str().unwrap() {
+                    // A full page the server says is the last.
+                    "scan" if page == 1 => serde_json::json!({
+                        "results": search_rows(20, 1.0), "has_more": false,
+                    }),
+                    "scan" | "tag" => serde_json::json!({
+                        "results": search_rows(20, 1.0), "has_more": true,
+                    }),
+                    // The cursor differs from the last row's created_at, so
+                    // a link built from the row would not match it.
+                    "recent" if b.get("cursor").is_none() => serde_json::json!({
+                        "results": search_rows(20, 1788000100.0), "has_more": true,
+                        "next_cursor": 1788000000.5,
+                    }),
+                    "recent" => serde_json::json!({
+                        "results": search_rows(3, 1.0), "has_more": false,
+                        "next_cursor": 1.0,
+                    }),
+                    "hybrid" => serde_json::json!({
+                        "results": search_rows(20, 1.0), "has_more": false,
+                        "total": 60, "total_pages": 3, "page": page,
+                    }),
+                    _ => unreachable!(),
+                };
+                axum::Json(reply)
+            }),
+        );
+        let (state, cookie, _) = triage_app(upstream).await;
+
+        let (_, html) = get_page(&state, &cookie, "/alaya?mode=scan").await;
+        assert!(
+            !html.contains("Next →"),
+            "full page, has_more false: {html}"
+        );
+        assert!(!html.contains("← Prev"));
+
+        let (_, html) = get_page(&state, &cookie, "/alaya?mode=scan&page=2").await;
+        assert!(links_to(&html, "/alaya?mode=scan", "← Prev"), "{html}");
+        assert!(links_to(&html, "/alaya?mode=scan&amp;page=3", "Next →"));
+
+        let (_, html) = get_page(&state, &cookie, "/alaya?mode=tag&tags=a&page=2").await;
+        assert!(
+            links_to(&html, "/alaya?mode=tag&amp;tags=a", "← Prev"),
+            "{html}"
+        );
+        assert!(links_to(
+            &html,
+            "/alaya?mode=tag&amp;tags=a&amp;page=3",
+            "Next →"
+        ));
+
+        let (_, html) = get_page(&state, &cookie, "/alaya?mode=recent").await;
+        assert!(
+            links_to(
+                &html,
+                "/alaya?mode=recent&amp;cursor=1788000000.5",
+                "Next →"
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("← Prev") && !html.contains("First page"));
+
+        let (_, html) = get_page(&state, &cookie, "/alaya?mode=recent&cursor=1788000000.5").await;
+        assert!(!html.contains("Next →"), "has_more false: {html}");
+        assert!(links_to(&html, "/alaya?mode=recent", "↑ First page"));
+        assert!(!html.contains("← Prev"));
+
+        let (_, html) = get_page(&state, &cookie, "/alaya?mode=hybrid&q=x&page=3").await;
+        assert!(
+            html.contains("Top 60 candidates for this query · page 3 of 3"),
+            "{html}"
+        );
+        assert!(!html.contains("Next →"), "no Next past the pool");
+        assert!(links_to(
+            &html,
+            "/alaya?mode=hybrid&amp;q=x&amp;page=2",
+            "← Prev"
+        ));
+    }
+
+    /// Serves one memory and answers `/relation` with `relations`.
+    fn detail_upstream(relations: (StatusCode, serde_json::Value)) -> Router {
+        Router::new()
+            .route(
+                "/memories/{hash}",
+                get(
+                    |axum::extract::Path(h): axum::extract::Path<String>| async move {
+                        axum::Json(serde_json::json!({ "found": true, "memory": {
+                            "content_hash": h, "content": "body", "memory_type": "note",
+                        }}))
+                    },
+                ),
+            )
+            .route(
+                "/relation",
+                post(move || {
+                    let (status, body) = relations.clone();
+                    async move { (status, axum::Json(body)) }
+                }),
+            )
+    }
+
+    /// AC-4: a failed relations read says so; an empty one says "No relations."
+    #[tokio::test]
+    async fn detail_tells_a_relations_failure_from_no_relations() {
+        let uri = format!("/alaya/memory/{}", "a".repeat(64));
+        let failing = detail_upstream((
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({ "error": "graph down" }),
+        ));
+        let (state, cookie, _) = triage_app(failing).await;
+        let (status, html) = get_page(&state, &cookie, &uri).await;
+        assert_eq!(status, StatusCode::OK, "the page survives the failure");
+        assert!(
+            html.contains("Could not load relations: alaya-server 503"),
+            "{html}"
+        );
+        assert!(!html.contains("No relations."));
+
+        let empty = detail_upstream((StatusCode::OK, serde_json::json!({ "relations": [] })));
+        let (state, cookie, _) = triage_app(empty).await;
+        let (_, html) = get_page(&state, &cookie, &uri).await;
+        assert!(html.contains("No relations."));
+        assert!(!html.contains("Could not load relations"));
+    }
+
+    /// AC-5: relations are grouped by type and direction, and each
+    /// CONTRADICTS edge links to its pair page in its stored direction.
+    #[tokio::test]
+    async fn detail_groups_relations_and_links_contradictions_to_their_pair() {
+        let (me, b, c, d) = (
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+        );
+        let edge = |s: &str, t: &str, rel: &str| serde_json::json!({ "source": s, "target": t, "relation_type": rel });
+        let relations = serde_json::json!({ "relations": [
+            edge(&me, &b, "RELATES_TO"),
+            edge(&c, &me, "CONTRADICTS"),
+            edge(&me, &d, "CONTRADICTS"),
+        ]});
+        let (state, cookie, _) = triage_app(detail_upstream((StatusCode::OK, relations))).await;
+        let (_, html) = get_page(&state, &cookie, &format!("/alaya/memory/{me}")).await;
+
+        let headings = [
+            "CONTRADICTS · from this memory (1)",
+            "CONTRADICTS · to this memory (1)",
+            "RELATES_TO · from this memory (1)",
+        ];
+        let at: Vec<usize> = headings
+            .iter()
+            .map(|h| {
+                html.find(h)
+                    .unwrap_or_else(|| panic!("{h} missing: {html}"))
+            })
+            .collect();
+        assert!(
+            at.windows(2).all(|w| w[0] < w[1]),
+            "grouped in order: {at:?}"
+        );
+        for (a, b) in [(&me, &d), (&c, &me)] {
+            let href = format!("href=\"/alaya/contradictions/pair?a={a}&amp;b={b}\"");
+            assert!(html.contains(&href), "{href}: {html}");
+        }
+        assert_eq!(html.matches("Review pair").count(), 2, "CONTRADICTS only");
+    }
+
     // ─── Un-supersede (LAB-6880) ───────────────────────────────────────────
 
     /// A `/memories/{hash}` upstream for the chain A→B→C: A superseded by B

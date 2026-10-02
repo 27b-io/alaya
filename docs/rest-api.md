@@ -207,6 +207,8 @@ curl -X POST http://localhost:3001/search \
   -d '{"query":"why did we switch package managers?","mode":"hybrid","page_size":5}'
 ```
 
+`read_only` (REST only, optional boolean, default `false`) makes the search a pure read. A hybrid search normally records that it was read: each returned memory's `access_count` goes up by one, and consecutive hits are queued for Hebbian co-access strengthening, so the search changes future ranking. With `"read_only": true` it does neither, and each result reports its stored `access_count`. The flag can only narrow: a principal that is already read-only (the read-only bearer, or an OIDC bearer) never writes, whatever the flag says. The other modes never write. A non-boolean value is a `422`.
+
 **Response:** array of memories sorted by relevance.
 
 ```json

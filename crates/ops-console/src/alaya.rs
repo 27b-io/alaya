@@ -5,7 +5,7 @@
 //! defensively instead of mirroring another service's output types, so an
 //! additive upstream change can't break the UI.
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::error::AppError;
 
@@ -82,8 +82,14 @@ impl AlayaClient {
             .map_err(|_| AppError::Upstream("alaya-server returned non-JSON".into()))
     }
 
-    pub async fn search(&self, params: Value) -> Result<Value, AppError> {
-        self.post("/search", params).await
+    /// Every console search is `read_only`: under the full bearer a hybrid
+    /// search would otherwise bump each hit's `access_count` and queue
+    /// Hebbian co-access updates, so browsing the store would re-rank it.
+    /// Takes a `Map`, not a `Value`: the flag is inserted into an object
+    /// the type guarantees, so no caller can reach a panicking index.
+    pub async fn search(&self, mut params: Map<String, Value>) -> Result<Value, AppError> {
+        params.insert("read_only".into(), json!(true));
+        self.post("/search", Value::Object(params)).await
     }
 
     pub async fn store(&self, params: Value) -> Result<Value, AppError> {

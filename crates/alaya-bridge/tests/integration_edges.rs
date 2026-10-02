@@ -184,6 +184,24 @@ async fn get_edges_direction_incoming_vs_outgoing() -> anyhow::Result<()> {
         !both_b.result_set.is_empty(),
         "Both direction on B must find the edge"
     );
+    // ...in its stored direction, not as B→A: the undirected match pins `a`
+    // to the queried node, so the endpoints must come from the edge itself.
+    let row = &both_b.result_set[0];
+    assert_eq!(row[0].as_str(), Some(HASH_A), "source is the edge's start");
+    assert_eq!(row[1].as_str(), Some(HASH_B), "target is the edge's end");
+
+    // The all-types query reports the same direction.
+    let all_b = ctx
+        .exec_tuple(cypher::get_all_typed_edges(
+            HASH_B,
+            &[UserRelationType::Precedes, UserRelationType::RelatesTo],
+            Direction::Both,
+            10,
+        ))
+        .await;
+    assert_eq!(all_b.result_set.len(), 1);
+    assert_eq!(all_b.result_set[0][0].as_str(), Some(HASH_A));
+    assert_eq!(all_b.result_set[0][1].as_str(), Some(HASH_B));
 
     ctx.cleanup().await;
     Ok(())

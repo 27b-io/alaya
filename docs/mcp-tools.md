@@ -182,7 +182,7 @@ Manage typed edges between two memories in the knowledge graph. One tool with th
 | Param | Type | Required | Notes |
 |:--|:--|:-:|:--|
 | `action` | enum | ✓ | `create`, `get`, or `delete`. |
-| `content_hash` | string | ✓ | Source memory hash. For `get`, all outgoing edges of this node are returned. |
+| `content_hash` | string | ✓ | Source memory hash. For `get`, typed edges touching this node are returned in both directions, at most 50 per relation type (so up to 150 when `relation_type` is omitted); a node with more gets a truncated list. Each edge's `source` and `target` give its stored direction. |
 | `target_hash` | string | for `create`/`delete` | Target memory hash. |
 | `relation_type` | enum | for `create`/`delete` | One of `RELATES_TO`, `PRECEDES`, `CONTRADICTS`. |
 
