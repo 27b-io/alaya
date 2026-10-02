@@ -5214,9 +5214,12 @@ mod tests {
 
     /// Mock VectorStorage that returns pre-configured vector search results
     /// and can serve specific memories from get_batch (for graph injection).
+    /// Counts access-count increments, so a test can see search's writes.
+    #[derive(Default)]
     struct MockVectorsWithInjection {
         search_results: Vec<ScoredMemory>,
         injectable_memories: HashMap<String, Memory>,
+        access_increments: Rc<Cell<usize>>,
     }
 
     #[async_trait(?Send)]
@@ -5301,6 +5304,7 @@ mod tests {
             Ok(vec!["stability".into()])
         }
         async fn increment_access_count(&self, _h: &str) -> Result<()> {
+            self.access_increments.set(self.access_increments.get() + 1);
             Ok(())
         }
         async fn health(&self) -> Result<HealthStatus> {
@@ -5511,6 +5515,7 @@ mod tests {
             Box::new(MockVectorsWithInjection {
                 search_results: vec![seed],
                 injectable_memories: injectable,
+                ..Default::default()
             }),
             Box::new(MockEmbeddings),
             Box::new(MockGraphWithActivation { activation }),
@@ -5570,6 +5575,7 @@ mod tests {
             Box::new(MockVectorsWithInjection {
                 search_results: vec![],
                 injectable_memories: injectable,
+                ..Default::default()
             }),
             Box::new(MockEmbeddings),
             Box::new(MockGraphWithActivation {
@@ -5773,7 +5779,7 @@ mod tests {
         let mut svc = MemoryService::new(
             Box::new(MockVectorsWithInjection {
                 search_results,
-                injectable_memories: HashMap::new(),
+                ..Default::default()
             }),
             Box::new(MockEmbeddings),
             Box::new(MockGraphWithActivation {
@@ -5787,6 +5793,57 @@ mod tests {
             svc = svc.with_reranker(r);
         }
         svc
+    }
+
+    /// Hebbian sink that counts enqueue calls.
+    struct CountingHebbian(Rc<Cell<usize>>);
+    #[async_trait(?Send)]
+    impl HebbianService for CountingHebbian {
+        async fn enqueue_strengthen(&self, _p: &[CoAccessPair]) -> Result<()> {
+            self.0.set(self.0.get() + 1);
+            Ok(())
+        }
+    }
+
+    /// A read-only hybrid search writes nothing: no access-count bump, no
+    /// Hebbian co-access enqueue, and the reported count is the stored one.
+    /// The same search without it writes both — the control that proves the
+    /// fixture can see the writes at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_only_hybrid_search_skips_access_and_hebbian_writes() {
+        for (read_only, want_writes) in [(true, false), (false, true)] {
+            let increments = Rc::new(Cell::new(0));
+            let enqueues = Rc::new(Cell::new(0));
+            let svc = MemoryService::new(
+                Box::new(MockVectorsWithInjection {
+                    search_results: vec![
+                        make_scored_memory(&"a".repeat(64), "stability first", 0.9),
+                        make_scored_memory(&"b".repeat(64), "stability second", 0.8),
+                    ],
+                    access_increments: increments.clone(),
+                    ..Default::default()
+                }),
+                Box::new(MockEmbeddings),
+                Box::new(MockGraph),
+                Box::new(CountingHebbian(enqueues.clone())),
+                Box::new(MockConsolidation),
+                None,
+            );
+            let res = svc
+                .search_with(search_params("stability"), read_only)
+                .await
+                .expect("search");
+            let results = res["results"].as_array().expect("results");
+            assert_eq!(results.len(), 2, "two hits, so a co-access pair exists");
+            assert_eq!(increments.get() > 0, want_writes, "read_only={read_only}");
+            assert_eq!(enqueues.get() > 0, want_writes, "read_only={read_only}");
+            let stored = make_scored_memory("x", "x", 0.0).memory.access_count;
+            let reported = if read_only { stored } else { stored + 1 };
+            assert!(
+                results.iter().all(|r| r["access_count"] == reported),
+                "read_only={read_only}: {results:?}"
+            );
+        }
     }
 
     fn search_params(query: &str) -> SearchParams {
@@ -7066,6 +7123,7 @@ mod tests {
             Box::new(MockVectorsWithInjection {
                 search_results: vec![seed],
                 injectable_memories: HashMap::from([(neighbor.content_hash.clone(), neighbor)]),
+                ..Default::default()
             }),
             Box::new(MockEmbeddings),
             Box::new(MockGraphWithActivation {

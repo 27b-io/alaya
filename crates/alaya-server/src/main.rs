@@ -2942,12 +2942,24 @@ async fn store(
     .await
 }
 
+/// `POST /search` body: the shared search params plus a REST-only
+/// `read_only` that a caller sets to make its own search a pure read. It can
+/// only narrow: it is OR'd with the principal's policy, so `false` never
+/// lifts a read-only principal into the side-effect writes.
+#[derive(Deserialize)]
+struct SearchReq {
+    #[serde(flatten)]
+    params: SearchParams,
+    #[serde(default)]
+    read_only: bool,
+}
+
 async fn search(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
-    Json(params): Json<SearchParams>,
+    Json(SearchReq { params, read_only }): Json<SearchReq>,
 ) -> (StatusCode, Json<Value>) {
-    let read_only = WritePolicy::read_only_for(principal);
+    let read_only = read_only || WritePolicy::read_only_for(principal);
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::Search {
@@ -5994,6 +6006,68 @@ mod wedge_tests {
         let resp = app.oneshot(get(TEST_KEY)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         worker.await.unwrap();
+    }
+
+    /// `POST /search`'s `read_only` flag only narrows. Under the full bearer
+    /// it turns the search into a pure read; absent, the full bearer keeps
+    /// its writes; and `false` never lifts the read-only bearer. The flag
+    /// rides beside the shared params without disturbing them.
+    #[tokio::test]
+    async fn search_read_only_flag_narrows_and_never_widens() {
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = mpsc::channel::<Cmd>(4);
+        let mut auth = test_auth_state();
+        auth.readonly_api_key = Some("ro-key".into());
+        let app = protected_router(ServiceHandle { tx }, auth);
+
+        let cases = [
+            (TEST_KEY, json!({ "read_only": true }), true),
+            (TEST_KEY, json!({}), false),
+            (TEST_KEY, json!({ "read_only": false }), false),
+            ("ro-key", json!({ "read_only": false }), true),
+            ("ro-key", json!({}), true),
+        ];
+        for (token, flag, want) in cases {
+            let mut body = json!({ "query": "q", "mode": "tag", "tags": "a, b", "page": 2 });
+            body.as_object_mut()
+                .unwrap()
+                .extend(flag.as_object().unwrap().clone());
+            let req = axum::http::Request::post("/search")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            let worker = async {
+                match rx.recv().await.map(|c| c.inner) {
+                    Some(CmdInner::Search {
+                        params,
+                        read_only,
+                        reply,
+                    }) => {
+                        let _ = reply.send(json!({ "results": [] }));
+                        (params, read_only)
+                    }
+                    _ => panic!("expected a Search command"),
+                }
+            };
+            let (resp, (params, read_only)) = tokio::join!(app.clone().oneshot(req), worker);
+            assert_eq!(resp.unwrap().status(), StatusCode::OK);
+            assert_eq!(read_only, want, "{token} with {flag}");
+            assert!(matches!(params.mode, alaya_types::search::SearchMode::Tag));
+            assert_eq!(params.tags, Some(vec!["a".into(), "b".into()]));
+            assert_eq!(params.page, 2);
+        }
+
+        // A mistyped flag is refused, never read as either value.
+        let req = axum::http::Request::post("/search")
+            .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"query":"q","read_only":"yes"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(rx.try_recv().is_err(), "a refused call must not dispatch");
     }
 
     /// The other half of #63's contract: a worker that IS draining must never

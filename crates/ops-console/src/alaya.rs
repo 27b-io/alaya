@@ -77,7 +77,11 @@ impl AlayaClient {
             .map_err(|_| AppError::Upstream("alaya-server returned non-JSON".into()))
     }
 
-    pub async fn search(&self, params: Value) -> Result<Value, AppError> {
+    /// Every console search is `read_only`: under the full bearer a hybrid
+    /// search would otherwise bump each hit's `access_count` and queue
+    /// Hebbian co-access updates, so browsing the store would re-rank it.
+    pub async fn search(&self, mut params: Value) -> Result<Value, AppError> {
+        params["read_only"] = json!(true);
         self.post("/search", params).await
     }
 

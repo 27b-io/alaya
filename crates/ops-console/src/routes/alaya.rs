@@ -91,176 +91,428 @@ fn one() -> usize {
 
 const PAGE_SIZE: usize = 20;
 
+/// The browse modes the console offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Hybrid,
+    Scan,
+    Recent,
+    Tag,
+}
+
+/// The inputs a mode's server path reads. `include_superseded` is read by
+/// every mode, so it is not listed.
+#[derive(Debug, PartialEq, Eq)]
+struct Applies {
+    query: bool,
+    memory_type: bool,
+    tags: bool,
+}
+
+impl Mode {
+    const ALL: [Mode; 4] = [Mode::Hybrid, Mode::Scan, Mode::Recent, Mode::Tag];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Mode::Hybrid => "hybrid",
+            Mode::Scan => "scan",
+            Mode::Recent => "recent",
+            Mode::Tag => "tag",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self, AppError> {
+        Mode::ALL
+            .into_iter()
+            .find(|m| m.as_str() == s)
+            .ok_or_else(|| {
+                AppError::BadRequest("unknown mode (expected hybrid, scan, recent or tag)".into())
+            })
+    }
+
+    /// Read off alaya-core's `search_hybrid` / `search_scan` /
+    /// `search_recent` / `search_tag`. Hybrid matches tags from the query's
+    /// own keywords, never from `tags`; tag mode never reads `memory_type`;
+    /// only hybrid reads the query.
+    fn applies(self) -> Applies {
+        let (query, memory_type, tags) = match self {
+            Mode::Hybrid => (true, true, false),
+            Mode::Scan | Mode::Recent => (false, true, false),
+            Mode::Tag => (false, false, true),
+        };
+        Applies {
+            query,
+            memory_type,
+            tags,
+        }
+    }
+}
+
+/// One browse request, cut down to what its mode applies. Every link the
+/// page offers is built from it, so no link carries an input its mode would
+/// drop, and `ignored` names what the request carried that the mode drops.
+struct BrowseView {
+    mode: Mode,
+    q: String,
+    memory_type: String,
+    tags: String,
+    include_superseded: bool,
+    page: usize,
+    cursor: Option<f64>,
+    ignored: Vec<&'static str>,
+}
+
+impl BrowseView {
+    fn new(q: BrowseQuery) -> Result<Self, AppError> {
+        let mode = match q.mode.as_deref() {
+            Some(m) if !m.is_empty() => Mode::parse(m)?,
+            _ if q.q.trim().is_empty() => Mode::Scan,
+            _ => Mode::Hybrid,
+        };
+        let applies = mode.applies();
+        let mut ignored = Vec::new();
+        let mut keep = |applied: bool, name: &'static str, value: String| {
+            if applied {
+                return value;
+            }
+            if !value.trim().is_empty() {
+                ignored.push(name);
+            }
+            String::new()
+        };
+        let query = keep(applies.query, "query", q.q);
+        let memory_type = keep(applies.memory_type, "type", q.memory_type);
+        let tags = keep(applies.tags, "tags", q.tags);
+        // Recent pages by cursor and the rest by page number; each mode
+        // ignores the other's.
+        let (page, cursor) = if mode == Mode::Recent {
+            if q.page > 1 {
+                ignored.push("page");
+            }
+            (1, q.cursor)
+        } else {
+            if q.cursor.is_some() {
+                ignored.push("cursor");
+            }
+            (q.page.max(1), None)
+        };
+        Ok(BrowseView {
+            mode,
+            q: query,
+            memory_type,
+            tags,
+            include_superseded: q.include_superseded.is_some(),
+            page,
+            cursor,
+            ignored,
+        })
+    }
+
+    /// This view in `mode`, on its first page.
+    fn in_mode(&self, mode: Mode) -> BrowseView {
+        BrowseView {
+            mode,
+            q: self.q.clone(),
+            memory_type: self.memory_type.clone(),
+            tags: self.tags.clone(),
+            include_superseded: self.include_superseded,
+            page: 1,
+            cursor: None,
+            ignored: Vec::new(),
+        }
+    }
+
+    fn href(&self, page: usize, cursor: Option<f64>) -> String {
+        let applies = self.mode.applies();
+        let mut qs = url::form_urlencoded::Serializer::new(String::new());
+        qs.append_pair("mode", self.mode.as_str());
+        for (applied, key, value) in [
+            (applies.query, "q", &self.q),
+            (applies.memory_type, "memory_type", &self.memory_type),
+            (applies.tags, "tags", &self.tags),
+        ] {
+            if applied && !value.is_empty() {
+                qs.append_pair(key, value);
+            }
+        }
+        if self.include_superseded {
+            qs.append_pair("include_superseded", "on");
+        }
+        if page > 1 {
+            qs.append_pair("page", &page.to_string());
+        }
+        if let Some(c) = cursor {
+            qs.append_pair("cursor", &c.to_string());
+        }
+        format!("/alaya?{}", qs.finish())
+    }
+
+    /// The input a mode cannot run without, when it is missing: the server
+    /// would refuse the search, so the page asks for it instead.
+    fn missing_input(&self) -> Option<&'static str> {
+        match self.mode {
+            Mode::Hybrid if self.q.trim().is_empty() => {
+                Some("Enter a query to run a hybrid search.")
+            }
+            Mode::Tag if self.tags.trim().is_empty() => Some("Enter one or more tags."),
+            _ => None,
+        }
+    }
+
+    /// The search body: only what the mode applies, so the request says
+    /// exactly what the server will do.
+    fn upstream(&self) -> Value {
+        let mut params = json!({
+            "mode": self.mode.as_str(),
+            "page": self.page,
+            "page_size": PAGE_SIZE,
+            "include_superseded": self.include_superseded,
+            "output": "both",
+        });
+        if !self.q.is_empty() {
+            params["query"] = json!(self.q);
+        }
+        if !self.memory_type.is_empty() {
+            params["memory_type"] = json!(self.memory_type);
+        }
+        if !self.tags.trim().is_empty() {
+            params["tags"] = json!(self.tags);
+        }
+        if let Some(c) = self.cursor {
+            params["cursor"] = json!(c);
+        }
+        params
+    }
+}
+
+/// Paging links and the count line, from the server's own paging fields.
+/// Next appears only when the server says there is more.
+struct Pager {
+    summary: String,
+    prev: Option<String>,
+    next: Option<String>,
+    first: Option<String>,
+}
+
+fn pager(view: &BrowseView, res: &Value, shown: usize) -> Pager {
+    let has_more = res.get("has_more").and_then(Value::as_bool) == Some(true);
+    let page = view.page;
+    let prev = (page > 1).then(|| view.href(page - 1, None));
+    let next = has_more.then(|| view.href(page + 1, None));
+    match view.mode {
+        // A cursor only goes forward without JS: "first page", never Prev.
+        Mode::Recent => Pager {
+            summary: match view.cursor {
+                Some(c) => format!("{shown} memories created before {}", fmt_epoch(c)),
+                None => format!("{shown} newest memories"),
+            },
+            prev: None,
+            next: res
+                .get("next_cursor")
+                .and_then(Value::as_f64)
+                .filter(|_| has_more)
+                .map(|c| view.href(1, Some(c))),
+            first: view.cursor.map(|_| view.href(1, None)),
+        },
+        // Hybrid ranks a bounded candidate pool, not the corpus: `total` is
+        // that pool, so it is labelled as one.
+        Mode::Hybrid => Pager {
+            summary: match res.get("total").and_then(Value::as_u64) {
+                Some(total) => {
+                    let pages = res.get("total_pages").and_then(Value::as_u64).unwrap_or(1);
+                    format!("Top {total} candidates for this query · page {page} of {pages}")
+                }
+                None => format!("{shown} results · page {page}"),
+            },
+            prev,
+            next,
+            first: None,
+        },
+        Mode::Scan | Mode::Tag => Pager {
+            summary: format!("{shown} memories · page {page}"),
+            prev,
+            next,
+            first: None,
+        },
+    }
+}
+
+fn notice(label: &'static str, msg: String) -> impl IntoView + use<> {
+    view! {
+        <p class="text-sm" role="alert">
+            <span class=badge(BadgeKind::Warning)>{label}</span>
+            " "{msg}
+        </p>
+    }
+}
+
+fn result_row(m: &Value) -> impl IntoView + use<> {
+    let hash = vs(m, "content_hash");
+    let mtype = vs(m, "memory_type");
+    let text = excerpt(m, 140);
+    let tags: Vec<String> = m
+        .get("tags")
+        .and_then(|t| t.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .take(4)
+                .collect()
+        })
+        .unwrap_or_default();
+    let created = fmt_epoch(vf(m, "created_at"));
+    let superseded = is_superseded(m);
+    view! {
+        <TableRow>
+            <TableCell><HashLink hash=hash /></TableCell>
+            <TableCell><span class=badge(BadgeKind::Secondary)>{mtype}</span></TableCell>
+            <TableCell>
+                <span class="text-sm">{text}</span>
+                {superseded.then(|| view! {
+                    <span class=format!("ml-2 {}", badge(BadgeKind::Warning))>"superseded"</span>
+                })}
+            </TableCell>
+            <TableCell>
+                <div class="flex flex-wrap gap-1">
+                    {tags.into_iter().map(|t| view! {
+                        <span class=badge(BadgeKind::Muted)>{t}</span>
+                    }).collect_view()}
+                </div>
+            </TableCell>
+            <TableCell><span class="text-xs text-muted-foreground whitespace-nowrap">{created}</span></TableCell>
+        </TableRow>
+    }
+}
+
+/// The search form for `view`'s mode: only the inputs that mode applies.
+/// Without JS a form cannot re-shape itself when a select changes, so the
+/// mode is picked by link and the form posts it back hidden.
+fn browse_form(view: &BrowseView) -> impl IntoView + use<> {
+    let applies = view.mode.applies();
+    let tabs = Mode::ALL
+        .into_iter()
+        .map(|m| {
+            let (class, current) = if m == view.mode {
+                (btn_sm(Btn::Default), Some("page"))
+            } else {
+                (btn_sm(Btn::Outline), None)
+            };
+            let href = view.in_mode(m).href(1, None);
+            view! { <a class=class href=href aria-current=current>{m.as_str()}</a> }
+        })
+        .collect_view();
+    let q = view.q.clone();
+    let tags = view.tags.clone();
+    let memory_type = view.memory_type.clone();
+    let include_superseded = view.include_superseded;
+    view! {
+        <div class="flex flex-wrap gap-2 mb-4">{tabs}</div>
+        <form method="get" action="/alaya" class="flex flex-wrap items-end gap-3">
+            <input type="hidden" name="mode" value=view.mode.as_str() />
+            {applies.query.then(|| view! {
+                <div class="flex flex-col gap-1.5 grow min-w-56">
+                    <label class=LABEL_CLASS for="q">"Query"</label>
+                    <input class=INPUT_CLASS id="q" name="q" value=q placeholder="semantic query" />
+                </div>
+            })}
+            {applies.memory_type.then(|| view! {
+                <div class="flex flex-col gap-1.5">
+                    <label class=LABEL_CLASS for="memory_type">"Type"</label>
+                    <select class=SELECT_CLASS id="memory_type" name="memory_type">
+                        {["", "note", "decision", "task", "reference"].into_iter().map(|t| {
+                            let selected = t == memory_type;
+                            let label = if t.is_empty() { "any" } else { t };
+                            view! { <option value=t selected=selected>{label}</option> }
+                        }).collect_view()}
+                    </select>
+                </div>
+            })}
+            {applies.tags.then(|| view! {
+                <div class="flex flex-col gap-1.5 grow min-w-56">
+                    <label class=LABEL_CLASS for="tags">"Tags (csv)"</label>
+                    <input class=INPUT_CLASS id="tags" name="tags" value=tags />
+                </div>
+            })}
+            <label class=format!("{LABEL_CLASS} h-9")>
+                <input type="checkbox" name="include_superseded" checked=include_superseded />
+                "include superseded"
+            </label>
+            <button type="submit" class=btn(Btn::Default)>"Search"</button>
+        </form>
+    }
+}
+
 pub async fn browse(
     State(state): State<AppState>,
     session: Session,
     Query(q): Query<BrowseQuery>,
     jar: PrivateCookieJar,
 ) -> Result<(PrivateCookieJar, Html<String>), AppError> {
+    let view = BrowseView::new(q)?;
     let (jar, flash) = take_flash(jar);
 
-    let mode = q.mode.clone().unwrap_or_else(|| {
-        if q.q.trim().is_empty() {
-            "scan".into()
-        } else {
-            "hybrid".into()
-        }
+    let ignored = (!view.ignored.is_empty()).then(|| {
+        notice(
+            "not applied",
+            format!(
+                "{} mode does not apply: {}. The server ignores these, so the results below are not filtered by them.",
+                view.mode.as_str(),
+                view.ignored.join(", "),
+            ),
+        )
     });
-    let include_superseded = q.include_superseded.is_some();
-
-    let mut params = json!({
-        "mode": mode,
-        "query": q.q,
-        "page": q.page,
-        "page_size": PAGE_SIZE,
-        "k": PAGE_SIZE,
-        "include_superseded": include_superseded,
-        "output": "both",
+    // Hybrid hands `memory_type` to the vector search only; its keyword and
+    // graph candidates are not type-filtered upstream.
+    let partial_type = (view.mode == Mode::Hybrid && !view.memory_type.is_empty()).then(|| {
+        notice(
+            "partial",
+            "In hybrid mode the server applies the type filter to semantic matches only; keyword and graph matches of other types can still appear.".into(),
+        )
     });
-    if !q.memory_type.is_empty() {
-        params["memory_type"] = json!(q.memory_type);
-    }
-    if !q.tags.trim().is_empty() {
-        params["tags"] = json!(q.tags);
-    }
-    if let Some(c) = q.cursor {
-        params["cursor"] = json!(c);
-    }
 
-    let res = state.alaya.search(params).await?;
-    let results = res
-        .get("results")
-        .and_then(|r| r.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let total = res.get("total").and_then(|t| t.as_u64());
-    let has_more = res
-        .get("has_more")
-        .and_then(|h| h.as_bool())
-        .unwrap_or(false);
-
-    // Pagination targets (scan/tag are page-based; recent is cursor-based).
-    let base_qs = |page: usize, cursor: Option<f64>| {
-        let mut qs = format!(
-            "/alaya?q={}&mode={}&memory_type={}&tags={}&page={page}",
-            urlenc(&q.q),
-            urlenc(&mode),
-            urlenc(&q.memory_type),
-            urlenc(&q.tags),
-        );
-        if include_superseded {
-            qs.push_str("&include_superseded=on");
-        }
-        if let Some(c) = cursor {
-            qs.push_str(&format!("&cursor={c}"));
-        }
-        qs
-    };
-    let prev_href = (mode != "recent" && q.page > 1).then(|| base_qs(q.page - 1, None));
-    let next_href = if mode == "recent" {
-        results
-            .last()
-            .map(|last| base_qs(1, Some(vf(last, "created_at"))))
-            .filter(|_| results.len() >= PAGE_SIZE)
-    } else if has_more || results.len() >= PAGE_SIZE {
-        // hybrid/scan/tag are all page-based upstream.
-        Some(base_qs(q.page + 1, None))
-    } else {
-        None
-    };
-
-    let rows = results
-        .iter()
-        .map(|m| {
-            let hash = vs(m, "content_hash");
-            let mtype = vs(m, "memory_type");
-            let text = excerpt(m, 140);
-            let tags: Vec<String> = m
-                .get("tags")
-                .and_then(|t| t.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str().map(String::from))
-                        .take(4)
-                        .collect()
-                })
+    let (results, pager) = match view.missing_input() {
+        Some(ask) => (
+            Vec::new(),
+            Pager {
+                summary: ask.into(),
+                prev: None,
+                next: None,
+                first: None,
+            },
+        ),
+        None => {
+            let res = state.alaya.search(view.upstream()).await?;
+            let results = res
+                .get("results")
+                .and_then(|r| r.as_array())
+                .cloned()
                 .unwrap_or_default();
-            let created = fmt_epoch(vf(m, "created_at"));
-            let superseded = is_superseded(m);
-            view! {
-                <TableRow>
-                    <TableCell><HashLink hash=hash /></TableCell>
-                    <TableCell><span class=badge(BadgeKind::Secondary)>{mtype}</span></TableCell>
-                    <TableCell>
-                        <span class="text-sm">{text}</span>
-                        {superseded.then(|| view! {
-                            <span class=format!("ml-2 {}", badge(BadgeKind::Warning))>"superseded"</span>
-                        })}
-                    </TableCell>
-                    <TableCell>
-                        <div class="flex flex-wrap gap-1">
-                            {tags.into_iter().map(|t| view! {
-                                <span class=badge(BadgeKind::Muted)>{t}</span>
-                            }).collect_view()}
-                        </div>
-                    </TableCell>
-                    <TableCell><span class="text-xs text-muted-foreground whitespace-nowrap">{created}</span></TableCell>
-                </TableRow>
-            }
-        })
-        .collect_view();
-
-    let count_line = match total {
-        Some(t) => format!("{t} memories · page {}", q.page),
-        None => format!("{} results", results.len()),
+            let pager = pager(&view, &res, results.len());
+            (results, pager)
+        }
     };
+    let rows = results.iter().map(result_row).collect_view();
+    let form = browse_form(&view);
+    let Pager {
+        summary,
+        prev,
+        next,
+        first,
+    } = pager;
 
     let content = view! {
         <div class="space-y-6">
             <Card>
                 <CardHeader>
                     <CardTitle>"Memories"</CardTitle>
-                    <CardDescription>"Search or browse the corpus. Filters apply in every mode."</CardDescription>
+                    <CardDescription>"Search or browse the corpus. Each mode offers only the filters the server applies in it. Hybrid ranks a bounded pool of candidates for the query, not the whole corpus; browse everything with scan."</CardDescription>
                 </CardHeader>
-                <CardContent>
-                    <form method="get" action="/alaya" class="flex flex-wrap items-end gap-3">
-                        <div class="flex flex-col gap-1.5 grow min-w-56">
-                            <label class=LABEL_CLASS for="q">"Query"</label>
-                            <input class=INPUT_CLASS id="q" name="q" value=q.q.clone() placeholder="semantic query, or empty to browse" />
-                        </div>
-                        <div class="flex flex-col gap-1.5">
-                            <label class=LABEL_CLASS for="mode">"Mode"</label>
-                            <select class=SELECT_CLASS id="mode" name="mode">
-                                {["hybrid", "scan", "recent", "tag"].into_iter().map(|m| {
-                                    let selected = m == mode;
-                                    view! { <option value=m selected=selected>{m}</option> }
-                                }).collect_view()}
-                            </select>
-                        </div>
-                        <div class="flex flex-col gap-1.5">
-                            <label class=LABEL_CLASS for="memory_type">"Type"</label>
-                            <select class=SELECT_CLASS id="memory_type" name="memory_type">
-                                {["", "note", "decision", "task", "reference"].into_iter().map(|t| {
-                                    let selected = t == q.memory_type;
-                                    let label = if t.is_empty() { "any" } else { t };
-                                    view! { <option value=t selected=selected>{label}</option> }
-                                }).collect_view()}
-                            </select>
-                        </div>
-                        <div class="flex flex-col gap-1.5">
-                            <label class=LABEL_CLASS for="tags">"Tags (csv)"</label>
-                            <input class=INPUT_CLASS id="tags" name="tags" value=q.tags.clone() />
-                        </div>
-                        <label class=format!("{LABEL_CLASS} h-9")>
-                            <input type="checkbox" name="include_superseded" checked=include_superseded />
-                            "include superseded"
-                        </label>
-                        <button type="submit" class=btn(Btn::Default)>"Search"</button>
-                    </form>
-                </CardContent>
+                <CardContent>{form}</CardContent>
             </Card>
 
-            <div class="text-sm text-muted-foreground">{count_line}</div>
+            {ignored}
+            {partial_type}
+            <div class="text-sm text-muted-foreground">{summary}</div>
             <TableWrapper>
                 <Table>
                     <TableHeader>
@@ -276,8 +528,9 @@ pub async fn browse(
                 </Table>
             </TableWrapper>
             <div class="flex gap-3">
-                {prev_href.map(|h| view! { <a class=btn_sm(Btn::Outline) href=h>"← Prev"</a> })}
-                {next_href.map(|h| view! { <a class=btn_sm(Btn::Outline) href=h>"Next →"</a> })}
+                {first.map(|h| view! { <a class=btn_sm(Btn::Outline) href=h>"↑ First page"</a> })}
+                {prev.map(|h| view! { <a class=btn_sm(Btn::Outline) href=h>"← Prev"</a> })}
+                {next.map(|h| view! { <a class=btn_sm(Btn::Outline) href=h>"Next →"</a> })}
             </div>
         </div>
     };
@@ -333,6 +586,111 @@ async fn supersession_chain(
     chain
 }
 
+/// The detail page's relations, grouped by type and direction. A
+/// CONTRADICTS edge links to its pair-review page, where the verdict lives.
+/// A failed read says so, distinct from an empty list.
+fn relations_view(hash: &str, relations: Result<Vec<Value>, AppError>, csrf: &str) -> AnyView {
+    let relations = match relations {
+        Err(e) => {
+            return view! {
+                <p class="text-sm mb-4" role="alert">
+                    <span class=badge(BadgeKind::Destructive)>"unavailable"</span>
+                    " "{format!("Could not load relations: {}", e.detail())}
+                </p>
+            }
+            .into_any();
+        }
+        Ok(r) if r.is_empty() => {
+            return view! {
+                <p class="text-sm text-muted-foreground mb-4">"No relations."</p>
+            }
+            .into_any();
+        }
+        Ok(r) => r,
+    };
+    // Outgoing before incoming within a type.
+    let mut groups: std::collections::BTreeMap<(String, bool), Vec<Value>> = Default::default();
+    for e in relations {
+        let incoming = vs(&e, "source") != hash;
+        groups
+            .entry((vs(&e, "relation_type"), incoming))
+            .or_default()
+            .push(e);
+    }
+    let sections = groups
+        .into_iter()
+        .map(|((rel_type, incoming), edges)| {
+            let heading = if incoming {
+                format!("{rel_type} · to this memory ({})", edges.len())
+            } else {
+                format!("{rel_type} · from this memory ({})", edges.len())
+            };
+            let rows = edges
+                .iter()
+                .map(|e| relation_row(hash, e, csrf, incoming))
+                .collect_view();
+            view! {
+                <div class="mb-4">
+                    <h3 class="text-sm font-medium mb-2">{heading}</h3>
+                    <TableWrapper><Table>
+                        <TableHeader>
+                            <TableRow>
+                                <TableHead>"Linked memory"</TableHead>
+                                <TableHead>"Created"</TableHead>
+                                <TableHead>""</TableHead>
+                            </TableRow>
+                        </TableHeader>
+                        <TableBody>{rows}</TableBody>
+                    </Table></TableWrapper>
+                </div>
+            }
+        })
+        .collect_view();
+    sections.into_any()
+}
+
+fn relation_row(hash: &str, e: &Value, csrf: &str, incoming: bool) -> impl IntoView + use<> {
+    let source = vs(e, "source");
+    let target = vs(e, "target");
+    let rel_type = vs(e, "relation_type");
+    // Link to the far end of the edge, whichever side this memory is.
+    let other = if incoming {
+        source.clone()
+    } else {
+        target.clone()
+    };
+    let created = fmt_epoch(vf(e, "created_at"));
+    // The pair page reads the edge in its stored direction: a = source.
+    let review = (rel_type == "CONTRADICTS"
+        && validate_hash(&source).is_ok()
+        && validate_hash(&target).is_ok())
+    .then(|| {
+        let href = format!("{QUEUE_PATH}/pair?a={source}&b={target}");
+        view! { <a class=btn_sm(Btn::Outline) href=href>"Review pair"</a> }
+    });
+    let csrf = csrf.to_string();
+    let back = memory_href(hash);
+    view! {
+        <TableRow>
+            <TableCell><HashLink hash=other /></TableCell>
+            <TableCell><span class="text-xs text-muted-foreground">{created}</span></TableCell>
+            <TableCell>
+                <div class="flex gap-2">
+                    {review}
+                    <form method="post" action="/alaya/relation/delete">
+                        <input type="hidden" name="csrf" value=csrf />
+                        <input type="hidden" name="content_hash" value=source />
+                        <input type="hidden" name="target_hash" value=target />
+                        <input type="hidden" name="relation_type" value=rel_type />
+                        <input type="hidden" name="back" value=back />
+                        <button type="submit" class=btn_sm(Btn::Outline)>"Delete"</button>
+                    </form>
+                </div>
+            </TableCell>
+        </TableRow>
+    }
+}
+
 pub async fn detail(
     State(state): State<AppState>,
     session: Session,
@@ -348,15 +706,19 @@ pub async fn detail(
         .cloned()
         .ok_or_else(|| AppError::NotFound("memory not found".into()))?;
 
-    // Relations are graph-backed and non-fatal upstream; treat a failure as
-    // an empty list with a note rather than a dead page.
+    // Relations are graph-backed and fail on their own; a failure renders
+    // as a note in the Relations card, never as "No relations." and never
+    // as a dead page.
     let relations = state
         .alaya
         .relation("get", &hash, None, None)
         .await
-        .ok()
-        .and_then(|r| r.get("relations").and_then(|x| x.as_array()).cloned())
-        .unwrap_or_default();
+        .and_then(|r| {
+            r.get("relations")
+                .and_then(|x| x.as_array())
+                .cloned()
+                .ok_or_else(|| AppError::Upstream("alaya-server returned no relations list".into()))
+        });
 
     let chain = supersession_chain(&state.alaya, &mem).await;
 
@@ -393,37 +755,7 @@ pub async fn detail(
     let superseded = is_superseded(&mem);
     let csrf = session.csrf.clone();
 
-    let relation_rows = relations
-        .iter()
-        .map(|e| {
-            let csrf = csrf.clone();
-            let back = memory_href(&hash);
-            let source = vs(e, "source");
-            let target = vs(e, "target");
-            let rel_type = vs(e, "relation_type");
-            let rel_badge = rel_type.clone();
-            // Link to the far end of the edge, whichever side this memory is.
-            let other = if source == hash { target.clone() } else { source.clone() };
-            let created = fmt_epoch(vf(e, "created_at"));
-            view! {
-                <TableRow>
-                    <TableCell><span class=badge(BadgeKind::Info)>{rel_badge}</span></TableCell>
-                    <TableCell><HashLink hash=other /></TableCell>
-                    <TableCell><span class="text-xs text-muted-foreground">{created}</span></TableCell>
-                    <TableCell>
-                        <form method="post" action="/alaya/relation/delete">
-                            <input type="hidden" name="csrf" value=csrf />
-                            <input type="hidden" name="content_hash" value=source />
-                            <input type="hidden" name="target_hash" value=target />
-                            <input type="hidden" name="relation_type" value=rel_type />
-                            <input type="hidden" name="back" value=back />
-                            <button type="submit" class=btn_sm(Btn::Outline)>"Delete"</button>
-                        </form>
-                    </TableCell>
-                </TableRow>
-            }
-        })
-        .collect_view();
+    let relations_view = relations_view(&hash, relations, &csrf);
 
     // view! wraps each expression in a move closure — every string below is
     // a dedicated local used exactly once inside the view.
@@ -501,25 +833,7 @@ pub async fn detail(
             <Card>
                 <CardHeader><CardTitle>"Relations"</CardTitle></CardHeader>
                 <CardContent>
-                    {if relations.is_empty() {
-                        Either::Left(view! { <p class="text-sm text-muted-foreground mb-4">"No relations."</p> })
-                    } else {
-                        Either::Right(view! {
-                            <div class="mb-4">
-                                <TableWrapper><Table>
-                                    <TableHeader>
-                                        <TableRow>
-                                            <TableHead>"Type"</TableHead>
-                                            <TableHead>"Linked memory"</TableHead>
-                                            <TableHead>"Created"</TableHead>
-                                            <TableHead>""</TableHead>
-                                        </TableRow>
-                                    </TableHeader>
-                                    <TableBody>{relation_rows}</TableBody>
-                                </Table></TableWrapper>
-                            </div>
-                        })
-                    }}
+                    {relations_view}
                     <form method="post" action="/alaya/relation/create" class="flex flex-wrap items-end gap-3">
                         <input type="hidden" name="csrf" value=csrf_rel />
                         <input type="hidden" name="content_hash" value=hash_hidden />
@@ -2127,6 +2441,27 @@ pub async fn auth_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AC-1: the filters each mode offers, pinned to what alaya-core's
+    /// per-mode search reads. A change upstream must change this table.
+    #[test]
+    fn each_mode_applies_exactly_the_filters_its_server_path_reads() {
+        for (mode, query, memory_type, tags) in [
+            ("hybrid", true, true, false),
+            ("scan", false, true, false),
+            ("recent", false, true, false),
+            ("tag", false, false, true),
+        ] {
+            let applies = Mode::parse(mode).ok().expect("offered").applies();
+            let want = Applies {
+                query,
+                memory_type,
+                tags,
+            };
+            assert_eq!(applies, want, "{mode}");
+        }
+        assert!(Mode::parse("similar").is_err(), "not offered");
+    }
 
     fn pair(extra: Value) -> Value {
         let mut p = json!({
