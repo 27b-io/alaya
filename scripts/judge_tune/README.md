@@ -115,9 +115,10 @@ dropped, never guessed. Extra keys on a row are carried into the report as
 marks. `eval --pairs rows` then judges them.
 
 `compare --run <name>` rescores every one-pass `--pairs all` and `--pairs
-rows` eval in the run, and skips any other, from its records against the
-current fixture, with no API call, so a relabelled fixture costs nothing to
-rescore. It writes `compare.json` and a readable `compare.md`. A positive for
+rows` eval in the run from its records against the current fixture, with no
+API call, so a relabelled fixture costs nothing to rescore. It skips any other
+eval in the run, with a log line. It writes `compare.json` and a readable
+`compare.md`. A positive for
 Jev's safe-to-hide answer is the losing memory of a supersession pair. The
 auto-apply rule is `--primary` supersession at confidence >= 0.90, alone and
 with each other judge's agreement as a second vote; a pair the second judge

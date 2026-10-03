@@ -489,7 +489,13 @@ SECRET_KEY_NAME = (
 )
 # A value's characters, and a placeholder a rule before the key rules wrote.
 VALUE_CHAR = r"[^\s\"'<>,;]"
-PLACEHOLDER = r"<(?:secret|url|email|ip)>"
+PLACEHOLDER = r"(?:<(?:secret|url|email|ip)>)"
+# A value that ran into the next key's name took that key's separator with it,
+# leaving the next value with no key in front: the key rules take it too.
+NEXT_VALUES = (
+    r"(?:(?:(?<=[:=])\s*+|\s++(?:=>|[:=])\s*+)[\"']?"
+    rf"(?:{VALUE_CHAR}|{PLACEHOLDER})++)*+"
+)
 # (class, pattern). A `keep` group survives in front of the placeholder.
 SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
     (
@@ -534,12 +540,24 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
         "secret",
         re.compile(r"(?P<keep>(?:^|\s)(?:-u\s*|--user[=\s]\s*)[^\s:<>]+:)[^\s<>]{6,}"),
     ),
+    (  # a command-line flag naming a secret, then its value: --password VALUE
+        "secret",
+        re.compile(
+            r"(?P<keep>(?<![\w-])--(?=[\w-]*?(?:key|token|secret|passw(?:or)?d))"
+            r"[\w-]++[=\s]\s*[\"']?)[^\s\"'<>]{6,}",
+            re.I,
+        ),
+    ),
     # A secret-named key's value: first one that stops at a bracket, so a call
     # such as `token => login(password: "...")` cannot hide the inner key; then
-    # any value, brackets included.
+    # any value, brackets included. The flag rule runs first: a placeholder it
+    # wrote inside a key's value after them would change on a second scrub.
     (
         "secret",
-        re.compile(rf"(?P<keep>{SECRET_KEY_NAME})[^\s\"'<>,;()\[\]{{}}]{{8,}}", re.I),
+        re.compile(
+            rf"(?P<keep>{SECRET_KEY_NAME})[^\s\"'<>,;()\[\]{{}}]{{8,}}{NEXT_VALUES}",
+            re.I,
+        ),
     ),
     (  # ...and what is left of a value an earlier placeholder split: the
         # tail a bracket left, or the rest around an IP, URL or email in it
@@ -547,15 +565,7 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
         re.compile(
             rf"(?P<keep>{SECRET_KEY_NAME})(?:"
             rf"(?:{VALUE_CHAR}++{PLACEHOLDER}++|{PLACEHOLDER}++{VALUE_CHAR})"
-            rf"(?:{VALUE_CHAR}++|{PLACEHOLDER})*+|{VALUE_CHAR}{{8,}})",
-            re.I,
-        ),
-    ),
-    (  # a command-line flag naming a secret, then its value: --password VALUE
-        "secret",
-        re.compile(
-            r"(?P<keep>(?<![\w-])--(?=[\w-]*?(?:key|token|secret|passw(?:or)?d))"
-            r"[\w-]++[=\s]\s*[\"']?)[^\s\"'<>]{6,}",
+            rf"(?:{VALUE_CHAR}++|{PLACEHOLDER})*+|{VALUE_CHAR}{{8,}}){NEXT_VALUES}",
             re.I,
         ),
     ),
@@ -703,8 +713,8 @@ def judge_pair(
     refusal_fails: bool = False,
 ) -> dict:
     """Judge one rendered pair. An API error propagates: the caller decides
-    whether it aborts the run (tune) or fails the pair (eval). A refusal is
-    `unjudged`, as production records it, unless `refusal_fails` makes it an
+    whether it aborts the run (tune) or fails the pair (eval). A refusal's text
+    is read as production reads it, unless `refusal_fails` makes the refusal an
     `ApiError`, as eval treats a refusal on every wire."""
     resp = client.messages.create(
         system=prompt,
@@ -1870,19 +1880,21 @@ ROWS_FILE = "rows.json"
 LOCK_FILE = ".eval.lock"
 
 
-def spend_log(out: Path) -> list[dict]:
-    """One line per eval in the run directory; the run's cap covers them all."""
-    path = out / SPEND_LOG
-    if not path.exists():
-        return []
-    # A torn line (an aborted append) stops the run: skipping it would
-    # undercount the run's spend against its cap.
+def read_jsonl(path: Path) -> list[dict]:
+    """Every line of `path` as JSON. A torn line (an aborted write) exits
+    naming it: skipped, it would undercount spend or drop verdicts."""
     lines = read_file(path).splitlines()
     return [
         parse_json(line, f"{path}:{n}")
         for n, line in enumerate(lines, 1)
         if line.strip()
     ]
+
+
+def spend_log(out: Path) -> list[dict]:
+    """One line per eval in the run directory; the run's cap covers them all."""
+    path = out / SPEND_LOG
+    return read_jsonl(path) if path.exists() else []
 
 
 def load_rows(out: Path) -> list[Pair]:
@@ -2108,33 +2120,34 @@ def contradiction_pages() -> Iterable[dict]:
             offset = page.get("next_offset")
 
 
-HEX = re.compile(r"[0-9a-f]+")
-
-
 def check_prefixes(rows: Any) -> list[dict]:
-    """Spot-check rows as `resolve_rows` needs them: a unique int `row` and
-    distinct, non-empty lowercase-hex `survivor` and `loser` prefixes (an
-    empty one would match every hash). Exits on the first bad row."""
+    """Spot-check rows in the shape `resolve_rows` reads: each a unique int
+    `row` and a pair of distinct, non-empty lowercase-hex `survivor` and
+    `loser` prefixes (an empty one matches every hash) that no other row
+    names. Exits on the first bad row."""
     if not isinstance(rows, list):
         sys.exit("--prefixes must hold a JSON list of rows")
-    seen: set[int] = set()
+    seen_rows: set[int] = set()
+    seen_pairs: set[frozenset[str]] = set()
     for i, r in enumerate(rows):
         ok = (
             isinstance(r, dict)
             and type(r.get("row")) is int
-            and r["row"] not in seen
+            and r["row"] not in seen_rows
             and all(
-                isinstance(r.get(k), str) and HEX.fullmatch(r[k])
+                isinstance(r.get(k), str) and re.fullmatch(r"[0-9a-f]+", r[k])
                 for k in ("survivor", "loser")
             )
             and r["survivor"] != r["loser"]
+            and frozenset((r["survivor"], r["loser"])) not in seen_pairs
         )
         if not ok:
             sys.exit(
                 f"--prefixes entry {i}: want a unique int `row` and distinct "
-                "lowercase-hex `survivor` and `loser` prefixes"
+                "lowercase-hex `survivor` and `loser` prefixes no other row names"
             )
-        seen.add(r["row"])
+        seen_rows.add(r["row"])
+        seen_pairs.add(frozenset((r["survivor"], r["loser"])))
     return rows
 
 
@@ -2255,9 +2268,7 @@ def load_evals(out: Path) -> dict[str, dict[str, dict]]:
         if name in evals[kind]:
             sys.exit(f"two {kind} evals for {name} in {out}; keep one")
         votes: dict[tuple[str, str], list[dict]] = defaultdict(list)
-        lines = (out / result["records"]).read_text(encoding="utf-8").splitlines()
-        for line in lines:
-            r = json.loads(line)
+        for r in read_jsonl(out / result["records"]):
             votes[(r["a"], r["b"])].append(r)
         evals[kind][name] = {"result": result, "votes": votes}
     return evals
@@ -2561,7 +2572,10 @@ def scrub_section(evals: dict[str, dict[str, dict]]) -> dict:
         if not results:
             continue
         if len({json.dumps(r["scrub_counts"], sort_keys=True) for r in results}) > 1:
-            sys.exit(f"{kind} evals were scrubbed differently: different --host-names?")
+            sys.exit(
+                f"{kind} evals were scrubbed differently: different --host-names "
+                "or scrub rules?"
+            )
         counts = results[0]["scrub_counts"]
         out[kind] = {"memories": results[0]["sent"]["memories"]} | {
             c: counts.get(c, 0) for c in SCRUB_CLASSES
@@ -2573,7 +2587,7 @@ def cmd_compare(args) -> None:
     out = HERE / "runs" / args.run
     evals = load_evals(out)
     if not evals:
-        sys.exit(f"no `--pairs all` or `--pairs rows` evals in {out}")
+        sys.exit(f"no one-pass `--pairs all` or `--pairs rows` evals in {out}")
     report = {
         "fixture": fixture_provenance(),
         "primary": args.primary,

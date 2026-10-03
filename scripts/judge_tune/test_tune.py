@@ -375,15 +375,33 @@ def check_scrub() -> None:
         assert "pL4zQ8w" not in out and "YlL2BoR" not in out, out
         assert s(out) == out and s.leaks(out) == [], out
     # Nor can an IP, URL or email an earlier rule replaced inside the value.
+    # A run of 8 or more before it is a `<secret>` already: the tail goes too.
     for text in (
         "API_KEY=" + "x9-1.2.3.4-Zq8Lm",
         "PASSWORD=" + "x9-ops@example.org-Zq8Lm",
         "TOKEN=" + "x9-1.2.3.4-5.6.7.8-Zq8Lm",
         "SECRET=" + "1.2.3.4-Zq8Lm",
+        "DB_PASSWORD=" + "hunter2hunter2-10.0.0.5-Zq8Lm",
+        "SECRET=" + "longprefix9@ops@example.org-Zq8Lm",
     ):
         out = s(text)
-        assert "x9" not in out and "Zq8Lm" not in out, out
+        assert "x9" not in out and "Zq8Lm" not in out and "hunter2" not in out, out
         assert out.endswith("=<secret>") and s(out) == out and s.leaks(out) == [], out
+    # A value that runs into the next key's name takes that key's value too.
+    for text in (
+        "API_TOKEN=" + "10.0.0.5/db_password: Pa[ss]w0rd",
+        "secret_key=" + "10.0.0.5&&PASSWORD => abc(Pa55w0rd)",
+        "token=" + "abcdefgh/password: Pa55w0rd99",
+        "token=" + "abcdefgh/password: x/api_key: Pa55w0rd99",
+    ):
+        out = s(text)
+        assert "Pa" not in out, out
+        assert s(out) == out and s.leaks(out) == [], out
+    # A placeholder a later rule writes, or a `>` after one, keeps the scrub
+    # idempotent: a second pass would read as a leak and stop the eval.
+    for text in ("echo TOKEN=" + "abcdefgh(1)>out.txt", 'TOKEN="--key=,abcdef"'):
+        out = s(text)
+        assert s(out) == out and s.leaks(out) == [], out
     # A secret-named value cannot swallow the next secret-named key.
     out = s(':auth_token => login(password: "' + "Zx9Qw8Er7Ty6" + '")')
     assert "Zx9Qw8Er7Ty6" not in out and s.leaks(out) == [], out
@@ -627,7 +645,7 @@ def check_judges() -> None:
         else:
             raise AssertionError("a content filter or refusal is an API error")
 
-    def messages(stop: str, text: str = "") -> SimpleNamespace:
+    def fake_client(stop: str, text: str = "") -> SimpleNamespace:
         usage = SimpleNamespace(
             input_tokens=50,
             output_tokens=3,
@@ -641,16 +659,16 @@ def check_judges() -> None:
     def ask(client) -> dict:
         return tune.anthropic_judge(client, "claude-sonnet-5", "sys", "default")("p")
 
-    assert ask(messages("end_turn", good))["verdict"] == "supersession"
+    assert ask(fake_client("end_turn", good))["verdict"] == "supersession"
     try:
-        ask(messages("refusal", good))  # even a parseable verdict
+        ask(fake_client("refusal", good))  # even a parseable verdict
     except tune.ApiError as e:
         assert e.tokens == (50, 3) and "refused" in str(e), e
     else:
         raise AssertionError("an Anthropic refusal is an API error in eval")
-    # tune scores a refusal as production records it: unjudged.
-    v = tune.judge_pair(messages("refusal"), "claude-sonnet-5", "sys", "p")
-    assert v["verdict"] == "unjudged" and v["tokens"] == (50, 3), v
+    # tune reads a refusal's text as production does.
+    v = tune.judge_pair(fake_client("refusal", good), "claude-sonnet-5", "sys", "p")
+    assert v["verdict"] == "supersession" and v["tokens"] == (50, 3), v
 
     def jev(verdicts, survivors, hide=(0.2, 0.8)):
         return {
@@ -750,6 +768,7 @@ def check_rows() -> None:
         [ok | {"loser": ""}],  # an empty prefix matches every hash
         [ok | {"loser": "B" * 12}],  # hashes are lowercase hex
         [ok | {"loser": "a" * 12}],
+        [ok, ok | {"row": 6, "survivor": ok["loser"], "loser": ok["survivor"]}],
     ):
         try:
             tune.check_prefixes(bad)
@@ -931,6 +950,14 @@ def check_compare_run() -> None:
             assert f"{tune.SPEND_LOG}:3" in str(e), e
         else:
             raise AssertionError("a torn spend line must exit")
+        with (out / "eval_s_records.jsonl").open("a", encoding="utf-8") as f:
+            f.write('{"pair": 0, "a": "')
+        try:
+            tune.load_evals(out)
+        except SystemExit as e:
+            assert "eval_s_records.jsonl:" in str(e), e
+        else:
+            raise AssertionError("a torn records line must exit")
 
 
 def main() -> None:
