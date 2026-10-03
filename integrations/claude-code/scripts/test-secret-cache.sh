@@ -74,13 +74,12 @@ v4=$(_resolve_secret TEST_SECRET "$C"); c4=$(cat "$RESOLVECOUNT")
 [[ "$v4" == "direct-value" && "$c4" == "$c9" ]] || { echo "FAIL direct-value: v=$v4 c=$c4"; exit 1; }
 
 # SECRET_CACHE_MINUTES=0, in its own state dir: the command runs on every call,
-# nothing is written but failures.log, a failure returns non-zero with no stale
-# fallback, and key files an earlier setting left behind are removed.
+# nothing is written but failures.log, and a failure returns non-zero with no
+# stale fallback, even when the failing command printed something.
 unset TEST_SECRET
 Z="$T/zero"; mkdir "$Z"
 zero() { STATE_DIR="$Z" SECRET_CACHE_MINUTES=0 _resolve_secret TEST_SECRET "$Z/zero-cache"; }
 zfiles() { find "$Z" -mindepth 1 ! -name failures.log | sort | tr '\n' ' '; }
-printf 'old-plaintext' > "$Z/zero-cache"; touch "$Z/zero-cache.attempt"
 before=$(cat "$RESOLVECOUNT")
 v=$(zero); c=$(cat "$RESOLVECOUNT")
 [[ "$v" == "sekrit-value" && "$c" == $((before + 1)) && -z "$(zfiles)" ]] \
@@ -96,6 +95,21 @@ rc=0; v=$(zero) || rc=$?; c=$(cat "$RESOLVECOUNT")
 [[ -z "$v" && "$rc" != 0 && "$c" == $((before + 4)) ]] \
   || { echo "FAIL zero (no backoff): v=$v rc=$rc calls=$((c - before))"; exit 1; }
 rm -f "$RESOLVEFAIL"
+printf '%s\n' '#!/bin/bash' 'printf partial-secret; exit 42' > "$T/partial"; chmod +x "$T/partial"
+rc=0; v=$(TEST_SECRET_CMD="$T/partial" zero) || rc=$?
+[[ -z "$v" && "$rc" != 0 && -z "$(zfiles)" ]] \
+  || { echo "FAIL zero (non-zero exit with output): v=$v rc=$rc files=$(zfiles)"; exit 1; }
+
+# Whole hook: with 0, key files and markers left by an earlier setting are purged
+# before any gate can skip the save (here the unset ALAYA_URL gate, which exits
+# before either secret is resolved). Above 0 they are kept.
+seed() { for f in llm-api-key alaya-api-key; do printf 'old-plaintext' > "$Z/$f"; touch "$Z/$f.attempt"; done; }
+runhook() { env -u ALAYA_URL ALAYA_HOOK_STATE_DIR="$Z" ALAYA_SECRET_CACHE_MINUTES="$1" bash "$HOOK" </dev/null; }
+seed; runhook 0
+[[ -z "$(zfiles)" ]] || { echo "FAIL zero (hook purge): files=$(zfiles)"; exit 1; }
+seed; runhook 720
+[[ "$(zfiles)" == "$Z/alaya-api-key $Z/alaya-api-key.attempt $Z/llm-api-key $Z/llm-api-key.attempt " ]] \
+  || { echo "FAIL non-zero (hook kept cache): files=$(zfiles)"; exit 1; }
 
 # python3 watchdog branch (macOS/BSD path, where timeout(1) doesn't exist):
 # with timeout hidden from PATH, a hanging resolver must be killed at the
@@ -111,4 +125,4 @@ took=$(( $(date +%s) - start ))
 [[ -z "$v5" && "$took" -le 15 ]] || { echo "FAIL watchdog: v='$v5' took=${took}s"; exit 1; }
 grep -q 'timed out' "$T/failures.log" || { echo "FAIL watchdog: no timeout line in failures.log"; exit 1; }
 
-echo "ALL PASS: cold=1 call, warm=0 calls, 0600 perms, stale cache on resolver failure, 15-min retry backoff (stale and cold), direct-value bypass, CACHE_MINUTES=0 persists nothing, watchdog bound without timeout(1), hook syntax clean"
+echo "ALL PASS: cold=1 call, warm=0 calls, 0600 perms, stale cache on resolver failure, 15-min retry backoff (stale and cold), direct-value bypass, CACHE_MINUTES=0 persists nothing and purges leftovers, watchdog bound without timeout(1), hook syntax clean"

@@ -93,8 +93,9 @@ marker too.
 
 The cache is a plain-text file (mode 0600). Set `ALAYA_SECRET_CACHE_MINUTES=0` to keep no copy at
 all: the command then runs on every Stop, nothing is written under `ALAYA_HOOK_STATE_DIR` but
-`failures.log`, any cache file or `.attempt` marker left from an earlier setting is deleted, and a
-failed command skips the save (logged as `unresolved`) with no stale fallback and no backoff. Use
+`failures.log`, every Stop deletes both cache files and their `.attempt` markers left from an
+earlier setting, and a failed command (non-zero exit, even with output, or empty output) skips the
+save (logged as `unresolved`) with no stale fallback and no backoff. Use
 it when the command does its own caching and failure handling, so the hook's copy would be a second,
 unencrypted one.
 

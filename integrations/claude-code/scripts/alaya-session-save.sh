@@ -43,6 +43,14 @@ MEMORY_CAP=$(_int_or_default "$MEMORY_CAP" 3)
 SECRET_CACHE_MINUTES=$(_int_or_default "$SECRET_CACHE_MINUTES" 720)
 
 mkdir -p "$STATE_DIR" 2>/dev/null || true
+LLM_KEY_CACHE="$STATE_DIR/llm-api-key"
+ALAYA_KEY_CACHE="$STATE_DIR/alaya-api-key"
+# SECRET_CACHE_MINUTES=0 keeps no plaintext key: purge both cache files (and
+# their markers) left by an earlier setting before any gate can skip the save,
+# so a Stop that never reaches _resolve_secret still clears them.
+if (( SECRET_CACHE_MINUTES == 0 )); then
+    rm -f "$LLM_KEY_CACHE" "$LLM_KEY_CACHE.attempt" "$ALAYA_KEY_CACHE" "$ALAYA_KEY_CACHE.attempt"
+fi
 _log_failure() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$STATE_DIR/failures.log" 2>/dev/null || true; }
 _skip() { _log_failure "$1"; exit 0; }
 
@@ -197,10 +205,11 @@ except subprocess.TimeoutExpired:
 # every Stop once the cache goes stale, piling more requests onto the limit.
 # `rm` the matching cache file and its .attempt marker under STATE_DIR to
 # force a refresh after a key rotation.
-# SECRET_CACHE_MINUTES=0 persists nothing: the command runs on every call, a
-# failure is a failure (no stale fallback, no backoff), and any cache file or
-# marker an earlier setting left behind is removed. For a resolver that
-# caches by itself, where a plain-text copy here is a second, redundant one.
+# SECRET_CACHE_MINUTES=0 persists nothing: the command runs on every call and
+# a failure is a failure (no stale fallback, no backoff); a non-zero exit fails
+# even with output, so a partial token is never used. Leftover cache files are
+# purged at the top of the hook. For a resolver that caches by itself, where a
+# plain-text copy here is a second, redundant one.
 _resolve_secret() { # <env-var-name> <cache-file>
     local name="$1" cache="$2" direct cmd_var cmd val
     direct="${!name:-}"
@@ -212,8 +221,7 @@ _resolve_secret() { # <env-var-name> <cache-file>
     cmd="${!cmd_var:-}"
     [[ -z "$cmd" ]] && return 1
     if (( SECRET_CACHE_MINUTES == 0 )); then
-        rm -f "$cache" "$cache.attempt"
-        val=$(_run_secret_cmd "$cmd")
+        val=$(_run_secret_cmd "$cmd") || return 1
         [[ -z "$val" ]] && return 1
         printf '%s' "$val"
         return 0
@@ -227,11 +235,11 @@ _resolve_secret() { # <env-var-name> <cache-file>
     [[ -r "$cache" ]] && cat "$cache"
 }
 
-LLM_API_KEY=$(_resolve_secret ALAYA_LLM_API_KEY "$STATE_DIR/llm-api-key") || true
+LLM_API_KEY=$(_resolve_secret ALAYA_LLM_API_KEY "$LLM_KEY_CACHE") || true
 [[ -z "$LLM_API_KEY" ]] && _skip "config: ALAYA_LLM_API_KEY unresolved, skipping save"
 
 # Alaya bearer — server auth is fail-closed. Missing key means no save.
-ALAYA_API_KEY=$(_resolve_secret ALAYA_API_KEY "$STATE_DIR/alaya-api-key") || true
+ALAYA_API_KEY=$(_resolve_secret ALAYA_API_KEY "$ALAYA_KEY_CACHE") || true
 [[ -z "$ALAYA_API_KEY" ]] && _skip "config: ALAYA_API_KEY unresolved, skipping save"
 
 # --- LLM call: memory-focused structured extraction ---
