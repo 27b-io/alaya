@@ -108,3 +108,83 @@ List price throughout, cached input counted at the full input rate.
    were tidying snapshots rather than correcting claims, the label rule and the
    prompt's "recording history is intended" disagree, and one of them has to
    move.
+
+# Results: cross-judge eval and a Jev "safe to hide" vote (2026-10-03)
+
+**Outcome: do not wire Jev in as a second vote.** At the thresholds tested,
+its safe-to-hide answer vetoes nearly every supersession. That has the same
+effect as switching auto-apply off, which needs no vendor.
+
+## Setup
+
+- Golden set v2 (`rule_version` 2): 174 pairs, labelled 98 supersession, 51
+  coexist (4 of them `partial`) and 25 unrelated. A second set held 51
+  production pairs the judge had called supersession at confidence ≥ 0.90,
+  resolved from the contradiction queue.
+- One pass per judge, as production judges once:
+  - `claude-sonnet-5`: the production Messages request;
+  - `gpt-6-sol` and `gemini-3.8-flash`: through a LiteLLM proxy, using the
+    request `openai.rs` sends;
+  - `jev-1.13.0`: the typed questions in `JEV_QUESTIONS`.
+- Every judge got the same scrubbed rendering, with hosts, IPs, URLs, emails
+  and secrets replaced. Sonnet also ran once on unscrubbed text as a control.
+  The scrub made 224 host, 124 URL, 41 IP, 25 email and 4 secret replacements
+  over 357 memories.
+- No pair failed for any judge. Spend was USD 5.81 at list price: Anthropic
+  3.56, OpenAI-compatible 2.23, Jev 0.02.
+
+## Golden set, `partial` pairs counted as coexist
+
+| judge | precision(S) | recall(S) | coexist→conflict | false supersede | yield |
+|---|---|---|---|---|---|
+| claude-sonnet-5 | 94/99 = 0.949 | 94/98 = 0.959 | 5/51 = 0.098 | 6/52 = 0.115 | 0.891 |
+| claude-sonnet-5, unscrubbed | 96/100 = 0.960 | 96/98 = 0.980 | 4/51 = 0.078 | 5/52 = 0.096 | 0.897 |
+| gpt-6-sol | 87/92 = 0.946 | 87/98 = 0.888 | 5/51 = 0.098 | 6/52 = 0.115 | 0.851 |
+| gemini-3.8-flash | 67/67 = 1.000 | 67/98 = 0.684 | 0/51 = 0.000 | 0/51 = 0.000 | 0.753 |
+| jev-1.13.0 | 74/76 = 0.974 | 74/98 = 0.755 | 2/51 = 0.039 | 3/52 = 0.058 | 0.707 |
+
+Survivor accuracy is 0.986 to 1.000 for every judge. Jev calls 24 of the 25
+unrelated pairs coexist. Counting `partial` pairs as supersessions moves no
+conclusion; `compare.md` carries both views with 95 % Wilson intervals.
+
+The scrub did not move Sonnet. The scrubbed and unscrubbed passes agree on
+159/174 verdicts (κ 0.85), which is about what one sampled pass differs from
+the next. On the pairs both called supersession, mean confidence moved by
++0.003, and both passes would auto-apply exactly 66 pairs.
+
+## The vote
+
+The auto-apply rule is Sonnet supersession at confidence ≥ 0.90:
+
+| rule | applied | correct | precision | recall |
+|---|---|---|---|---|
+| Sonnet alone | 66 | 66 | 1.000 [0.94, 1.00] | 0.673 |
+| AND gpt-6-sol agrees | 63 | 63 | 1.000 | 0.643 |
+| AND jev-1.13.0's class agrees | 61 | 61 | 1.000 | 0.622 |
+| AND gemini-3.8-flash agrees | 54 | 54 | 1.000 | 0.551 |
+| AND Jev safe-to-hide ≥ 0.5 | 2 | 2 | 1.000 | 0.020 |
+| AND Jev safe-to-hide ≥ 0.7 or ≥ 0.9 | 0 | 0 | n/a | 0.000 |
+
+The golden set holds no false apply at this threshold. A second vote
+therefore cannot show a precision gain here; it can only cost recall.
+
+Jev's safe-to-hide probability ranks the losing memory above every other
+endpoint well (ROC AUC 0.92), but its scale is low. Losers have a median of
+0.17 and a maximum of 0.63; other endpoints have a median of about 0.07. On
+the 51 production pairs, the probability for the memory auto-apply would
+hide was 0.05 to 0.32, under 0.5 on all 51. A threshold low enough to pass
+real supersessions would have to be chosen on this same set, which would fit
+it to the test data.
+
+## Agreement on verdict class (Cohen's κ)
+
+| | golden (174) | production pairs (51) |
+|---|---|---|
+| Sonnet vs gpt-6-sol | 0.74 | 0.62 |
+| Sonnet vs gemini-3.8-flash | 0.57 | 0.23 |
+| Sonnet vs jev-1.13.0 | 0.47 | 0.52 |
+
+Re-judged on the production pairs, Sonnet itself repeats "supersession, same
+survivor, confidence ≥ 0.90" on only 16 of the 51. They were selected for a
+high score on one sample, so a second sample regresses. A single pass at a
+0.90 cut is a noisy gate however the second vote is chosen.

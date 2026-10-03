@@ -19,11 +19,11 @@ a key.
 
 | variable | meaning |
 |---|---|
-| `ALAYA_URL` | Ālaya REST origin; the script GETs `/memories/{hash}` |
+| `ALAYA_URL` | Ālaya REST origin; the script GETs `/memories/{hash}` and, for `rows`, POSTs the read-only `/contradictions` |
 | `ALAYA_API_KEY` | bearer for that origin (read access is all it needs) |
-| `JUDGE_URL` | Anthropic Messages API origin, as `JUDGE_URL` for the server |
-| `JUDGE_API_KEY` | key for `JUDGE_URL` |
-| `JUDGE_MODEL` | default `claude-sonnet-5` |
+| `JUDGE_URL` | the judge's API origin: Anthropic Messages API, an OpenAI-compatible endpoint, or TypeSafe's (`eval --judge`) |
+| `JUDGE_API_KEY` | key for `JUDGE_URL`, read once at start |
+| `JUDGE_MODEL` | default `claude-sonnet-5` for the Anthropic judge; `eval --model` overrides it |
 | `REFLECTION_URL`, `REFLECTION_API_KEY` | default to the `JUDGE_*` values; set both or neither, a key is never sent to another origin |
 | `REFLECTION_MODEL` | default `claude-opus-5` |
 
@@ -44,15 +44,74 @@ uv run scripts/judge_tune/tune.py tune --run $(date +%Y%m%d)
 uv run scripts/judge_tune/tune.py eval \
   --prompt-file scripts/judge_tune/runs/<run>/best_prompt.txt --pairs all --run <run> \
   --passes 3 --regime default --max-usd 15
+
+# 4. Cross-judge: the same scrubbed pairs to several judges, then compare.
+#    --prompt-file defaults to judge.rs's SYSTEM_PROMPT.
+uv run scripts/judge_tune/tune.py rows --run <run> --prefixes <rows.json>
+uv run scripts/judge_tune/tune.py eval --judge jev --scrub --pairs all --run <run>
+uv run scripts/judge_tune/tune.py eval --judge openai --model <id> --scrub \
+  --pairs rows --run <run>
+uv run scripts/judge_tune/tune.py compare --run <run>
 ```
 
 Every output lands under `scripts/judge_tune/runs/<name>/`, which is gitignored:
 `tune` writes `report.md`, `report.json`, `records.jsonl` (every verdict),
 `spend.json`, `best_prompt.txt` and GEPA's own state and logs; `eval` writes
-`eval_<pairs>_<regime>_k<passes>_<sha>.json` plus `_records.jsonl` (every
-verdict of every pass) and `_spend.json`. The harness writes no memory content to disk, but the
-run directory holds model output about it (candidate prompts, verdict reasons),
-so it stays out of git.
+`eval_<pairs>_<model>_<scrubbed|raw>_<regime>_k<passes>_<sha>.json` plus
+`_records.jsonl` (every verdict of every pass, keyed by both hashes) and
+`_spend.json`, and appends its spend to the run's `spend_log.jsonl`; `rows`
+writes `rows.json`; `compare` writes `compare.json` and `compare.md`. The
+harness writes no memory content to disk, but the run directory holds model
+output about it (candidate prompts, verdict reasons, hash prefixes), so it
+stays out of git.
+
+## Cross-judge eval
+
+`eval --judge` picks the judge; every judge gets the same rendered pair.
+
+- `anthropic` (default): the production request, as above.
+- `openai`: what `crates/alaya-backends/src/openai.rs` sends, `POST
+  /v1/chat/completions` with a strict `json_schema` response format,
+  `max_completion_tokens` and no `temperature`, so its numbers predict that
+  wire. `--model` is required.
+- `jev`: TypeSafe's typed-question API (`POST /v1/systemone`), model
+  `jev-1.13.0` pinned. Jev writes no text: the committed `JEV_QUESTIONS` ask
+  for a probability per verdict class, a survivor (a / b / neither) and, per
+  memory, whether it is safe to hide that whole memory. The class is the most
+  probable one; a supersession takes the likelier of a and b as survivor.
+
+`--scrub` replaces host names, IP addresses, URLs (`op://` included), email
+addresses and secrets (API keys, tokens, bearer strings, private-key blocks)
+with `<host>`, `<ip>`, `<url>`, `<email>` and `<secret>` in each memory's
+content and tags, before the 4,000-character cut. A host name without a dot
+cannot be told from a word by pattern, so `--host-names <file>` adds bare
+names (one per line, kept out of git). Before any request leaves, every
+rendered pair is checked against every rule, and one match aborts the run.
+`openai` and `jev` refuse to run without `--scrub`; the unscrubbed Anthropic
+run is the control that measures what the scrub changes.
+
+An API error, a content-filter block or a refusal is retried once; a second
+one makes the pair `failed`: counted, kept out of every metric, never scored
+as a verdict. A 401 or 403, or a chunk in which every call failed, aborts the
+run. A reply that is not a valid verdict is still `unjudged` and scores wrong.
+`--max-usd` caps the run directory's total spend across every `eval` in it.
+
+`rows --prefixes <file>` resolves spot-check rows, given as
+`[{"row", "survivor", "loser"}]` hash prefixes, through `/contradictions`
+with resolved pairs included. A row whose prefixes fit two memory pairs is
+dropped, never guessed. Extra keys on a row are carried into the report as
+marks. `eval --pairs rows` then judges them.
+
+`compare --run <name>` rescores every `--pairs all` and `--pairs rows` eval
+in the run from its records against the current fixture, with no API call,
+so a relabelled fixture costs nothing to rescore. It reports, per judge, the
+headline rates and precision and recall per class, both with `partial` pairs
+counted both ways; Jev's safe-to-hide precision and recall at 0.5, 0.7 and
+0.9, where a positive is the losing memory of a supersession pair; the
+auto-apply set (`--primary` supersession at confidence >= 0.90) alone and
+with each other judge as a second vote; the primary's error overlap with Jev;
+the scrubbed-against-unscrubbed control; pairwise Cohen's kappa and raw
+agreement on verdict class; and a per-row table of the spot-check rows.
 
 ## What the tune enforces
 
@@ -121,7 +180,7 @@ that is unmeasured, while no pair carries the label.
 
 `--max-usd` is checked between chunks of 20 calls. The first chunk's cost is
 projected over the whole run, so a run the cap cannot cover with 10 % headroom
-stops after one chunk. An API error aborts the run once every call that returned is booked.
+stops after one chunk. Every call that returned is booked before an abort.
 
 `--regime default` is the production request (no `thinking` parameter, so
 `claude-sonnet-5` runs adaptive thinking). `--regime thinking-off` adds

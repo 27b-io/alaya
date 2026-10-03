@@ -13,8 +13,8 @@ import argparse
 import itertools
 import json
 import sys
+from collections import Counter
 
-import anthropic
 
 import tune
 
@@ -195,131 +195,90 @@ def check_consensus_scoring() -> None:
 
 
 def check_judge_passes() -> None:
-    """Spend cap, cost projection and API errors in `judge_passes`."""
-    hashes = [f"{i:064x}" for i in range(45)]
-    memories = {h: mem(h, 0.0) for h in hashes}
-    pairs = [
-        tune.Pair(i, h, h, "coexist", None, "agreed") for i, h in enumerate(hashes)
-    ]
+    """Spend cap, cost projection, API errors and outages in `judge_passes`."""
+    texts = [f"{i:064x}" for i in range(45)]
     calls = itertools.count()
 
     def run(cost, max_usd: float) -> tuple[list, tune.Ledger, str | None]:
-        votes: list = [[] for _ in pairs]
+        votes: list = [[] for _ in texts]
         ledger = tune.Ledger()
-        tune.judge_pair = lambda c, m, pr, x, y, regime: cost(x, next(calls))
+
+        def judge(t):
+            return cost(t, next(calls))
+
         try:
             tune.judge_passes(
-                None,
-                "claude-sonnet-5",
-                "p",
-                memories,
-                pairs,
-                3,
-                "default",
-                ledger,
-                max_usd,
-                votes,
+                judge, "claude-sonnet-5", texts, 3, ledger, max_usd, votes
             )
         except RuntimeError as e:
             return votes, ledger, str(e)
         return votes, ledger, None
 
-    real = tune.judge_pair
+    # A run the cap cannot cover stops after its first chunk ($0.50 a call,
+    # 135 calls, $15 cap).
+    votes, ledger, err = run(lambda t, n: verdict(tokens=(250_000, 0)), 15.0)
+    assert err and "project" in err, err
+    assert (
+        sum(map(len, votes))
+        == tune.SPEND_CHECK_EVERY
+        == ledger.rows[("judge", "claude-sonnet-5")][0]
+    )
+    # A run projected just under the cap (cap = 1.05x the projection) is refused
+    # up front, not killed late.
+    calls = itertools.count()
+    votes, ledger, err = run(lambda t, n: verdict(tokens=(5_000, 0)), 1.35 * 1.05)
+    assert err and "project" in err, err
+    # A run whose cost rises later still stops on the hard cap, at a chunk edge.
+    calls = itertools.count()
+    votes, ledger, err = run(
+        lambda t, n: verdict(tokens=(5_000 if n < 20 else 500_000, 0)), 15.0
+    )
+    assert err and ">= $15.0" in err and sum(map(len, votes)) == 40, err
+
+    # An error is re-raised only after every call that returned is booked.
+    def flaky(t):
+        if t == texts[7]:
+            raise tune.AuthError("HTTP 401")
+        return verdict(tokens=(1_000, 10))
+
+    votes: list = [[] for _ in texts]
+    ledger = tune.Ledger()
     try:
-        # A run the cap cannot cover stops after its first chunk ($0.50 a call,
-        # 135 calls, $15 cap).
-        votes, ledger, err = run(lambda x, n: verdict(tokens=(250_000, 0)), 15.0)
-        assert err and "project" in err, err
-        assert (
-            sum(map(len, votes))
-            == tune.SPEND_CHECK_EVERY
-            == ledger.rows[("judge", "claude-sonnet-5")][0]
-        )
-        # A run projected just under the cap (cap = 1.05x the projection) is refused
-        # up front, not killed late.
-        calls = itertools.count()
-        votes, ledger, err = run(lambda x, n: verdict(tokens=(5_000, 0)), 1.35 * 1.05)
-        assert err and "project" in err, err
-        # A run whose cost rises later still stops on the hard cap, at a chunk edge.
-        calls = itertools.count()
-        votes, ledger, err = run(
-            lambda x, n: verdict(tokens=(5_000 if n < 20 else 500_000, 0)), 15.0
-        )
-        assert err and ">= $15.0" in err and sum(map(len, votes)) == 40, err
+        tune.judge_passes(flaky, "claude-sonnet-5", texts, 3, ledger, 1e9, votes)
+    except tune.AuthError:
+        pass
+    else:
+        raise AssertionError("an auth error must abort the run")
+    assert sum(map(len, votes)) == tune.SPEND_CHECK_EVERY - 1 and not votes[7]
+    assert ledger.rows[("judge", "claude-sonnet-5")][0] == tune.SPEND_CHECK_EVERY - 1
+    # A failed pair is booked and kept; a chunk of nothing but failures aborts.
+    gone = verdict(verdict=tune.FAILED, reason="HTTP 503", tokens=(0, 0))
+    votes, ledger, err = run(lambda t, n: gone if t == texts[3] else verdict(), 1e9)
+    assert err is None and votes[3][0]["verdict"] == tune.FAILED
+    votes, ledger, err = run(lambda t, n: gone, 1e9)
+    assert err and "all 20 calls of a chunk failed: HTTP 503" in err, err
+    # A run that fits in one chunk is never refused after it has been paid.
+    votes, ledger = [[] for _ in texts[:20]], tune.Ledger()
 
-        # An API error is re-raised only after every call that returned is booked.
-        def flaky(x, n):
-            if x["content"] == hashes[7]:
-                raise anthropic.APIConnectionError(request=None)
-            return verdict(tokens=(1_000, 10))
+    def paid(t):
+        return verdict(tokens=(25_000, 0))
 
-        votes: list = [[] for _ in pairs]
-        ledger = tune.Ledger()
-        tune.judge_pair = lambda c, m, pr, x, y, regime: flaky(x, 0)
-        try:
-            tune.judge_passes(
-                None,
-                "claude-sonnet-5",
-                "p",
-                memories,
-                pairs,
-                3,
-                "default",
-                ledger,
-                1e9,
-                votes,
-            )
-        except anthropic.APIConnectionError:
-            pass
-        else:
-            raise AssertionError("an API error must abort the run")
-        assert sum(map(len, votes)) == tune.SPEND_CHECK_EVERY - 1 and not votes[7]
-        assert (
-            ledger.rows[("judge", "claude-sonnet-5")][0] == tune.SPEND_CHECK_EVERY - 1
+    tune.judge_passes(paid, "claude-sonnet-5", texts[:20], 1, ledger, 1.05, votes)
+    assert all(len(vs) == 1 for vs in votes) and abs(ledger.usd() - 1.0) < 1e-9
+    # ... but with passes left after the first chunk, the projection applies.
+    votes, ledger = [[] for _ in texts[:20]], tune.Ledger()
+    try:
+        tune.judge_passes(paid, "claude-sonnet-5", texts[:20], 2, ledger, 1.5, votes)
+    except RuntimeError as e:
+        assert "project" in str(e), e
+    else:
+        raise AssertionError(
+            "a run of 2 passes projected at $2 must stop under a $1.50 cap"
         )
-        # A run that fits in one chunk is never refused after it has been paid.
-        votes, ledger = [[] for _ in pairs[:20]], tune.Ledger()
-        tune.judge_pair = lambda c, m, pr, x, y, regime: verdict(tokens=(25_000, 0))
-        tune.judge_passes(
-            None,
-            "claude-sonnet-5",
-            "p",
-            memories,
-            pairs[:20],
-            1,
-            "default",
-            ledger,
-            1.05,
-            votes,
-        )
-        assert all(len(vs) == 1 for vs in votes) and abs(ledger.usd() - 1.0) < 1e-9
-        # ... but with passes left after the first chunk, the projection applies.
-        votes, ledger = [[] for _ in pairs[:20]], tune.Ledger()
-        try:
-            tune.judge_passes(
-                None,
-                "claude-sonnet-5",
-                "p",
-                memories,
-                pairs[:20],
-                2,
-                "default",
-                ledger,
-                1.5,
-                votes,
-            )
-        except RuntimeError as e:
-            assert "project" in str(e), e
-        else:
-            raise AssertionError(
-                "a run of 2 passes projected at $2 must stop under a $1.50 cap"
-            )
-        assert all(len(vs) == 1 for vs in votes) and abs(ledger.usd() - 1.0) < 1e-9
-        # Uncapped, every pair gets every pass.
-        votes, _, err = run(lambda x, n: verdict(), 1e9)
-        assert err is None and all(len(vs) == 3 for vs in votes)
-    finally:
-        tune.judge_pair = real
+    assert all(len(vs) == 1 for vs in votes) and abs(ledger.usd() - 1.0) < 1e-9
+    # Uncapped, every pair gets every pass.
+    votes, _, err = run(lambda t, n: verdict(), 1e9)
+    assert err is None and all(len(vs) == 3 for vs in votes)
     assert tune.positive_int("3") == 3
     try:
         tune.positive_int("0")
@@ -327,6 +286,284 @@ def check_judge_passes() -> None:
         pass
     else:
         raise AssertionError("--passes 0 must be rejected")
+
+
+def check_scrub() -> None:
+    """Each scrub class becomes its placeholder, counted; nothing survives the
+    check; scrubbing is idempotent. Key-shaped test strings are assembled at
+    run time so the repo's secret scanners never see one in the source."""
+    key_block = (
+        "-----BEGIN " + "OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n"
+        "-----END " + "OPENSSH PRIVATE KEY-----"
+    )
+    cases = {
+        "host": [
+            "svc at store-api.data.svc:3001 now",
+            "the gateway.corp.example.net front",
+            "pushed to crates.io",
+            "behind iap at app.cloud.goog",
+            "box build-box-01 rebooted",
+        ],
+        "ip": [
+            "ClusterIP 192.0.2.10:3001",
+            "v6 2001:db8:a1e0::1 and 2001:db8:0:0:0:0:2:1",
+        ],
+        "url": [
+            "see https://example.com/a?b=c) for more",
+            "key at op://vault/item/field",
+            "redis://cache:6379/0",
+        ],
+        "email": ["mail ops+alerts@example.org today"],
+        "secret": [
+            "header Authorization: Bearer " + "abc" * 6,
+            "export API_KEY=" + "z9" * 10,
+            "token: " + "q" * 12,
+            "sk-" + "ant-" + "x1" * 15,
+            "gh" + "p_" + "A" * 36,
+            "jwt eyJ" + "a" * 10 + ".eyJ" + "b" * 10 + "." + "c" * 12,
+            key_block,
+        ],
+    }
+    for cls, texts in cases.items():
+        for text in texts:
+            s = tune.Scrubber(["build-box-01"])
+            out = s(text)
+            assert f"<{cls}>" in out and s.counts[cls] >= 1, (cls, text, out)
+            assert s.leaks(out) == [] and s.leaks(text), (cls, text, out)
+            assert s(out) == out, (cls, out)  # idempotent
+    s = tune.Scrubber()
+    assert s("Bearer " + "abc" * 6) == "Bearer <secret>"
+    assert s(key_block + " tail") == "<secret> tail"
+    assert s("ssh -i key2 " + key_block[:40]) == "ssh -i key2 <secret>"  # cut block
+    # Prose, file names, versions, times and hashes are not a scrub class.
+    plain = (
+        "Ray ruled on tune.py and judge.rs (v1.13.0) at 12:30:45; max_tokens=4096, "
+        "token budget 5, std::fs, hash 9999d3f16a2030def3b3479ef273318194c8e03f, "
+        "e.g. the bearer token; lab node; pinned cachekit@0.1.4 and action@v3.2.0"
+    )
+    assert s(plain) == plain and s.leaks(plain) == [], s(plain)
+    # Bare names come only from the host list, longest first, as whole words.
+    s = tune.Scrubber(["box", "box-wsl"])
+    assert s("box-wsl and box, not boxing") == "<host> and <host>, not boxing"
+    assert s.counts == Counter(host=2)
+    # The rendered pair carries scrubbed content and tags, and checks clean.
+    s = tune.Scrubber()
+    a = s.memory(mem("db at 10.0.0.5 via db.internal", 0.0, tags=("x.svc", "plain")))
+    assert a["content"] == "db at <ip> via <host>" and a["tags"] == ["<host>", "plain"]
+    text = tune.render_pair(a, s.memory(mem("ok", 86_400.0 * 2)))
+    assert s.leaks(text) == [] and "tags: <host>, plain" in text, text
+    assert s.counts == Counter(ip=1, host=2)
+    assert tune.read_host_names(None) == []
+
+
+def check_judges() -> None:
+    """The judge seam: retry once, then fail; OpenAI and Jev replies."""
+    tries = []
+
+    def flaky(t):
+        tries.append(t)
+        if len(tries) == 1:
+            raise tune.ApiError("HTTP 503", (5, 1))
+        return verdict(tokens=(10, 2))
+
+    real_sleep = tune.time.sleep
+    tune.time.sleep = lambda s: None
+    try:
+        v = tune.retried(flaky)("t")
+        assert v["verdict"] == "coexist" and v["tokens"] == (15, 3) and len(tries) == 2
+
+        def down(t):
+            raise tune.ApiError("HTTP 400: content filter " + "x" * 300, (7, 0))
+
+        v = tune.retried(down)("t")
+        assert v["verdict"] == tune.FAILED and v["tokens"] == (14, 0)
+        assert v["reason"].startswith("HTTP 400: content filter")
+        assert len(v["reason"]) == tune.MAX_REASON_CHARS
+
+        def locked(t):
+            raise tune.AuthError("HTTP 401")
+
+        try:
+            tune.retried(locked)("t")
+        except tune.AuthError:
+            pass
+        else:
+            raise AssertionError("an auth error must propagate")
+    finally:
+        tune.time.sleep = real_sleep
+
+    # The request openai.rs sends: no temperature, strict schema.
+    body = tune.openai_body("gpt-6-sol", "sys", "pair")
+    assert "temperature" not in body and "max_tokens" not in body
+    assert body["max_completion_tokens"] == tune.MAX_OUTPUT_TOKENS
+    assert body["response_format"]["json_schema"]["strict"] is True
+    assert [m["role"] for m in body["messages"]] == ["system", "user"]
+
+    def chat(content=None, finish="stop", refusal=None, usage=True):
+        msg = {"role": "assistant", "content": content, "refusal": refusal}
+        out = {"choices": [{"message": msg, "finish_reason": finish}]}
+        if usage:
+            out["usage"] = {"prompt_tokens": 100, "completion_tokens": 20}
+        return out
+
+    good = json.dumps(verdict(verdict="supersession", survivor="a", confidence=0.9))
+    v = tune.openai_verdict(chat(good))
+    assert (v["verdict"], v["survivor"], v["tokens"]) == (
+        "supersession",
+        "a",
+        (100, 20),
+    )
+    assert tune.openai_verdict(chat(good, usage=False))["tokens"] == (0, 0)
+    assert tune.openai_verdict(chat(None))["verdict"] == "unjudged"
+    assert tune.openai_verdict(chat("not json"))["verdict"] == "unjudged"
+    assert tune.openai_verdict({"choices": []})["verdict"] == "unjudged"
+    for bad in (chat(good, finish="content_filter"), chat(None, refusal="no")):
+        try:
+            tune.openai_verdict(bad)
+        except tune.ApiError as e:
+            assert e.tokens == (100, 20), e.tokens
+        else:
+            raise AssertionError("a content filter or refusal is an API error")
+
+    def jev(verdicts, survivors, hide=(0.2, 0.8)):
+        return {
+            "model": tune.JEV_MODEL,
+            "answers": {
+                "verdict": {"type": "choice", "probabilities": verdicts},
+                "survivor": {"type": "choice", "probabilities": survivors},
+                "hide_a": {"type": "noul", "noul": hide[0]},
+                "hide_b": {"type": "noul", "noul": hide[1]},
+            },
+            "usage": {"input_tokens": 900, "output_tokens": 40},
+        }
+
+    probs = {
+        "contradiction": 0.05,
+        "supersession": 0.6,
+        "coexist": 0.3,
+        "unrelated": 0.05,
+    }
+    v = tune.jev_verdict(jev(probs, {"a": 0.2, "b": 0.1, "neither": 0.7}))
+    # A supersession names a survivor even when "neither" leads.
+    assert (v["verdict"], v["survivor"], v["confidence"]) == ("supersession", "a", 0.6)
+    assert v["hide"] == {"a": 0.2, "b": 0.8} and v["tokens"] == (900, 40)
+    # A Jev verdict is one `validate` accepts, as every judge's must be.
+    assert v["model_version"] == tune.JEV_MODEL
+    assert tune.validate(v, v["tokens"]) == {
+        k: v[k] for k in ("verdict", "survivor", "reason", "confidence", "tokens")
+    }
+    probs = {
+        "contradiction": 0.7,
+        "supersession": 0.1,
+        "coexist": 0.1,
+        "unrelated": 0.1,
+    }
+    v = tune.jev_verdict(jev(probs, {"a": 0.2, "b": 0.1, "neither": 0.7}))
+    assert (v["verdict"], v["survivor"]) == ("contradiction", None)
+    try:
+        tune.jev_verdict({"answers": {"verdict": {}}, "usage": {"input_tokens": 9}})
+    except tune.ApiError as e:
+        assert e.tokens == (9, 0) and "malformed" in str(e)
+    else:
+        raise AssertionError("a malformed Jev answer is an API error")
+    assert set(tune.JEV_QUESTIONS) == {"verdict", "survivor", "hide_a", "hide_b"}
+    assert list(tune.JEV_QUESTIONS["verdict"]["criteria"]) == list(tune.CLASSES)
+    assert tune.price("jev-1.13.0") == (0.042, 0.0)
+
+
+def check_rows() -> None:
+    """Prefix rows resolve to exactly one memory pair, or are dropped."""
+
+    def edge(a, b, verdict="supersession", survivor=None, conf=0.95):
+        return {
+            "memory_a_hash": a,
+            "memory_b_hash": b,
+            "verdict": verdict,
+            "survivor": survivor,
+            "verdict_confidence": conf,
+            "verdict_model": "claude-sonnet-5",
+        }
+
+    h = {k: k * 64 for k in "abcdef"}
+    clash = "e" * 12 + "0" * 52  # shares e's 12-char prefix
+    rows = [
+        {"row": 1, "survivor": "a" * 12, "loser": "b" * 12, "flag": True},
+        {"row": 2, "survivor": "c" * 12, "loser": "d" * 12},
+        {"row": 3, "survivor": "e" * 12, "loser": "f" * 12},
+        {"row": 4, "survivor": "9" * 12, "loser": "8" * 12},
+    ]
+    edges = [
+        edge(h["b"], h["a"], "coexist", None, 0.6),  # the reverse direction
+        edge(h["a"], h["b"], "supersession", h["a"], 0.97),
+        edge(h["d"], h["c"], "supersession", h["c"], 0.91),
+        edge(h["e"], h["f"]),
+        edge(clash, h["f"]),
+    ]
+    done, ambiguous, unmatched = tune.resolve_rows(rows, edges)
+    assert [r["row"] for r in done] == [1, 2]
+    assert [r["row"] for r in ambiguous] == [3] and [r["row"] for r in unmatched] == [4]
+    r1, r2 = done
+    assert (r1["a"], r1["b"], r1["survivor"], r1["loser"]) == (
+        h["a"],
+        h["b"],
+        h["a"],
+        h["b"],
+    )
+    assert r1["prod_confidence"] == 0.97 and r1["flag"] is True
+    assert (r2["a"], r2["survivor"], r2["loser"]) == (h["d"], h["c"], h["d"])
+
+
+def check_compare() -> None:
+    """Agreement, safe-to-hide rates and the auto-apply vote."""
+    assert tune.kappa(["s", "c", "s", "c"], ["s", "c", "s", "c"]) == 1.0
+    assert tune.kappa(["s", "s", "c", "c"], ["s", "c", "s", "c"]) == 0.0
+    assert tune.kappa(["s", "s"], ["s", "s"]) is None and tune.kappa([], []) is None
+    k = tune.kappa(list("sssscc"), list("ssscsc"))
+    assert abs(k - 0.25) < 1e-12, k  # po 4/6, pe (4*4 + 2*2) / 36
+    assert tune.decide([verdict(), verdict(verdict=tune.FAILED)]) is None
+    assert tune.decide([]) is None
+    d = tune.decide([verdict(confidence=0.9, hide={"a": 0.3, "b": 0.8})])
+    assert d["confidence"] == 0.9 and d["hide"] == {"a": 0.3, "b": 0.8}
+
+    a, b, c, e = ("a" * 64, "b" * 64, "c" * 64, "e" * 64)
+    s1 = tune.Pair(0, a, b, "supersession", a, "operator")  # loser b
+    s2 = tune.Pair(1, c, e, "supersession", e, "operator")  # loser c
+    co = tune.Pair(2, "1" * 64, "2" * 64, "coexist", None, "agreed")
+    pairs = [s1, s2, co]
+
+    def sup(surv: str, conf: float = 0.95) -> dict:
+        return {"verdict": "supersession", "survivor": surv, "confidence": conf}
+
+    primary = {0: sup("a"), 1: sup("b", 0.80), 2: sup("a")}
+    alone = tune.auto_apply(pairs, primary)
+    assert (alone["applied"], alone["correct"], alone["wrong_ids"]) == (2, 1, [2])
+    assert alone["recall"]["n"] == 2 and alone["precision"]["rate"] == 0.5
+    jev = {0: {"hide": {"a": 0.1, "b": 0.95}}, 2: {"hide": {"a": 0.2, "b": 0.6}}}
+    seconds = tune.second_votes({"p": primary, "jev-1.13.0": jev}, "p", "jev-1.13.0")
+    assert sorted(seconds) == ["jev-1.13.0"] + [
+        f"jev-1.13.0 hide>={t}" for t in tune.HIDE_THRESHOLDS
+    ]
+    voted = tune.auto_apply(pairs, primary, seconds["jev-1.13.0 hide>=0.7"])
+    assert (voted["applied"], voted["correct"], voted["wrong_ids"]) == (1, 1, [])
+    other = {
+        0: sup("a"),
+        2: {"verdict": "coexist", "survivor": None, "confidence": 0.9},
+    }
+    agrees = tune.second_votes({"p": primary, "g": other}, "p", None)["g"]
+    assert tune.auto_apply(pairs, primary, agrees)["wrong_ids"] == []
+
+    rows = [(s1, {"hide": {"a": 0.1, "b": 0.8}}), (co, {"hide": {"a": 0.85, "b": 0.2}})]
+    r = tune.hide_rates(rows, 0.7)
+    assert (r["precision"]["k"], r["precision"]["n"], r["recall"]["n"]) == (1, 2, 1)
+    assert tune.hide_rates(rows, 0.9)["precision"]["n"] == 0
+    # The one loser (0.8) outranks 2 of the 3 other endpoints; no loser, no AUC.
+    assert tune.hide_auc(rows) == 2 / 3 and tune.hide_auc(rows[1:]) is None
+    agree = tune.agreement({"x": {0: verdict(), 1: verdict()}, "y": {1: verdict()}})
+    assert agree == [
+        {"judges": ["x", "y"], "n": 1, "raw": tune.rate(1, 1), "kappa": None}
+    ]
+    fx = tune.fixture_provenance()
+    assert fx["rule_version"] == 2 and len(fx["git_blob"]) == 40
 
 
 def main() -> None:
@@ -454,6 +691,10 @@ def main() -> None:
 
     check_fixture()
     check_consensus_scoring()
+    check_scrub()
+    check_judges()
+    check_rows()
+    check_compare()
 
     # stopper: the seed never stops the run; a tuned candidate must clear the
     # bar without losing accuracy to the seed.
