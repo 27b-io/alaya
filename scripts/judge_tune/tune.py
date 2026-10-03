@@ -404,6 +404,14 @@ SECRET_TOKENS = (
     r"|ops_[\w-]{20,}|tskey-[A-Za-z0-9-]{10,}"
     r"|eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}"  # JWT
 )
+# A key name that names a secret: API_KEY, client_secret, x-api-key. The
+# look-behind starts it at the head of a name and the possessive `++` never
+# gives a character back, so a long run costs linear time, not quadratic.
+SECRET_KEY_NAME = (
+    r"(?<![\w.-])(?=[\w.-]*?(?:api[_-]?key|account[_-]?key|[_-]key|token|secret"
+    r"|passw(?:or)?d|passphrase|pwd|credential))[\w.-]++"
+    r"[\"']?\]?\s*(?:=>|[:=])\s*[\"']?"  # also os.environ['X_KEY'] = '...'
+)
 # (class, pattern). A `keep` group survives in front of the placeholder.
 SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
     (
@@ -414,9 +422,12 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
             re.S,
         ),
     ),
-    ("url", re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s<>\"'`)\]]+", re.I)),
+    ("url", re.compile(r"(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*+://[^\s<>\"'`)\]]+", re.I)),
     # The domain ends in letters, so a package pin (`pkg@0.1.4`) is no email.
-    ("email", re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\b")),
+    (
+        "email",
+        re.compile(r"(?<![\w.+-])[\w.+-]++@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\b"),
+    ),
     ("secret", re.compile(rf"\b(?:{SECRET_TOKENS})")),
     ("secret", re.compile(r"(?P<keep>\bBearer\s+)[\w.~+/=-]{8,}")),
     (
@@ -430,20 +441,19 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
         "secret",
         re.compile(r"(?P<keep>(?:^|\s)(?:-u\s*|--user[=\s]\s*)[^\s:<>]+:)[^\s<>]{6,}"),
     ),
-    (  # any key naming a secret, prefixed or not: API_KEY=, client_secret:
+    # A secret-named key's value: first one that stops at a bracket, so a call
+    # such as `token => login(password: "...")` cannot hide the inner key; then
+    # any value, brackets included.
+    (
         "secret",
-        re.compile(  # the look-behind anchors the name: without it, quadratic
-            r"(?P<keep>(?<![\w.-])[\w.-]*?(?:api[_-]?key|account[_-]?key|[_-]key"
-            r"|token|secret|passw(?:or)?d|passphrase|pwd|credential)[\w.-]*"
-            r"[\"']?\s*(?:=>|[:=])\s*[\"']?)[^\s\"'<>,;]{8,}",
-            re.I,
-        ),
+        re.compile(rf"(?P<keep>{SECRET_KEY_NAME})[^\s\"'<>,;()\[\]{{}}]{{8,}}", re.I),
     ),
+    ("secret", re.compile(rf"(?P<keep>{SECRET_KEY_NAME})[^\s\"'<>,;]{{8,}}", re.I)),
     (  # a command-line flag naming a secret, then its value: --password VALUE
         "secret",
         re.compile(
-            r"(?P<keep>--[\w-]*(?:key|token|secret|passw(?:or)?d)[\w-]*[=\s]\s*)"
-            r"[^\s\"'<>]{6,}",
+            r"(?P<keep>(?<![\w-])--(?=[\w-]*?(?:key|token|secret|passw(?:or)?d))"
+            r"[\w-]++[=\s]\s*[\"']?)[^\s\"'<>]{6,}",
             re.I,
         ),
     ),
@@ -459,7 +469,9 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
     (
         "host",
         re.compile(
-            rf"\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:{HOST_TLDS})\b"
+            # At the head of a name only, so a long dotted run is linear; one
+            # leading dot is taken along, as in `*.example.net`.
+            rf"(?<![a-z0-9.-])\.?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:{HOST_TLDS})\b"
             r"(?!-|\.[a-z0-9])",
             re.I,
         ),

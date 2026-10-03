@@ -304,6 +304,7 @@ def check_scrub() -> None:
             "the gateway.corp.example.net front",
             "pushed to crates.io",
             "behind iap at app.cloud.goog",
+            "resolves *.example.net and {svc}.dev.example.io",
             "box build-box-01 rebooted",
         ],
         "ip": [
@@ -336,6 +337,10 @@ def check_scrub() -> None:
             "AccountName=x;AccountKey=" + "Zm9v" * 6 + "==",
             "'apikey' => '" + "a6" * 8 + "'",
             "wh" + "sec_" + "W" * 24,
+            "mysql --password '" + "Zx9Qw8Er7Ty6" + "'",
+            'cli --api-key "' + "Zx9Qw8Er7Ty6" + '"',
+            "os.environ['OPENAI_API_KEY'] = '" + "o8" * 8 + "'",
+            'config["password"] = "' + "Zx9Qw8Er7Ty6" + '"',
             "n" + "pm_" + "B" * 36,
             "-----BEGIN PGP "
             + "PRIVATE KEY BLOCK-----\nlQOYBF\n-----END PGP PRIVATE KEY BLOCK-----",
@@ -356,10 +361,17 @@ def check_scrub() -> None:
     assert s("Bearer " + "abc" * 6) == "Bearer <secret>"
     assert s(key_block + " tail") == "<secret> tail"
     assert s("ssh -i key2 " + key_block[:40]) == "ssh -i key2 <secret>"  # cut block
-    # The key-name rule stays linear on a long unbroken token (it was quadratic).
-    start = tune.time.perf_counter()
-    s("x" * 64_000 + " token")
-    assert tune.time.perf_counter() - start < 1.0
+    # A secret-named value cannot swallow the next secret-named key.
+    out = s(':auth_token => login(password: "' + "Zx9Qw8Er7Ty6" + '")')
+    assert "Zx9Qw8Er7Ty6" not in out and s.leaks(out) == [], out
+    # Every rule stays near linear on long adversarial runs (some were
+    # quadratic or worse: 64k characters took minutes).
+    for run in ("x", "a.", "1.", "_key", "token", "--key", "-", "a@", "ab:"):
+        text = (run * 64_000)[:64_000]
+        start = tune.time.perf_counter()
+        s(text)
+        took = tune.time.perf_counter() - start
+        assert took < 1.0, (run, took)
     # Prose, file names, versions, times and hashes are not a scrub class.
     plain = (
         "Ray ruled on tune.py and judge.rs (v1.13.0) at 12:30:45; max_tokens=4096, "
@@ -700,6 +712,15 @@ def check_compare_run() -> None:
             pass
         else:
             raise AssertionError("an unknown --primary must exit")
+        # A scored eval that never recorded what it sent would undercount.
+        (out / "eval_j_sent.json").rename(out / "eval_j_sent.bak")
+        try:
+            tune.load_evals(out)
+        except SystemExit as e:
+            assert "_sent.json" in str(e), e
+        else:
+            raise AssertionError("an eval without its _sent.json must exit")
+        (out / "eval_j_sent.bak").rename(out / "eval_j_sent.json")
         # Different scrub counts mean different text reached different judges.
         write_eval(out, "eval_r", "anthropic", "claude-opus-5", [], counts={"host": 4})
         try:
