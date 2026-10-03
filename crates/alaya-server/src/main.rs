@@ -684,6 +684,16 @@ async fn ensure_qdrant_collection(qdrant: &QdrantClient, dimensions: usize) {
 
 const CMD_CHANNEL_CAP: usize = 256;
 
+/// Searches one process runs at a time (LAB-6896). Searches run off the
+/// worker loop, so none of them holds up a store, but they still run one at
+/// a time, as they did inline: Qdrant is where a slow search spends its time,
+/// and a higher bound would put more concurrent load on it.
+const SEARCH_CONCURRENCY: usize = 1;
+/// Searches outstanding, queued or running, past which a new one is refused.
+/// A spawned search has left the command channel, so this is the queue bound
+/// the channel used to give them, at the same depth.
+const SEARCH_BACKLOG_MAX: usize = CMD_CHANNEL_CAP;
+
 // Wedge protection (#63): the worker serializes all ops through one channel,
 // so a single await that never resolves used to freeze the whole service —
 // invisibly, because /health bypasses the worker. Three layers fix that:
@@ -1301,8 +1311,9 @@ impl Drop for InFlight {
 /// Runs MemoryService on a LocalSet, processing commands from the channel.
 ///
 /// Wraps the service in `Rc` so long-running operations (find_duplicates,
-/// merge_duplicates) can be spawned as local tasks without blocking the
-/// command loop. Other commands continue processing while they run.
+/// merge_duplicates) and searches can be spawned as local tasks without
+/// blocking the command loop. Other commands continue processing while they
+/// run; every write still runs inline, one at a time, in arrival order.
 ///
 /// Every handler await is bounded by `limits` (#63), and `progress` is
 /// stamped after each command so the health watchdog can tell a draining
@@ -1336,6 +1347,11 @@ async fn service_worker(
     let judge_limiter = std::rc::Rc::new(std::cell::RefCell::new(JudgeDailyCap::new(
         limits.judge_daily_cap,
     )));
+    // Searches run in spawned tasks: the gate keeps them one at a time, the
+    // slots bound how many wait (SEARCH_CONCURRENCY, SEARCH_BACKLOG_MAX).
+    // `Arc` for the slots: `try_acquire_owned` needs it.
+    let search_gate = std::rc::Rc::new(tokio::sync::Semaphore::new(SEARCH_CONCURRENCY));
+    let search_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(SEARCH_BACKLOG_MAX));
 
     // First heartbeat: bootstrap is done and the loop is live. Until this
     // stamp the health checker reports the worker as "starting" (progress
@@ -1466,11 +1482,23 @@ async fn service_worker(
                 };
                 let _ = reply.send(result);
             }
+            CmdInner::Search { reply, .. } if search_slots.available_permits() == 0 => {
+                tracing::warn!(op, max = SEARCH_BACKLOG_MAX, "search backlog full");
+                let _ = reply.send(json!({"error": "search backlog full, try again later"}));
+            }
+            // Spawned, not awaited (LAB-6896): a slow search held every store
+            // queued behind it past its caller's timeout. `search_gate` still
+            // runs searches one at a time, in arrival order; the deadline
+            // starts once a search holds it, as it started at pickup inline.
             CmdInner::Search {
                 params,
                 read_only,
                 reply,
             } => {
+                let slot = search_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("checked by the arm above, on this thread");
                 let mode = format!("{:?}", params.mode).to_lowercase();
                 let query_preview = truncate(&params.query, 80);
                 let page = params.page;
@@ -1478,37 +1506,50 @@ async fn service_worker(
                 let tag_count = params.tags.as_ref().map(|t| t.len()).unwrap_or(0);
                 let mem_type = params.memory_type.clone().unwrap_or_default();
                 let span = tracing::info_span!(parent: &ps, "search", %mode, read_only);
-                let result = match timeout(
-                    limits.cmd,
-                    svc.search_with(params, read_only).instrument(span),
-                )
-                .await
-                {
-                    Ok(Ok(r)) => {
-                        let n = result_count(&r);
-                        let has_more = r.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
-                        tracing::info!(
-                            op,
-                            mode = mode.as_str(),
-                            query = query_preview.as_str(),
-                            results = n,
-                            has_more,
-                            page,
-                            page_size,
-                            tag_count,
-                            mem_type = mem_type.as_str(),
-                            elapsed_ms = ms(start),
-                            "ok"
-                        );
-                        r
-                    }
-                    Ok(Err(e)) => {
-                        log_err(op, &e, start);
-                        json!({"error": e.safe_message()})
-                    }
-                    Err(_) => deadline_exceeded(op, limits.cmd, start),
-                };
-                let _ = reply.send(result);
+                let svc = svc.clone();
+                let gate = search_gate.clone();
+                let deadline = limits.cmd;
+                tokio::task::spawn_local(async move {
+                    let _slot = slot;
+                    let Ok(_running) = gate.acquire().await else {
+                        return;
+                    };
+                    let queued_ms = ms(start);
+                    let start = std::time::Instant::now();
+                    let result = match timeout(
+                        deadline,
+                        svc.search_with(params, read_only).instrument(span),
+                    )
+                    .await
+                    {
+                        Ok(Ok(r)) => {
+                            let n = result_count(&r);
+                            let has_more =
+                                r.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
+                            tracing::info!(
+                                op,
+                                mode = mode.as_str(),
+                                query = query_preview.as_str(),
+                                results = n,
+                                has_more,
+                                page,
+                                page_size,
+                                tag_count,
+                                mem_type = mem_type.as_str(),
+                                queued_ms,
+                                elapsed_ms = ms(start),
+                                "ok"
+                            );
+                            r
+                        }
+                        Ok(Err(e)) => {
+                            log_err(op, &e, start);
+                            json!({"error": e.safe_message()})
+                        }
+                        Err(_) => deadline_exceeded(op, deadline, start),
+                    };
+                    let _ = reply.send(result);
+                });
             }
             CmdInner::Delete { hash, reply } => {
                 let span = tracing::info_span!(parent: &ps, "delete");
@@ -4936,10 +4977,10 @@ mod wedge_tests {
     impl EmbeddingProvider for StubEmbeddings {
         async fn embed_batch(
             &self,
-            _texts: &[&str],
+            texts: &[&str],
             _prompt_name: PromptName,
         ) -> Result<Vec<Vec<f32>>> {
-            unimplemented!()
+            Ok(vec![vec![0.5; 4]; texts.len()])
         }
         fn dimensions(&self) -> usize {
             4
@@ -4957,7 +4998,8 @@ mod wedge_tests {
     }
 
     /// Graph whose stats reads blackhole, like `HangVectors`, or panic with
-    /// `panic_stats` set; the rest panic unless a test needs them.
+    /// `panic_stats` set. The writes a store makes and the boosts a hybrid
+    /// search reads answer at once; the rest panic unless a test needs them.
     struct StubGraph {
         panic_stats: bool,
     }
@@ -4990,7 +5032,7 @@ mod wedge_tests {
             unimplemented!()
         }
         async fn ensure_node(&self, _content_hash: &str, _created_at: f64) -> Result<()> {
-            unimplemented!()
+            Ok(())
         }
         async fn delete_node(&self, _content_hash: &str) -> Result<()> {
             unimplemented!()
@@ -5002,7 +5044,7 @@ mod wedge_tests {
             _rel: UserRelationType,
             _meta: EdgeMeta,
         ) -> Result<bool> {
-            unimplemented!()
+            Ok(true)
         }
         async fn get_typed_edges(
             &self,
@@ -5078,10 +5120,10 @@ mod wedge_tests {
             _min_activation: f64,
             _limit: usize,
         ) -> Result<HashMap<String, f64>> {
-            unimplemented!()
+            Ok(HashMap::new())
         }
         async fn hebbian_boosts_within(&self, _hashes: &[&str]) -> Result<HashMap<String, f64>> {
-            unimplemented!()
+            Ok(HashMap::new())
         }
         async fn get_contradiction_stats(
             &self,
@@ -5392,6 +5434,332 @@ mod wedge_tests {
                 );
             })
             .await;
+    }
+
+    /// How long `SlowSearchVectors` holds every hybrid search.
+    const SLOW_SEARCH: Duration = Duration::from_secs(30);
+    /// The store caller's patience: a 10 s client timeout.
+    const STORE_BUDGET: Duration = Duration::from_secs(10);
+    /// Outer bound on any reply await, so a wedge fails instead of hanging.
+    const NEVER: Duration = Duration::from_secs(3600);
+
+    /// VectorStorage whose `search_by_tags` takes `SLOW_SEARCH`. Only hybrid
+    /// search calls it, and every one does, the tag cache notwithstanding:
+    /// `get_all_tags` answers "flag", a keyword of the test query. The store
+    /// path runs at full speed: its `search_by_vector` answers `neighbour` at
+    /// once, and `stored` records every write. Methods neither path calls
+    /// panic.
+    struct SlowSearchVectors {
+        neighbour: Memory,
+        stored: std::rc::Rc<std::cell::RefCell<Vec<Memory>>>,
+    }
+
+    #[async_trait(?Send)]
+    impl VectorStorage for SlowSearchVectors {
+        async fn reverse_supersession(
+            &self,
+            _h: &str,
+            _e: &serde_json::Value,
+            _r: &alaya_backends::ReversalRecord,
+        ) -> Result<alaya_backends::ReversalOutcome> {
+            unimplemented!()
+        }
+        async fn store(&self, memory: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
+            self.stored.borrow_mut().push(memory.clone());
+            Ok((true, memory.content_hash.clone()))
+        }
+        async fn get_by_hash(&self, _content_hash: &str) -> Result<Option<Memory>> {
+            unimplemented!()
+        }
+        async fn set_generated_summary(
+            &self,
+            _content_hash: &str,
+            _summary: &str,
+            _summary_embedding: Option<Vec<f32>>,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn get_batch(&self, _hashes: &[&str]) -> Result<Vec<Memory>> {
+            unimplemented!()
+        }
+        async fn delete(&self, _content_hash: &str) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn update_metadata(
+            &self,
+            _content_hash: &str,
+            _updates: MetadataUpdate,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+        async fn patch_memory(
+            &self,
+            _content_hash: &str,
+            _patch: &PatchMemoryRequest,
+        ) -> Result<Memory> {
+            unimplemented!()
+        }
+        async fn search_by_vector(
+            &self,
+            _embedding: &[f32],
+            _limit: usize,
+            _filters: Option<PayloadFilter>,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(vec![ScoredMemory {
+                memory: self.neighbour.clone(),
+                score: 0.9,
+            }])
+        }
+        async fn search_by_tags(
+            &self,
+            _tags: &[&str],
+            _match_all: bool,
+            _limit: usize,
+            _mt: Option<&str>,
+        ) -> Result<Vec<ScoredMemory>> {
+            tokio::time::sleep(SLOW_SEARCH).await;
+            Ok(Vec::new())
+        }
+        async fn search_similar_tags(
+            &self,
+            _tag_embedding: &[f32],
+            _limit: usize,
+        ) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
+            Ok(())
+        }
+        async fn get_all(&self, _limit: usize, _offset: Option<&str>) -> Result<ScrollResult> {
+            unimplemented!()
+        }
+        async fn get_recent(
+            &self,
+            _limit: usize,
+            _start_from: Option<f64>,
+            _memory_type: Option<&str>,
+        ) -> Result<Vec<Memory>> {
+            unimplemented!()
+        }
+        async fn count(&self) -> Result<usize> {
+            Ok(1)
+        }
+        async fn get_all_tags(&self) -> Result<Vec<String>> {
+            Ok(vec!["flag".into()])
+        }
+        async fn increment_access_count(&self, _content_hash: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            unimplemented!()
+        }
+    }
+
+    /// A worker over `SlowSearchVectors`, run until `body` ends. `body` gets
+    /// the command sender, the neighbour every vector search answers, and the
+    /// record of stores.
+    async fn with_slow_search_worker<F>(
+        limits: WorkerLimits,
+        body: impl FnOnce(mpsc::Sender<Cmd>, Memory, std::rc::Rc<std::cell::RefCell<Vec<Memory>>>) -> F,
+    ) where
+        F: std::future::Future<Output = ()>,
+    {
+        let neighbour: Memory = serde_json::from_value(json!({
+            "content": "enable the flag", "content_hash": "b".repeat(64), "tags": [],
+            "memory_type": "note", "created_at": 0.0, "updated_at": 0.0,
+        }))
+        .expect("memory");
+        let stored = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let svc = MemoryService::new(
+            Box::new(SlowSearchVectors {
+                neighbour: neighbour.clone(),
+                stored: stored.clone(),
+            }),
+            Box::new(StubEmbeddings),
+            Box::new(StubGraph { panic_stats: false }),
+            Box::new(StubHebbian),
+            Box::new(StubConsolidation),
+            None,
+        );
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::channel::<Cmd>(8);
+                tokio::task::spawn_local(service_worker(
+                    rx,
+                    svc,
+                    Arc::new(AtomicU64::new(0)),
+                    limits,
+                ));
+                body(tx, neighbour, stored).await;
+            })
+            .await;
+    }
+
+    /// Enqueues one hybrid search and returns its reply receiver.
+    async fn send_hybrid_search(tx: &mpsc::Sender<Cmd>) -> oneshot::Receiver<Value> {
+        let (reply, answer) = oneshot::channel();
+        let params: SearchParams =
+            serde_json::from_value(json!({ "query": "flag state", "mode": "hybrid" }))
+                .expect("search params");
+        tx.send(Cmd {
+            inner: CmdInner::Search {
+                params,
+                read_only: false,
+                reply,
+            },
+            span: tracing::Span::none(),
+        })
+        .await
+        .unwrap();
+        answer
+    }
+
+    /// LAB-6896: `searches` hybrid searches, each holding its
+    /// tag branch for `SLOW_SEARCH`, then a store 1 ms later. The store's
+    /// reply must arrive within `STORE_BUDGET` of its own enqueue. A worker
+    /// that awaits searches inline answers it only after every search ahead
+    /// of it, at least `searches × SLOW_SEARCH` later. The store must also be
+    /// the store it was: written exactly once under its content hash, with
+    /// interference detection run against its neighbour.
+    async fn store_is_not_held_behind(searches: usize) {
+        with_slow_search_worker(
+            WorkerLimits::default(),
+            |tx, neighbour, stored| async move {
+                let mut search_replies = Vec::new();
+                for _ in 0..searches {
+                    search_replies.push(send_hybrid_search(&tx).await);
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+
+                // "disable" against the neighbour's "enable": an antonym signal.
+                let content = "disable the flag";
+                let (reply, answer) = oneshot::channel();
+                let enqueued = tokio::time::Instant::now();
+                tx.send(Cmd {
+                    inner: CmdInner::Store {
+                        params: StoreParams {
+                            content: content.into(),
+                            tags: Some(vec!["flag".into()]),
+                            memory_type: None,
+                            metadata: None,
+                            client_hostname: None,
+                            summary: None,
+                            dedup_threshold: None,
+                        },
+                        read_only: false,
+                        reply,
+                    },
+                    span: tracing::Span::none(),
+                })
+                .await
+                .unwrap();
+                let stored_reply = tokio::time::timeout(NEVER, answer)
+                    .await
+                    .expect("store never replied")
+                    .expect("store reply dropped");
+                let waited = enqueued.elapsed();
+                assert!(
+                    waited < STORE_BUDGET,
+                    "store replied {waited:?} after its enqueue, behind {searches} slow search(es)"
+                );
+
+                let hash = alaya_core::hashing::generate_content_hash(content);
+                assert_eq!(stored_reply["success"], true, "{stored_reply}");
+                assert_eq!(stored_reply["content_hash"], json!(hash), "{stored_reply}");
+                assert_eq!(
+                    stored_reply["interference"]["contradictions"][0]["existing_hash"],
+                    json!(neighbour.content_hash),
+                    "interference detection did not run: {stored_reply}"
+                );
+
+                // Every search still answers, with its result.
+                for answer in search_replies {
+                    let found = tokio::time::timeout(NEVER, answer)
+                        .await
+                        .expect("search never replied")
+                        .expect("search reply dropped");
+                    assert!(found.get("error").is_none(), "{found}");
+                    assert_eq!(found["mode"], "hybrid", "{found}");
+                }
+                // Counted after every search is done: nothing wrote it twice.
+                let stored = stored.borrow();
+                assert_eq!(stored.len(), 1, "store landed {} times", stored.len());
+                assert_eq!(stored[0].content_hash, hash);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn store_is_not_held_behind_a_running_slow_search() {
+        store_is_not_held_behind(1).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn store_is_not_held_behind_two_queued_slow_searches() {
+        store_is_not_held_behind(2).await;
+    }
+
+    /// The #63 deadline, for a spawned search: past its deadline a search
+    /// replies `error_kind: "timeout"` and frees the running permit, so the
+    /// search queued behind it runs, with its own full deadline, and does the
+    /// same.
+    #[tokio::test(start_paused = true)]
+    async fn search_past_its_deadline_times_out_and_frees_the_next() {
+        let limits = WorkerLimits {
+            cmd: SLOW_SEARCH / 3,
+            ..WorkerLimits::default()
+        };
+        with_slow_search_worker(limits, |tx, _, _| async move {
+            let start = tokio::time::Instant::now();
+            let first = send_hybrid_search(&tx).await;
+            let second = send_hybrid_search(&tx).await;
+            for (n, answer) in [first, second].into_iter().enumerate() {
+                let reply = tokio::time::timeout(NEVER, answer)
+                    .await
+                    .expect("search never replied — worker wedged")
+                    .expect("search reply dropped");
+                assert_eq!(reply["error_kind"], "timeout", "search {n}: {reply}");
+                // Run one after the other, each for its whole deadline.
+                assert_eq!(start.elapsed(), (SLOW_SEARCH / 3) * (n as u32 + 1));
+            }
+        })
+        .await;
+    }
+
+    /// Spawned searches have left the command channel, so the worker bounds
+    /// them itself, at the depth the channel refused at: past
+    /// `SEARCH_BACKLOG_MAX` outstanding a search is refused, and other
+    /// commands still run.
+    #[tokio::test(start_paused = true)]
+    async fn search_backlog_is_bounded_and_refusal_blocks_nothing() {
+        with_slow_search_worker(WorkerLimits::default(), |tx, _, _| async move {
+            let mut held = Vec::new();
+            for _ in 0..SEARCH_BACKLOG_MAX {
+                held.push(send_hybrid_search(&tx).await);
+            }
+            let refused = tokio::time::timeout(STORE_BUDGET, send_hybrid_search(&tx).await)
+                .await
+                .expect("refusal queued behind the backlog")
+                .expect("refusal dropped");
+            assert_eq!(refused["error"], "search backlog full, try again later");
+
+            let (ptx, prx) = oneshot::channel();
+            tx.send(Cmd {
+                inner: CmdInner::Ping { reply: ptx },
+                span: tracing::Span::none(),
+            })
+            .await
+            .unwrap();
+            let pong = tokio::time::timeout(STORE_BUDGET, prx)
+                .await
+                .expect("ping queued behind the backlog")
+                .unwrap();
+            assert_eq!(pong["ok"], true);
+            assert!(held.iter_mut().all(|r| r.try_recv().is_err()));
+        })
+        .await;
     }
 
     /// Stall tests read this fixed monotonic "now", so a stamp of
