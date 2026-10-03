@@ -12,6 +12,7 @@ and the Rust stay in step.
 import argparse
 import itertools
 import json
+import socket
 import sys
 import tempfile
 from collections import Counter
@@ -417,6 +418,55 @@ def check_scrub() -> None:
         tune.os.environ.clear()
         tune.os.environ.update(real_env)
     check_egress(real_env)
+    check_no_env_proxy(real_env)
+
+
+def check_no_env_proxy(real_env: dict) -> None:
+    """Every client that carries a key or memory text dials the certified
+    host itself: with HTTP_PROXY and ALL_PROXY pointing at a local listener,
+    none reaches it. A control client that trusts the environment does, so the
+    probe is live."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(16)
+    listener.settimeout(0.2)
+    proxy = f"http://127.0.0.1:{listener.getsockname()[1]}"
+    target = "http://judge-under-test.invalid:8082"  # never resolves directly
+
+    def proxied(call) -> int:
+        try:
+            call()
+        except Exception:  # noqa: BLE001 - only where the request went matters
+            pass
+        hits = 0
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except TimeoutError:
+                return hits
+            conn.close()
+            hits += 1
+
+    try:
+        for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            tune.os.environ[var] = proxy
+        tune.os.environ["ALAYA_URL"] = "http://alaya-under-test.svc:3001"
+        tune.os.environ["ALAYA_API_KEY"] = "test-only"
+        control = tune.httpx.Client(timeout=2)
+        assert proxied(lambda: control.get(target)) == 1, "the probe must see a proxy"
+        assert proxied(lambda: tune.http_client(target, "t").get("/")) == 0
+        assert proxied(lambda: tune.alaya_client().get("/health")) == 0
+        sdk = tune.make_client(target, "t", max_retries=0).with_options(timeout=2)
+        call = lambda: sdk.messages.create(  # noqa: E731
+            model="claude-sonnet-5",
+            max_tokens=1,
+            messages=[{"role": "user", "content": "x"}],
+        )
+        assert proxied(call) == 0
+    finally:
+        listener.close()
+        tune.os.environ.clear()
+        tune.os.environ.update(real_env)
 
 
 def check_egress(real_env: dict) -> None:

@@ -36,6 +36,7 @@ import argparse
 import dataclasses
 import fcntl
 import hashlib
+import importlib
 import ipaddress
 import json
 import math
@@ -201,7 +202,10 @@ def env(key: str) -> str:
 
 # ── Egress ───────────────────────────────────────────────────────────────────
 # Every origin that gets a key or memory text, judged as alaya-server judges
-# JUDGE_URL at boot: https, or plain http only to a cluster-local host.
+# JUDGE_URL at boot: https, or plain http only to a cluster-local host. The
+# check certifies the URL's host, so it holds only while every client dials
+# that host itself: each one is built with trust_env=False, or an HTTP_PROXY /
+# ALL_PROXY from the environment would carry the key and the text elsewhere.
 
 PRIVATE_NETS = tuple(
     ipaddress.ip_network(n)
@@ -400,6 +404,7 @@ def alaya_client() -> httpx.Client:
         headers={"Authorization": f"Bearer {env('ALAYA_API_KEY')}"},
         timeout=120,
         transport=httpx.HTTPTransport(retries=3),
+        trust_env=False,  # no proxy from the environment: see Egress
     )
 
 
@@ -759,12 +764,14 @@ def anthropic_judge(
 
 
 def http_client(url: str, key: str) -> httpx.Client:
-    # No redirects, as in make_client: one could carry the bearer elsewhere.
+    # No redirects, as in make_client: one could carry the bearer elsewhere;
+    # no proxy from the environment: see Egress.
     return httpx.Client(
         base_url=url.rstrip("/"),
         headers={"Authorization": f"Bearer {key}"},
         timeout=JUDGE_TIMEOUT_S,
         follow_redirects=False,
+        trust_env=False,
     )
 
 
@@ -1544,13 +1551,25 @@ def choose_best(adapter: JudgeAdapter) -> tuple[str, dict]:
 def make_client(url: str, key: str, max_retries: int = 2) -> anthropic.Anthropic:
     # No redirects: httpx strips Authorization on a cross-origin redirect but
     # not x-api-key, so a redirecting endpoint could take the key elsewhere.
-    # Same policy as the Rust transport.
+    # Same policy as the Rust transport, which also ignores proxies from the
+    # environment (see Egress). The SDK's default client mounts HTTP(S)_PROXY
+    # and ALL_PROXY itself, whatever trust_env says, unless it is handed a
+    # transport, and it speaks its own httpx flavour (httpx2 since 1.11): the
+    # transport comes from the package its client class is built on.
+    base = next(
+        c
+        for c in anthropic.DefaultHttpxClient.__mro__
+        if c.__module__.split(".")[0] in ("httpx", "httpx2")
+    )
+    lib = importlib.import_module(base.__module__.split(".")[0])
     return anthropic.Anthropic(
         base_url=url,
         api_key=key,
         timeout=JUDGE_TIMEOUT_S,
         max_retries=max_retries,
-        http_client=anthropic.DefaultHttpxClient(follow_redirects=False),
+        http_client=anthropic.DefaultHttpxClient(
+            follow_redirects=False, trust_env=False, transport=lib.HTTPTransport()
+        ),
     )
 
 

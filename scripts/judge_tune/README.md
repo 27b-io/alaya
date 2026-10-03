@@ -97,6 +97,9 @@ to a `claude-*` model at an approved origin, `https://api.anthropic.com` or
 one listed in `UNSCRUBBED_JUDGE_ORIGINS`; a model name alone proves nothing,
 since any proxy can serve one. `tune` holds its judge and reflection
 endpoints to the same rule.
+These checks certify the host each URL names, so every client dials it
+directly: `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` are ignored, as
+alaya-server ignores them.
 
 An API error, a content-filter block or a refusal is retried once; a second
 one makes the pair `failed`: counted, kept out of every metric, never scored
