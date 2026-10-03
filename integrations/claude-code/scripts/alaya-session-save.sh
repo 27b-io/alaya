@@ -160,6 +160,33 @@ if [[ -n "$LAST_ASSISTANT" ]]; then
     } >> "$_HOOKDIR/context.txt"
 fi
 
+# --- Run a `_CMD` secret resolver, bounded, and print its output. ---
+# Resolver's own stderr (e.g. "op: command not found", vault-not-found)
+# goes to failures.log instead of /dev/null — it's the one piece of
+# info that explains WHICH failure mode this is.
+# Bound the resolver: a hung secret manager (locked 1Password app,
+# vault network hang) would otherwise ride to the hook's 60s timeout
+# and die by SIGKILL with no log line. With a bound, the failure
+# falls through to the caller's logged "unresolved" skip. macOS/BSD
+# ship no timeout(1), so fall back to a python3 watchdog (python3 is
+# already a documented prerequisite) rather than an unbounded eval.
+_run_secret_cmd() { # <command>
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "${_RESOLVER_TIMEOUT_SECS:-15}" bash -c "$1" 2>>"$STATE_DIR/failures.log"
+        return
+    fi
+    python3 -c '
+import subprocess, sys
+try:
+    r = subprocess.run(["bash", "-c", sys.argv[1]], capture_output=True, text=True, timeout=int(sys.argv[2]))
+    sys.stderr.write(r.stderr)
+    sys.stdout.write(r.stdout)
+    sys.exit(r.returncode)
+except subprocess.TimeoutExpired:
+    sys.stderr.write("secret resolver timed out after " + sys.argv[2] + "s\n")
+    sys.exit(124)' "$1" "${_RESOLVER_TIMEOUT_SECS:-15}" 2>>"$STATE_DIR/failures.log"
+}
+
 # --- Resolve a secret from either a direct env var or a `_CMD` sourcing
 # command, with a cached result so a slow secret manager (1Password, vault,
 # etc.) isn't invoked on every Stop. On resolver failure, serve the last
@@ -170,6 +197,10 @@ fi
 # every Stop once the cache goes stale, piling more requests onto the limit.
 # `rm` the matching cache file and its .attempt marker under STATE_DIR to
 # force a refresh after a key rotation.
+# SECRET_CACHE_MINUTES=0 persists nothing: the command runs on every call, a
+# failure is a failure (no stale fallback, no backoff), and any cache file or
+# marker an earlier setting left behind is removed. For a resolver that
+# caches by itself, where a plain-text copy here is a second, redundant one.
 _resolve_secret() { # <env-var-name> <cache-file>
     local name="$1" cache="$2" direct cmd_var cmd val
     direct="${!name:-}"
@@ -180,32 +211,17 @@ _resolve_secret() { # <env-var-name> <cache-file>
     cmd_var="${name}_CMD"
     cmd="${!cmd_var:-}"
     [[ -z "$cmd" ]] && return 1
+    if (( SECRET_CACHE_MINUTES == 0 )); then
+        rm -f "$cache" "$cache.attempt"
+        val=$(_run_secret_cmd "$cmd")
+        [[ -z "$val" ]] && return 1
+        printf '%s' "$val"
+        return 0
+    fi
     if [[ -z "$(find "$cache" -mmin -"$SECRET_CACHE_MINUTES" 2>/dev/null)" \
         && -z "$(find "$cache.attempt" -mmin -15 2>/dev/null)" ]]; then
         touch "$cache.attempt"
-        # Resolver's own stderr (e.g. "op: command not found", vault-not-found)
-        # goes to failures.log instead of /dev/null — it's the one piece of
-        # info that explains WHICH failure mode this is.
-        # Bound the resolver: a hung secret manager (locked 1Password app,
-        # vault network hang) would otherwise ride to the hook's 60s timeout
-        # and die by SIGKILL with no log line. With a bound, the failure
-        # falls through to the caller's logged "unresolved" skip. macOS/BSD
-        # ship no timeout(1), so fall back to a python3 watchdog (python3 is
-        # already a documented prerequisite) rather than an unbounded eval.
-        if command -v timeout >/dev/null 2>&1; then
-            val=$(timeout "${_RESOLVER_TIMEOUT_SECS:-15}" bash -c "$cmd" 2>>"$STATE_DIR/failures.log")
-        else
-            val=$(python3 -c '
-import subprocess, sys
-try:
-    r = subprocess.run(["bash", "-c", sys.argv[1]], capture_output=True, text=True, timeout=int(sys.argv[2]))
-    sys.stderr.write(r.stderr)
-    sys.stdout.write(r.stdout)
-    sys.exit(r.returncode)
-except subprocess.TimeoutExpired:
-    sys.stderr.write("secret resolver timed out after " + sys.argv[2] + "s\n")
-    sys.exit(124)' "$cmd" "${_RESOLVER_TIMEOUT_SECS:-15}" 2>>"$STATE_DIR/failures.log")
-        fi
+        val=$(_run_secret_cmd "$cmd")
         [[ -n "$val" ]] && printf '%s' "$val" > "$cache" && rm -f "$cache.attempt"
     fi
     [[ -r "$cache" ]] && cat "$cache"

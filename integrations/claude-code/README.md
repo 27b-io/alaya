@@ -72,7 +72,7 @@ an env file you `source` before launching `claude`, or the top-level `"env"` key
 | `ALAYA_IMPORTANCE` | no | `0.7` | `metadata.importance` sent to Ālaya's store call |
 | `ALAYA_CLIENT_HOSTNAME` | no | `claude-code-hook` | `client_hostname` provenance tag |
 | `ALAYA_HOOK_STATE_DIR` | no | `~/.cache/alaya-hook` | Per-session save state, resolved-secret cache, `failures.log` |
-| `ALAYA_SECRET_CACHE_MINUTES` | no | `720` | How long a `_CMD`-resolved secret is cached |
+| `ALAYA_SECRET_CACHE_MINUTES` | no | `720` | How long a `_CMD`-resolved secret is cached; `0` writes no cache file (see below) |
 | `ALAYA_PRECOMPACT_RECENT_LINES` | no | `500` | PreCompact: how far back to scan for a recent save |
 
 **Transport security:** both endpoints receive a bearer token on every call. Use `https://`
@@ -90,6 +90,13 @@ once every 15 minutes, not on every Stop, so retries don't pile onto a limit tha
 rejecting them. Delete the cache file (named after the variable, e.g. `alaya-api-key`) to force a
 refresh after a key rotation; if a refresh failed in the last 15 minutes, delete its `.attempt`
 marker too.
+
+The cache is a plain-text file (mode 0600). Set `ALAYA_SECRET_CACHE_MINUTES=0` to keep no copy at
+all: the command then runs on every Stop, nothing is written under `ALAYA_HOOK_STATE_DIR` but
+`failures.log`, any cache file or `.attempt` marker left from an earlier setting is deleted, and a
+failed command skips the save (logged as `unresolved`) with no stale fallback and no backoff. Use
+it when the command does its own caching and failure handling, so the hook's copy would be a second,
+unencrypted one.
 
 **Missing configuration is a silent no-op, not a hook error:** if `ALAYA_URL`, `ALAYA_LLM_URL`,
 or either secret can't be resolved, the Stop hook logs one line to

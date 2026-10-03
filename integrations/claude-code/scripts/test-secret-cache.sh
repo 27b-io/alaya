@@ -3,7 +3,8 @@
 # generalized from a hardcoded `op read` call to any value-or-command source).
 # Proves: cold fetch = 1 resolver call; warm = 0 resolver calls; 0600 cache
 # perms; stale cache served when the resolver fails; a failing resolver retried
-# at most once per 15 min (stale and cold); hook still parses.
+# at most once per 15 min (stale and cold); SECRET_CACHE_MINUTES=0 persists
+# nothing; hook still parses.
 set -e
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOK="$HERE/alaya-session-save.sh"
@@ -16,9 +17,9 @@ printf '%s\n' '#!/bin/bash' \
   'echo "sekrit-value"' > "$T/resolver"
 chmod +x "$T/resolver"
 
-# extract the real function from the shipped hook
-sed -n '/^_resolve_secret()/,/^}/p' "$HOOK" > "$T/fn.sh"
-[[ -s "$T/fn.sh" ]] || { echo "FAIL: function not found in hook"; exit 1; }
+# extract the real functions from the shipped hook
+sed -n '/^_run_secret_cmd()/,/^}/p;/^_resolve_secret()/,/^}/p' "$HOOK" > "$T/fn.sh"
+[[ $(grep -c '^_run_secret_cmd()\|^_resolve_secret()' "$T/fn.sh") == 2 ]] || { echo "FAIL: functions not found in hook"; exit 1; }
 
 export RESOLVECOUNT="$T/count" RESOLVEFAIL="$T/fail.flag"
 export SECRET_CACHE_MINUTES=720
@@ -72,6 +73,30 @@ export TEST_SECRET="direct-value"
 v4=$(_resolve_secret TEST_SECRET "$C"); c4=$(cat "$RESOLVECOUNT")
 [[ "$v4" == "direct-value" && "$c4" == "$c9" ]] || { echo "FAIL direct-value: v=$v4 c=$c4"; exit 1; }
 
+# SECRET_CACHE_MINUTES=0, in its own state dir: the command runs on every call,
+# nothing is written but failures.log, a failure returns non-zero with no stale
+# fallback, and key files an earlier setting left behind are removed.
+unset TEST_SECRET
+Z="$T/zero"; mkdir "$Z"
+zero() { STATE_DIR="$Z" SECRET_CACHE_MINUTES=0 _resolve_secret TEST_SECRET "$Z/zero-cache"; }
+zfiles() { find "$Z" -mindepth 1 ! -name failures.log | sort | tr '\n' ' '; }
+printf 'old-plaintext' > "$Z/zero-cache"; touch "$Z/zero-cache.attempt"
+before=$(cat "$RESOLVECOUNT")
+v=$(zero); c=$(cat "$RESOLVECOUNT")
+[[ "$v" == "sekrit-value" && "$c" == $((before + 1)) && -z "$(zfiles)" ]] \
+  || { echo "FAIL zero (success): v=$v calls=$((c - before)) files=$(zfiles)"; exit 1; }
+v=$(zero); c=$(cat "$RESOLVECOUNT")
+[[ "$v" == "sekrit-value" && "$c" == $((before + 2)) && -z "$(zfiles)" ]] \
+  || { echo "FAIL zero (no cache): v=$v calls=$((c - before)) files=$(zfiles)"; exit 1; }
+touch "$RESOLVEFAIL"
+rc=0; v=$(zero) || rc=$?; c=$(cat "$RESOLVECOUNT")
+[[ -z "$v" && "$rc" != 0 && "$c" == $((before + 3)) && -z "$(zfiles)" ]] \
+  || { echo "FAIL zero (failure): v=$v rc=$rc calls=$((c - before)) files=$(zfiles)"; exit 1; }
+rc=0; v=$(zero) || rc=$?; c=$(cat "$RESOLVECOUNT")
+[[ -z "$v" && "$rc" != 0 && "$c" == $((before + 4)) ]] \
+  || { echo "FAIL zero (no backoff): v=$v rc=$rc calls=$((c - before))"; exit 1; }
+rm -f "$RESOLVEFAIL"
+
 # python3 watchdog branch (macOS/BSD path, where timeout(1) doesn't exist):
 # with timeout hidden from PATH, a hanging resolver must be killed at the
 # bound and logged — not ride to the hook's 60s SIGKILL. Linux CI would
@@ -86,4 +111,4 @@ took=$(( $(date +%s) - start ))
 [[ -z "$v5" && "$took" -le 15 ]] || { echo "FAIL watchdog: v='$v5' took=${took}s"; exit 1; }
 grep -q 'timed out' "$T/failures.log" || { echo "FAIL watchdog: no timeout line in failures.log"; exit 1; }
 
-echo "ALL PASS: cold=1 call, warm=0 calls, 0600 perms, stale cache on resolver failure, 15-min retry backoff (stale and cold), direct-value bypass, watchdog bound without timeout(1), hook syntax clean"
+echo "ALL PASS: cold=1 call, warm=0 calls, 0600 perms, stale cache on resolver failure, 15-min retry backoff (stale and cold), direct-value bypass, CACHE_MINUTES=0 persists nothing, watchdog bound without timeout(1), hook syntax clean"
