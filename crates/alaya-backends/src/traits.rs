@@ -173,13 +173,15 @@ pub trait VectorStorage {
         limit: usize,
         filters: Option<PayloadFilter>,
     ) -> Result<Vec<ScoredMemory>>;
-    /// `memory_type`, when set, is an exact match applied before `limit`.
+    /// `memory_type` (exact match) and `min_trust_score` (stored
+    /// `provenance.trust_score` at least this), when set, apply before `limit`.
     async fn search_by_tags(
         &self,
         tags: &[&str],
         match_all: bool,
         limit: usize,
         memory_type: Option<&str>,
+        min_trust_score: Option<f64>,
     ) -> Result<Vec<ScoredMemory>>;
     async fn search_similar_tags(&self, tag_embedding: &[f32], limit: usize)
     -> Result<Vec<String>>;

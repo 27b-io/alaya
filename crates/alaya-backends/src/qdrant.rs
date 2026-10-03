@@ -753,9 +753,11 @@ fn build_filter(filter: &PayloadFilter) -> Value {
     // after retrieval, not at the Qdrant filter level. Qdrant's nested payload
     // filtering for "field does not exist" is unreliable without explicit indexes.
 
+    // `provenance` is a top-level payload key (see memory_to_payload), not
+    // nested under `metadata`. A point with no stored trust_score never matches.
     if let Some(min_trust) = filter.min_trust_score {
         must.push(json!({
-            "key": "metadata.provenance.trust_score",
+            "key": "provenance.trust_score",
             "range": { "gte": min_trust }
         }));
     }
@@ -1455,11 +1457,14 @@ impl VectorStorage for QdrantClient {
         match_all: bool,
         limit: usize,
         memory_type: Option<&str>,
+        min_trust_score: Option<f64>,
     ) -> Result<Vec<ScoredMemory>> {
-        // Qdrant applies memory_type before `limit`, so wrong-type tag matches
-        // cannot fill the page ahead of the requested type.
+        // Qdrant applies memory_type and min_trust_score before `limit`, so
+        // wrong-type or below-trust tag matches cannot fill the page ahead of
+        // the memories the caller asked for.
         let filter = PayloadFilter {
             memory_type: memory_type.map(String::from),
+            min_trust_score,
             tags: Some(tags.iter().map(|t| t.to_string()).collect()),
             tags_match_all: match_all,
             ..Default::default()
@@ -2113,9 +2118,10 @@ mod tests {
             min_trust_score: Some(0.5),
             ..Default::default()
         };
-        let filter = build_filter(&f);
-        let must = filter["must"].as_array().unwrap();
-        assert!(must.iter().any(|c| c.get("range").is_some()));
+        assert_eq!(
+            build_filter(&f),
+            json!({"must": [{"key": "provenance.trust_score", "range": {"gte": 0.5}}]})
+        );
     }
 
     #[test]
