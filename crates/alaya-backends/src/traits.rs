@@ -228,6 +228,15 @@ pub trait EmbeddingProvider {
     /// every semantic search will fail, so a health report must not say
     /// `healthy` without consulting it (LAB-4025).
     async fn health(&self) -> Result<HealthStatus>;
+    /// One embed round-trip that no cache may answer (the self-check). An
+    /// endpoint can pass `health` and still fail every embed; a cached vector
+    /// proves nothing about either, so caching decorators forward this to
+    /// the provider they wrap.
+    async fn probe(&self, text: &str) -> Result<()> {
+        self.embed_batch(&[text], PromptName::Query)
+            .await
+            .map(|_| ())
+    }
 }
 
 /// Graph operations backend (calls alaya-bridge typed RPC).

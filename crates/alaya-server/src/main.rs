@@ -15,6 +15,7 @@ mod build_info;
 mod cached_embedding;
 mod mcp;
 mod oidc;
+mod selfcheck;
 mod telemetry;
 #[cfg(test)]
 mod testkit;
@@ -53,6 +54,7 @@ use alaya_core::service::{
     JudgeOutcome, MemoryService, OutputMode, RelationParams, SearchParams, StoreParams,
     parse_user_relation,
 };
+use alaya_core::vitals::{CountingEmbedding, SelfCheckOutcome, Vitals};
 use alaya_types::graph::{Contradiction, ContradictionQuery, Resolution};
 use alaya_types::memory::PatchMemoryRequest;
 
@@ -95,6 +97,8 @@ struct Config {
     rerank_api_key: Option<String>,
     rerank_top_n: usize,
     rerank_timeout_ms: std::num::NonZeroU64,
+    /// Periodic self-check (LAB-4026); `None` when its env vars are unset.
+    selfcheck: Option<selfcheck::SelfCheckConfig>,
 }
 
 impl Config {
@@ -159,6 +163,12 @@ impl Config {
             rerank_timeout_ms: env_or("RERANK_TIMEOUT_MS", "5000")
                 .parse()
                 .expect("RERANK_TIMEOUT_MS must be a positive integer (ms)"),
+            selfcheck: selfcheck::parse(
+                env_non_empty("SELFCHECK_QUERY"),
+                env_non_empty("SELFCHECK_EXPECT_HASH"),
+                env_non_empty("SELFCHECK_INTERVAL_SECS"),
+            )
+            .unwrap_or_else(|e| panic!("{e}")),
         };
         // Read through the helper `init_l2_cache` uses, so the guard and the
         // cache can never disagree about which string gets dialled.
@@ -824,6 +834,13 @@ pub(crate) enum CmdInner {
     Stats {
         reply: oneshot::Sender<Value>,
     },
+    /// One self-check (LAB-4026), sent by the self-check task only — not
+    /// exposed over REST or MCP. Read-only.
+    SelfCheck {
+        query: String,
+        expect_hash: String,
+        reply: oneshot::Sender<SelfCheckOutcome>,
+    },
 }
 
 impl CmdInner {
@@ -860,6 +877,7 @@ impl Cmd {
             CmdInner::BackfillSummaries { .. } => "backfill_summaries",
             CmdInner::BackfillContradictions { .. } => "backfill_contradictions",
             CmdInner::Stats { .. } => "stats",
+            CmdInner::SelfCheck { .. } => "selfcheck",
         }
     }
 }
@@ -963,10 +981,17 @@ struct HealthChecker {
     /// Last Qdrant verdict, written by the pinger via `refresh_qdrant` and
     /// read by the bare probe — which therefore never touches Qdrant itself.
     qdrant_ok: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Failure counters and the last self-check (LAB-4026), written on the
+    /// worker thread. Read by the detail view only, never the bare probe.
+    vitals: std::sync::Arc<Vitals>,
 }
 
 impl HealthChecker {
-    fn new(config: &Config, worker_progress: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+    fn new(
+        config: &Config,
+        worker_progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        vitals: std::sync::Arc<Vitals>,
+    ) -> Self {
         // One client, three backends: each credential is attached per
         // request (`bearer_auth`), never as a client default header, so
         // Qdrant's bearer is not sent to the embedding endpoint or the bridge.
@@ -983,6 +1008,7 @@ impl HealthChecker {
             stall_threshold: WORKER_STALL_THRESHOLD,
             clock: monotonic_secs,
             qdrant_ok: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            vitals,
         }
     }
 
@@ -1202,9 +1228,12 @@ impl HealthChecker {
     /// worker-stall 503 contract (#63), and a restart does not fix TEI.
     async fn check_detail(&self) -> Value {
         let (mut v, embedding) = tokio::join!(self.check(), self.check_embedding());
-        if embedding.is_err() && v["status"] == "healthy" {
+        // A failing self-check degrades like a dead endpoint (LAB-4026): the
+        // embedder can answer `/health` and still fail every embed.
+        if (embedding.is_err() || self.vitals.selfcheck_failing()) && v["status"] == "healthy" {
             v["status"] = json!("degraded");
         }
+        v["pod"] = self.vitals.snapshot();
         v["embedding_health"] = match embedding {
             Ok(e) => e,
             Err(e) => json!({ "status": "unhealthy", "error": e }),
@@ -1422,11 +1451,18 @@ async fn service_worker(
 
                         json!(r)
                     }
+                    // Counted (LAB-4026) unless the caller sent a bad request.
                     Ok(Err(e)) => {
+                        if !matches!(e, alaya_types::AlayaError::Validation(_)) {
+                            svc.vitals.store_failed();
+                        }
                         log_err(op, &e, start);
                         json!({"success": false, "error": e.safe_message()})
                     }
-                    Err(_) => deadline_exceeded(op, limits.cmd, start),
+                    Err(_) => {
+                        svc.vitals.store_failed();
+                        deadline_exceeded(op, limits.cmd, start)
+                    }
                 };
                 let _ = reply.send(result);
             }
@@ -1924,7 +1960,7 @@ async fn service_worker(
                 tokio::task::spawn_local(
                     async move {
                         let _flight = flight;
-                        let result = match timeout(deadline, svc.corpus_stats()).await {
+                        let mut result = match timeout(deadline, svc.corpus_stats()).await {
                             Ok(mut v) => {
                                 v["judge_daily_cap"] = cap;
                                 let errors = v["errors"].as_array().map_or(0, Vec::len);
@@ -1933,10 +1969,28 @@ async fn service_worker(
                             }
                             Err(_) => deadline_exceeded(op, deadline, start),
                         };
+                        // Even past the deadline: when the backends are slow
+                        // is exactly when the failure counters matter.
+                        result["pod"] = svc.vitals.snapshot();
                         let _ = reply.send(result);
                     }
                     .instrument(span),
                 );
+            }
+            CmdInner::SelfCheck {
+                query,
+                expect_hash,
+                reply,
+            } => {
+                // Spawned: a wedged embedder holds the check for its whole
+                // budget, and real traffic must not queue behind it.
+                let svc = svc.clone();
+                tokio::task::spawn_local(async move {
+                    let outcome = svc
+                        .self_check(&query, &expect_hash, selfcheck::BUDGET)
+                        .await;
+                    let _ = reply.send(outcome);
+                });
             }
             CmdInner::BackfillContradictions {
                 limit,
@@ -2545,6 +2599,16 @@ fn main() {
         let worker_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let progress_for_worker = worker_progress.clone();
 
+        // Failure counters and the self-check result (LAB-4026): written by
+        // the worker, read by the health checker. Kubernetes sets HOSTNAME
+        // to the pod name; the counters are per pod, so say which.
+        let vitals = std::sync::Arc::new(Vitals::new(
+            env_non_empty("HOSTNAME").unwrap_or_else(|| "unknown".into()),
+            epoch_secs(),
+            config.selfcheck.is_some(),
+        ));
+        let vitals_for_worker = vitals.clone();
+
         // Built here, on the main thread, so bad bearer material is a
         // fail-closed startup panic (non-zero exit) like the auth invariants
         // below — not a panic inside the worker thread (#97). The value is
@@ -2654,6 +2718,9 @@ fn main() {
                 // L2 embedding cache via cachekit-rs (optional) — backend
                 // selected by CACHE_BACKEND (redis default, saas).
                 let l2_cache = init_l2_cache().await;
+                // Counted under the cache: a cache hit is not an embed call
+                // that could fail.
+                let embeddings = CountingEmbedding::new(Box::new(embeddings), vitals_for_worker.clone());
                 let cached_embeddings = cached_embedding::CachedEmbedding::new(
                     Box::new(embeddings),
                     10_000, // L1 max cached embeddings (~40 MB at 1024 dims)
@@ -2671,7 +2738,8 @@ fn main() {
                     Box::new(HebbianRef(graph.clone())),
                     Box::new(ConsolidationRef(graph)),
                     summary,
-                );
+                )
+                .with_vitals(vitals_for_worker);
 
                 if let Some(judge) = judge {
                     svc = svc.with_judge(Box::new(judge));
@@ -2699,7 +2767,7 @@ fn main() {
         // reqwest::Client. Prevents health probe timeouts during long ops.
         // The worker_progress watchdog covers the blind spot that bypass
         // created (#63): a wedged worker now turns /health unhealthy (503).
-        let checker = HealthChecker::new(&config, worker_progress);
+        let checker = HealthChecker::new(&config, worker_progress, vitals.clone());
 
         // Pinger: sends a no-op Ping through the worker channel so progress
         // stays fresh while idle. try_send on purpose — if the channel is
@@ -2724,6 +2792,11 @@ fn main() {
                 }
             })
         };
+
+        let selfcheck_task = config
+            .selfcheck
+            .clone()
+            .map(|cfg| selfcheck::spawn(handle.clone(), cfg, vitals));
 
         let protected = protected_router(handle, auth_state.clone());
 
@@ -2772,9 +2845,13 @@ fn main() {
             .await
             .expect("server error");
 
-        // The pinger holds a ServiceHandle clone — abort it or the worker's
-        // rx.recv() never sees the channel close and the drain below hangs.
+        // The pinger and the self-check task hold ServiceHandle clones — abort
+        // them or the worker's rx.recv() never sees the channel close and the
+        // drain below hangs.
         pinger.abort();
+        if let Some(t) = selfcheck_task {
+            t.abort();
+        }
 
         // axum returned — all in-flight requests done, router (and its
         // ServiceHandle/Sender clones) dropped. The worker's rx.recv()
@@ -5342,6 +5419,7 @@ mod wedge_tests {
             stall_threshold: WORKER_STALL_THRESHOLD,
             clock: || TEST_NOW,
             qdrant_ok: Arc::new(AtomicBool::new(false)),
+            vitals: Default::default(),
         }
     }
 
@@ -5871,9 +5949,10 @@ mod wedge_tests {
             rerank_api_key: None,
             rerank_top_n: 0,
             rerank_timeout_ms: std::num::NonZeroU64::MIN,
+            selfcheck: None,
         };
         // `check_detail` fans out to all four probes.
-        HealthChecker::new(&config, Arc::new(AtomicU64::new(0)))
+        HealthChecker::new(&config, Arc::new(AtomicU64::new(0)), Default::default())
             .check_detail()
             .await;
 
@@ -5892,6 +5971,149 @@ mod wedge_tests {
         let mut seen = seen.lock().unwrap().clone();
         seen.sort();
         assert_eq!(seen, expected);
+    }
+
+    /// LAB-4026 AC-3: with the embedder unreachable, one self-check run makes
+    /// `/health/detail` and `GET /stats` name the broken step, while the
+    /// probe Kubernetes uses still answers 200 with its status alone. The
+    /// embedder sits under the production chain (cache over counter over
+    /// client), so this also proves the probe gets past the cache.
+    #[tokio::test]
+    async fn embed_outage_shows_on_detail_and_stats_while_the_probe_stays_green() {
+        let vitals = Arc::new(Vitals::new("alaya-server-test".into(), 1_700_000_000, true));
+        let embeddings = cached_embedding::CachedEmbedding::new(
+            Box::new(CountingEmbedding::new(
+                // Port 1 refuses immediately — models an unreachable embedder.
+                Box::new(EmbeddingClient::new(
+                    "http://127.0.0.1:1".into(),
+                    "m".into(),
+                    4,
+                    1,
+                    None,
+                )),
+                vitals.clone(),
+            )),
+            10,
+            None,
+        );
+        let svc = MemoryService::new(
+            Box::new(HangVectors { batch: None }),
+            Box::new(embeddings),
+            Box::new(StubGraph { panic_stats: false }),
+            Box::new(StubHebbian),
+            Box::new(StubConsolidation),
+            None,
+        )
+        .with_vitals(vitals.clone());
+        let cfg = selfcheck::SelfCheckConfig {
+            query: "what is alaya".into(),
+            expect_hash: "a".repeat(64),
+            interval: Duration::from_secs(300),
+        };
+        // The stub graph and vectors never answer the stats aggregates; a
+        // short deadline lets /stats return, and its pod section must survive.
+        let limits = WorkerLimits {
+            cmd: Duration::from_millis(50),
+            ..WorkerLimits::default()
+        };
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::channel::<Cmd>(8);
+                tokio::task::spawn_local(service_worker(
+                    rx,
+                    svc,
+                    Arc::new(AtomicU64::new(0)),
+                    limits,
+                ));
+                let handle = ServiceHandle { tx };
+
+                selfcheck::run_once(&handle, &cfg, &vitals).await;
+
+                let health = health_routes(
+                    HealthChecker {
+                        vitals: vitals.clone(),
+                        ..test_checker(TEST_NOW)
+                    },
+                    test_auth_state(),
+                );
+                let (code, body) = probe(&health, "/health", None).await;
+                assert_eq!(code, StatusCode::OK);
+                assert_eq!(body.as_object().expect("object body").len(), 1, "{body}");
+
+                let (code, detail) = probe(&health, "/health/detail", Some(TEST_KEY)).await;
+                assert_eq!(code, StatusCode::OK);
+                assert_eq!(detail["status"], "degraded");
+                let stats_app = protected_router(handle, test_auth_state());
+                let (code, stats) = probe(&stats_app, "/stats", Some(TEST_KEY)).await;
+                assert_eq!(code, StatusCode::OK);
+
+                for (surface, doc) in [("/health/detail", &detail), ("/stats", &stats)] {
+                    let pod = &doc["pod"];
+                    assert_eq!(pod["name"], "alaya-server-test", "{surface}: {doc}");
+                    assert_eq!(pod["started_at"], 1_700_000_000, "{surface}");
+                    assert_eq!(pod["failures"]["embedding"], 1, "{surface}: {pod}");
+                    let sc = &pod["selfcheck"];
+                    assert_eq!(sc["enabled"], true, "{surface}");
+                    assert_eq!(sc["consecutive_failures"], 1, "{surface}");
+                    assert_eq!(sc["last"]["ok"], false, "{surface}");
+                    assert_eq!(sc["last"]["failing_step"], "embed", "{surface}: {sc}");
+                }
+            })
+            .await;
+    }
+
+    /// A store that fails on a backend counts; one refused as a bad request
+    /// does not — that is the caller's fault, not the service's (LAB-4026).
+    #[tokio::test]
+    async fn store_failures_count_backend_errors_not_bad_requests() {
+        let vitals = Arc::new(Vitals::default());
+        let svc = MemoryService::new(
+            Box::new(HangVectors { batch: None }),
+            Box::new(EmbeddingClient::new(
+                "http://127.0.0.1:1".into(),
+                "m".into(),
+                4,
+                1,
+                None,
+            )),
+            Box::new(StubGraph { panic_stats: false }),
+            Box::new(StubHebbian),
+            Box::new(StubConsolidation),
+            None,
+        )
+        .with_vitals(vitals.clone());
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::channel::<Cmd>(8);
+                tokio::task::spawn_local(service_worker(
+                    rx,
+                    svc,
+                    Arc::new(AtomicU64::new(0)),
+                    WorkerLimits::default(),
+                ));
+                for content in ["", "embedder is down"] {
+                    let (reply, rx) = oneshot::channel();
+                    tx.send(Cmd {
+                        inner: CmdInner::Store {
+                            params: serde_json::from_value(json!({ "content": content })).unwrap(),
+                            read_only: false,
+                            reply,
+                        },
+                        span: tracing::Span::none(),
+                    })
+                    .await
+                    .unwrap();
+                    let r = rx.await.expect("store reply");
+                    assert_eq!(r["success"], false, "{r}");
+                }
+            })
+            .await;
+
+        assert_eq!(vitals.snapshot()["failures"]["store"], 1);
     }
 
     /// The #63 contract is the HTTP code, not the body: a wedged worker must

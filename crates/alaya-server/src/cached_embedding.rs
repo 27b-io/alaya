@@ -420,6 +420,13 @@ impl EmbeddingProvider for CachedEmbedding {
     async fn health(&self) -> Result<HealthStatus> {
         self.inner.health().await
     }
+
+    /// Never served from cache, for the same reason as `health`: the
+    /// self-check's query is fixed, so a cached answer would hide a dead
+    /// embedder for as long as the entry lives.
+    async fn probe(&self, text: &str) -> Result<()> {
+        self.inner.probe(text).await
+    }
 }
 
 #[cfg(test)]
@@ -481,6 +488,49 @@ mod tests {
                 details: None,
             })
         }
+    }
+
+    /// Embedder that answers once, then fails every call.
+    struct DiesAfterOne(Cell<u32>);
+
+    #[async_trait(?Send)]
+    impl EmbeddingProvider for DiesAfterOne {
+        async fn embed_batch(&self, texts: &[&str], p: PromptName) -> Result<Vec<Vec<f32>>> {
+            self.0.set(self.0.get() + 1);
+            if self.0.get() > 1 {
+                return Err(alaya_types::AlayaError::Embedding("down".into()));
+            }
+            StubEmbeddings.embed_batch(texts, p).await
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        fn model_name(&self) -> &str {
+            "dies"
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            StubEmbeddings.health().await
+        }
+    }
+
+    /// The self-check's query never changes, so after one success the cache
+    /// answers it forever. `probe` must reach the embedder anyway, or a dead
+    /// one passes the self-check.
+    #[tokio::test]
+    async fn probe_bypasses_the_cache() {
+        let cache = CachedEmbedding::new(Box::new(DiesAfterOne(Cell::new(0))), 10, None);
+        cache
+            .embed_batch(&["q"], PromptName::Query)
+            .await
+            .expect("first embed reaches the embedder");
+        cache
+            .embed_batch(&["q"], PromptName::Query)
+            .await
+            .expect("second embed is an L1 hit");
+        assert!(
+            cache.probe("q").await.is_err(),
+            "probe must not be served from cache"
+        );
     }
 
     /// A blackholed L2 must not hang embed_batch: both batch phases time out
