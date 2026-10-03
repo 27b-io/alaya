@@ -17,6 +17,7 @@ import sys
 import tempfile
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
 
 import tune
@@ -373,6 +374,16 @@ def check_scrub() -> None:
         out = s(text)
         assert "pL4zQ8w" not in out and "YlL2BoR" not in out, out
         assert s(out) == out and s.leaks(out) == [], out
+    # Nor can an IP, URL or email an earlier rule replaced inside the value.
+    for text in (
+        "API_KEY=" + "x9-1.2.3.4-Zq8Lm",
+        "PASSWORD=" + "x9-ops@example.org-Zq8Lm",
+        "TOKEN=" + "x9-1.2.3.4-5.6.7.8-Zq8Lm",
+        "SECRET=" + "1.2.3.4-Zq8Lm",
+    ):
+        out = s(text)
+        assert "x9" not in out and "Zq8Lm" not in out, out
+        assert out.endswith("=<secret>") and s(out) == out and s.leaks(out) == [], out
     # A secret-named value cannot swallow the next secret-named key.
     out = s(':auth_token => login(password: "' + "Zx9Qw8Er7Ty6" + '")')
     assert "Zx9Qw8Er7Ty6" not in out and s.leaks(out) == [], out
@@ -396,6 +407,12 @@ def check_scrub() -> None:
     s = tune.Scrubber(["box", "box-wsl"])
     assert s("box-wsl and box, not boxing") == "<host> and <host>, not boxing"
     assert s.counts == Counter(host=2)
+    try:
+        tune.read_host_names("no-such-host-list.txt")
+    except SystemExit as e:
+        assert "no-such-host-list.txt" in str(e), e
+    else:
+        raise AssertionError("a missing host list must exit, naming it")
     # The rendered pair carries scrubbed content and tags, and checks clean.
     s = tune.Scrubber()
     a = s.memory(mem("db at 10.0.0.5 via db.internal", 0.0, tags=("x.svc", "plain")))
@@ -436,8 +453,8 @@ def check_no_env_proxy(real_env: dict) -> None:
     def proxied(call) -> int:
         try:
             call()
-        except Exception:  # noqa: BLE001 - only where the request went matters
-            pass
+        except (tune.httpx.HTTPError, tune.anthropic.APIError):
+            pass  # no server answers: only where the request went matters
         hits = 0
         while True:
             try:
@@ -483,6 +500,8 @@ def check_egress(real_env: dict) -> None:
         "http://[::1]:8082",
         "http://[fd12::1]:80",
         "http://u:p@anthropic-lb:8082",
+        "http://2130706433:8082",  # 127.0.0.1, as the resolver reads it
+        "http://0x0a000001",  # 10.0.0.1
     ):
         assert tune.is_cluster_local(ok), ok
     for no in (
@@ -494,6 +513,8 @@ def check_egress(real_env: dict) -> None:
         "http://anthropic-lb:8082@api.anthropic.com",  # userinfo never poses as host
         "http://[2606:4700::1111]",
         "http://[::ffff:1.2.3.4]",
+        "http://16843009",  # 1.1.1.1 to the resolver, though it has no dot
+        "http://0x01010101",
     ):
         assert not tune.is_cluster_local(no), no
 
@@ -606,6 +627,31 @@ def check_judges() -> None:
         else:
             raise AssertionError("a content filter or refusal is an API error")
 
+    def messages(stop: str, text: str = "") -> SimpleNamespace:
+        usage = SimpleNamespace(
+            input_tokens=50,
+            output_tokens=3,
+            cache_creation_input_tokens=None,
+            cache_read_input_tokens=None,
+        )
+        blk = SimpleNamespace(type="text", text=text)
+        resp = SimpleNamespace(stop_reason=stop, usage=usage, content=[blk])
+        return SimpleNamespace(messages=SimpleNamespace(create=lambda **kw: resp))
+
+    def ask(client) -> dict:
+        return tune.anthropic_judge(client, "claude-sonnet-5", "sys", "default")("p")
+
+    assert ask(messages("end_turn", good))["verdict"] == "supersession"
+    try:
+        ask(messages("refusal", good))  # even a parseable verdict
+    except tune.ApiError as e:
+        assert e.tokens == (50, 3) and "refused" in str(e), e
+    else:
+        raise AssertionError("an Anthropic refusal is an API error in eval")
+    # tune scores a refusal as production records it: unjudged.
+    v = tune.judge_pair(messages("refusal"), "claude-sonnet-5", "sys", "p")
+    assert v["verdict"] == "unjudged" and v["tokens"] == (50, 3), v
+
     def jev(verdicts, survivors, hide=(0.2, 0.8)):
         return {
             "model": tune.JEV_MODEL,
@@ -692,6 +738,25 @@ def check_rows() -> None:
     )
     assert r1["prod_confidence"] == 0.97 and r1["flag"] is True
     assert (r2["a"], r2["survivor"], r2["loser"]) == (h["d"], h["c"], h["d"])
+    assert tune.check_prefixes(rows) == rows
+    ok = {"row": 5, "survivor": "a" * 12, "loser": "b" * 12}
+    for bad in (
+        {"rows": rows},
+        [7],
+        [ok, ok],  # a row number twice
+        [ok | {"row": "5"}],
+        [ok | {"row": True}],
+        [{"row": 5, "survivor": "a" * 12}],
+        [ok | {"loser": ""}],  # an empty prefix matches every hash
+        [ok | {"loser": "B" * 12}],  # hashes are lowercase hex
+        [ok | {"loser": "a" * 12}],
+    ):
+        try:
+            tune.check_prefixes(bad)
+        except SystemExit as e:
+            assert "--prefixes" in str(e), e
+        else:
+            raise AssertionError(f"bad prefixes must exit: {bad}")
 
 
 def check_compare() -> None:
@@ -800,6 +865,11 @@ def check_compare_run() -> None:
             + json.dumps({"judge": "jev", "total_usd": 0.25})
             + "\n"
         )
+        # README step 3's k-pass eval, or an older one with no judge, can share
+        # the run directory; compare skips it.
+        for stem, result in (("eval_k3", {"judge": "anthropic"}), ("eval_old", {})):
+            result |= {"pairs": "all", "passes": 3, "records": f"{stem}_records.jsonl"}
+            (out / f"{stem}.json").write_text(json.dumps(result))
         evals = tune.load_evals(out)
         g = tune.golden_section(evals["golden"], "claude-sonnet-5")
         vv = g["vote_value"]["partial_as_coexist"]
@@ -851,6 +921,16 @@ def check_compare_run() -> None:
             pass
         else:
             raise AssertionError("mismatched scrub counts must exit")
+        # An aborted append can tear the last spend line: the cap must not
+        # undercount, so the run stops and names the line.
+        with (out / tune.SPEND_LOG).open("a", encoding="utf-8") as f:
+            f.write('{"judge": "jev", "tot')
+        try:
+            tune.spend_log(out)
+        except SystemExit as e:
+            assert f"{tune.SPEND_LOG}:3" in str(e), e
+        else:
+            raise AssertionError("a torn spend line must exit")
 
 
 def main() -> None:

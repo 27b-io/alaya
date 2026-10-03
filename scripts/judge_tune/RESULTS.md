@@ -117,8 +117,8 @@ effect as switching auto-apply off, which needs no vendor.
 
 ## Setup
 
-- Golden set v2 (`rule_version` 2): 174 pairs, labelled 98 supersession, 51
-  coexist (4 of them `partial`) and 25 unrelated. A second set held 51
+- Golden set v2 (`rule_version` 2): 174 pairs, 98 labelled `supersession`,
+  51 `coexist` (4 of them `partial`) and 25 `unrelated`. A second set held 51
   production pairs the judge had called supersession at confidence ≥ 0.90,
   resolved from the contradiction queue.
 - One pass per judge, as production judges once:
@@ -128,10 +128,11 @@ effect as switching auto-apply off, which needs no vendor.
   - `jev-1.13.0`: the typed questions in `JEV_QUESTIONS`.
 - Every judge got the same scrubbed rendering, with hosts, IPs, URLs, emails
   and secrets replaced. Sonnet also ran once on unscrubbed text as a control.
-  The scrub made 224 host, 124 URL, 41 IP, 25 email and 4 secret replacements
-  over 357 memories. Review later widened the secret rules (prefixed key
-  names such as `X_API_KEY=`, `Authorization:` headers, secret-bearing
-  command-line flags, more token formats).
+  Over 357 memories the scrub replaced 224 hosts, 124 URLs, 41 IPs, 25 emails
+  and 4 secrets. Review later widened the secret rules (prefixed key names
+  such as `X_API_KEY=`, `Authorization:` headers, secret-bearing command-line
+  flags, more token formats, the rest of a secret value around an IP, URL or
+  email in it).
   Re-scanning the text actually sent, with those rules and with gitleaks,
   found no secret; the extra matches were a placeholder and a CI keyword.
 - No pair failed for any judge. Spend was USD 5.81 at list price: Anthropic

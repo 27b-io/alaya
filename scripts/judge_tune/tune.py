@@ -43,6 +43,7 @@ import math
 import os
 import random
 import re
+import socket
 import statistics
 import subprocess
 import sys
@@ -226,7 +227,12 @@ def is_cluster_local(url: str) -> bool:
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
-        return bool(host) and "." not in host
+        # "16843009" and "0x01010101" have no dot, yet the resolver dials them
+        # as IPv4 addresses, and alaya-server's URL parser reads them so too.
+        try:
+            ip = ipaddress.IPv4Address(socket.inet_aton(host))
+        except OSError:
+            return bool(host) and "." not in host
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
         ip = ip.ipv4_mapped
     return ip.is_loopback or any(ip in net for net in PRIVATE_NETS)
@@ -481,6 +487,9 @@ SECRET_KEY_NAME = (
     r"|passw(?:or)?d|passphrase|pwd|credential))[\w.-]++"
     r"[\"']?\]?\s*(?:=>|[:=])\s*[\"']?"  # also os.environ['X_KEY'] = '...'
 )
+# A value's characters, and a placeholder a rule before the key rules wrote.
+VALUE_CHAR = r"[^\s\"'<>,;]"
+PLACEHOLDER = r"<(?:secret|url|email|ip)>"
 # (class, pattern). A `keep` group survives in front of the placeholder.
 SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
     (
@@ -532,10 +541,13 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
         "secret",
         re.compile(rf"(?P<keep>{SECRET_KEY_NAME})[^\s\"'<>,;()\[\]{{}}]{{8,}}", re.I),
     ),
-    (  # ...and the tail a bracket left after the first rule's placeholder
+    (  # ...and what is left of a value an earlier placeholder split: the
+        # tail a bracket left, or the rest around an IP, URL or email in it
         "secret",
         re.compile(
-            rf"(?P<keep>{SECRET_KEY_NAME})(?:<secret>[^\s\"'<>,;]++|[^\s\"'<>,;]{{8,}})",
+            rf"(?P<keep>{SECRET_KEY_NAME})(?:"
+            rf"(?:{VALUE_CHAR}++{PLACEHOLDER}++|{PLACEHOLDER}++{VALUE_CHAR})"
+            rf"(?:{VALUE_CHAR}++|{PLACEHOLDER})*+|{VALUE_CHAR}{{8,}})",
             re.I,
         ),
     ),
@@ -569,7 +581,7 @@ class Scrubber:
     names (a machine list, kept out of git) come in through `host_names`.
     """
 
-    def __init__(self, host_names: Iterable[str] = ()):
+    def __init__(self, host_names: Iterable[str] = ()) -> None:
         self.rules = list(SCRUB_RULES)
         names = sorted({n.strip() for n in host_names if n.strip()}, key=len)
         if names:
@@ -598,10 +610,26 @@ class Scrubber:
         return sorted({cls for cls, pattern in self.rules if pattern.search(text)})
 
 
+def read_file(path: str | Path) -> str:
+    """A file's text, or an exit that names the file."""
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        sys.exit(f"cannot read {path}: {e}")
+
+
+def parse_json(text: str, where: str) -> Any:
+    """`text` as JSON, or an exit that names where it came from."""
+    try:
+        return json.loads(text)
+    except ValueError as e:
+        sys.exit(f"{where}: not JSON ({e})")
+
+
 def read_host_names(path: str | None) -> list[str]:
     if not path:
         return []
-    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    lines = read_file(path).splitlines()
     return [ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")]
 
 
@@ -671,9 +699,13 @@ def judge_pair(
     prompt: str,
     text: str,
     regime: str = "default",
+    *,
+    refusal_fails: bool = False,
 ) -> dict:
     """Judge one rendered pair. An API error propagates: the caller decides
-    whether it aborts the run (tune) or fails the pair (eval)."""
+    whether it aborts the run (tune) or fails the pair (eval). A refusal is
+    `unjudged`, as production records it, unless `refusal_fails` makes it an
+    `ApiError`, as eval treats a refusal on every wire."""
     resp = client.messages.create(
         system=prompt,
         messages=[{"role": "user", "content": text}],
@@ -686,6 +718,8 @@ def judge_pair(
         + (u.cache_read_input_tokens or 0),
         u.output_tokens or 0,
     )
+    if refusal_fails and resp.stop_reason == "refusal":
+        raise ApiError("model refused (stop_reason=refusal)", tokens)
     text = next(
         (
             blk.text.strip()
@@ -719,7 +753,7 @@ class ApiError(Exception):
     status, content filter, refusal or a malformed typed answer. Carries the
     tokens of a call that returned, so they are still booked."""
 
-    def __init__(self, msg: str, tokens: tuple[int, int] = (0, 0)):
+    def __init__(self, msg: str, tokens: tuple[int, int] = (0, 0)) -> None:
         super().__init__(sanitize_reason(msg))
         self.tokens = tokens
 
@@ -752,7 +786,7 @@ def anthropic_judge(
 ) -> Callable[[str], dict]:
     def judge(text: str) -> dict:
         try:
-            return judge_pair(client, model, prompt, text, regime)
+            return judge_pair(client, model, prompt, text, regime, refusal_fails=True)
         except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as e:
             raise AuthError(f"HTTP {e.status_code}") from e
         except anthropic.APIStatusError as e:
@@ -1841,8 +1875,14 @@ def spend_log(out: Path) -> list[dict]:
     path = out / SPEND_LOG
     if not path.exists():
         return []
-    lines = path.read_text(encoding="utf-8").splitlines()
-    return [json.loads(line) for line in lines if line.strip()]
+    # A torn line (an aborted append) stops the run: skipping it would
+    # undercount the run's spend against its cap.
+    lines = read_file(path).splitlines()
+    return [
+        parse_json(line, f"{path}:{n}")
+        for n, line in enumerate(lines, 1)
+        if line.strip()
+    ]
 
 
 def load_rows(out: Path) -> list[Pair]:
@@ -1854,7 +1894,9 @@ def load_rows(out: Path) -> list[Pair]:
     return [Pair(r["row"], r["a"], r["b"], "", None, "spotcheck") for r in rows]
 
 
-def make_judge(judge: str, model: str, prompt: str, regime: str, url: str):
+def make_judge(
+    judge: str, model: str, prompt: str, regime: str, url: str
+) -> Callable[[str], dict]:
     if judge == "jev":
         http = http_client(url, env("TYPESAFE_API_KEY"))
         return retried(jev_judge(http, model))
@@ -1906,11 +1948,7 @@ def cmd_eval(args) -> None:
         sys.exit(f"--judge {args.judge} needs --scrub")
     if args.judge != "anthropic" and args.regime != "default":
         sys.exit("--regime applies to the anthropic judge only")
-    prompt = (
-        Path(args.prompt_file).read_text(encoding="utf-8")
-        if args.prompt_file
-        else seed_prompt()
-    )
+    prompt = read_file(args.prompt_file) if args.prompt_file else seed_prompt()
     model = args.model or {
         "anthropic": os.environ.get("JUDGE_MODEL", "claude-sonnet-5"),
         "jev": JEV_MODEL,
@@ -2070,6 +2108,36 @@ def contradiction_pages() -> Iterable[dict]:
             offset = page.get("next_offset")
 
 
+HEX = re.compile(r"[0-9a-f]+")
+
+
+def check_prefixes(rows: Any) -> list[dict]:
+    """Spot-check rows as `resolve_rows` needs them: a unique int `row` and
+    distinct, non-empty lowercase-hex `survivor` and `loser` prefixes (an
+    empty one would match every hash). Exits on the first bad row."""
+    if not isinstance(rows, list):
+        sys.exit("--prefixes must hold a JSON list of rows")
+    seen: set[int] = set()
+    for i, r in enumerate(rows):
+        ok = (
+            isinstance(r, dict)
+            and type(r.get("row")) is int
+            and r["row"] not in seen
+            and all(
+                isinstance(r.get(k), str) and HEX.fullmatch(r[k])
+                for k in ("survivor", "loser")
+            )
+            and r["survivor"] != r["loser"]
+        )
+        if not ok:
+            sys.exit(
+                f"--prefixes entry {i}: want a unique int `row` and distinct "
+                "lowercase-hex `survivor` and `loser` prefixes"
+            )
+        seen.add(r["row"])
+    return rows
+
+
 def resolve_rows(
     rows: list[dict], edges: Iterable[dict]
 ) -> tuple[list[dict], list[dict], list[dict]]:
@@ -2132,7 +2200,7 @@ def resolve_rows(
 def cmd_rows(args) -> None:
     out = HERE / "runs" / args.run
     out.mkdir(parents=True, exist_ok=True)
-    wanted = json.loads(Path(args.prefixes).read_text(encoding="utf-8"))
+    wanted = check_prefixes(parse_json(read_file(args.prefixes), args.prefixes))
     resolved, ambiguous, unmatched = resolve_rows(wanted, contradiction_pages())
     (out / ROWS_FILE).write_text(json.dumps(resolved, indent=1) + "\n")
     log(
@@ -2177,7 +2245,8 @@ def load_evals(out: Path) -> dict[str, dict[str, dict]]:
         if result.get("pairs") not in ("all", "rows"):
             continue
         if "judge" not in result or result["passes"] != 1:
-            sys.exit(f"{path.name}: compare scores one-pass judge-seam evals only")
+            log(f"compare skips {path.name}: it scores one-pass judge-seam evals only")
+            continue
         stem = result["records"].removesuffix("_records.jsonl")
         if not (out / f"{stem}_sent.json").exists():  # the Sent table would undercount
             sys.exit(f"{path.name} has no {stem}_sent.json")
