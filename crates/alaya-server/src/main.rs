@@ -927,6 +927,15 @@ impl ServiceHandle {
         let reply_deadline = op.inner.deadline() + REPLY_MARGIN;
         self.try_dispatch(op)?;
         match tokio::time::timeout(reply_deadline, rx).await {
+            // A worker-side queue refused it (the search backlog): the same
+            // answer as a full channel, so callers see one overload signal.
+            Ok(Ok(v)) if v["error_kind"] == "overloaded" => Err((
+                -32000,
+                v["error"]
+                    .as_str()
+                    .unwrap_or("Service overloaded")
+                    .to_string(),
+            )),
             Ok(Ok(v)) => Ok(v),
             Ok(Err(_)) => Err((-32000, "service dropped response".to_string())),
             Err(_) => {
@@ -948,8 +957,8 @@ impl ServiceHandle {
     }
 
     /// REST wrapper over `call_rpc`. Op-level errors ride inside a 200 body
-    /// (unchanged convention), but dispatch/transport failures — full channel,
-    /// closed channel, no reply within deadline — are 503, matching
+    /// (unchanged convention), but dispatch/transport failures — full channel
+    /// or search backlog, closed channel, no reply within deadline — are 503, matching
     /// `patch_memory`/`get_memory` so overload/stall semantics are uniform.
     async fn call(
         &self,
@@ -1313,7 +1322,11 @@ impl Drop for InFlight {
 /// Wraps the service in `Rc` so long-running operations (find_duplicates,
 /// merge_duplicates) and searches can be spawned as local tasks without
 /// blocking the command loop. Other commands continue processing while they
-/// run; every write still runs inline, one at a time, in arrival order.
+/// run. Every mutating command still runs inline, one at a time, in arrival
+/// order. The writes that ride along with other work run in spawned tasks:
+/// a search's access-count bump and Hebbian enqueue, and a store's summary
+/// and judge follow-ups. Only the backend's compare-and-set and `write_lock`
+/// order those against the inline writes.
 ///
 /// Every handler await is bounded by `limits` (#63), and `progress` is
 /// stamped after each command so the health watchdog can tell a draining
@@ -1348,10 +1361,11 @@ async fn service_worker(
         limits.judge_daily_cap,
     )));
     // Searches run in spawned tasks: the gate keeps them one at a time, the
-    // slots bound how many wait (SEARCH_CONCURRENCY, SEARCH_BACKLOG_MAX).
-    // `Arc` for the slots: `try_acquire_owned` needs it.
+    // slots bound how many are outstanding (SEARCH_CONCURRENCY,
+    // SEARCH_BACKLOG_MAX). `Arc` for the slots: `try_acquire_owned` needs it.
     let search_gate = std::rc::Rc::new(tokio::sync::Semaphore::new(SEARCH_CONCURRENCY));
     let search_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(SEARCH_BACKLOG_MAX));
+    let mut search_backlog_warned = false;
 
     // First heartbeat: bootstrap is done and the loop is live. Until this
     // stamp the health checker reports the worker as "starting" (progress
@@ -1483,8 +1497,19 @@ async fn service_worker(
                 let _ = reply.send(result);
             }
             CmdInner::Search { reply, .. } if search_slots.available_permits() == 0 => {
-                tracing::warn!(op, max = SEARCH_BACKLOG_MAX, "search backlog full");
-                let _ = reply.send(json!({"error": "search backlog full, try again later"}));
+                // One WARN per overload episode; the episode ends when a
+                // search is admitted again.
+                if std::mem::replace(&mut search_backlog_warned, true) {
+                    tracing::debug!(op, max = SEARCH_BACKLOG_MAX, "search backlog full");
+                } else {
+                    tracing::warn!(op, max = SEARCH_BACKLOG_MAX, "search backlog full");
+                }
+                // `call_rpc` answers this kind as it answers a full channel.
+                let _ = reply.send(json!({
+                    "success": false,
+                    "error_kind": "overloaded",
+                    "error": "search backlog full, try again later",
+                }));
             }
             // Spawned, not awaited (LAB-6896): a slow search held every store
             // queued behind it past its caller's timeout. `search_gate` still
@@ -1495,6 +1520,7 @@ async fn service_worker(
                 read_only,
                 reply,
             } => {
+                search_backlog_warned = false;
                 let slot = search_slots
                     .clone()
                     .try_acquire_owned()
@@ -1505,51 +1531,58 @@ async fn service_worker(
                 let page_size = params.page_size;
                 let tag_count = params.tags.as_ref().map(|t| t.len()).unwrap_or(0);
                 let mem_type = params.memory_type.clone().unwrap_or_default();
-                let span = tracing::info_span!(parent: &ps, "search", %mode, read_only);
+                // `queued_ms` is recorded once the search holds the gate, so
+                // its ok, failed and timeout lines all carry the wait.
+                let span = tracing::info_span!(parent: &ps, "search", %mode, read_only,
+                    queued_ms = tracing::field::Empty);
                 let svc = svc.clone();
                 let gate = search_gate.clone();
                 let deadline = limits.cmd;
-                tokio::task::spawn_local(async move {
-                    let _slot = slot;
-                    let Ok(_running) = gate.acquire().await else {
-                        return;
-                    };
-                    let queued_ms = ms(start);
-                    let start = std::time::Instant::now();
-                    let result = match timeout(
-                        deadline,
-                        svc.search_with(params, read_only).instrument(span),
-                    )
-                    .await
-                    {
-                        Ok(Ok(r)) => {
-                            let n = result_count(&r);
-                            let has_more =
-                                r.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
-                            tracing::info!(
-                                op,
-                                mode = mode.as_str(),
-                                query = query_preview.as_str(),
-                                results = n,
-                                has_more,
-                                page,
-                                page_size,
-                                tag_count,
-                                mem_type = mem_type.as_str(),
-                                queued_ms,
-                                elapsed_ms = ms(start),
-                                "ok"
-                            );
-                            r
+                tokio::task::spawn_local(
+                    async move {
+                        let _slot = slot;
+                        let _running = gate.acquire().await.expect("search gate is never closed");
+                        tracing::Span::current().record("queued_ms", ms(start));
+                        // Nobody is waiting for it: running it would only
+                        // delay the searches behind it and bump access
+                        // counts for results no one received.
+                        if reply.is_closed() {
+                            tracing::info!(op, "caller gone before the search ran; skipped");
+                            return;
                         }
-                        Ok(Err(e)) => {
-                            log_err(op, &e, start);
-                            json!({"error": e.safe_message()})
-                        }
-                        Err(_) => deadline_exceeded(op, deadline, start),
-                    };
-                    let _ = reply.send(result);
-                });
+                        let running_since = std::time::Instant::now();
+                        let result = match timeout(deadline, svc.search_with(params, read_only))
+                            .await
+                        {
+                            Ok(Ok(r)) => {
+                                let n = result_count(&r);
+                                let has_more =
+                                    r.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
+                                tracing::info!(
+                                    op,
+                                    mode = mode.as_str(),
+                                    query = query_preview.as_str(),
+                                    results = n,
+                                    has_more,
+                                    page,
+                                    page_size,
+                                    tag_count,
+                                    mem_type = mem_type.as_str(),
+                                    elapsed_ms = ms(running_since),
+                                    "ok"
+                                );
+                                r
+                            }
+                            Ok(Err(e)) => {
+                                log_err(op, &e, running_since);
+                                json!({"error": e.safe_message()})
+                            }
+                            Err(_) => deadline_exceeded(op, deadline, running_since),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    .instrument(span),
+                );
             }
             CmdInner::Delete { hash, reply } => {
                 let span = tracing::info_span!(parent: &ps, "delete");
@@ -5596,18 +5629,24 @@ mod wedge_tests {
             .await;
     }
 
-    /// Enqueues one hybrid search and returns its reply receiver.
-    async fn send_hybrid_search(tx: &mpsc::Sender<Cmd>) -> oneshot::Receiver<Value> {
-        let (reply, answer) = oneshot::channel();
+    /// The hybrid search every test here sends: its keyword "flag" is the
+    /// tag `SlowSearchVectors` knows.
+    fn hybrid_search(reply: oneshot::Sender<Value>) -> CmdInner {
         let params: SearchParams =
             serde_json::from_value(json!({ "query": "flag state", "mode": "hybrid" }))
                 .expect("search params");
+        CmdInner::Search {
+            params,
+            read_only: false,
+            reply,
+        }
+    }
+
+    /// Enqueues one hybrid search and returns its reply receiver.
+    async fn send_hybrid_search(tx: &mpsc::Sender<Cmd>) -> oneshot::Receiver<Value> {
+        let (reply, answer) = oneshot::channel();
         tx.send(Cmd {
-            inner: CmdInner::Search {
-                params,
-                read_only: false,
-                reply,
-            },
+            inner: hybrid_search(reply),
             span: tracing::Span::none(),
         })
         .await
@@ -5697,7 +5736,7 @@ mod wedge_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn store_is_not_held_behind_two_queued_slow_searches() {
+    async fn store_is_not_held_behind_a_running_and_a_queued_slow_search() {
         store_is_not_held_behind(2).await;
     }
 
@@ -5730,20 +5769,37 @@ mod wedge_tests {
 
     /// Spawned searches have left the command channel, so the worker bounds
     /// them itself, at the depth the channel refused at: past
-    /// `SEARCH_BACKLOG_MAX` outstanding a search is refused, and other
-    /// commands still run.
+    /// `SEARCH_BACKLOG_MAX` outstanding a search is refused, as a full
+    /// channel is (MCP -32000, REST 503), and other commands still run.
     #[tokio::test(start_paused = true)]
     async fn search_backlog_is_bounded_and_refusal_blocks_nothing() {
+        use tokio::sync::oneshot::error::TryRecvError;
+
         with_slow_search_worker(WorkerLimits::default(), |tx, _, _| async move {
             let mut held = Vec::new();
             for _ in 0..SEARCH_BACKLOG_MAX {
                 held.push(send_hybrid_search(&tx).await);
             }
-            let refused = tokio::time::timeout(STORE_BUDGET, send_hybrid_search(&tx).await)
-                .await
-                .expect("refusal queued behind the backlog")
-                .expect("refusal dropped");
-            assert_eq!(refused["error"], "search backlog full, try again later");
+            // Let the worker drain the channel, so the refusals below are the
+            // backlog's and not a full channel's.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            let handle = ServiceHandle { tx: tx.clone() };
+            let refusal = "search backlog full, try again later".to_string();
+
+            let (reply, answer) = oneshot::channel();
+            let rpc =
+                tokio::time::timeout(STORE_BUDGET, handle.call_rpc(hybrid_search(reply), answer))
+                    .await
+                    .expect("refusal queued behind the backlog");
+            assert_eq!(rpc.unwrap_err(), (-32000, refusal.clone()));
+
+            let (reply, answer) = oneshot::channel();
+            let (status, Json(body)) =
+                tokio::time::timeout(STORE_BUDGET, handle.call(hybrid_search(reply), answer))
+                    .await
+                    .expect("refusal queued behind the backlog");
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert_eq!(body["error"], json!(refusal));
 
             let (ptx, prx) = oneshot::channel();
             tx.send(Cmd {
@@ -5757,9 +5813,76 @@ mod wedge_tests {
                 .expect("ping queued behind the backlog")
                 .unwrap();
             assert_eq!(pong["ok"], true);
-            assert!(held.iter_mut().all(|r| r.try_recv().is_err()));
+            assert!(
+                held.iter_mut()
+                    .all(|r| matches!(r.try_recv(), Err(TryRecvError::Empty))),
+                "a held search answered or was dropped"
+            );
         })
         .await;
+    }
+
+    /// A queued search whose caller has gone is skipped when its turn comes,
+    /// so the search behind it starts at once, not a whole search later.
+    #[tokio::test(start_paused = true)]
+    async fn queued_search_whose_caller_left_is_skipped() {
+        with_slow_search_worker(WorkerLimits::default(), |tx, _, _| async move {
+            let start = tokio::time::Instant::now();
+            let first = send_hybrid_search(&tx).await;
+            drop(send_hybrid_search(&tx).await);
+            let third = send_hybrid_search(&tx).await;
+            for (answer, ends_at) in [(first, SLOW_SEARCH), (third, SLOW_SEARCH * 2)] {
+                let found = tokio::time::timeout(NEVER, answer)
+                    .await
+                    .expect("search never replied")
+                    .expect("search reply dropped");
+                assert!(found.get("error").is_none(), "{found}");
+                assert_eq!(start.elapsed(), ends_at);
+            }
+        })
+        .await;
+    }
+
+    /// A search that panics ends its own task only. Its caller sees the reply
+    /// dropped, the gate and slot are released, so the next search runs (and
+    /// panics the same way), and the loop keeps serving. Inline, a panicking
+    /// search took the worker, and with it the process, down.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_search_fails_alone() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::channel::<Cmd>(8);
+                // `HangVectors::get_all_tags` panics: hybrid search calls it first.
+                tokio::task::spawn_local(service_worker(
+                    rx,
+                    hanging_service(),
+                    Arc::new(AtomicU64::new(0)),
+                    WorkerLimits::default(),
+                ));
+                for call in 1..=2 {
+                    let answer = send_hybrid_search(&tx).await;
+                    let dropped = tokio::time::timeout(STORE_BUDGET, answer)
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!("search {call} wedged: the gate was never freed")
+                        });
+                    assert!(dropped.is_err(), "search {call} answered: {dropped:?}");
+                }
+                let (ptx, prx) = oneshot::channel();
+                tx.send(Cmd {
+                    inner: CmdInner::Ping { reply: ptx },
+                    span: tracing::Span::none(),
+                })
+                .await
+                .unwrap();
+                let pong = tokio::time::timeout(STORE_BUDGET, prx)
+                    .await
+                    .expect("the loop stopped after a search panicked")
+                    .unwrap();
+                assert_eq!(pong["ok"], true);
+            })
+            .await;
     }
 
     /// Stall tests read this fixed monotonic "now", so a stamp of
