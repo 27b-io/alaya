@@ -33,11 +33,9 @@ const VERDICT_ROWS: [(&str, &str, &str); 6] = [
     ("never_judged", "never judged (backlog)", "unjudged"),
 ];
 
-/// Columns of a per-day table: `(the server's key in counts, heading)`.
-type DayColumns = [(&'static str, &'static str); 5];
-
-/// Columns of the judged-per-day table.
-const DAY_COLUMNS: DayColumns = [
+/// Columns of the judged-per-day table: `(the server's key in counts,
+/// heading)`.
+const DAY_COLUMNS: [(&str, &str); 5] = [
     ("contradiction", "contradiction"),
     ("supersession", "supersession"),
     ("coexist", "coexist"),
@@ -46,7 +44,7 @@ const DAY_COLUMNS: DayColumns = [
 ];
 
 /// Columns of the write-novelty table, by nearest-neighbour similarity.
-const NOVELTY_COLUMNS: DayColumns = [
+const NOVELTY_COLUMNS: [(&str, &str); 5] = [
     ("0.95+", "≥ 0.95"),
     ("0.85-0.95", "0.85–0.95"),
     ("0.70-0.85", "0.70–0.85"),
@@ -322,7 +320,10 @@ fn per_day_card(s: &Value) -> impl IntoView + use<> {
 }
 
 /// `[{date, counts}]` as a table: one row per UTC day, one column per count.
-fn day_table(days: &[Value], columns: &'static DayColumns) -> impl IntoView + use<> {
+fn day_table(
+    days: &[Value],
+    columns: &'static [(&'static str, &'static str)],
+) -> impl IntoView + use<> {
     let rows = days
         .iter()
         .map(|d| {

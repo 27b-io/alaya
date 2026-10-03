@@ -19,7 +19,7 @@ const DAY_SECS: f64 = 86_400.0;
 
 /// UTC days in the `judged_per_day` and `writes.novelty` series, today
 /// included.
-pub const JUDGED_DAYS: i64 = 14;
+pub const STATS_WINDOW_DAYS: i64 = 14;
 
 /// `writes.novelty` count keys, by the write's `nearest_similarity`:
 /// three similarity bands, below the lowest, and none recorded (no live
@@ -35,7 +35,7 @@ impl MemoryService {
     pub async fn corpus_stats(&self) -> Value {
         let now = (self.clock)();
         let today = (now / DAY_SECS).floor() as i64;
-        let first_day = today - (JUDGED_DAYS - 1);
+        let first_day = today - (STATS_WINDOW_DAYS - 1);
         let since = first_day as f64 * DAY_SECS;
         let (total, novelty, graph, contradictions) = futures::join!(
             self.vectors.count(),
@@ -720,7 +720,7 @@ mod tests {
         );
 
         let days = c["judged_per_day"].as_array().unwrap();
-        assert_eq!(days.len(), JUDGED_DAYS as usize);
+        assert_eq!(days.len(), STATS_WINDOW_DAYS as usize);
         assert_eq!(days[0]["date"], "2026-09-18");
         assert!(
             days[0]["counts"].get("bogus").is_none(),
@@ -742,7 +742,7 @@ mod tests {
         );
 
         let novelty = v["writes"]["novelty"].as_array().unwrap();
-        assert_eq!(novelty.len(), JUDGED_DAYS as usize);
+        assert_eq!(novelty.len(), STATS_WINDOW_DAYS as usize);
         assert_eq!(novelty[0]["date"], "2026-09-18");
         let bands = |a: usize, b: usize, c: usize, d: usize, n: usize| json!({ "0.95+": a, "0.85-0.95": b, "0.70-0.85": c, "below_0.70": d, "none": n });
         assert_eq!(
@@ -782,7 +782,7 @@ mod tests {
     /// window 13 days before it. Those days have no date and are left out.
     #[test]
     fn pre_epoch_window_days_are_left_out() {
-        let c = contradictions_section(&sample(), -(JUDGED_DAYS - 1), 0);
+        let c = contradictions_section(&sample(), -(STATS_WINDOW_DAYS - 1), 0);
         let days = c["judged_per_day"].as_array().unwrap();
         assert_eq!(days.len(), 1, "{days:?}");
         assert_eq!(days[0]["date"], "1970-01-01");

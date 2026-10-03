@@ -844,7 +844,9 @@ fn parse_payload(payload: &Value) -> Option<Memory> {
             }),
         supersession_log: payload.get(SUPERSESSION_LOG).cloned().map(log_entries),
         supersession_reason: payload.get(SUPERSESSION_REASON).cloned(),
-        nearest_similarity: payload.get(NEAREST_SIMILARITY).and_then(Value::as_f64),
+        // Write-only on `Memory`: only the store path sets it, from its own
+        // search, so a parsed copy written back can never carry a stale one.
+        nearest_similarity: None,
     })
 }
 
@@ -2221,21 +2223,23 @@ mod tests {
         assert!(written.get("supersession_reason").is_none(), "{written}");
     }
 
+    /// Written from the store's own value, never read back: a parsed copy
+    /// re-stored as-is writes none rather than a stale one.
     #[test]
-    fn nearest_similarity_round_trips_through_the_payload() {
+    fn nearest_similarity_is_written_by_the_store_and_never_read_back() {
         let payload = json!({
             "content": "c",
             "content_hash": "c".repeat(64),
             "nearest_similarity": 0.87,
         });
         let mem = parse_payload(&payload).expect("parses");
-        assert_eq!(mem.nearest_similarity, Some(0.87));
-        assert_eq!(memory_to_payload(&mem)["nearest_similarity"], json!(0.87));
-        let none = Memory {
-            nearest_similarity: None,
+        assert_eq!(mem.nearest_similarity, None);
+        assert!(memory_to_payload(&mem).get("nearest_similarity").is_none());
+        let fresh = Memory {
+            nearest_similarity: Some(0.42),
             ..mem
         };
-        assert!(memory_to_payload(&none).get("nearest_similarity").is_none());
+        assert_eq!(memory_to_payload(&fresh)["nearest_similarity"], json!(0.42));
     }
 
     #[test]

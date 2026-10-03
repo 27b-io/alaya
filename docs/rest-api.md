@@ -214,7 +214,7 @@ Two metadata keys are reserved, and a request carrying either, with any value, r
 | `created` | `false` when this content was already stored: the record was updated in place (`message` is `"Memory updated"`), keeping its creation time and access history. |
 | `tags` | Present only when the memory has tags. |
 | `neighbours` | Up to 5 of the nearest **live** (not superseded) memories, nearest first, never the stored memory itself: `content_hash`, cosine `similarity`, `memory_type`, and `summary` clipped to 200 characters (the content, clipped, when no summary exists yet). They come from the search the store already runs for contradiction detection. `[]` when that search found no live memory. **Absent** when no search ran: a read-only principal's store, or a failed search. A failed search never fails the store. |
-| `interference.contradictions` | Present only when contradiction cues were detected against a live neighbour with similarity ≥ 0.7; each one is also written as a `CONTRADICTS` edge. |
+| `interference.contradictions` | Present only when contradiction cues were detected against a live neighbour with similarity ≥ 0.7; each one is also written as a `CONTRADICTS` edge. The neighbour search runs before the write, so two related stores that race on different server processes can each miss the other, and neither gets the edge. |
 
 Every store also records its novelty on the memory: `nearest_similarity`, the first neighbour's similarity, or none when there was no neighbour or no search. A re-store recomputes it. It is server-maintained and not returned by reads; `GET /stats` aggregates it as `writes.novelty`.
 

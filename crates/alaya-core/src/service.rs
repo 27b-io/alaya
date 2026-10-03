@@ -464,11 +464,15 @@ impl MemoryService {
             }
         }
 
-        // The store-path neighbour search. It runs before the write so the
-        // write can carry its novelty (`nearest_similarity`), and it feeds
-        // interference detection and the `neighbours` response field without
-        // a second search. Suppressed under read_only with the graph writes it
-        // feeds; a failure only loses those, never the store.
+        // The store-path neighbour search, separate from dedup's above. It
+        // runs before the write so the write can carry its novelty
+        // (`nearest_similarity`), and the same result feeds interference
+        // detection and the `neighbours` response field. Suppressed under
+        // read_only with the graph writes it feeds; a failure only loses
+        // those, never the store. Accepted cost of searching first: two
+        // related stores racing on different processes can each miss the
+        // other, so neither gets the CONTRADICTS / RELATES_TO edge; a search
+        // after the write always let the later one see the earlier.
         let similar = if read_only {
             None
         } else {
@@ -592,16 +596,17 @@ impl MemoryService {
         // `relation` tool).
         let mut contradiction_signals = Vec::new();
         if let Some(similar) = &similar {
-            // When this search ran after the write, the stored memory took one
-            // of its slots; detection keeps considering the same candidates.
-            let similar: Vec<&ScoredMemory> = similar
+            // Detection weighs the nine nearest other memories, superseded
+            // ones included (skipped below): the window it had when the search
+            // followed the write and the stored memory took the tenth slot.
+            let detection_window: Vec<&ScoredMemory> = similar
                 .iter()
                 .filter(|s| s.memory.content_hash != content_hash)
                 .take(NEIGHBOUR_SEARCH_K - 1)
                 .collect();
             let mut edges_to_create: Vec<(String, String, UserRelationType, EdgeMeta)> = Vec::new();
 
-            for scored in &similar {
+            for scored in &detection_window {
                 // Never relate/contradict against a superseded memory (see
                 // is_superseded — the Qdrant-side filter is a no-op).
                 if is_superseded(&scored.memory) {
@@ -634,7 +639,7 @@ impl MemoryService {
             }
 
             // Cross-reference detection (lower threshold)
-            for scored in &similar {
+            for scored in &detection_window {
                 if scored.score < 0.4 || scored.score >= 0.7 {
                     continue; // Only create RELATES_TO for moderate similarity
                 }

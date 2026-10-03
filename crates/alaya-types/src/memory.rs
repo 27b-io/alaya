@@ -45,9 +45,10 @@ pub struct Memory {
     pub supersession_reason: Option<serde_json::Value>,
     /// The `nearest_similarity` payload key: how close this memory's nearest
     /// live neighbour was when it was last stored, `None` when the store-path
-    /// search was skipped, failed or found nothing. The server computes it on
-    /// every store; serde never reads or writes it, so no caller input can
-    /// carry it.
+    /// search was skipped, failed or found nothing. Write-only: the store
+    /// path sets it for its own write and reads never fill it, so a parsed
+    /// copy cannot carry a stale value; serde never reads or writes it, so no
+    /// caller input can carry one either.
     #[serde(skip)]
     pub nearest_similarity: Option<f64>,
 }
