@@ -273,7 +273,10 @@ fn validate_upstream_url(var: &str, url: &url::Url) -> Result<(), String> {
 ///
 /// The userinfo rule is what keeps a credential out of the logs — see
 /// `reject_userinfo` for why this URL is the loud half of it.
-fn validate_issuer(issuer: &str) -> Result<(), String> {
+///
+/// Returns the issuer to store: the raw string with its host folded
+/// (`fold_host_case`).
+fn validate_issuer(issuer: &str) -> Result<String, String> {
     if !issuer.starts_with("https://") {
         return Err("CONSOLE_OIDC_ISSUER must be https".into());
     }
@@ -283,7 +286,32 @@ fn validate_issuer(issuer: &str) -> Result<(), String> {
     reject_userinfo("CONSOLE_OIDC_ISSUER", &url)?;
     // Discovery concatenates the well-known path onto the issuer (`oidc.rs`).
     reject_query_or_fragment("CONSOLE_OIDC_ISSUER", &url)?;
-    Ok(())
+    Ok(fold_host_case(issuer, &url))
+}
+
+/// `raw` with its host in the lowercase the URL parser reads, which is how
+/// an IdP echoes it. Both issuer checks — the discovery echo and the
+/// id_token's `iss` — compare bytes against what `Config` stores, so a raw
+/// `https://ID.27B.IO` would boot clean and then fail every login.
+///
+/// Only the host changes. `Url::as_str()` would also drop an explicit `:443`
+/// and respell the path, and an IdP that publishes those echoes them
+/// verbatim. The trailing slash is left to `alaya_oidc`, which strips one
+/// from each side where it compares. The parser picks the bytes to fold: a
+/// host it respells beyond case (IDN) is kept as typed.
+pub(crate) fn fold_host_case(raw: &str, url: &url::Url) -> String {
+    let scheme = format!("{}://", url.scheme());
+    let host = url.host_str().unwrap_or_default();
+    match raw.strip_prefix(&scheme) {
+        Some(rest)
+            if rest
+                .get(..host.len())
+                .is_some_and(|h| h.eq_ignore_ascii_case(host)) =>
+        {
+            format!("{scheme}{host}{}", &rest[host.len()..])
+        }
+        _ => raw.to_string(),
+    }
 }
 
 fn required(key: &str) -> Result<String, String> {
@@ -324,8 +352,7 @@ impl Config {
             .map_err(|e| format!("CONSOLE_PUBLIC_URL is not a valid URL: {e}"))?;
         validate_public_url(&public_url)?;
 
-        let oidc_issuer = required("CONSOLE_OIDC_ISSUER")?;
-        validate_issuer(&oidc_issuer)?;
+        let oidc_issuer = validate_issuer(&required("CONSOLE_OIDC_ISSUER")?)?;
 
         let allowed_subjects: Vec<String> = required("CONSOLE_ALLOWED_SUBJECTS")?
             .split(',')
@@ -440,6 +467,37 @@ mod tests {
         assert!(LbConfig::from_parts(Some("http://lb.example.com".into()), k(), on()).is_err());
         assert!(LbConfig::from_parts(Some("http://lb:8082".into()), k(), off()).is_err());
         assert!(LbConfig::from_parts(Some("http://lb:8082".into()), k(), on()).is_ok());
+    }
+
+    #[test]
+    fn issuer_is_stored_as_the_idp_echoes_it() {
+        let stored = |s: &str| validate_issuer(s).unwrap();
+        assert_eq!(stored("https://ID.27B.IO"), "https://id.27b.io");
+        assert_eq!(
+            stored("https://id.test/realms/ops"),
+            "https://id.test/realms/ops"
+        );
+        // Only the host folds: a path is case-sensitive, and so is the IdP's
+        // echo of it.
+        assert_eq!(
+            stored("https://ID.test/Realms/Ops"),
+            "https://id.test/Realms/Ops"
+        );
+        // Everything else stays as typed, because an IdP that publishes it
+        // echoes it verbatim. `Url::as_str()` would drop the explicit default
+        // port and resolve the dot segment.
+        assert_eq!(stored("https://ID.test:443"), "https://id.test:443");
+        assert_eq!(stored("https://id.test/a/./b"), "https://id.test/a/./b");
+        // The trailing slash is `alaya_oidc`'s to strip, once, where it
+        // compares: stripping here as well turns `/realm//` into `/realm`,
+        // while the echo only loses one.
+        assert_eq!(stored("https://id.test/realm//"), "https://id.test/realm//");
+        // A host the parser respells beyond case (IDN to punycode) is kept
+        // as typed.
+        assert_eq!(
+            stored("https://BÜCHER.test/realms/ops"),
+            "https://BÜCHER.test/realms/ops"
+        );
     }
 
     #[test]

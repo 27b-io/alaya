@@ -754,4 +754,60 @@ mod tests {
             "ops-operator"
         );
     }
+
+    /// An operator types the issuer in mixed case; the IdP echoes it
+    /// lowercased, in discovery and in `iss`. Both checks compare bytes
+    /// against the configured issuer, so the whole login runs here against
+    /// a loopback IdP — `http`, because `validate_issuer` is https-only and
+    /// nothing in-process serves TLS, so `fold_host_case` is called direct.
+    #[tokio::test]
+    async fn a_mixed_case_issuer_completes_discovery_and_id_token_validation() {
+        use crate::testkit;
+        use axum::routing::{get, post};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock IdP");
+        let port = listener.local_addr().unwrap().port();
+        let echoed = format!("http://localhost:{port}");
+        let discovery = serde_json::json!({
+            "issuer": echoed,
+            "authorization_endpoint": format!("{echoed}/authorize"),
+            "token_endpoint": format!("{echoed}/token"),
+            "jwks_uri": format!("{echoed}/jwks"),
+        });
+        let jwks = serde_json::json!({"keys": [{
+            "kty": "EC", "kid": testkit::KID, "x": testkit::KEY.x, "y": testkit::KEY.y,
+        }]});
+        let tokens = serde_json::json!({
+            "id_token": testkit::mint_id_token_from(&echoed, "ops-operator", None, None),
+        });
+        let idp = axum::Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                get(move || std::future::ready(axum::Json(discovery.clone()))),
+            )
+            .route(
+                "/jwks",
+                get(move || std::future::ready(axum::Json(jwks.clone()))),
+            )
+            .route(
+                "/token",
+                post(move || std::future::ready(axum::Json(tokens.clone()))),
+            );
+        tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
+
+        let typed = format!("http://LOCALHOST:{port}/");
+        let rp = OidcRp::new(
+            crate::config::fold_host_case(&typed, &typed.parse().unwrap()),
+            testkit::CLIENT_ID.into(),
+            "secret".into(),
+            "https://console.test/auth/callback".into(),
+        );
+        let claims = rp
+            .exchange_and_verify("code", "verifier", "NONCE")
+            .await
+            .expect("discovery echo and iss both match the stored issuer");
+        assert_eq!(claims.sub, "ops-operator");
+    }
 }
