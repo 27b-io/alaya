@@ -80,7 +80,7 @@ The one retrieval tool. Mode selects the algorithm.
 | `memory_type` | string | | Restrict to one of the 4 types. |
 | `encoding_context` | object | | Context-similarity reranking — pass the same shape used when storing. |
 | `include_superseded` | bool | `false` | Set to `true` to see history of resolved contradictions. |
-| `min_trust_score` | number | | Drop results below this provenance trust score. |
+| `min_trust_score` | number | | `hybrid` and `similar` only: keep only memories whose stored `provenance.trust_score` is at least this value. A memory with no stored trust score is dropped. `hybrid` applies it to every candidate pool (vector, tag and graph neighbours). `tag`, `recent` and `scan` ignore it. |
 | `cursor` | number | | `recent` mode pagination — pass `next_cursor` from the previous response. |
 
 **Modes:**

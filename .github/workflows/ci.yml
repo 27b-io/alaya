@@ -33,8 +33,9 @@ jobs:
           cargo build -p alaya-backends --target wasm32-unknown-unknown
           cargo build -p alaya-core --target wasm32-unknown-unknown
 
-  # Compare-and-set against a real Qdrant: the two-process races in
-  # qdrant_cas_real are #[ignore]d without a server, so they only count here.
+  # Tests against a real Qdrant: the two-process races in qdrant_cas_real and
+  # the min_trust_score filter in qdrant_trust_real are #[ignore]d without a
+  # server, so they only count here.
   qdrant-races:
     runs-on: ubuntu-latest
     services:
@@ -62,6 +63,10 @@ jobs:
         env:
           QDRANT_TEST_URL: http://localhost:6333
         run: cargo test -p alaya-backends --test qdrant_cas_real -- --include-ignored --test-threads=1
+      - name: min_trust_score filter
+        env:
+          QDRANT_TEST_URL: http://localhost:6333
+        run: cargo test -p alaya-core --test qdrant_trust_real -- --include-ignored
 
   audit:
     runs-on: ubuntu-latest

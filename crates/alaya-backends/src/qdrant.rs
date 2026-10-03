@@ -753,9 +753,11 @@ fn build_filter(filter: &PayloadFilter) -> Value {
     // after retrieval, not at the Qdrant filter level. Qdrant's nested payload
     // filtering for "field does not exist" is unreliable without explicit indexes.
 
+    // `provenance` is a top-level payload key (see memory_to_payload), not
+    // nested under `metadata`. A point with no stored trust_score never matches.
     if let Some(min_trust) = filter.min_trust_score {
         must.push(json!({
-            "key": "metadata.provenance.trust_score",
+            "key": "provenance.trust_score",
             "range": { "gte": min_trust }
         }));
     }
@@ -2046,9 +2048,10 @@ mod tests {
             min_trust_score: Some(0.5),
             ..Default::default()
         };
-        let filter = build_filter(&f);
-        let must = filter["must"].as_array().unwrap();
-        assert!(must.iter().any(|c| c.get("range").is_some()));
+        assert_eq!(
+            build_filter(&f),
+            json!({"must": [{"key": "provenance.trust_score", "range": {"gte": 0.5}}]})
+        );
     }
 
     #[test]
