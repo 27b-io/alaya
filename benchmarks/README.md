@@ -282,12 +282,21 @@ confidence interval: `95% CI [0.971, 0.993]; paired McNemar p≈5.5e-10 (36 ques
 
 ## Continuous integration
 
-> A reduced run (`--stratified 50`) runs in CI on a schedule against an
-> ephemeral stack. It gates on hit-rate@5 not regressing below `0.95`.
+No CI job runs this benchmark. [`ci.yml`](../.github/workflows/ci.yml) builds and
+tests the code; it never starts a bench stack or runs `longmemeval_bench.py`. Every
+number in the [results table](#results) comes from a deliberate manual run, with its
+provenance recorded beside it.
 
-CI does **not** assert the headline number — at `n=50` the confidence interval
-is too wide (≈ ±6–7 pp) to publish a decimal, and the full 500-question run is
-manual (~6 h). The scheduled stratified run exists to **catch regressions**: a
-retrieval change that drops hit-rate@5 below the floor fails the gate. The
-[results table](#results) above is populated only by a deliberate full run, with
-its provenance recorded alongside it.
+## Ranking changes
+
+This harness cannot judge a ranking change on its own. It stores every session as a
+`reference` memory stamped with the ingestion time, and keeps the session's real date
+only in `metadata.session_date`, which ranking never reads. A change to recency decay,
+memory-type weighting or popularity boosts therefore leaves its numbers unchanged.
+
+A ranking change (scoring, fusion, decay, boosts, rerank) is instead judged on a
+read-only replay of labelled real agent queries against a deployment's live corpus.
+That query set is private, because it is drawn from operators' own memories, so public
+CI cannot run it. A ranking-change PR posts the replay's deltas against `main` (recall@5,
+recall@10 and MRR, each with a 95% confidence interval) on its tracking ticket before
+the change is switched on in a deployment.
