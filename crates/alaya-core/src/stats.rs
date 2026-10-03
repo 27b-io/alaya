@@ -1,7 +1,8 @@
 //! Corpus and contradiction-judge statistics (LAB-6881) behind `GET /stats`.
 //!
-//! Read-only by construction: one vector-store count and two graph
-//! aggregates, nothing else — no access bump, no edge write. Each source
+//! Read-only by construction: one vector-store count, one vector-store scroll
+//! of the window's writes and two graph aggregates, nothing else — no access
+//! bump, no edge write. Each source
 //! degrades on its own: a failed backend nulls its sections and adds an
 //! error note, and never reads as zero.
 
@@ -16,8 +17,14 @@ use crate::service::MemoryService;
 
 const DAY_SECS: f64 = 86_400.0;
 
-/// UTC days in the `judged_per_day` series, today included.
-pub const JUDGED_DAYS: i64 = 14;
+/// UTC days in the `judged_per_day` and `writes.novelty` series, today
+/// included.
+pub const STATS_WINDOW_DAYS: i64 = 14;
+
+/// `writes.novelty` count keys, by the write's `nearest_similarity`:
+/// three similarity bands, below the lowest, and none recorded (no live
+/// neighbour, no search, or a memory stored before the field existed).
+const NOVELTY_BUCKETS: [&str; 5] = ["0.95+", "0.85-0.95", "0.70-0.85", "below_0.70", "none"];
 
 /// Key for an edge never judged (NULL verdict): the backlog.
 const NEVER_JUDGED: &str = "never_judged";
@@ -28,12 +35,13 @@ impl MemoryService {
     pub async fn corpus_stats(&self) -> Value {
         let now = (self.clock)();
         let today = (now / DAY_SECS).floor() as i64;
-        let first_day = today - (JUDGED_DAYS - 1);
-        let (total, graph, contradictions) = futures::join!(
+        let first_day = today - (STATS_WINDOW_DAYS - 1);
+        let since = first_day as f64 * DAY_SECS;
+        let (total, novelty, graph, contradictions) = futures::join!(
             self.vectors.count(),
+            self.vectors.write_novelty(since),
             self.graph.get_stats(),
-            self.graph
-                .get_contradiction_stats(first_day as f64 * DAY_SECS),
+            self.graph.get_contradiction_stats(since),
         );
 
         let mut errors: Vec<String> = Vec::new();
@@ -46,6 +54,10 @@ impl MemoryService {
             }
         };
         let memories = section("vector store", total.map(|n| json!({ "total": n })));
+        let writes = section(
+            "write novelty",
+            novelty.map(|rows| json!({ "novelty": novelty_per_day(&rows, first_day, today) })),
+        );
         let graph = section("graph stats", graph.map(|g| graph_section(&g)));
         let contradictions = section(
             "contradiction stats",
@@ -56,6 +68,7 @@ impl MemoryService {
             "memories": memories,
             "graph": graph,
             "contradictions": contradictions,
+            "writes": writes,
             "errors": errors,
         })
     }
@@ -79,6 +92,47 @@ fn verdict_key(v: Option<&str>) -> Option<&'static str> {
         None => Some(NEVER_JUDGED),
         Some(s) => Verdict::parse(s).map(|v| v.as_str()),
     }
+}
+
+/// A per-day series as `[{date, counts}]`, oldest first. A clock within 13
+/// days of the epoch starts the window before it; those days have no date and
+/// are left out.
+fn dated(per_day: BTreeMap<i64, BTreeMap<&str, usize>>) -> Vec<Value> {
+    per_day
+        .into_iter()
+        .filter_map(|(d, counts)| {
+            let epoch_secs = u64::try_from(d).ok()?.checked_mul(86_400)?;
+            Some(json!({ "date": utc_date_str(epoch_secs), "counts": counts }))
+        })
+        .collect()
+}
+
+fn novelty_bucket(nearest_similarity: Option<f64>) -> &'static str {
+    match nearest_similarity {
+        None => "none",
+        Some(s) if s >= 0.95 => "0.95+",
+        Some(s) if s >= 0.85 => "0.85-0.95",
+        Some(s) if s >= 0.70 => "0.70-0.85",
+        Some(_) => "below_0.70",
+    }
+}
+
+/// Each UTC creation day's writes by novelty bucket, zero-filled. A re-store
+/// recomputes a memory's value but keeps its creation day.
+fn novelty_per_day(rows: &[(f64, Option<f64>)], first_day: i64, today: i64) -> Vec<Value> {
+    let mut per_day: BTreeMap<i64, BTreeMap<&str, usize>> = (first_day..=today)
+        .map(|d| (d, NOVELTY_BUCKETS.iter().map(|b| (*b, 0)).collect()))
+        .collect();
+    for (created_at, nearest) in rows {
+        let day = (created_at / DAY_SECS).floor() as i64;
+        if let Some(n) = per_day
+            .get_mut(&day)
+            .and_then(|c| c.get_mut(novelty_bucket(*nearest)))
+        {
+            *n += 1;
+        }
+    }
+    dated(per_day)
 }
 
 fn contradictions_section(c: &ContradictionStats, first_day: i64, today: i64) -> Value {
@@ -140,15 +194,7 @@ fn contradictions_section(c: &ContradictionStats, first_day: i64, today: i64) ->
             // can put the top list above the total; floor at zero.
             "other": failures.saturating_sub(top_total),
         },
-        // A clock within 13 days of the epoch starts the window before it;
-        // those days have no date and are left out.
-        "judged_per_day": per_day
-            .into_iter()
-            .filter_map(|(d, counts)| {
-                let epoch_secs = u64::try_from(d).ok()?.checked_mul(86_400)?;
-                Some(json!({ "date": utc_date_str(epoch_secs), "counts": counts }))
-            })
-            .collect::<Vec<_>>(),
+        "judged_per_day": dated(per_day),
         "degenerate_reasons": degenerate,
     })
 }
@@ -289,6 +335,25 @@ mod tests {
                 return Err(AlayaError::Storage("qdrant down".into()));
             }
             Ok(1234)
+        }
+        async fn write_novelty(&self, since: f64) -> Result<Vec<(f64, Option<f64>)>> {
+            if self.fail {
+                return Err(AlayaError::Storage("qdrant down".into()));
+            }
+            assert_eq!(since, (TODAY - 13) as f64 * DAY_SECS);
+            let today = TODAY as f64 * DAY_SECS;
+            Ok(vec![
+                (today + 1.0, Some(0.97)),
+                (today + 2.0, Some(0.95)),
+                (today + 3.0, Some(0.90)),
+                (today + 4.0, Some(0.85)),
+                (today + 5.0, Some(0.70)),
+                (today + 6.0, Some(0.3)),
+                (today + 7.0, None),
+                (since, Some(0.5)),
+                // A replica clock a few seconds ahead at midnight: no slot.
+                (today + DAY_SECS, Some(0.99)),
+            ])
         }
         async fn get_all_tags(&self) -> Result<Vec<String>> {
             Ok(vec![])
@@ -655,7 +720,7 @@ mod tests {
         );
 
         let days = c["judged_per_day"].as_array().unwrap();
-        assert_eq!(days.len(), JUDGED_DAYS as usize);
+        assert_eq!(days.len(), STATS_WINDOW_DAYS as usize);
         assert_eq!(days[0]["date"], "2026-09-18");
         assert!(
             days[0]["counts"].get("bogus").is_none(),
@@ -675,13 +740,49 @@ mod tests {
             c["degenerate_reasons"],
             json!({ "contradiction": 0, "supersession": 2, "coexist": 0, "unrelated": 0 })
         );
+
+        let novelty = v["writes"]["novelty"].as_array().unwrap();
+        assert_eq!(novelty.len(), STATS_WINDOW_DAYS as usize);
+        assert_eq!(novelty[0]["date"], "2026-09-18");
+        let bands = |a: usize, b: usize, c: usize, d: usize, n: usize| json!({ "0.95+": a, "0.85-0.95": b, "0.70-0.85": c, "below_0.70": d, "none": n });
+        assert_eq!(
+            novelty[0]["counts"],
+            bands(0, 0, 0, 1, 0),
+            "window start is in"
+        );
+        assert_eq!(novelty[6]["counts"], bands(0, 0, 0, 0, 0), "zero-filled");
+        assert_eq!(
+            novelty[13]["counts"],
+            bands(2, 2, 1, 1, 1),
+            "lower band edges are inclusive; the out-of-window row is left out"
+        );
+    }
+
+    /// Qdrant down nulls both vector sections with a note, never zeros, and
+    /// keeps the graph's.
+    #[tokio::test]
+    async fn vector_store_unavailable_nulls_memories_and_writes() {
+        let (svc, writes, _) = service(true, false);
+        let v = svc.corpus_stats().await;
+
+        assert_eq!(writes.get(), 0);
+        assert!(v["memories"].is_null());
+        assert!(v["writes"].is_null(), "never zeros: {v}");
+        assert!(v["graph"].is_object());
+        let errors = v["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.as_str().unwrap().starts_with("write novelty:"))
+        );
     }
 
     /// A clock at the epoch (the wall clock's pre-1970 fallback) starts the
     /// window 13 days before it. Those days have no date and are left out.
     #[test]
     fn pre_epoch_window_days_are_left_out() {
-        let c = contradictions_section(&sample(), -(JUDGED_DAYS - 1), 0);
+        let c = contradictions_section(&sample(), -(STATS_WINDOW_DAYS - 1), 0);
         let days = c["judged_per_day"].as_array().unwrap();
         assert_eq!(days.len(), 1, "{days:?}");
         assert_eq!(days[0]["date"], "1970-01-01");

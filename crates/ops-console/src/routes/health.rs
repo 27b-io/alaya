@@ -3,7 +3,7 @@
 //! GET only, plain tables, no JS. Renders alaya-server's `GET /stats`: the
 //! answering pod's self-check and failure counters (LAB-4026), the
 //! contradiction judge's verdict mix, stored failures, backlog, daily-cap
-//! usage and the corpus by edge type. A section whose source is down shows
+//! usage, the novelty of each day's writes and the corpus by edge type. A section whose source is down shows
 //! an "unavailable" banner, never zeros, so an outage cannot pass for an
 //! empty corpus; a failing self-check is a banner too.
 
@@ -34,13 +34,23 @@ const VERDICT_ROWS: [(&str, &str, &str); 6] = [
     ("never_judged", "never judged (backlog)", "unjudged"),
 ];
 
-/// Columns of the per-day table, in the server's key names.
-const DAY_COLUMNS: [&str; 5] = [
-    "contradiction",
-    "supersession",
-    "coexist",
-    "unrelated",
-    "unjudged",
+/// Columns of the judged-per-day table: `(the server's key in counts,
+/// heading)`.
+const DAY_COLUMNS: [(&str, &str); 5] = [
+    ("contradiction", "contradiction"),
+    ("supersession", "supersession"),
+    ("coexist", "coexist"),
+    ("unrelated", "unrelated"),
+    ("unjudged", "unjudged"),
+];
+
+/// Columns of the write-novelty table, by nearest-neighbour similarity.
+const NOVELTY_COLUMNS: [(&str, &str); 5] = [
+    ("0.95+", "≥ 0.95"),
+    ("0.85-0.95", "0.85–0.95"),
+    ("0.70-0.85", "0.70–0.85"),
+    ("below_0.70", "< 0.70"),
+    ("none", "none"),
 ];
 
 /// The four classes the judge answers with — the degenerate-reason rows.
@@ -68,6 +78,7 @@ pub async fn pane(
                 {verdicts_card(&s)}
                 {failures_card(&s)}
                 {per_day_card(&s)}
+                {novelty_card(&s)}
                 {degenerate_card(&s)}
                 {corpus_card(&s)}
             </div>
@@ -409,48 +420,7 @@ fn per_day_card(s: &Value) -> impl IntoView + use<> {
     let days = section(s, "contradictions").and_then(|c| c.get("judged_per_day"));
     let body = match days.and_then(Value::as_array) {
         None => Either::Left(unavailable("contradiction stats", "see the errors above")),
-        Some(days) => {
-            let rows = days
-                .iter()
-                .map(|d| {
-                    let counts = d.get("counts");
-                    let cells = DAY_COLUMNS
-                        .iter()
-                        .map(|k| {
-                            let n = count(counts.and_then(|c| c.get(*k)));
-                            view! { <TableCell>{n}</TableCell> }
-                        })
-                        .collect_view();
-                    let date = vs(d, "date");
-                    view! {
-                        <TableRow>
-                            <TableCell>{date}</TableCell>
-                            {cells}
-                        </TableRow>
-                    }
-                })
-                .collect_view();
-            let heads = DAY_COLUMNS
-                .iter()
-                .map(|k| {
-                    let k = k.to_string();
-                    view! { <TableHead>{k}</TableHead> }
-                })
-                .collect_view();
-            Either::Right(view! {
-                <TableWrapper>
-                    <Table>
-                        <TableHeader>
-                            <TableRow>
-                                <TableHead>"UTC day"</TableHead>
-                                {heads}
-                            </TableRow>
-                        </TableHeader>
-                        <TableBody>{rows}</TableBody>
-                    </Table>
-                </TableWrapper>
-            })
-        }
+        Some(days) => Either::Right(day_table(days, &DAY_COLUMNS)),
     };
     view! {
         <Card>
@@ -458,6 +428,71 @@ fn per_day_card(s: &Value) -> impl IntoView + use<> {
                 <CardTitle>"Pairs judged per day"</CardTitle>
                 <CardDescription>
                     "Last 14 UTC days by the verdict each edge carries now, from judged_at. A re-judged edge counts once, on its latest day."
+                </CardDescription>
+            </CardHeader>
+            <CardContent>{body}</CardContent>
+        </Card>
+    }
+}
+
+/// `[{date, counts}]` as a table: one row per UTC day, one column per count.
+fn day_table(
+    days: &[Value],
+    columns: &'static [(&'static str, &'static str)],
+) -> impl IntoView + use<> {
+    let rows = days
+        .iter()
+        .map(|d| {
+            let counts = d.get("counts");
+            let cells = columns
+                .iter()
+                .map(|(k, _)| {
+                    let n = count(counts.and_then(|c| c.get(*k)));
+                    view! { <TableCell>{n}</TableCell> }
+                })
+                .collect_view();
+            let date = vs(d, "date");
+            view! {
+                <TableRow>
+                    <TableCell>{date}</TableCell>
+                    {cells}
+                </TableRow>
+            }
+        })
+        .collect_view();
+    let heads = columns
+        .iter()
+        .map(|(_, label)| view! { <TableHead>{*label}</TableHead> })
+        .collect_view();
+    view! {
+        <TableWrapper>
+            <Table>
+                <TableHeader>
+                    <TableRow>
+                        <TableHead>"UTC day"</TableHead>
+                        {heads}
+                    </TableRow>
+                </TableHeader>
+                <TableBody>{rows}</TableBody>
+            </Table>
+        </TableWrapper>
+    }
+}
+
+// ─── Write novelty ──────────────────────────────────────────────────────────
+
+fn novelty_card(s: &Value) -> impl IntoView + use<> {
+    let days = section(s, "writes").and_then(|w| w.get("novelty"));
+    let body = match days.and_then(Value::as_array) {
+        None => Either::Left(unavailable("write novelty", "see the errors above")),
+        Some(days) => Either::Right(day_table(days, &NOVELTY_COLUMNS)),
+    };
+    view! {
+        <Card>
+            <CardHeader>
+                <CardTitle>"Write novelty"</CardTitle>
+                <CardDescription>
+                    "Memories created per UTC day over the last 14 days, by their similarity to the nearest live memory when stored. None means no live neighbour was found, no neighbour search ran (read-only or failed), or the memory predates the measure. A re-store recomputes the value and keeps the creation day."
                 </CardDescription>
             </CardHeader>
             <CardContent>{body}</CardContent>

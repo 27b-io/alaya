@@ -545,7 +545,7 @@ fn tool_schemas() -> Value {
     json!([
         {
             "name": "store_memory",
-            "description": "Store a new memory for future semantic retrieval. Content is vectorized for similarity search. Salience scoring and contradiction detection are computed automatically. Returns the new memory's full 64-char content_hash — the identifier used by get_memory, memory_supersede, delete_memory, and relation.",
+            "description": "Store a new memory for future semantic retrieval. Content is vectorized for similarity search. Salience scoring and contradiction detection are computed automatically. Returns the new memory's full 64-char content_hash — the identifier used by get_memory, memory_supersede, delete_memory, and relation — and `neighbours`: up to 5 nearest live memories ({content_hash, similarity, memory_type, summary}), absent when no neighbour search ran.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -791,22 +791,24 @@ mod tests {
         headers
     }
 
-    /// A caller-set supersession marker is -32602 and never reaches the
-    /// worker, so nothing is stored (LAB-6891).
+    /// A caller-set supersession marker or novelty value is -32602 and never
+    /// reaches the worker, so nothing is stored (LAB-6891).
     #[tokio::test]
     async fn store_memory_refuses_reserved_metadata_key() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let handle = ServiceHandle { tx };
-        let args = json!({
-            "content": "live fact",
-            "metadata": {"superseded_by": "b".repeat(64)},
-        });
-        let (code, msg) = dispatch_tool("store_memory", args, &handle, AuthPrincipal::Static)
-            .await
-            .expect_err("reserved key must be refused");
-        assert_eq!(code, -32602);
-        assert!(msg.contains("metadata.superseded_by"), "{msg}");
-        assert!(rx.try_recv().is_err(), "nothing may be dispatched");
+        for key in ["superseded_by", "nearest_similarity"] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let handle = ServiceHandle { tx };
+            let args = json!({
+                "content": "live fact",
+                "metadata": {key: "b".repeat(64)},
+            });
+            let (code, msg) = dispatch_tool("store_memory", args, &handle, AuthPrincipal::Static)
+                .await
+                .expect_err("reserved key must be refused");
+            assert_eq!(code, -32602);
+            assert!(msg.contains(&format!("metadata.{key}")), "{msg}");
+            assert!(rx.try_recv().is_err(), "nothing may be dispatched");
+        }
     }
 
     #[test]

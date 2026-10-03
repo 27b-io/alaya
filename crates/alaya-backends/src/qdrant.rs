@@ -844,6 +844,9 @@ fn parse_payload(payload: &Value) -> Option<Memory> {
             }),
         supersession_log: payload.get(SUPERSESSION_LOG).cloned().map(log_entries),
         supersession_reason: payload.get(SUPERSESSION_REASON).cloned(),
+        // Write-only on `Memory`: only the store path sets it, from its own
+        // search, so a parsed copy written back can never carry a stale one.
+        nearest_similarity: None,
     })
 }
 
@@ -870,7 +873,9 @@ fn top_level_payload(updates: &MetadataUpdate) -> serde_json::Map<String, Value>
 
 /// Build the payload JSON for upsert from a Memory struct. Never writes
 /// `supersession_log` or `supersession_reason`: on a re-store `carry_over`
-/// alone keeps them.
+/// alone keeps them. `nearest_similarity` is written from the `Memory`, which
+/// only the server's store path sets, and never carried over: every store
+/// recomputes it.
 fn memory_to_payload(memory: &Memory) -> Value {
     let mut payload = json!({
         "content": memory.content,
@@ -902,9 +907,19 @@ fn memory_to_payload(memory: &Memory) -> Value {
     if let Some(ref se) = memory.summary_embedding {
         payload["summary_embedding"] = json!(se);
     }
+    if let Some(ns) = memory.nearest_similarity {
+        payload[NEAREST_SIMILARITY] = json!(ns);
+    }
 
     payload
 }
+
+/// Payload key: the similarity of a memory's nearest live neighbour when it
+/// was last stored (see `Memory::nearest_similarity`). Server-maintained.
+const NEAREST_SIMILARITY: &str = "nearest_similarity";
+
+/// Points per page of the `write_novelty` scroll.
+const NOVELTY_PAGE: usize = 1000;
 
 /// Payload key: the reversed supersessions of a memory, oldest first (see
 /// `VectorStorage::reverse_supersession`). Server-maintained.
@@ -1707,6 +1722,58 @@ impl VectorStorage for QdrantClient {
     }
 
     #[tracing::instrument(skip(self))]
+    async fn write_novelty(&self, since: f64) -> Result<Vec<(f64, Option<f64>)>> {
+        let mut rows = Vec::new();
+        let mut offset: Option<Value> = None;
+        loop {
+            let mut body = json!({
+                "limit": NOVELTY_PAGE,
+                "filter": {"must": [{"key": "created_at", "range": {"gte": since}}]},
+                "with_payload": ["created_at", NEAREST_SIMILARITY],
+                "with_vector": false,
+            });
+            if let Some(off) = offset.take() {
+                body["offset"] = off;
+            }
+
+            let resp = self
+                .client
+                .post(format!(
+                    "{}/collections/{}/points/scroll",
+                    self.base_url, self.collection
+                ))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
+            if !resp.status().is_success() {
+                return Err(qdrant_error(resp).await);
+            }
+            let data: QdrantResponse<ScrollResponse> = resp
+                .json()
+                .await
+                .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
+            // A page with no result is a protocol violation, not an empty
+            // window: fail rather than report zero writes.
+            let page = data
+                .result
+                .ok_or_else(|| AlayaError::Storage("Qdrant scroll returned no result".into()))?;
+
+            rows.extend(page.points.iter().filter_map(|p| {
+                let payload = p.get("payload")?;
+                Some((
+                    payload.get("created_at")?.as_f64()?,
+                    payload.get(NEAREST_SIMILARITY).and_then(Value::as_f64),
+                ))
+            }));
+            match page.next_page_offset {
+                Some(next) if !next.is_null() => offset = Some(next),
+                _ => return Ok(rows),
+            }
+        }
+    }
+
+    #[tracing::instrument(skip(self))]
     async fn get_all_tags(&self) -> Result<Vec<String>> {
         // Scroll the tag collection to get all tags
         let mut all_tags = Vec::new();
@@ -2114,6 +2181,7 @@ mod tests {
             summary_embedding: None,
             supersession_log: None,
             supersession_reason: None,
+            nearest_similarity: None,
         };
         let payload = memory_to_payload(&mem);
         assert_eq!(payload["content"], "test content");
@@ -2153,6 +2221,25 @@ mod tests {
         assert_eq!(mem.supersession_reason, Some(json!("wrong merge")));
         let written = memory_to_payload(&mem);
         assert!(written.get("supersession_reason").is_none(), "{written}");
+    }
+
+    /// Written from the store's own value, never read back: a parsed copy
+    /// re-stored as-is writes none rather than a stale one.
+    #[test]
+    fn nearest_similarity_is_written_by_the_store_and_never_read_back() {
+        let payload = json!({
+            "content": "c",
+            "content_hash": "c".repeat(64),
+            "nearest_similarity": 0.87,
+        });
+        let mem = parse_payload(&payload).expect("parses");
+        assert_eq!(mem.nearest_similarity, None);
+        assert!(memory_to_payload(&mem).get("nearest_similarity").is_none());
+        let fresh = Memory {
+            nearest_similarity: Some(0.42),
+            ..mem
+        };
+        assert_eq!(memory_to_payload(&fresh)["nearest_similarity"], json!(0.42));
     }
 
     #[test]

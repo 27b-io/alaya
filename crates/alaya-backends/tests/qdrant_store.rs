@@ -60,6 +60,7 @@ fn incoming() -> Memory {
         summary_embedding: None,
         supersession_log: None,
         supersession_reason: None,
+        nearest_similarity: None,
     }
 }
 
@@ -295,6 +296,35 @@ async fn store_keeps_the_log_and_drops_a_stale_caller_marker_on_restore() {
         json!({"note": "kept"}),
         "the caller's marker is dropped, its other metadata kept"
     );
+}
+
+/// `nearest_similarity` is server-computed per store, never carried over: a
+/// re-store writes the value it just computed, and one that computed none
+/// (search skipped or failed) leaves no stale value behind.
+#[tokio::test]
+async fn restore_recomputes_nearest_similarity() {
+    for (fresh, want) in [(Some(0.42), json!(0.42)), (None, Value::Null)] {
+        let mut stored = existing_payload();
+        stored["nearest_similarity"] = json!(0.99);
+        let (server, fake) = fake_with(Some(stored)).await;
+        let mut memory = incoming();
+        memory.nearest_similarity = fresh;
+
+        client_for(&server)
+            .store(&memory, StoreMode::Upsert)
+            .await
+            .expect("store succeeds");
+
+        let point = fake.point(ID).unwrap();
+        assert_eq!(
+            point
+                .get("nearest_similarity")
+                .cloned()
+                .unwrap_or(Value::Null),
+            want,
+            "{point}"
+        );
+    }
 }
 
 /// Existence is decided on the raw point, not on whether it parses as a
