@@ -172,11 +172,13 @@ pub trait VectorStorage {
         limit: usize,
         filters: Option<PayloadFilter>,
     ) -> Result<Vec<ScoredMemory>>;
+    /// `memory_type`, when set, is an exact match applied before `limit`.
     async fn search_by_tags(
         &self,
         tags: &[&str],
         match_all: bool,
         limit: usize,
+        memory_type: Option<&str>,
     ) -> Result<Vec<ScoredMemory>>;
     async fn search_similar_tags(&self, tag_embedding: &[f32], limit: usize)
     -> Result<Vec<String>>;

@@ -458,14 +458,6 @@ pub async fn browse(
             ),
         )
     });
-    // Hybrid hands `memory_type` to the vector search only; its keyword and
-    // graph candidates are not type-filtered upstream.
-    let partial_type = (view.mode == Mode::Hybrid && !view.memory_type.is_empty()).then(|| {
-        notice(
-            "partial",
-            "In hybrid mode the server applies the type filter to semantic matches only; keyword and graph matches of other types can still appear.".into(),
-        )
-    });
 
     let (results, pager) = match view.missing_input() {
         Some(ask) => (
@@ -506,7 +498,6 @@ pub async fn browse(
             </Card>
 
             {ignored}
-            {partial_type}
             <div class="text-sm text-muted-foreground">{summary}</div>
             <TableWrapper>
                 <Table>

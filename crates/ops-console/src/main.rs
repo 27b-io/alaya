@@ -1969,7 +1969,10 @@ mod tests {
         assert!(html.contains("name=\"q\"") && !html.contains("name=\"tags\""));
 
         let (_, html) = get_page(&state, &cookie, "/alaya?mode=hybrid&q=x&memory_type=task").await;
-        assert!(html.contains("semantic matches only"), "{html}");
+        assert!(
+            !html.contains("partial") && !html.contains("not applied"),
+            "hybrid applies the type filter in full: {html}"
+        );
 
         let (_, html) = get_page(&state, &cookie, "/alaya?mode=recent&page=3&cursor=5").await;
         assert!(

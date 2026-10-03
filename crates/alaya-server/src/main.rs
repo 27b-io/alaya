@@ -4814,6 +4814,7 @@ mod wedge_tests {
             _tags: &[&str],
             _match_all: bool,
             _limit: usize,
+            _mt: Option<&str>,
         ) -> Result<Vec<ScoredMemory>> {
             unimplemented!()
         }
