@@ -482,18 +482,27 @@ SECRET_TOKENS = (
 # A key name that names a secret: API_KEY, client_secret, x-api-key. The
 # look-behind starts it at the head of a name and the possessive `++` never
 # gives a character back, so a long run costs linear time, not quadratic.
-SECRET_KEY_NAME = (
+SECRET_NAME = (
     r"(?<![\w.-])(?=[\w.-]*?(?:api[_-]?key|account[_-]?key|[_-]key|token|secret"
     r"|passw(?:or)?d|passphrase|pwd|credential))[\w.-]++"
-    r"[\"']?\]?\s*(?:=>|[:=])\s*[\"']?"  # also os.environ['X_KEY'] = '...'
 )
+SECRET_KEY_NAME = (  # also os.environ['X_KEY'] = '...'
+    rf"{SECRET_NAME}[\"']?\]?\s*(?:=>|[:=])\s*[\"']?"
+)
+# What a URL may hold; a URL ends at the first character outside it.
+URL_CHAR = r"[^\s<>\"'`)\]]"
+# A secret-named key whose separator ends a URL: its value lies outside the
+# URL, so a URL that took the key would leave the value with no key in front.
+# A key whose value stays inside (`?api_key=v`, a password with `==` padding
+# before `@host`) ends nothing and stays in the URL.
+URL_ENDING_KEY = rf"{SECRET_NAME}[\"']?\]?\s*+(?:=>|[:=])(?!{URL_CHAR})"
 # A value's characters, and a placeholder a rule before the key rules wrote.
 VALUE_CHAR = r"[^\s\"'<>,;]"
 PLACEHOLDER = r"(?:<(?:secret|url|email|ip)>)"
 # A value that ran into the next key's name took that key's separator with it,
 # leaving the next value with no key in front: the key rules take it too.
-NEXT_VALUES = (
-    r"(?:(?:(?<=[:=])\s*+|\s++(?:=>|[:=])\s*+)[\"']?"
+NEXT_VALUES = (  # `>?`: the separator may be `=>`, with only its `=` taken
+    r"(?:(?:(?<=[:=])>?\s*+|\s++(?:=>|[:=])\s*+)[\"']?"
     rf"(?:{VALUE_CHAR}|{PLACEHOLDER})++)*+"
 )
 # (class, pattern). A `keep` group survives in front of the placeholder.
@@ -506,10 +515,12 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
             re.S,
         ),
     ),
-    (  # a scheme may follow a dash, as in ${VAR:-redis://...}
+    (  # a scheme may follow a dash, as in ${VAR:-redis://...}; a URL stops
+        # before a secret-named key that ends it (`.../DB_PASSWORD: x`)
         "url",
         re.compile(
-            r"(?<![a-z0-9+.-])(?P<keep>[0-9+.-]*+)[a-z][a-z0-9+.-]*+://[^\s<>\"'`)\]]+",
+            r"(?<![a-z0-9+.-])(?P<keep>[0-9+.-]*+)[a-z][a-z0-9+.-]*+://"
+            rf"(?:(?!{URL_ENDING_KEY}){URL_CHAR})+",
             re.I,
         ),
     ),

@@ -402,6 +402,23 @@ def check_scrub() -> None:
     for text in ("echo TOKEN=" + "abcdefgh(1)>out.txt", 'TOKEN="--key=,abcdef"'):
         out = s(text)
         assert s(out) == out and s.leaks(out) == [], out
+    # A URL cannot swallow the secret-named key after it, leaving the value
+    # with no key in front of it.
+    for text in (
+        "API_TOKEN=abcdefgh/http://intra/DB_PASSWORD: " + "Pa55w0rd99",
+        "see http://intra/DB_PASSWORD : " + "Pa55w0rd99",
+        "https://h.example.com/p?api_key=" + "Pa55w0rd99" + "&x=1",
+        "redis://cache:6379/0?password=" + "Pa55w0rd99",
+        "token=abcdefgh/password=>" + "Pa55w0rd99",
+        "API_TOKEN=abcdefgh/http://intraDB_PASSWORD=>" + "Pa55w0rd99",
+        # A key inside the URL stays in it, even one that looks like a key:
+        # base64 padding after `pwd` in a password, a port after a host.
+        "s3://user:ae8qx3WuOWbJxnvPZpwdAhUKEh==@db.example.local:5432/" + "Pa55w0rd99",
+        "proxy_pass http://yg.pwdcqm.svc:17368/" + "Pa55w0rd99",
+    ):
+        out = s(text)
+        assert "Pa55w0rd99" not in out, (text, out)
+        assert s(out) == out and s.leaks(out) == [], out
     # A secret-named value cannot swallow the next secret-named key.
     out = s(':auth_token => login(password: "' + "Zx9Qw8Er7Ty6" + '")')
     assert "Zx9Qw8Er7Ty6" not in out and s.leaks(out) == [], out
