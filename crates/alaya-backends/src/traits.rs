@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 
 use alaya_types::{
-    Result,
+    AlayaError, Result,
     graph::{
         CoAccessPair, Contradiction, ContradictionQuery, ContradictionRef, ContradictionStats,
         Direction, Edge, EdgeMeta, EdgeVerdict, GraphStats, Neighbor, Resolution,
@@ -241,6 +241,24 @@ pub trait EmbeddingProvider {
     /// every semantic search will fail, so a health report must not say
     /// `healthy` without consulting it (LAB-4025).
     async fn health(&self) -> Result<HealthStatus>;
+    /// One embed round-trip that no cache may answer (the self-check). An
+    /// endpoint can pass `health` and still fail every embed; a cached vector
+    /// proves nothing about either, so caching decorators forward this to
+    /// the provider they wrap. A 200 with no vector, or one of the wrong
+    /// size, is a failure: every fresh store and cold search would fail on
+    /// it while the cache kept the check's own search green.
+    async fn probe(&self, text: &str) -> Result<()> {
+        let vectors = self.embed_batch(&[text], PromptName::Query).await?;
+        match vectors.as_slice() {
+            [v] if v.len() == self.dimensions() => Ok(()),
+            _ => Err(AlayaError::Embedding(format!(
+                "probe expected 1 vector of {} dims, got {} ({:?} dims)",
+                self.dimensions(),
+                vectors.len(),
+                vectors.iter().map(Vec::len).collect::<Vec<_>>(),
+            ))),
+        }
+    }
 }
 
 /// Graph operations backend (calls alaya-bridge typed RPC).

@@ -114,13 +114,19 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" \
   "vector_health": { "status": "green" },
   "graph_health": { "status": "healthy" },
   "embedding_health": { "status": "healthy" },
-  "total_memories": 1247
+  "total_memories": 1247,
+  "pod": { "name": "alaya-server-7d9f", "started_at": 1790990000, "...": "see below" }
 }
 ```
 
+`pod` is the answering pod's self-check and failure counters, the same
+section `GET /stats` carries; see [Self-check and failure
+counters](#self-check-and-failure-counters).
+
 Same HTTP-code mapping as `/health`. `status` additionally folds in the
-embedding probe: with the embedding endpoint down, `/health/detail` reports
-`degraded` and `embedding_health` carries the reason —
+embedding probe and the self-check: with the embedding endpoint down, or the
+latest self-check failed, `/health/detail` reports `degraded`. A dead endpoint
+puts the reason in `embedding_health` —
 
 ```json
   "status": "degraded",
@@ -132,6 +138,9 @@ embedding probe: with the embedding endpoint down, `/health/detail` reports
 
 A stalled worker still reports `unhealthy` (503) regardless: an embedding
 outage is not fixed by a restart, a wedged worker is.
+
+The embedding probe asks the endpoint's readiness route; an endpoint can pass
+it and still fail every embed. The self-check is what catches that case.
 
 > [!NOTE]
 > These fields were served by the unauthenticated `/health` in earlier builds.
@@ -579,6 +588,16 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" http://localhost:3001/stats
     ]
   },
   "judge_daily_cap": {"cap": 1000, "admitted_today": 41, "utc_day": "2026-10-01"},
+  "pod": {
+    "name": "alaya-server-7d9f",
+    "started_at": 1790990000,
+    "failures": {"embedding": 3, "rerank": 11, "store": 2},
+    "selfcheck": {
+      "enabled": true,
+      "consecutive_failures": 0,
+      "last": {"at": 1791000000, "ok": true, "failing_step": null, "error": null, "rerank": "ran", "elapsed_ms": 812}
+    }
+  },
   "errors": []
 }
 ```
@@ -594,11 +613,51 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" http://localhost:3001/stats
 | `writes.novelty` | The last 14 UTC days, oldest first, each zero-filled: memories created that day, counted by the `nearest_similarity` recorded when they were stored (see `POST /store`). Bands are lower-inclusive: `0.95+` is ≥ 0.95, `0.85-0.95` is ≥ 0.85 and < 0.95, `0.70-0.85` is ≥ 0.70 and < 0.85. `none` is a memory with no value: no live neighbour, no search (read-only principal, failed search), or stored before the server recorded novelty. Superseded memories count; a write `dedup_threshold` skipped does not, nor does a deleted memory. A re-store recomputes the value but keeps the memory's creation day. |
 | `judge_daily_cap.cap` | `JUDGE_DAILY_CAP`, or `null` when no judge is configured. |
 | `judge_daily_cap.admitted_today`, `utc_day` | Store-path judge calls billed today (UTC) **by the process that answered** — the counter is per process, so with several replicas each reports its own. `POST /backfill/contradictions` is not counted. |
+| `pod` | The answering pod's self-check and failure counters; see [Self-check and failure counters](#self-check-and-failure-counters). Present on a timed-out reply too. |
 | `errors` | One note per failed source. A section whose source failed is `null` — `memories` and `writes` for the vector store, `graph` and `contradictions` for the graph — and never zeros; the call still answers `200`. |
 
 Two different confidences exist on a pair and must not be read as one: `verdict_confidence` (on `POST /contradictions`) is the **judge's** confidence in its verdict, while `confidence` is the lexical **detector's** score for the edge when it was written. This endpoint aggregates neither; it counts verdicts and reasons only.
 
 Every aggregate is one read-only pass over the `CONTRADICTS` relationship, using property tests and `indegree()` only (no per-edge pattern predicates). `writes` is one paged vector-store scroll over the window's memories, reading two payload fields each. Every section is computed fresh per call, so poll it at human rates, not as a metrics scrape. One call runs at a time per process: a call while one is in flight answers `{"success": false, "error": "stats already running"}`. A reply past the command deadline is `{"success": false, "error_kind": "timeout"}`.
+
+### Self-check and failure counters
+
+The `pod` section of `GET /stats` and `GET /health/detail`. Every
+`alaya-server` process counts its own failures from the moment it starts, so
+the section names the pod (`name`, from `HOSTNAME`, which Kubernetes sets to
+the pod name) and its start time (`started_at`, Unix seconds). A restart zeroes
+the counts, and with several replicas each call shows the pod that answered.
+
+| Field | Meaning |
+|:--|:--|
+| `failures.embedding` | Embedding calls that failed. Cache hits are not calls and never count. |
+| `failures.rerank` | Hybrid searches whose rerank errored, timed out or returned the wrong number of scores, and so served RRF order. The search itself succeeded. |
+| `failures.store` | Stores that failed on a backend or hit the command deadline. A request refused as invalid (`Invalid request parameters`) is not counted. |
+| `selfcheck.enabled` | Whether `SELFCHECK_QUERY` and `SELFCHECK_EXPECT_HASH` are set. |
+| `selfcheck.consecutive_failures` | Failed checks since the last pass. |
+| `selfcheck.last` | The latest check, or `null` before the first. `at` is Unix seconds; `ok`; `failing_step` is `null` on a pass, else one of the steps below; `error` is the failure detail; `rerank` is `ran`, `fell_back`, `no_candidates`, `not_configured`, or `null` when the search never finished; `elapsed_ms` covers the whole check. |
+
+With the self-check enabled, each pod checks at startup and then every
+`SELFCHECK_INTERVAL_SECS` (default 300, minimum 30). It embeds
+`SELFCHECK_QUERY` with no cache in the way, then runs it as a read-only hybrid
+search (no access-count bump, no Hebbian write) and passes when the memory
+`SELFCHECK_EXPECT_HASH` is in the top 10, all within 10 seconds. Pick a stable
+`decision` or `reference` memory and a query that finds it. Setting only one of
+the two variables, a hash that is not 64 lowercase hex characters, or an
+interval under 30 refuses boot.
+
+| `failing_step` | Meaning |
+|:--|:--|
+| `embed` | The embedder could not embed the query: down, erroring, past the budget, or answering without exactly one vector of `EMBEDDING_DIMENSIONS`. |
+| `search` | The hybrid search failed for another reason (vector store, for example). |
+| `rerank` | The search ran but the reranker fell back to RRF order; `error` names the cause (`error`, `timed out` or `score count mismatch`). The check fails even if the memory was found: a reranker that is always down costs ranking quality, and nothing else would say so. |
+| `expect` | The search ran but the expected memory was not in the top 10: superseded, deleted, or ranked out. |
+| `worker` | The service worker did not take or answer the check (overloaded, wedged or gone). |
+
+A failed check logs one `WARN` on target `alaya_server::selfcheck` with
+`step`, `error`, `rerank`, `consecutive_failures` and `elapsed_ms`. `/health`
+never runs or reads the self-check: a probe that embeds would restart every pod
+during an embedding outage, and a restart does not fix the embedder.
 
 ## `POST /mcp`
 

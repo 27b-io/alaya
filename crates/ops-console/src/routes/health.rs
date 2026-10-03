@@ -1,10 +1,11 @@
 //! Ālaya health pane (LAB-6881) — `/alaya/health`.
 //!
 //! GET only, plain tables, no JS. Renders alaya-server's `GET /stats`: the
+//! answering pod's self-check and failure counters (LAB-4026), the
 //! contradiction judge's verdict mix, stored failures, backlog, daily-cap
 //! usage, the novelty of each day's writes and the corpus by edge type. A section whose source is down shows
 //! an "unavailable" banner, never zeros, so an outage cannot pass for an
-//! empty corpus.
+//! empty corpus; a failing self-check is a banner too.
 
 use axum::extract::State;
 use axum::response::Html;
@@ -14,7 +15,7 @@ use leptos::prelude::*;
 use serde_json::Value;
 
 use crate::error::AppError;
-use crate::routes::vs;
+use crate::routes::{fmt_epoch, vs};
 use crate::session::{Session, take_flash};
 use crate::state::AppState;
 use crate::ui::*;
@@ -72,6 +73,7 @@ pub async fn pane(
         }),
         Ok(s) => Either::Right(view! {
             <div class="space-y-6">
+                {pod_card(&s)}
                 {summary_card(&s)}
                 {verdicts_card(&s)}
                 {failures_card(&s)}
@@ -116,6 +118,120 @@ fn section<'a>(s: &'a Value, key: &str) -> Option<&'a Value> {
 
 fn link(href: String, text: String) -> impl IntoView + use<> {
     view! { <a class="text-primary underline-offset-4 hover:underline" href=href>{text}</a> }
+}
+
+// ─── Pod: self-check and failure counters (LAB-4026) ─────────────────────────
+
+/// Failure counters in display order: `(key in pod.failures, label)`.
+const FAILURE_ROWS: [(&str, &str); 3] = [
+    ("embedding", "embedding calls"),
+    ("rerank", "rerank fallbacks to RRF order"),
+    ("store", "stores"),
+];
+
+fn pod_card(s: &Value) -> impl IntoView + use<> {
+    let Some(pod) = section(s, "pod") else {
+        return Either::Left(view! {
+            <Card>
+                <CardHeader>
+                    <CardTitle>"Self-check"</CardTitle>
+                </CardHeader>
+                <CardContent>
+                    {unavailable("self-check and failure counters", "this alaya-server does not report them")}
+                </CardContent>
+            </Card>
+        });
+    };
+    let sc = pod.get("selfcheck");
+    let enabled = sc.and_then(|c| c.get("enabled")).and_then(Value::as_bool);
+    let last = sc.and_then(|c| c.get("last")).filter(|l| l.is_object());
+    let streak = count(sc.and_then(|c| c.get("consecutive_failures")));
+    let state = match (enabled, last) {
+        (Some(false), _) => Either::Left(view! {
+            <p class="text-sm">
+                <span class=badge(BadgeKind::Muted)>"disabled"</span>
+                " SELFCHECK_QUERY and SELFCHECK_EXPECT_HASH are unset on this pod."
+            </p>
+        }),
+        (_, None) => Either::Left(view! {
+            <p class="text-sm">
+                <span class=badge(BadgeKind::Muted)>"not run yet"</span>
+                " The first check runs at startup."
+            </p>
+        }),
+        (_, Some(l)) if l.get("ok").and_then(Value::as_bool) == Some(true) => {
+            let msg = format!(
+                "Last run {} UTC; rerank: {}.",
+                fmt_epoch(l["at"].as_f64().unwrap_or(0.0)),
+                vs(l, "rerank"),
+            );
+            Either::Right(Either::Left(view! {
+                <p class="text-sm">
+                    <span class=badge(BadgeKind::Success)>"passing"</span>
+                    " "{msg}
+                </p>
+            }))
+        }
+        (_, Some(l)) => {
+            let msg = format!(
+                "Self-check failing at step {}: {} ({} consecutive; last run {} UTC).",
+                vs(l, "failing_step"),
+                vs(l, "error"),
+                streak,
+                fmt_epoch(l["at"].as_f64().unwrap_or(0.0)),
+            );
+            Either::Right(Either::Right(view! {
+                <p class="text-sm" role="alert">
+                    <span class=badge(BadgeKind::Destructive)>"failing"</span>
+                    " "{msg}
+                </p>
+            }))
+        }
+    };
+    let rows = FAILURE_ROWS
+        .iter()
+        .map(|(key, label)| {
+            let (label, n) = (
+                label.to_string(),
+                count(pod.get("failures").and_then(|f| f.get(*key))),
+            );
+            view! {
+                <TableRow>
+                    <TableCell>{label}</TableCell>
+                    <TableCell>{n}</TableCell>
+                </TableRow>
+            }
+        })
+        .collect_view();
+    let (name, started) = (
+        vs(pod, "name"),
+        fmt_epoch(pod.get("started_at").and_then(Value::as_f64).unwrap_or(0.0)),
+    );
+    Either::Right(view! {
+        <Card>
+            <CardHeader>
+                <CardTitle>"Self-check"</CardTitle>
+                <CardDescription>
+                    {format!("Pod {name}, up since {started} UTC. ")}
+                    "Each pod embeds a fixed query and runs it as a read-only search every few minutes; the counts below run from the pod's start. With several replicas this is the pod that answered."
+                </CardDescription>
+            </CardHeader>
+            <CardContent>
+                <div class="mb-4">{state}</div>
+                <TableWrapper>
+                    <Table>
+                        <TableHeader>
+                            <TableRow>
+                                <TableHead>"Failed"</TableHead>
+                                <TableHead>"Since start"</TableHead>
+                            </TableRow>
+                        </TableHeader>
+                        <TableBody>{rows}</TableBody>
+                    </Table>
+                </TableWrapper>
+            </CardContent>
+        </Card>
+    })
 }
 
 // ─── Summary: errors, vector total, judge daily cap ──────────────────────────
