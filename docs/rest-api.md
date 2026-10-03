@@ -614,7 +614,7 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" http://localhost:3001/stats
 | `judge_daily_cap.cap` | `JUDGE_DAILY_CAP`, or `null` when no judge is configured. |
 | `judge_daily_cap.admitted_today`, `utc_day` | Store-path judge calls billed today (UTC) **by the process that answered** — the counter is per process, so with several replicas each reports its own. `POST /backfill/contradictions` is not counted. |
 | `pod` | The answering pod's self-check and failure counters; see [Self-check and failure counters](#self-check-and-failure-counters). Present on a timed-out reply too. |
-| `errors` | One note per failed source. A section whose source failed is `null` — `memories` and `writes` for the vector store, `graph` and `contradictions` for the graph — and never zeros; the call still answers `200`. |
+| `errors` | One note per failed call, prefixed with its source. Each section comes from its own call and is `null` only when that call fails: `memories` from the vector-store count (`vector store: …`), `writes` from the novelty scroll (`write novelty: …`), `graph` from the graph stats (`graph stats: …`) and `contradictions` from the contradiction aggregates (`contradiction stats: …`). So `memories` and `writes` can fail independently even though both read the vector store. A failed section is never zeros; the call still answers `200`. |
 
 Two different confidences exist on a pair and must not be read as one: `verdict_confidence` (on `POST /contradictions`) is the **judge's** confidence in its verdict, while `confidence` is the lexical **detector's** score for the edge when it was written. This endpoint aggregates neither; it counts verdicts and reasons only.
 
