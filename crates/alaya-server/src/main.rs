@@ -1331,10 +1331,11 @@ impl Drop for InFlight {
 /// patch, relation, contradiction resolution) run inline, one at a time, in
 /// arrival order. Spawned tasks write too: merge_duplicates and both
 /// backfills, a search's access-count bump and Hebbian enqueue, and a store's
-/// summary and judge follow-ups. Only the backend's compare-and-set and its
-/// locks order those against the inline writes: `write_lock` for most, and
-/// for the access bump its own `access_lock`, so a store never waits on a
-/// search's Qdrant calls.
+/// summary and judge follow-ups. Their vector-store writes are ordered
+/// against the inline ones only by the backend's compare-and-set and its
+/// locks; a search's access bump waits for a write in progress but holds no
+/// lock a store waits on. Their graph writes (Hebbian, judge verdicts,
+/// relation edges) are unordered and non-fatal.
 ///
 /// Every handler await is bounded by `limits` (#63), and `progress` is
 /// stamped after each command so the health watchdog can tell a draining
