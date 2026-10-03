@@ -58,6 +58,7 @@ fn memory(content: &str, tags: &[&str]) -> Memory {
         summary_embedding: None,
         supersession_log: None,
         supersession_reason: None,
+        nearest_similarity: None,
     }
 }
 

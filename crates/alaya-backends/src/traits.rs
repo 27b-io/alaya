@@ -92,7 +92,8 @@ pub trait VectorStorage {
     /// memory (LAB-6876). Every other
     /// payload field is written from `memory` as given and fields absent on
     /// `memory` are removed; `updated_at` is therefore whatever the caller
-    /// set. The write is conditional on the record the carry-over read (see
+    /// set, and `nearest_similarity` is the one the store just computed. The
+    /// write is conditional on the record the carry-over read (see
     /// the trait docs), so a write that landed in between is never rolled
     /// back and a deleted record is never brought back from that copy. A
     /// delete that lands while the store is in flight is reported as
@@ -201,6 +202,18 @@ pub trait VectorStorage {
 
     // Metadata
     async fn count(&self) -> Result<usize>;
+
+    /// `(created_at, nearest_similarity)` of every memory created at or
+    /// after `since` (epoch seconds), superseded ones included: one row per
+    /// write that is still stored. Read-only. Feeds the `/stats` write-novelty
+    /// series. Default: unsupported, so a backend that lacks it reports an
+    /// error rather than an empty window.
+    async fn write_novelty(&self, since: f64) -> Result<Vec<(f64, Option<f64>)>> {
+        let _ = since;
+        Err(alaya_types::AlayaError::Storage(
+            "write_novelty is not supported by this backend".into(),
+        ))
+    }
     async fn get_all_tags(&self) -> Result<Vec<String>>;
     async fn increment_access_count(&self, content_hash: &str) -> Result<()>;
 

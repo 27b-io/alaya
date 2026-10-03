@@ -174,6 +174,13 @@ const TAG_CACHE_TTL: f64 = 60.0;
 /// batches of 64, keeping the total under ~10-20s instead of ~40s at 500.
 const MAX_DEDUP_SCAN: usize = 200;
 
+/// Nearest neighbours the store path searches for (interference detection,
+/// novelty, the `neighbours` response field).
+const NEIGHBOUR_SEARCH_K: usize = 10;
+
+/// Live neighbours a store response reports, nearest first.
+const MAX_STORE_NEIGHBOURS: usize = 5;
+
 // ─── Search ranking weights ────────────────────────────────────────────────
 //
 // Multiplicative boosts applied to each result after RRF fusion.
@@ -457,6 +464,28 @@ impl MemoryService {
             }
         }
 
+        // The store-path neighbour search. It runs before the write so the
+        // write can carry its novelty (`nearest_similarity`), and it feeds
+        // interference detection and the `neighbours` response field without
+        // a second search. Suppressed under read_only with the graph writes it
+        // feeds; a failure only loses those, never the store.
+        let similar = if read_only {
+            None
+        } else {
+            self.vectors
+                .search_by_vector(&embedding, NEIGHBOUR_SEARCH_K, None)
+                .await
+                .inspect_err(|e| tracing::warn!("neighbour search failed (non-fatal): {e}"))
+                .ok()
+        };
+        // Other live memories, nearest first. On a re-store the search finds
+        // the record being replaced, which is never its own neighbour.
+        let live_neighbours: Vec<&ScoredMemory> = similar
+            .iter()
+            .flatten()
+            .filter(|s| s.memory.content_hash != content_hash && !is_superseded(&s.memory))
+            .collect();
+
         // Build memory struct
         let memory = Memory {
             content: params.content.clone(),
@@ -477,6 +506,7 @@ impl MemoryService {
             summary_embedding: None,
             supersession_log: None,
             supersession_reason: None,
+            nearest_similarity: live_neighbours.first().map(|s| s.score),
         };
 
         // A read-only principal's store is additive only. Re-storing content
@@ -556,18 +586,22 @@ impl MemoryService {
             tracing::warn!("graph ensure_node failed (non-fatal): {e}");
         }
 
-        // Interference detection: search for similar content + create graph edges.
-        // Suppressed under read_only: edges write to the shared owner graph
-        // (would be a side-channel to the gated `relation` tool).
+        // Interference detection over the neighbour search: create graph
+        // edges. Suppressed under read_only (no search ran): edges write to
+        // the shared owner graph (would be a side-channel to the gated
+        // `relation` tool).
         let mut contradiction_signals = Vec::new();
-        if !read_only && let Ok(similar) = self.vectors.search_by_vector(&embedding, 10, None).await
-        {
+        if let Some(similar) = &similar {
+            // When this search ran after the write, the stored memory took one
+            // of its slots; detection keeps considering the same candidates.
+            let similar: Vec<&ScoredMemory> = similar
+                .iter()
+                .filter(|s| s.memory.content_hash != content_hash)
+                .take(NEIGHBOUR_SEARCH_K - 1)
+                .collect();
             let mut edges_to_create: Vec<(String, String, UserRelationType, EdgeMeta)> = Vec::new();
 
             for scored in &similar {
-                if scored.memory.content_hash == content_hash {
-                    continue;
-                }
                 // Never relate/contradict against a superseded memory (see
                 // is_superseded — the Qdrant-side filter is a no-op).
                 if is_superseded(&scored.memory) {
@@ -601,9 +635,6 @@ impl MemoryService {
 
             // Cross-reference detection (lower threshold)
             for scored in &similar {
-                if scored.memory.content_hash == content_hash {
-                    continue;
-                }
                 if scored.score < 0.4 || scored.score >= 0.7 {
                     continue; // Only create RELATES_TO for moderate similarity
                 }
@@ -642,6 +673,24 @@ impl MemoryService {
         );
         if !tags.is_empty() {
             result.insert("tags".into(), serde_json::json!(tags));
+        }
+        // Absent, not empty, when no search ran or it failed: "no neighbours"
+        // would be a claim the server cannot make.
+        if similar.is_some() {
+            let neighbours: Vec<Value> = live_neighbours
+                .iter()
+                .take(MAX_STORE_NEIGHBOURS)
+                .map(|s| {
+                    let m = &s.memory;
+                    serde_json::json!({
+                        "content_hash": m.content_hash,
+                        "similarity": s.score,
+                        "memory_type": m.memory_type,
+                        "summary": truncate(m.summary.as_deref().unwrap_or(&m.content), 200),
+                    })
+                })
+                .collect();
+            result.insert("neighbours".into(), serde_json::json!(neighbours));
         }
 
         if !contradiction_signals.is_empty() {
@@ -3147,6 +3196,7 @@ mod tests {
             summary_embedding: None,
             supersession_log: None,
             supersession_reason: None,
+            nearest_similarity: None,
         }
     }
 
@@ -3795,6 +3845,7 @@ mod tests {
                 summary_embedding: None,
                 supersession_log: None,
                 supersession_reason: None,
+                nearest_similarity: None,
             }
         }
     }
@@ -4212,9 +4263,14 @@ mod tests {
         }
     }
 
-    /// Mock VectorStorage that returns similar memories for interference detection.
+    /// Mock VectorStorage that returns similar memories for interference
+    /// detection, keeps every memory `store` was handed, and counts searches.
+    #[derive(Default)]
     struct MockVectorsWithSimilar {
         similar_memories: Vec<ScoredMemory>,
+        stored: Rc<RefCell<Vec<Memory>>>,
+        searches: Rc<Cell<usize>>,
+        search_fails: bool,
     }
 
     #[async_trait(?Send)]
@@ -4227,7 +4283,8 @@ mod tests {
         ) -> Result<alaya_backends::ReversalOutcome> {
             unimplemented!()
         }
-        async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
+        async fn store(&self, m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
+            self.stored.borrow_mut().push(m.clone());
             Ok((true, "mock".into()))
         }
         async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
@@ -4259,6 +4316,10 @@ mod tests {
             _l: usize,
             _f: Option<PayloadFilter>,
         ) -> Result<Vec<ScoredMemory>> {
+            self.searches.set(self.searches.get() + 1);
+            if self.search_fails {
+                return Err(AlayaError::Storage("qdrant down".into()));
+            }
             Ok(self.similar_memories.clone())
         }
         async fn search_by_tags(
@@ -4329,6 +4390,7 @@ mod tests {
                 summary_embedding: None,
                 supersession_log: None,
                 supersession_reason: None,
+                nearest_similarity: None,
             },
             score,
         }
@@ -4349,6 +4411,7 @@ mod tests {
         let svc = MemoryService::new(
             Box::new(MockVectorsWithSimilar {
                 similar_memories: similar,
+                ..Default::default()
             }),
             Box::new(MockEmbeddings),
             Box::new(MockGraphBatchTracker::new(
@@ -4361,6 +4424,189 @@ mod tests {
             None,
         );
         (svc, individual, batch, batch_edges)
+    }
+
+    // ─── Store-path neighbours and novelty ──────────────────────────────
+
+    const NEW_CONTENT: &str = "the deploy uses blue-green rollouts";
+
+    fn novelty_service(mock: MockVectorsWithSimilar) -> MemoryService {
+        MemoryService::new(
+            Box::new(mock),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        )
+    }
+
+    fn novelty_params() -> StoreParams {
+        StoreParams {
+            content: NEW_CONTENT.into(),
+            tags: None,
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: None,
+        }
+    }
+
+    fn superseded(mut sm: ScoredMemory) -> ScoredMemory {
+        sm.memory.metadata = Some(HashMap::from([(
+            "superseded_by".to_string(),
+            serde_json::json!("f".repeat(64)),
+        )]));
+        sm
+    }
+
+    /// The response lists up to five live neighbours, nearest first, never
+    /// the stored memory itself (found by the search on a re-store) and
+    /// never a superseded one; the write carries the nearest one's
+    /// similarity, from the same single search.
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_reports_live_neighbours_and_persists_nearest_similarity() {
+        let own = crate::hashing::generate_content_hash(NEW_CONTENT);
+        let mut summarised = make_contradicting_memory(&"5".repeat(64), "long content", 0.80);
+        summarised.memory.summary = Some("s".repeat(300));
+        summarised.memory.memory_type = "decision".into();
+        let similar = vec![
+            make_contradicting_memory(&own, NEW_CONTENT, 1.0),
+            superseded(make_contradicting_memory(&"0".repeat(64), "dead", 0.97)),
+            make_contradicting_memory(&"1".repeat(64), "one", 0.93),
+            make_contradicting_memory(&"2".repeat(64), "two", 0.90),
+            make_contradicting_memory(&"3".repeat(64), "three", 0.88),
+            make_contradicting_memory(&"4".repeat(64), &"c".repeat(300), 0.85),
+            summarised,
+            make_contradicting_memory(&"6".repeat(64), "six", 0.75),
+        ];
+        let mock = MockVectorsWithSimilar {
+            similar_memories: similar,
+            ..Default::default()
+        };
+        let (stored, searches) = (mock.stored.clone(), mock.searches.clone());
+
+        let result = novelty_service(mock)
+            .store_memory(novelty_params())
+            .await
+            .unwrap();
+
+        assert_eq!(searches.get(), 1, "one neighbour search per store");
+        let neighbours = result["neighbours"].as_array().unwrap();
+        let hashes: Vec<&str> = neighbours
+            .iter()
+            .map(|n| n["content_hash"].as_str().unwrap())
+            .collect();
+        let want: Vec<String> = ["1", "2", "3", "4", "5"]
+            .iter()
+            .map(|c| c.repeat(64))
+            .collect();
+        assert_eq!(hashes, want);
+        assert_eq!(neighbours[0]["similarity"], serde_json::json!(0.93));
+        assert_eq!(neighbours[0]["memory_type"], serde_json::json!("note"));
+        assert_eq!(neighbours[0]["summary"], serde_json::json!("one"));
+        // No summary yet: clipped content stands in, as in summary output.
+        assert_eq!(
+            neighbours[3]["summary"],
+            serde_json::json!(format!("{}...", "c".repeat(200)))
+        );
+        assert_eq!(neighbours[4]["memory_type"], serde_json::json!("decision"));
+        assert_eq!(
+            neighbours[4]["summary"],
+            serde_json::json!(format!("{}...", "s".repeat(200)))
+        );
+        assert_eq!(stored.borrow()[0].nearest_similarity, Some(0.93));
+    }
+
+    /// The search succeeded and found no live memory: an empty list and no
+    /// novelty value, which `/stats` buckets as null.
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_with_no_live_neighbour_reports_an_empty_list() {
+        let mock = MockVectorsWithSimilar {
+            similar_memories: vec![superseded(make_contradicting_memory(
+                &"0".repeat(64),
+                "dead",
+                0.97,
+            ))],
+            ..Default::default()
+        };
+        let stored = mock.stored.clone();
+        let result = novelty_service(mock)
+            .store_memory(novelty_params())
+            .await
+            .unwrap();
+        assert_eq!(result["neighbours"], serde_json::json!([]));
+        assert_eq!(stored.borrow()[0].nearest_similarity, None);
+    }
+
+    /// A read-only store runs no neighbour search (it feeds owner-graph
+    /// writes), and a failed one never fails the store: either way the field
+    /// is absent rather than an empty list, and no novelty is written.
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_without_a_neighbour_search_omits_neighbours() {
+        for (read_only, search_fails) in [(true, false), (false, true)] {
+            let mock = MockVectorsWithSimilar {
+                similar_memories: vec![make_contradicting_memory(&"1".repeat(64), "one", 0.9)],
+                search_fails,
+                ..Default::default()
+            };
+            let (stored, searches) = (mock.stored.clone(), mock.searches.clone());
+
+            let result = novelty_service(mock)
+                .store_memory_with(novelty_params(), read_only)
+                .await
+                .expect("the write happens without neighbours");
+
+            assert_eq!(result["success"], serde_json::json!(true));
+            assert!(!result.contains_key("neighbours"), "{result:?}");
+            assert_eq!(stored.borrow().len(), 1);
+            assert_eq!(stored.borrow()[0].nearest_similarity, None);
+            assert_eq!(searches.get(), usize::from(!read_only));
+        }
+    }
+
+    /// A caller cannot plant the novelty value through metadata.
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_refuses_caller_nearest_similarity() {
+        let mock = MockVectorsWithSimilar::default();
+        let stored = mock.stored.clone();
+        let mut params = novelty_params();
+        params.metadata = Some(HashMap::from([(
+            "nearest_similarity".to_string(),
+            serde_json::json!(0.1),
+        )]));
+        let err = novelty_service(mock)
+            .store_memory(params)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nearest_similarity"), "{err}");
+        assert!(stored.borrow().is_empty(), "nothing written");
+    }
+
+    /// Moving the search ahead of the write must not widen detection: it
+    /// still weighs the nine nearest other memories, as when the stored
+    /// memory itself took the tenth slot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn interference_window_is_unchanged_by_searching_before_the_write() {
+        let own = crate::hashing::generate_content_hash(
+            "Authentication is not required, it failed and cannot be used and won't work",
+        );
+        let others: Vec<ScoredMemory> = (0..10)
+            .map(|i| make_contradicting_memory(&format!("{i:064}"), "related notes", 0.55))
+            .collect();
+        let mut with_self = vec![make_contradicting_memory(&own, "self", 1.0)];
+        with_self.extend(others.iter().take(9).cloned());
+
+        for similar in [others, with_self] {
+            let (svc, _, _, batch_edges) = build_batch_test_service(similar);
+            let mut params = novelty_params();
+            params.content =
+                "Authentication is not required, it failed and cannot be used and won't work"
+                    .into();
+            svc.store_memory(params).await.unwrap();
+            assert_eq!(batch_edges.get(), 9, "nine RELATES_TO edges");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5527,6 +5773,7 @@ mod tests {
                 summary_embedding: None,
                 supersession_log: None,
                 supersession_reason: None,
+                nearest_similarity: None,
             },
             score,
         }
@@ -7229,6 +7476,7 @@ mod tests {
                     summary_embedding: None,
                     supersession_log: None,
                     supersession_reason: None,
+                    nearest_similarity: None,
                 }
             })
             .collect()
@@ -7573,6 +7821,7 @@ mod tests {
                 summary_embedding: None,
                 supersession_log: None,
                 supersession_reason: None,
+                nearest_similarity: None,
             }
         }
 

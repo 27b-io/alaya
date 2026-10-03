@@ -1206,6 +1206,14 @@ mod tests {
                     "contradiction": 1, "supersession": 6, "coexist": 32, "unrelated": 31,
                 },
             },
+            "writes": { "novelty": [
+                { "date": "2026-09-30", "counts": {
+                    "0.95+": 61, "0.85-0.95": 212, "0.70-0.85": 433, "below_0.70": 97, "none": 3,
+                }},
+                { "date": "2026-10-01", "counts": {
+                    "0.95+": 0, "0.85-0.95": 0, "0.70-0.85": 0, "below_0.70": 0, "none": 818,
+                }},
+            ]},
             "judge_daily_cap": { "cap": 1000, "admitted_today": 41, "utc_day": "2026-10-01" },
             "errors": [],
         })
@@ -1260,6 +1268,48 @@ mod tests {
             assert!(body.contains(needle), "missing {needle:?} in {body}");
         }
         assert!(!body.contains("<script"), "no JS on the pane");
+    }
+
+    /// Write novelty is one row per UTC day with a column per similarity
+    /// band, in the server's order, each count in its own cell.
+    #[tokio::test]
+    async fn health_pane_renders_write_novelty_as_a_day_table() {
+        let (status, body) = health_page(full_stats()).await;
+        assert_eq!(status, StatusCode::OK);
+        let card = &body[body.find("Write novelty").expect("novelty card")..];
+        let card = &card[..card.find("</table>").expect("a table")];
+        let heads = [
+            "UTC day",
+            "≥ 0.95",
+            "0.85–0.95",
+            "0.70–0.85",
+            "&lt; 0.70",
+            "none",
+        ];
+        let mut at = 0;
+        for h in heads {
+            at += card[at..]
+                .find(h)
+                .unwrap_or_else(|| panic!("{h} out of order in {card}"));
+        }
+        let row = &card[card.find("2026-09-30").expect("day row")..];
+        let mut at = 0;
+        for n in [">61<", ">212<", ">433<", ">97<", ">3<"] {
+            at += row[at..]
+                .find(n)
+                .unwrap_or_else(|| panic!("{n} out of order in {row}"));
+        }
+        assert!(card.contains(">818<"), "{card}");
+
+        // Section nulled server-side: a banner, never a table of zeros.
+        let mut down = full_stats();
+        down["writes"] = serde_json::Value::Null;
+        down["errors"] = serde_json::json!(["write novelty: Storage error"]);
+        let (_, body) = health_page(down).await;
+        let card = &body[body.find("Write novelty").expect("novelty card")..];
+        let card = &card[..card.find("Degenerate judge reasons").expect("next card")];
+        assert!(card.contains("unavailable"), "{card}");
+        assert!(!body.contains("≥ 0.95"), "no novelty table");
     }
 
     /// AC-4/AC-6: the bridge down nulls the graph sections server-side; the
