@@ -21,9 +21,10 @@ a key.
 |---|---|
 | `ALAYA_URL` | Ālaya REST origin; the script GETs `/memories/{hash}` and, for `rows`, POSTs the read-only `/contradictions` |
 | `ALAYA_API_KEY` | bearer for that origin (read access is all it needs) |
-| `JUDGE_URL` | the judge's API origin: the Anthropic Messages API, or an OpenAI-compatible endpoint for `eval --judge openai` |
+| `JUDGE_URL` | the judge's API origin: the Anthropic Messages API, or an OpenAI-compatible endpoint for `eval --judge openai`. Like `ALAYA_URL` and `REFLECTION_URL`, it must be https, or plain http to a cluster-local host (the rule alaya-server applies to its own `JUDGE_URL`) |
 | `JUDGE_API_KEY` | key for `JUDGE_URL`, read once at start |
 | `TYPESAFE_API_KEY` | key for `eval --judge jev`, which only ever calls TypeSafe's fixed origin |
+| `UNSCRUBBED_JUDGE_ORIGINS` | comma-separated origins, besides `https://api.anthropic.com`, that may receive unscrubbed pairs: the production judge's own proxy. Kept out of git |
 | `JUDGE_MODEL` | default `claude-sonnet-5` for the Anthropic judge; `eval --model` overrides it |
 | `REFLECTION_URL`, `REFLECTION_API_KEY` | default to the `JUDGE_*` values; set both or neither, a key is never sent to another origin |
 | `REFLECTION_MODEL` | default `claude-opus-5` |
@@ -90,9 +91,12 @@ suffix (`.com`, `.svc`, `.local`, ...), so a bare name or a short in-cluster
 name such as `service.namespace` comes in through `--host-names <file>`, one
 per line, kept out of git. Before any request leaves, every rendered pair is
 checked against every rule, and one match aborts the run; for `openai`, so
-is the system prompt. `openai` and `jev` refuse to run without `--scrub`, and
-an unscrubbed run (the control that measures what the scrub changes) only
-goes to a `claude-*` model; `tune` holds both its models to the same rule.
+is the system prompt. `openai` and `jev` refuse to run without `--scrub`. An
+unscrubbed run (the control that measures what the scrub changes) goes only
+to a `claude-*` model at an approved origin, `https://api.anthropic.com` or
+one listed in `UNSCRUBBED_JUDGE_ORIGINS`; a model name alone proves nothing,
+since any proxy can serve one. `tune` holds its judge and reflection
+endpoints to the same rule.
 
 An API error, a content-filter block or a refusal is retried once; a second
 one makes the pair `failed`: counted, kept out of every metric, never scored

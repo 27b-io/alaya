@@ -416,14 +416,75 @@ def check_scrub() -> None:
     finally:
         tune.os.environ.clear()
         tune.os.environ.update(real_env)
-    tune.unscrubbed_ok("claude-sonnet-5")
-    for model in ("gemini-3.8-flash", "gpt-6-sol"):
+    check_egress(real_env)
+
+
+def check_egress(real_env: dict) -> None:
+    """A key or memory text leaves only over https, or plain http to a
+    cluster-local host (alaya-server's boot rule); unscrubbed pairs go only to
+    a Claude model at an approved origin."""
+    # alaya-server's `cluster_local_accepts_service_dns_and_private_hosts_only`.
+    for ok in (
+        "http://anthropic-lb:8082",
+        "http://alaya-bridge:3000",
+        "http://alaya-server.mcp.svc:3001",
+        "http://localhost:8082",
+        "http://10.43.144.201:8082",
+        "http://[::1]:8082",
+        "http://[fd12::1]:80",
+        "http://u:p@anthropic-lb:8082",
+    ):
+        assert tune.is_cluster_local(ok), ok
+    for no in (
+        "http://api.anthropic.com",
+        "http://proxy.example.net:8082",
+        "http://1.2.3.4",
+        "http://100.64.0.1:8082",  # shared address space is not private
+        "http://u:p@api.anthropic.com",
+        "http://anthropic-lb:8082@api.anthropic.com",  # userinfo never poses as host
+        "http://[2606:4700::1111]",
+        "http://[::ffff:1.2.3.4]",
+    ):
+        assert not tune.is_cluster_local(no), no
+
+    def exits(fn, *args) -> str:
         try:
-            tune.unscrubbed_ok(model)
-        except SystemExit:
-            pass
-        else:
-            raise AssertionError(f"{model} must never read unscrubbed text")
+            fn(*args)
+        except SystemExit as e:
+            return str(e)
+        raise AssertionError(f"{fn.__name__}{args} must exit")
+
+    try:
+        for url in ("https://proxy.example.net", "http://anthropic-lb:8082"):
+            tune.os.environ["X_URL"] = url
+            assert tune.egress_url("X_URL") == url
+        for url in (
+            "http://proxy.example.net",
+            "ftp://anthropic-lb",
+            "anthropic-lb:8082",
+        ):
+            tune.os.environ["X_URL"] = url
+            assert "must be https" in exits(tune.egress_url, "X_URL"), url
+        tune.os.environ.pop("UNSCRUBBED_JUDGE_ORIGINS", None)
+        tune.unscrubbed_ok("claude-sonnet-5", "https://api.anthropic.com")
+        tune.unscrubbed_ok("claude-sonnet-5", "https://api.anthropic.com:443/")
+        # A claude-* name behind an unapproved origin is no Anthropic judge.
+        assert "UNSCRUBBED_JUDGE_ORIGINS" in exits(
+            tune.unscrubbed_ok, "claude-sonnet-5", "https://proxy.example.net"
+        )
+        assert "only claude-*" in exits(
+            tune.unscrubbed_ok, "gemini-3.8-flash", "https://api.anthropic.com"
+        )
+        tune.os.environ["UNSCRUBBED_JUDGE_ORIGINS"] = (
+            "http://anthropic-lb:8082, https://lb.example.net"
+        )
+        tune.unscrubbed_ok("claude-sonnet-5", "http://anthropic-lb:8082/")
+        tune.unscrubbed_ok("claude-opus-5", "https://lb.example.net:443")
+        exits(tune.unscrubbed_ok, "claude-sonnet-5", "https://lb.example.net:8443")
+        exits(tune.unscrubbed_ok, "gpt-6-sol", "https://lb.example.net")
+    finally:
+        tune.os.environ.clear()
+        tune.os.environ.update(real_env)
 
 
 def check_judges() -> None:

@@ -36,6 +36,7 @@ import argparse
 import dataclasses
 import fcntl
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -52,6 +53,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import anthropic
 import httpx
@@ -197,6 +199,68 @@ def env(key: str) -> str:
     return value
 
 
+# ── Egress ───────────────────────────────────────────────────────────────────
+# Every origin that gets a key or memory text, judged as alaya-server judges
+# JUDGE_URL at boot: https, or plain http only to a cluster-local host.
+
+PRIVATE_NETS = tuple(
+    ipaddress.ip_network(n)
+    for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7")
+)
+ANTHROPIC_ORIGIN = "https://api.anthropic.com"
+
+
+def is_cluster_local(url: str) -> bool:
+    """Port of alaya-server's `is_cluster_local`: a private or loopback IP,
+    localhost, `*.svc`, `*.svc.cluster.local`, `*.internal`, or a single-label
+    service name. The host is the one the client connects to, never userinfo."""
+    host = urlsplit(url).hostname or ""
+    if host == "localhost" or host.endswith(
+        (".svc", ".svc.cluster.local", ".internal")
+    ):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return bool(host) and "." not in host
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback or any(ip in net for net in PRIVATE_NETS)
+
+
+def egress_url(key: str) -> str:
+    """An API origin from the environment that may carry a key: https, or
+    http to a cluster-local host only."""
+    url = env(key)
+    scheme = urlsplit(url).scheme
+    if scheme == "https" or (scheme == "http" and is_cluster_local(url)):
+        return url
+    sys.exit(f"{key} must be https, or http to a cluster-local host")
+
+
+def origin(url: str) -> str:
+    u = urlsplit(url)
+    return f"{u.scheme}://{u.hostname}:{u.port or {'https': 443, 'http': 80}.get(u.scheme)}"
+
+
+def unscrubbed_ok(model: str, url: str) -> None:
+    """Unscrubbed pairs go only to a Claude model at an origin approved for
+    them: Anthropic's API, or one named in UNSCRUBBED_JUDGE_ORIGINS
+    (comma-separated, the production judge's own proxy). The model alone is
+    no proof: a third-party proxy can serve a `claude-*` name."""
+    if not model.startswith("claude-"):
+        sys.exit(f"{model} would read unscrubbed memory text; only claude-* may")
+    listed = os.environ.get("UNSCRUBBED_JUDGE_ORIGINS", "").split(",")
+    allowed = {origin(ANTHROPIC_ORIGIN)} | {
+        origin(o.strip()) for o in listed if o.strip()
+    }
+    if origin(url) not in allowed:
+        sys.exit(
+            f"unscrubbed pairs may go only to {sorted(allowed)}, not {origin(url)}; "
+            "name the production judge's origin in UNSCRUBBED_JUDGE_ORIGINS"
+        )
+
+
 def sha(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -332,7 +396,7 @@ def seed_prompt() -> str:
 
 def alaya_client() -> httpx.Client:
     return httpx.Client(
-        base_url=env("ALAYA_URL").rstrip("/"),
+        base_url=egress_url("ALAYA_URL").rstrip("/"),
         headers={"Authorization": f"Bearer {env('ALAYA_API_KEY')}"},
         timeout=120,
         transport=httpx.HTTPTransport(retries=3),
@@ -1200,13 +1264,6 @@ class Hygiene:
 # ── Spend ledger ─────────────────────────────────────────────────────────────
 
 
-def unscrubbed_ok(model: str) -> None:
-    """Unscrubbed pairs go only to Claude, where the production judge sends
-    them, whichever wire or proxy carries the request."""
-    if not model.startswith("claude-"):
-        sys.exit(f"{model} would read unscrubbed memory text; only claude-* may")
-
-
 def price(model: str) -> tuple[float, float]:
     for prefix, p in PRICE_PER_MTOK.items():
         if model.startswith(prefix):
@@ -1557,7 +1614,17 @@ def cmd_tune(args) -> None:
     judge_model = os.environ.get("JUDGE_MODEL", "claude-sonnet-5")
     reflection_model = os.environ.get("REFLECTION_MODEL", "claude-opus-5")
     price(judge_model), price(reflection_model)  # fail before the first paid call
-    unscrubbed_ok(judge_model), unscrubbed_ok(reflection_model)  # both read raw pairs
+    judge_url, judge_key = egress_url("JUDGE_URL"), env("JUDGE_API_KEY")
+    refl_url = (
+        egress_url("REFLECTION_URL") if os.environ.get("REFLECTION_URL") else None
+    )
+    refl_key = (
+        env("REFLECTION_API_KEY") if os.environ.get("REFLECTION_API_KEY") else None
+    )
+    if bool(refl_url) != bool(refl_key):  # never send one origin's key to another
+        sys.exit("set REFLECTION_URL and REFLECTION_API_KEY together, or neither")
+    unscrubbed_ok(judge_model, judge_url)  # both models read raw pairs
+    unscrubbed_ok(reflection_model, refl_url or judge_url)
     memories = fetch_memories(pairs)
     hygiene = Hygiene(seed, memories)
     literal_hits = hygiene.leak_hits(seed, LITERAL_WINDOW, ignore_seed=False)
@@ -1566,12 +1633,7 @@ def cmd_tune(args) -> None:
         f"with golden memories: {len(literal_hits)}"
     )
     ledger = Ledger()
-    judge_url, judge_key = env("JUDGE_URL"), env("JUDGE_API_KEY")
     judge_client = make_client(judge_url, judge_key)
-    refl_url = os.environ.get("REFLECTION_URL")
-    refl_key = os.environ.get("REFLECTION_API_KEY")
-    if bool(refl_url) != bool(refl_key):  # never send one origin's key to another
-        sys.exit("set REFLECTION_URL and REFLECTION_API_KEY together, or neither")
     reflection_client = make_client(
         refl_url or judge_url, refl_key or judge_key
     ).with_options(timeout=600)
@@ -1773,11 +1835,11 @@ def load_rows(out: Path) -> list[Pair]:
     return [Pair(r["row"], r["a"], r["b"], "", None, "spotcheck") for r in rows]
 
 
-def make_judge(judge: str, model: str, prompt: str, regime: str):
+def make_judge(judge: str, model: str, prompt: str, regime: str, url: str):
     if judge == "jev":
-        http = http_client(TYPESAFE_URL, env("TYPESAFE_API_KEY"))
+        http = http_client(url, env("TYPESAFE_API_KEY"))
         return retried(jev_judge(http, model))
-    url, key = env("JUDGE_URL"), env("JUDGE_API_KEY")
+    key = env("JUDGE_API_KEY")
     if judge == "anthropic":  # no SDK retries: `retried` retries once, as for all
         client = make_client(url, key, max_retries=0)
         return retried(anthropic_judge(client, model, prompt, regime))
@@ -1837,8 +1899,10 @@ def cmd_eval(args) -> None:
     if not model:
         sys.exit(f"--judge {args.judge} needs --model")
     price(model)  # fail before the first paid call
+    # Every egress check runs before the first memory is fetched.
+    judge_url = TYPESAFE_URL if args.judge == "jev" else egress_url("JUDGE_URL")
     if not args.scrub:
-        unscrubbed_ok(model)
+        unscrubbed_ok(model, judge_url)
     out = HERE / "runs" / args.run
     out.mkdir(parents=True, exist_ok=True)
     lock = (out / LOCK_FILE).open("w")  # held until exit: one eval per run at a time
@@ -1870,7 +1934,7 @@ def cmd_eval(args) -> None:
             f"the prompt matches scrub rules {scrubber.leaks(prompt)}; nothing sent"
         )
     texts = render_all(chosen, memories, scrubber)
-    judge = make_judge(args.judge, model, prompt, args.regime)
+    judge = make_judge(args.judge, model, prompt, args.regime, judge_url)
     instructions = (
         json.dumps(JEV_QUESTIONS, sort_keys=True) if args.judge == "jev" else prompt
     )
