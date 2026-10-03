@@ -641,7 +641,10 @@ async fn generated_summary_commits_only_while_summary_is_absent() {
 // Compare-and-set alone would keep the final state whole even then (the first
 // writer loses its write and retries); the client's write lock additionally
 // makes the second writer wait, so the write order below is forced and no
-// retry is spent on an in-process race.
+// retry is spent on an in-process race. The access increments are the
+// exception (`access_lock`, LAB-6896): they run inside a search, so they
+// never wait for a store and a store never waits for them. Compare-and-set
+// alone keeps both, at the cost of one retry round.
 
 async fn parked_first_reader(payload: Value) -> (MockServer, FakeQdrant) {
     let (server, fake) = fake_with(Some(payload)).await;
@@ -797,11 +800,15 @@ async fn concurrent_access_increment_cannot_land_inside_a_restore() {
     a.expect("store succeeds");
     b.expect("increment succeeds");
 
+    // The increment does not wait for the parked store: it lands first, the
+    // store's write on its stale snapshot is rejected, and the store re-reads
+    // and lands with the count carried over.
     assert_eq!(
         write_order(&server).await,
         [
-            format!("PUT {POINTS_PATH}?wait=true"),
             format!("POST {PAYLOAD_PATH}?wait=true"),
+            format!("PUT {POINTS_PATH}?wait=true"),
+            format!("PUT {POINTS_PATH}?wait=true"),
         ],
         "an access increment must not be rolled back by a store snapshot"
     );
@@ -826,17 +833,86 @@ async fn concurrent_batch_access_increment_cannot_land_inside_a_restore() {
     a.expect("store succeeds");
     b.expect("batch increment succeeds");
 
+    // The increment does not wait for the parked store: it lands first, the
+    // store's write on its stale snapshot is rejected, and the store re-reads
+    // and lands with the count carried over.
     assert_eq!(
         write_order(&server).await,
         [
-            format!("PUT {POINTS_PATH}?wait=true"),
             format!("POST {PAYLOAD_PATH}?wait=true"),
+            format!("PUT {POINTS_PATH}?wait=true"),
+            format!("PUT {POINTS_PATH}?wait=true"),
         ],
         "a batch access increment must not be rolled back by a store snapshot"
     );
     let stored = fake.point(ID).unwrap();
     assert_eq!(stored["access_count"], json!(6));
     assert_eq!(stored["access_timestamps"].as_array().unwrap().len(), 3);
+}
+
+/// A search's access increment never holds up a store (LAB-6896): with the
+/// increment parked on its read, a store of the same memory lands before
+/// that read even returns. Compare-and-set keeps both: the increment's write,
+/// built on the stale read, is rejected, re-read and re-sent.
+#[tokio::test]
+async fn store_is_not_held_behind_a_parked_access_increment() {
+    let (server, fake) = parked_first_reader(existing_payload()).await;
+    let client = client_for(&server);
+    let hash = hash();
+    let hashes = [hash.as_str()];
+    let mem = incoming();
+    let increment_done = std::cell::Cell::new(false);
+
+    let (a, b) = tokio::join!(
+        async {
+            let counted = client.increment_access_count_batch(&hashes).await;
+            increment_done.set(true);
+            counted
+        },
+        once_first_read_arrived(&server, async {
+            let stored = client.store(&mem, StoreMode::Upsert).await;
+            assert!(
+                !increment_done.get(),
+                "the store waited for the parked increment"
+            );
+            stored
+        })
+    );
+    a.expect("batch increment succeeds");
+    b.expect("store succeeds");
+
+    let order = write_order(&server).await;
+    assert_eq!(
+        order[0],
+        format!("PUT {POINTS_PATH}?wait=true"),
+        "{order:?}"
+    );
+    let stored = fake.point(ID).unwrap();
+    assert_eq!(stored["tags"], json!(["new-tag"]), "the store landed");
+    assert_eq!(stored["access_count"], json!(6), "the increment landed too");
+    assert_eq!(stored["access_timestamps"].as_array().unwrap().len(), 3);
+}
+
+/// One client's access increments still wait for each other (`access_lock`):
+/// a burst on one hot memory must not spend the retries meant for
+/// cross-process races. Two increments, two writes, no rejected round.
+#[tokio::test]
+async fn one_clients_access_increments_wait_for_each_other() {
+    let (server, fake) = parked_first_reader(existing_payload()).await;
+    let client = client_for(&server);
+    let hash = hash();
+
+    let (a, b) = tokio::join!(
+        client.increment_access_count(&hash),
+        once_first_read_arrived(&server, client.increment_access_count(&hash))
+    );
+    a.expect("first increment succeeds");
+    b.expect("second increment succeeds");
+
+    assert_eq!(writes(&server).await.len(), 2, "no retry spent in-process");
+    let stored = fake.point(ID).unwrap();
+    assert_eq!(stored["access_count"], json!(7));
+    assert_eq!(stored["access_timestamps"].as_array().unwrap().len(), 4);
 }
 
 #[tokio::test]

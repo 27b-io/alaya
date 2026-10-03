@@ -937,7 +937,12 @@ impl ServiceHandle {
                     .to_string(),
             )),
             Ok(Ok(v)) => Ok(v),
-            Ok(Err(_)) => Err((-32000, "service dropped response".to_string())),
+            Ok(Err(_)) => {
+                // A spawned handler that panicked ends here, with the pod
+                // still up: this line is the only structured record of it.
+                tracing::error!(op = op_name, "service worker dropped the reply");
+                Err((-32000, "service dropped response".to_string()))
+            }
             Err(_) => {
                 tracing::error!(
                     op = op_name,
@@ -1322,11 +1327,14 @@ impl Drop for InFlight {
 /// Wraps the service in `Rc` so long-running operations (find_duplicates,
 /// merge_duplicates) and searches can be spawned as local tasks without
 /// blocking the command loop. Other commands continue processing while they
-/// run. Every mutating command still runs inline, one at a time, in arrival
-/// order. The writes that ride along with other work run in spawned tasks:
-/// a search's access-count bump and Hebbian enqueue, and a store's summary
-/// and judge follow-ups. Only the backend's compare-and-set and `write_lock`
-/// order those against the inline writes.
+/// run. The single-memory writes (store, delete, supersede, unsupersede,
+/// patch, relation, contradiction resolution) run inline, one at a time, in
+/// arrival order. Spawned tasks write too: merge_duplicates and both
+/// backfills, a search's access-count bump and Hebbian enqueue, and a store's
+/// summary and judge follow-ups. Only the backend's compare-and-set and its
+/// locks order those against the inline writes: `write_lock` for most, and
+/// for the access bump its own `access_lock`, so a store never waits on a
+/// search's Qdrant calls.
 ///
 /// Every handler await is bounded by `limits` (#63), and `progress` is
 /// stamped after each command so the health watchdog can tell a draining
@@ -1497,8 +1505,9 @@ async fn service_worker(
                 let _ = reply.send(result);
             }
             CmdInner::Search { reply, .. } if search_slots.available_permits() == 0 => {
-                // One WARN per overload episode; the episode ends when a
-                // search is admitted again.
+                // WARN on the first refusal since a search was last admitted,
+                // debug after: under sustained saturation, at most one WARN
+                // per search that completes.
                 if std::mem::replace(&mut search_backlog_warned, true) {
                     tracing::debug!(op, max = SEARCH_BACKLOG_MAX, "search backlog full");
                 } else {
@@ -1547,7 +1556,11 @@ async fn service_worker(
                         // delay the searches behind it and bump access
                         // counts for results no one received.
                         if reply.is_closed() {
-                            tracing::info!(op, "caller gone before the search ran; skipped");
+                            tracing::info!(
+                                op,
+                                query = query_preview.as_str(),
+                                "caller gone before the search ran; skipped"
+                            );
                             return;
                         }
                         let running_since = std::time::Instant::now();
