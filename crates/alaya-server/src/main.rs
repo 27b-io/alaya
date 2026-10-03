@@ -5977,7 +5977,7 @@ mod wedge_tests {
     /// `/health/detail` and `GET /stats` name the broken step, while the
     /// probe Kubernetes uses still answers 200 with its status alone. The
     /// embedder sits under the production chain (cache over counter over
-    /// client), so this also proves the probe gets past the cache.
+    /// client). The cache bypass itself is `probe_bypasses_the_cache`.
     #[tokio::test]
     async fn embed_outage_shows_on_detail_and_stats_while_the_probe_stays_green() {
         let vitals = Arc::new(Vitals::new("alaya-server-test".into(), 1_700_000_000, true));

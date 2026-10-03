@@ -605,9 +605,9 @@ interval under 30 refuses boot.
 
 | `failing_step` | Meaning |
 |:--|:--|
-| `embed` | The embedder could not embed the query: down, erroring, or past the budget. |
+| `embed` | The embedder could not embed the query: down, erroring, past the budget, or answering without exactly one vector of `EMBEDDING_DIMENSIONS`. |
 | `search` | The hybrid search failed for another reason (vector store, for example). |
-| `rerank` | The search ran but the reranker fell back to RRF order. The check fails even if the memory was found: a reranker that is always down costs ranking quality, and nothing else would say so. |
+| `rerank` | The search ran but the reranker fell back to RRF order; `error` names the cause (`error`, `timed out` or `score count mismatch`). The check fails even if the memory was found: a reranker that is always down costs ranking quality, and nothing else would say so. |
 | `expect` | The search ran but the expected memory was not in the top 10: superseded, deleted, or ranked out. |
 | `worker` | The service worker did not take or answer the check (overloaded, wedged or gone). |
 

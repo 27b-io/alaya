@@ -768,7 +768,7 @@ impl MemoryService {
         }
         let mode_str = format!("{:?}", params.mode).to_lowercase();
         let mut result = match params.mode {
-            SearchMode::Hybrid => self.search_hybrid(&params, read_only).await?,
+            SearchMode::Hybrid => self.search_hybrid(&params, read_only).await?.0,
             SearchMode::Scan => self.search_scan(&params).await?,
             SearchMode::Similar => self.search_similar(&params).await?,
             SearchMode::Tag => self.search_tag(&params).await?,
@@ -781,16 +781,10 @@ impl MemoryService {
         Ok(result)
     }
 
+    /// The hybrid search response, plus what the rerank pass did: the
+    /// response does not carry that, and the self-check reads it.
     #[tracing::instrument(skip(self, params))]
-    async fn search_hybrid(&self, params: &SearchParams, read_only: bool) -> Result<Value> {
-        self.search_hybrid_ranked(params, read_only)
-            .await
-            .map(|(v, _)| v)
-    }
-
-    /// [`Self::search_hybrid`] plus what the rerank pass did, which the
-    /// response does not carry. The self-check reads it.
-    pub(crate) async fn search_hybrid_ranked(
+    pub(crate) async fn search_hybrid(
         &self,
         params: &SearchParams,
         read_only: bool,
@@ -1130,7 +1124,7 @@ impl MemoryService {
                         "rerank score count mismatch; skipping rerank"
                     );
                     self.vitals.rerank_failed();
-                    break 'rerank (HashMap::new(), Rerank::FellBack);
+                    break 'rerank (HashMap::new(), Rerank::FellBack("score count mismatch"));
                 }
                 Some(Err(e)) => {
                     tracing::warn!(
@@ -1140,7 +1134,7 @@ impl MemoryService {
                         "rerank failed (non-fatal); using RRF order"
                     );
                     self.vitals.rerank_failed();
-                    break 'rerank (HashMap::new(), Rerank::FellBack);
+                    break 'rerank (HashMap::new(), Rerank::FellBack("error"));
                 }
                 None => {
                     tracing::warn!(
@@ -1149,7 +1143,7 @@ impl MemoryService {
                         "rerank timed out (non-fatal); using RRF order"
                     );
                     self.vitals.rerank_failed();
-                    break 'rerank (HashMap::new(), Rerank::FellBack);
+                    break 'rerank (HashMap::new(), Rerank::FellBack("timed out"));
                 }
             };
 
@@ -6486,7 +6480,11 @@ mod tests {
             .await;
 
         assert_eq!(o.failing_step, Some(Step::Rerank));
-        assert_eq!(o.rerank, Some(Rerank::FellBack));
+        assert_eq!(o.rerank, Some(Rerank::FellBack("error")));
+        assert_eq!(
+            o.error.as_deref(),
+            Some("rerank fell back to RRF order: error")
+        );
         assert_eq!(svc.vitals.snapshot()["failures"]["rerank"], 1);
     }
 

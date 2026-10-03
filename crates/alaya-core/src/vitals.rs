@@ -35,8 +35,9 @@ pub enum Rerank {
     /// Nothing to rerank: the search found no candidates.
     NoCandidates,
     Ran,
-    /// Error, timeout or score-count mismatch: RRF order was served.
-    FellBack,
+    /// Error, timeout or score-count mismatch (the cause): RRF order was
+    /// served.
+    FellBack(&'static str),
 }
 
 impl Rerank {
@@ -45,7 +46,7 @@ impl Rerank {
             Self::NotConfigured => "not_configured",
             Self::NoCandidates => "no_candidates",
             Self::Ran => "ran",
-            Self::FellBack => "fell_back",
+            Self::FellBack(_) => "fell_back",
         }
     }
 }
@@ -276,22 +277,19 @@ impl MemoryService {
                 output: OutputMode::Summary,
                 cursor: None,
             };
-            let (result, rerank) = self
-                .search_hybrid_ranked(&params, true)
-                .await
-                .map_err(|e| {
-                    // The search embeds again; if that call is the one that
-                    // failed, the embedder is the broken step.
-                    let step = match e {
-                        AlayaError::Embedding(_) => Step::Embed,
-                        _ => Step::Search,
-                    };
-                    SelfCheckOutcome::fail(step, e.to_string(), None)
-                })?;
-            if rerank == Rerank::FellBack {
+            let (result, rerank) = self.search_hybrid(&params, true).await.map_err(|e| {
+                // The search embeds again; if that call is the one that
+                // failed, the embedder is the broken step.
+                let step = match e {
+                    AlayaError::Embedding(_) => Step::Embed,
+                    _ => Step::Search,
+                };
+                SelfCheckOutcome::fail(step, e.to_string(), None)
+            })?;
+            if let Rerank::FellBack(cause) = rerank {
                 return Err(SelfCheckOutcome::fail(
                     Step::Rerank,
-                    "rerank fell back to RRF order",
+                    format!("rerank fell back to RRF order: {cause}"),
                     Some(rerank),
                 ));
             }

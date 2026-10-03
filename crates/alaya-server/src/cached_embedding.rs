@@ -533,6 +533,58 @@ mod tests {
         );
     }
 
+    /// Embedder that answers once, then returns 200 with `answer` forever.
+    struct DegradesAfterOne(Cell<u32>, Vec<Vec<f32>>);
+
+    #[async_trait(?Send)]
+    impl EmbeddingProvider for DegradesAfterOne {
+        async fn embed_batch(&self, texts: &[&str], p: PromptName) -> Result<Vec<Vec<f32>>> {
+            self.0.set(self.0.get() + 1);
+            if self.0.get() > 1 {
+                return Ok(self.1.clone());
+            }
+            StubEmbeddings.embed_batch(texts, p).await
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        fn model_name(&self) -> &str {
+            "degrades"
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            StubEmbeddings.health().await
+        }
+    }
+
+    /// An embedder that answers 200 with no vector, or a wrong-sized one,
+    /// fails the probe even while the cache still serves the self-check's
+    /// own query: every fresh store and cold search would fail on it.
+    #[tokio::test]
+    async fn probe_rejects_an_empty_or_wrong_sized_answer_behind_a_warm_cache() {
+        for answer in [
+            vec![],
+            vec![vec![0.5_f32; 3]],
+            vec![vec![0.5; 4], vec![0.5; 4]],
+        ] {
+            let cache = CachedEmbedding::new(
+                Box::new(DegradesAfterOne(Cell::new(0), answer.clone())),
+                10,
+                None,
+            );
+            cache.embed_batch(&["q"], PromptName::Query).await.unwrap();
+            assert_eq!(
+                cache.embed_batch(&["q"], PromptName::Query).await.unwrap()[0].len(),
+                4,
+                "the cache still answers the fixed query"
+            );
+            let err = cache.probe("q").await.expect_err("probe must fail");
+            assert!(
+                err.to_string().contains("expected 1 vector of 4 dims"),
+                "{answer:?}: {err}"
+            );
+        }
+    }
+
     /// A blackholed L2 must not hang embed_batch: both batch phases time out
     /// (each counts as one breaker failure) and the inner provider answers.
     /// Paused clock — the 3s timeouts elapse instantly.

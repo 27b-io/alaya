@@ -47,11 +47,7 @@ pub(crate) fn parse(
             );
         }
     };
-    if expect_hash.len() != 64
-        || !expect_hash
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
+    if !alaya_types::memory::validate_content_hash(&expect_hash) {
         return Err("SELFCHECK_EXPECT_HASH must be a 64-char lowercase hex content_hash".into());
     }
     let secs = match interval_secs {
