@@ -400,7 +400,7 @@ SECRET_TOKENS = (
     r"|xox[abprs]-[A-Za-z0-9-]{10,}"
     r"|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[\w-]{35}|GOCSPX-[\w-]{20,}"
     r"|glpat-[\w-]{20,}|hf_[A-Za-z0-9]{30,}|npm_[A-Za-z0-9]{36}|pypi-[\w-]{50,}"
-    r"|[sr]k_(?:live|test)_\w{20,}"
+    r"|[sr]k_(?:live|test)_\w{20,}|whsec_[A-Za-z0-9+/=]{20,}"
     r"|ops_[\w-]{20,}|tskey-[A-Za-z0-9-]{10,}"
     r"|eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}"  # JWT
 )
@@ -426,12 +426,24 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
             re.I,
         ),
     ),
-    ("secret", re.compile(r"(?P<keep>(?:^|\s)-u\s*[^\s:<>]+:)[^\s<>]{6,}")),
+    (  # the user-and-password argument of curl -u or --user
+        "secret",
+        re.compile(r"(?P<keep>(?:^|\s)(?:-u\s*|--user[=\s]\s*)[^\s:<>]+:)[^\s<>]{6,}"),
+    ),
     (  # any key naming a secret, prefixed or not: API_KEY=, client_secret:
         "secret",
+        re.compile(  # the look-behind anchors the name: without it, quadratic
+            r"(?P<keep>(?<![\w.-])[\w.-]*?(?:api[_-]?key|account[_-]?key|[_-]key"
+            r"|token|secret|passw(?:or)?d|passphrase|pwd|credential)[\w.-]*"
+            r"[\"']?\s*(?:=>|[:=])\s*[\"']?)[^\s\"'<>,;]{8,}",
+            re.I,
+        ),
+    ),
+    (  # a command-line flag naming a secret, then its value: --password VALUE
+        "secret",
         re.compile(
-            r"(?P<keep>[\w.-]*?(?:api[_-]?key|token|secret|passw(?:or)?d|pwd"
-            r"|credential)[\w.-]*[\"']?\s*[:=]\s*[\"']?)[^\s\"'<>,;]{8,}",
+            r"(?P<keep>--[\w-]*(?:key|token|secret|passw(?:or)?d)[\w-]*[=\s]\s*)"
+            r"[^\s\"'<>]{6,}",
             re.I,
         ),
     ),
@@ -1826,8 +1838,9 @@ def cmd_eval(args) -> None:
         if problems:  # eval measures; landing is gated in judge.rs and by a human
             log("prompt hygiene problems: " + "; ".join(problems))
     scrubber = Scrubber(read_host_names(args.host_names)) if args.scrub else None
-    if scrubber and args.judge == "openai" and scrubber.leaks(prompt):
-        # The system prompt goes out too, and a tuned one was written from raw pairs.
+    if scrubber and args.judge != "jev" and scrubber.leaks(prompt):
+        # The system prompt goes out too, to whichever model the wire reaches,
+        # and a tuned one was written from raw pairs.
         sys.exit(
             f"the prompt matches scrub rules {scrubber.leaks(prompt)}; nothing sent"
         )
@@ -2053,10 +2066,13 @@ def load_evals(out: Path) -> dict[str, dict[str, dict]]:
         if path.name.endswith(("_sent.json", "_spend.json")):
             continue
         result = json.loads(path.read_text(encoding="utf-8"))
+        if result.get("pairs") not in ("all", "rows"):
+            continue
         if "judge" not in result or result["passes"] != 1:
             sys.exit(f"{path.name}: compare scores one-pass judge-seam evals only")
-        if result["pairs"] not in ("all", "rows"):
-            continue
+        stem = result["records"].removesuffix("_records.jsonl")
+        if not (out / f"{stem}_sent.json").exists():  # the Sent table would undercount
+            sys.exit(f"{path.name} has no {stem}_sent.json")
         kind = "rows" if result["pairs"] == "rows" else "golden"
         name = result["judge_model"] + ("" if result["scrubbed"] else ":raw")
         if name in evals[kind]:

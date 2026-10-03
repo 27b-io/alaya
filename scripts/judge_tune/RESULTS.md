@@ -130,7 +130,8 @@ effect as switching auto-apply off, which needs no vendor.
   and secrets replaced. Sonnet also ran once on unscrubbed text as a control.
   The scrub made 224 host, 124 URL, 41 IP, 25 email and 4 secret replacements
   over 357 memories. Review later widened the secret rules (prefixed key
-  names such as `X_API_KEY=`, `Authorization:` headers, more token formats).
+  names such as `X_API_KEY=`, `Authorization:` headers, secret-bearing
+  command-line flags, more token formats).
   Re-scanning the text actually sent, with those rules and with gitleaks,
   found no secret; the extra matches were a placeholder and a CI keyword.
 - No pair failed for any judge. Spend was USD 5.81 at list price: Anthropic

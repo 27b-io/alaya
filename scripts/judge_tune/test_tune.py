@@ -328,6 +328,14 @@ def check_scrub() -> None:
             "refresh_token = " + "r7" * 8,
             "Authorization: Basic " + "dXNlcjpw" * 3,
             "curl -u admin:" + "pa55word",
+            "curl --user admin:" + "pa55word",
+            "mysql --password " + "s3cr3tpass",
+            "private_key: " + "k3" * 8,
+            "ENCRYPTION_KEY=" + "e4" * 8,
+            "passphrase: " + "p5" * 8,
+            "AccountName=x;AccountKey=" + "Zm9v" * 6 + "==",
+            "'apikey' => '" + "a6" * 8 + "'",
+            "wh" + "sec_" + "W" * 24,
             "n" + "pm_" + "B" * 36,
             "-----BEGIN PGP "
             + "PRIVATE KEY BLOCK-----\nlQOYBF\n-----END PGP PRIVATE KEY BLOCK-----",
@@ -348,11 +356,16 @@ def check_scrub() -> None:
     assert s("Bearer " + "abc" * 6) == "Bearer <secret>"
     assert s(key_block + " tail") == "<secret> tail"
     assert s("ssh -i key2 " + key_block[:40]) == "ssh -i key2 <secret>"  # cut block
+    # The key-name rule stays linear on a long unbroken token (it was quadratic).
+    start = tune.time.perf_counter()
+    s("x" * 64_000 + " token")
+    assert tune.time.perf_counter() - start < 1.0
     # Prose, file names, versions, times and hashes are not a scrub class.
     plain = (
         "Ray ruled on tune.py and judge.rs (v1.13.0) at 12:30:45; max_tokens=4096, "
         "token budget 5, std::fs, hash 9999d3f16a2030def3b3479ef273318194c8e03f, "
-        "e.g. the bearer token; lab node; pinned cachekit@0.1.4 and action@v3.2.0"
+        "e.g. the bearer token; lab node; pinned cachekit@0.1.4 and action@v3.2.0; "
+        "systemctl --user restart gateway"
     )
     assert s(plain) == plain and s.leaks(plain) == [], s(plain)
     # Bare names come only from the host list, longest first, as whole words.
