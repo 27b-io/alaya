@@ -1207,7 +1207,21 @@ mod tests {
                 },
             },
             "judge_daily_cap": { "cap": 1000, "admitted_today": 41, "utc_day": "2026-10-01" },
+            "pod": pod(serde_json::json!({
+                "at": 1_791_000_000, "ok": true, "failing_step": null, "error": null,
+                "rerank": "ran", "elapsed_ms": 812,
+            }), 0),
             "errors": [],
+        })
+    }
+
+    /// The `pod` section of `GET /stats` (LAB-4026) with `last` as the
+    /// latest self-check.
+    fn pod(last: serde_json::Value, consecutive: u64) -> serde_json::Value {
+        serde_json::json!({
+            "name": "alaya-server-7d9f", "started_at": 1_790_990_000,
+            "failures": { "embedding": 3, "rerank": 11, "store": 2 },
+            "selfcheck": { "enabled": true, "consecutive_failures": consecutive, "last": last },
         })
     }
 
@@ -1300,6 +1314,74 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("unavailable"));
         assert!(body.contains("stats timed out after 30s"));
+    }
+
+    /// LAB-4026 AC-5: a passing self-check renders as a badge beside the
+    /// pod's counters; no alert.
+    #[tokio::test]
+    async fn health_pane_shows_a_passing_self_check_and_the_counters() {
+        let (status, body) = health_page(full_stats()).await;
+        assert_eq!(status, StatusCode::OK);
+        for needle in [
+            ">passing<",
+            "rerank: ran",
+            "alaya-server-7d9f",
+            "embedding calls",
+            ">3<",
+            ">11<",
+            ">2<",
+        ] {
+            assert!(body.contains(needle), "missing {needle:?} in {body}");
+        }
+        assert!(!body.contains(r#"role="alert""#), "{body}");
+    }
+
+    /// LAB-4026 AC-5: a failing self-check is an alert banner naming the
+    /// step and the error — never a quiet row of zeros.
+    #[tokio::test]
+    async fn health_pane_renders_a_failing_self_check_as_a_banner() {
+        let mut stats = full_stats();
+        stats["pod"] = pod(
+            serde_json::json!({
+                "at": 1_791_000_000, "ok": false, "failing_step": "embed",
+                "error": "embedding error: connection refused", "rerank": null, "elapsed_ms": 4,
+            }),
+            4,
+        );
+        let (status, body) = health_page(stats).await;
+        assert_eq!(status, StatusCode::OK);
+        let alert = body
+            .split(r#"role="alert""#)
+            .nth(1)
+            .expect("an alert banner");
+        for needle in [
+            ">failing<",
+            "step embed",
+            "embedding error: connection refused",
+            "4 consecutive",
+        ] {
+            assert!(alert.contains(needle), "missing {needle:?} in {body}");
+        }
+        assert!(!body.contains(">passing<"));
+    }
+
+    /// A server without the section (older build) says so; a disabled check
+    /// says it is disabled. Neither passes for a healthy check.
+    #[tokio::test]
+    async fn health_pane_self_check_absent_or_disabled_is_never_passing() {
+        let mut stats = full_stats();
+        stats.as_object_mut().unwrap().remove("pod");
+        let (_, body) = health_page(stats.clone()).await;
+        assert!(body.contains("self-check and failure counters"), "{body}");
+        assert!(body.contains("unavailable") && !body.contains(">passing<"));
+
+        stats["pod"] = pod(serde_json::Value::Null, 0);
+        stats["pod"]["selfcheck"]["enabled"] = false.into();
+        let (_, body) = health_page(stats).await;
+        assert!(
+            body.contains(">disabled<") && !body.contains(">passing<"),
+            "{body}"
+        );
     }
 
     /// The pane's link targets must load on today's contradictions page:

@@ -171,6 +171,9 @@ RERANK_URL=                              # optional — empty disables cross-enc
 RERANK_API_KEY=                          # optional
 RERANK_TOP_N=20                          # how many RRF candidates to rerank
 RERANK_TIMEOUT_MS=5000                   # budget per rerank call; falls back to RRF order past this
+SELFCHECK_QUERY=                         # periodic read-only search per pod (LAB-4026); set both or neither —
+SELFCHECK_EXPECT_HASH=                   #   result + failure counters in /health/detail and GET /stats `pod`
+SELFCHECK_INTERVAL_SECS=300              #   minimum 30; never wired to /health (a deep probe restart-loops pods)
 CACHE_BACKEND=redis                      # L2 embedding cache backend: redis (default) | saas
 REDIS_CACHE_URL=                         # redis backend — empty disables L2 (L1-only)
 CACHEKIT_API_KEY=                        # saas backend — required when CACHE_BACKEND=saas

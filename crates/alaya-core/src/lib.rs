@@ -9,3 +9,4 @@ pub mod salience;
 pub mod service;
 pub mod spaced_repetition;
 pub mod stats;
+pub mod vitals;

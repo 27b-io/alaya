@@ -73,6 +73,7 @@ use crate::{
     hashing::generate_content_hash,
     hybrid_search::{self, RRF_K},
     interference, provenance, salience, spaced_repetition,
+    vitals::{Rerank, Vitals},
 };
 
 // ─── Search types ───────────────────────────────────────────────────────────
@@ -296,6 +297,9 @@ pub struct MemoryService {
     /// Optional cross-encoder reranker. When set, hybrid search re-scores
     /// the top-N RRF candidates as (query, doc) pairs and reorders them.
     pub reranker: Option<Box<dyn RerankingService>>,
+    /// Failure counters and the self-check's last result (LAB-4026). Shared
+    /// with the server, which reads them off the worker thread.
+    pub vitals: std::sync::Arc<Vitals>,
     /// Cached (timestamp, tags) from `get_all_tags()`. RefCell is fine:
     /// MemoryService runs single-threaded on a LocalSet (`!Send`).
     tag_cache: RefCell<Option<(f64, Vec<String>)>>,
@@ -321,6 +325,7 @@ impl MemoryService {
             summary,
             judge: None,
             reranker: None,
+            vitals: Default::default(),
             tag_cache: RefCell::new(None),
             clock: current_timestamp,
         }
@@ -330,6 +335,13 @@ impl MemoryService {
     /// re-scores the top-N RRF candidates and reorders them.
     pub fn with_reranker(mut self, reranker: Box<dyn RerankingService>) -> Self {
         self.reranker = Some(reranker);
+        self
+    }
+
+    /// Builder: share the server's counters (LAB-4026), so the health
+    /// checker sees the rerank fallbacks this service counts.
+    pub fn with_vitals(mut self, vitals: std::sync::Arc<Vitals>) -> Self {
+        self.vitals = vitals;
         self
     }
 
@@ -358,6 +370,7 @@ impl MemoryService {
             summary: None,
             judge: None,
             reranker: None,
+            vitals: Default::default(),
             tag_cache: RefCell::new(None),
             clock,
         }
@@ -755,7 +768,7 @@ impl MemoryService {
         }
         let mode_str = format!("{:?}", params.mode).to_lowercase();
         let mut result = match params.mode {
-            SearchMode::Hybrid => self.search_hybrid(&params, read_only).await?,
+            SearchMode::Hybrid => self.search_hybrid(&params, read_only).await?.0,
             SearchMode::Scan => self.search_scan(&params).await?,
             SearchMode::Similar => self.search_similar(&params).await?,
             SearchMode::Tag => self.search_tag(&params).await?,
@@ -768,8 +781,14 @@ impl MemoryService {
         Ok(result)
     }
 
+    /// The hybrid search response, plus what the rerank pass did: the
+    /// response does not carry that, and the self-check reads it.
     #[tracing::instrument(skip(self, params))]
-    async fn search_hybrid(&self, params: &SearchParams, read_only: bool) -> Result<Value> {
+    pub(crate) async fn search_hybrid(
+        &self,
+        params: &SearchParams,
+        read_only: bool,
+    ) -> Result<(Value, Rerank)> {
         let stages = StageClock::start();
         let result = self.search_hybrid_timed(params, read_only, &stages).await;
         stages.finish(result.is_ok());
@@ -783,7 +802,7 @@ impl MemoryService {
         params: &SearchParams,
         read_only: bool,
         stages: &StageClock,
-    ) -> Result<Value> {
+    ) -> Result<(Value, Rerank)> {
         if params.query.trim().is_empty() {
             return Err(AlayaError::Validation(
                 "query is required for hybrid mode".into(),
@@ -1066,15 +1085,18 @@ impl MemoryService {
         // replaces the RRF+cosine blend in the scoring loop for those entries.
         // Validated on LongMemEval (2026-05-23): R@5 0.936 → 0.990 with
         // BAAI/bge-reranker-v2-m3 and top_n=20.
-        let rerank_score_map: HashMap<String, f64> = 'rerank: {
+        // Every fallback is counted (LAB-4026): it logs a warning and the
+        // response looks the same, so the counter is the only trace a
+        // reranker that is down every time leaves behind.
+        let (rerank_score_map, rerank): (HashMap<String, f64>, Rerank) = 'rerank: {
             let Some(reranker) = self.reranker.as_ref() else {
-                break 'rerank HashMap::new();
+                break 'rerank (HashMap::new(), Rerank::NotConfigured);
             };
             let _span = tracing::info_span!("rerank", top_n = reranker.top_n()).entered();
             let _stage = stages.stage(Stage::Rerank);
             let top_n = reranker.top_n().min(fused.len());
             if top_n == 0 {
-                break 'rerank HashMap::new();
+                break 'rerank (HashMap::new(), Rerank::NoCandidates);
             }
 
             let candidate_contents: Vec<&str> = fused
@@ -1101,7 +1123,8 @@ impl MemoryService {
                         expected = top_n,
                         "rerank score count mismatch; skipping rerank"
                     );
-                    break 'rerank HashMap::new();
+                    self.vitals.rerank_failed();
+                    break 'rerank (HashMap::new(), Rerank::FellBack("score count mismatch"));
                 }
                 Some(Err(e)) => {
                     tracing::warn!(
@@ -1110,7 +1133,8 @@ impl MemoryService {
                         elapsed_ms = elapsed.as_millis() as u64,
                         "rerank failed (non-fatal); using RRF order"
                     );
-                    break 'rerank HashMap::new();
+                    self.vitals.rerank_failed();
+                    break 'rerank (HashMap::new(), Rerank::FellBack("error"));
                 }
                 None => {
                     tracing::warn!(
@@ -1118,7 +1142,8 @@ impl MemoryService {
                         elapsed_ms = elapsed.as_millis() as u64,
                         "rerank timed out (non-fatal); using RRF order"
                     );
-                    break 'rerank HashMap::new();
+                    self.vitals.rerank_failed();
+                    break 'rerank (HashMap::new(), Rerank::FellBack("timed out"));
                 }
             };
 
@@ -1144,7 +1169,7 @@ impl MemoryService {
                 reranked = map.len(),
                 "cross-encoder rerank reordered top-N candidates"
             );
-            map
+            (map, Rerank::Ran)
         };
 
         // Normalize RRF scores to [0, 1] for blending with display_score (cosine).
@@ -1324,14 +1349,17 @@ impl MemoryService {
             })
             .collect();
 
-        Ok(serde_json::json!({
-            "page": params.page,
-            "total": total,
-            "page_size": params.page_size,
-            "has_more": has_more,
-            "total_pages": total_pages,
-            "results": results,
-        }))
+        Ok((
+            serde_json::json!({
+                "page": params.page,
+                "total": total,
+                "page_size": params.page_size,
+                "has_more": has_more,
+                "total_pages": total_pages,
+                "results": results,
+            }),
+            rerank,
+        ))
     }
 
     #[tracing::instrument(skip(self, params))]
@@ -2737,7 +2765,7 @@ impl MemoryService {
 /// the per-request reqwest timeout in the backend client is the bound and
 /// surfaces as `Some(Err)`.
 #[cfg(not(target_arch = "wasm32"))]
-async fn with_budget<T>(
+pub(crate) async fn with_budget<T>(
     budget: std::time::Duration,
     fut: impl std::future::Future<Output = T>,
 ) -> Option<T> {
@@ -2745,7 +2773,7 @@ async fn with_budget<T>(
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn with_budget<T>(
+pub(crate) async fn with_budget<T>(
     _budget: std::time::Duration,
     fut: impl std::future::Future<Output = T>,
 ) -> Option<T> {
@@ -6361,6 +6389,136 @@ mod tests {
             "RRF order (cosine-driven) preserved when rerank times out — a \
              completed rerank would have put doc-bbbb first"
         );
+    }
+
+    // ─── Self-check (LAB-4026) ───────────────────────────────────────────
+
+    use crate::vitals::{Rerank, SelfCheckOutcome, Step};
+
+    const SELFCHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn selfcheck_hits() -> Vec<ScoredMemory> {
+        vec![
+            make_scored_memory(&"a".repeat(64), "doc-aaaa stability first", 0.9),
+            make_scored_memory(&"b".repeat(64), "doc-bbbb stability second", 0.8),
+        ]
+    }
+
+    /// A pass with a working reranker, through mocks that count every write
+    /// a hybrid search can make: the self-check must make none of them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn self_check_passes_and_writes_nothing() {
+        let increments = Rc::new(Cell::new(0));
+        let enqueues = Rc::new(Cell::new(0));
+        let svc = MemoryService::new(
+            Box::new(MockVectorsWithInjection {
+                search_results: selfcheck_hits(),
+                access_increments: increments.clone(),
+                ..Default::default()
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(CountingHebbian(enqueues.clone())),
+            Box::new(MockConsolidation),
+            None,
+        )
+        .with_reranker(Box::new(MockReranker {
+            top_n: 2,
+            scores_by_doc_prefix: HashMap::new(),
+            sleep_for: std::time::Duration::ZERO,
+            budget: std::time::Duration::from_secs(5),
+        }));
+
+        let o = svc
+            .self_check("stability", &"b".repeat(64), SELFCHECK_BUDGET)
+            .await;
+
+        assert_eq!(
+            o,
+            SelfCheckOutcome {
+                failing_step: None,
+                error: None,
+                rerank: Some(Rerank::Ran),
+            }
+        );
+        assert_eq!(increments.get(), 0, "no access-count bump");
+        assert_eq!(enqueues.get(), 0, "no Hebbian enqueue");
+        assert_eq!(svc.vitals.snapshot()["failures"]["rerank"], 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn self_check_failing_embedder_names_the_embed_step() {
+        let svc = MemoryService::new(
+            Box::new(MockVectorsWithInjection {
+                search_results: selfcheck_hits(),
+                ..Default::default()
+            }),
+            Box::new(FailingEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        );
+
+        let o = svc
+            .self_check("stability", &"a".repeat(64), SELFCHECK_BUDGET)
+            .await;
+
+        assert_eq!(o.failing_step, Some(Step::Embed));
+        assert!(o.error.unwrap().contains("connection refused"));
+        assert_eq!(o.rerank, None, "the search never ran");
+    }
+
+    /// The expected memory is found, but RRF order was served: recorded as a
+    /// fallback, counted, and a failing check.
+    #[tokio::test(flavor = "current_thread")]
+    async fn self_check_records_a_rerank_fallback() {
+        let svc = build_rerank_test_service(selfcheck_hits(), Some(Box::new(FailingReranker)));
+
+        let o = svc
+            .self_check("stability", &"a".repeat(64), SELFCHECK_BUDGET)
+            .await;
+
+        assert_eq!(o.failing_step, Some(Step::Rerank));
+        assert_eq!(o.rerank, Some(Rerank::FellBack("error")));
+        assert_eq!(
+            o.error.as_deref(),
+            Some("rerank fell back to RRF order: error")
+        );
+        assert_eq!(svc.vitals.snapshot()["failures"]["rerank"], 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn self_check_fails_when_the_expected_memory_is_missing() {
+        let svc = build_rerank_test_service(selfcheck_hits(), None);
+
+        let o = svc
+            .self_check("stability", &"c".repeat(64), SELFCHECK_BUDGET)
+            .await;
+
+        assert_eq!(o.failing_step, Some(Step::Expect));
+        assert_eq!(o.rerank, Some(Rerank::NotConfigured));
+    }
+
+    /// A wedged embedder is cut off at the budget and the failure names the
+    /// step that was running.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn self_check_times_out_naming_the_running_step() {
+        let svc = MemoryService::new(
+            Box::new(MockVectorsWithInjection::default()),
+            Box::new(HangingEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        );
+
+        let o = svc
+            .self_check("stability", &"a".repeat(64), SELFCHECK_BUDGET)
+            .await;
+
+        assert_eq!(o.failing_step, Some(Step::Embed));
+        assert_eq!(o.error.as_deref(), Some("timed out after 10s"));
     }
 
     /// Without a reranker, search behavior is unchanged — RRF/cosine wins.
