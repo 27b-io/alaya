@@ -13,7 +13,9 @@ import argparse
 import itertools
 import json
 import sys
+import tempfile
 from collections import Counter
+from pathlib import Path
 
 
 import tune
@@ -318,6 +320,17 @@ def check_scrub() -> None:
             "header Authorization: Bearer " + "abc" * 6,
             "export API_KEY=" + "z9" * 10,
             "token: " + "q" * 12,
+            # Prefixed and suffixed key names, as env vars and configs write them.
+            "ALAYA_API_KEY=" + "0f" * 16,
+            "GRAPH_API_KEY: " + "ab12" * 4,
+            "DB_PASSWORD=" + "hunter2hunter2",
+            '"client_secret": "' + "c5" * 10 + '"',
+            "refresh_token = " + "r7" * 8,
+            "Authorization: Basic " + "dXNlcjpw" * 3,
+            "curl -u admin:" + "pa55word",
+            "n" + "pm_" + "B" * 36,
+            "-----BEGIN PGP "
+            + "PRIVATE KEY BLOCK-----\nlQOYBF\n-----END PGP PRIVATE KEY BLOCK-----",
             "sk-" + "ant-" + "x1" * 15,
             "gh" + "p_" + "A" * 36,
             "jwt eyJ" + "a" * 10 + ".eyJ" + "b" * 10 + "." + "c" * 12,
@@ -353,7 +366,28 @@ def check_scrub() -> None:
     text = tune.render_pair(a, s.memory(mem("ok", 86_400.0 * 2)))
     assert s.leaks(text) == [] and "tags: <host>, plain" in text, text
     assert s.counts == Counter(ip=1, host=2)
-    assert tune.read_host_names(None) == []
+
+    # Keys reach HTTP headers: whitespace would make httpx echo them in errors.
+    real_env = dict(tune.os.environ)
+    try:
+        tune.os.environ["X_KEY"] = "abc\r"
+        try:
+            tune.env("X_KEY")
+        except SystemExit as e:
+            assert "non-printable" in str(e) and "abc" not in str(e)
+        else:
+            raise AssertionError("a key with a CR must be refused")
+    finally:
+        tune.os.environ.clear()
+        tune.os.environ.update(real_env)
+    tune.unscrubbed_ok("claude-sonnet-5")
+    for model in ("gemini-3.8-flash", "gpt-6-sol"):
+        try:
+            tune.unscrubbed_ok(model)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"{model} must never read unscrubbed text")
 
 
 def check_judges() -> None:
@@ -460,6 +494,7 @@ def check_judges() -> None:
     }
     v = tune.jev_verdict(jev(probs, {"a": 0.2, "b": 0.1, "neither": 0.7}))
     assert (v["verdict"], v["survivor"]) == ("contradiction", None)
+    assert v["survivor_probs"]["neither"] == 0.7
     try:
         tune.jev_verdict({"answers": {"verdict": {}}, "usage": {"input_tokens": 9}})
     except tune.ApiError as e:
@@ -468,7 +503,6 @@ def check_judges() -> None:
         raise AssertionError("a malformed Jev answer is an API error")
     assert set(tune.JEV_QUESTIONS) == {"verdict", "survivor", "hide_a", "hide_b"}
     assert list(tune.JEV_QUESTIONS["verdict"]["criteria"]) == list(tune.CLASSES)
-    assert tune.price("jev-1.13.0") == (0.042, 0.0)
 
 
 def check_rows() -> None:
@@ -520,8 +554,8 @@ def check_compare() -> None:
     assert tune.kappa(["s", "s"], ["s", "s"]) is None and tune.kappa([], []) is None
     k = tune.kappa(list("sssscc"), list("ssscsc"))
     assert abs(k - 0.25) < 1e-12, k  # po 4/6, pe (4*4 + 2*2) / 36
-    assert tune.decide([verdict(), verdict(verdict=tune.FAILED)]) is None
-    assert tune.decide([]) is None
+    assert tune.decide([verdict(verdict=tune.FAILED)]) is None
+    assert tune.decide([verdict(verdict="unjudged")])["verdict"] == tune.ABSTAIN
     d = tune.decide([verdict(confidence=0.9, hide={"a": 0.3, "b": 0.8})])
     assert d["confidence"] == 0.9 and d["hide"] == {"a": 0.3, "b": 0.8}
 
@@ -536,34 +570,131 @@ def check_compare() -> None:
 
     primary = {0: sup("a"), 1: sup("b", 0.80), 2: sup("a")}
     alone = tune.auto_apply(pairs, primary)
-    assert (alone["applied"], alone["correct"], alone["wrong_ids"]) == (2, 1, [2])
+    assert (alone["applied"], alone["correct"]) == (2, 1)
     assert alone["recall"]["n"] == 2 and alone["precision"]["rate"] == 0.5
     jev = {0: {"hide": {"a": 0.1, "b": 0.95}}, 2: {"hide": {"a": 0.2, "b": 0.6}}}
     seconds = tune.second_votes({"p": primary, "jev-1.13.0": jev}, "p", "jev-1.13.0")
     assert sorted(seconds) == ["jev-1.13.0"] + [
         f"jev-1.13.0 hide>={t}" for t in tune.HIDE_THRESHOLDS
     ]
-    voted = tune.auto_apply(pairs, primary, seconds["jev-1.13.0 hide>=0.7"])
-    assert (voted["applied"], voted["correct"], voted["wrong_ids"]) == (1, 1, [])
-    other = {
-        0: sup("a"),
-        2: {"verdict": "coexist", "survivor": None, "confidence": 0.9},
-    }
-    agrees = tune.second_votes({"p": primary, "g": other}, "p", None)["g"]
-    assert tune.auto_apply(pairs, primary, agrees)["wrong_ids"] == []
+    judge, agrees = seconds["jev-1.13.0 hide>=0.7"]
+    voted = tune.auto_apply([p for p in pairs if p.id in jev], primary, agrees)
+    assert judge == "jev-1.13.0" and (voted["applied"], voted["correct"]) == (1, 1)
 
     rows = [(s1, {"hide": {"a": 0.1, "b": 0.8}}), (co, {"hide": {"a": 0.85, "b": 0.2}})]
-    r = tune.hide_rates(rows, 0.7)
-    assert (r["precision"]["k"], r["precision"]["n"], r["recall"]["n"]) == (1, 2, 1)
-    assert tune.hide_rates(rows, 0.9)["precision"]["n"] == 0
-    # The one loser (0.8) outranks 2 of the 3 other endpoints; no loser, no AUC.
-    assert tune.hide_auc(rows) == 2 / 3 and tune.hide_auc(rows[1:]) is None
+    r = tune.hide_rates(rows)
+    at7 = r["thresholds"]["0.7"]
+    assert (at7["precision"]["k"], at7["precision"]["n"], at7["recall"]["n"]) == (
+        1,
+        2,
+        1,
+    )
+    assert r["thresholds"]["0.9"]["precision"]["n"] == 0
+    # The one loser (0.8) outranks 2 of the 3 other endpoints.
+    assert r["auc"] == 2 / 3 and r["median_loser"] == 0.8 and r["median_other"] == 0.2
+    assert tune.hide_rates(rows[1:])["auc"] is None
     agree = tune.agreement({"x": {0: verdict(), 1: verdict()}, "y": {1: verdict()}})
     assert agree == [
         {"judges": ["x", "y"], "n": 1, "raw": tune.rate(1, 1), "kappa": None}
     ]
-    fx = tune.fixture_provenance()
-    assert fx["rule_version"] == 2 and len(fx["git_blob"]) == 40
+    assert len(tune.fixture_provenance()["git_blob"]) == 40
+    check_compare_run()
+
+
+def check_compare_run() -> None:
+    """compare end to end over a fake run directory: a failed second vote is
+    left out, never a veto; sent counts include an eval that aborted."""
+    pairs = tune.load_fixture()
+    sups = [p for p in pairs if p.label == "supersession"]
+    flaky = sups[0]  # the second judge fails here
+
+    def vote(p, failed=False, hide=None):
+        v = {"verdict": p.label, "survivor": p.survivor_letter(), "confidence": 0.95}
+        v["survivor"] = v["survivor"] and v["survivor"].lower()
+        if failed:
+            v = {"verdict": tune.FAILED, "survivor": None, "confidence": None}
+        if hide is not None:
+            v["hide"] = hide
+        return v | {"a": p.a, "b": p.b, "newer": p.b, "reason": ""}
+
+    def write_eval(out, stem, judge, model, votes, scrubbed=True, counts=None):
+        (out / f"{stem}_records.jsonl").write_text(
+            "".join(json.dumps(v) + "\n" for v in votes)
+        )
+        result = {"judge": judge, "judge_model": model, "pairs": "all", "passes": 1}
+        result |= {"scrubbed": scrubbed, "records": f"{stem}_records.jsonl"}
+        result |= {"scrub_counts": counts or {"host": 3}, "sent": {"memories": 274}}
+        (out / f"{stem}.json").write_text(json.dumps(result))
+        sent = {
+            "judge": judge,
+            "scrubbed": scrubbed,
+            "pairs": [[p.a, p.b] for p in pairs],
+        }
+        (out / f"{stem}_sent.json").write_text(json.dumps(sent))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        write_eval(
+            out, "eval_s", "anthropic", "claude-sonnet-5", [vote(p) for p in pairs]
+        )
+        write_eval(
+            out, "eval_g", "openai", "gpt-6-sol", [vote(p, p is flaky) for p in pairs]
+        )
+        hide = {"a": 0.9, "b": 0.9}
+        write_eval(
+            out, "eval_j", "jev", "jev-1.13.0", [vote(p, hide=hide) for p in pairs]
+        )
+        # An eval that aborted before its result: still counted as sent.
+        aborted = {"judge": "jev", "scrubbed": True, "pairs": [["f" * 64, "e" * 64]]}
+        (out / "eval_x_sent.json").write_text(json.dumps(aborted))
+        (out / tune.SPEND_LOG).write_text(
+            json.dumps({"judge": "openai", "total_usd": 1.5})
+            + "\n"
+            + json.dumps({"judge": "jev", "total_usd": 0.25})
+            + "\n"
+        )
+        evals = tune.load_evals(out)
+        g = tune.golden_section(evals["golden"], "claude-sonnet-5")
+        vv = g["vote_value"]["partial_as_coexist"]
+        assert vv["alone"]["recall"]["k"] == vv["alone"]["recall"]["n"] == len(sups)
+        # The failed pair leaves the gpt-6-sol rule's denominator; no veto.
+        assert vv["gpt-6-sol"]["recall"]["n"] == len(sups) - 1
+        assert vv["gpt-6-sol"]["recall"]["k"] == len(sups) - 1
+        assert g["judges"]["gpt-6-sol"]["failed"] == 1
+        assert vv["jev-1.13.0 hide>=0.9"]["applied"] == len(sups)
+        sent = tune.sent_by_vendor(out)
+        assert sent["jev"]["pairs"] == len(pairs) + 1 and sent["openai"][
+            "pairs"
+        ] == len(pairs)
+        assert sent["anthropic"]["unscrubbed_pairs"] == 0
+        assert tune.spend_by_vendor(out) == {"jev": 0.25, "openai": 1.5, "total": 1.75}
+        assert tune.scrub_section(evals)["golden"]["host"] == 3
+        assert "## Golden set" in tune.compare_markdown(
+            {
+                "fixture": tune.fixture_provenance(),
+                "primary": "claude-sonnet-5",
+                "auto_apply_confidence": tune.AUTO_APPLY,
+                "spend_usd": {},
+                "sent": sent,
+                "scrub": {},
+                "golden": g,
+                "rows": None,
+            }
+        )
+        try:
+            tune.golden_section(evals["golden"], "claude-sonnet-5-typo")
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("an unknown --primary must exit")
+        # Different scrub counts mean different text reached different judges.
+        write_eval(out, "eval_r", "anthropic", "claude-opus-5", [], counts={"host": 4})
+        try:
+            tune.scrub_section(tune.load_evals(out))
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("mismatched scrub counts must exit")
 
 
 def main() -> None:

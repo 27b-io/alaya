@@ -34,12 +34,14 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import fcntl
 import hashlib
 import json
 import math
 import os
 import random
 import re
+import statistics
 import subprocess
 import sys
 import time
@@ -188,6 +190,10 @@ def env(key: str) -> str:
     value = os.environ.get(key)
     if not value:
         sys.exit(f"{key} must be set")
+    # A trailing CR or space would reach an HTTP header, and httpx echoes an
+    # illegal header value, key included, in its error message.
+    if not all("!" <= c <= "~" for c in value):
+        sys.exit(f"{key} holds whitespace or a non-printable character")
     return value
 
 
@@ -324,24 +330,30 @@ def seed_prompt() -> str:
 # ── Memories ─────────────────────────────────────────────────────────────────
 
 
+def alaya_client() -> httpx.Client:
+    return httpx.Client(
+        base_url=env("ALAYA_URL").rstrip("/"),
+        headers={"Authorization": f"Bearer {env('ALAYA_API_KEY')}"},
+        timeout=120,
+        transport=httpx.HTTPTransport(retries=3),
+    )
+
+
 def fetch_memories(pairs: list[Pair]) -> dict[str, dict]:
-    url = env("ALAYA_URL").rstrip("/")
-    headers = {"Authorization": f"Bearer {env('ALAYA_API_KEY')}"}
     hashes = sorted({h for p in pairs for h in (p.a, p.b)})
     memories: dict[str, dict] = {}
-    transport = httpx.HTTPTransport(retries=3)
-    with httpx.Client(timeout=60, headers=headers, transport=transport) as client:
+    with alaya_client() as client:
         for h in hashes:
             try:
-                resp = client.get(f"{url}/memories/{h}")
+                resp = client.get(f"/memories/{h}")
                 if resp.status_code == 404:  # the server maps found:false to 404
                     sys.exit(f"memory {h} is missing (deleted since labelling?)")
                 resp.raise_for_status()
                 memory = resp.json().get("memory")
             except httpx.HTTPStatusError as e:  # str(e) echoes the URL, userinfo too
                 sys.exit(f"GET /memories/{h}: HTTP {e.response.status_code}")
-            except (httpx.HTTPError, ValueError) as e:  # transport, non-JSON body
-                sys.exit(f"GET /memories/{h}: {e}")
+            except (httpx.HTTPError, ValueError) as e:  # never str(e): see env()
+                sys.exit(f"GET /memories/{h}: {type(e).__name__}")
             if not memory:
                 sys.exit(f"GET /memories/{h}: 200 without a memory body")
             memories[h] = memory
@@ -386,8 +398,9 @@ SECRET_TOKENS = (
     r"sk-[\w-]{20,}"  # Anthropic, OpenAI and LiteLLM keys
     r"|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_\w{30,}"
     r"|xox[abprs]-[A-Za-z0-9-]{10,}"
-    r"|AKIA[0-9A-Z]{16}|AIza[\w-]{35}"
-    r"|glpat-[\w-]{20,}|hf_[A-Za-z0-9]{30,}"
+    r"|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[\w-]{35}|GOCSPX-[\w-]{20,}"
+    r"|glpat-[\w-]{20,}|hf_[A-Za-z0-9]{30,}|npm_[A-Za-z0-9]{36}|pypi-[\w-]{50,}"
+    r"|[sr]k_(?:live|test)_\w{20,}"
     r"|ops_[\w-]{20,}|tskey-[A-Za-z0-9-]{10,}"
     r"|eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}"  # JWT
 )
@@ -396,8 +409,8 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
     (
         "secret",
         re.compile(
-            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?"
-            r"(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)",
+            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----.*?"
+            r"(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|\Z)",
             re.S,
         ),
     ),
@@ -409,8 +422,16 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
     (
         "secret",
         re.compile(
-            r"(?P<keep>\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|token"
-            r"|secret|password|passwd)[\"']?\s*[:=]\s*[\"']?)[^\s\"'<>,;]{8,}",
+            r"(?P<keep>\bauthorization[\"']?\s*[:=]\s*[\"']?\w+\s+)[^\s\"'<>]{8,}",
+            re.I,
+        ),
+    ),
+    ("secret", re.compile(r"(?P<keep>(?:^|\s)-u\s*[^\s:<>]+:)[^\s<>]{6,}")),
+    (  # any key naming a secret, prefixed or not: API_KEY=, client_secret:
+        "secret",
+        re.compile(
+            r"(?P<keep>[\w.-]*?(?:api[_-]?key|token|secret|passw(?:or)?d|pwd"
+            r"|credential)[\w.-]*[\"']?\s*[:=]\s*[\"']?)[^\s\"'<>,;]{8,}",
             re.I,
         ),
     ),
@@ -649,8 +670,8 @@ def http_client(url: str, key: str) -> httpx.Client:
 def post_json(http: httpx.Client, path: str, body: dict) -> dict:
     try:
         resp = http.post(path, json=body)
-    except httpx.HTTPError as e:  # transport; the message never holds a header
-        raise ApiError(f"{type(e).__name__}: {e}") from e
+    except httpx.HTTPError as e:  # never str(e): see env()
+        raise ApiError(type(e).__name__) from e
     if resp.status_code in (401, 403):
         raise AuthError(f"HTTP {resp.status_code}")
     if resp.status_code != 200:  # a gateway content-filter block lands here too
@@ -719,6 +740,8 @@ def openai_judge(http: httpx.Client, model: str, prompt: str) -> Callable[[str],
 # probabilities and writes no text. The criteria restate the judge prompt's
 # four classes; `hide_a` / `hide_b` ask the auto-apply question directly.
 JEV_MODEL = "jev-1.13.0"  # pinned: the `jev-latest` alias moves without notice
+# A fixed origin and a key of its own, so no other vendor's key can reach it.
+TYPESAFE_URL = "https://api.typesafe.ai"
 
 
 def safe_to_hide(x: str, y: str) -> dict:
@@ -792,8 +815,8 @@ JEV_QUESTIONS = {
 
 def jev_verdict(body: dict) -> dict:
     """A verdict from Jev's answers. The class is the most probable one; a
-    supersession names the likelier of a and b as survivor (it must name one),
-    a contradiction names one only when "neither" is not the most probable."""
+    supersession names the likelier of a and b as survivor (it must name one).
+    No metric reads another class's survivor; the probabilities are kept."""
     u = body.get("usage") or {}
     tokens = (u.get("input_tokens") or 0, u.get("output_tokens") or 0)
     try:
@@ -810,9 +833,6 @@ def jev_verdict(body: dict) -> dict:
     survivor = None
     if verdict == "supersession":
         survivor = "a" if surv["a"] >= surv["b"] else "b"
-    elif verdict == "contradiction":
-        best = max(surv, key=surv.__getitem__)
-        survivor = None if best == "neither" else best
     return {
         "verdict": verdict,
         "survivor": survivor,
@@ -1141,6 +1161,13 @@ class Hygiene:
 
 
 # ── Spend ledger ─────────────────────────────────────────────────────────────
+
+
+def unscrubbed_ok(model: str) -> None:
+    """Unscrubbed pairs go only to Claude, where the production judge sends
+    them, whichever wire or proxy carries the request."""
+    if not model.startswith("claude-"):
+        sys.exit(f"{model} would read unscrubbed memory text; only claude-* may")
 
 
 def price(model: str) -> tuple[float, float]:
@@ -1493,6 +1520,7 @@ def cmd_tune(args) -> None:
     judge_model = os.environ.get("JUDGE_MODEL", "claude-sonnet-5")
     reflection_model = os.environ.get("REFLECTION_MODEL", "claude-opus-5")
     price(judge_model), price(reflection_model)  # fail before the first paid call
+    unscrubbed_ok(judge_model), unscrubbed_ok(reflection_model)  # both read raw pairs
     memories = fetch_memories(pairs)
     hygiene = Hygiene(seed, memories)
     literal_hits = hygiene.leak_hits(seed, LITERAL_WINDOW, ignore_seed=False)
@@ -1687,15 +1715,16 @@ def consensus_disagreements(
 
 SPEND_LOG = "spend_log.jsonl"
 ROWS_FILE = "rows.json"
+LOCK_FILE = ".eval.lock"
 
 
-def run_spend(out: Path) -> float:
-    """USD booked by earlier evals in this run directory: the cap is per run."""
+def spend_log(out: Path) -> list[dict]:
+    """One line per eval in the run directory; the run's cap covers them all."""
     path = out / SPEND_LOG
     if not path.exists():
-        return 0.0
+        return []
     lines = path.read_text(encoding="utf-8").splitlines()
-    return sum(json.loads(line)["total_usd"] for line in lines if line.strip())
+    return [json.loads(line) for line in lines if line.strip()]
 
 
 def load_rows(out: Path) -> list[Pair]:
@@ -1708,13 +1737,14 @@ def load_rows(out: Path) -> list[Pair]:
 
 
 def make_judge(judge: str, model: str, prompt: str, regime: str):
+    if judge == "jev":
+        http = http_client(TYPESAFE_URL, env("TYPESAFE_API_KEY"))
+        return retried(jev_judge(http, model))
     url, key = env("JUDGE_URL"), env("JUDGE_API_KEY")
     if judge == "anthropic":  # no SDK retries: `retried` retries once, as for all
         client = make_client(url, key, max_retries=0)
         return retried(anthropic_judge(client, model, prompt, regime))
-    if judge == "openai":
-        return retried(openai_judge(http_client(url, key), model, prompt))
-    return retried(jev_judge(http_client(url, key), model))
+    return retried(openai_judge(http_client(url, key), model, prompt))
 
 
 def request_shape(judge: str, model: str, regime: str) -> dict:
@@ -1736,6 +1766,22 @@ def record(p: Pair, k: int, v: dict, newer: str) -> dict:
     return row | {key: v[key] for key in extra if key in v}
 
 
+def render_all(
+    chosen: list[Pair], memories: dict[str, dict], scrubber: Scrubber | None
+) -> list[str]:
+    """Every chosen pair as the judge sees it. Scrubbed, it fails closed: the
+    run exits before any request while a rendered pair still matches a rule."""
+    sent = {h for p in chosen for h in (p.a, p.b)}
+    shown = {h: scrubber.memory(memories[h]) if scrubber else memories[h] for h in sent}
+    texts = [render_pair(shown[p.a], shown[p.b]) for p in chosen]
+    if scrubber:
+        leaked = Counter(c for t in texts for c in scrubber.leaks(t))
+        if leaked:
+            sys.exit(f"scrub check failed, nothing sent: still matching {dict(leaked)}")
+        log(f"scrubbed {len(sent)} memories: {dict(scrubber.counts)}")
+    return texts
+
+
 def cmd_eval(args) -> None:
     if args.judge != "anthropic" and not args.scrub:
         # Unscrubbed text goes only where the production judge already sends it.
@@ -1754,9 +1800,16 @@ def cmd_eval(args) -> None:
     if not model:
         sys.exit(f"--judge {args.judge} needs --model")
     price(model)  # fail before the first paid call
+    if not args.scrub:
+        unscrubbed_ok(model)
     out = HERE / "runs" / args.run
     out.mkdir(parents=True, exist_ok=True)
-    cap = args.max_usd - run_spend(out)
+    lock = (out / LOCK_FILE).open("w")  # held until exit: one eval per run at a time
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(f"another eval is running in {out}; the run's cap needs them in turn")
+    cap = args.max_usd - sum(e["total_usd"] for e in spend_log(out))
     if cap <= 0:
         sys.exit(f"run {args.run} has already spent its ${args.max_usd} cap")
     if args.pairs == "rows":
@@ -1772,21 +1825,27 @@ def cmd_eval(args) -> None:
         problems = Hygiene(seed_prompt(), memories).problems(prompt)
         if problems:  # eval measures; landing is gated in judge.rs and by a human
             log("prompt hygiene problems: " + "; ".join(problems))
-    sent = sorted({h for p in chosen for h in (p.a, p.b)})
     scrubber = Scrubber(read_host_names(args.host_names)) if args.scrub else None
-    shown = {h: scrubber.memory(memories[h]) if scrubber else memories[h] for h in sent}
-    texts = [render_pair(shown[p.a], shown[p.b]) for p in chosen]
-    if scrubber:  # fail closed: nothing leaves while a rendered pair still matches
-        leaked = Counter(c for t in texts for c in scrubber.leaks(t))
-        if leaked:
-            sys.exit(f"scrub check failed, nothing sent: still matching {dict(leaked)}")
-        log(f"scrubbed {len(sent)} memories: {dict(scrubber.counts)}")
+    if scrubber and args.judge == "openai" and scrubber.leaks(prompt):
+        # The system prompt goes out too, and a tuned one was written from raw pairs.
+        sys.exit(
+            f"the prompt matches scrub rules {scrubber.leaks(prompt)}; nothing sent"
+        )
+    texts = render_all(chosen, memories, scrubber)
     judge = make_judge(args.judge, model, prompt, args.regime)
     instructions = (
         json.dumps(JEV_QUESTIONS, sort_keys=True) if args.judge == "jev" else prompt
     )
     scrub = "scrubbed" if scrubber else "raw"
-    stem = f"eval_{args.pairs}_{model}_{scrub}_{args.regime}_k{args.passes}_{sha(instructions)[:8]}"
+    stem = (
+        f"eval_{args.pairs}_{args.judge}_{model}_{scrub}_{args.regime}"
+        f"_k{args.passes}_{sha(instructions)[:8]}"
+    )
+    # What this eval sends, written before the first request: an abort or an
+    # outage later cannot drop it from the report.
+    sent = {"judge": args.judge, "model": model, "scrubbed": bool(scrubber)}
+    sent["pairs"] = [[p.a, p.b] for p in chosen]
+    (out / f"{stem}_sent.json").write_text(json.dumps(sent) + "\n", encoding="utf-8")
     log(
         f"eval: {args.judge}:{model}, {len(chosen)} pairs x {args.passes} passes, "
         f"{scrub}, regime={args.regime}, run cap left ${cap:.2f}"
@@ -1797,23 +1856,19 @@ def cmd_eval(args) -> None:
     try:
         judge_passes(judge, model, texts, args.passes, ledger, cap, votes)
     finally:  # paid verdicts and spend are written before any exit path
-        spend = ledger.summary()
-        (out / f"{stem}_spend.json").write_text(json.dumps(spend, indent=2) + "\n")
         with (out / SPEND_LOG).open("a", encoding="utf-8") as f:
-            line = {"stem": stem, "judge": args.judge, "model": model} | spend
-            f.write(json.dumps(line) + "\n")
+            line = {"stem": stem, "judge": args.judge, "model": model}
+            f.write(json.dumps(line | ledger.summary()) + "\n")
         with (out / f"{stem}_records.jsonl").open("w", encoding="utf-8") as f:
             for p, vs in zip(chosen, votes):
                 for k, v in enumerate(vs):
                     f.write(json.dumps(record(p, k, v, newer[p.id])) + "\n")
-    failed = {
-        p.id for p, vs in zip(chosen, votes) if any(v["verdict"] == FAILED for v in vs)
-    }
+    failed = set()
     for p, vs in zip(chosen, votes):
-        if p.id in failed:
-            log(
-                f"failed pair {p.id}: {next(v['reason'] for v in vs if v['verdict'] == FAILED)}"
-            )
+        reasons = [v["reason"] for v in vs if v["verdict"] == FAILED]
+        if reasons:
+            failed.add(p.id)
+            log(f"failed pair {p.id}: {reasons[0]}")
     result = {
         "judge": args.judge,
         "judge_model": model,
@@ -1829,7 +1884,10 @@ def cmd_eval(args) -> None:
         "hygiene_problems": problems,
         "scrubbed": bool(scrubber),
         "scrub_counts": dict(scrubber.counts) if scrubber else None,
-        "sent": {"pairs": len(chosen), "memories": len(sent)},
+        "sent": {
+            "pairs": len(chosen),
+            "memories": len({h for p in chosen for h in (p.a, p.b)}),
+        },
         "failed_pairs": len(failed),
         "records": f"{stem}_records.jsonl",
         "spend": ledger.summary(),
@@ -1867,31 +1925,26 @@ def cmd_eval(args) -> None:
 # them through the contradiction queue, resolved pairs included: the edge
 # carries the production verdict, survivor and confidence the row was drawn on.
 
-ROW_SWEEPS = (["supersession"], [*CLASSES, "unjudged"])
 
-
-def contradiction_pages(verdicts: list[str]) -> Iterable[dict]:
-    """Every CONTRADICTS pair whose verdict is in `verdicts`, newest first."""
-    url = env("ALAYA_URL").rstrip("/")
-    headers = {"Authorization": f"Bearer {env('ALAYA_API_KEY')}"}
-    transport = httpx.HTTPTransport(retries=3)
+def contradiction_pages() -> Iterable[dict]:
+    """Every CONTRADICTS pair, whatever its verdict, newest first."""
     offset = 0
-    with httpx.Client(timeout=120, headers=headers, transport=transport) as client:
+    with alaya_client() as client:
         while offset is not None:
             body = {
                 "limit": 500,
                 "offset": offset,
                 "include_resolved": True,
-                "verdicts": verdicts,
+                "verdicts": [*CLASSES, "unjudged"],
             }
             try:
-                resp = client.post(f"{url}/contradictions", json=body)
+                resp = client.post("/contradictions", json=body)
                 resp.raise_for_status()
                 page = resp.json()
             except httpx.HTTPStatusError as e:  # str(e) echoes the URL
                 sys.exit(f"POST /contradictions: HTTP {e.response.status_code}")
-            except (httpx.HTTPError, ValueError) as e:
-                sys.exit(f"POST /contradictions: {e}")
+            except (httpx.HTTPError, ValueError) as e:  # never str(e): see env()
+                sys.exit(f"POST /contradictions: {type(e).__name__}")
             yield from page["pairs"]
             offset = page.get("next_offset")
 
@@ -1959,21 +2012,12 @@ def cmd_rows(args) -> None:
     out = HERE / "runs" / args.run
     out.mkdir(parents=True, exist_ok=True)
     wanted = json.loads(Path(args.prefixes).read_text(encoding="utf-8"))
-    resolved: list[dict] = []
-    dropped: list[dict] = []
-    todo = wanted
-    for verdicts in ROW_SWEEPS:  # the drawn verdict first; every verdict if needed
-        done, ambiguous, todo = resolve_rows(todo, contradiction_pages(verdicts))
-        resolved += done
-        dropped += ambiguous
-        if not todo:
-            break
-    dropped += todo
-    resolved.sort(key=lambda r: r["row"])
+    resolved, ambiguous, unmatched = resolve_rows(wanted, contradiction_pages())
     (out / ROWS_FILE).write_text(json.dumps(resolved, indent=1) + "\n")
     log(
-        f"rows: {len(resolved)} of {len(wanted)} resolved; "
-        f"dropped {len(dropped)}: {sorted(r['row'] for r in dropped)}"
+        f"rows: {len(resolved)} of {len(wanted)} resolved; dropped "
+        f"{sorted(r['row'] for r in ambiguous)} ambiguous, "
+        f"{sorted(r['row'] for r in unmatched)} unmatched"
     )
 
 
@@ -1995,30 +2039,26 @@ def kappa(x: list[str], y: list[str]) -> float | None:
 
 
 def decide(votes: list[dict]) -> dict | None:
-    """A judge's decision on one pair, or None when a pass failed."""
-    if not votes or any(v["verdict"] == FAILED for v in votes):
+    """A judge's one-pass decision on a pair, or None when the pass failed."""
+    v = votes[0]
+    if v["verdict"] == FAILED:
         return None
-    d = consensus(votes)
-    confs = [v["confidence"] for v in votes if v["confidence"] is not None]
-    d["confidence"] = min(confs) if len(confs) == len(votes) else None
-    if all("hide" in v for v in votes):
-        d["hide"] = {s: min(v["hide"][s] for v in votes) for s in ("a", "b")}
-    return d
+    return consensus(votes) | {k: v[k] for k in ("confidence", "hide") if k in v}
 
 
 def load_evals(out: Path) -> dict[str, dict[str, dict]]:
-    """pairs kind -> judge name -> {"result", "votes": (a, b) -> votes}."""
+    """ "golden" or "rows" -> judge name -> {"result", "votes": (a, b) -> votes}."""
     evals: dict[str, dict[str, dict]] = defaultdict(dict)
     for path in sorted(out.glob("eval_*.json")):
-        if path.name.endswith("_spend.json"):
+        if path.name.endswith(("_sent.json", "_spend.json")):
             continue
         result = json.loads(path.read_text(encoding="utf-8"))
-        if "judge" not in result:  # an eval from before the judge seam
-            continue
-        name = result["judge_model"] + ("" if result["scrubbed"] else ":raw")
-        kind = "rows" if result["pairs"] == "rows" else "golden"
+        if "judge" not in result or result["passes"] != 1:
+            sys.exit(f"{path.name}: compare scores one-pass judge-seam evals only")
         if result["pairs"] not in ("all", "rows"):
             continue
+        kind = "rows" if result["pairs"] == "rows" else "golden"
+        name = result["judge_model"] + ("" if result["scrubbed"] else ":raw")
         if name in evals[kind]:
             sys.exit(f"two {kind} evals for {name} in {out}; keep one")
         votes: dict[tuple[str, str], list[dict]] = defaultdict(list)
@@ -2028,6 +2068,10 @@ def load_evals(out: Path) -> dict[str, dict[str, dict]]:
             votes[(r["a"], r["b"])].append(r)
         evals[kind][name] = {"result": result, "votes": votes}
     return evals
+
+
+def jev_name(evals: dict[str, dict]) -> str | None:
+    return next((n for n, ev in evals.items() if ev["result"]["judge"] == "jev"), None)
 
 
 def class_rates(rows: list[tuple[Pair, dict]]) -> dict:
@@ -2041,32 +2085,29 @@ def class_rates(rows: list[tuple[Pair, dict]]) -> dict:
     return out
 
 
-def hide_rates(rows: list[tuple[Pair, dict]], threshold: float) -> dict:
-    """Safe-to-hide as a classifier over endpoints. Positive: the losing
-    memory of a supersession pair."""
-    tp = fp = fn = 0
-    for p, d in rows:
-        for side, h in (("a", p.a), ("b", p.b)):
-            truth = p.label == "supersession" and p.survivor != h
-            said = d["hide"][side] >= threshold
-            tp += truth and said
-            fp += said and not truth
-            fn += truth and not said
-    return {"precision": rate(tp, tp + fp), "recall": rate(tp, tp + fn)}
-
-
-def hide_auc(rows: list[tuple[Pair, dict]]) -> float | None:
-    """How well the safe-to-hide probability ranks a losing memory above any
-    other endpoint, whatever the threshold (ROC AUC; ties count half)."""
+def hide_rates(rows: list[tuple[Pair, dict]]) -> dict:
+    """Safe-to-hide as a classifier over endpoints (positive: the losing
+    memory of a supersession pair) at each threshold, plus how well it ranks
+    whatever the threshold (ROC AUC, ties half) and each group's median."""
     pos, neg = [], []
     for p, d in rows:
         for side, h in (("a", p.a), ("b", p.b)):
-            truth = p.label == "supersession" and p.survivor != h
-            (pos if truth else neg).append(d["hide"][side])
-    if not pos or not neg:
-        return None
+            loser = p.label == "supersession" and p.survivor != h
+            (pos if loser else neg).append(d["hide"][side])
+    thresholds = {}
+    for t in HIDE_THRESHOLDS:
+        tp, fp = sum(x >= t for x in pos), sum(x >= t for x in neg)
+        thresholds[str(t)] = {
+            "precision": rate(tp, tp + fp),
+            "recall": rate(tp, len(pos)),
+        }
     wins = sum((x > y) + 0.5 * (x == y) for x in pos for y in neg)
-    return wins / (len(pos) * len(neg))
+    return {
+        "thresholds": thresholds,
+        "auc": wins / (len(pos) * len(neg)) if pos and neg else None,
+        "median_loser": statistics.median(pos) if pos else None,
+        "median_other": statistics.median(neg) if neg else None,
+    }
 
 
 def loser_side(d: dict) -> str:
@@ -2101,27 +2142,32 @@ def auto_apply(
         "correct": len(correct),
         "precision": rate(len(correct), len(applied)),
         "recall": rate(len(correct), positives),
-        "wrong_ids": sorted({p.id for p in applied} - {p.id for p in correct}),
     }
 
 
-def second_votes(decided: dict[str, dict[int, dict]], primary: str, jev: str | None):
-    """name -> agrees(pair, primary decision) for every second vote."""
+def second_votes(
+    decided: dict[str, dict[int, dict]], primary: str, jev: str | None
+) -> dict[str, tuple[str, Callable[[Pair, dict], bool]]]:
+    """rule -> (the judge casting the vote, agrees(pair, primary decision)).
+    A rule is scored only over pairs its judge decided: a failed vote is
+    left out, as everywhere, never counted as a veto."""
     out = {}
     for name, dec in decided.items():
         if name == primary or name.endswith(":raw"):
             continue
+        out[name] = (
+            name,
+            lambda p, d, dec=dec: (
+                dec[p.id]["verdict"] == "supersession"
+                and dec[p.id]["survivor"] == d["survivor"]
+            ),
+        )
         if name == jev:
             for t in HIDE_THRESHOLDS:
-                out[f"{name} hide>={t}"] = lambda p, d, dec=dec, t=t: (
-                    (j := dec.get(p.id)) is not None and j["hide"][loser_side(d)] >= t
+                out[f"{name} hide>={t}"] = (
+                    name,
+                    lambda p, d, dec=dec, t=t: dec[p.id]["hide"][loser_side(d)] >= t,
                 )
-        # Every judge's verdict class is a vote too, Jev's included.
-        out[name] = lambda p, d, dec=dec: (
-            (o := dec.get(p.id)) is not None
-            and o["verdict"] == "supersession"
-            and o["survivor"] == d["survivor"]
-        )
     return out
 
 
@@ -2167,113 +2213,73 @@ def fixture_provenance() -> dict:
 
 
 def golden_section(evals: dict[str, dict], primary: str) -> dict:
-    pairs = load_fixture()
-    newer = {}
+    fixture = load_fixture()
+    pairs = [p for p in fixture if not p.disputed]  # as eval's headline
+    newer: dict[int, str] = {}
     decided: dict[str, dict[int, dict]] = {}
     failed: dict[str, int] = {}
     for name, ev in evals.items():
         dec = {}
         for p in pairs:
-            votes = ev["votes"].get((p.a, p.b))
-            if votes:
+            if votes := ev["votes"].get((p.a, p.b)):
                 newer[p.id] = votes[0]["newer"]
                 if (d := decide(votes)) is not None:
                     dec[p.id] = d
         decided[name] = dec
         failed[name] = sum(1 for p in pairs if (p.a, p.b) in ev["votes"]) - len(dec)
-    jev = next((n for n in decided if n.startswith("jev")), None)
+    if primary not in decided:
+        sys.exit(f"--primary {primary} has no golden eval here: {sorted(decided)}")
+    jev = jev_name(evals)
     views = {
         view: [label_views(p, newer)[view] for p in pairs if p.id in newer]
         for view in VIEWS
     }
     judges = {}
     for name, dec in decided.items():
-        rows = [(p, dec[p.id]) for p in views[VIEWS[0]] if p.id in dec]
-        j = {
-            "scored": len(rows),
+        scored = {
+            view: [(p, dec[p.id]) for p in views[view] if p.id in dec] for view in VIEWS
+        }
+        judges[name] = {
+            "scored": len(scored[VIEWS[0]]),
             "failed": failed[name],
-            "unjudged": sum(1 for _, d in rows if d["verdict"] == "unjudged"),
-            "headline": both_ways(rows, newer),
-            "classes": {
-                view: class_rates([(p, dec[p.id]) for p in views[view] if p.id in dec])
-                for view in VIEWS
-            },
+            "headline": both_ways(scored[VIEWS[0]], newer),
+            "classes": {view: class_rates(scored[view]) for view in VIEWS},
         }
         if name == jev:
-            j["safe_to_hide"] = {
-                view: {
-                    str(t): hide_rates(
-                        [(p, dec[p.id]) for p in views[view] if p.id in dec], t
-                    )
-                    for t in HIDE_THRESHOLDS
-                }
-                | {
-                    "auc": hide_auc(
-                        [(p, dec[p.id]) for p in views[view] if p.id in dec]
-                    )
-                }
-                for view in VIEWS
+            judges[name]["safe_to_hide"] = {
+                view: hide_rates(scored[view]) for view in VIEWS
             }
-        judges[name] = j
-    vote_value, overlap = {}, {}
-    if primary in decided:
-        prim = decided[primary]
-        seconds = second_votes(decided, primary, jev)
-        for view in VIEWS:
-            alone = auto_apply(views[view], prim)
-            vote_value[view] = {"alone": alone} | {
-                name: auto_apply(views[view], prim, agrees)
-                for name, agrees in seconds.items()
-            }
-            if jev:
-                jd = decided[jev]
-                common = [p for p in views[view] if p.id in prim and p.id in jd]
-                wrong_p = {p.id for p in common if score(p, prim[p.id]) == 0}
-                wrong_j = {p.id for p in common if score(p, jd[p.id]) == 0}
-                overlap[view] = {
-                    "pairs": len(common),
-                    "primary_wrong": len(wrong_p),
-                    "jev_wrong": len(wrong_j),
-                    "both_wrong": len(wrong_p & wrong_j),
-                    "false_applies": len(alone["wrong_ids"]),
-                    "false_applies_jev_passes": {
-                        str(t): sum(
-                            1
-                            for i in alone["wrong_ids"]
-                            if i in jd and jd[i]["hide"][loser_side(prim[i])] >= t
-                        )
-                        for t in HIDE_THRESHOLDS
-                    },
-                }
-    control = None
-    raw = f"{primary}:raw"
-    if primary in decided and raw in decided:
-        common = sorted(decided[primary].keys() & decided[raw].keys())
-        same_class = sum(
-            1
-            for i in common
-            if decided[primary][i]["verdict"] == decided[raw][i]["verdict"]
-        )
-        same_vote = sum(
-            1
-            for i in common
-            if vote_key(decided[primary][i]) == vote_key(decided[raw][i])
-        )
-        control = {
-            "pairs": len(common),
-            "same_class": rate(same_class, len(common)),
-            "same_verdict_and_survivor": rate(same_vote, len(common)),
-            "kappa": kappa(
-                [decided[primary][i]["verdict"] for i in common],
-                [decided[raw][i]["verdict"] for i in common],
-            ),
+    prim = decided[primary]
+    seconds = second_votes(decided, primary, jev)
+    vote_value = {
+        view: {"alone": auto_apply(views[view], prim)}
+        | {
+            rule: auto_apply(
+                [p for p in views[view] if p.id in decided[j]], prim, agrees
+            )
+            for rule, (j, agrees) in seconds.items()
         }
+        for view in VIEWS
+    }
+    overlap = {}
+    if jev:
+        jd = decided[jev]
+        for view in VIEWS:
+            common = [p for p in views[view] if p.id in prim and p.id in jd]
+            wrong_p = {p.id for p in common if score(p, prim[p.id]) == 0}
+            wrong_j = {p.id for p in common if score(p, jd[p.id]) == 0}
+            overlap[view] = {
+                "pairs": len(common),
+                "primary_wrong": len(wrong_p),
+                "jev_wrong": len(wrong_j),
+                "both_wrong": len(wrong_p & wrong_j),
+            }
     return {
+        "excluded_disputed": len(fixture) - len(pairs),
         "judges": judges,
-        "control": control,
         "vote_value": vote_value,
         "error_overlap": overlap,
-        "agreement": agreement({n: d for n, d in decided.items()}),
+        "agreement": agreement(decided),
     }
 
 
@@ -2293,16 +2299,16 @@ def rows_section(out: Path, evals: dict[str, dict]) -> dict:
         name: {
             r["row"]: d
             for r in rows
-            if (d := decide(ev["votes"].get((r["a"], r["b"]), []))) is not None
+            if (votes := ev["votes"].get((r["a"], r["b"])))
+            and (d := decide(votes)) is not None
         }
         for name, ev in evals.items()
     }
-    jev = next((n for n in decided if n.startswith("jev")), None)
-    keys = {"row", "a", "b", "survivor", "loser", "conf"}
+    jev = jev_name(evals)
+    plain = {"row", "a", "b", "survivor", "loser", "conf"}
     table = []
     for r in rows:
-        side = "a" if r["loser"] == r["a"] else "b"
-        hide = decided[jev].get(r["row"], {}).get("hide", {}).get(side) if jev else None
+        j = decided[jev].get(r["row"]) if jev else None
         table.append(
             {
                 "row": r["row"],
@@ -2312,94 +2318,61 @@ def rows_section(out: Path, evals: dict[str, dict]) -> dict:
                 "marks": {
                     k: v
                     for k, v in r.items()
-                    if k not in keys and not k.startswith("prod_")
+                    if k not in plain and not k.startswith("prod_")
                 },
                 "verdicts": {
                     n: short(dec.get(r["row"]), r) for n, dec in decided.items()
                 },
-                "jev_hide_loser": hide,
+                "jev_hide_loser": j["hide"]["a" if r["loser"] == r["a"] else "b"]
+                if j
+                else None,
             }
         )
-    vetoes = {
-        str(t): sum(
-            1
-            for row in table
-            if row["jev_hide_loser"] is not None and row["jev_hide_loser"] < t
-        )
-        for t in HIDE_THRESHOLDS
-    }
-    return {
-        "rows": len(rows),
-        "agreement": agreement(decided),
-        "jev_vetoes": vetoes if jev else None,
-        "table": table,
-    }
+    return {"rows": len(rows), "agreement": agreement(decided), "table": table}
 
 
 def spend_by_vendor(out: Path) -> dict:
-    path = out / SPEND_LOG
     totals: dict[str, float] = defaultdict(float)
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                entry = json.loads(line)
-                totals[entry["judge"]] += entry["total_usd"]
+    for entry in spend_log(out):
+        totals[entry["judge"]] += entry["total_usd"]
     return {k: round(v, 4) for k, v in sorted(totals.items())} | {
         "total": round(sum(totals.values()), 4)
     }
 
 
-def sent_by_vendor(evals: dict[str, dict[str, dict]]) -> dict:
-    out: dict[str, dict] = {}
-    for kind_evals in evals.values():
-        for ev in kind_evals.values():
-            res = ev["result"]
-            v = out.setdefault(
-                res["judge"],
-                {
-                    "requests": 0,
-                    "pairs": set(),
-                    "memories": set(),
-                    "unscrubbed_pairs": set(),
-                },
-            )
-            v["requests"] += sum(len(vs) for vs in ev["votes"].values())
-            for a, b in ev["votes"]:
-                v["pairs"].add((a, b))
-                v["memories"] |= {a, b}
-                if not res["scrubbed"]:
-                    v["unscrubbed_pairs"].add((a, b))
-    return {
-        k: {
-            "requests": v["requests"],
-            "distinct_pairs": len(v["pairs"]),
-            "distinct_memories": len(v["memories"]),
-            "unscrubbed_pairs": len(v["unscrubbed_pairs"]),
-        }
-        for k, v in sorted(out.items())
-    }
+def sent_by_vendor(out: Path) -> dict:
+    """Distinct pairs and memories each vendor was sent, from what every eval
+    records before its first request, aborted evals included."""
+    sent: dict[str, dict[str, set]] = defaultdict(
+        lambda: {"pairs": set(), "memories": set(), "unscrubbed_pairs": set()}
+    )
+    for path in sorted(out.glob("eval_*_sent.json")):
+        s = json.loads(path.read_text(encoding="utf-8"))
+        v = sent[s["judge"]]
+        for a, b in s["pairs"]:
+            v["pairs"].add((a, b))
+            v["memories"] |= {a, b}
+            if not s["scrubbed"]:
+                v["unscrubbed_pairs"].add((a, b))
+    return {k: {f: len(x) for f, x in v.items()} for k, v in sorted(sent.items())}
 
 
 def scrub_section(evals: dict[str, dict[str, dict]]) -> dict:
-    """Replacement counts per class, per pair set. Scrubbing is deterministic,
-    so every scrubbed eval of one set must report the same counts."""
+    """Replacements per class, per pair set. Scrubbing is deterministic, so
+    different counts mean judges saw different text: that aborts."""
     out = {}
     for kind, kind_evals in evals.items():
-        counts = {
-            json.dumps(ev["result"]["scrub_counts"], sort_keys=True)
-            for ev in kind_evals.values()
-            if ev["result"]["scrubbed"]
+        results = [
+            ev["result"] for ev in kind_evals.values() if ev["result"]["scrubbed"]
+        ]
+        if not results:
+            continue
+        if len({json.dumps(r["scrub_counts"], sort_keys=True) for r in results}) > 1:
+            sys.exit(f"{kind} evals were scrubbed differently: different --host-names?")
+        counts = results[0]["scrub_counts"]
+        out[kind] = {"memories": results[0]["sent"]["memories"]} | {
+            c: counts.get(c, 0) for c in SCRUB_CLASSES
         }
-        if len(counts) > 1:
-            log(f"scrub counts differ across {kind} evals: {counts}")
-        if counts:
-            c = json.loads(min(counts))
-            memories = max(
-                ev["result"]["sent"]["memories"]
-                for ev in kind_evals.values()
-                if ev["result"]["scrubbed"]
-            )
-            out[kind] = {"memories": memories} | {k: c.get(k, 0) for k in SCRUB_CLASSES}
     return out
 
 
@@ -2407,13 +2380,13 @@ def cmd_compare(args) -> None:
     out = HERE / "runs" / args.run
     evals = load_evals(out)
     if not evals:
-        sys.exit(f"no judge-seam evals in {out}")
+        sys.exit(f"no `--pairs all` or `--pairs rows` evals in {out}")
     report = {
         "fixture": fixture_provenance(),
         "primary": args.primary,
         "auto_apply_confidence": AUTO_APPLY,
         "spend_usd": spend_by_vendor(out),
-        "sent": sent_by_vendor(evals),
+        "sent": sent_by_vendor(out),
         "scrub": scrub_section(evals),
         "golden": golden_section(evals["golden"], args.primary)
         if evals.get("golden")
@@ -2432,6 +2405,29 @@ def rate_text(r: dict | None) -> str:
     return f"{r['k']}/{r['n']} = {r['rate']:.3f} [{lo:.2f}, {hi:.2f}]"
 
 
+def num(x: float | None) -> str:
+    return "n/a" if x is None else f"{x:.3f}"
+
+
+def md_table(head: list[str], rows: Iterable[Iterable]) -> list[str]:
+    return [
+        "",
+        "| " + " | ".join(head) + " |",
+        "|---" * len(head) + "|",
+        *("| " + " | ".join(map(str, r)) + " |" for r in rows),
+    ]
+
+
+def agreement_table(agree: list[dict]) -> list[str]:
+    return md_table(
+        ["judges", "n", "raw", "kappa"],
+        (
+            [" vs ".join(a["judges"]), a["n"], rate_text(a["raw"]), num(a["kappa"])]
+            for a in agree
+        ),
+    )
+
+
 def compare_markdown(rep: dict) -> str:
     fx = rep["fixture"]
     lines = [
@@ -2444,143 +2440,128 @@ def compare_markdown(rep: dict) -> str:
         f"- spend USD: {json.dumps(rep['spend_usd'])}",
         "",
         "## Sent",
-        "",
-        "| vendor | requests | distinct pairs | distinct memories | unscrubbed pairs |",
-        "|---|---|---|---|---|",
     ]
-    for k, v in rep["sent"].items():
-        lines.append(
-            f"| {k} | {v['requests']} | {v['distinct_pairs']} | "
-            f"{v['distinct_memories']} | {v['unscrubbed_pairs']} |"
-        )
-    lines += [
-        "",
-        "## Scrub replacements",
-        "",
-        "| set | memories | " + " | ".join(SCRUB_CLASSES) + " |",
-        "|---" * (len(SCRUB_CLASSES) + 2) + "|",
-    ]
-    for kind, c in rep["scrub"].items():
-        lines.append(
-            f"| {kind} | {c['memories']} | "
-            + " | ".join(str(c[k]) for k in SCRUB_CLASSES)
-            + " |"
-        )
+    lines += md_table(
+        ["vendor", "distinct pairs", "distinct memories", "unscrubbed pairs"],
+        (
+            [k, v["pairs"], v["memories"], v["unscrubbed_pairs"]]
+            for k, v in rep["sent"].items()
+        ),
+    )
+    lines += ["", "## Scrub replacements"]
+    lines += md_table(
+        ["set", "memories", *SCRUB_CLASSES],
+        (
+            [k, c["memories"], *(c[x] for x in SCRUB_CLASSES)]
+            for k, c in rep["scrub"].items()
+        ),
+    )
     g = rep["golden"]
     if g:
+        headline = (
+            "false_supersede_rate",
+            "coexist_to_conflict",
+            "survivor_accuracy",
+            "yield",
+        )
         for view in VIEWS:
             lines += [
                 "",
-                f"## Golden set, {view}",
-                "",
-                "| judge | scored | failed | false supersede | coexist->conflict | "
-                "recall S | precision S | survivor acc | yield |",
-                "|---|---|---|---|---|---|---|---|---|",
+                f"## Golden set, {view} ({g['excluded_disputed']} disputed out)",
             ]
-            for name, j in g["judges"].items():
-                h = j["headline"][view]
-                lines.append(
-                    f"| {name} | {j['scored']} | {j['failed']} | "
-                    f"{rate_text(h['false_supersede_rate'])} | "
-                    f"{rate_text(h['coexist_to_conflict'])} | "
-                    f"{rate_text(h['recall_supersession'])} | "
-                    f"{rate_text(h['precision_supersession'])} | "
-                    f"{rate_text(h['survivor_accuracy'])} | {rate_text(h['yield'])} |"
-                )
-            lines += [
-                "",
-                "| judge | " + " | ".join(f"P {c} | R {c}" for c in CLASSES) + " |",
-                "|---" * (1 + 2 * len(CLASSES)) + "|",
-            ]
-            for name, j in g["judges"].items():
-                cr = j["classes"][view]
-                lines.append(
-                    f"| {name} | "
-                    + " | ".join(
-                        f"{rate_text(cr[c]['precision'])} | {rate_text(cr[c]['recall'])}"
-                        for c in CLASSES
-                    )
-                    + " |"
-                )
-            for name, j in g["judges"].items():
+            lines += md_table(
+                ["judge", "scored", "failed", *headline],
+                (
+                    [
+                        n,
+                        j["scored"],
+                        j["failed"],
+                        *(rate_text(j["headline"][view][k]) for k in headline),
+                    ]
+                    for n, j in g["judges"].items()
+                ),
+            )
+            lines += md_table(
+                ["judge", *(f"{m} {c}" for c in CLASSES for m in ("P", "R"))],
+                (
+                    [
+                        n,
+                        *(
+                            rate_text(j["classes"][view][c][m])
+                            for c in CLASSES
+                            for m in ("precision", "recall")
+                        ),
+                    ]
+                    for n, j in g["judges"].items()
+                ),
+            )
+            for n, j in g["judges"].items():
                 if "safe_to_hide" in j:
+                    h = j["safe_to_hide"][view]
                     lines += [
                         "",
-                        f"{name} safe-to-hide over endpoints:",
-                        "",
-                        "| threshold | precision | recall |",
-                        "|---|---|---|",
+                        f"{n} safe-to-hide over endpoints: ROC AUC {num(h['auc'])}, "
+                        f"median loser {num(h['median_loser'])}, "
+                        f"median other {num(h['median_other'])}",
                     ]
-                    for t, hr in j["safe_to_hide"][view].items():
-                        if t == "auc":
-                            lines.append(f"| ROC AUC | {hr:.3f} | |")
-                            continue
-                        lines.append(
-                            f"| {t} | {rate_text(hr['precision'])} | {rate_text(hr['recall'])} |"
-                        )
-            vv = g["vote_value"].get(view)
-            if vv:
+                    lines += md_table(
+                        ["threshold", "precision", "recall"],
+                        (
+                            [t, rate_text(r["precision"]), rate_text(r["recall"])]
+                            for t, r in h["thresholds"].items()
+                        ),
+                    )
+            lines += ["", "Auto-apply set:"]
+            lines += md_table(
+                ["rule", "applied", "correct", "precision", "recall"],
+                (
+                    [
+                        "primary alone" if r == "alone" else f"AND {r}",
+                        a["applied"],
+                        a["correct"],
+                        rate_text(a["precision"]),
+                        rate_text(a["recall"]),
+                    ]
+                    for r, a in g["vote_value"][view].items()
+                ),
+            )
+            if g["error_overlap"]:
                 lines += [
                     "",
-                    "Auto-apply set:",
-                    "",
-                    "| rule | applied | correct | precision | recall |",
-                    "|---|---|---|---|---|",
+                    f"Error overlap with Jev: {json.dumps(g['error_overlap'][view])}",
                 ]
-                for name, a in vv.items():
-                    rule = "primary alone" if name == "alone" else f"AND {name}"
-                    lines.append(
-                        f"| {rule} | {a['applied']} | {a['correct']} | "
-                        f"{rate_text(a['precision'])} | {rate_text(a['recall'])} |"
-                    )
-            ov = g["error_overlap"].get(view)
-            if ov:
-                lines += ["", f"Error overlap: {json.dumps(ov)}"]
-        if g["control"]:
-            lines += ["", f"## Scrub control\n\n{json.dumps(g['control'])}"]
-        lines += [
-            "",
-            "## Agreement, golden",
-            "",
-            "| judges | n | raw | kappa |",
-            "|---|---|---|---|",
-        ]
-        for a in g["agreement"]:
-            k = "n/a" if a["kappa"] is None else f"{a['kappa']:.3f}"
-            lines.append(
-                f"| {' vs '.join(a['judges'])} | {a['n']} | {rate_text(a['raw'])} | {k} |"
-            )
+        lines += ["", "## Agreement, golden", *agreement_table(g["agreement"])]
     r = rep["rows"]
     if r:
         lines += [
             "",
             f"## Spot-check rows ({r['rows']})",
-            "",
-            "| judges | n | raw | kappa |",
-            "|---|---|---|---|",
+            *agreement_table(r["agreement"]),
         ]
-        for a in r["agreement"]:
-            k = "n/a" if a["kappa"] is None else f"{a['kappa']:.3f}"
-            lines.append(
-                f"| {' vs '.join(a['judges'])} | {a['n']} | {rate_text(a['raw'])} | {k} |"
-            )
-        lines += ["", f"Jev vetoes (hide loser < t): {json.dumps(r['jev_vetoes'])}", ""]
         names = list(r["table"][0]["verdicts"]) if r["table"] else []
-        lines += [
-            "| row | marks | survivor | loser | prod conf | "
-            + " | ".join(names)
-            + " | Jev hide loser |",
-            "|---" * (6 + len(names)) + "|",
-        ]
-        for t in r["table"]:
-            hide = "" if t["jev_hide_loser"] is None else f"{t['jev_hide_loser']:.2f}"
-            marks = ",".join(f"{k}={v}" for k, v in t["marks"].items())
-            lines.append(
-                f"| {t['row']} | {marks} | `{t['survivor']}` | `{t['loser']}` | "
-                f"{t['prod_confidence']} | "
-                + " | ".join(t["verdicts"][n] for n in names)
-                + f" | {hide} |"
-            )
+        lines += md_table(
+            [
+                "row",
+                "marks",
+                "survivor",
+                "loser",
+                "prod conf",
+                *names,
+                "Jev hide loser",
+            ],
+            (
+                [
+                    t["row"],
+                    ",".join(f"{k}={v}" for k, v in t["marks"].items()),
+                    f"`{t['survivor']}`",
+                    f"`{t['loser']}`",
+                    t["prod_confidence"],
+                    *(t["verdicts"][n] for n in names),
+                    num(t["jev_hide_loser"]),
+                ]
+                for t in r["table"]
+            ),
+        )
     return "\n".join(lines) + "\n"
 
 

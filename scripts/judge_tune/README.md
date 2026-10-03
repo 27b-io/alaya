@@ -21,8 +21,9 @@ a key.
 |---|---|
 | `ALAYA_URL` | Ālaya REST origin; the script GETs `/memories/{hash}` and, for `rows`, POSTs the read-only `/contradictions` |
 | `ALAYA_API_KEY` | bearer for that origin (read access is all it needs) |
-| `JUDGE_URL` | the judge's API origin: Anthropic Messages API, an OpenAI-compatible endpoint, or TypeSafe's (`eval --judge`) |
+| `JUDGE_URL` | the judge's API origin: the Anthropic Messages API, or an OpenAI-compatible endpoint for `eval --judge openai` |
 | `JUDGE_API_KEY` | key for `JUDGE_URL`, read once at start |
+| `TYPESAFE_API_KEY` | key for `eval --judge jev`, which only ever calls TypeSafe's fixed origin |
 | `JUDGE_MODEL` | default `claude-sonnet-5` for the Anthropic judge; `eval --model` overrides it |
 | `REFLECTION_URL`, `REFLECTION_API_KEY` | default to the `JUDGE_*` values; set both or neither, a key is never sent to another origin |
 | `REFLECTION_MODEL` | default `claude-opus-5` |
@@ -57,9 +58,10 @@ uv run scripts/judge_tune/tune.py compare --run <run>
 Every output lands under `scripts/judge_tune/runs/<name>/`, which is gitignored:
 `tune` writes `report.md`, `report.json`, `records.jsonl` (every verdict),
 `spend.json`, `best_prompt.txt` and GEPA's own state and logs; `eval` writes
-`eval_<pairs>_<model>_<scrubbed|raw>_<regime>_k<passes>_<sha>.json` plus
-`_records.jsonl` (every verdict of every pass, keyed by both hashes) and
-`_spend.json`, and appends its spend to the run's `spend_log.jsonl`; `rows`
+`eval_<pairs>_<judge>_<model>_<scrubbed|raw>_<regime>_k<passes>_<sha>.json`
+plus `_records.jsonl` (every verdict of every pass, keyed by both hashes) and
+`_sent.json` (every pair it sends, written before the first request), and
+appends its spend to the run's `spend_log.jsonl`; `rows`
 writes `rows.json`; `compare` writes `compare.json` and `compare.md`. The
 harness writes no memory content to disk, but the run directory holds model
 output about it (candidate prompts, verdict reasons, hash prefixes), so it
@@ -83,18 +85,21 @@ stays out of git.
 `--scrub` replaces host names, IP addresses, URLs (`op://` included), email
 addresses and secrets (API keys, tokens, bearer strings, private-key blocks)
 with `<host>`, `<ip>`, `<url>`, `<email>` and `<secret>` in each memory's
-content and tags, before the 4,000-character cut. A host name without a dot
-cannot be told from a word by pattern, so `--host-names <file>` adds bare
-names (one per line, kept out of git). Before any request leaves, every
-rendered pair is checked against every rule, and one match aborts the run.
-`openai` and `jev` refuse to run without `--scrub`; the unscrubbed Anthropic
-run is the control that measures what the scrub changes.
+content and tags, before the 4,000-character cut. The host rule needs a known
+suffix (`.com`, `.svc`, `.local`, ...), so a bare name or a short in-cluster
+name such as `service.namespace` comes in through `--host-names <file>`, one
+per line, kept out of git. Before any request leaves, every rendered pair is
+checked against every rule, and one match aborts the run; for `openai`, so
+is the system prompt. `openai` and `jev` refuse to run without `--scrub`, and
+an unscrubbed run (the control that measures what the scrub changes) only
+goes to a `claude-*` model; `tune` holds both its models to the same rule.
 
 An API error, a content-filter block or a refusal is retried once; a second
 one makes the pair `failed`: counted, kept out of every metric, never scored
 as a verdict. A 401 or 403, or a chunk in which every call failed, aborts the
 run. A reply that is not a valid verdict is still `unjudged` and scores wrong.
-`--max-usd` caps the run directory's total spend across every `eval` in it.
+`--max-usd` caps the run directory's total spend across every `eval` in it;
+a lock keeps a second `eval` in the same run from starting meanwhile.
 
 `rows --prefixes <file>` resolves spot-check rows, given as
 `[{"row", "survivor", "loser"}]` hash prefixes, through `/contradictions`
@@ -102,16 +107,14 @@ with resolved pairs included. A row whose prefixes fit two memory pairs is
 dropped, never guessed. Extra keys on a row are carried into the report as
 marks. `eval --pairs rows` then judges them.
 
-`compare --run <name>` rescores every `--pairs all` and `--pairs rows` eval
-in the run from its records against the current fixture, with no API call,
-so a relabelled fixture costs nothing to rescore. It reports, per judge, the
-headline rates and precision and recall per class, both with `partial` pairs
-counted both ways; Jev's safe-to-hide precision and recall at 0.5, 0.7 and
-0.9, where a positive is the losing memory of a supersession pair; the
-auto-apply set (`--primary` supersession at confidence >= 0.90) alone and
-with each other judge as a second vote; the primary's error overlap with Jev;
-the scrubbed-against-unscrubbed control; pairwise Cohen's kappa and raw
-agreement on verdict class; and a per-row table of the spot-check rows.
+`compare --run <name>` rescores every one-pass `--pairs all` and `--pairs
+rows` eval in the run from its records against the current fixture, with no
+API call, so a relabelled fixture costs nothing to rescore. It writes
+`compare.json` and a readable `compare.md`. A positive for Jev's safe-to-hide
+answer is the losing memory of a supersession pair. The auto-apply rule is
+`--primary` supersession at confidence >= 0.90, alone and with each other
+judge's agreement as a second vote; a pair the second judge failed on is
+left out of that rule, never counted as a veto.
 
 ## What the tune enforces
 

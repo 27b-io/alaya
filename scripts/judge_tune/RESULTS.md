@@ -129,7 +129,10 @@ effect as switching auto-apply off, which needs no vendor.
 - Every judge got the same scrubbed rendering, with hosts, IPs, URLs, emails
   and secrets replaced. Sonnet also ran once on unscrubbed text as a control.
   The scrub made 224 host, 124 URL, 41 IP, 25 email and 4 secret replacements
-  over 357 memories.
+  over 357 memories. Review later widened the secret rules (prefixed key
+  names such as `X_API_KEY=`, `Authorization:` headers, more token formats).
+  Re-scanning the text actually sent, with those rules and with gitleaks,
+  found no secret; the extra matches were a placeholder and a CI keyword.
 - No pair failed for any judge. Spend was USD 5.81 at list price: Anthropic
   3.56, OpenAI-compatible 2.23, Jev 0.02.
 
@@ -170,7 +173,7 @@ therefore cannot show a precision gain here; it can only cost recall.
 
 Jev's safe-to-hide probability ranks the losing memory above every other
 endpoint well (ROC AUC 0.92), but its scale is low. Losers have a median of
-0.17 and a maximum of 0.63; other endpoints have a median of about 0.07. On
+0.17 and a maximum of 0.63; other endpoints have a median of 0.06. On
 the 51 production pairs, the probability for the memory auto-apply would
 hide was 0.05 to 0.32, under 0.5 on all 51. A threshold low enough to pass
 real supersessions would have to be chosen on this same set, which would fit
