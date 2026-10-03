@@ -491,11 +491,16 @@ SECRET_KEY_NAME = (  # also os.environ['X_KEY'] = '...'
 )
 # What a URL may hold; a URL ends at the first character outside it.
 URL_CHAR = r"[^\s<>\"'`)\]]"
-# A secret-named key whose separator ends a URL: its value lies outside the
-# URL, so a URL that took the key would leave the value with no key in front.
-# A key whose value stays inside (`?api_key=v`, a password with `==` padding
-# before `@host`) ends nothing and stays in the URL.
-URL_ENDING_KEY = rf"{SECRET_NAME}[\"']?\]?\s*+(?:=>|[:=])(?!{URL_CHAR})"
+SEPARATOR = r"(?:=>|[:=])"
+# A secret-named key that ends a URL: a quote, bracket or space before its
+# separator, or a separator the URL cannot run past. Its value lies outside
+# the URL (`.../DB_PASSWORD: x`, `Get "...?token=x": err`), so the URL rule
+# takes the key, the separator and the value too. A key whose value stays
+# inside (`?api_key=v`, a password with `=` padding before `@host`) ends
+# nothing; and a URL is never cut short, since its last run may be the secret.
+URL_ENDING_KEY = (
+    rf"{SECRET_NAME}(?:(?=[\"'\]\s])[\"']?\]?\s*+{SEPARATOR}|{SEPARATOR}(?!{URL_CHAR}))"
+)
 # A value's characters, and a placeholder a rule before the key rules wrote.
 VALUE_CHAR = r"[^\s\"'<>,;]"
 PLACEHOLDER = r"(?:<(?:secret|url|email|ip)>)"
@@ -515,12 +520,14 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
             re.S,
         ),
     ),
-    (  # a scheme may follow a dash, as in ${VAR:-redis://...}; a URL stops
-        # before a secret-named key that ends it (`.../DB_PASSWORD: x`)
+    (  # a scheme may follow a dash, as in ${VAR:-redis://...}; a secret key
+        # that ends the URL comes along with its value (see URL_ENDING_KEY)
         "url",
         re.compile(
             r"(?<![a-z0-9+.-])(?P<keep>[0-9+.-]*+)[a-z][a-z0-9+.-]*+://"
-            rf"(?:(?!{URL_ENDING_KEY}){URL_CHAR})+",
+            rf"(?={URL_CHAR})(?:(?!{URL_ENDING_KEY}){URL_CHAR})*+"
+            rf"(?:(?={URL_ENDING_KEY}){SECRET_NAME}[\"']?\]?\s*+{SEPARATOR}\s*+[\"']?"
+            rf"(?:{VALUE_CHAR}|{PLACEHOLDER})*+{NEXT_VALUES})?",
             re.I,
         ),
     ),
@@ -593,6 +600,11 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
     ),
 )
 SCRUB_CLASSES = ("host", "ip", "url", "email", "secret")
+# Only for the fail-closed check: a secret key and its value right after a URL
+# placeholder mean some rule cut a URL short, leaving a value no key rule saw.
+ORPHANED_VALUE = re.compile(
+    rf"<url>{SECRET_NAME}[\"']?\]?\s*+{SEPARATOR}\s*+[\"']?{VALUE_CHAR}{{8,}}", re.I
+)
 
 
 class Scrubber:
@@ -628,7 +640,10 @@ class Scrubber:
 
     def leaks(self, text: str) -> list[str]:
         """Classes some rule still matches in `text`: empty when it is clean."""
-        return sorted({cls for cls, pattern in self.rules if pattern.search(text)})
+        found = {cls for cls, pattern in self.rules if pattern.search(text)}
+        if ORPHANED_VALUE.search(text):
+            found.add("secret")
+        return sorted(found)
 
 
 def read_file(path: str | Path) -> str:

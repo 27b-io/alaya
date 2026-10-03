@@ -415,10 +415,24 @@ def check_scrub() -> None:
         # base64 padding after `pwd` in a password, a port after a host.
         "s3://user:ae8qx3WuOWbJxnvPZpwdAhUKEh==@db.example.local:5432/" + "Pa55w0rd99",
         "proxy_pass http://yg.pwdcqm.svc:17368/" + "Pa55w0rd99",
+        # A URL is never cut short: its last run may be the secret itself, as
+        # in the error messages Go and Python print.
+        'Get "https://api.example.com/v1/x?api_key=Ab3pwd' + 'Pa55w0rd99": dial tcp',
+        "fetch https://api.example.com/v1?access_token=" + "Pa55w0rd99" + ": HTTP 403",
+        "webhook https://hooks.example.com/services/T0/B0/xQ9pwd"
+        + "Pa55w0rd99"
+        + ": 404",
+        # Anything between the key and its separator ends the URL at the key.
+        "http://intra/DB_PASSWORD :" + "Pa55w0rd99",
+        "http://intra/DB_PASSWORD\t=" + "Pa55w0rd99",
+        'http://intra/DB_PASSWORD"=' + "Pa55w0rd99",
     ):
         out = s(text)
         assert "Pa55w0rd99" not in out, (text, out)
         assert s(out) == out and s.leaks(out) == [], out
+    # The check also fails closed on a value a URL cut left behind.
+    assert s.leaks("<url>DB_PASSWORD: " + "Pa55w0rd99") == ["secret"]
+    assert s.leaks("<url>DB_PASSWORD: <secret>") == []
     # A secret-named value cannot swallow the next secret-named key.
     out = s(':auth_token => login(password: "' + "Zx9Qw8Er7Ty6" + '")')
     assert "Zx9Qw8Er7Ty6" not in out and s.leaks(out) == [], out
