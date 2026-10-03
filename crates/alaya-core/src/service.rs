@@ -842,6 +842,7 @@ impl MemoryService {
                         false,
                         fetch_size,
                         params.memory_type.as_deref(),
+                        params.min_trust_score,
                     );
                     stages
                         .time(Stage::TagSearch, search)
@@ -890,7 +891,13 @@ impl MemoryService {
                 }
                 let refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
                 self.vectors
-                    .search_by_tags(&refs, false, fetch_size, params.memory_type.as_deref())
+                    .search_by_tags(
+                        &refs,
+                        false,
+                        fetch_size,
+                        params.memory_type.as_deref(),
+                        params.min_trust_score,
+                    )
                     .await
                     .unwrap_or_default()
             };
@@ -919,8 +926,8 @@ impl MemoryService {
         // is_superseded). Both apply memory_type Qdrant-side, so wrong-type
         // hits cannot crowd the right type out of fetch_size; checking it
         // again here keeps one predicate for every pool, graph injection
-        // included. Only search_by_vector applies min_trust_score, so the
-        // tag pools and graph neighbours rely on this check for it.
+        // included. Both also apply min_trust_score Qdrant-side; graph
+        // neighbours rely on this check alone for both.
         let admits = |m: &Memory| {
             (params.include_superseded || !is_superseded(m))
                 && params
@@ -1479,10 +1486,11 @@ impl MemoryService {
             target,
             MAX_TAG_FETCH,
             params.include_superseded,
-            // Tag mode does not read memory_type (the console says so).
+            // Tag mode reads neither memory_type (the console says so) nor
+            // min_trust_score (the docs say so).
             |n| {
                 self.vectors
-                    .search_by_tags(&tag_refs, params.match_all, n, None)
+                    .search_by_tags(&tag_refs, params.match_all, n, None, None)
             },
         )
         .await?;
@@ -3215,6 +3223,7 @@ mod tests {
             _m: bool,
             _l: usize,
             _mt: Option<&str>,
+            _mts: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -3864,6 +3873,7 @@ mod tests {
             _m: bool,
             _l: usize,
             _mt: Option<&str>,
+            _mts: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -4282,6 +4292,7 @@ mod tests {
             _m: bool,
             _l: usize,
             _mt: Option<&str>,
+            _mts: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -4676,6 +4687,7 @@ mod tests {
             _m: bool,
             _l: usize,
             _mt: Option<&str>,
+            _mts: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -5328,12 +5340,14 @@ mod tests {
             _m: bool,
             limit: usize,
             memory_type: Option<&str>,
+            min_trust_score: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(tags
                 .iter()
                 .filter_map(|t| self.tag_pools.get(*t))
                 .flatten()
                 .filter(|sm| memory_type.is_none_or(|t| sm.memory.memory_type == t))
+                .filter(|sm| min_trust_score.is_none_or(|min| meets_trust(&sm.memory, min)))
                 .take(limit)
                 .cloned()
                 .collect())
@@ -5857,6 +5871,70 @@ mod tests {
         let result = svc
             .search(SearchParams {
                 memory_type: Some("decision".into()),
+                ..search_params("stability notes")
+            })
+            .await
+            .expect("search succeeds");
+        let returned: std::collections::HashSet<&str> = result["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .filter_map(|r| r["content_hash"].as_str())
+            .collect();
+        assert_eq!(
+            returned,
+            std::collections::HashSet::from([
+                keyword_ok.memory.content_hash.as_str(),
+                semantic_ok.memory.content_hash.as_str(),
+            ])
+        );
+    }
+
+    /// A hybrid search with `min_trust_score` passes it to both tag
+    /// searches, so below-trust tag matches cannot fill fetch_size ahead of
+    /// the memories that meet it. Each pool holds 100 matches at trust 0.5
+    /// (fetch_size never exceeds 100) before its one at 0.8, and the mock
+    /// honours its limit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_min_trust_score_reaches_both_tag_searches() {
+        let trusted = |hash: String, trust: f64| {
+            let mut sm = make_scored_memory(&hash, "pool member", 0.5);
+            sm.memory.provenance = Some(HashMap::from([(
+                "trust_score".to_string(),
+                serde_json::json!(trust),
+            )]));
+            sm
+        };
+        let keyword_ok = trusted("b".repeat(64), 0.8);
+        let semantic_ok = trusted("d".repeat(64), 0.8);
+        let pool = |offset: usize, ok: &ScoredMemory| {
+            (offset..offset + 100)
+                .map(|i| trusted(format!("{i:064x}"), 0.5))
+                .chain([ok.clone()])
+                .collect::<Vec<_>>()
+        };
+
+        let svc = MemoryService::new(
+            Box::new(MockVectorsWithInjection {
+                tag_pools: HashMap::from([
+                    ("stability".into(), pool(0, &keyword_ok)),
+                    ("semantic".into(), pool(100, &semantic_ok)),
+                ]),
+                similar_tags: vec!["semantic".into()],
+                ..Default::default()
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraphWithActivation {
+                activation: HashMap::new(),
+            }),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        );
+
+        let result = svc
+            .search(SearchParams {
+                min_trust_score: Some(0.6),
                 ..search_params("stability notes")
             })
             .await
@@ -6639,6 +6717,7 @@ mod tests {
             _m: bool,
             _l: usize,
             _mt: Option<&str>,
+            _mts: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -7273,6 +7352,7 @@ mod tests {
             _m: bool,
             limit: usize,
             _mt: Option<&str>,
+            _mts: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(self.scored(limit))
         }
@@ -7783,6 +7863,7 @@ mod tests {
                 _a: bool,
                 _l: usize,
                 _mt: Option<&str>,
+                _mts: Option<f64>,
             ) -> Result<Vec<ScoredMemory>> {
                 unimplemented!()
             }
@@ -8786,6 +8867,7 @@ mod tests {
             _m: bool,
             limit: usize,
             _mt: Option<&str>,
+            _mts: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(scored_from(&self.0.memories.borrow(), limit))
         }

@@ -1,5 +1,6 @@
 //! `min_trust_score` against a real Qdrant: the range filter must read the
-//! key the payload actually stores (top-level `provenance.trust_score`).
+//! key the payload actually stores (top-level `provenance.trust_score`), and
+//! the tag scroll must apply it before its limit.
 //!
 //! Ignored by default: it needs `QDRANT_TEST_URL`, a disposable Qdrant (the
 //! test makes and drops its own collections). Embeddings are a fixed stub and
@@ -55,7 +56,7 @@ fn memory(hash: char, trust: f64) -> Memory {
     Memory {
         content: format!("trust {trust}"),
         content_hash: hash.to_string().repeat(64),
-        tags: vec![],
+        tags: vec!["pool".into()],
         memory_type: "note".into(),
         metadata: None,
         created_at: 1000.0,
@@ -129,6 +130,17 @@ async fn min_trust_score_keeps_only_memories_that_meet_it() {
         qdrant.store(m, StoreMode::Upsert).await.expect("store");
     }
 
+    // Scroll pages in point-id order, so with `limit` 2 the two low-trust
+    // points (ids from 'a…', 'b…') fill the page unless the trust filter runs
+    // before the limit.
+    let tag_page: HashSet<String> = qdrant
+        .search_by_tags(&["pool"], false, 2, None, Some(0.6))
+        .await
+        .expect("tag search")
+        .into_iter()
+        .map(|sm| sm.memory.content_hash)
+        .collect();
+
     let graph = std::rc::Rc::new(GraphHttpClient::new("http://127.0.0.1:9".into(), "").unwrap());
     let svc = MemoryService::new(
         Box::new(qdrant),
@@ -151,6 +163,11 @@ async fn min_trust_score_keeps_only_memories_that_meet_it() {
     }
     drop_collections(&url, &name).await;
 
+    assert_eq!(
+        tag_page,
+        hashes(&high),
+        "search_by_tags with min_trust_score 0.6"
+    );
     for (mode, unfiltered, filtered) in outcomes {
         assert_eq!(unfiltered, everything, "{mode:?} without min_trust_score");
         assert_eq!(filtered, hashes(&high), "{mode:?} with min_trust_score 0.6");

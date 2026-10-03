@@ -1442,11 +1442,14 @@ impl VectorStorage for QdrantClient {
         match_all: bool,
         limit: usize,
         memory_type: Option<&str>,
+        min_trust_score: Option<f64>,
     ) -> Result<Vec<ScoredMemory>> {
-        // Qdrant applies memory_type before `limit`, so wrong-type tag matches
-        // cannot fill the page ahead of the requested type.
+        // Qdrant applies memory_type and min_trust_score before `limit`, so
+        // wrong-type or below-trust tag matches cannot fill the page ahead of
+        // the memories the caller asked for.
         let filter = PayloadFilter {
             memory_type: memory_type.map(String::from),
+            min_trust_score,
             tags: Some(tags.iter().map(|t| t.to_string()).collect()),
             tags_match_all: match_all,
             ..Default::default()
