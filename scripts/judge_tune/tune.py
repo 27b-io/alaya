@@ -422,11 +422,26 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
             re.S,
         ),
     ),
-    ("url", re.compile(r"(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*+://[^\s<>\"'`)\]]+", re.I)),
+    (  # a scheme may follow a dash, as in ${VAR:-redis://...}
+        "url",
+        re.compile(
+            r"(?<![a-z0-9+.-])(?P<keep>[0-9+.-]*+)[a-z][a-z0-9+.-]*+://[^\s<>\"'`)\]]+",
+            re.I,
+        ),
+    ),
     # The domain ends in letters, so a package pin (`pkg@0.1.4`) is no email.
     (
         "email",
         re.compile(r"(?<![\w.+-])[\w.+-]++@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\b"),
+    ),
+    (
+        "ip",
+        re.compile(
+            r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
+            r"|\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\b"
+            r"|\b(?:[0-9a-f]{1,4}:){2,6}:(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?",
+            re.I,
+        ),
     ),
     ("secret", re.compile(rf"\b(?:{SECRET_TOKENS})")),
     ("secret", re.compile(r"(?P<keep>\bBearer\s+)[\w.~+/=-]{8,}")),
@@ -448,7 +463,13 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
         "secret",
         re.compile(rf"(?P<keep>{SECRET_KEY_NAME})[^\s\"'<>,;()\[\]{{}}]{{8,}}", re.I),
     ),
-    ("secret", re.compile(rf"(?P<keep>{SECRET_KEY_NAME})[^\s\"'<>,;]{{8,}}", re.I)),
+    (  # ...and the tail a bracket left after the first rule's placeholder
+        "secret",
+        re.compile(
+            rf"(?P<keep>{SECRET_KEY_NAME})(?:<secret>[^\s\"'<>,;]++|[^\s\"'<>,;]{{8,}})",
+            re.I,
+        ),
+    ),
     (  # a command-line flag naming a secret, then its value: --password VALUE
         "secret",
         re.compile(
@@ -458,20 +479,12 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
         ),
     ),
     (
-        "ip",
-        re.compile(
-            r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
-            r"|\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\b"
-            r"|\b(?:[0-9a-f]{1,4}:){2,6}:(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?",
-            re.I,
-        ),
-    ),
-    (
         "host",
         re.compile(
-            # At the head of a name only, so a long dotted run is linear; one
-            # leading dot is taken along, as in `*.example.net`.
-            rf"(?<![a-z0-9.-])\.?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:{HOST_TLDS})\b"
+            # At the head of a name only, so a long dotted run is linear; a
+            # leading dash (`-hdb.example.com`) or dot (`*.example.net`) is skipped.
+            rf"(?<![a-z0-9.-])(?P<keep>-*+)\.?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.++)+"
+            rf"(?:{HOST_TLDS})\b"
             r"(?!-|\.[a-z0-9])",
             re.I,
         ),

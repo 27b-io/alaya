@@ -305,6 +305,8 @@ def check_scrub() -> None:
             "pushed to crates.io",
             "behind iap at app.cloud.goog",
             "resolves *.example.net and {svc}.dev.example.io",
+            "mysql -hdb.prod.example.com -uroot",
+            "see...api.example.com for details",
             "box build-box-01 rebooted",
         ],
         "ip": [
@@ -315,6 +317,7 @@ def check_scrub() -> None:
             "see https://example.com/a?b=c) for more",
             "key at op://vault/item/field",
             "redis://cache:6379/0",
+            "REDIS_URL=${REDIS_URL:-redis://:pw@cache:6379/0}",
         ],
         "email": ["mail ops+alerts@example.org today"],
         "secret": [
@@ -361,6 +364,14 @@ def check_scrub() -> None:
     assert s("Bearer " + "abc" * 6) == "Bearer <secret>"
     assert s(key_block + " tail") == "<secret> tail"
     assert s("ssh -i key2 " + key_block[:40]) == "ssh -i key2 <secret>"  # cut block
+    # A bracket inside a value cannot leave the value's tail behind.
+    for text in (
+        "DB_PASSWORD=Xk9#mQ2!vR7(pL4zQ8w",
+        "f(auth_token=zC&x0JA95mJ[B#@YlL2BoR)",
+    ):
+        out = s(text)
+        assert "pL4zQ8w" not in out and "YlL2BoR" not in out, out
+        assert s(out) == out and s.leaks(out) == [], out
     # A secret-named value cannot swallow the next secret-named key.
     out = s(':auth_token => login(password: "' + "Zx9Qw8Er7Ty6" + '")')
     assert "Zx9Qw8Er7Ty6" not in out and s.leaks(out) == [], out
