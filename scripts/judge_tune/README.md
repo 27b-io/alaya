@@ -48,11 +48,13 @@ uv run scripts/judge_tune/tune.py eval \
   --passes 3 --regime default --max-usd 15
 
 # 4. Cross-judge: the same scrubbed pairs to several judges, then compare.
-#    --prompt-file defaults to judge.rs's SYSTEM_PROMPT.
+#    --prompt-file defaults to judge.rs's SYSTEM_PROMPT. --scrub needs
+#    gitleaks on PATH, and --host-names <file> or --no-host-names.
 uv run scripts/judge_tune/tune.py rows --run <run> --prefixes <rows.json>
-uv run scripts/judge_tune/tune.py eval --judge jev --scrub --pairs all --run <run>
+uv run scripts/judge_tune/tune.py eval --judge jev --scrub --host-names <file> \
+  --pairs all --run <run>
 uv run scripts/judge_tune/tune.py eval --judge openai --model <id> --scrub \
-  --pairs rows --run <run>
+  --host-names <file> --pairs rows --run <run>
 uv run scripts/judge_tune/tune.py compare --run <run>
 ```
 
@@ -84,14 +86,30 @@ stays out of git.
   probable one; a supersession takes the likelier of a and b as survivor.
 
 `--scrub` replaces host names, IP addresses, URLs (`op://` included), email
-addresses and secrets (API keys, tokens, bearer strings, private-key blocks)
-with `<host>`, `<ip>`, `<url>`, `<email>` and `<secret>` in each memory's
-content and tags, before the 4,000-character cut. The host rule needs a known
-suffix (`.com`, `.svc`, `.local`, ...), so a bare name or a short in-cluster
-name such as `service.namespace` comes in through `--host-names <file>`, one
-per line, kept out of git. Before any request leaves, every rendered pair is
-checked against every rule, and one match aborts the run; for `openai`, so
-is the system prompt. `openai` and `jev` refuse to run without `--scrub`. An
+addresses and secrets (API keys, tokens, passwords, bearer strings,
+private-key blocks, password hashes, and any run of 16 or more letters and
+digits mixing upper case, lower case and digits) with `<host>`, `<ip>`,
+`<url>`, `<email>` and `<secret>` in each memory's content and tags, before
+the 4,000-character cut. The host rule needs a known suffix (`.com`, `.svc`,
+`.local`, ...), so a bare name or a short in-cluster name such as
+`service.namespace` comes in through `--host-names <file>`, one per line,
+kept out of git. `--scrub` takes that file or an explicit `--no-host-names`,
+and the eval records which as `host_names` in its JSON and its `_sent.json`.
+
+Before any request leaves, a gate checks every rendered pair, and the system
+prompt for any judge that gets one. gitleaks, run with its default rules,
+must find nothing, and no scrub rule may still match. gitleaks shares no rule
+with the scrubber, so a secret of a shape gitleaks knows stops the run even
+where the scrubber missed it; the scrub-rule check catches one rule undoing
+another. Either finding stops the run with nothing sent, and so does a
+missing `gitleaks` binary, which `--scrub` needs on `PATH`. The gate is a
+second, independent detector, not a proof: a secret of a shape neither
+knows still goes out. A finding may be a false positive, as gitleaks'
+generic rule fires on some prose; the way past one is to scrub more, never
+to skip the gate: add a rule, or put the flagged word in the `--host-names`
+file, which scrubs it as `<host>`.
+
+`openai` and `jev` refuse to run without `--scrub`. An
 unscrubbed run (the control that measures what the scrub changes) goes only
 to a `claude-*` model at an approved origin, `https://api.anthropic.com` or
 one listed in `UNSCRUBBED_JUDGE_ORIGINS`; a model name alone proves nothing,

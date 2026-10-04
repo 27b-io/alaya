@@ -43,10 +43,12 @@ import math
 import os
 import random
 import re
+import shutil
 import socket
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 from collections import Counter, defaultdict
@@ -461,13 +463,19 @@ def render_pair(a: dict, b: dict) -> str:
 # Five classes of text are replaced by a typed placeholder before a pair is
 # rendered for any judge but the unscrubbed control run. Rules run in order: a
 # private-key block spans lines, a URL holds a host and an email a domain, so
-# each goes before the patterns that would split it. No placeholder matches a
-# rule, so scrubbing twice changes nothing and `Scrubber.leaks` can re-check
-# rendered text.
+# each goes before the patterns that would split it. Every rule but the key
+# rules runs before them: the key rules take a placeholder inside a value as
+# part of it (an IP inside a password), so one written there after them would
+# change on a second scrub. What holds is that scrubbing is idempotent and
+# leaves nothing any rule matches; the tests check both on every case. So
+# `Scrubber.leaks` on scrubbed text shows the rules agree with each other, not
+# that the text is clean: the pre-send gate adds gitleaks, whose rules share
+# nothing with these (see `gitleaks`).
 
+SCRUB_CLASSES = ("host", "ip", "url", "email", "secret")
 HOST_TLDS = (
     "com|net|org|io|ai|dev|app|cloud|goog|co|tech|xyz|info|biz|edu|gov|us|uk|au|nz"
-    "|de|ca|local|localhost|internal|svc|lan|home|arpa"
+    "|de|ca|me|so|local|localhost|internal|svc|lan|home|arpa|lab|corp|int"
 )
 SECRET_TOKENS = (
     r"sk-[\w-]{20,}"  # Anthropic, OpenAI and LiteLLM keys
@@ -477,23 +485,41 @@ SECRET_TOKENS = (
     r"|glpat-[\w-]{20,}|hf_[A-Za-z0-9]{30,}|npm_[A-Za-z0-9]{36}|pypi-[\w-]{50,}"
     r"|[sr]k_(?:live|test)_\w{20,}|whsec_[A-Za-z0-9+/=]{20,}"
     r"|ops_[\w-]{20,}|tskey-[A-Za-z0-9-]{10,}"
+    r"|SG\.[\w-]{16,}\.[\w-]{16,}|do[opr]_v1_[a-f0-9]{64}"  # SendGrid, DigitalOcean
+    r"|\d{5,16}:A[\w-]{30,}"  # Telegram bot
+    r"|\$(?:apr1|2[abxy]?|[156]|y)\$[./\w$]{8,}"  # crypt(3) password hashes
     r"|eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}"  # JWT
 )
-# A key name that names a secret: API_KEY, client_secret, x-api-key. The
-# look-behind starts it at the head of a name and the possessive `++` never
-# gives a character back, so a long run costs linear time, not quadratic.
-SECRET_NAME = (
-    r"(?<![\w.-])(?=[\w.-]*?(?:api[_-]?key|account[_-]?key|[_-]key|token|secret"
-    r"|passw(?:or)?d|passphrase|pwd|credential))[\w.-]++"
+# The words that make a key name a secret's, wherever they sit in it: API_KEY,
+# client_secret, x-api-key, DB_PASS, MYSQL_ROOT_PW, PrivateKey. The key rules
+# and the flag rule read this one list. `pass` and `pw` count only inside a
+# longer name, as a review pass is not a password. A password's value is a
+# secret at any length; any other key's needs eight characters, so
+# `max_tokens=4096` stays.
+KEY_WORDS = r"(?:api|access|account|encryption|master|preshared|private|secret|signing)"
+PASSWORD_WORDS = r"passw(?:or)?d|passphrase|pwd|(?<=[_.-])(?:pass|pw)(?![a-z])"
+SECRET_WORDS = (
+    rf"{PASSWORD_WORDS}|{KEY_WORDS}[_-]?key|[_-]key|token|secret|credential|cookie"
+    r"|(?<![a-z])auth(?![a-z])"
 )
+# A key name that names a secret: a name run holding a secret word, or two
+# words such as `API key`. The look-behind starts it at the head of a name and
+# the possessive `++` never gives a character back, so a long run costs linear
+# time, not quadratic.
+SECRET_NAME = (
+    rf"(?<![\w.-])(?:{KEY_WORDS}[ \t]key(?![\w.-])"
+    rf"|(?=[\w.-]*?(?:{SECRET_WORDS}))[\w.-]++)"
+)
+PASSWORD_NAME = rf"(?<![\w.-])(?=[\w.-]*?(?:{PASSWORD_WORDS}))[\w.-]++"
 # What may close a key before its separator: a quote, a bracket or both, as
 # in os.environ['X_KEY'] = '...'. Every rule that finds a key's separator
-# takes it from here, so none of them can miss a closer another accepts.
+# takes the closer and the separator from here, so none of them can miss one
+# another accepts.
 KEY_CLOSE = r"[\"']?\]?"
-SECRET_KEY_NAME = rf"{SECRET_NAME}{KEY_CLOSE}\s*(?:=>|[:=])\s*[\"']?"
+SEPARATOR = r"(?:=>|[:=])"
+SECRET_KEY_NAME = rf"{SECRET_NAME}{KEY_CLOSE}\s*{SEPARATOR}\s*[\"']?"
 # What a URL may hold; a URL ends at the first character outside it.
 URL_CHAR = r"[^\s<>\"'`)\]]"
-SEPARATOR = r"(?:=>|[:=])"
 # A secret-named key that ends a URL: a quote, bracket or space before its
 # separator, or a separator the URL cannot run past. Its value lies outside
 # the URL (`.../DB_PASSWORD: x`, `Get "...?token=x": err`), so the URL rule
@@ -501,16 +527,18 @@ SEPARATOR = r"(?:=>|[:=])"
 # inside (`?api_key=v`, a password with `=` padding before `@host`) ends
 # nothing; and a URL is never cut short, since its last run may be the secret.
 URL_ENDING_KEY = rf"{SECRET_NAME}(?:(?=[\"'\]\s]){KEY_CLOSE}\s*+{SEPARATOR}|{SEPARATOR}(?!{URL_CHAR}))"
-# A value's characters, and a placeholder a rule before the key rules wrote.
-VALUE_CHAR = r"[^\s\"'<>,;]"
-PLACEHOLDER = r"(?:<(?:secret|url|email|ip)>)"
+# A value's characters, `,` and `;` included where more of the value follows
+# (`a1b2c3d4,e5f6g7h8`), and any placeholder: every rule but the key rules
+# runs before them, so a value may hold a placeholder of any class.
+VALUE_CHAR = r"(?:[^\s\"'<>,;]|[,;](?=[^\s\"'<>,;]))"
+PLACEHOLDER = rf"(?:<(?:{'|'.join(SCRUB_CLASSES)})>)"
 # A value that ran into the next key's name took that key's separator with it,
 # leaving the next value with no key in front: the key rules take it too, on
 # the same line only, so a value ending in `=` padding or `:` takes nothing
 # from the lines after it. A secret key whose value sits on a later line is
 # the NEXT_LINE_SECRET rule's. `>?`: the separator may be `=>`.
 NEXT_VALUES = (
-    r"(?:(?:(?<=[:=])>?[ \t]*+|[ \t]++(?:=>|[:=])[ \t]*+)[\"']?"
+    rf"(?:(?:(?<=[:=])>?[ \t]*+|[ \t]++{SEPARATOR}[ \t]*+)[\"']?"
     rf"(?:{VALUE_CHAR}|{PLACEHOLDER})++)*+"
 )
 # A secret value, whole or as what an earlier placeholder left of it: the
@@ -519,12 +547,19 @@ SECRET_VALUE = (
     rf"(?:(?:{VALUE_CHAR}++{PLACEHOLDER}++|{PLACEHOLDER}++{VALUE_CHAR})"
     rf"(?:{VALUE_CHAR}++|{PLACEHOLDER})*+|{VALUE_CHAR}{{8,}})"
 )
+# What follows a URL's `://`: up to the first character outside it, and a
+# secret key that ends the URL comes along with its value (see URL_ENDING_KEY).
+URL_TAIL = (
+    rf"(?={URL_CHAR})(?:(?!{URL_ENDING_KEY}){URL_CHAR})*+"
+    rf"(?:(?={URL_ENDING_KEY}){SECRET_NAME}{KEY_CLOSE}\s*+{SEPARATOR}\s*+[\"']?"
+    rf"(?:{VALUE_CHAR}|{PLACEHOLDER})*+{NEXT_VALUES})?"
+)
 # A secret key whose separator meets a line break, its value on a later line.
 # SECRET_KEY_NAME's own grammar, so any name it reads as secret, at any length
 # and with any closer.
 NEXT_LINE_KEY = (
-    rf"{SECRET_NAME}{KEY_CLOSE}(?:[ \t]*+\r?\n\s*+(?:=>|[:=])"
-    r"|[ \t]*+(?:=>|[:=])[ \t]*+\r?\n)\s*+[\"']?"
+    rf"{SECRET_NAME}{KEY_CLOSE}(?:[ \t]*+\r?\n\s*+{SEPARATOR}"
+    rf"|[ \t]*+{SEPARATOR}[ \t]*+\r?\n)\s*+[\"']?"
 )
 # Its value. The rule runs right after the private-key rule, as any later rule
 # whose value can run into such a key (`token=x/DB_PASSWORD_PROD:` then the
@@ -537,8 +572,12 @@ NEXT_LINE_SECRET = (
     rf"(?P<keep>{NEXT_LINE_KEY})(?:(?:(?:(?!{NEXT_LINE_KEY}){VALUE_CHAR}|{PLACEHOLDER})*+"
     rf"{NEXT_LINE_KEY})++(?:{VALUE_CHAR}|{PLACEHOLDER})*+|{SECRET_VALUE}){NEXT_VALUES}"
 )
+HOST_LABEL = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+# `_` is a boundary for an IP, a host or a bare name: `node_10.0.0.5`.
+NAME_START = r"(?<![^\W_])"
+NAME_END = r"(?![^\W_])"
 # (class, pattern). A `keep` group survives in front of the placeholder.
-SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
+PLAIN_RULES: tuple[tuple[str, re.Pattern], ...] = (
     (
         "secret",
         re.compile(
@@ -549,14 +588,17 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
     ),
     # Before any rule whose value can run into a secret key (see NEXT_LINE_SECRET).
     ("secret", re.compile(NEXT_LINE_SECRET, re.I)),
-    (  # a scheme may follow a dash, as in ${VAR:-redis://...}; a secret key
-        # that ends the URL comes along with its value (see URL_ENDING_KEY)
+    (  # a 1Password reference, whose vault and item names may hold spaces
         "url",
         re.compile(
-            r"(?<![a-z0-9+.-])(?P<keep>[0-9+.-]*+)[a-z][a-z0-9+.-]*+://"
-            rf"(?={URL_CHAR})(?:(?!{URL_ENDING_KEY}){URL_CHAR})*+"
-            rf"(?:(?={URL_ENDING_KEY}){SECRET_NAME}{KEY_CLOSE}\s*+{SEPARATOR}\s*+[\"']?"
-            rf"(?:{VALUE_CHAR}|{PLACEHOLDER})*+{NEXT_VALUES})?",
+            rf"(?<![a-z0-9+.-])op://(?=\S)[^/\n<>\"'`]++/[^/\n<>\"'`]++/{URL_TAIL}",
+            re.I,
+        ),
+    ),
+    (  # a scheme may follow a dash, as in ${VAR:-redis://...}
+        "url",
+        re.compile(
+            rf"(?<![a-z0-9+.-])(?P<keep>[0-9+.-]*+)[a-z][a-z0-9+.-]*+://{URL_TAIL}",
             re.I,
         ),
     ),
@@ -565,21 +607,27 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
         "email",
         re.compile(r"(?<![\w.+-])[\w.+-]++@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\b"),
     ),
+    (  # the password of a connection string with no scheme: user:pw@db:5432
+        "secret",
+        re.compile(r"(?P<keep>(?<![\w.%+:/-])[\w.%+-]*+:)[^\s@/<>\"'`]++(?=@[\w.\[-])"),
+    ),
     (
         "ip",
         re.compile(
-            r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
-            r"|\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\b"
-            r"|\b(?:[0-9a-f]{1,4}:){2,6}:(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?",
+            rf"{NAME_START}(?:\d{{1,3}}\.){{3}}\d{{1,3}}{NAME_END}"
+            rf"|{NAME_START}(?:[0-9a-f]{{1,4}}:){{7}}[0-9a-f]{{1,4}}{NAME_END}"
+            rf"|{NAME_START}(?:[0-9a-f]{{1,4}}:){{1,6}}:"
+            r"(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*+)?(?!\w)",
             re.I,
         ),
     ),
-    ("secret", re.compile(rf"\b(?:{SECRET_TOKENS})")),
+    ("secret", re.compile(rf"(?<!\w)(?:{SECRET_TOKENS})")),
     ("secret", re.compile(r"(?P<keep>\bBearer\s+)[\w.~+/=-]{8,}")),
     (
         "secret",
         re.compile(
-            r"(?P<keep>\bauthorization[\"']?\s*[:=]\s*[\"']?\w+\s+)[^\s\"'<>]{8,}",
+            rf"(?P<keep>\bauthorization{KEY_CLOSE}\s*{SEPARATOR}\s*[\"']?\w+\s+)"
+            r"[^\s\"'<>]{8,}",
             re.I,
         ),
     ),
@@ -590,15 +638,52 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
     (  # a command-line flag naming a secret, then its value: --password VALUE
         "secret",
         re.compile(
-            r"(?P<keep>(?<![\w-])--(?=[\w-]*?(?:key|token|secret|passw(?:or)?d))"
-            r"[\w-]++[=\s]\s*[\"']?)[^\s\"'<>]{6,}",
+            rf"(?P<keep>(?<![\w-])(?=-[\w-]*?(?:{SECRET_WORDS}))--[\w-]++[=\s]\s*[\"']?)"
+            r"[^\s\"'<>]{6,}",
             re.I,
         ),
     ),
-    # A secret-named key's value: first one that stops at a bracket, so a call
-    # such as `token => login(password: "...")` cannot hide the inner key; then
-    # any value, brackets included. The flag rule runs first: a placeholder it
-    # wrote inside a key's value after them would change on a second scrub.
+    (  # a long run mixing upper case, lower case and digits: a key with no
+        # known prefix, or a random id, which no pattern tells from one
+        "secret",
+        re.compile(
+            r"(?<![A-Za-z0-9])(?=[A-Za-z0-9]*?[a-z])(?=[A-Za-z0-9]*?[A-Z])"
+            r"(?=[A-Za-z0-9]*?[0-9])[A-Za-z0-9]{16,}+"
+        ),
+    ),
+    (
+        "host",
+        re.compile(
+            # At the head of a name only, so a long dotted run is linear; a
+            # leading dash (`-hdb.example.com`) or dot (`*.example.net`) is
+            # skipped. Three labels or more may touch a `-` or `_` after them
+            # (`db.example.com-old`); two may not, as code paths such as
+            # `steps.app-token` and `secrets.APP_ID` read the same.
+            rf"(?<![a-z0-9.-])(?P<keep>-*+)\.?(?:(?:{HOST_LABEL}\.++){{2,}}(?:{HOST_TLDS}){NAME_END}"
+            rf"|{HOST_LABEL}\.++(?:{HOST_TLDS})\b(?!-))(?!\.[a-z0-9])",
+            re.I,
+        ),
+    ),
+)
+# A secret-named key's value: a password's first, at any length; then one
+# that stops at a bracket, so a call such as `token => login(password: "...")`
+# cannot hide the inner key; then any value, brackets included. Each takes a
+# placeholder the ones before it wrote as part of a value, so a key rule never
+# writes one that a key rule before it would take on a second scrub.
+KEY_RULES: tuple[tuple[str, re.Pattern], ...] = (
+    (  # a password's: up to a space, or quoted, to the line's last such quote
+        # (an escaped one inside cannot cut it short) or, unclosed, to its end;
+        # after a separator or, in prose, after `the password is`. A boolean is
+        # a setting, not a password.
+        "secret",
+        re.compile(
+            rf"(?P<keep>(?:{PASSWORD_NAME}{KEY_CLOSE}\s*+{SEPARATOR}"
+            r"|(?<![\w.-])(?:passw(?:or)?d|passphrase)\s++(?:is|was)(?!\S))\s*+)"
+            rf"(?:(?P<q>[\"'`])(?!{PLACEHOLDER}(?:(?P=q)|$))(?:[^\n]*(?P=q)|[^\n]++)"
+            rf"|[\"'`]?(?!(?:true|false|none|null)\b)[^\s\"'`<>]++){NEXT_VALUES}",
+            re.I,
+        ),
+    ),
     (
         "secret",
         re.compile(
@@ -610,23 +695,11 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
         "secret",
         re.compile(rf"(?P<keep>{SECRET_KEY_NAME}){SECRET_VALUE}{NEXT_VALUES}", re.I),
     ),
-    (
-        "host",
-        re.compile(
-            # At the head of a name only, so a long dotted run is linear; a
-            # leading dash (`-hdb.example.com`) or dot (`*.example.net`) is skipped.
-            rf"(?<![a-z0-9.-])(?P<keep>-*+)\.?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.++)+"
-            rf"(?:{HOST_TLDS})\b"
-            r"(?!-|\.[a-z0-9])",
-            re.I,
-        ),
-    ),
 )
-SCRUB_CLASSES = ("host", "ip", "url", "email", "secret")
-# Only for the fail-closed check: a secret key and its value right after a URL
+# Only for `Scrubber.leaks`: a secret key and its value right after a URL
 # placeholder mean some rule cut a URL short, leaving a value no key rule saw.
 ORPHANED_VALUE = re.compile(
-    rf"<url>{SECRET_NAME}[\"']?\]?\s*+{SEPARATOR}\s*+[\"']?{VALUE_CHAR}{{8,}}", re.I
+    rf"<url>{SECRET_NAME}{KEY_CLOSE}\s*+{SEPARATOR}\s*+[\"']?{VALUE_CHAR}{{8,}}", re.I
 )
 
 
@@ -638,11 +711,15 @@ class Scrubber:
     """
 
     def __init__(self, host_names: Iterable[str] = ()) -> None:
-        self.rules = list(SCRUB_RULES)
         names = sorted({n.strip() for n in host_names if n.strip()}, key=len)
+        named = []
         if names:
             alt = "|".join(map(re.escape, reversed(names)))  # longest first
-            self.rules.append(("host", re.compile(rf"\b(?:{alt})\b", re.I)))
+            named.append(
+                ("host", re.compile(rf"{NAME_START}(?:{alt}){NAME_END}", re.I))
+            )
+        # Bare names before the key rules, as every other rule (see Scrub).
+        self.rules = [*PLAIN_RULES, *named, *KEY_RULES]
         self.counts: Counter[str] = Counter()
 
     def __call__(self, text: str) -> str:
@@ -662,11 +739,56 @@ class Scrubber:
         }
 
     def leaks(self, text: str) -> list[str]:
-        """Classes some rule still matches in `text`: empty when it is clean."""
+        """Classes some rule still matches in `text`. On scrubbed text this
+        finds a rule another rule's placeholder defeated; it cannot find a
+        shape no rule knows, which is what `gitleaks` is for."""
         found = {cls for cls, pattern in self.rules if pattern.search(text)}
         if ORPHANED_VALUE.search(text):
             found.add("secret")
         return sorted(found)
+
+
+GITLEAKS = "gitleaks"
+
+
+def gitleaks(texts: list[str]) -> Counter[str]:
+    """gitleaks' default rules over `texts`: findings per rule id, secrets
+    redacted. Its rules are written apart from the scrubber's, so it is the
+    check for a shape they miss. It runs in an empty directory with no
+    GITLEAKS_* variable, so no repo config or ignore file narrows its rules,
+    and a `gitleaks:allow` in the text silences nothing."""
+    argv = [GITLEAKS, "stdin", "--no-banner", "--log-level", "error", "--redact"]
+    argv += ["--ignore-gitleaks-allow", "--exit-code", "0"]
+    argv += ["--report-format", "json", "--report-path", "-"]
+    with tempfile.TemporaryDirectory() as cwd:
+        try:
+            run = subprocess.run(
+                argv,
+                input="\n".join(texts),
+                capture_output=True,
+                text=True,
+                cwd=cwd,
+                env={"PATH": os.environ.get("PATH", "")},
+                check=False,
+            )
+        except FileNotFoundError:
+            sys.exit(
+                f"{GITLEAKS} is not installed; the scrub check needs it, nothing sent"
+            )
+    if run.returncode:
+        sys.exit(f"{GITLEAKS} exited {run.returncode}; nothing sent")
+    findings = parse_json(run.stdout, f"{GITLEAKS} report")
+    if not isinstance(findings, list):
+        sys.exit(f"{GITLEAKS} report is not a list; nothing sent")
+    return Counter(f["RuleID"] for f in findings)
+
+
+def scrub_findings(texts: list[str], scrubber: Scrubber) -> dict[str, int]:
+    """What the pre-send gate finds in scrubbed `texts`: each scrub class some
+    rule still matches, and each gitleaks rule that fires."""
+    found = Counter(c for t in texts for c in scrubber.leaks(t))
+    found.update({f"gitleaks:{rule}": n for rule, n in gitleaks(texts).items()})
+    return dict(found)
 
 
 def read_file(path: str | Path) -> str:
@@ -1990,15 +2112,19 @@ def record(p: Pair, k: int, v: dict, newer: str) -> dict:
 def render_all(
     chosen: list[Pair], memories: dict[str, dict], scrubber: Scrubber | None
 ) -> list[str]:
-    """Every chosen pair as the judge sees it. Scrubbed, it fails closed: the
-    run exits before any request while a rendered pair still matches a rule."""
+    """Every chosen pair as the judge sees it. Scrubbed, the run exits before
+    any request unless every rendered pair passes the gate (`scrub_findings`):
+    no scrub rule still matches it, and gitleaks finds nothing in it. gitleaks
+    shares no rule with the scrubber, so a secret of a shape gitleaks knows
+    stops the run even where the scrubber missed it. Neither check proves a
+    text holds no secret: one of a shape neither knows still goes out."""
     sent = {h for p in chosen for h in (p.a, p.b)}
     shown = {h: scrubber.memory(memories[h]) if scrubber else memories[h] for h in sent}
     texts = [render_pair(shown[p.a], shown[p.b]) for p in chosen]
     if scrubber:
-        leaked = Counter(c for t in texts for c in scrubber.leaks(t))
-        if leaked:
-            sys.exit(f"scrub check failed, nothing sent: still matching {dict(leaked)}")
+        found = scrub_findings(texts, scrubber)
+        if found:
+            sys.exit(f"scrub check failed, nothing sent: {found}")
         log(f"scrubbed {len(sent)} memories: {dict(scrubber.counts)}")
     return texts
 
@@ -2021,6 +2147,12 @@ def cmd_eval(args) -> None:
     judge_url = TYPESAFE_URL if args.judge == "jev" else egress_url("JUDGE_URL")
     if not args.scrub:
         unscrubbed_ok(model, judge_url)
+    elif not (args.host_names or args.no_host_names):
+        # No pattern tells a bare machine name from a word: without the list,
+        # every one goes out as it is, so that takes a choice, not a default.
+        sys.exit("--scrub needs --host-names <file>, or --no-host-names")
+    elif not shutil.which(GITLEAKS):
+        sys.exit(f"--scrub needs {GITLEAKS} on PATH for its pre-send check")
     out = HERE / "runs" / args.run
     out.mkdir(parents=True, exist_ok=True)
     lock = (out / LOCK_FILE).open("w")  # held until exit: one eval per run at a time
@@ -2044,13 +2176,17 @@ def cmd_eval(args) -> None:
         problems = Hygiene(seed_prompt(), memories).problems(prompt)
         if problems:  # eval measures; landing is gated in judge.rs and by a human
             log("prompt hygiene problems: " + "; ".join(problems))
-    scrubber = Scrubber(read_host_names(args.host_names)) if args.scrub else None
-    if scrubber and args.judge != "jev" and scrubber.leaks(prompt):
+    names = read_host_names(args.host_names)
+    scrubber = Scrubber(names) if args.scrub else None
+    host_names = {"file": args.host_names, "names": len(names)} if scrubber else None
+    if (
+        scrubber
+        and args.judge != "jev"
+        and (found := scrub_findings([prompt], scrubber))
+    ):
         # The system prompt goes out too, to whichever model the wire reaches,
         # and a tuned one was written from raw pairs.
-        sys.exit(
-            f"the prompt matches scrub rules {scrubber.leaks(prompt)}; nothing sent"
-        )
+        sys.exit(f"the prompt fails the scrub check {found}; nothing sent")
     texts = render_all(chosen, memories, scrubber)
     judge = make_judge(args.judge, model, prompt, args.regime, judge_url)
     instructions = (
@@ -2064,6 +2200,7 @@ def cmd_eval(args) -> None:
     # What this eval sends, written before the first request: an abort or an
     # outage later cannot drop it from the report.
     sent = {"judge": args.judge, "model": model, "scrubbed": bool(scrubber)}
+    sent["host_names"] = host_names
     sent["pairs"] = [[p.a, p.b] for p in chosen]
     (out / f"{stem}_sent.json").write_text(json.dumps(sent) + "\n", encoding="utf-8")
     log(
@@ -2104,6 +2241,7 @@ def cmd_eval(args) -> None:
         "hygiene_problems": problems,
         "scrubbed": bool(scrubber),
         "scrub_counts": dict(scrubber.counts) if scrubber else None,
+        "host_names": host_names,
         "sent": {
             "pairs": len(chosen),
             "memories": len({h for p in chosen for h in (p.a, p.b)}),
@@ -2854,7 +2992,11 @@ def main() -> None:
     e.add_argument(
         "--scrub", action="store_true", help="replace hosts, IPs, URLs, emails, secrets"
     )
-    e.add_argument("--host-names", help="file of bare host names to scrub too")
+    names = e.add_mutually_exclusive_group()
+    names.add_argument("--host-names", help="file of bare host names to scrub too")
+    names.add_argument(
+        "--no-host-names", action="store_true", help="--scrub with no such file"
+    )
     e.add_argument(
         "--passes",
         type=positive_int,

@@ -10,6 +10,8 @@ and the Rust stay in step.
 """
 
 import argparse
+import contextlib
+import io
 import itertools
 import json
 import socket
@@ -292,88 +294,161 @@ def check_judge_passes() -> None:
         raise AssertionError("--passes 0 must be rejected")
 
 
+def scrubs(text: str, *secrets: str, names=("build-box-01",)) -> str:
+    """`text` scrubbed, holding what every scrub case must: each of `secrets`
+    is gone, a second scrub changes nothing, no rule matches what is left, and
+    some rule matched the input."""
+    s = tune.Scrubber(names)
+    out = s(text)
+    for secret in secrets:
+        assert secret not in out, (text, secret, out)
+    assert s(out) == out, (text, out)
+    assert s.leaks(out) == [], (text, out)
+    assert s.leaks(text), text
+    return out
+
+
 def check_scrub() -> None:
-    """Each scrub class becomes its placeholder, counted; nothing survives the
-    check; scrubbing is idempotent. Key-shaped test strings are assembled at
-    run time so the repo's secret scanners never see one in the source."""
+    """Each scrub class becomes its placeholder; every case holds `scrubs`.
+    Key-shaped test strings are assembled at run time so the repo's secret
+    scanners never see one in the source."""
     key_block = (
         "-----BEGIN " + "OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n"
         "-----END " + "OPENSSH PRIVATE KEY-----"
     )
+    value = "Zq8" + "Lm4Rt"  # eight characters: a key rule's, not the long-run rule's
+    hexed = "9f86d081" + "884c7d659a2feaa0c55ad015"
+    wg_key = "yAnz5TF+" + "lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk="
     cases = {
         "host": [
-            "svc at store-api.data.svc:3001 now",
-            "the gateway.corp.example.net front",
-            "pushed to crates.io",
-            "behind iap at app.cloud.goog",
-            "resolves *.example.net and {svc}.dev.example.io",
-            "mysql -hdb.prod.example.com -uroot",
-            "see...api.example.com for details",
-            "box build-box-01 rebooted",
+            ("svc at store-api.data.svc:3001 now", "store-api"),
+            ("the gateway.corp.example.net front", "gateway"),
+            ("pushed to crates.io", "crates"),
+            ("behind iap at app.cloud.goog", "cloud.goog"),
+            ("resolves *.example.net and {svc}.dev.example.io", "example"),
+            ("mysql -hdb.prod.example.com -uroot", "prod.example"),
+            ("see...api.example.com for details", "api.example"),
+            ("box build-box-01 rebooted", "build-box-01"),
+            (
+                "nas.lab, git.corp, api.int, x.me and y.so",
+                "nas",
+                "git",
+                "api",
+                "x.",
+                "y.",
+            ),
+            ("node_db.example.com, db.example.com_old, db.example.com-old", "db.ex"),
+            ("logs on build-box-01_tmp", "build-box-01"),
         ],
         "ip": [
-            "ClusterIP 192.0.2.10:3001",
-            "v6 2001:db8:a1e0::1 and 2001:db8:0:0:0:0:2:1",
+            ("ClusterIP 192.0.2.10:3001", "192.0.2.10"),
+            ("v6 2001:db8:a1e0::1 and 2001:db8:0:0:0:0:2:1", "2001:db8"),
+            ("ula fd00::5 and link fe80::1", "fd00", "fe80"),
+            ("up on node_10.0.0.5", "10.0.0.5"),
         ],
         "url": [
-            "see https://example.com/a?b=c) for more",
-            "key at op://vault/item/field",
-            "redis://cache:6379/0",
-            "REDIS_URL=${REDIS_URL:-redis://:pw@cache:6379/0}",
+            ("see https://example.com/a?b=c) for more", "example.com"),
+            ("key at op://vault/item/field", "vault"),
+            ("read op://Private/My Prod DB/password", "Private", "Prod DB"),
+            ("redis://cache:6379/0", "cache"),
+            ("REDIS_URL=${REDIS_URL:-redis://:pw@cache:6379/0}", "pw@cache"),
         ],
-        "email": ["mail ops+alerts@example.org today"],
+        "email": [("mail ops+alerts@example.org today", "ops+alerts")],
         "secret": [
-            "header Authorization: Bearer " + "abc" * 6,
-            "export API_KEY=" + "z9" * 10,
-            "token: " + "q" * 12,
+            ("header Authorization: Bearer " + "abc" * 6, "abcabc"),
+            ("export API_KEY=" + "z9" * 10, "z9z9"),
+            ("token: " + "q" * 12, "qqqq"),
             # Prefixed and suffixed key names, as env vars and configs write them.
-            "ALAYA_API_KEY=" + "0f" * 16,
-            "GRAPH_API_KEY: " + "ab12" * 4,
-            "DB_PASSWORD=" + "hunter2hunter2",
-            '"client_secret": "' + "c5" * 10 + '"',
-            "refresh_token = " + "r7" * 8,
-            "Authorization: Basic " + "dXNlcjpw" * 3,
-            "curl -u admin:" + "pa55word",
-            "curl --user admin:" + "pa55word",
-            "mysql --password " + "s3cr3tpass",
-            "private_key: " + "k3" * 8,
-            "ENCRYPTION_KEY=" + "e4" * 8,
-            "passphrase: " + "p5" * 8,
-            "AccountName=x;AccountKey=" + "Zm9v" * 6 + "==",
-            "'apikey' => '" + "a6" * 8 + "'",
-            "wh" + "sec_" + "W" * 24,
-            "mysql --password '" + "Zx9Qw8Er7Ty6" + "'",
-            'cli --api-key "' + "Zx9Qw8Er7Ty6" + '"',
-            "os.environ['OPENAI_API_KEY'] = '" + "o8" * 8 + "'",
-            'config["password"] = "' + "Zx9Qw8Er7Ty6" + '"',
-            "n" + "pm_" + "B" * 36,
-            "-----BEGIN PGP "
-            + "PRIVATE KEY BLOCK-----\nlQOYBF\n-----END PGP PRIVATE KEY BLOCK-----",
-            "sk-" + "ant-" + "x1" * 15,
-            "gh" + "p_" + "A" * 36,
-            "jwt eyJ" + "a" * 10 + ".eyJ" + "b" * 10 + "." + "c" * 12,
-            key_block,
+            ("ALAYA_API_KEY=" + "0f" * 16, "0f0f"),
+            ("GRAPH_API_KEY: " + "ab12" * 4, "ab12"),
+            ("DB_PASSWORD=" + "hunter2hunter2", "hunter2"),
+            ('"client_secret": "' + "c5" * 10 + '"', "c5c5"),
+            ("refresh_token = " + "r7" * 8, "r7r7"),
+            ("Authorization: Basic " + "dXNlcjpw" * 3, "dXNlcjpw"),
+            ("curl -u admin:" + "pa55word", "pa55word"),
+            ("curl --user admin:" + "pa55word", "pa55word"),
+            ("mysql --password " + "s3cr3tpass", "s3cr3tpass"),
+            ("private_key: " + "k3" * 8, "k3k3"),
+            ("ENCRYPTION_KEY=" + "e4" * 8, "e4e4"),
+            ("passphrase: " + "p5" * 8, "p5p5"),
+            ("AccountName=x;AccountKey=" + "Zm9v" * 6 + "==", "Zm9v"),
+            ("'apikey' => '" + "a6" * 8 + "'", "a6a6"),
+            ("wh" + "sec_" + "W" * 24, "WWWW"),
+            ("mysql --password '" + "Zx9Qw8Er7Ty6" + "'", "Zx9Qw8Er7Ty6"),
+            ('cli --api-key "' + "Zx9Qw8Er7Ty6" + '"', "Zx9Qw8Er7Ty6"),
+            ("os.environ['OPENAI_API_KEY'] = '" + "o8" * 8 + "'", "o8o8"),
+            ('config["password"] = "' + "Zx9Qw8Er7Ty6" + '"', "Zx9Qw8Er7Ty6"),
+            ("n" + "pm_" + "B" * 36, "BBBB"),
+            (
+                "-----BEGIN PGP "
+                + "PRIVATE KEY BLOCK-----\nlQOYBF\n-----END PGP PRIVATE KEY BLOCK-----",
+                "lQOYBF",
+            ),
+            ("sk-" + "ant-" + "x1" * 15, "x1x1"),
+            ("gh" + "p_" + "A" * 36, "AAAA"),
+            ("jwt eyJ" + "a" * 10 + ".eyJ" + "b" * 10 + "." + "c" * 12, "aaaa"),
+            (key_block, "b3BlbnNz"),
+            # Key names: a short password word inside a longer name, auth, cookies.
+            ("DB_PASS=" + value, value),
+            ("SMTP_PASS=" + value, value),
+            ("MYSQL_ROOT_PW: " + value, value),
+            ("REDIS_AUTH=" + value, value),
+            ("Cookie: session=" + hexed, hexed),
+            ("auth: " + hexed, hexed),
+            # Two words, or one CamelCase name.
+            ("API key: " + value, value),
+            ("Secret access key: " + value, value),
+            ("private key: " + value, value),
+            ("signing key: " + hexed, hexed),
+            ("[Interface]\nPrivateKey = " + wg_key, "lXXJte14"),
+            ("[Peer]\nPresharedKey = " + wg_key, "lXXJte14"),
+            # A password's value at any length, quoted with spaces, or holding `;`.
+            ("password=" + "hunter2", "hunter2"),
+            ('password: "correct horse ' + 'battery staple"', "horse", "battery"),
+            ("password='it''s " + "here'", "here"),
+            ('DB_PASS="correct horse ' + "battery", "horse", "battery"),  # unclosed
+            ("password=ab;" + value, value),
+            ("DB_PASSWORD=x," + value, value),
+            ("the admin password is " + "hunter2", "hunter2"),
+            # Flags with any secret word.
+            ("gpg --passphrase " + value, value),
+            ("cli --pwd " + "hunter2", "hunter2"),
+            ("cli --credential " + value, value),
+            # A connection string with no scheme.
+            ("admin:" + "S3cret99" + "@db-primary:5432", "S3cret99"),
+            ("admin:" + "S3cret99" + "@10.0.0.5:5432", "S3cret99"),
+            # Tokens with no key in front: by prefix, or a long mixed run.
+            ("bot " + "110201543:" + "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw", "AAHdq"),
+            (
+                "SG." + "ngeVfQFYQlKU0ufo8x5d1A." + "TwL2iGABf9DHoTf-09kqeF8tAmbih",
+                "ngeV",
+            ),
+            ("do" + "p_v1_" + "c0ffee12" * 8, "c0ffee12"),
+            ("admin:" + "$apr1$" + "r31.....$HqJZimcKQFAMYayBlzkrA/", "HqJZ"),
+            (
+                "$2y$"
+                + "10$"
+                + "N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
+                "N9qo",
+            ),
+            ("id " + "Qw3rTy7u" + "Io9pAs2dFg5h ok", "Qw3rTy7u"),
         ],
     }
-    for cls, texts in cases.items():
-        for text in texts:
-            s = tune.Scrubber(["build-box-01"])
-            out = s(text)
-            assert f"<{cls}>" in out and s.counts[cls] >= 1, (cls, text, out)
-            assert s.leaks(out) == [] and s.leaks(text), (cls, text, out)
-            assert s(out) == out, (cls, out)  # idempotent
+    for cls, rows in cases.items():
+        for text, *secrets in rows:
+            out = scrubs(text, *secrets)
+            assert f"<{cls}>" in out, (cls, text, out)
     s = tune.Scrubber()
     assert s("Bearer " + "abc" * 6) == "Bearer <secret>"
     assert s(key_block + " tail") == "<secret> tail"
     assert s("ssh -i key2 " + key_block[:40]) == "ssh -i key2 <secret>"  # cut block
+    assert s('password: "a b c"') == "password: <secret>"  # quotes and all
     # A bracket inside a value cannot leave the value's tail behind.
     for text in (
         "DB_PASSWORD=Xk9#mQ2!vR7(pL4zQ8w",
         "f(auth_token=zC&x0JA95mJ[B#@YlL2BoR)",
     ):
-        out = s(text)
-        assert "pL4zQ8w" not in out and "YlL2BoR" not in out, out
-        assert s(out) == out and s.leaks(out) == [], out
+        scrubs(text, "pL4zQ8w", "YlL2BoR")
     # Nor can an IP, URL or email an earlier rule replaced inside the value.
     # A run of 8 or more before it is a `<secret>` already: the tail goes too.
     for text in (
@@ -383,10 +458,9 @@ def check_scrub() -> None:
         "SECRET=" + "1.2.3.4-Zq8Lm",
         "DB_PASSWORD=" + "hunter2hunter2-10.0.0.5-Zq8Lm",
         "SECRET=" + "longprefix9@ops@example.org-Zq8Lm",
+        "API_KEY=" + "x9-db.example.com-Zq8Lm",
     ):
-        out = s(text)
-        assert "x9" not in out and "Zq8Lm" not in out and "hunter2" not in out, out
-        assert out.endswith("=<secret>") and s(out) == out and s.leaks(out) == [], out
+        assert scrubs(text, "x9", "Zq8Lm", "hunter2").endswith("=<secret>"), text
     # A value that runs into the next key's name takes that key's value too.
     for text in (
         "API_TOKEN=" + "10.0.0.5/db_password: Pa[ss]w0rd",
@@ -394,14 +468,11 @@ def check_scrub() -> None:
         "token=" + "abcdefgh/password: Pa55w0rd99",
         "token=" + "abcdefgh/password: x/api_key: Pa55w0rd99",
     ):
-        out = s(text)
-        assert "Pa" not in out, out
-        assert s(out) == out and s.leaks(out) == [], out
+        scrubs(text, "Pa")
     # A placeholder a later rule writes, or a `>` after one, keeps the scrub
     # idempotent: a second pass would read as a leak and stop the eval.
-    for text in ("echo TOKEN=" + "abcdefgh(1)>out.txt", 'TOKEN="--key=,abcdef"'):
-        out = s(text)
-        assert s(out) == out and s.leaks(out) == [], out
+    scrubs("echo TOKEN=" + "abcdefgh(1)>out.txt", "abcdefgh")
+    scrubs('TOKEN="--key=,abcdef"', "abcdef")
     # A URL cannot swallow the secret-named key after it, leaving the value
     # with no key in front of it.
     for text in (
@@ -427,9 +498,7 @@ def check_scrub() -> None:
         "http://intra/DB_PASSWORD\t=" + "Pa55w0rd99",
         'http://intra/DB_PASSWORD"=' + "Pa55w0rd99",
     ):
-        out = s(text)
-        assert "Pa55w0rd99" not in out, (text, out)
-        assert s(out) == out and s.leaks(out) == [], out
+        scrubs(text, "Pa55w0rd99")
     # The check also fails closed on a value a URL cut left behind.
     assert s.leaks("<url>DB_PASSWORD: " + "Pa55w0rd99") == ["secret"]
     assert s.leaks("<url>DB_PASSWORD: <secret>") == []
@@ -461,9 +530,10 @@ def check_scrub() -> None:
         # ...at any length, as SECRET_NAME has no limit either.
         "token=abcdefgh/X_API_KEY_APPLICATION_PRODUCTION_EU_WEST_01:\n",
         "token=abcdefgh/DB_PASSWORD_" + "X" * 300 + "]:\n",
+        # ...or as two words.
+        "token=abcdefgh/" + "private key:\n",
     ):
-        out = s(text + "Pa55w0rd99")
-        assert "Pa55w0rd99" not in out and s.leaks(out) == [], out
+        scrubs(text + "Pa55w0rd99", "Pa55w0rd99")
     # A next-line value may end in, or be, another such key: the chain goes whole.
     for text in (
         "password:\nYWJjZGVmZ2hp/api_key:\n",
@@ -478,12 +548,9 @@ def check_scrub() -> None:
         "curl -u user:abcdefgh/api_key:\n",
         "cli --password abcdefgh/api_key:\n",
     ):
-        out = s(text + "Pa55w0rd99")
-        assert "Pa55w0rd99" not in out and "YWJj" not in out, out
-        assert s(out) == out and s.leaks(out) == [], out
+        scrubs(text + "Pa55w0rd99", "Pa55w0rd99", "YWJj")
     # A secret-named value cannot swallow the next secret-named key.
-    out = s(':auth_token => login(password: "' + "Zx9Qw8Er7Ty6" + '")')
-    assert "Zx9Qw8Er7Ty6" not in out and s.leaks(out) == [], out
+    scrubs(':auth_token => login(password: "' + "Zx9Qw8Er7Ty6" + '")', "Zx9Qw8Er7Ty6")
     # Every rule stays near linear on long adversarial runs (some were
     # quadratic or worse: 64k characters took minutes).
     for run in (
@@ -498,24 +565,39 @@ def check_scrub() -> None:
         "ab:",
         "pwd:\n",
         "pwd:\nx ",
+        "aB3",
+        "op://a ",
+        "x:@",
+        "_pw: ",
+        'password: "',
+        "password is ",
+        "a1::",
+        "$1$",
+        "api key ",
     ):
         text = (run * 64_000)[:64_000]
         start = tune.time.perf_counter()
         s(text)
         took = tune.time.perf_counter() - start
         assert took < 1.0, (run, took)
-    # Prose, file names, versions, times and hashes are not a scrub class.
+    # Prose, file names, versions, times, hashes and code paths are not a
+    # scrub class; nor is a review pass, a setting or a short token count.
     plain = (
         "Ray ruled on tune.py and judge.rs (v1.13.0) at 12:30:45; max_tokens=4096, "
         "token budget 5, std::fs, hash 9999d3f16a2030def3b3479ef273318194c8e03f, "
         "e.g. the bearer token; lab node; pinned cachekit@0.1.4 and action@v3.2.0; "
-        "systemctl --user restart gateway"
+        "systemctl --user restart gateway; a review pass: 3 of 4; PASS: 12; "
+        "${{ secrets.APP_ID }} and steps.app-token.outputs.token; identity.tech_id; "
+        "DISABLE_PASSWORD=true; de::Deserialize; the password is rotated"
     )
-    assert s(plain) == plain and s.leaks(plain) == [], s(plain)
+    assert s(plain) == plain.replace("rotated", "<secret>"), s(plain)
+    assert s.leaks(s(plain)) == [], s(plain)
     # Bare names come only from the host list, longest first, as whole words.
     s = tune.Scrubber(["box", "box-wsl"])
     assert s("box-wsl and box, not boxing") == "<host> and <host>, not boxing"
     assert s.counts == Counter(host=2)
+    # ...and before the key rules, so a name inside a short value stays put.
+    scrubs("token=box-x", "box", names=["box"])
     try:
         tune.read_host_names("no-such-host-list.txt")
     except SystemExit as e:
@@ -529,9 +611,55 @@ def check_scrub() -> None:
     text = tune.render_pair(a, s.memory(mem("ok", 86_400.0 * 2)))
     assert s.leaks(text) == [] and "tags: <host>, plain" in text, text
     assert s.counts == Counter(ip=1, host=2)
+    check_gate()
 
-    # Keys reach HTTP headers: whitespace would make httpx echo them in errors.
-    real_env = dict(tune.os.environ)
+
+def check_gate() -> None:
+    """The pre-send gate runs gitleaks, which owes nothing to the scrub rules:
+    with no rule at all, a secret gitleaks knows still stops the run before a
+    request, and so does a missing gitleaks binary."""
+    a, b = "a" * 64, "b" * 64
+    pair = tune.Pair(0, a, b, "coexist", None, "operator")
+    leaky = {a: mem("creds = " + "9f86d081" + "884c7d659a2feaa0c55ad015", 0.0)}
+    leaky[b] = mem("nothing here", 86_400.0)
+    bare = tune.Scrubber()
+    bare.rules = []
+    # Neither an allow comment in the text nor a config from the environment
+    # narrows gitleaks' rules.
+    tune.os.environ["GITLEAKS_CONFIG_TOML"] = '[allowlist]\nregexes = [".*"]'
+    try:
+        for texts in (
+            [tune.render_pair(leaky[a], leaky[b])],
+            ["x gitleaks:allow " + leaky[a]["content"]],
+        ):
+            assert tune.gitleaks(texts) == Counter({"generic-api-key": 1}), texts
+    finally:
+        del tune.os.environ["GITLEAKS_CONFIG_TOML"]
+    try:
+        tune.render_all([pair], leaky, bare)
+    except SystemExit as e:
+        assert "nothing sent" in str(e) and "gitleaks:generic-api-key" in str(e), e
+    else:
+        raise AssertionError("a gitleaks finding must stop the run")
+    clean = {a: mem("nothing here", 0.0), b: mem("nor here", 1.0)}
+    assert tune.render_all([pair], clean, bare) == [
+        tune.render_pair(clean[a], clean[b])
+    ]
+    path = tune.os.environ["PATH"]
+    with tempfile.TemporaryDirectory() as empty:
+        tune.os.environ["PATH"] = empty
+        try:
+            tune.gitleaks(["x"])
+        except SystemExit as e:
+            assert "gitleaks is not installed" in str(e), e
+        else:
+            raise AssertionError("a missing gitleaks must stop the run")
+        finally:
+            tune.os.environ["PATH"] = path
+
+
+def check_key_env(real_env: dict) -> None:
+    """Keys reach HTTP headers: whitespace would make httpx echo them in errors."""
     try:
         tune.os.environ["X_KEY"] = "abc\r"
         try:
@@ -543,8 +671,88 @@ def check_scrub() -> None:
     finally:
         tune.os.environ.clear()
         tune.os.environ.update(real_env)
-    check_egress(real_env)
-    check_no_env_proxy(real_env)
+
+
+def check_eval_scrub(real_env: dict) -> None:
+    """eval --scrub needs a host-name choice and gitleaks before it fetches
+    anything, records the choice, and sends nothing while the gate finds
+    something: here a secret of a shape no scrub rule knows today, which
+    gitleaks does. If a rule learns it, pick another for this check."""
+    a, b = "a" * 64, "b" * 64
+    pair = tune.Pair(0, a, b, "coexist", None, "operator")
+    memories = {a: mem("nothing to hide", 0.0), b: mem("still nothing", 86_400.0)}
+    sent: list[str] = []
+
+    def judge(text: str) -> dict:
+        sent.append(text)
+        return verdict(tokens=(10, 1))
+
+    def args(**over) -> SimpleNamespace:
+        base = {
+            "prompt_file": None,
+            "pairs": "all",
+            "run": "gate",
+            "judge": "anthropic",
+        }
+        base |= {"model": "claude-sonnet-5", "scrub": True, "host_names": None}
+        base |= {
+            "no_host_names": False,
+            "passes": 1,
+            "regime": "default",
+            "max_usd": 1.0,
+        }
+        return SimpleNamespace(**(base | over))
+
+    def run(**over) -> None:
+        with contextlib.redirect_stdout(io.StringIO()):  # its report
+            tune.cmd_eval(args(**over))
+
+    def exits(**over) -> str:
+        try:
+            run(**over)
+        except SystemExit as e:
+            return str(e)
+        raise AssertionError(f"eval {over} must exit")
+
+    def result(out: Path) -> dict:
+        [path] = [p for p in out.glob("eval_*.json") if not p.stem.endswith("_sent")]
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    stubs = {
+        "load_fixture": lambda: [pair],
+        "load_split": lambda pairs: (pairs, pairs),
+        "fetch_memories": lambda pairs: memories,
+        "make_judge": lambda *_: judge,
+    }
+    real = {name: getattr(tune, name) for name in (*stubs, "HERE")}
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            for name, stub in stubs.items():
+                setattr(tune, name, stub)
+            tune.HERE = Path(tmp)
+            tune.os.environ["JUDGE_URL"] = "https://judge.example.net"
+            assert "--host-names" in exits()
+            tune.os.environ["PATH"] = tmp  # no gitleaks there
+            assert "gitleaks" in exits(no_host_names=True)
+            tune.os.environ["PATH"] = real_env["PATH"]
+            assert not (Path(tmp) / "runs").exists(), "nothing runs before the checks"
+            hosts = Path(tmp) / "hosts.txt"
+            hosts.write_text("build-box-01\nbox-2\n", encoding="utf-8")
+            run(host_names=str(hosts), run="listed")
+            choice = {"file": str(hosts), "names": 2}
+            assert result(Path(tmp) / "runs/listed")["host_names"] == choice
+            run(no_host_names=True, run="unlisted")
+            choice = {"file": None, "names": 0}
+            assert result(Path(tmp) / "runs/unlisted")["host_names"] == choice
+            assert len(sent) == 2
+            memories[a] = mem("creds = " + "9f86d081" + "884c7d659a2feaa0c55ad015", 0.0)
+            assert "gitleaks:generic-api-key" in exits(no_host_names=True, run="leak")
+            assert len(sent) == 2, "the gate stops the run before any request"
+        finally:
+            for name, value in real.items():
+                setattr(tune, name, value)
+            tune.os.environ.clear()
+            tune.os.environ.update(real_env)
 
 
 def check_no_env_proxy(real_env: dict) -> None:
@@ -1177,6 +1385,11 @@ def main() -> None:
     check_fixture()
     check_consensus_scoring()
     check_scrub()
+    real_env = dict(tune.os.environ)
+    check_key_env(real_env)
+    check_egress(real_env)
+    check_no_env_proxy(real_env)
+    check_eval_scrub(real_env)
     check_judges()
     check_rows()
     check_compare()
