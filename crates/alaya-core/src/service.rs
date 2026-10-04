@@ -240,6 +240,34 @@ const SCORE_CAP: f64 = 1.5;
 /// signal for production (where boosts amplify it).
 const RRF_BLEND_WEIGHT: f64 = 0.4;
 
+/// Runtime switches for the hybrid boosts that feed on popularity and age
+/// (LAB-7714). Each one turns a boost off; none changes a weight. `Default`
+/// has every boost on, so a server that sets none of them ranks as before.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RankingFlags {
+    /// Salience counts `access_count`. Off, it still counts importance and
+    /// emotional valence.
+    pub access_salience: bool,
+    /// The spaced-repetition boost.
+    pub spacing: bool,
+    /// Spreading activation, the Hebbian boost and graph-neighbour
+    /// injection. Off, search does not query the graph at all.
+    pub graph: bool,
+    /// Memory types recency decay skips.
+    pub decay_exempt_types: Vec<String>,
+}
+
+impl Default for RankingFlags {
+    fn default() -> Self {
+        Self {
+            access_salience: true,
+            spacing: true,
+            graph: true,
+            decay_exempt_types: Vec::new(),
+        }
+    }
+}
+
 /// `tracing` target of the contradiction-judge shadow log (LAB-3283 AC-4b).
 /// Exactly one INFO event per *judged* pair, always the same field set
 /// (`memory_a`, `memory_b`, `verdict`, `survivor`, `confidence`, `model`,
@@ -323,6 +351,8 @@ pub struct MemoryService {
     /// Failure counters and the self-check's last result (LAB-4026). Shared
     /// with the server, which reads them off the worker thread.
     pub vitals: std::sync::Arc<Vitals>,
+    /// Which hybrid ranking boosts are on.
+    pub ranking: RankingFlags,
     /// Cached (timestamp, tags) from `get_all_tags()`. RefCell is fine:
     /// MemoryService runs single-threaded on a LocalSet (`!Send`).
     tag_cache: RefCell<Option<(f64, Vec<String>)>>,
@@ -349,6 +379,7 @@ impl MemoryService {
             judge: None,
             reranker: None,
             vitals: Default::default(),
+            ranking: RankingFlags::default(),
             tag_cache: RefCell::new(None),
             clock: current_timestamp,
         }
@@ -365,6 +396,12 @@ impl MemoryService {
     /// checker sees the rerank fallbacks this service counts.
     pub fn with_vitals(mut self, vitals: std::sync::Arc<Vitals>) -> Self {
         self.vitals = vitals;
+        self
+    }
+
+    /// Builder: switch hybrid ranking boosts off.
+    pub fn with_ranking(mut self, ranking: RankingFlags) -> Self {
+        self.ranking = ranking;
         self
     }
 
@@ -394,6 +431,7 @@ impl MemoryService {
             judge: None,
             reranker: None,
             vitals: Default::default(),
+            ranking: RankingFlags::default(),
             tag_cache: RefCell::new(None),
             clock,
         }
@@ -1059,7 +1097,9 @@ impl MemoryService {
         }
 
         // Stage 4: Boost — graph queries run concurrently
-        let (spreading, hebbian_boosts) = {
+        let (spreading, hebbian_boosts) = if !self.ranking.graph {
+            (HashMap::new(), HashMap::new())
+        } else {
             let _span = tracing::info_span!("graph_boost").entered();
             let _stage = stages.stage(Stage::GraphBoost);
             let result_hashes: Vec<&str> =
@@ -1288,8 +1328,13 @@ impl MemoryService {
                         .and_then(|ev| ev.get("sentiment"))
                         .and_then(|v| v.as_f64())
                         .unwrap_or(0.0);
+                    let access_count = if self.ranking.access_salience {
+                        sm.memory.access_count
+                    } else {
+                        0
+                    };
                     let live_salience =
-                        salience::compute_salience(emotional, sm.memory.access_count, importance);
+                        salience::compute_salience(emotional, access_count, importance);
                     score = salience::apply_salience_boost(score, live_salience, BOOST_SALIENCE);
 
                     // Trust boost — provenance-based quality signal
@@ -1302,9 +1347,12 @@ impl MemoryService {
                     score *= 1.0 + BOOST_TRUST * trust;
 
                     // Spacing boost
-                    let sq =
-                        spaced_repetition::compute_spacing_quality(&sm.memory.access_timestamps);
-                    score = spaced_repetition::apply_spacing_boost(score, sq, BOOST_SPACING);
+                    if self.ranking.spacing {
+                        let sq = spaced_repetition::compute_spacing_quality(
+                            &sm.memory.access_timestamps,
+                        );
+                        score = spaced_repetition::apply_spacing_boost(score, sq, BOOST_SPACING);
+                    }
 
                     // Encoding context boost
                     if let (Some(stored_ctx), Some(query_ctx)) =
@@ -1326,12 +1374,18 @@ impl MemoryService {
                     }
 
                     // Recency decay
-                    score = hybrid_search::apply_recency_decay(
-                        score,
-                        sm.memory.created_at,
-                        now,
-                        RECENCY_DECAY_LAMBDA,
-                    );
+                    if !self
+                        .ranking
+                        .decay_exempt_types
+                        .contains(&sm.memory.memory_type)
+                    {
+                        score = hybrid_search::apply_recency_decay(
+                            score,
+                            sm.memory.created_at,
+                            now,
+                            RECENCY_DECAY_LAMBDA,
+                        );
+                    }
                 }
 
                 // Graph boosts — spreading activation now correctly applies to
@@ -5805,8 +5859,12 @@ mod tests {
     }
 
     /// Mock graph that returns pre-configured spreading activation results.
+    #[derive(Default)]
     struct MockGraphWithActivation {
         activation: HashMap<String, f64>,
+        hebbian: HashMap<String, f64>,
+        /// Spreading-activation and Hebbian-boost queries answered.
+        boost_queries: Rc<Cell<usize>>,
     }
 
     #[async_trait(?Send)]
@@ -5925,10 +5983,12 @@ mod tests {
             _a: f64,
             _l: usize,
         ) -> Result<HashMap<String, f64>> {
+            self.boost_queries.set(self.boost_queries.get() + 1);
             Ok(self.activation.clone())
         }
         async fn hebbian_boosts_within(&self, _h: &[&str]) -> Result<HashMap<String, f64>> {
-            Ok(HashMap::new())
+            self.boost_queries.set(self.boost_queries.get() + 1);
+            Ok(self.hebbian.clone())
         }
         async fn get_contradiction_stats(
             &self,
@@ -6008,7 +6068,10 @@ mod tests {
                 ..Default::default()
             }),
             Box::new(MockEmbeddings),
-            Box::new(MockGraphWithActivation { activation }),
+            Box::new(MockGraphWithActivation {
+                activation,
+                ..Default::default()
+            }),
             Box::new(MockHebbian),
             Box::new(MockConsolidation),
             None,
@@ -6050,6 +6113,192 @@ mod tests {
             neighbor_hash,
             result_hashes,
         );
+    }
+
+    // ─── Ranking switches (LAB-7714) ────────────────────────────────────
+    //
+    // Each test holds the candidate pool to one memory, so its fused base
+    // score is the same in every run and a score difference is the boost
+    // alone. "Off" must equal the same search with that one signal absent
+    // from the memory: the switch removes that boost and nothing else.
+
+    /// 100 days after `make_scored_memory`'s `created_at`.
+    const RANKING_NOW: f64 = 1_000_000.0 + 100.0 * 86_400.0;
+
+    fn ranking_svc(
+        results: Vec<ScoredMemory>,
+        injectable: Vec<Memory>,
+        graph: MockGraphWithActivation,
+        ranking: RankingFlags,
+    ) -> MemoryService {
+        let mut svc = MemoryService::new(
+            Box::new(MockVectorsWithInjection {
+                search_results: results,
+                injectable_memories: injectable
+                    .into_iter()
+                    .map(|m| (m.content_hash.clone(), m))
+                    .collect(),
+                ..Default::default()
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(graph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        )
+        .with_ranking(ranking);
+        svc.clock = || RANKING_NOW;
+        svc
+    }
+
+    async fn ranked(svc: &MemoryService) -> HashMap<String, f64> {
+        let result = svc
+            .search(search_params("ranking switches"))
+            .await
+            .expect("search succeeds");
+        result["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .map(|r| {
+                (
+                    r["content_hash"].as_str().unwrap().to_string(),
+                    r["score"].as_f64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// The one memory's score, with no graph signal.
+    async fn score_of(sm: &ScoredMemory, ranking: RankingFlags) -> f64 {
+        let svc = ranking_svc(
+            vec![sm.clone()],
+            vec![],
+            MockGraphWithActivation::default(),
+            ranking,
+        );
+        ranked(&svc).await[&sm.memory.content_hash]
+    }
+
+    fn ranked_memory() -> ScoredMemory {
+        let mut sm = make_scored_memory(&"a".repeat(64), "ranked memory", 0.3);
+        // Importance is the salience input that must survive the switch.
+        sm.memory.metadata = Some(HashMap::from([(
+            "importance".to_string(),
+            serde_json::json!(1.0),
+        )]));
+        sm
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn access_salience_off_ignores_access_count_only() {
+        let mut popular = ranked_memory();
+        popular.memory.access_count = 50;
+        let mut unread = ranked_memory();
+        unread.memory.access_count = 0;
+        let off = RankingFlags {
+            access_salience: false,
+            ..RankingFlags::default()
+        };
+
+        let on_popular = score_of(&popular, RankingFlags::default()).await;
+        let on_unread = score_of(&unread, RankingFlags::default()).await;
+        assert!(on_popular > on_unread, "the boost exists while on");
+        assert_eq!(score_of(&popular, off.clone()).await, on_unread);
+
+        // Importance still counts: with it cleared the score drops.
+        let mut unimportant = unread.clone();
+        unimportant.memory.metadata = None;
+        assert!(score_of(&unimportant, off).await < on_unread);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spacing_off_ignores_access_timestamps_only() {
+        let day = 86_400.0;
+        let mut spaced = ranked_memory();
+        spaced.memory.access_timestamps = vec![
+            RANKING_NOW - 3.0 * day,
+            RANKING_NOW - 2.0 * day,
+            RANKING_NOW - day,
+        ];
+        let mut unspaced = ranked_memory();
+        unspaced.memory.access_timestamps = vec![];
+        let off = RankingFlags {
+            spacing: false,
+            ..RankingFlags::default()
+        };
+
+        let on_spaced = score_of(&spaced, RankingFlags::default()).await;
+        let on_unspaced = score_of(&unspaced, RankingFlags::default()).await;
+        assert!(on_spaced > on_unspaced, "the boost exists while on");
+        assert_eq!(score_of(&spaced, off).await, on_unspaced);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn decay_exempt_types_skip_decay_for_those_types_only() {
+        let old = ranked_memory();
+        assert_eq!(old.memory.memory_type, "decision");
+        let mut fresh = old.clone();
+        fresh.memory.created_at = RANKING_NOW;
+        let exempt = RankingFlags {
+            decay_exempt_types: vec!["decision".into(), "reference".into()],
+            ..RankingFlags::default()
+        };
+
+        let decayed = score_of(&old, RankingFlags::default()).await;
+        let undecayed = score_of(&fresh, RankingFlags::default()).await;
+        assert!(decayed < undecayed, "decay applies while not exempt");
+        assert_eq!(score_of(&old, exempt.clone()).await, undecayed);
+
+        // A type outside the list still decays exactly as before.
+        let mut old_note = old.clone();
+        old_note.memory.memory_type = "note".into();
+        assert_eq!(
+            score_of(&old_note, exempt).await,
+            score_of(&old_note, RankingFlags::default()).await
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn graph_off_skips_activation_hebbian_and_injection() {
+        let seed = ranked_memory();
+        let seed_hash = seed.memory.content_hash.clone();
+        let neighbour = make_scored_memory(&"b".repeat(64), "graph neighbour", 0.0).memory;
+        let neighbour_hash = neighbour.content_hash.clone();
+        let graph = || MockGraphWithActivation {
+            activation: HashMap::from([(seed_hash.clone(), 0.5), (neighbour_hash.clone(), 0.8)]),
+            hebbian: HashMap::from([(seed_hash.clone(), 0.5)]),
+            ..Default::default()
+        };
+        let no_graph_signal = score_of(&seed, RankingFlags::default()).await;
+
+        let on = ranked(&ranking_svc(
+            vec![seed.clone()],
+            vec![neighbour.clone()],
+            graph(),
+            RankingFlags::default(),
+        ))
+        .await;
+        assert!(on.contains_key(&neighbour_hash), "injection runs while on");
+        assert!(
+            on[&seed_hash] > no_graph_signal,
+            "the boosts exist while on"
+        );
+
+        let off_graph = graph();
+        let queries = off_graph.boost_queries.clone();
+        let off = ranked(&ranking_svc(
+            vec![seed.clone()],
+            vec![neighbour],
+            off_graph,
+            RankingFlags {
+                graph: false,
+                ..RankingFlags::default()
+            },
+        ))
+        .await;
+        assert_eq!(off, HashMap::from([(seed_hash, no_graph_signal)]));
+        assert_eq!(queries.get(), 0, "the graph is not queried");
     }
 
     /// With `memory_type` set, hybrid returns only that type from every
@@ -6115,6 +6364,7 @@ mod tests {
                     .into_iter()
                     .map(|sm| (sm.memory.content_hash.clone(), 0.8))
                     .collect(),
+                ..Default::default()
             }),
             Box::new(MockHebbian),
             Box::new(MockConsolidation),
@@ -6213,6 +6463,7 @@ mod tests {
                     .into_iter()
                     .map(|sm| (sm.memory.content_hash.clone(), 0.8))
                     .collect(),
+                ..Default::default()
             }),
             Box::new(MockHebbian),
             Box::new(MockConsolidation),
@@ -6276,6 +6527,7 @@ mod tests {
             Box::new(MockEmbeddings),
             Box::new(MockGraphWithActivation {
                 activation: HashMap::new(),
+                ..Default::default()
             }),
             Box::new(MockHebbian),
             Box::new(MockConsolidation),
@@ -6340,6 +6592,7 @@ mod tests {
             Box::new(MockEmbeddings),
             Box::new(MockGraphWithActivation {
                 activation: HashMap::new(),
+                ..Default::default()
             }),
             Box::new(MockHebbian),
             Box::new(MockConsolidation),
@@ -6400,6 +6653,7 @@ mod tests {
                     .iter()
                     .map(|(m, a)| (m.content_hash.clone(), *a))
                     .collect(),
+                ..Default::default()
             }),
             Box::new(MockHebbian),
             Box::new(MockConsolidation),
@@ -6445,6 +6699,7 @@ mod tests {
             Box::new(MockEmbeddings),
             Box::new(MockGraphWithActivation {
                 activation: HashMap::new(),
+                ..Default::default()
             }),
             Box::new(MockHebbian),
             Box::new(MockConsolidation),
@@ -6685,6 +6940,7 @@ mod tests {
             Box::new(MockEmbeddings),
             Box::new(MockGraphWithActivation {
                 activation: HashMap::new(),
+                ..Default::default()
             }),
             Box::new(MockHebbian),
             Box::new(MockConsolidation),
@@ -8165,6 +8421,7 @@ mod tests {
             Box::new(MockEmbeddings),
             Box::new(MockGraphWithActivation {
                 activation: HashMap::from([("b".repeat(64), 0.8)]),
+                ..Default::default()
             }),
             Box::new(MockHebbian),
             Box::new(MockConsolidation),

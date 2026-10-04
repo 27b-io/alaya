@@ -166,6 +166,10 @@ Copy `.env.example` to `.env`. All settings have sensible defaults for local dev
 | `RERANK_API_KEY` | — | Optional bearer token for `RERANK_URL`. With it set, plain `http://` to a host that is not cluster-local is refused at boot, as for `SUMMARY_URL` |
 | `RERANK_TOP_N` | `20` | How many top RRF candidates to rerank |
 | `RERANK_TIMEOUT_MS` | `5000` | Budget for the rerank call; a slower or unreachable reranker falls back to RRF order after this many ms |
+| `RANK_ACCESS_BOOST` | `true` | `false` drops `access_count` from the hybrid salience boost; importance and emotional valence still count. Ranking only: hybrid search still records accesses |
+| `RANK_SPACING_BOOST` | `true` | `false` turns off the hybrid spaced-repetition boost (`access_timestamps`) |
+| `RANK_GRAPH_BOOST` | `true` | `false` turns off hybrid spreading activation, the Hebbian co-access boost and graph-neighbour injection; search then makes no graph call. Ranking only: hybrid search still records co-access pairs |
+| `RANK_DECAY_EXEMPT_TYPES` | — | Comma-separated memory types hybrid recency decay skips, e.g. `decision,reference`. Other types still decay. An unknown type or an empty entry refuses boot. Every `RANK_*` variable that is set must hold a value: set but blank refuses boot too, so unset it to keep the default |
 | `SELFCHECK_QUERY` | — | Self-check query: each pod embeds it and runs it as a read-only search every `SELFCHECK_INTERVAL_SECS`. Set with `SELFCHECK_EXPECT_HASH`, or leave both unset to disable the check. See [docs/rest-api.md](docs/rest-api.md#self-check-and-failure-counters) |
 | `SELFCHECK_EXPECT_HASH` | — | `content_hash` the self-check expects in the top 10 results |
 | `SELFCHECK_INTERVAL_SECS` | `300` | Seconds between self-checks (minimum 30) |
