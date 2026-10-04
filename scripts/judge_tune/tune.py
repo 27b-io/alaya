@@ -1410,23 +1410,31 @@ def judge_batch(
     prompt: str,
     memories: dict,
     batch: list[Pair],
+    ledger: Ledger,
     regime: str = "default",
 ) -> list[dict]:
     # An API error aborts the tune: an infrastructure fault must not be scored
-    # as a prompt failure.
+    # as a prompt failure. Every call that returned was paid for, so it is
+    # booked before the error is re-raised.
     with ThreadPoolExecutor(CONCURRENCY) as pool:
-        return list(
-            pool.map(
-                lambda p: judge_pair(
-                    client,
-                    model,
-                    prompt,
-                    render_pair(memories[p.a], memories[p.b]),
-                    regime,
-                ),
-                batch,
+        futures = [
+            pool.submit(
+                judge_pair,
+                client,
+                model,
+                prompt,
+                render_pair(memories[p.a], memories[p.b]),
+                regime,
             )
-        )
+            for p in batch
+        ]
+    for f in futures:
+        if f.exception() is None:
+            ledger.add("judge", model, *f.result()["tokens"])
+    errors = [f.exception() for f in futures if f.exception() is not None]
+    if errors:
+        raise errors[0]
+    return [f.result() for f in futures]
 
 
 class JudgeAdapter:
@@ -1484,9 +1492,10 @@ class JudgeAdapter:
             raise RuntimeError(
                 f"spend guard: ${self.ledger.usd():.2f} > 1.1 x ${self.max_usd}"
             )
-        verdicts = judge_batch(self.client, self.model, prompt, self.memories, batch)
+        verdicts = judge_batch(
+            self.client, self.model, prompt, self.memories, batch, self.ledger
+        )
         for p, v in zip(batch, verdicts):
-            self.ledger.add("judge", self.model, *v["tokens"])
             self.records[key][p.id] = v
         self.judge_calls += len(batch)
         scores = [score(p, v) for p, v in zip(batch, verdicts)]
@@ -1846,11 +1855,13 @@ def judge_passes(
     ledger: Ledger,
     max_usd: float,
     votes: list[list[dict]],
+    book: Callable[[Ledger], None] = lambda chunk: None,
 ) -> None:
     """Fill `votes[pair]` with `passes` independent verdicts per rendered pair.
 
     The caller owns `votes`, so verdicts already paid for survive an abort:
-    every call that returned is booked before an error is re-raised. A chunk
+    every call that returned is booked, and each chunk's spend handed to
+    `book`, before an error is re-raised. A chunk
     whose every call failed aborts too: that is an outage, not failed pairs.
     Spend is checked between chunks of SPEND_CHECK_EVERY calls, so the cap is
     overshot by at most one chunk, and the first chunk's cost is projected over
@@ -1868,13 +1879,16 @@ def judge_passes(
             with ThreadPoolExecutor(CONCURRENCY) as pool:
                 futures = [pool.submit(judge, t) for t in chunk]
             errors = [f.exception() for f in futures if f.exception() is not None]
-            booked = []
+            booked, spent = [], Ledger()
             for j, f in enumerate(futures):
                 if f.exception() is None:
                     v = f.result()
-                    ledger.add("judge", model, *v["tokens"])
+                    for led in (ledger, spent):
+                        led.add("judge", model, *v["tokens"])
                     votes[i + j].append(v)
                     booked.append(v)
+            if booked:
+                book(spent)
             if errors:
                 raise errors[0]
             if len(chunk) > 1 and all(v["verdict"] == FAILED for v in booked):
@@ -1941,7 +1955,9 @@ def read_jsonl(path: Path) -> list[dict]:
 
 
 def spend_log(out: Path) -> list[dict]:
-    """One line per eval in the run directory; the run's cap covers them all."""
+    """One line per chunk of every eval in the run directory, appended as the
+    chunk is booked, so a killed eval loses at most one chunk's spend; the
+    run's cap covers them all."""
     path = out / SPEND_LOG
     return read_jsonl(path) if path.exists() else []
 
@@ -1953,6 +1969,16 @@ def load_rows(out: Path) -> list[Pair]:
         sys.exit(f"{path} missing: run `tune.py rows` first")
     rows = json.loads(path.read_text(encoding="utf-8"))
     return [Pair(r["row"], r["a"], r["b"], "", None, "spotcheck") for r in rows]
+
+
+def new_records(out: Path, stem: str) -> Path:
+    """Where this eval writes its verdicts. An earlier eval's file is never
+    overwritten: an aborted rerun would leave its `{stem}.json` beside a
+    partial file, and `compare` would score that judge on the subset."""
+    path = out / f"{stem}_records.jsonl"
+    if path.exists():
+        sys.exit(f"{path} exists: move it and {stem}.json aside, or use another --run")
+    return path
 
 
 def make_judge(
@@ -2031,6 +2057,15 @@ def cmd_eval(args) -> None:
     cap = args.max_usd - sum(e["total_usd"] for e in spend_log(out))
     if cap <= 0:
         sys.exit(f"run {args.run} has already spent its ${args.max_usd} cap")
+    instructions = (
+        json.dumps(JEV_QUESTIONS, sort_keys=True) if args.judge == "jev" else prompt
+    )
+    scrub = "scrubbed" if args.scrub else "raw"
+    stem = (
+        f"eval_{args.pairs}_{args.judge}_{model}_{scrub}_{args.regime}"
+        f"_k{args.passes}_{sha(instructions)[:8]}"
+    )
+    records = new_records(out, stem)
     if args.pairs == "rows":
         chosen = load_rows(out)
         memories = fetch_memories(chosen)
@@ -2053,14 +2088,6 @@ def cmd_eval(args) -> None:
         )
     texts = render_all(chosen, memories, scrubber)
     judge = make_judge(args.judge, model, prompt, args.regime, judge_url)
-    instructions = (
-        json.dumps(JEV_QUESTIONS, sort_keys=True) if args.judge == "jev" else prompt
-    )
-    scrub = "scrubbed" if scrubber else "raw"
-    stem = (
-        f"eval_{args.pairs}_{args.judge}_{model}_{scrub}_{args.regime}"
-        f"_k{args.passes}_{sha(instructions)[:8]}"
-    )
     # What this eval sends, written before the first request: an abort or an
     # outage later cannot drop it from the report.
     sent = {"judge": args.judge, "model": model, "scrubbed": bool(scrubber)}
@@ -2073,13 +2100,16 @@ def cmd_eval(args) -> None:
     newer = {p.id: newer_memory(p, memories) for p in chosen}
     votes: list[list[dict]] = [[] for _ in chosen]
     ledger = Ledger()
-    try:
-        judge_passes(judge, model, texts, args.passes, ledger, cap, votes)
-    finally:  # paid verdicts and spend are written before any exit path
+
+    def book(spent: Ledger) -> None:
         with (out / SPEND_LOG).open("a", encoding="utf-8") as f:
             line = {"stem": stem, "judge": args.judge, "model": model}
-            f.write(json.dumps(line | ledger.summary()) + "\n")
-        with (out / f"{stem}_records.jsonl").open("w", encoding="utf-8") as f:
+            f.write(json.dumps(line | spent.summary()) + "\n")
+
+    try:
+        judge_passes(judge, model, texts, args.passes, ledger, cap, votes, book)
+    finally:  # paid verdicts are written before any exit path
+        with records.open("w", encoding="utf-8") as f:
             for p, vs in zip(chosen, votes):
                 for k, v in enumerate(vs):
                     f.write(json.dumps(record(p, k, v, newer[p.id])) + "\n")

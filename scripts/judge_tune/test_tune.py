@@ -246,15 +246,33 @@ def check_judge_passes() -> None:
         return verdict(tokens=(1_000, 10))
 
     votes: list = [[] for _ in texts]
-    ledger = tune.Ledger()
+    ledger, chunks = tune.Ledger(), []
     try:
-        tune.judge_passes(flaky, "claude-sonnet-5", texts, 3, ledger, 1e9, votes)
+        tune.judge_passes(
+            flaky, "claude-sonnet-5", texts, 3, ledger, 1e9, votes, chunks.append
+        )
     except tune.AuthError:
         pass
     else:
         raise AssertionError("an auth error must abort the run")
     assert sum(map(len, votes)) == tune.SPEND_CHECK_EVERY - 1 and not votes[7]
     assert ledger.rows[("judge", "claude-sonnet-5")][0] == tune.SPEND_CHECK_EVERY - 1
+    # ... and handed to `book` before the raise: a kill now loses no paid call.
+    assert len(chunks) == 1 and chunks[0].rows == ledger.rows
+    # Each chunk is booked as it lands, so the spend log sums to the ledger.
+    votes, ledger, chunks = [[] for _ in texts], tune.Ledger(), []
+    tune.judge_passes(
+        lambda t: verdict(tokens=(1_000, 10)),
+        "claude-sonnet-5",
+        texts,
+        2,
+        ledger,
+        1e9,
+        votes,
+        chunks.append,
+    )
+    assert len(chunks) == 2 * -(-len(texts) // tune.SPEND_CHECK_EVERY)
+    assert abs(sum(c.usd() for c in chunks) - ledger.usd()) < 1e-9
     # A failed pair is booked and kept; a chunk of nothing but failures aborts.
     gone = verdict(verdict=tune.FAILED, reason="HTTP 503", tokens=(0, 0))
     votes, ledger, err = run(lambda t, n: gone if t == texts[3] else verdict(), 1e9)
@@ -1051,6 +1069,54 @@ def check_compare_run() -> None:
             raise AssertionError("a torn records line must exit")
 
 
+def check_judge_batch(pairs: list) -> None:
+    """tune's batch books every call that returned before an error aborts it:
+    those calls were paid for, and spend.json must say so."""
+    batch = pairs[:6]
+    memories = {h: mem(h, 1.0) for p in batch for h in (p.a, p.b)}
+    failing = tune.render_pair(memories[batch[2].a], memories[batch[2].b])
+
+    def judge_pair(client, model, prompt, text, regime="default"):
+        if text == failing:
+            raise tune.ApiError("HTTP 529")
+        return verdict(tokens=(1_000, 10))
+
+    real, tune.judge_pair = tune.judge_pair, judge_pair
+    try:
+        ledger = tune.Ledger()
+        try:
+            tune.judge_batch(None, "claude-sonnet-5", "p", memories, batch, ledger)
+        except tune.ApiError:
+            pass
+        else:
+            raise AssertionError("an API error must abort the batch")
+        assert ledger.rows[("judge", "claude-sonnet-5")] == [5, 5_000, 50]
+        ledger = tune.Ledger()
+        got = tune.judge_batch(
+            None, "claude-sonnet-5", "p", memories, batch[3:], ledger
+        )
+        assert len(got) == 3 and ledger.rows[("judge", "claude-sonnet-5")][0] == 3
+    finally:
+        tune.judge_pair = real
+
+
+def check_new_records() -> None:
+    """A rerun of the same eval refuses to start rather than overwrite (or,
+    aborted, truncate) the records an earlier result points at."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        path = tune.new_records(out, "eval_s")
+        assert path == out / "eval_s_records.jsonl" and not path.exists()
+        path.write_text("{}\n")
+        try:
+            tune.new_records(out, "eval_s")
+        except SystemExit as e:
+            assert "eval_s_records.jsonl exists" in str(e), e
+        else:
+            raise AssertionError("an existing records file must refuse the eval")
+        assert path.read_text() == "{}\n"
+
+
 def main() -> None:
     if not __debug__:  # every check below is an assert; -O would strip them all
         sys.exit("run this file without -O")
@@ -1213,7 +1279,7 @@ def main() -> None:
     )
     real = tune.judge_batch
     try:
-        tune.judge_batch = lambda c, m, pr, mem, batch: [
+        tune.judge_batch = lambda c, m, pr, mem, batch, ledger: [
             {
                 "verdict": p.label,
                 "survivor": (
@@ -1237,6 +1303,9 @@ def main() -> None:
         assert len(adapter.val_evals) == 1
     finally:
         tune.judge_batch = real
+
+    check_judge_batch(all_pairs)
+    check_new_records()
 
     # GEPA's proposer dereferences this attribute without getattr.
     assert tune.JudgeAdapter.propose_new_texts is None
