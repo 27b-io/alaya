@@ -526,9 +526,10 @@ NEXT_LINE_KEY = (
     rf"{SECRET_NAME}{KEY_CLOSE}(?:[ \t]*+\r?\n\s*+(?:=>|[:=])"
     r"|[ \t]*+(?:=>|[:=])[ \t]*+\r?\n)\s*+[\"']?"
 )
-# Its value. The rule runs before the key rules, which would otherwise let a
-# value that ran into such a key (`token=x/DB_PASSWORD_PROD:` then the value
-# on the next line) take the key and leave its value behind. The value line
+# Its value. The rule runs right after the private-key rule, as any later rule
+# whose value can run into such a key (`token=x/DB_PASSWORD_PROD:` then the
+# value on the next line: a key rule, a URL's ending key, a Bearer token, a
+# flag) would otherwise take the key and leave its value behind. The value line
 # may itself end in such a key (`x/API_KEY:`, a nested YAML key): then the
 # rule takes the whole chain, each key and the last value, for the same
 # reason. A value character never starts such a key, so nothing backtracks.
@@ -546,6 +547,8 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
             re.S,
         ),
     ),
+    # Before any rule whose value can run into a secret key (see NEXT_LINE_SECRET).
+    ("secret", re.compile(NEXT_LINE_SECRET, re.I)),
     (  # a scheme may follow a dash, as in ${VAR:-redis://...}; a secret key
         # that ends the URL comes along with its value (see URL_ENDING_KEY)
         "url",
@@ -592,7 +595,6 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
             re.I,
         ),
     ),
-    ("secret", re.compile(NEXT_LINE_SECRET, re.I)),
     # A secret-named key's value: first one that stops at a bracket, so a call
     # such as `token => login(password: "...")` cannot hide the inner key; then
     # any value, brackets included. The flag rule runs first: a placeholder it

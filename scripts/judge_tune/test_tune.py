@@ -471,6 +471,12 @@ def check_scrub() -> None:
         "password:\nab/SECRET:\nYWJjZGVmZ2hp/x-api-key\n= ",
         "password:\nmy_token_value:\n",
         "secrets:\n  db_password:\n    value: ",
+        # ...however an earlier rule's value ran into the key.
+        "http://intra/DB_PASSWORD: abcdefgh/api_key:\n",
+        "Authorization: Bearer abcdefgh/api_key:\n",
+        "authorization: Basic abcdefgh/api_key=\n",
+        "curl -u user:abcdefgh/api_key:\n",
+        "cli --password abcdefgh/api_key:\n",
     ):
         out = s(text + "Pa55w0rd99")
         assert "Pa55w0rd99" not in out and "YWJj" not in out, out
