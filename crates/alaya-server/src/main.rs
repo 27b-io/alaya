@@ -51,12 +51,12 @@ use alaya_backends::{
 use alaya_core::calendar::utc_date_str;
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{
-    JudgeOutcome, MemoryService, OutputMode, RelationParams, SearchParams, StoreParams,
-    parse_user_relation,
+    JudgeOutcome, MemoryService, OutputMode, RankingFlags, RelationParams, SearchParams,
+    StoreParams, parse_user_relation,
 };
 use alaya_core::vitals::{CountingEmbedding, SelfCheckOutcome, Vitals};
 use alaya_types::graph::{Contradiction, ContradictionQuery, Resolution};
-use alaya_types::memory::PatchMemoryRequest;
+use alaya_types::memory::{PatchMemoryRequest, VALID_MEMORY_TYPES};
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -97,6 +97,8 @@ struct Config {
     rerank_api_key: Option<String>,
     rerank_top_n: usize,
     rerank_timeout_ms: std::num::NonZeroU64,
+    /// Hybrid ranking boosts switched off by `RANK_*` (LAB-7714).
+    ranking: RankingFlags,
     /// Periodic self-check (LAB-4026); `None` when its env vars are unset.
     selfcheck: Option<selfcheck::SelfCheckConfig>,
 }
@@ -163,6 +165,7 @@ impl Config {
             rerank_timeout_ms: env_or("RERANK_TIMEOUT_MS", "5000")
                 .parse()
                 .expect("RERANK_TIMEOUT_MS must be a positive integer (ms)"),
+            ranking: parse_ranking(env_non_empty).unwrap_or_else(|e| panic!("{e}")),
             selfcheck: selfcheck::parse(
                 env_non_empty("SELFCHECK_QUERY"),
                 env_non_empty("SELFCHECK_EXPECT_HASH"),
@@ -2141,6 +2144,42 @@ fn parse_provider(var: &str, raw: Option<String>, fallback: Provider) -> Result<
     })
 }
 
+/// The `RANK_*` switches (LAB-7714), read through `env_non_empty` (so blank is
+/// unset): unset leaves every boost on. A switch takes only `true` or `false`,
+/// and the exempt list only known memory types, so a typo refuses boot
+/// instead of silently ranking as before.
+fn parse_ranking(env: impl Fn(&str) -> Option<String>) -> Result<RankingFlags, String> {
+    let switch = |var: &str| match env(var) {
+        None => Ok(true),
+        Some(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(format!("{var} must be true or false, got {s:?}")),
+        },
+    };
+    let decay_exempt_types = env("RANK_DECAY_EXEMPT_TYPES")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            if VALID_MEMORY_TYPES.contains(&t) {
+                Ok(t.to_string())
+            } else {
+                Err(format!(
+                    "RANK_DECAY_EXEMPT_TYPES: {t:?} is not a memory type (one of {VALID_MEMORY_TYPES:?})"
+                ))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RankingFlags {
+        access_salience: switch("RANK_ACCESS_BOOST")?,
+        spacing: switch("RANK_SPACING_BOOST")?,
+        graph: switch("RANK_GRAPH_BOOST")?,
+        decay_exempt_types,
+    })
+}
+
 /// Default daily cap for store-path judge calls (LAB-3895).
 const JUDGE_DAILY_CAP_DEFAULT: usize = 1000;
 
@@ -2755,6 +2794,14 @@ fn main() {
             None
         };
 
+        tracing::info!(
+            access_boost = config.ranking.access_salience,
+            spacing_boost = config.ranking.spacing,
+            graph_boost = config.ranking.graph,
+            decay_exempt_types = ?config.ranking.decay_exempt_types,
+            "hybrid ranking switches"
+        );
+
         let judge: Option<JudgeClient> = if let Some(url) = &config.judge_url {
             tracing::info!(
                 origin = log_safe_origin(url).as_str(),
@@ -2835,6 +2882,7 @@ fn main() {
                 if let Some(rerank) = rerank {
                     svc = svc.with_reranker(Box::new(rerank));
                 }
+                svc = svc.with_ranking(cfg_clone.ranking);
 
                 let limits = WorkerLimits {
                     judge_daily_cap: cfg_clone.judge_daily_cap,
@@ -3828,6 +3876,48 @@ mod tests {
 
         let err = parse_judge_daily_cap(Some("12.5".into())).unwrap_err();
         assert!(err.contains("JUDGE_DAILY_CAP must be a non-negative integer"));
+    }
+
+    #[test]
+    fn parse_ranking_defaults_and_validates() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |var: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == var)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(parse_ranking(env(&[])).unwrap(), RankingFlags::default());
+
+        let all_off = parse_ranking(env(&[
+            ("RANK_ACCESS_BOOST", "false"),
+            ("RANK_SPACING_BOOST", "FALSE"),
+            ("RANK_GRAPH_BOOST", " false "),
+            ("RANK_DECAY_EXEMPT_TYPES", " decision, reference,"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            all_off,
+            RankingFlags {
+                access_salience: false,
+                spacing: false,
+                graph: false,
+                decay_exempt_types: vec!["decision".into(), "reference".into()],
+            }
+        );
+        assert_eq!(
+            parse_ranking(env(&[("RANK_GRAPH_BOOST", "true")])).unwrap(),
+            RankingFlags::default()
+        );
+
+        let err = parse_ranking(env(&[("RANK_SPACING_BOOST", "off")])).unwrap_err();
+        assert!(
+            err.contains("RANK_SPACING_BOOST must be true or false"),
+            "{err}"
+        );
+        let err = parse_ranking(env(&[("RANK_DECAY_EXEMPT_TYPES", "decisions")])).unwrap_err();
+        assert!(err.contains("\"decisions\" is not a memory type"), "{err}");
     }
 
     const DAY1: u64 = 1789733949; // 2026-09-18
@@ -6462,6 +6552,7 @@ mod wedge_tests {
             rerank_api_key: None,
             rerank_top_n: 0,
             rerank_timeout_ms: std::num::NonZeroU64::MIN,
+            ranking: RankingFlags::default(),
             selfcheck: None,
         };
         // `check_detail` fans out to all four probes.

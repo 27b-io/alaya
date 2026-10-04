@@ -111,7 +111,7 @@ pub struct PatchMemoryRequest {
 }
 
 /// Valid memory types matching the MCP tool schema.
-const VALID_MEMORY_TYPES: &[&str] = &["note", "decision", "task", "reference"];
+pub const VALID_MEMORY_TYPES: &[&str] = &["note", "decision", "task", "reference"];
 
 /// Maximum number of tags per memory.
 const MAX_TAGS: usize = 100;
