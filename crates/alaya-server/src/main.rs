@@ -6648,16 +6648,15 @@ mod wedge_tests {
     /// serves — so reverting production's `make_span_with(request_span)`
     /// fails this test, not just editing `request_span` itself.
     ///
-    /// Thread-scoped (`set_default`, not `set_global_default`): this binary
-    /// also has `telemetry::tests::installs_without_a_tokio_runtime`, which
-    /// installs a real global default — the two would race for the single
-    /// process-wide slot. Scoped is normally flaky (tracing-core caches
-    /// callsite interest per registering thread), but only for a callsite
-    /// another concurrent test hits first. The sole callsite asserted on is
-    /// `request_span`'s own close event (`FmtSpan::CLOSE`), and nothing else
-    /// in this binary builds `protected_router`. Never assert on tower-http's
-    /// `on_request`/`on_response` events: those are shared, and would bring
-    /// the flake back.
+    /// Thread-scoped (`testlog::scoped`, not `set_global_default`): this
+    /// binary also has `telemetry::tests::installs_without_a_tokio_runtime`,
+    /// which installs a real global default — the two would race for the
+    /// single process-wide slot. Isolation rests on `testlog::scoped` alone:
+    /// other tests here build `protected_router` with no subscriber, and a
+    /// bare `set_default` let whichever of them registered `request_span`'s
+    /// callsite first cache `never` for every thread. `scoped` keeps a second
+    /// dispatcher registered, so registration asks this test's subscriber
+    /// too, however the suite is filtered or interleaved.
     #[tokio::test]
     async fn request_span_omits_query_string() {
         use std::sync::{Arc, Mutex};
@@ -6684,7 +6683,7 @@ mod wedge_tests {
             .with_writer(move || writer.clone())
             .with_ansi(false)
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = crate::testlog::scoped(subscriber);
 
         // Anonymous, so `require_auth` answers 401 inside the span and no
         // handler ever reaches the (unserviced) command channel.

@@ -25,17 +25,23 @@ use tracing::subscriber::{DefaultGuard, NoSubscriber};
 /// closes.
 static OFF_THE_FAST_PATH: LazyLock<Dispatch> = LazyLock::new(|| Dispatch::new(NoSubscriber::new()));
 
+/// Make `sub` the default subscriber for the current thread until the
+/// returned guard drops — the one way a test here installs a subscriber.
+/// `set_default`, not `with_default`: the code under test is usually async,
+/// and a closure cannot hold an `.await`.
+pub(crate) fn scoped(sub: impl tracing::Subscriber + Send + Sync + 'static) -> DefaultGuard {
+    LazyLock::force(&OFF_THE_FAST_PATH);
+    tracing::subscriber::set_default(sub)
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct LogBuf(Arc<Mutex<Vec<u8>>>);
 
 impl LogBuf {
     /// Capture into this buffer on the current thread until the returned
     /// guard drops. Thread-local, so parallel tests cannot cross-contaminate.
-    /// `set_default`, not `with_default`: the code under test is async, and a
-    /// closure cannot hold an `.await`.
     pub(crate) fn capture(&self) -> DefaultGuard {
-        LazyLock::force(&OFF_THE_FAST_PATH);
-        tracing::subscriber::set_default(
+        scoped(
             tracing_subscriber::fmt()
                 .with_writer(self.clone())
                 .with_ansi(false)
