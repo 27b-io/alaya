@@ -194,7 +194,9 @@ that is unmeasured, while no pair carries the label.
 projected over the whole run, so a run the cap cannot cover with 10 % headroom
 stops after one chunk. Every call that returned is booked before an abort,
 and each chunk's spend is in `spend_log.jsonl` before the next starts, so a
-killed `eval` leaves at most one chunk's spend unbooked.
+killed `eval` leaves at most one chunk's spend unbooked. An append that fails
+aborts the `eval` and prints the spend and the line it owed: the run's cap
+ignores that chunk until the line is in the log.
 
 `--regime default` is the production request (no `thinking` parameter, so
 `claude-sonnet-5` runs adaptive thinking). `--regime thinking-off` adds

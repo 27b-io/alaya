@@ -1415,18 +1415,12 @@ def judge_batch(
 ) -> list[dict]:
     # An API error aborts the tune: an infrastructure fault must not be scored
     # as a prompt failure. Every call that returned was paid for, so it is
-    # booked before the error is re-raised.
+    # booked before the error is re-raised. Pairs are rendered before the pool
+    # starts, so one that cannot be rendered aborts before any call goes out.
+    texts = [render_pair(memories[p.a], memories[p.b]) for p in batch]
     with ThreadPoolExecutor(CONCURRENCY) as pool:
         futures = [
-            pool.submit(
-                judge_pair,
-                client,
-                model,
-                prompt,
-                render_pair(memories[p.a], memories[p.b]),
-                regime,
-            )
-            for p in batch
+            pool.submit(judge_pair, client, model, prompt, t, regime) for t in texts
         ]
     for f in futures:
         if f.exception() is None:
@@ -1861,7 +1855,8 @@ def judge_passes(
 
     The caller owns `votes`, so verdicts already paid for survive an abort:
     every call that returned is booked, and each chunk's spend handed to
-    `book`, before an error is re-raised. A chunk
+    `book`, before an error is re-raised; an error from `book` carries the
+    judge's as its context. A chunk
     whose every call failed aborts too: that is an outage, not failed pairs.
     Spend is checked between chunks of SPEND_CHECK_EVERY calls, so the cap is
     overshot by at most one chunk, and the first chunk's cost is projected over
@@ -1887,14 +1882,17 @@ def judge_passes(
                         led.add("judge", model, *v["tokens"])
                     votes[i + j].append(v)
                     booked.append(v)
-            if booked:
-                book(spent)
-            if errors:
-                raise errors[0]
-            if len(chunk) > 1 and all(v["verdict"] == FAILED for v in booked):
-                raise RuntimeError(
-                    f"all {len(chunk)} calls of a chunk failed: {booked[0]['reason']}"
-                )
+            try:
+                if errors:
+                    raise errors[0]
+                if len(chunk) > 1 and all(v["verdict"] == FAILED for v in booked):
+                    raise RuntimeError(
+                        f"all {len(chunk)} calls of a chunk failed: "
+                        f"{booked[0]['reason']}"
+                    )
+            finally:
+                if booked:
+                    book(spent)
             done += len(chunk)
             projected = ledger.usd() / done * total
             # 10 % headroom, so a run the projection admits does not trip the cap
@@ -1960,6 +1958,22 @@ def spend_log(out: Path) -> list[dict]:
     run's cap covers them all."""
     path = out / SPEND_LOG
     return read_jsonl(path) if path.exists() else []
+
+
+def book_spend(out: Path, entry: dict, spent: Ledger) -> None:
+    """Append one chunk's spend to the run's log. A failed append aborts the
+    eval naming the spend and the line it owed: until that line is in the
+    log, the run's cap ignores the chunk."""
+    line = json.dumps(entry | spent.summary())
+    try:
+        with (out / SPEND_LOG).open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        e.add_note(
+            f"${spent.usd():.4f} not booked: the run's cap ignores it until "
+            f"{out / SPEND_LOG} holds this line:\n{line}"
+        )
+        raise
 
 
 def load_rows(out: Path) -> list[Pair]:
@@ -2102,9 +2116,7 @@ def cmd_eval(args) -> None:
     ledger = Ledger()
 
     def book(spent: Ledger) -> None:
-        with (out / SPEND_LOG).open("a", encoding="utf-8") as f:
-            line = {"stem": stem, "judge": args.judge, "model": model}
-            f.write(json.dumps(line | spent.summary()) + "\n")
+        book_spend(out, {"stem": stem, "judge": args.judge, "model": model}, spent)
 
     try:
         judge_passes(judge, model, texts, args.passes, ledger, cap, votes, book)
