@@ -1649,6 +1649,17 @@ def make_client(url: str, key: str, max_retries: int = 2) -> anthropic.Anthropic
     # and ALL_PROXY itself, whatever trust_env says, unless it is handed a
     # transport, and it speaks its own httpx flavour (httpx2 since 1.11): the
     # transport comes from the package its client class is built on.
+    #
+    # The SDK also merges ANTHROPIC_CUSTOM_HEADERS into every request, whatever
+    # key, URL and transport it is handed, and re-reads its ANTHROPIC_*
+    # variables whenever with_options builds a new client. The tool reads none
+    # of them, so it drops them all for the life of the process: a client then
+    # sends only the headers set here, and only to the URL certified for it.
+    unread = sorted(v for v in os.environ if v.startswith("ANTHROPIC_"))
+    for var in unread:
+        del os.environ[var]
+    if unread:
+        log(f"ignoring {', '.join(unread)}: the judge client sets its own headers")
     base = next(
         c
         for c in anthropic.DefaultHttpxClient.__mro__
