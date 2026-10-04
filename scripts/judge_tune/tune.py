@@ -1850,13 +1850,15 @@ def judge_passes(
     max_usd: float,
     votes: list[list[dict]],
     book: Callable[[Ledger], None] = lambda chunk: None,
+    owe: Callable[[], None] = lambda: None,
 ) -> None:
     """Fill `votes[pair]` with `passes` independent verdicts per rendered pair.
 
     The caller owns `votes`, so verdicts already paid for survive an abort:
     every call that returned is booked, and each chunk's spend handed to
     `book`, before an error is re-raised; an error from `book` carries the
-    judge's as its context. A chunk
+    judge's as its context. `owe` runs before each chunk's first request, so
+    the caller can mark spend that `book` has not yet settled. A chunk
     whose every call failed aborts too: that is an outage, not failed pairs.
     Spend is checked between chunks of SPEND_CHECK_EVERY calls, so the cap is
     overshot by at most one chunk, and the first chunk's cost is projected over
@@ -1871,6 +1873,7 @@ def judge_passes(
                     f"spend cap: ${ledger.usd():.2f} >= ${max_usd} in pass {k + 1}"
                 )
             chunk = texts[i : i + SPEND_CHECK_EVERY]
+            owe()
             with ThreadPoolExecutor(CONCURRENCY) as pool:
                 futures = [pool.submit(judge, t) for t in chunk]
             errors = [f.exception() for f in futures if f.exception() is not None]
@@ -1891,8 +1894,7 @@ def judge_passes(
                         f"{booked[0]['reason']}"
                     )
             finally:
-                if booked:
-                    book(spent)
+                book(spent)
             done += len(chunk)
             projected = ledger.usd() / done * total
             # 10 % headroom, so a run the projection admits does not trip the cap
@@ -1937,6 +1939,7 @@ def consensus_disagreements(
 
 
 SPEND_LOG = "spend_log.jsonl"
+UNBOOKED_FILE = "unbooked.json"
 ROWS_FILE = "rows.json"
 LOCK_FILE = ".eval.lock"
 
@@ -1954,26 +1957,48 @@ def read_jsonl(path: Path) -> list[dict]:
 
 def spend_log(out: Path) -> list[dict]:
     """One line per chunk of every eval in the run directory, appended as the
-    chunk is booked, so a killed eval loses at most one chunk's spend; the
-    run's cap covers them all."""
+    chunk is booked; the run's cap covers them all (see `run_spent`)."""
     path = out / SPEND_LOG
     return read_jsonl(path) if path.exists() else []
 
 
+def owe_spend(out: Path, entry: dict) -> None:
+    """Mark the run before a chunk's first request. The mark is written while
+    the run directory still takes writes, so an append that fails later, or a
+    kill mid-chunk, cannot leave the run with no record of the chunk."""
+    (out / UNBOOKED_FILE).write_text(json.dumps(entry) + "\n", encoding="utf-8")
+
+
 def book_spend(out: Path, entry: dict, spent: Ledger) -> None:
-    """Append one chunk's spend to the run's log. A failed append aborts the
-    eval naming the spend and the line it owed: until that line is in the
-    log, the run's cap ignores the chunk."""
+    """Append one chunk's spend to the run's log, then clear its mark. A
+    failed append aborts the eval naming the spend and the line it owed, and
+    leaves the mark, so no eval in the run starts until that line is in the
+    log."""
     line = json.dumps(entry | spent.summary())
     try:
         with (out / SPEND_LOG).open("a", encoding="utf-8") as f:
             f.write(line + "\n")
     except OSError as e:
         e.add_note(
-            f"${spent.usd():.4f} not booked: the run's cap ignores it until "
-            f"{out / SPEND_LOG} holds this line:\n{line}"
+            f"${spent.usd():.4f} not booked: no eval in this run starts until "
+            f"{out / SPEND_LOG} holds this line and {out / UNBOOKED_FILE} is "
+            f"deleted:\n{line}"
         )
         raise
+    (out / UNBOOKED_FILE).unlink(missing_ok=True)
+
+
+def run_spent(out: Path) -> float:
+    """What the run's evals have spent. Exits while a chunk is marked unbooked:
+    the log would leave that chunk out, and the cap would hand it out again."""
+    mark = out / UNBOOKED_FILE
+    if mark.exists():
+        sys.exit(
+            f"{mark} exists: an eval sent a chunk whose spend is not booked "
+            f"({read_file(mark).strip()}). Add that chunk's spend to "
+            f"{out / SPEND_LOG}, then delete {mark}."
+        )
+    return sum(e["total_usd"] for e in spend_log(out))
 
 
 def load_rows(out: Path) -> list[Pair]:
@@ -2068,7 +2093,7 @@ def cmd_eval(args) -> None:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         sys.exit(f"another eval is running in {out}; the run's cap needs them in turn")
-    cap = args.max_usd - sum(e["total_usd"] for e in spend_log(out))
+    cap = args.max_usd - run_spent(out)
     if cap <= 0:
         sys.exit(f"run {args.run} has already spent its ${args.max_usd} cap")
     instructions = (
@@ -2115,11 +2140,16 @@ def cmd_eval(args) -> None:
     votes: list[list[dict]] = [[] for _ in chosen]
     ledger = Ledger()
 
+    entry = {"stem": stem, "judge": args.judge, "model": model}
+
     def book(spent: Ledger) -> None:
-        book_spend(out, {"stem": stem, "judge": args.judge, "model": model}, spent)
+        book_spend(out, entry, spent)
+
+    def owe() -> None:
+        owe_spend(out, entry)
 
     try:
-        judge_passes(judge, model, texts, args.passes, ledger, cap, votes, book)
+        judge_passes(judge, model, texts, args.passes, ledger, cap, votes, book, owe)
     finally:  # paid verdicts are written before any exit path
         with records.open("w", encoding="utf-8") as f:
             for p, vs in zip(chosen, votes):

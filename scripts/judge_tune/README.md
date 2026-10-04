@@ -193,10 +193,12 @@ that is unmeasured, while no pair carries the label.
 `--max-usd` is checked between chunks of 20 calls. The first chunk's cost is
 projected over the whole run, so a run the cap cannot cover with 10 % headroom
 stops after one chunk. Every call that returned is booked before an abort,
-and each chunk's spend is in `spend_log.jsonl` before the next starts, so a
-killed `eval` leaves at most one chunk's spend unbooked. An append that fails
-aborts the `eval` and prints the spend and the line it owed: the run's cap
-ignores that chunk until the line is in the log.
+and each chunk's spend is in `spend_log.jsonl` before the next starts. The
+run directory holds `unbooked.json` from before a chunk's first request until
+its spend is in the log, so a killed `eval`, or an append that fails, leaves it
+behind, and no later `eval` in the run starts until someone books that chunk
+and deletes the file. A failed append prints the spend and the exact line it
+owed; after a kill, take the chunk's spend from the provider's usage.
 
 `--regime default` is the production request (no `thinking` parameter, so
 `claude-sonnet-5` runs adaptive thinking). `--regime thinking-off` adds

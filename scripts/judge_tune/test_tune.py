@@ -293,6 +293,31 @@ def check_judge_passes() -> None:
     )
     assert len(chunks) == 2 * -(-len(texts) // tune.SPEND_CHECK_EVERY)
     assert abs(sum(c.usd() for c in chunks) - ledger.usd()) < 1e-9
+    # Each chunk is owed before its first request and settled after its last,
+    # a chunk whose every call raised included: nothing is left marked unpaid.
+    events: list[str] = []
+
+    def denied(t):
+        events.append("call")
+        raise tune.AuthError("HTTP 401")
+
+    try:
+        tune.judge_passes(
+            denied,
+            "claude-sonnet-5",
+            texts[:2],
+            1,
+            tune.Ledger(),
+            1e9,
+            [[], []],
+            lambda spent: events.append(f"book {spent.usd()}"),
+            lambda: events.append("owe"),
+        )
+    except tune.AuthError:
+        pass
+    else:
+        raise AssertionError("an auth error must abort the run")
+    assert events == ["owe", "call", "call", "book 0.0"], events
     # A failed pair is booked and kept; a chunk of nothing but failures aborts.
     gone = verdict(verdict=tune.FAILED, reason="HTTP 503", tokens=(0, 0))
     votes, ledger, err = run(lambda t, n: gone if t == texts[3] else verdict(), 1e9)
@@ -1152,27 +1177,60 @@ def check_new_records() -> None:
 
 
 def check_book_spend() -> None:
-    """Each chunk's spend is appended to the run's log. A failed append names
-    the spend and the line it owed: the run's cap ignores that chunk until the
-    line is in the log."""
+    """Each chunk's spend is appended to the run's log, and the run is marked
+    from before the chunk's first request until then. A failed append names
+    the spend and the line it owed, and leaves the mark: no eval in the run
+    starts on a cap that leaves that chunk out."""
     spent = tune.Ledger()
     spent.add("judge", "claude-sonnet-5", 100_000, 1_000)
     entry = {"stem": "eval_s", "judge": "anthropic", "model": "claude-sonnet-5"}
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp)
+        assert tune.run_spent(out) == 0
+        tune.owe_spend(out, entry)
         tune.book_spend(out, entry, spent)
         tune.book_spend(out, entry, spent)
         assert tune.spend_log(out) == [entry | spent.summary()] * 2
+        assert tune.run_spent(out) == 2 * spent.summary()["total_usd"]
         (out / tune.SPEND_LOG).unlink()
         (out / tune.SPEND_LOG).mkdir()  # the append now fails
+
+        # Wired as `cmd_eval` wires it: the chunk is paid, its append fails.
+        def book(chunk):
+            tune.book_spend(out, entry, chunk)
+
         try:
-            tune.book_spend(out, entry, spent)
+            tune.judge_passes(
+                lambda t: verdict(tokens=(100_000, 1_000)),
+                "claude-sonnet-5",
+                ["x"],
+                1,
+                tune.Ledger(),
+                1e9,
+                [[]],
+                book,
+                lambda: tune.owe_spend(out, entry),
+            )
         except OSError as e:
             note = "\n".join(getattr(e, "__notes__", []))
             assert f"${spent.usd():.4f} not booked" in note, note
             assert json.dumps(entry | spent.summary()) in note, note
         else:
             raise AssertionError("a failed append must abort the eval")
+        # The directory recovers and a new eval starts: the paid chunk is in
+        # no log line, so its cap would be the run's whole cap. It must refuse.
+        (out / tune.SPEND_LOG).rmdir()
+        try:
+            tune.run_spent(out)
+        except SystemExit as e:
+            assert tune.UNBOOKED_FILE in str(e) and "eval_s" in str(e), e
+        else:
+            raise AssertionError("an unbooked chunk must stop the next eval")
+        # The line the error named appended by hand, the mark deleted: the
+        # run's cap counts the chunk.
+        (out / tune.SPEND_LOG).write_text(json.dumps(entry | spent.summary()) + "\n")
+        (out / tune.UNBOOKED_FILE).unlink()
+        assert tune.run_spent(out) == spent.summary()["total_usd"]
 
 
 def main() -> None:
