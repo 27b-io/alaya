@@ -410,6 +410,10 @@ def check_scrub() -> None:
             ("password=ab;" + value, value),
             ("DB_PASSWORD=x," + value, value),
             ("the admin password is " + "hunter2", "hunter2"),
+            # ...one that starts like a setting included.
+            ("password=" + "true-42", "true-42"),
+            ("DB_PASS=" + "none.1", "none.1"),
+            ("password=" + "null!", "null!"),
             # Flags with any secret word.
             ("gpg --passphrase " + value, value),
             ("cli --pwd " + "hunter2", "hunter2"),
@@ -581,14 +585,14 @@ def check_scrub() -> None:
         took = tune.time.perf_counter() - start
         assert took < 1.0, (run, took)
     # Prose, file names, versions, times, hashes and code paths are not a
-    # scrub class; nor is a review pass, a setting or a short token count.
+    # scrub class; nor is a review pass or a short token count.
     plain = (
         "Ray ruled on tune.py and judge.rs (v1.13.0) at 12:30:45; max_tokens=4096, "
         "token budget 5, std::fs, hash 9999d3f16a2030def3b3479ef273318194c8e03f, "
         "e.g. the bearer token; lab node; pinned cachekit@0.1.4 and action@v3.2.0; "
         "systemctl --user restart gateway; a review pass: 3 of 4; PASS: 12; "
         "${{ secrets.APP_ID }} and steps.app-token.outputs.token; identity.tech_id; "
-        "DISABLE_PASSWORD=true; de::Deserialize; the password is rotated"
+        "de::Deserialize; the password is rotated"
     )
     assert s(plain) == plain.replace("rotated", "<secret>"), s(plain)
     assert s.leaks(s(plain)) == [], s(plain)
@@ -617,7 +621,7 @@ def check_scrub() -> None:
 def check_gate() -> None:
     """The pre-send gate runs gitleaks, which owes nothing to the scrub rules:
     with no rule at all, a secret gitleaks knows still stops the run before a
-    request, and so does a missing gitleaks binary."""
+    request, and so does a gitleaks that fails."""
     a, b = "a" * 64, "b" * 64
     pair = tune.Pair(0, a, b, "coexist", None, "operator")
     leaky = {a: mem("creds = " + "9f86d081" + "884c7d659a2feaa0c55ad015", 0.0)}
@@ -645,17 +649,20 @@ def check_gate() -> None:
     assert tune.render_all([pair], clean, bare) == [
         tune.render_pair(clean[a], clean[b])
     ]
-    path = tune.os.environ["PATH"]
-    with tempfile.TemporaryDirectory() as empty:
-        tune.os.environ["PATH"] = empty
+    # A gitleaks that fails stops the run, and says why.
+    with tempfile.TemporaryDirectory() as tmp:
+        broken = Path(tmp) / "gitleaks"
+        broken.write_text("#!/bin/sh\necho 'unknown flag' >&2\nexit 2\n")
+        broken.chmod(0o755)
+        tune.GITLEAKS = str(broken)
         try:
             tune.gitleaks(["x"])
         except SystemExit as e:
-            assert "gitleaks is not installed" in str(e), e
+            assert "exited 2; nothing sent: unknown flag" in str(e), e
         else:
-            raise AssertionError("a missing gitleaks must stop the run")
+            raise AssertionError("a failing gitleaks must stop the run")
         finally:
-            tune.os.environ["PATH"] = path
+            tune.GITLEAKS = "gitleaks"
 
 
 def check_key_env(real_env: dict) -> None:

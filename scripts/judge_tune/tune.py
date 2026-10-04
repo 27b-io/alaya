@@ -467,10 +467,7 @@ def render_pair(a: dict, b: dict) -> str:
 # rules runs before them: the key rules take a placeholder inside a value as
 # part of it (an IP inside a password), so one written there after them would
 # change on a second scrub. What holds is that scrubbing is idempotent and
-# leaves nothing any rule matches; the tests check both on every case. So
-# `Scrubber.leaks` on scrubbed text shows the rules agree with each other, not
-# that the text is clean: the pre-send gate adds gitleaks, whose rules share
-# nothing with these (see `gitleaks`).
+# leaves nothing any rule matches; the tests check both on every case.
 
 SCRUB_CLASSES = ("host", "ip", "url", "email", "secret")
 HOST_TLDS = (
@@ -673,14 +670,13 @@ PLAIN_RULES: tuple[tuple[str, re.Pattern], ...] = (
 KEY_RULES: tuple[tuple[str, re.Pattern], ...] = (
     (  # a password's: up to a space, or quoted, to the line's last such quote
         # (an escaped one inside cannot cut it short) or, unclosed, to its end;
-        # after a separator or, in prose, after `the password is`. A boolean is
-        # a setting, not a password.
+        # after a separator or, in prose, after `the password is`
         "secret",
         re.compile(
             rf"(?P<keep>(?:{PASSWORD_NAME}{KEY_CLOSE}\s*+{SEPARATOR}"
             r"|(?<![\w.-])(?:passw(?:or)?d|passphrase)\s++(?:is|was)(?!\S))\s*+)"
             rf"(?:(?P<q>[\"'`])(?!{PLACEHOLDER}(?:(?P=q)|$))(?:[^\n]*(?P=q)|[^\n]++)"
-            rf"|[\"'`]?(?!(?:true|false|none|null)\b)[^\s\"'`<>]++){NEXT_VALUES}",
+            rf"|[\"'`]?[^\s\"'`<>]++){NEXT_VALUES}",
             re.I,
         ),
     ),
@@ -739,9 +735,8 @@ class Scrubber:
         }
 
     def leaks(self, text: str) -> list[str]:
-        """Classes some rule still matches in `text`. On scrubbed text this
-        finds a rule another rule's placeholder defeated; it cannot find a
-        shape no rule knows, which is what `gitleaks` is for."""
+        """Classes some rule still matches in `text`: on scrubbed text, a rule
+        another rule's placeholder defeated."""
         found = {cls for cls, pattern in self.rules if pattern.search(text)}
         if ORPHANED_VALUE.search(text):
             found.add("secret")
@@ -753,30 +748,26 @@ GITLEAKS = "gitleaks"
 
 def gitleaks(texts: list[str]) -> Counter[str]:
     """gitleaks' default rules over `texts`: findings per rule id, secrets
-    redacted. Its rules are written apart from the scrubber's, so it is the
-    check for a shape they miss. It runs in an empty directory with no
-    GITLEAKS_* variable, so no repo config or ignore file narrows its rules,
-    and a `gitleaks:allow` in the text silences nothing."""
+    redacted. It runs in an empty directory with no GITLEAKS_* variable, so no
+    repo config or ignore file narrows its rules, and a `gitleaks:allow` in the
+    text silences nothing."""
     argv = [GITLEAKS, "stdin", "--no-banner", "--log-level", "error", "--redact"]
     argv += ["--ignore-gitleaks-allow", "--exit-code", "0"]
     argv += ["--report-format", "json", "--report-path", "-"]
     with tempfile.TemporaryDirectory() as cwd:
-        try:
-            run = subprocess.run(
-                argv,
-                input="\n".join(texts),
-                capture_output=True,
-                text=True,
-                cwd=cwd,
-                env={"PATH": os.environ.get("PATH", "")},
-                check=False,
-            )
-        except FileNotFoundError:
-            sys.exit(
-                f"{GITLEAKS} is not installed; the scrub check needs it, nothing sent"
-            )
-    if run.returncode:
-        sys.exit(f"{GITLEAKS} exited {run.returncode}; nothing sent")
+        run = subprocess.run(
+            argv,
+            input="\n".join(texts),
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            env={"PATH": os.environ.get("PATH", "")},
+            check=False,
+        )
+    if run.returncode:  # --redact: its stderr names no secret
+        sys.exit(
+            f"{GITLEAKS} exited {run.returncode}; nothing sent: {run.stderr.strip()[-500:]}"
+        )
     findings = parse_json(run.stdout, f"{GITLEAKS} report")
     if not isinstance(findings, list):
         sys.exit(f"{GITLEAKS} report is not a list; nothing sent")
