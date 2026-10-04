@@ -1365,26 +1365,25 @@ impl MemoryService {
         // Suppressed under read_only: access_count + Hebbian touch shared
         // owner ranking state. Skipping leaves rankings unchanged.
         let page_hashes: Vec<&str> = page_results.iter().map(|(h, _)| h.as_str()).collect();
-        // Whether this search's access bump finished and succeeded: only then
-        // does the response report the incremented count.
+        // Whether this search's access bump finished: only then does the
+        // response report the incremented count.
         let mut bumped = false;
 
         if !read_only {
             let _span = tracing::info_span!("enrich", results = page_hashes.len()).entered();
             let _stage = stages.stage(Stage::Enrich);
             // Each side records that it finished, so an overrun can say which
-            // one it was still waiting on. `bump` is `Some(succeeded)` once done.
-            let bump = std::cell::Cell::new(None);
+            // one it was still waiting on.
+            let access_done = std::cell::Cell::new(false);
             let hebbian_done = std::cell::Cell::new(false);
             let access_fut = async {
-                let r = self
+                // Non-fatal: the implementations return Ok past a failed write
+                // (QdrantClient logs it).
+                let _ = self
                     .vectors
                     .increment_access_count_batch(&page_hashes)
                     .await;
-                if let Err(e) = &r {
-                    tracing::warn!(error = %e, "search access bump failed");
-                }
-                bump.set(Some(r.is_ok()));
+                access_done.set(true);
             };
 
             let hebbian_enqueue_fut = async {
@@ -1414,13 +1413,13 @@ impl MemoryService {
                 tracing::warn!(
                     results = page_hashes.len(),
                     budget_ms = ENRICH_BUDGET.as_millis() as u64,
-                    access_done = bump.get().is_some(),
+                    access_done = access_done.get(),
                     hebbian_done = hebbian_done.get(),
                     "search side-effect writes ran past their budget; \
-                     access counts and co-access pairs may not be recorded"
+                     the side not done may not be recorded"
                 );
             }
-            bumped = bump.get() == Some(true);
+            bumped = access_done.get();
         }
 
         // Stage 7: Format response
@@ -1435,7 +1434,8 @@ impl MemoryService {
                 // Reflect the post-increment access_count (the bump wrote N+1)
                 // only when this search's bump finished. Under read_only it was
                 // skipped, and past ENRICH_BUDGET it may not have landed: report
-                // the stored value rather than a count Qdrant never recorded.
+                // the stored value rather than a count Qdrant may not have
+                // recorded.
                 if let Some(obj) = item.as_object_mut() {
                     let reported = if bumped {
                         sm.memory.access_count.saturating_add(1)
