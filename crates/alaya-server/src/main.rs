@@ -165,7 +165,7 @@ impl Config {
             rerank_timeout_ms: env_or("RERANK_TIMEOUT_MS", "5000")
                 .parse()
                 .expect("RERANK_TIMEOUT_MS must be a positive integer (ms)"),
-            ranking: parse_ranking(env_non_empty).unwrap_or_else(|e| panic!("{e}")),
+            ranking: parse_ranking(|var| std::env::var(var).ok()).unwrap_or_else(|e| panic!("{e}")),
             selfcheck: selfcheck::parse(
                 env_non_empty("SELFCHECK_QUERY"),
                 env_non_empty("SELFCHECK_EXPECT_HASH"),
@@ -2144,10 +2144,11 @@ fn parse_provider(var: &str, raw: Option<String>, fallback: Provider) -> Result<
     })
 }
 
-/// The `RANK_*` switches (LAB-7714), read through `env_non_empty` (so blank is
-/// unset): unset leaves every boost on. A switch takes only `true` or `false`,
-/// and the exempt list only known memory types, so a typo refuses boot
-/// instead of silently ranking as before.
+/// The `RANK_*` switches (LAB-7714). Unset leaves every boost on. Set, a
+/// switch takes only `true` or `false`, and the exempt list only known memory
+/// types with no empty entry, so a typo refuses boot instead of silently
+/// ranking as before. Read raw, not through `env_non_empty`: a blank value is
+/// set, and an operator who blanked one meant something by it.
 fn parse_ranking(env: impl Fn(&str) -> Option<String>) -> Result<RankingFlags, String> {
     let switch = |var: &str| match env(var) {
         None => Ok(true),
@@ -2157,21 +2158,23 @@ fn parse_ranking(env: impl Fn(&str) -> Option<String>) -> Result<RankingFlags, S
             _ => Err(format!("{var} must be true or false, got {s:?}")),
         },
     };
-    let decay_exempt_types = env("RANK_DECAY_EXEMPT_TYPES")
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(|t| {
-            if VALID_MEMORY_TYPES.contains(&t) {
-                Ok(t.to_string())
-            } else {
-                Err(format!(
-                    "RANK_DECAY_EXEMPT_TYPES: {t:?} is not a memory type (one of {VALID_MEMORY_TYPES:?})"
-                ))
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let decay_exempt_types = match env("RANK_DECAY_EXEMPT_TYPES") {
+        None => Vec::new(),
+        Some(list) => list
+            .split(',')
+            .map(str::trim)
+            .map(|t| {
+                if VALID_MEMORY_TYPES.contains(&t) {
+                    Ok(t.to_string())
+                } else {
+                    Err(format!(
+                        "RANK_DECAY_EXEMPT_TYPES must list memory types ({VALID_MEMORY_TYPES:?}) \
+                         separated by commas, got {list:?}"
+                    ))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
     Ok(RankingFlags {
         access_salience: switch("RANK_ACCESS_BOOST")?,
         spacing: switch("RANK_SPACING_BOOST")?,
@@ -3894,7 +3897,7 @@ mod tests {
             ("RANK_ACCESS_BOOST", "false"),
             ("RANK_SPACING_BOOST", "FALSE"),
             ("RANK_GRAPH_BOOST", " false "),
-            ("RANK_DECAY_EXEMPT_TYPES", " decision, reference,"),
+            ("RANK_DECAY_EXEMPT_TYPES", " decision, reference"),
         ]))
         .unwrap();
         assert_eq!(
@@ -3916,8 +3919,19 @@ mod tests {
             err.contains("RANK_SPACING_BOOST must be true or false"),
             "{err}"
         );
-        let err = parse_ranking(env(&[("RANK_DECAY_EXEMPT_TYPES", "decisions")])).unwrap_err();
-        assert!(err.contains("\"decisions\" is not a memory type"), "{err}");
+        // Set but blank is not unset: each of these refuses boot.
+        for (var, value) in [
+            ("RANK_GRAPH_BOOST", ""),
+            ("RANK_ACCESS_BOOST", " "),
+            ("RANK_DECAY_EXEMPT_TYPES", "decisions"),
+            ("RANK_DECAY_EXEMPT_TYPES", ""),
+            ("RANK_DECAY_EXEMPT_TYPES", ","),
+            ("RANK_DECAY_EXEMPT_TYPES", "decision,"),
+            ("RANK_DECAY_EXEMPT_TYPES", "decision,,reference"),
+        ] {
+            let err = parse_ranking(|v| (v == var).then(|| value.to_string())).unwrap_err();
+            assert!(err.starts_with(var), "{var}={value:?}: {err}");
+        }
     }
 
     const DAY1: u64 = 1789733949; // 2026-09-18

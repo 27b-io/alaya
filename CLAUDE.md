@@ -171,6 +171,11 @@ RERANK_URL=                              # optional — empty disables cross-enc
 RERANK_API_KEY=                          # optional
 RERANK_TOP_N=20                          # how many RRF candidates to rerank
 RERANK_TIMEOUT_MS=5000                   # budget per rerank call; falls back to RRF order past this
+RANK_ACCESS_BOOST=true                   # hybrid ranking switches (LAB-7714), unset = on; false drops access_count from salience
+RANK_SPACING_BOOST=true                  #   false = no spaced-repetition boost
+RANK_GRAPH_BOOST=true                    #   false = no spreading activation, Hebbian boost or neighbour injection (no graph call)
+RANK_DECAY_EXEMPT_TYPES=                 #   comma list of memory types recency decay skips, e.g. decision,reference.
+                                         #   Ranking only (searches still write). Set-but-blank, a typo or an empty entry refuses boot
 SELFCHECK_QUERY=                         # periodic read-only search per pod (LAB-4026); set both or neither —
 SELFCHECK_EXPECT_HASH=                   #   result + failure counters in /health/detail and GET /stats `pod`
 SELFCHECK_INTERVAL_SECS=300              #   minimum 30; never wired to /health (a deep probe restart-loops pods)
