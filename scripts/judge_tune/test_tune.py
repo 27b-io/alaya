@@ -1231,6 +1231,28 @@ def check_book_spend() -> None:
         (out / tune.SPEND_LOG).write_text(json.dumps(entry | spent.summary()) + "\n")
         (out / tune.UNBOOKED_FILE).unlink()
         assert tune.run_spent(out) == spent.summary()["total_usd"]
+        # A mark that cannot be written stops the chunk before any request.
+        (out / tune.UNBOOKED_FILE).mkdir()  # the write now fails
+        sent = []
+        try:
+            tune.judge_passes(
+                lambda t: sent.append(t) or verdict(),
+                "claude-sonnet-5",
+                ["x"],
+                1,
+                tune.Ledger(),
+                1e9,
+                [[]],
+                book,
+                lambda: tune.owe_spend(out, entry),
+            )
+        except OSError as e:
+            note = "\n".join(getattr(e, "__notes__", []))
+            assert "no request sent and no spend owed" in note, note
+            assert str(out / tune.UNBOOKED_FILE) in note, note
+        else:
+            raise AssertionError("a failed mark must abort the eval")
+        assert sent == [] and tune.spend_log(out) == [entry | spent.summary()]
 
 
 def main() -> None:

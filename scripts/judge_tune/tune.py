@@ -1965,8 +1965,18 @@ def spend_log(out: Path) -> list[dict]:
 def owe_spend(out: Path, entry: dict) -> None:
     """Mark the run before a chunk's first request. The mark is written while
     the run directory still takes writes, so an append that fails later, or a
-    kill mid-chunk, cannot leave the run with no record of the chunk."""
-    (out / UNBOOKED_FILE).write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    kill mid-chunk, cannot leave the run with no record of the chunk. A failed
+    mark aborts the eval before the chunk sends anything; every earlier chunk
+    is booked, since its mark was cleared only after its line was appended."""
+    mark = out / UNBOOKED_FILE
+    try:
+        mark.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    except OSError as e:
+        e.add_note(
+            f"chunk not started: no request sent and no spend owed for it. "
+            f"If {mark} exists, the failed write left it: delete it."
+        )
+        raise
 
 
 def book_spend(out: Path, entry: dict, spent: Ledger) -> None:
