@@ -728,10 +728,12 @@ class Scrubber:
         return text
 
     def memory(self, m: dict) -> dict:
-        """`m` with its content and tags scrubbed: the fields `describe` sends."""
+        """`m` with the text fields `describe` sends scrubbed: its content,
+        tags and type (free text on the store path)."""
         return m | {
             "content": self(m["content"]),
             "tags": [self(t) for t in m.get("tags") or ()],
+            "memory_type": self(m["memory_type"]),
         }
 
     def leaks(self, text: str) -> list[str]:
@@ -2115,16 +2117,24 @@ def render_all(
     chosen: list[Pair], memories: dict[str, dict], scrubber: Scrubber | None
 ) -> list[str]:
     """Every chosen pair as the judge sees it. Scrubbed, the run exits before
-    any request unless every rendered pair passes the gate (`scrub_findings`):
-    no scrub rule still matches it, and gitleaks finds nothing in it. gitleaks
-    shares no rule with the scrubber, so a secret of a shape gitleaks knows
-    stops the run even where the scrubber missed it. Neither check proves a
-    text holds no secret: one of a shape neither knows still goes out."""
+    any request unless every rendered pair, and every field it shows on its
+    own, passes the gate (`scrub_findings`): no scrub rule still matches it,
+    and gitleaks finds nothing in it. gitleaks shares no rule with the
+    scrubber, so a secret of a shape gitleaks knows stops the run even where
+    the scrubber missed it. Neither check proves a text holds no secret: one
+    of a shape neither knows still goes out."""
     sent = {h for p in chosen for h in (p.a, p.b)}
     shown = {h: scrubber.memory(memories[h]) if scrubber else memories[h] for h in sent}
     texts = [render_pair(shown[p.a], shown[p.b]) for p in chosen]
     if scrubber:
-        found = scrub_findings(texts, scrubber)
+        # Rendered, a type or tag ends at `;`, `,` or `)`, where gitleaks does
+        # not see a secret end; alone on its line, it does.
+        fields = [
+            f
+            for m in map(shown.get, sent)
+            for f in (m["memory_type"], *m["tags"], m["content"][:MAX_CONTENT_CHARS])
+        ]
+        found = scrub_findings(texts + fields, scrubber)
         if found:
             sys.exit(f"scrub check failed, nothing sent: {found}")
         log(f"scrubbed {len(sent)} memories: {dict(scrubber.counts)}")

@@ -639,12 +639,23 @@ def check_gate() -> None:
             assert tune.gitleaks(texts) == Counter({"generic-api-key": 1}), texts
     finally:
         del tune.os.environ["GITLEAKS_CONFIG_TOML"]
-    try:
-        tune.render_all([pair], leaky, bare)
-    except SystemExit as e:
-        assert "nothing sent" in str(e) and "gitleaks:generic-api-key" in str(e), e
-    else:
-        raise AssertionError("a gitleaks finding must stop the run")
+    # Wherever the secret sits: rendered, a type or tag ends at `;`, `,` or
+    # `)`, where gitleaks sees no secret end, so each field is scanned alone too.
+    secret = leaky[a]["content"]
+    for placed in (
+        leaky[a],
+        mem("x", 0.0, tags=(secret,)),
+        mem("x", 0.0, tags=(secret, "plain")),
+        mem("x", 0.0, memory_type=secret),
+    ):
+        for scrubber in (bare, tune.Scrubber()):
+            try:
+                tune.render_all([pair], {a: placed, b: leaky[b]}, scrubber)
+            except SystemExit as e:
+                assert "nothing sent" in str(e), e
+                assert "gitleaks:generic-api-key" in str(e), (placed, e)
+            else:
+                raise AssertionError(f"a gitleaks finding must stop the run: {placed}")
     clean = {a: mem("nothing here", 0.0), b: mem("nor here", 1.0)}
     assert tune.render_all([pair], clean, bare) == [
         tune.render_pair(clean[a], clean[b])

@@ -89,15 +89,16 @@ stays out of git.
 addresses and secrets (API keys, tokens, passwords, bearer strings,
 private-key blocks, password hashes, and any run of 16 or more letters and
 digits mixing upper case, lower case and digits) with `<host>`, `<ip>`,
-`<url>`, `<email>` and `<secret>` in each memory's content and tags, before
+`<url>`, `<email>` and `<secret>` in each memory's content, tags and type, before
 the 4,000-character cut. The host rule needs a known suffix (`.com`, `.svc`,
 `.local`, ...), so a bare name or a short in-cluster name such as
 `service.namespace` comes in through `--host-names <file>`, one per line,
 kept out of git. `--scrub` takes that file or an explicit `--no-host-names`,
 and the eval records which as `host_names` in its JSON and its `_sent.json`.
 
-Before any request leaves, a gate checks every rendered pair, and the system
-prompt for any judge that gets one. gitleaks, run with its default rules,
+Before any request leaves, a gate checks every rendered pair, each field it
+shows (type, tags, content) on a line of its own, and the system prompt for
+any judge that gets one. gitleaks, run with its default rules,
 must find nothing, and no scrub rule may still match. gitleaks shares no rule
 with the scrubber, so a secret of a shape gitleaks knows stops the run even
 where the scrubber missed it; the scrub-rule check catches one rule undoing
