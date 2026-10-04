@@ -752,8 +752,8 @@ def gitleaks(texts: list[str]) -> Counter[str]:
     """gitleaks' default rules over `texts`: findings per rule id, secrets
     redacted. It runs in an empty directory with no GITLEAKS_* variable, so no
     repo config or ignore file narrows its rules, and a `gitleaks:allow` in the
-    text silences nothing. A blank line between texts lets it end a chunk of
-    its input there, never inside one."""
+    text silences nothing. A blank line between texts gives gitleaks a place
+    to end a chunk, so a cut never runs one text into the next."""
     argv = [GITLEAKS, "stdin", "--no-banner", "--log-level", "error", "--redact"]
     argv += ["--ignore-gitleaks-allow", "--exit-code", "0"]
     argv += ["--report-format", "json", "--report-path", "-"]
@@ -769,7 +769,7 @@ def gitleaks(texts: list[str]) -> Counter[str]:
         )
     if run.returncode:  # --redact: its stderr names no secret
         sys.exit(
-            f"{GITLEAKS} exited {run.returncode}; nothing sent: {run.stderr.strip()[-500:]}"
+            f"{GITLEAKS} exited {run.returncode}; nothing sent: {run.stderr.strip()[:500]}"
         )
     findings = parse_json(run.stdout, f"{GITLEAKS} report")
     if not isinstance(findings, list):
@@ -2128,13 +2128,13 @@ def render_all(
     shown = {h: scrubber.memory(memories[h]) if scrubber else memories[h] for h in sent}
     texts = [render_pair(shown[p.a], shown[p.b]) for p in chosen]
     if scrubber:
-        # Rendered, a type or tag ends at `;`, `,` or `)`, where gitleaks does
-        # not see a secret end; alone on its line, it does.
-        fields = [
-            f
-            for m in map(shown.get, sent)
-            for f in (m["memory_type"], *m["tags"], m["content"][:MAX_CONTENT_CHARS])
-        ]
+        # Each field alone, and each two neighbours joined: rendered, a type or
+        # tag ends at `;`, `,` or `)`, where gitleaks sees no secret end, and a
+        # key in one field can take its value from the next.
+        fields = []
+        for m in shown.values():
+            seq = [m["memory_type"], *m["tags"], m["content"][:MAX_CONTENT_CHARS]]
+            fields += seq + [f"{x}, {y}" for x, y in zip(seq, seq[1:])]
         found = scrub_findings(texts + fields, scrubber)
         if found:
             sys.exit(f"scrub check failed, nothing sent: {found}")

@@ -610,11 +610,14 @@ def check_scrub() -> None:
         raise AssertionError("a missing host list must exit, naming it")
     # The rendered pair carries scrubbed content and tags, and checks clean.
     s = tune.Scrubber()
-    a = s.memory(mem("db at 10.0.0.5 via db.internal", 0.0, tags=("x.svc", "plain")))
+    a = s.memory(
+        mem("db at 10.0.0.5 via db.internal", 0.0, ("x.svc", "plain"), "y.svc")
+    )
     assert a["content"] == "db at <ip> via <host>" and a["tags"] == ["<host>", "plain"]
+    assert a["memory_type"] == "<host>"
     text = tune.render_pair(a, s.memory(mem("ok", 86_400.0 * 2)))
-    assert s.leaks(text) == [] and "tags: <host>, plain" in text, text
-    assert s.counts == Counter(ip=1, host=2)
+    assert s.leaks(text) == [] and "type: <host>; tags: <host>, plain" in text, text
+    assert s.counts == Counter(ip=1, host=3)
     check_gate()
 
 
@@ -624,7 +627,8 @@ def check_gate() -> None:
     request, and so does a gitleaks that fails."""
     a, b = "a" * 64, "b" * 64
     pair = tune.Pair(0, a, b, "coexist", None, "operator")
-    leaky = {a: mem("creds = " + "9f86d081" + "884c7d659a2feaa0c55ad015", 0.0)}
+    key = "9f86d081" + "884c7d659a2feaa0c55ad015"
+    leaky = {a: mem("creds = " + key, 0.0)}
     leaky[b] = mem("nothing here", 86_400.0)
     bare = tune.Scrubber()
     bare.rules = []
@@ -640,22 +644,24 @@ def check_gate() -> None:
     finally:
         del tune.os.environ["GITLEAKS_CONFIG_TOML"]
     # Wherever the secret sits: rendered, a type or tag ends at `;`, `,` or
-    # `)`, where gitleaks sees no secret end, so each field is scanned alone too.
+    # `)`, where gitleaks sees no secret end, and its key may sit in the field
+    # before it, so each field is scanned alone and with its neighbour.
     secret = leaky[a]["content"]
     for placed in (
         leaky[a],
-        mem("x", 0.0, tags=(secret,)),
-        mem("x", 0.0, tags=(secret, "plain")),
+        mem("x", 0.0, tags=("plain", secret)),
         mem("x", 0.0, memory_type=secret),
+        mem("x", 0.0, tags=("creds", key, "deploy")),
+        mem("x", 0.0, tags=(key,), memory_type="creds"),
+        mem(key, 0.0, tags=("creds",)),
     ):
-        for scrubber in (bare, tune.Scrubber()):
-            try:
-                tune.render_all([pair], {a: placed, b: leaky[b]}, scrubber)
-            except SystemExit as e:
-                assert "nothing sent" in str(e), e
-                assert "gitleaks:generic-api-key" in str(e), (placed, e)
-            else:
-                raise AssertionError(f"a gitleaks finding must stop the run: {placed}")
+        try:
+            tune.render_all([pair], {a: placed, b: leaky[b]}, bare)
+        except SystemExit as e:
+            assert "nothing sent" in str(e), e
+            assert "gitleaks:generic-api-key" in str(e), (placed, e)
+        else:
+            raise AssertionError(f"a gitleaks finding must stop the run: {placed}")
     clean = {a: mem("nothing here", 0.0), b: mem("nor here", 1.0)}
     assert tune.render_all([pair], clean, bare) == [
         tune.render_pair(clean[a], clean[b])

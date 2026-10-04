@@ -97,8 +97,8 @@ kept out of git. `--scrub` takes that file or an explicit `--no-host-names`,
 and the eval records which as `host_names` in its JSON and its `_sent.json`.
 
 Before any request leaves, a gate checks every rendered pair, each field it
-shows (type, tags, content) on a line of its own, and the system prompt for
-any judge that gets one. gitleaks, run with its default rules,
+shows (type, tags, content) on a line of its own and joined to the next one,
+and the system prompt for any judge that gets one. gitleaks, run with its default rules,
 must find nothing, and no scrub rule may still match. gitleaks shares no rule
 with the scrubber, so a secret of a shape gitleaks knows stops the run even
 where the scrubber missed it; the scrub-rule check catches one rule undoing
