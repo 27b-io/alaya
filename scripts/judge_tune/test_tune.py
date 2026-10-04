@@ -442,7 +442,16 @@ def check_scrub() -> None:
     )
     # ...but a value that ran into a secret key still takes that key's value
     # from the next line.
-    for text in ("token=abcdefgh/password:\n  ", "token=abcdefgh/DB_PASSWORD :\n\t"):
+    # The key may close with what SECRET_KEY_NAME accepts, and its separator
+    # may follow on the next line.
+    for text in (
+        "token=abcdefgh/password:\n  ",
+        "token=abcdefgh/DB_PASSWORD :\n\t",
+        "token=abcdefgh/DB_PASSWORD]:\n",
+        'token=abcdefgh/DB_PASSWORD"]:\n',
+        "token=abcdefgh/DB_PASSWORD']=>\n",
+        "token=abcdefgh/DB_PASSWORD\n: ",
+    ):
         out = s(text + "Pa55w0rd99")
         assert "Pa55w0rd99" not in out and s.leaks(out) == [], out
     # A secret-named value cannot swallow the next secret-named key.

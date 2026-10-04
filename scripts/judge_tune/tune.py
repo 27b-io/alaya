@@ -486,9 +486,11 @@ SECRET_NAME = (
     r"(?<![\w.-])(?=[\w.-]*?(?:api[_-]?key|account[_-]?key|[_-]key|token|secret"
     r"|passw(?:or)?d|passphrase|pwd|credential))[\w.-]++"
 )
-SECRET_KEY_NAME = (  # also os.environ['X_KEY'] = '...'
-    rf"{SECRET_NAME}[\"']?\]?\s*(?:=>|[:=])\s*[\"']?"
-)
+# What may close a key before its separator: a quote, a bracket or both, as
+# in os.environ['X_KEY'] = '...'. Every rule that finds a key's separator
+# takes it from here, so none of them can miss a closer another accepts.
+KEY_CLOSE = r"[\"']?\]?"
+SECRET_KEY_NAME = rf"{SECRET_NAME}{KEY_CLOSE}\s*(?:=>|[:=])\s*[\"']?"
 # What a URL may hold; a URL ends at the first character outside it.
 URL_CHAR = r"[^\s<>\"'`)\]]"
 SEPARATOR = r"(?:=>|[:=])"
@@ -498,9 +500,7 @@ SEPARATOR = r"(?:=>|[:=])"
 # takes the key, the separator and the value too. A key whose value stays
 # inside (`?api_key=v`, a password with `=` padding before `@host`) ends
 # nothing; and a URL is never cut short, since its last run may be the secret.
-URL_ENDING_KEY = (
-    rf"{SECRET_NAME}(?:(?=[\"'\]\s])[\"']?\]?\s*+{SEPARATOR}|{SEPARATOR}(?!{URL_CHAR}))"
-)
+URL_ENDING_KEY = rf"{SECRET_NAME}(?:(?=[\"'\]\s]){KEY_CLOSE}\s*+{SEPARATOR}|{SEPARATOR}(?!{URL_CHAR}))"
 # A value's characters, and a placeholder a rule before the key rules wrote.
 VALUE_CHAR = r"[^\s\"'<>,;]"
 PLACEHOLDER = r"(?:<(?:secret|url|email|ip)>)"
@@ -514,10 +514,12 @@ SECRET_KEY_ENDS = (
     "passwd", "pwd", "passphrase", "credential", "credentials",
 )  # fmt: skip
 ENDS_SECRET_KEY = "|".join(f"(?<={w})" for w in SECRET_KEY_ENDS)
-ENDS_SECRET_KEY_SEP = "|".join(f"(?<={w}[:=])" for w in SECRET_KEY_ENDS)
+# The value took the separator too, and with it a `]` (a value never holds a
+# quote, so only the bracket of KEY_CLOSE can come along).
+ENDS_SECRET_KEY_SEP = "|".join(f"(?<={w}[:=])|(?<={w}\\][:=])" for w in SECRET_KEY_ENDS)
 NEXT_VALUES = (
     rf"(?:(?:(?:{ENDS_SECRET_KEY_SEP})>?\s*+"
-    rf"|(?:{ENDS_SECRET_KEY})[\"']?[ \t]*+(?:=>|[:=])\s*+"
+    rf"|(?:{ENDS_SECRET_KEY}){KEY_CLOSE}\s*+(?:=>|[:=])\s*+"
     r"|(?<=[:=])>?[ \t]*+|[ \t]++(?:=>|[:=])[ \t]*+)[\"']?"
     rf"(?:{VALUE_CHAR}|{PLACEHOLDER})++)*+"
 )
@@ -537,7 +539,7 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
         re.compile(
             r"(?<![a-z0-9+.-])(?P<keep>[0-9+.-]*+)[a-z][a-z0-9+.-]*+://"
             rf"(?={URL_CHAR})(?:(?!{URL_ENDING_KEY}){URL_CHAR})*+"
-            rf"(?:(?={URL_ENDING_KEY}){SECRET_NAME}[\"']?\]?\s*+{SEPARATOR}\s*+[\"']?"
+            rf"(?:(?={URL_ENDING_KEY}){SECRET_NAME}{KEY_CLOSE}\s*+{SEPARATOR}\s*+[\"']?"
             rf"(?:{VALUE_CHAR}|{PLACEHOLDER})*+{NEXT_VALUES})?",
             re.I,
         ),
