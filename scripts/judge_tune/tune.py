@@ -752,14 +752,15 @@ def gitleaks(texts: list[str]) -> Counter[str]:
     """gitleaks' default rules over `texts`: findings per rule id, secrets
     redacted. It runs in an empty directory with no GITLEAKS_* variable, so no
     repo config or ignore file narrows its rules, and a `gitleaks:allow` in the
-    text silences nothing."""
+    text silences nothing. A blank line between texts lets it end a chunk of
+    its input there, never inside one."""
     argv = [GITLEAKS, "stdin", "--no-banner", "--log-level", "error", "--redact"]
     argv += ["--ignore-gitleaks-allow", "--exit-code", "0"]
     argv += ["--report-format", "json", "--report-path", "-"]
     with tempfile.TemporaryDirectory() as cwd:
         run = subprocess.run(
             argv,
-            input="\n".join(texts),
+            input="\n\n".join(texts),
             capture_output=True,
             text=True,
             cwd=cwd,
