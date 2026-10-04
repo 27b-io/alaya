@@ -762,6 +762,32 @@ def check_eval_scrub(real_env: dict) -> None:
             tune.os.environ.update(real_env)
 
 
+def check_no_env_headers(real_env: dict) -> None:
+    """A client carries only the headers the tool sets: none from
+    ANTHROPIC_CUSTOM_HEADERS, not even through with_options, which builds a
+    new client. A control client built the SDK's way does carry them, so the
+    probe is live."""
+    probe = "x-probe: PROBE\nx-probe-2: PROBE"
+    url = "https://judge-under-test.invalid"
+
+    def probed(client) -> list:
+        return [k for k, v in client.default_headers.items() if v == "PROBE"]
+
+    try:
+        tune.os.environ["ANTHROPIC_CUSTOM_HEADERS"] = probe
+        tune.os.environ["ANTHROPIC_PROBE"] = "unread"
+        control = tune.anthropic.Anthropic(base_url=url, api_key="t")
+        assert probed(control) == ["x-probe", "x-probe-2"], (
+            "the probe must reach a client"
+        )
+        sdk = tune.make_client(url, "t")
+        assert probed(sdk) == [] and probed(sdk.with_options(timeout=600)) == []
+        assert not [v for v in tune.os.environ if v.startswith("ANTHROPIC_")]
+    finally:
+        tune.os.environ.clear()
+        tune.os.environ.update(real_env)
+
+
 def check_no_env_proxy(real_env: dict) -> None:
     """Every client that carries a key or memory text dials the certified
     host itself: with HTTP_PROXY and ALL_PROXY pointing at a local listener,
@@ -1396,6 +1422,7 @@ def main() -> None:
     check_key_env(real_env)
     check_egress(real_env)
     check_no_env_proxy(real_env)
+    check_no_env_headers(real_env)
     check_eval_scrub(real_env)
     check_judges()
     check_rows()
