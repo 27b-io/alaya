@@ -433,6 +433,18 @@ def check_scrub() -> None:
     # The check also fails closed on a value a URL cut left behind.
     assert s.leaks("<url>DB_PASSWORD: " + "Pa55w0rd99") == ["secret"]
     assert s.leaks("<url>DB_PASSWORD: <secret>") == []
+    # A value ending in `=` padding or `:` takes nothing from the next line.
+    padded = "SECRET=YWJj" + "ZGVmZ2hpams="
+    assert s(padded + "\nNote: the rotation") == "SECRET=<secret>\nNote: the rotation"
+    assert (
+        s(padded + "\n\nnext paragraph here")
+        == "SECRET=<secret>\n\nnext paragraph here"
+    )
+    # ...but a value that ran into a secret key still takes that key's value
+    # from the next line.
+    for text in ("token=abcdefgh/password:\n  ", "token=abcdefgh/DB_PASSWORD :\n\t"):
+        out = s(text + "Pa55w0rd99")
+        assert "Pa55w0rd99" not in out and s.leaks(out) == [], out
     # A secret-named value cannot swallow the next secret-named key.
     out = s(':auth_token => login(password: "' + "Zx9Qw8Er7Ty6" + '")')
     assert "Zx9Qw8Er7Ty6" not in out and s.leaks(out) == [], out

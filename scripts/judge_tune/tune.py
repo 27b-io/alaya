@@ -505,9 +505,20 @@ URL_ENDING_KEY = (
 VALUE_CHAR = r"[^\s\"'<>,;]"
 PLACEHOLDER = r"(?:<(?:secret|url|email|ip)>)"
 # A value that ran into the next key's name took that key's separator with it,
-# leaving the next value with no key in front: the key rules take it too.
-NEXT_VALUES = (  # `>?`: the separator may be `=>`, with only its `=` taken
-    r"(?:(?:(?<=[:=])>?\s*+|\s++(?:=>|[:=])\s*+)[\"']?"
+# leaving the next value with no key in front: the key rules take it too. Only
+# a secret-named key's value may sit on a later line (`.../DB_PASSWORD:\n  x`);
+# any other chain stays on its line, so a value ending in `=` padding or `:`
+# takes nothing from the lines after it. `>?`: the separator may be `=>`.
+SECRET_KEY_ENDS = (
+    "key", "keys", "token", "tokens", "secret", "secrets", "password", "passwords",
+    "passwd", "pwd", "passphrase", "credential", "credentials",
+)  # fmt: skip
+ENDS_SECRET_KEY = "|".join(f"(?<={w})" for w in SECRET_KEY_ENDS)
+ENDS_SECRET_KEY_SEP = "|".join(f"(?<={w}[:=])" for w in SECRET_KEY_ENDS)
+NEXT_VALUES = (
+    rf"(?:(?:(?:{ENDS_SECRET_KEY_SEP})>?\s*+"
+    rf"|(?:{ENDS_SECRET_KEY})[\"']?[ \t]*+(?:=>|[:=])\s*+"
+    r"|(?<=[:=])>?[ \t]*+|[ \t]++(?:=>|[:=])[ \t]*+)[\"']?"
     rf"(?:{VALUE_CHAR}|{PLACEHOLDER})++)*+"
 )
 # (class, pattern). A `keep` group survives in front of the placeholder.
