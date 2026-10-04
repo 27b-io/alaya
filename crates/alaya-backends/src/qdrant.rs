@@ -33,13 +33,16 @@ pub struct QdrantClient {
     /// Serialises this client's writes to the memories collection. Every
     /// write is already conditional on the revision it read (see
     /// `update_points`), so this is no longer what keeps writes from undoing
-    /// one another; another process never sees it. What it still buys: the
-    /// service's spawned tasks (search-time access increments, enrichment,
-    /// duplicate merge) do not race each other, so the bounded CAS retries
-    /// are spent only on cross-process races — a burst of in-process
-    /// increments on one hot memory would otherwise exhaust them and drop
-    /// counts. Held by every writer; reads never take it (alaya#86, #130).
+    /// one another; another process never sees it. What it still buys: this
+    /// client's writers do not spend each other's bounded CAS retries. Held
+    /// by every writer for its whole read→write→read-back; reads never take
+    /// it (alaya#86, #130). The access increments never hold it: see
+    /// `access_turn`.
     write_lock: futures::lock::Mutex<()>,
+    /// Serialises the access increments among themselves, so a burst of
+    /// increments on one hot memory cannot spend each other's CAS retries
+    /// and drop counts (see `access_turn`).
+    access_lock: futures::lock::Mutex<()>,
     /// Random per client. With `writes`, makes every revision token unique
     /// across processes (see `stamp`).
     instance: u64,
@@ -87,6 +90,7 @@ impl QdrantClient {
             collection,
             tag_collection,
             write_lock: futures::lock::Mutex::new(()),
+            access_lock: futures::lock::Mutex::new(()),
             // OS-seeded per process on native targets. wasm32 (deferred, no
             // deployment) has no seed source in std and gets fixed keys.
             instance: std::collections::hash_map::RandomState::new().hash_one(0u8),
@@ -320,10 +324,30 @@ impl QdrantClient {
         Ok(outcome)
     }
 
+    /// The access increments' turn to write (LAB-6896). An increment runs
+    /// inside a search, so it must never hold `write_lock` across its Qdrant
+    /// calls: a store would wait on search I/O. Nor may it commit while a
+    /// write of this client is in progress: an increment that lands inside
+    /// a store's read→write window costs the store a round, and one search
+    /// after another can then take all eight. So it waits until no writer
+    /// holds `write_lock`, and lets go before its own I/O. A store therefore
+    /// loses at most one round to this client's increments: the one already
+    /// past this point when the store began. Every later increment waits for
+    /// the store to finish. The lock promises no fairness, so under a steady
+    /// run of writes an increment can wait out the run. The hybrid search
+    /// that awaits it bounds that wait (`ENRICH_BUDGET` in alaya-core) and
+    /// drops the increment past it, so the wait costs an access count, never
+    /// the search.
+    async fn access_turn(&self) -> futures::lock::MutexGuard<'_, ()> {
+        let turn = self.access_lock.lock().await;
+        drop(self.write_lock.lock().await);
+        turn
+    }
+
     /// Record one access on each point: count + 1 and a capped timestamp
     /// history, both computed from the copy the write is conditional on, so
     /// two processes counting the same hit record two accesses, not one.
-    /// The caller holds `write_lock`.
+    /// The caller holds its `access_turn`.
     async fn bump_access(&self, point_ids: &[String]) -> Result<HashMap<String, Update>> {
         let now = now_secs();
         self.update_points(
@@ -1832,7 +1856,7 @@ impl VectorStorage for QdrantClient {
 
     async fn increment_access_count(&self, content_hash: &str) -> Result<()> {
         let point_id = hash_to_uuid(content_hash)?;
-        let _write = self.write_lock.lock().await;
+        let _turn = self.access_turn().await;
         match self
             .bump_access(std::slice::from_ref(&point_id))
             .await?
@@ -1848,8 +1872,8 @@ impl VectorStorage for QdrantClient {
 
     #[tracing::instrument(skip(self), fields(n = content_hashes.len()))]
     async fn increment_access_count_batch(&self, content_hashes: &[&str]) -> Result<()> {
-        // Non-fatal throughout: an access count is ranking input, and this
-        // runs fire-and-forget after a search that has already answered.
+        // Non-fatal throughout: an access count is ranking input, and the
+        // search that awaits this has its results already.
         let point_ids: Vec<String> = content_hashes
             .iter()
             .filter_map(|h| hash_to_uuid(h).ok())
@@ -1858,7 +1882,7 @@ impl VectorStorage for QdrantClient {
             return Ok(());
         }
 
-        let _write = self.write_lock.lock().await;
+        let _turn = self.access_turn().await;
         let outcome = match self.bump_access(&point_ids).await {
             Ok(o) => o,
             Err(e) => {

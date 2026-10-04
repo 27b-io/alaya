@@ -170,6 +170,14 @@ pub struct RelationParams {
 /// up to one minute after being stored.
 const TAG_CACHE_TTL: f64 = 60.0;
 
+/// How long a non-read-only search waits for its own side-effect writes (the
+/// access-count bump and the Hebbian co-access enqueue) once its results are
+/// built. Healthy, those are a dozen fast Qdrant calls and one bridge call. The
+/// bump can also queue behind this process's writes (`QdrantClient`'s access
+/// turn), so past this budget the search answers without them: they are
+/// ranking input, not part of the answer (LAB-6896).
+const ENRICH_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Maximum number of memories to scan in `find_duplicates`. Embedding large
 /// batches blocks the LocalSet for tens of seconds. 200 memories = ~4 embedding
 /// batches of 64, keeping the total under ~10-20s instead of ~40s at 500.
@@ -1376,7 +1384,18 @@ impl MemoryService {
                 }
             };
 
-            let _ = futures::join!(access_fut, hebbian_enqueue_fut);
+            // Bounded: the results are built and these are ranking input. Past
+            // the budget they are dropped mid-flight; every write is
+            // conditional, so a cut-off bump lands whole or not at all.
+            let side_effects = async { futures::join!(access_fut, hebbian_enqueue_fut) };
+            if with_budget(ENRICH_BUDGET, side_effects).await.is_none() {
+                tracing::warn!(
+                    results = page_hashes.len(),
+                    budget_ms = ENRICH_BUDGET.as_millis() as u64,
+                    "search side-effect writes ran past their budget; \
+                     access counts and co-access pairs may not be recorded"
+                );
+            }
         }
 
         // Stage 7: Format response
@@ -3198,6 +3217,9 @@ mod tests {
     struct MockVectors {
         get_all_tags_calls: Rc<Cell<usize>>,
         tags: Vec<String>,
+        /// Set by `stuck_access`: every vector search answers this memory, and
+        /// the batch access increment never finishes.
+        stuck_access: Option<Memory>,
     }
 
     impl MockVectors {
@@ -3205,6 +3227,14 @@ mod tests {
             Self {
                 get_all_tags_calls: counter,
                 tags,
+                stuck_access: None,
+            }
+        }
+
+        fn stuck_access() -> Self {
+            Self {
+                stuck_access: Some(dummy_memory()),
+                ..Self::new(vec![], Rc::new(Cell::new(0)))
             }
         }
     }
@@ -3275,7 +3305,14 @@ mod tests {
             _l: usize,
             _f: Option<PayloadFilter>,
         ) -> Result<Vec<ScoredMemory>> {
-            Ok(vec![])
+            Ok(self
+                .stuck_access
+                .iter()
+                .map(|m| ScoredMemory {
+                    memory: m.clone(),
+                    score: 0.9,
+                })
+                .collect())
         }
         async fn search_by_tags(
             &self,
@@ -3315,6 +3352,12 @@ mod tests {
             Ok(self.tags.clone())
         }
         async fn increment_access_count(&self, _h: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn increment_access_count_batch(&self, _h: &[&str]) -> Result<()> {
+            if self.stuck_access.is_some() {
+                std::future::pending::<()>().await;
+            }
             Ok(())
         }
         async fn health(&self) -> Result<HealthStatus> {
@@ -3638,6 +3681,55 @@ mod tests {
         assert_eq!(
             h["embedding_health"]["error"],
             "Embedding generation failed"
+        );
+    }
+
+    /// A search does not wait out its own side-effect writes (LAB-6896). The
+    /// access bump is ranking input and the results are built; a bump queued
+    /// behind this process's writes must not turn a finished search into a
+    /// timeout. Paused clock: a bump that never finishes costs the search
+    /// exactly `ENRICH_BUDGET`. Lose the bound and the outer timeout fails
+    /// the test instead of hanging it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn search_does_not_wait_out_a_stuck_access_bump() {
+        let svc = MemoryService::new(
+            Box::new(MockVectors::stuck_access()),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        );
+        let params = SearchParams {
+            query: "anything at all".into(),
+            mode: SearchMode::Hybrid,
+            page: 1,
+            page_size: 10,
+            tags: None,
+            match_all: false,
+            k: 10,
+            min_similarity: None,
+            memory_type: None,
+            encoding_context: None,
+            include_superseded: false,
+            min_trust_score: None,
+            output: OutputMode::Full,
+            cursor: None,
+        };
+
+        let started = tokio::time::Instant::now();
+        let found = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            svc.search_with(params, false),
+        )
+        .await
+        .expect("the search waited on its access bump")
+        .expect("search succeeds");
+        assert_eq!(started.elapsed(), ENRICH_BUDGET);
+        assert_eq!(
+            found["results"].as_array().map(Vec::len),
+            Some(1),
+            "{found}"
         );
     }
 
