@@ -643,15 +643,17 @@ def check_gate() -> None:
             assert tune.gitleaks(texts) == Counter({"generic-api-key": 1}), texts
     finally:
         del tune.os.environ["GITLEAKS_CONFIG_TOML"]
-    # Wherever the secret sits: rendered, a type or tag ends at `;`, `,` or
-    # `)`, where gitleaks sees no secret end, and its key may sit in the field
-    # before it, so each field is scanned alone and with its neighbour.
+    # Wherever the secret sits: rendered, a tag ends at `,` or `)`, where
+    # gitleaks sees no secret end, and its key may sit in the field before it,
+    # a blank field between them included, so each field is scanned alone and
+    # with its neighbour.
     secret = leaky[a]["content"]
     for placed in (
         leaky[a],
         mem("x", 0.0, tags=("plain", secret)),
         mem("x", 0.0, memory_type=secret),
         mem("x", 0.0, tags=("creds", key, "deploy")),
+        mem("x", 0.0, tags=("creds", " ", key)),
         mem("x", 0.0, tags=(key,), memory_type="creds"),
         mem(key, 0.0, tags=("creds",)),
     ):
@@ -666,20 +668,27 @@ def check_gate() -> None:
     assert tune.render_all([pair], clean, bare) == [
         tune.render_pair(clean[a], clean[b])
     ]
-    # A gitleaks that fails stops the run, and says why.
+    # A gitleaks that fails, or hangs, stops the run, and says why.
+    real = (tune.GITLEAKS, tune.GITLEAKS_TIMEOUT_S)
     with tempfile.TemporaryDirectory() as tmp:
         broken = Path(tmp) / "gitleaks"
-        broken.write_text("#!/bin/sh\necho 'unknown flag' >&2\nexit 2\n")
-        broken.chmod(0o755)
-        tune.GITLEAKS = str(broken)
-        try:
-            tune.gitleaks(["x"])
-        except SystemExit as e:
-            assert "exited 2; nothing sent: unknown flag" in str(e), e
-        else:
-            raise AssertionError("a failing gitleaks must stop the run")
-        finally:
-            tune.GITLEAKS = "gitleaks"
+        for script, says in (
+            ("echo 'unknown flag' >&2\nexit 2", "exited 2; nothing sent: unknown flag"),
+            ("exec sleep 5", "ran past 0.5 s; nothing sent"),
+        ):
+            broken.write_text(f"#!/bin/sh\n{script}\n")
+            broken.chmod(0o755)
+            tune.GITLEAKS, tune.GITLEAKS_TIMEOUT_S = str(broken), 0.5
+            try:
+                tune.gitleaks(["x"])
+            except SystemExit as e:
+                assert says in str(e), e
+            else:
+                raise AssertionError(
+                    f"a gitleaks that runs {script!r} must stop the run"
+                )
+            finally:
+                tune.GITLEAKS, tune.GITLEAKS_TIMEOUT_S = real
 
 
 def check_key_env(real_env: dict) -> None:

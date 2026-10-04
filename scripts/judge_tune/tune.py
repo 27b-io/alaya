@@ -746,6 +746,7 @@ class Scrubber:
 
 
 GITLEAKS = "gitleaks"
+GITLEAKS_TIMEOUT_S = 300  # a whole eval's text takes it about a second
 
 
 def gitleaks(texts: list[str]) -> Counter[str]:
@@ -758,15 +759,19 @@ def gitleaks(texts: list[str]) -> Counter[str]:
     argv += ["--ignore-gitleaks-allow", "--exit-code", "0"]
     argv += ["--report-format", "json", "--report-path", "-"]
     with tempfile.TemporaryDirectory() as cwd:
-        run = subprocess.run(
-            argv,
-            input="\n\n".join(texts),
-            capture_output=True,
-            text=True,
-            cwd=cwd,
-            env={"PATH": os.environ.get("PATH", "")},
-            check=False,
-        )
+        try:
+            run = subprocess.run(
+                argv,
+                input="\n\n".join(texts),
+                capture_output=True,
+                text=True,
+                cwd=cwd,
+                env={"PATH": os.environ.get("PATH", "")},
+                check=False,
+                timeout=GITLEAKS_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            sys.exit(f"{GITLEAKS} ran past {GITLEAKS_TIMEOUT_S} s; nothing sent")
     if run.returncode:  # --redact: its stderr names no secret
         sys.exit(
             f"{GITLEAKS} exited {run.returncode}; nothing sent: {run.stderr.strip()[:500]}"
@@ -2118,8 +2123,8 @@ def render_all(
     chosen: list[Pair], memories: dict[str, dict], scrubber: Scrubber | None
 ) -> list[str]:
     """Every chosen pair as the judge sees it. Scrubbed, the run exits before
-    any request unless every rendered pair, and every field it shows on its
-    own, passes the gate (`scrub_findings`): no scrub rule still matches it,
+    any request unless every rendered pair, and every field it shows, alone
+    and joined to the next, passes the gate (`scrub_findings`): no scrub rule still matches it,
     and gitleaks finds nothing in it. gitleaks shares no rule with the
     scrubber, so a secret of a shape gitleaks knows stops the run even where
     the scrubber missed it. Neither check proves a text holds no secret: one
@@ -2128,12 +2133,14 @@ def render_all(
     shown = {h: scrubber.memory(memories[h]) if scrubber else memories[h] for h in sent}
     texts = [render_pair(shown[p.a], shown[p.b]) for p in chosen]
     if scrubber:
-        # Each field alone, and each two neighbours joined: rendered, a type or
-        # tag ends at `;`, `,` or `)`, where gitleaks sees no secret end, and a
-        # key in one field can take its value from the next.
+        # Each field alone, and each two neighbours joined: rendered, a tag ends
+        # at `,` or `)`, where gitleaks sees no secret end, and a key in one
+        # field can take its value from the next. A blank field between them
+        # would break that pair, so it is left out; it holds nothing to scan.
         fields = []
         for m in shown.values():
             seq = [m["memory_type"], *m["tags"], m["content"][:MAX_CONTENT_CHARS]]
+            seq = [f for f in seq if f.strip()]
             fields += seq + [f"{x}, {y}" for x, y in zip(seq, seq[1:])]
         found = scrub_findings(texts + fields, scrubber)
         if found:
