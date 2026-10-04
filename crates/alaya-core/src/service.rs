@@ -73,6 +73,7 @@ use crate::{
     hashing::generate_content_hash,
     hybrid_search::{self, RRF_K},
     interference, provenance, salience, spaced_repetition,
+    vitals::{Rerank, Vitals},
 };
 
 // ─── Search types ───────────────────────────────────────────────────────────
@@ -169,10 +170,25 @@ pub struct RelationParams {
 /// up to one minute after being stored.
 const TAG_CACHE_TTL: f64 = 60.0;
 
+/// How long a non-read-only search waits for its own side-effect writes (the
+/// access-count bump and the Hebbian co-access enqueue) once its results are
+/// built. Healthy, those are a dozen fast Qdrant calls and one bridge call. The
+/// bump can also queue behind this process's writes (`QdrantClient`'s access
+/// turn), so past this budget the search answers without them: they are
+/// ranking input, not part of the answer (LAB-6896).
+const ENRICH_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Maximum number of memories to scan in `find_duplicates`. Embedding large
 /// batches blocks the LocalSet for tens of seconds. 200 memories = ~4 embedding
 /// batches of 64, keeping the total under ~10-20s instead of ~40s at 500.
 const MAX_DEDUP_SCAN: usize = 200;
+
+/// Nearest neighbours the store path searches for (interference detection,
+/// novelty, the `neighbours` response field).
+const NEIGHBOUR_SEARCH_K: usize = 10;
+
+/// Live neighbours a store response reports, nearest first.
+const MAX_STORE_NEIGHBOURS: usize = 5;
 
 // ─── Search ranking weights ────────────────────────────────────────────────
 //
@@ -296,6 +312,9 @@ pub struct MemoryService {
     /// Optional cross-encoder reranker. When set, hybrid search re-scores
     /// the top-N RRF candidates as (query, doc) pairs and reorders them.
     pub reranker: Option<Box<dyn RerankingService>>,
+    /// Failure counters and the self-check's last result (LAB-4026). Shared
+    /// with the server, which reads them off the worker thread.
+    pub vitals: std::sync::Arc<Vitals>,
     /// Cached (timestamp, tags) from `get_all_tags()`. RefCell is fine:
     /// MemoryService runs single-threaded on a LocalSet (`!Send`).
     tag_cache: RefCell<Option<(f64, Vec<String>)>>,
@@ -321,6 +340,7 @@ impl MemoryService {
             summary,
             judge: None,
             reranker: None,
+            vitals: Default::default(),
             tag_cache: RefCell::new(None),
             clock: current_timestamp,
         }
@@ -330,6 +350,13 @@ impl MemoryService {
     /// re-scores the top-N RRF candidates and reorders them.
     pub fn with_reranker(mut self, reranker: Box<dyn RerankingService>) -> Self {
         self.reranker = Some(reranker);
+        self
+    }
+
+    /// Builder: share the server's counters (LAB-4026), so the health
+    /// checker sees the rerank fallbacks this service counts.
+    pub fn with_vitals(mut self, vitals: std::sync::Arc<Vitals>) -> Self {
+        self.vitals = vitals;
         self
     }
 
@@ -358,6 +385,7 @@ impl MemoryService {
             summary: None,
             judge: None,
             reranker: None,
+            vitals: Default::default(),
             tag_cache: RefCell::new(None),
             clock,
         }
@@ -457,6 +485,32 @@ impl MemoryService {
             }
         }
 
+        // The store-path neighbour search, separate from dedup's above. It
+        // runs before the write so the write can carry its novelty
+        // (`nearest_similarity`), and the same result feeds interference
+        // detection and the `neighbours` response field. Suppressed under
+        // read_only with the graph writes it feeds; a failure only loses
+        // those, never the store. Accepted cost of searching first: two
+        // related stores racing on different processes can each miss the
+        // other, so neither gets the CONTRADICTS / RELATES_TO edge; a search
+        // after the write always let the later one see the earlier.
+        let similar = if read_only {
+            None
+        } else {
+            self.vectors
+                .search_by_vector(&embedding, NEIGHBOUR_SEARCH_K, None)
+                .await
+                .inspect_err(|e| tracing::warn!("neighbour search failed (non-fatal): {e}"))
+                .ok()
+        };
+        // Other live memories, nearest first. On a re-store the search finds
+        // the record being replaced, which is never its own neighbour.
+        let live_neighbours: Vec<&ScoredMemory> = similar
+            .iter()
+            .flatten()
+            .filter(|s| s.memory.content_hash != content_hash && !is_superseded(&s.memory))
+            .collect();
+
         // Build memory struct
         let memory = Memory {
             content: params.content.clone(),
@@ -477,6 +531,7 @@ impl MemoryService {
             summary_embedding: None,
             supersession_log: None,
             supersession_reason: None,
+            nearest_similarity: live_neighbours.first().map(|s| s.score),
         };
 
         // A read-only principal's store is additive only. Re-storing content
@@ -556,18 +611,23 @@ impl MemoryService {
             tracing::warn!("graph ensure_node failed (non-fatal): {e}");
         }
 
-        // Interference detection: search for similar content + create graph edges.
-        // Suppressed under read_only: edges write to the shared owner graph
-        // (would be a side-channel to the gated `relation` tool).
+        // Interference detection over the neighbour search: create graph
+        // edges. Suppressed under read_only (no search ran): edges write to
+        // the shared owner graph (would be a side-channel to the gated
+        // `relation` tool).
         let mut contradiction_signals = Vec::new();
-        if !read_only && let Ok(similar) = self.vectors.search_by_vector(&embedding, 10, None).await
-        {
+        if let Some(similar) = &similar {
+            // Detection weighs the nine nearest other memories, superseded
+            // ones included (skipped below): the window it had when the search
+            // followed the write and the stored memory took the tenth slot.
+            let detection_window: Vec<&ScoredMemory> = similar
+                .iter()
+                .filter(|s| s.memory.content_hash != content_hash)
+                .take(NEIGHBOUR_SEARCH_K - 1)
+                .collect();
             let mut edges_to_create: Vec<(String, String, UserRelationType, EdgeMeta)> = Vec::new();
 
-            for scored in &similar {
-                if scored.memory.content_hash == content_hash {
-                    continue;
-                }
+            for scored in &detection_window {
                 // Never relate/contradict against a superseded memory (see
                 // is_superseded — the Qdrant-side filter is a no-op).
                 if is_superseded(&scored.memory) {
@@ -600,10 +660,7 @@ impl MemoryService {
             }
 
             // Cross-reference detection (lower threshold)
-            for scored in &similar {
-                if scored.memory.content_hash == content_hash {
-                    continue;
-                }
+            for scored in &detection_window {
                 if scored.score < 0.4 || scored.score >= 0.7 {
                     continue; // Only create RELATES_TO for moderate similarity
                 }
@@ -642,6 +699,24 @@ impl MemoryService {
         );
         if !tags.is_empty() {
             result.insert("tags".into(), serde_json::json!(tags));
+        }
+        // Absent, not empty, when no search ran or it failed: "no neighbours"
+        // would be a claim the server cannot make.
+        if similar.is_some() {
+            let neighbours: Vec<Value> = live_neighbours
+                .iter()
+                .take(MAX_STORE_NEIGHBOURS)
+                .map(|s| {
+                    let m = &s.memory;
+                    serde_json::json!({
+                        "content_hash": m.content_hash,
+                        "similarity": s.score,
+                        "memory_type": m.memory_type,
+                        "summary": truncate(m.summary.as_deref().unwrap_or(&m.content), 200),
+                    })
+                })
+                .collect();
+            result.insert("neighbours".into(), serde_json::json!(neighbours));
         }
 
         if !contradiction_signals.is_empty() {
@@ -755,7 +830,7 @@ impl MemoryService {
         }
         let mode_str = format!("{:?}", params.mode).to_lowercase();
         let mut result = match params.mode {
-            SearchMode::Hybrid => self.search_hybrid(&params, read_only).await?,
+            SearchMode::Hybrid => self.search_hybrid(&params, read_only).await?.0,
             SearchMode::Scan => self.search_scan(&params).await?,
             SearchMode::Similar => self.search_similar(&params).await?,
             SearchMode::Tag => self.search_tag(&params).await?,
@@ -768,8 +843,14 @@ impl MemoryService {
         Ok(result)
     }
 
+    /// The hybrid search response, plus what the rerank pass did: the
+    /// response does not carry that, and the self-check reads it.
     #[tracing::instrument(skip(self, params))]
-    async fn search_hybrid(&self, params: &SearchParams, read_only: bool) -> Result<Value> {
+    pub(crate) async fn search_hybrid(
+        &self,
+        params: &SearchParams,
+        read_only: bool,
+    ) -> Result<(Value, Rerank)> {
         let stages = StageClock::start();
         let result = self.search_hybrid_timed(params, read_only, &stages).await;
         stages.finish(result.is_ok());
@@ -783,7 +864,7 @@ impl MemoryService {
         params: &SearchParams,
         read_only: bool,
         stages: &StageClock,
-    ) -> Result<Value> {
+    ) -> Result<(Value, Rerank)> {
         if params.query.trim().is_empty() {
             return Err(AlayaError::Validation(
                 "query is required for hybrid mode".into(),
@@ -1076,15 +1157,18 @@ impl MemoryService {
         // replaces the RRF+cosine blend in the scoring loop for those entries.
         // Validated on LongMemEval (2026-05-23): R@5 0.936 → 0.990 with
         // BAAI/bge-reranker-v2-m3 and top_n=20.
-        let rerank_score_map: HashMap<String, f64> = 'rerank: {
+        // Every fallback is counted (LAB-4026): it logs a warning and the
+        // response looks the same, so the counter is the only trace a
+        // reranker that is down every time leaves behind.
+        let (rerank_score_map, rerank): (HashMap<String, f64>, Rerank) = 'rerank: {
             let Some(reranker) = self.reranker.as_ref() else {
-                break 'rerank HashMap::new();
+                break 'rerank (HashMap::new(), Rerank::NotConfigured);
             };
             let _span = tracing::info_span!("rerank", top_n = reranker.top_n()).entered();
             let _stage = stages.stage(Stage::Rerank);
             let top_n = reranker.top_n().min(fused.len());
             if top_n == 0 {
-                break 'rerank HashMap::new();
+                break 'rerank (HashMap::new(), Rerank::NoCandidates);
             }
 
             let candidate_contents: Vec<&str> = fused
@@ -1111,7 +1195,8 @@ impl MemoryService {
                         expected = top_n,
                         "rerank score count mismatch; skipping rerank"
                     );
-                    break 'rerank HashMap::new();
+                    self.vitals.rerank_failed();
+                    break 'rerank (HashMap::new(), Rerank::FellBack("score count mismatch"));
                 }
                 Some(Err(e)) => {
                     tracing::warn!(
@@ -1120,7 +1205,8 @@ impl MemoryService {
                         elapsed_ms = elapsed.as_millis() as u64,
                         "rerank failed (non-fatal); using RRF order"
                     );
-                    break 'rerank HashMap::new();
+                    self.vitals.rerank_failed();
+                    break 'rerank (HashMap::new(), Rerank::FellBack("error"));
                 }
                 None => {
                     tracing::warn!(
@@ -1128,7 +1214,8 @@ impl MemoryService {
                         elapsed_ms = elapsed.as_millis() as u64,
                         "rerank timed out (non-fatal); using RRF order"
                     );
-                    break 'rerank HashMap::new();
+                    self.vitals.rerank_failed();
+                    break 'rerank (HashMap::new(), Rerank::FellBack("timed out"));
                 }
             };
 
@@ -1154,7 +1241,7 @@ impl MemoryService {
                 reranked = map.len(),
                 "cross-encoder rerank reordered top-N candidates"
             );
-            map
+            (map, Rerank::Ran)
         };
 
         // Normalize RRF scores to [0, 1] for blending with display_score (cosine).
@@ -1307,7 +1394,18 @@ impl MemoryService {
                 }
             };
 
-            let _ = futures::join!(access_fut, hebbian_enqueue_fut);
+            // Bounded: the results are built and these are ranking input. Past
+            // the budget they are dropped mid-flight; every write is
+            // conditional, so a cut-off bump lands whole or not at all.
+            let side_effects = async { futures::join!(access_fut, hebbian_enqueue_fut) };
+            if with_budget(ENRICH_BUDGET, side_effects).await.is_none() {
+                tracing::warn!(
+                    results = page_hashes.len(),
+                    budget_ms = ENRICH_BUDGET.as_millis() as u64,
+                    "search side-effect writes ran past their budget; \
+                     access counts and co-access pairs may not be recorded"
+                );
+            }
         }
 
         // Stage 7: Format response
@@ -1334,14 +1432,17 @@ impl MemoryService {
             })
             .collect();
 
-        Ok(serde_json::json!({
-            "page": params.page,
-            "total": total,
-            "page_size": params.page_size,
-            "has_more": has_more,
-            "total_pages": total_pages,
-            "results": results,
-        }))
+        Ok((
+            serde_json::json!({
+                "page": params.page,
+                "total": total,
+                "page_size": params.page_size,
+                "has_more": has_more,
+                "total_pages": total_pages,
+                "results": results,
+            }),
+            rerank,
+        ))
     }
 
     #[tracing::instrument(skip(self, params))]
@@ -2749,7 +2850,7 @@ impl MemoryService {
 /// the per-request reqwest timeout in the backend client is the bound and
 /// surfaces as `Some(Err)`.
 #[cfg(not(target_arch = "wasm32"))]
-async fn with_budget<T>(
+pub(crate) async fn with_budget<T>(
     budget: std::time::Duration,
     fut: impl std::future::Future<Output = T>,
 ) -> Option<T> {
@@ -2757,7 +2858,7 @@ async fn with_budget<T>(
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn with_budget<T>(
+pub(crate) async fn with_budget<T>(
     _budget: std::time::Duration,
     fut: impl std::future::Future<Output = T>,
 ) -> Option<T> {
@@ -3139,6 +3240,9 @@ mod tests {
     struct MockVectors {
         get_all_tags_calls: Rc<Cell<usize>>,
         tags: Vec<String>,
+        /// Set by `stuck_access`: every vector search answers this memory, and
+        /// the batch access increment never finishes.
+        stuck_access: Option<Memory>,
     }
 
     impl MockVectors {
@@ -3146,6 +3250,14 @@ mod tests {
             Self {
                 get_all_tags_calls: counter,
                 tags,
+                stuck_access: None,
+            }
+        }
+
+        fn stuck_access() -> Self {
+            Self {
+                stuck_access: Some(dummy_memory()),
+                ..Self::new(vec![], Rc::new(Cell::new(0)))
             }
         }
     }
@@ -3170,6 +3282,7 @@ mod tests {
             summary_embedding: None,
             supersession_log: None,
             supersession_reason: None,
+            nearest_similarity: None,
         }
     }
 
@@ -3215,7 +3328,14 @@ mod tests {
             _l: usize,
             _f: Option<PayloadFilter>,
         ) -> Result<Vec<ScoredMemory>> {
-            Ok(vec![])
+            Ok(self
+                .stuck_access
+                .iter()
+                .map(|m| ScoredMemory {
+                    memory: m.clone(),
+                    score: 0.9,
+                })
+                .collect())
         }
         async fn search_by_tags(
             &self,
@@ -3256,6 +3376,12 @@ mod tests {
             Ok(self.tags.clone())
         }
         async fn increment_access_count(&self, _h: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn increment_access_count_batch(&self, _h: &[&str]) -> Result<()> {
+            if self.stuck_access.is_some() {
+                std::future::pending::<()>().await;
+            }
             Ok(())
         }
         async fn health(&self) -> Result<HealthStatus> {
@@ -3582,6 +3708,55 @@ mod tests {
         );
     }
 
+    /// A search does not wait out its own side-effect writes (LAB-6896). The
+    /// access bump is ranking input and the results are built; a bump queued
+    /// behind this process's writes must not turn a finished search into a
+    /// timeout. Paused clock: a bump that never finishes costs the search
+    /// exactly `ENRICH_BUDGET`. Lose the bound and the outer timeout fails
+    /// the test instead of hanging it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn search_does_not_wait_out_a_stuck_access_bump() {
+        let svc = MemoryService::new(
+            Box::new(MockVectors::stuck_access()),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        );
+        let params = SearchParams {
+            query: "anything at all".into(),
+            mode: SearchMode::Hybrid,
+            page: 1,
+            page_size: 10,
+            tags: None,
+            match_all: false,
+            k: 10,
+            min_similarity: None,
+            memory_type: None,
+            encoding_context: None,
+            include_superseded: false,
+            min_trust_score: None,
+            output: OutputMode::Full,
+            cursor: None,
+        };
+
+        let started = tokio::time::Instant::now();
+        let found = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            svc.search_with(params, false),
+        )
+        .await
+        .expect("the search waited on its access bump")
+        .expect("search succeeds");
+        assert_eq!(started.elapsed(), ENRICH_BUDGET);
+        assert_eq!(
+            found["results"].as_array().map(Vec::len),
+            Some(1),
+            "{found}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn health_reports_embedding_endpoint_when_up() {
         let (svc, _) = build_mock_service(vec![]);
@@ -3819,6 +3994,7 @@ mod tests {
                 summary_embedding: None,
                 supersession_log: None,
                 supersession_reason: None,
+                nearest_similarity: None,
             }
         }
     }
@@ -4237,9 +4413,14 @@ mod tests {
         }
     }
 
-    /// Mock VectorStorage that returns similar memories for interference detection.
+    /// Mock VectorStorage that returns similar memories for interference
+    /// detection, keeps every memory `store` was handed, and counts searches.
+    #[derive(Default)]
     struct MockVectorsWithSimilar {
         similar_memories: Vec<ScoredMemory>,
+        stored: Rc<RefCell<Vec<Memory>>>,
+        searches: Rc<Cell<usize>>,
+        search_fails: bool,
     }
 
     #[async_trait(?Send)]
@@ -4252,7 +4433,8 @@ mod tests {
         ) -> Result<alaya_backends::ReversalOutcome> {
             unimplemented!()
         }
-        async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
+        async fn store(&self, m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
+            self.stored.borrow_mut().push(m.clone());
             Ok((true, "mock".into()))
         }
         async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
@@ -4284,6 +4466,10 @@ mod tests {
             _l: usize,
             _f: Option<PayloadFilter>,
         ) -> Result<Vec<ScoredMemory>> {
+            self.searches.set(self.searches.get() + 1);
+            if self.search_fails {
+                return Err(AlayaError::Storage("qdrant down".into()));
+            }
             Ok(self.similar_memories.clone())
         }
         async fn search_by_tags(
@@ -4355,6 +4541,7 @@ mod tests {
                 summary_embedding: None,
                 supersession_log: None,
                 supersession_reason: None,
+                nearest_similarity: None,
             },
             score,
         }
@@ -4375,6 +4562,7 @@ mod tests {
         let svc = MemoryService::new(
             Box::new(MockVectorsWithSimilar {
                 similar_memories: similar,
+                ..Default::default()
             }),
             Box::new(MockEmbeddings),
             Box::new(MockGraphBatchTracker::new(
@@ -4387,6 +4575,189 @@ mod tests {
             None,
         );
         (svc, individual, batch, batch_edges)
+    }
+
+    // ─── Store-path neighbours and novelty ──────────────────────────────
+
+    const NEW_CONTENT: &str = "the deploy uses blue-green rollouts";
+
+    fn novelty_service(mock: MockVectorsWithSimilar) -> MemoryService {
+        MemoryService::new(
+            Box::new(mock),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        )
+    }
+
+    fn novelty_params() -> StoreParams {
+        StoreParams {
+            content: NEW_CONTENT.into(),
+            tags: None,
+            memory_type: None,
+            metadata: None,
+            client_hostname: None,
+            summary: None,
+            dedup_threshold: None,
+        }
+    }
+
+    fn superseded(mut sm: ScoredMemory) -> ScoredMemory {
+        sm.memory.metadata = Some(HashMap::from([(
+            "superseded_by".to_string(),
+            serde_json::json!("f".repeat(64)),
+        )]));
+        sm
+    }
+
+    /// The response lists up to five live neighbours, nearest first, never
+    /// the stored memory itself (found by the search on a re-store) and
+    /// never a superseded one; the write carries the nearest one's
+    /// similarity, from the same single search.
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_reports_live_neighbours_and_persists_nearest_similarity() {
+        let own = crate::hashing::generate_content_hash(NEW_CONTENT);
+        let mut summarised = make_contradicting_memory(&"5".repeat(64), "long content", 0.80);
+        summarised.memory.summary = Some("s".repeat(300));
+        summarised.memory.memory_type = "decision".into();
+        let similar = vec![
+            make_contradicting_memory(&own, NEW_CONTENT, 1.0),
+            superseded(make_contradicting_memory(&"0".repeat(64), "dead", 0.97)),
+            make_contradicting_memory(&"1".repeat(64), "one", 0.93),
+            make_contradicting_memory(&"2".repeat(64), "two", 0.90),
+            make_contradicting_memory(&"3".repeat(64), "three", 0.88),
+            make_contradicting_memory(&"4".repeat(64), &"c".repeat(300), 0.85),
+            summarised,
+            make_contradicting_memory(&"6".repeat(64), "six", 0.75),
+        ];
+        let mock = MockVectorsWithSimilar {
+            similar_memories: similar,
+            ..Default::default()
+        };
+        let (stored, searches) = (mock.stored.clone(), mock.searches.clone());
+
+        let result = novelty_service(mock)
+            .store_memory(novelty_params())
+            .await
+            .unwrap();
+
+        assert_eq!(searches.get(), 1, "one neighbour search per store");
+        let neighbours = result["neighbours"].as_array().unwrap();
+        let hashes: Vec<&str> = neighbours
+            .iter()
+            .map(|n| n["content_hash"].as_str().unwrap())
+            .collect();
+        let want: Vec<String> = ["1", "2", "3", "4", "5"]
+            .iter()
+            .map(|c| c.repeat(64))
+            .collect();
+        assert_eq!(hashes, want);
+        assert_eq!(neighbours[0]["similarity"], serde_json::json!(0.93));
+        assert_eq!(neighbours[0]["memory_type"], serde_json::json!("note"));
+        assert_eq!(neighbours[0]["summary"], serde_json::json!("one"));
+        // No summary yet: clipped content stands in, as in summary output.
+        assert_eq!(
+            neighbours[3]["summary"],
+            serde_json::json!(format!("{}...", "c".repeat(200)))
+        );
+        assert_eq!(neighbours[4]["memory_type"], serde_json::json!("decision"));
+        assert_eq!(
+            neighbours[4]["summary"],
+            serde_json::json!(format!("{}...", "s".repeat(200)))
+        );
+        assert_eq!(stored.borrow()[0].nearest_similarity, Some(0.93));
+    }
+
+    /// The search succeeded and found no live memory: an empty list and no
+    /// novelty value, which `/stats` buckets as null.
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_with_no_live_neighbour_reports_an_empty_list() {
+        let mock = MockVectorsWithSimilar {
+            similar_memories: vec![superseded(make_contradicting_memory(
+                &"0".repeat(64),
+                "dead",
+                0.97,
+            ))],
+            ..Default::default()
+        };
+        let stored = mock.stored.clone();
+        let result = novelty_service(mock)
+            .store_memory(novelty_params())
+            .await
+            .unwrap();
+        assert_eq!(result["neighbours"], serde_json::json!([]));
+        assert_eq!(stored.borrow()[0].nearest_similarity, None);
+    }
+
+    /// A read-only store runs no neighbour search (it feeds owner-graph
+    /// writes), and a failed one never fails the store: either way the field
+    /// is absent rather than an empty list, and no novelty is written.
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_without_a_neighbour_search_omits_neighbours() {
+        for (read_only, search_fails) in [(true, false), (false, true)] {
+            let mock = MockVectorsWithSimilar {
+                similar_memories: vec![make_contradicting_memory(&"1".repeat(64), "one", 0.9)],
+                search_fails,
+                ..Default::default()
+            };
+            let (stored, searches) = (mock.stored.clone(), mock.searches.clone());
+
+            let result = novelty_service(mock)
+                .store_memory_with(novelty_params(), read_only)
+                .await
+                .expect("the write happens without neighbours");
+
+            assert_eq!(result["success"], serde_json::json!(true));
+            assert!(!result.contains_key("neighbours"), "{result:?}");
+            assert_eq!(stored.borrow().len(), 1);
+            assert_eq!(stored.borrow()[0].nearest_similarity, None);
+            assert_eq!(searches.get(), usize::from(!read_only));
+        }
+    }
+
+    /// A caller cannot plant the novelty value through metadata.
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_refuses_caller_nearest_similarity() {
+        let mock = MockVectorsWithSimilar::default();
+        let stored = mock.stored.clone();
+        let mut params = novelty_params();
+        params.metadata = Some(HashMap::from([(
+            "nearest_similarity".to_string(),
+            serde_json::json!(0.1),
+        )]));
+        let err = novelty_service(mock)
+            .store_memory(params)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nearest_similarity"), "{err}");
+        assert!(stored.borrow().is_empty(), "nothing written");
+    }
+
+    /// Moving the search ahead of the write must not widen detection: it
+    /// still weighs the nine nearest other memories, as when the stored
+    /// memory itself took the tenth slot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn interference_window_is_unchanged_by_searching_before_the_write() {
+        let own = crate::hashing::generate_content_hash(
+            "Authentication is not required, it failed and cannot be used and won't work",
+        );
+        let others: Vec<ScoredMemory> = (0..10)
+            .map(|i| make_contradicting_memory(&format!("{i:064}"), "related notes", 0.55))
+            .collect();
+        let mut with_self = vec![make_contradicting_memory(&own, "self", 1.0)];
+        with_self.extend(others.iter().take(9).cloned());
+
+        for similar in [others, with_self] {
+            let (svc, _, _, batch_edges) = build_batch_test_service(similar);
+            let mut params = novelty_params();
+            params.content =
+                "Authentication is not required, it failed and cannot be used and won't work"
+                    .into();
+            svc.store_memory(params).await.unwrap();
+            assert_eq!(batch_edges.get(), 9, "nine RELATES_TO edges");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5556,6 +5927,7 @@ mod tests {
                 summary_embedding: None,
                 supersession_log: None,
                 supersession_reason: None,
+                nearest_similarity: None,
             },
             score,
         }
@@ -6554,6 +6926,136 @@ mod tests {
         );
     }
 
+    // ─── Self-check (LAB-4026) ───────────────────────────────────────────
+
+    use crate::vitals::{Rerank, SelfCheckOutcome, Step};
+
+    const SELFCHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn selfcheck_hits() -> Vec<ScoredMemory> {
+        vec![
+            make_scored_memory(&"a".repeat(64), "doc-aaaa stability first", 0.9),
+            make_scored_memory(&"b".repeat(64), "doc-bbbb stability second", 0.8),
+        ]
+    }
+
+    /// A pass with a working reranker, through mocks that count every write
+    /// a hybrid search can make: the self-check must make none of them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn self_check_passes_and_writes_nothing() {
+        let increments = Rc::new(Cell::new(0));
+        let enqueues = Rc::new(Cell::new(0));
+        let svc = MemoryService::new(
+            Box::new(MockVectorsWithInjection {
+                search_results: selfcheck_hits(),
+                access_increments: increments.clone(),
+                ..Default::default()
+            }),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(CountingHebbian(enqueues.clone())),
+            Box::new(MockConsolidation),
+            None,
+        )
+        .with_reranker(Box::new(MockReranker {
+            top_n: 2,
+            scores_by_doc_prefix: HashMap::new(),
+            sleep_for: std::time::Duration::ZERO,
+            budget: std::time::Duration::from_secs(5),
+        }));
+
+        let o = svc
+            .self_check("stability", &"b".repeat(64), SELFCHECK_BUDGET)
+            .await;
+
+        assert_eq!(
+            o,
+            SelfCheckOutcome {
+                failing_step: None,
+                error: None,
+                rerank: Some(Rerank::Ran),
+            }
+        );
+        assert_eq!(increments.get(), 0, "no access-count bump");
+        assert_eq!(enqueues.get(), 0, "no Hebbian enqueue");
+        assert_eq!(svc.vitals.snapshot()["failures"]["rerank"], 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn self_check_failing_embedder_names_the_embed_step() {
+        let svc = MemoryService::new(
+            Box::new(MockVectorsWithInjection {
+                search_results: selfcheck_hits(),
+                ..Default::default()
+            }),
+            Box::new(FailingEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        );
+
+        let o = svc
+            .self_check("stability", &"a".repeat(64), SELFCHECK_BUDGET)
+            .await;
+
+        assert_eq!(o.failing_step, Some(Step::Embed));
+        assert!(o.error.unwrap().contains("connection refused"));
+        assert_eq!(o.rerank, None, "the search never ran");
+    }
+
+    /// The expected memory is found, but RRF order was served: recorded as a
+    /// fallback, counted, and a failing check.
+    #[tokio::test(flavor = "current_thread")]
+    async fn self_check_records_a_rerank_fallback() {
+        let svc = build_rerank_test_service(selfcheck_hits(), Some(Box::new(FailingReranker)));
+
+        let o = svc
+            .self_check("stability", &"a".repeat(64), SELFCHECK_BUDGET)
+            .await;
+
+        assert_eq!(o.failing_step, Some(Step::Rerank));
+        assert_eq!(o.rerank, Some(Rerank::FellBack("error")));
+        assert_eq!(
+            o.error.as_deref(),
+            Some("rerank fell back to RRF order: error")
+        );
+        assert_eq!(svc.vitals.snapshot()["failures"]["rerank"], 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn self_check_fails_when_the_expected_memory_is_missing() {
+        let svc = build_rerank_test_service(selfcheck_hits(), None);
+
+        let o = svc
+            .self_check("stability", &"c".repeat(64), SELFCHECK_BUDGET)
+            .await;
+
+        assert_eq!(o.failing_step, Some(Step::Expect));
+        assert_eq!(o.rerank, Some(Rerank::NotConfigured));
+    }
+
+    /// A wedged embedder is cut off at the budget and the failure names the
+    /// step that was running.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn self_check_times_out_naming_the_running_step() {
+        let svc = MemoryService::new(
+            Box::new(MockVectorsWithInjection::default()),
+            Box::new(HangingEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        );
+
+        let o = svc
+            .self_check("stability", &"a".repeat(64), SELFCHECK_BUDGET)
+            .await;
+
+        assert_eq!(o.failing_step, Some(Step::Embed));
+        assert_eq!(o.error.as_deref(), Some("timed out after 10s"));
+    }
+
     /// Without a reranker, search behavior is unchanged — RRF/cosine wins.
     #[tokio::test(flavor = "current_thread")]
     async fn no_reranker_preserves_rrf_order() {
@@ -7422,6 +7924,7 @@ mod tests {
                     summary_embedding: None,
                     supersession_log: None,
                     supersession_reason: None,
+                    nearest_similarity: None,
                 }
             })
             .collect()
@@ -7766,6 +8269,7 @@ mod tests {
                 summary_embedding: None,
                 supersession_log: None,
                 supersession_reason: None,
+                nearest_similarity: None,
             }
         }
 

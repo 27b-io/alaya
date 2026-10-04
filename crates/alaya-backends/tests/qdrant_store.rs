@@ -13,7 +13,10 @@
 
 mod common;
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use alaya_backends::{StoreMode, VectorStorage, qdrant::QdrantClient};
@@ -25,7 +28,7 @@ use common::{
 };
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 /// The point id `QdrantClient` derives from `hash()`.
 const ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
@@ -60,6 +63,7 @@ fn incoming() -> Memory {
         summary_embedding: None,
         supersession_log: None,
         supersession_reason: None,
+        nearest_similarity: None,
     }
 }
 
@@ -295,6 +299,35 @@ async fn store_keeps_the_log_and_drops_a_stale_caller_marker_on_restore() {
         json!({"note": "kept"}),
         "the caller's marker is dropped, its other metadata kept"
     );
+}
+
+/// `nearest_similarity` is server-computed per store, never carried over: a
+/// re-store writes the value it just computed, and one that computed none
+/// (search skipped or failed) leaves no stale value behind.
+#[tokio::test]
+async fn restore_recomputes_nearest_similarity() {
+    for (fresh, want) in [(Some(0.42), json!(0.42)), (None, Value::Null)] {
+        let mut stored = existing_payload();
+        stored["nearest_similarity"] = json!(0.99);
+        let (server, fake) = fake_with(Some(stored)).await;
+        let mut memory = incoming();
+        memory.nearest_similarity = fresh;
+
+        client_for(&server)
+            .store(&memory, StoreMode::Upsert)
+            .await
+            .expect("store succeeds");
+
+        let point = fake.point(ID).unwrap();
+        assert_eq!(
+            point
+                .get("nearest_similarity")
+                .cloned()
+                .unwrap_or(Value::Null),
+            want,
+            "{point}"
+        );
+    }
 }
 
 /// Existence is decided on the raw point, not on whether it parses as a
@@ -611,7 +644,9 @@ async fn generated_summary_commits_only_while_summary_is_absent() {
 // Compare-and-set alone would keep the final state whole even then (the first
 // writer loses its write and retries); the client's write lock additionally
 // makes the second writer wait, so the write order below is forced and no
-// retry is spent on an in-process race.
+// retry is spent on an in-process race. The access increments hold no write
+// lock (LAB-6896): they wait for a write in progress, but no writer waits
+// for their Qdrant calls (`access_turn`).
 
 async fn parked_first_reader(payload: Value) -> (MockServer, FakeQdrant) {
     let (server, fake) = fake_with(Some(payload)).await;
@@ -807,6 +842,193 @@ async fn concurrent_batch_access_increment_cannot_land_inside_a_restore() {
     let stored = fake.point(ID).unwrap();
     assert_eq!(stored["access_count"], json!(6));
     assert_eq!(stored["access_timestamps"].as_array().unwrap().len(), 3);
+}
+
+/// An increment waits for a patch in progress, as for a store (LAB-6896):
+/// with the patch parked on its read, the increment lands after it, and the
+/// patched summary, its vector and the count all survive.
+#[tokio::test]
+async fn concurrent_access_increment_cannot_land_inside_a_patch() {
+    let (server, fake) = parked_first_reader(payload_with_summary("summary A")).await;
+    let client = client_for(&server);
+    let hash = hash();
+    let hashes = [hash.as_str()];
+    let enrichment = PatchMemoryRequest {
+        summary: Some("summary B".into()),
+        summary_embedding: Some(vec![0.5, 0.75]),
+        ..Default::default()
+    };
+
+    let (a, b) = tokio::join!(
+        client.patch_memory(&hash, &enrichment),
+        once_first_read_arrived(&server, client.increment_access_count_batch(&hashes))
+    );
+    a.expect("patch succeeds");
+    b.expect("batch increment succeeds");
+
+    assert_eq!(
+        write_order(&server).await,
+        [
+            format!("PUT {PAYLOAD_PATH}?wait=true"),
+            format!("POST {PAYLOAD_PATH}?wait=true"),
+        ],
+        "the increment runs after the patch, which loses no round"
+    );
+    let stored = fake.point(ID).unwrap();
+    assert_eq!(stored["summary"], json!("summary B"));
+    assert_eq!(stored["summary_embedding"], json!([0.5, 0.75]));
+    assert_eq!(stored["access_count"], json!(6));
+}
+
+/// A search's access increment never holds up a store (LAB-6896): with the
+/// increment parked on its read, a store of the same memory lands before
+/// that read even returns. Compare-and-set keeps both: the increment's write,
+/// built on the stale read, is rejected, re-read and re-sent.
+#[tokio::test]
+async fn store_is_not_held_behind_a_parked_access_increment() {
+    let (server, fake) = parked_first_reader(existing_payload()).await;
+    let client = client_for(&server);
+    let hash = hash();
+    let hashes = [hash.as_str()];
+    let mem = incoming();
+    let increment_done = std::cell::Cell::new(false);
+
+    let (a, b) = tokio::join!(
+        async {
+            let counted = client.increment_access_count_batch(&hashes).await;
+            increment_done.set(true);
+            counted
+        },
+        once_first_read_arrived(&server, async {
+            let stored = client.store(&mem, StoreMode::Upsert).await;
+            assert!(
+                !increment_done.get(),
+                "the store waited for the parked increment"
+            );
+            stored
+        })
+    );
+    a.expect("batch increment succeeds");
+    b.expect("store succeeds");
+
+    let order = write_order(&server).await;
+    assert_eq!(
+        order[0],
+        format!("PUT {POINTS_PATH}?wait=true"),
+        "{order:?}"
+    );
+    let stored = fake.point(ID).unwrap();
+    assert_eq!(stored["tags"], json!(["new-tag"]), "the store landed");
+    assert_eq!(stored["access_count"], json!(6), "the increment landed too");
+    assert_eq!(stored["access_timestamps"].as_array().unwrap().len(), 3);
+}
+
+/// One client's access increments still wait for each other (`access_lock`):
+/// a burst on one hot memory must not spend the retries meant for
+/// cross-process races. Two increments, two writes, no rejected round.
+#[tokio::test]
+async fn one_clients_access_increments_wait_for_each_other() {
+    let (server, fake) = parked_first_reader(existing_payload()).await;
+    let client = client_for(&server);
+    let hash = hash();
+
+    let (a, b) = tokio::join!(
+        client.increment_access_count(&hash),
+        once_first_read_arrived(&server, client.increment_access_count(&hash))
+    );
+    a.expect("first increment succeeds");
+    b.expect("second increment succeeds");
+
+    assert_eq!(writes(&server).await.len(), 2, "no retry spent in-process");
+    let stored = fake.point(ID).unwrap();
+    assert_eq!(stored["access_count"], json!(7));
+    assert_eq!(stored["access_timestamps"].as_array().unwrap().len(), 4);
+}
+
+/// Answers every full-payload read 100 ms late, counting them. Only a store's
+/// carry-over read asks for the whole payload: an increment reads its keys,
+/// and every read-back reads the revision keys.
+struct SlowFullRead {
+    fake: FakeQdrant,
+    reads: Arc<AtomicUsize>,
+}
+
+impl Respond for SlowFullRead {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.fake
+            .respond(request)
+            .set_delay(Duration::from_millis(100))
+    }
+}
+
+/// Serial search-time increments cannot starve a store of its retries
+/// (LAB-6896). An increment of the same memory is started inside each of the
+/// store's read→write windows, one after another, as successive searches
+/// would. Each one that committed inside a window would cost the store that
+/// round, and eight would exhaust it. An increment instead waits for a store
+/// in progress, so the store lands on its first round and the increment
+/// after it.
+#[tokio::test]
+async fn serial_access_increments_cannot_starve_a_store() {
+    let (server, fake) = fake_with(Some(existing_payload())).await;
+    let store_reads = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path(POINTS_PATH))
+        .and(|r: &Request| {
+            r.body_json::<Value>()
+                .is_ok_and(|b| b["with_payload"] == json!(true))
+        })
+        .respond_with(SlowFullRead {
+            fake: fake.clone(),
+            reads: store_reads.clone(),
+        })
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let client = client_for(&server);
+    let hash = hash();
+    let hashes = [hash.as_str()];
+    let store_done = Cell::new(false);
+    let mut increments = 0;
+
+    let (stored, ()) = tokio::join!(
+        async {
+            let stored = client.store(&incoming(), StoreMode::Upsert).await;
+            store_done.set(true);
+            stored
+        },
+        async {
+            for round in 1..=8 {
+                // Start the next increment inside the store's next read.
+                while store_reads.load(Ordering::SeqCst) < round && !store_done.get() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                if store_done.get() {
+                    break;
+                }
+                client
+                    .increment_access_count_batch(&hashes)
+                    .await
+                    .expect("increment succeeds");
+                increments += 1;
+            }
+        }
+    );
+    stored.expect("the store lands");
+
+    assert_eq!(
+        store_reads.load(Ordering::SeqCst),
+        1,
+        "the store lost a round to an increment"
+    );
+    let stored = fake.point(ID).unwrap();
+    assert_eq!(stored["tags"], json!(["new-tag"]), "the store landed");
+    assert_eq!(
+        stored["access_count"],
+        json!(5 + increments),
+        "every increment landed too"
+    );
 }
 
 #[tokio::test]
@@ -1042,7 +1264,7 @@ async fn run(client: &QdrantClient, writer: Writer) -> Result<(), AlayaError> {
 /// A writer that loses EVERY round gives up after exactly 8 attempts with a
 /// storage error, and never falls back to a write that could overwrite the
 /// winner: each one is insert-only or conditional on the revision it read.
-/// (The batch increment is fire-and-forget after a search: it gives up the
+/// (The batch increment is non-fatal inside a search: it gives up the
 /// same way but reports success.)
 #[tokio::test]
 async fn writer_that_loses_every_race_gives_up_after_eight_conditional_attempts() {

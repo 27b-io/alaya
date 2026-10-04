@@ -344,6 +344,7 @@ mod tests {
             summary_embedding: None,
             supersession_log: None,
             supersession_reason: None,
+            nearest_similarity: None,
         }
     }
 

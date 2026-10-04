@@ -15,6 +15,7 @@ mod build_info;
 mod cached_embedding;
 mod mcp;
 mod oidc;
+mod selfcheck;
 mod telemetry;
 #[cfg(test)]
 mod testkit;
@@ -53,6 +54,7 @@ use alaya_core::service::{
     JudgeOutcome, MemoryService, OutputMode, RelationParams, SearchParams, StoreParams,
     parse_user_relation,
 };
+use alaya_core::vitals::{CountingEmbedding, SelfCheckOutcome, Vitals};
 use alaya_types::graph::{Contradiction, ContradictionQuery, Resolution};
 use alaya_types::memory::PatchMemoryRequest;
 
@@ -95,6 +97,8 @@ struct Config {
     rerank_api_key: Option<String>,
     rerank_top_n: usize,
     rerank_timeout_ms: std::num::NonZeroU64,
+    /// Periodic self-check (LAB-4026); `None` when its env vars are unset.
+    selfcheck: Option<selfcheck::SelfCheckConfig>,
 }
 
 impl Config {
@@ -159,6 +163,12 @@ impl Config {
             rerank_timeout_ms: env_or("RERANK_TIMEOUT_MS", "5000")
                 .parse()
                 .expect("RERANK_TIMEOUT_MS must be a positive integer (ms)"),
+            selfcheck: selfcheck::parse(
+                env_non_empty("SELFCHECK_QUERY"),
+                env_non_empty("SELFCHECK_EXPECT_HASH"),
+                env_non_empty("SELFCHECK_INTERVAL_SECS"),
+            )
+            .unwrap_or_else(|e| panic!("{e}")),
         };
         // Read through the helper `init_l2_cache` uses, so the guard and the
         // cache can never disagree about which string gets dialled.
@@ -674,6 +684,16 @@ async fn ensure_qdrant_collection(qdrant: &QdrantClient, dimensions: usize) {
 
 const CMD_CHANNEL_CAP: usize = 256;
 
+/// Searches one process runs at a time (LAB-6896). Searches run off the
+/// worker loop, so none of them holds up a store, but they still run one at
+/// a time, as they did inline: Qdrant is where a slow search spends its time,
+/// and a higher bound would put more concurrent load on it.
+const SEARCH_CONCURRENCY: usize = 1;
+/// Searches outstanding, queued or running, past which a new one is refused.
+/// A spawned search has left the command channel, so this is the queue bound
+/// the channel used to give them, at the same depth.
+const SEARCH_BACKLOG_MAX: usize = CMD_CHANNEL_CAP;
+
 // Wedge protection (#63): the worker serializes all ops through one channel,
 // so a single await that never resolves used to freeze the whole service —
 // invisibly, because /health bypasses the worker. Three layers fix that:
@@ -824,6 +844,13 @@ pub(crate) enum CmdInner {
     Stats {
         reply: oneshot::Sender<Value>,
     },
+    /// One self-check (LAB-4026), sent by the self-check task only — not
+    /// exposed over REST or MCP. Read-only.
+    SelfCheck {
+        query: String,
+        expect_hash: String,
+        reply: oneshot::Sender<SelfCheckOutcome>,
+    },
 }
 
 impl CmdInner {
@@ -860,6 +887,7 @@ impl Cmd {
             CmdInner::BackfillSummaries { .. } => "backfill_summaries",
             CmdInner::BackfillContradictions { .. } => "backfill_contradictions",
             CmdInner::Stats { .. } => "stats",
+            CmdInner::SelfCheck { .. } => "selfcheck",
         }
     }
 }
@@ -899,8 +927,22 @@ impl ServiceHandle {
         let reply_deadline = op.inner.deadline() + REPLY_MARGIN;
         self.try_dispatch(op)?;
         match tokio::time::timeout(reply_deadline, rx).await {
+            // A worker-side queue refused it (the search backlog): the same
+            // answer as a full channel, so callers see one overload signal.
+            Ok(Ok(v)) if v["error_kind"] == "overloaded" => Err((
+                -32000,
+                v["error"]
+                    .as_str()
+                    .unwrap_or("Service overloaded")
+                    .to_string(),
+            )),
             Ok(Ok(v)) => Ok(v),
-            Ok(Err(_)) => Err((-32000, "service dropped response".to_string())),
+            Ok(Err(_)) => {
+                // A spawned handler that panicked ends here, with the pod
+                // still up: this line is the only structured record of it.
+                tracing::error!(op = op_name, "service worker dropped the reply");
+                Err((-32000, "service dropped response".to_string()))
+            }
             Err(_) => {
                 tracing::error!(
                     op = op_name,
@@ -920,8 +962,8 @@ impl ServiceHandle {
     }
 
     /// REST wrapper over `call_rpc`. Op-level errors ride inside a 200 body
-    /// (unchanged convention), but dispatch/transport failures — full channel,
-    /// closed channel, no reply within deadline — are 503, matching
+    /// (unchanged convention), but dispatch/transport failures — full channel
+    /// or search backlog, closed channel, no reply within deadline — are 503, matching
     /// `patch_memory`/`get_memory` so overload/stall semantics are uniform.
     async fn call(
         &self,
@@ -963,10 +1005,17 @@ struct HealthChecker {
     /// Last Qdrant verdict, written by the pinger via `refresh_qdrant` and
     /// read by the bare probe — which therefore never touches Qdrant itself.
     qdrant_ok: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Failure counters and the last self-check (LAB-4026), written on the
+    /// worker thread. Read by the detail view only, never the bare probe.
+    vitals: std::sync::Arc<Vitals>,
 }
 
 impl HealthChecker {
-    fn new(config: &Config, worker_progress: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+    fn new(
+        config: &Config,
+        worker_progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        vitals: std::sync::Arc<Vitals>,
+    ) -> Self {
         // One client, three backends: each credential is attached per
         // request (`bearer_auth`), never as a client default header, so
         // Qdrant's bearer is not sent to the embedding endpoint or the bridge.
@@ -983,6 +1032,7 @@ impl HealthChecker {
             stall_threshold: WORKER_STALL_THRESHOLD,
             clock: monotonic_secs,
             qdrant_ok: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            vitals,
         }
     }
 
@@ -1202,9 +1252,12 @@ impl HealthChecker {
     /// worker-stall 503 contract (#63), and a restart does not fix TEI.
     async fn check_detail(&self) -> Value {
         let (mut v, embedding) = tokio::join!(self.check(), self.check_embedding());
-        if embedding.is_err() && v["status"] == "healthy" {
+        // A failing self-check degrades like a dead endpoint (LAB-4026): the
+        // embedder can answer `/health` and still fail every embed.
+        if (embedding.is_err() || self.vitals.selfcheck_failing()) && v["status"] == "healthy" {
             v["status"] = json!("degraded");
         }
+        v["pod"] = self.vitals.snapshot();
         v["embedding_health"] = match embedding {
             Ok(e) => e,
             Err(e) => json!({ "status": "unhealthy", "error": e }),
@@ -1272,8 +1325,17 @@ impl Drop for InFlight {
 /// Runs MemoryService on a LocalSet, processing commands from the channel.
 ///
 /// Wraps the service in `Rc` so long-running operations (find_duplicates,
-/// merge_duplicates) can be spawned as local tasks without blocking the
-/// command loop. Other commands continue processing while they run.
+/// merge_duplicates) and searches can be spawned as local tasks without
+/// blocking the command loop. Other commands continue processing while they
+/// run. The single-memory writes (store, delete, supersede, unsupersede,
+/// patch, relation, contradiction resolution) run inline, one at a time, in
+/// arrival order. Spawned tasks write too: merge_duplicates and both
+/// backfills, a search's access-count bump and Hebbian enqueue, and a store's
+/// summary and judge follow-ups. Their vector-store writes are ordered
+/// against the inline ones only by the backend's compare-and-set and its
+/// locks; a search's access bump waits for a write in progress but holds no
+/// lock a store waits on. Their graph writes (Hebbian, judge verdicts,
+/// relation edges) are unordered and non-fatal.
 ///
 /// Every handler await is bounded by `limits` (#63), and `progress` is
 /// stamped after each command so the health watchdog can tell a draining
@@ -1307,6 +1369,12 @@ async fn service_worker(
     let judge_limiter = std::rc::Rc::new(std::cell::RefCell::new(JudgeDailyCap::new(
         limits.judge_daily_cap,
     )));
+    // Searches run in spawned tasks: the gate keeps them one at a time, the
+    // slots bound how many are outstanding (SEARCH_CONCURRENCY,
+    // SEARCH_BACKLOG_MAX). `Arc` for the slots: `try_acquire_owned` needs it.
+    let search_gate = std::rc::Rc::new(tokio::sync::Semaphore::new(SEARCH_CONCURRENCY));
+    let search_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(SEARCH_BACKLOG_MAX));
+    let mut search_backlog_warned = false;
 
     // First heartbeat: bootstrap is done and the loop is live. Until this
     // stamp the health checker reports the worker as "starting" (progress
@@ -1422,57 +1490,113 @@ async fn service_worker(
 
                         json!(r)
                     }
+                    // Counted (LAB-4026) unless the caller sent a bad request.
                     Ok(Err(e)) => {
+                        if !matches!(e, alaya_types::AlayaError::Validation(_)) {
+                            svc.vitals.store_failed();
+                        }
                         log_err(op, &e, start);
                         json!({"success": false, "error": e.safe_message()})
                     }
-                    Err(_) => deadline_exceeded(op, limits.cmd, start),
+                    Err(_) => {
+                        svc.vitals.store_failed();
+                        deadline_exceeded(op, limits.cmd, start)
+                    }
                 };
                 let _ = reply.send(result);
             }
+            CmdInner::Search { reply, .. } if search_slots.available_permits() == 0 => {
+                // WARN on the first refusal since a search was last admitted,
+                // debug after: under sustained saturation, at most one WARN
+                // per search that completes.
+                if std::mem::replace(&mut search_backlog_warned, true) {
+                    tracing::debug!(op, max = SEARCH_BACKLOG_MAX, "search backlog full");
+                } else {
+                    tracing::warn!(op, max = SEARCH_BACKLOG_MAX, "search backlog full");
+                }
+                // `call_rpc` answers this kind as it answers a full channel.
+                let _ = reply.send(json!({
+                    "success": false,
+                    "error_kind": "overloaded",
+                    "error": "search backlog full, try again later",
+                }));
+            }
+            // Spawned, not awaited (LAB-6896): a slow search held every store
+            // queued behind it past its caller's timeout. `search_gate` still
+            // runs searches one at a time, in arrival order; the deadline
+            // starts once a search holds it, as it started at pickup inline.
             CmdInner::Search {
                 params,
                 read_only,
                 reply,
             } => {
+                search_backlog_warned = false;
+                let slot = search_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("checked by the arm above, on this thread");
                 let mode = format!("{:?}", params.mode).to_lowercase();
                 let query_preview = truncate(&params.query, 80);
                 let page = params.page;
                 let page_size = params.page_size;
                 let tag_count = params.tags.as_ref().map(|t| t.len()).unwrap_or(0);
                 let mem_type = params.memory_type.clone().unwrap_or_default();
-                let span = tracing::info_span!(parent: &ps, "search", %mode, read_only);
-                let result = match timeout(
-                    limits.cmd,
-                    svc.search_with(params, read_only).instrument(span),
-                )
-                .await
-                {
-                    Ok(Ok(r)) => {
-                        let n = result_count(&r);
-                        let has_more = r.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
-                        tracing::info!(
-                            op,
-                            mode = mode.as_str(),
-                            query = query_preview.as_str(),
-                            results = n,
-                            has_more,
-                            page,
-                            page_size,
-                            tag_count,
-                            mem_type = mem_type.as_str(),
-                            elapsed_ms = ms(start),
-                            "ok"
-                        );
-                        r
+                // `queued_ms` is recorded once the search holds the gate, so
+                // its ok, failed and timeout lines all carry the wait.
+                let span = tracing::info_span!(parent: &ps, "search", %mode, read_only,
+                    queued_ms = tracing::field::Empty);
+                let svc = svc.clone();
+                let gate = search_gate.clone();
+                let deadline = limits.cmd;
+                tokio::task::spawn_local(
+                    async move {
+                        let _slot = slot;
+                        let _running = gate.acquire().await.expect("search gate is never closed");
+                        tracing::Span::current().record("queued_ms", ms(start));
+                        // Nobody is waiting for it: running it would only
+                        // delay the searches behind it and bump access
+                        // counts for results no one received.
+                        if reply.is_closed() {
+                            tracing::info!(
+                                op,
+                                query = query_preview.as_str(),
+                                "caller gone before the search ran; skipped"
+                            );
+                            return;
+                        }
+                        let running_since = std::time::Instant::now();
+                        let result = match timeout(deadline, svc.search_with(params, read_only))
+                            .await
+                        {
+                            Ok(Ok(r)) => {
+                                let n = result_count(&r);
+                                let has_more =
+                                    r.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
+                                tracing::info!(
+                                    op,
+                                    mode = mode.as_str(),
+                                    query = query_preview.as_str(),
+                                    results = n,
+                                    has_more,
+                                    page,
+                                    page_size,
+                                    tag_count,
+                                    mem_type = mem_type.as_str(),
+                                    elapsed_ms = ms(running_since),
+                                    "ok"
+                                );
+                                r
+                            }
+                            Ok(Err(e)) => {
+                                log_err(op, &e, running_since);
+                                json!({"error": e.safe_message()})
+                            }
+                            Err(_) => deadline_exceeded(op, deadline, running_since),
+                        };
+                        let _ = reply.send(result);
                     }
-                    Ok(Err(e)) => {
-                        log_err(op, &e, start);
-                        json!({"error": e.safe_message()})
-                    }
-                    Err(_) => deadline_exceeded(op, limits.cmd, start),
-                };
-                let _ = reply.send(result);
+                    .instrument(span),
+                );
             }
             CmdInner::Delete { hash, reply } => {
                 let span = tracing::info_span!(parent: &ps, "delete");
@@ -1924,7 +2048,7 @@ async fn service_worker(
                 tokio::task::spawn_local(
                     async move {
                         let _flight = flight;
-                        let result = match timeout(deadline, svc.corpus_stats()).await {
+                        let mut result = match timeout(deadline, svc.corpus_stats()).await {
                             Ok(mut v) => {
                                 v["judge_daily_cap"] = cap;
                                 let errors = v["errors"].as_array().map_or(0, Vec::len);
@@ -1933,10 +2057,28 @@ async fn service_worker(
                             }
                             Err(_) => deadline_exceeded(op, deadline, start),
                         };
+                        // Even past the deadline: when the backends are slow
+                        // is exactly when the failure counters matter.
+                        result["pod"] = svc.vitals.snapshot();
                         let _ = reply.send(result);
                     }
                     .instrument(span),
                 );
+            }
+            CmdInner::SelfCheck {
+                query,
+                expect_hash,
+                reply,
+            } => {
+                // Spawned: a wedged embedder holds the check for its whole
+                // budget, and real traffic must not queue behind it.
+                let svc = svc.clone();
+                tokio::task::spawn_local(async move {
+                    let outcome = svc
+                        .self_check(&query, &expect_hash, selfcheck::BUDGET)
+                        .await;
+                    let _ = reply.send(outcome);
+                });
             }
             CmdInner::BackfillContradictions {
                 limit,
@@ -2545,6 +2687,16 @@ fn main() {
         let worker_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let progress_for_worker = worker_progress.clone();
 
+        // Failure counters and the self-check result (LAB-4026): written by
+        // the worker, read by the health checker. Kubernetes sets HOSTNAME
+        // to the pod name; the counters are per pod, so say which.
+        let vitals = std::sync::Arc::new(Vitals::new(
+            env_non_empty("HOSTNAME").unwrap_or_else(|| "unknown".into()),
+            epoch_secs(),
+            config.selfcheck.is_some(),
+        ));
+        let vitals_for_worker = vitals.clone();
+
         // Built here, on the main thread, so bad bearer material is a
         // fail-closed startup panic (non-zero exit) like the auth invariants
         // below — not a panic inside the worker thread (#97). The value is
@@ -2654,6 +2806,9 @@ fn main() {
                 // L2 embedding cache via cachekit-rs (optional) — backend
                 // selected by CACHE_BACKEND (redis default, saas).
                 let l2_cache = init_l2_cache().await;
+                // Counted under the cache: a cache hit is not an embed call
+                // that could fail.
+                let embeddings = CountingEmbedding::new(Box::new(embeddings), vitals_for_worker.clone());
                 let cached_embeddings = cached_embedding::CachedEmbedding::new(
                     Box::new(embeddings),
                     10_000, // L1 max cached embeddings (~40 MB at 1024 dims)
@@ -2671,7 +2826,8 @@ fn main() {
                     Box::new(HebbianRef(graph.clone())),
                     Box::new(ConsolidationRef(graph)),
                     summary,
-                );
+                )
+                .with_vitals(vitals_for_worker);
 
                 if let Some(judge) = judge {
                     svc = svc.with_judge(Box::new(judge));
@@ -2699,7 +2855,7 @@ fn main() {
         // reqwest::Client. Prevents health probe timeouts during long ops.
         // The worker_progress watchdog covers the blind spot that bypass
         // created (#63): a wedged worker now turns /health unhealthy (503).
-        let checker = HealthChecker::new(&config, worker_progress);
+        let checker = HealthChecker::new(&config, worker_progress, vitals.clone());
 
         // Pinger: sends a no-op Ping through the worker channel so progress
         // stays fresh while idle. try_send on purpose — if the channel is
@@ -2724,6 +2880,11 @@ fn main() {
                 }
             })
         };
+
+        let selfcheck_task = config
+            .selfcheck
+            .clone()
+            .map(|cfg| selfcheck::spawn(handle.clone(), cfg, vitals));
 
         let protected = protected_router(handle, auth_state.clone());
 
@@ -2772,9 +2933,13 @@ fn main() {
             .await
             .expect("server error");
 
-        // The pinger holds a ServiceHandle clone — abort it or the worker's
-        // rx.recv() never sees the channel close and the drain below hangs.
+        // The pinger and the self-check task hold ServiceHandle clones — abort
+        // them or the worker's rx.recv() never sees the channel close and the
+        // drain below hangs.
         pinger.abort();
+        if let Some(t) = selfcheck_task {
+            t.abort();
+        }
 
         // axum returned — all in-flight requests done, router (and its
         // ServiceHandle/Sender clones) dropped. The worker's rx.recv()
@@ -4860,10 +5025,10 @@ mod wedge_tests {
     impl EmbeddingProvider for StubEmbeddings {
         async fn embed_batch(
             &self,
-            _texts: &[&str],
+            texts: &[&str],
             _prompt_name: PromptName,
         ) -> Result<Vec<Vec<f32>>> {
-            unimplemented!()
+            Ok(vec![vec![0.5; 4]; texts.len()])
         }
         fn dimensions(&self) -> usize {
             4
@@ -4881,7 +5046,8 @@ mod wedge_tests {
     }
 
     /// Graph whose stats reads blackhole, like `HangVectors`, or panic with
-    /// `panic_stats` set; the rest panic unless a test needs them.
+    /// `panic_stats` set. The writes a store makes and the boosts a hybrid
+    /// search reads answer at once; the rest panic unless a test needs them.
     struct StubGraph {
         panic_stats: bool,
     }
@@ -4914,7 +5080,7 @@ mod wedge_tests {
             unimplemented!()
         }
         async fn ensure_node(&self, _content_hash: &str, _created_at: f64) -> Result<()> {
-            unimplemented!()
+            Ok(())
         }
         async fn delete_node(&self, _content_hash: &str) -> Result<()> {
             unimplemented!()
@@ -4926,7 +5092,7 @@ mod wedge_tests {
             _rel: UserRelationType,
             _meta: EdgeMeta,
         ) -> Result<bool> {
-            unimplemented!()
+            Ok(true)
         }
         async fn get_typed_edges(
             &self,
@@ -5002,10 +5168,10 @@ mod wedge_tests {
             _min_activation: f64,
             _limit: usize,
         ) -> Result<HashMap<String, f64>> {
-            unimplemented!()
+            Ok(HashMap::new())
         }
         async fn hebbian_boosts_within(&self, _hashes: &[&str]) -> Result<HashMap<String, f64>> {
-            unimplemented!()
+            Ok(HashMap::new())
         }
         async fn get_contradiction_stats(
             &self,
@@ -5318,6 +5484,422 @@ mod wedge_tests {
             .await;
     }
 
+    /// How long `SlowSearchVectors` holds every hybrid search.
+    const SLOW_SEARCH: Duration = Duration::from_secs(30);
+    /// The store caller's patience: a 10 s client timeout.
+    const STORE_BUDGET: Duration = Duration::from_secs(10);
+    /// Outer bound on any reply await, so a wedge fails instead of hanging.
+    const NEVER: Duration = Duration::from_secs(3600);
+
+    /// VectorStorage whose `search_by_tags` takes `SLOW_SEARCH`. Only hybrid
+    /// search calls it, and every one does, the tag cache notwithstanding:
+    /// `get_all_tags` answers "flag", a keyword of the test query. The store
+    /// path runs at full speed: its `search_by_vector` answers `neighbour` at
+    /// once, and `stored` records every write. Methods neither path calls
+    /// panic.
+    struct SlowSearchVectors {
+        neighbour: Memory,
+        stored: std::rc::Rc<std::cell::RefCell<Vec<Memory>>>,
+    }
+
+    #[async_trait(?Send)]
+    impl VectorStorage for SlowSearchVectors {
+        async fn reverse_supersession(
+            &self,
+            _h: &str,
+            _e: &serde_json::Value,
+            _r: &alaya_backends::ReversalRecord,
+        ) -> Result<alaya_backends::ReversalOutcome> {
+            unimplemented!()
+        }
+        async fn store(&self, memory: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
+            self.stored.borrow_mut().push(memory.clone());
+            Ok((true, memory.content_hash.clone()))
+        }
+        async fn get_by_hash(&self, _content_hash: &str) -> Result<Option<Memory>> {
+            unimplemented!()
+        }
+        async fn set_generated_summary(
+            &self,
+            _content_hash: &str,
+            _summary: &str,
+            _summary_embedding: Option<Vec<f32>>,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn get_batch(&self, _hashes: &[&str]) -> Result<Vec<Memory>> {
+            unimplemented!()
+        }
+        async fn delete(&self, _content_hash: &str) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn update_metadata(
+            &self,
+            _content_hash: &str,
+            _updates: MetadataUpdate,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+        async fn patch_memory(
+            &self,
+            _content_hash: &str,
+            _patch: &PatchMemoryRequest,
+        ) -> Result<Memory> {
+            unimplemented!()
+        }
+        async fn search_by_vector(
+            &self,
+            _embedding: &[f32],
+            _limit: usize,
+            _filters: Option<PayloadFilter>,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(vec![ScoredMemory {
+                memory: self.neighbour.clone(),
+                score: 0.9,
+            }])
+        }
+        async fn search_by_tags(
+            &self,
+            _tags: &[&str],
+            _match_all: bool,
+            _limit: usize,
+            _mt: Option<&str>,
+        ) -> Result<Vec<ScoredMemory>> {
+            tokio::time::sleep(SLOW_SEARCH).await;
+            Ok(Vec::new())
+        }
+        async fn search_similar_tags(
+            &self,
+            _tag_embedding: &[f32],
+            _limit: usize,
+        ) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
+            Ok(())
+        }
+        async fn get_all(&self, _limit: usize, _offset: Option<&str>) -> Result<ScrollResult> {
+            unimplemented!()
+        }
+        async fn get_recent(
+            &self,
+            _limit: usize,
+            _start_from: Option<f64>,
+            _memory_type: Option<&str>,
+        ) -> Result<Vec<Memory>> {
+            unimplemented!()
+        }
+        async fn count(&self) -> Result<usize> {
+            Ok(1)
+        }
+        async fn get_all_tags(&self) -> Result<Vec<String>> {
+            Ok(vec!["flag".into()])
+        }
+        async fn increment_access_count(&self, _content_hash: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            unimplemented!()
+        }
+    }
+
+    /// A worker over `SlowSearchVectors`, run until `body` ends. `body` gets
+    /// the command sender, the neighbour every vector search answers, and the
+    /// record of stores.
+    async fn with_slow_search_worker<F>(
+        limits: WorkerLimits,
+        body: impl FnOnce(mpsc::Sender<Cmd>, Memory, std::rc::Rc<std::cell::RefCell<Vec<Memory>>>) -> F,
+    ) where
+        F: std::future::Future<Output = ()>,
+    {
+        let neighbour: Memory = serde_json::from_value(json!({
+            "content": "enable the flag", "content_hash": "b".repeat(64), "tags": [],
+            "memory_type": "note", "created_at": 0.0, "updated_at": 0.0,
+        }))
+        .expect("memory");
+        let stored = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let svc = MemoryService::new(
+            Box::new(SlowSearchVectors {
+                neighbour: neighbour.clone(),
+                stored: stored.clone(),
+            }),
+            Box::new(StubEmbeddings),
+            Box::new(StubGraph { panic_stats: false }),
+            Box::new(StubHebbian),
+            Box::new(StubConsolidation),
+            None,
+        );
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::channel::<Cmd>(8);
+                tokio::task::spawn_local(service_worker(
+                    rx,
+                    svc,
+                    Arc::new(AtomicU64::new(0)),
+                    limits,
+                ));
+                body(tx, neighbour, stored).await;
+            })
+            .await;
+    }
+
+    /// The hybrid search every test here sends: its keyword "flag" is the
+    /// tag `SlowSearchVectors` knows.
+    fn hybrid_search(reply: oneshot::Sender<Value>) -> CmdInner {
+        let params: SearchParams =
+            serde_json::from_value(json!({ "query": "flag state", "mode": "hybrid" }))
+                .expect("search params");
+        CmdInner::Search {
+            params,
+            read_only: false,
+            reply,
+        }
+    }
+
+    /// Enqueues one hybrid search and returns its reply receiver.
+    async fn send_hybrid_search(tx: &mpsc::Sender<Cmd>) -> oneshot::Receiver<Value> {
+        let (reply, answer) = oneshot::channel();
+        tx.send(Cmd {
+            inner: hybrid_search(reply),
+            span: tracing::Span::none(),
+        })
+        .await
+        .unwrap();
+        answer
+    }
+
+    /// LAB-6896: `searches` hybrid searches, each holding its
+    /// tag branch for `SLOW_SEARCH`, then a store 1 ms later. The store's
+    /// reply must arrive within `STORE_BUDGET` of its own enqueue. A worker
+    /// that awaits searches inline answers it only after every search ahead
+    /// of it, at least `searches × SLOW_SEARCH` later. The store must also be
+    /// the store it was: written exactly once under its content hash, with
+    /// interference detection run against its neighbour.
+    async fn store_is_not_held_behind(searches: usize) {
+        with_slow_search_worker(
+            WorkerLimits::default(),
+            |tx, neighbour, stored| async move {
+                let mut search_replies = Vec::new();
+                for _ in 0..searches {
+                    search_replies.push(send_hybrid_search(&tx).await);
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+
+                // "disable" against the neighbour's "enable": an antonym signal.
+                let content = "disable the flag";
+                let (reply, answer) = oneshot::channel();
+                let enqueued = tokio::time::Instant::now();
+                tx.send(Cmd {
+                    inner: CmdInner::Store {
+                        params: StoreParams {
+                            content: content.into(),
+                            tags: Some(vec!["flag".into()]),
+                            memory_type: None,
+                            metadata: None,
+                            client_hostname: None,
+                            summary: None,
+                            dedup_threshold: None,
+                        },
+                        read_only: false,
+                        reply,
+                    },
+                    span: tracing::Span::none(),
+                })
+                .await
+                .unwrap();
+                let stored_reply = tokio::time::timeout(NEVER, answer)
+                    .await
+                    .expect("store never replied")
+                    .expect("store reply dropped");
+                let waited = enqueued.elapsed();
+                assert!(
+                    waited < STORE_BUDGET,
+                    "store replied {waited:?} after its enqueue, behind {searches} slow search(es)"
+                );
+
+                let hash = alaya_core::hashing::generate_content_hash(content);
+                assert_eq!(stored_reply["success"], true, "{stored_reply}");
+                assert_eq!(stored_reply["content_hash"], json!(hash), "{stored_reply}");
+                assert_eq!(
+                    stored_reply["interference"]["contradictions"][0]["existing_hash"],
+                    json!(neighbour.content_hash),
+                    "interference detection did not run: {stored_reply}"
+                );
+
+                // Every search still answers, with its result.
+                for answer in search_replies {
+                    let found = tokio::time::timeout(NEVER, answer)
+                        .await
+                        .expect("search never replied")
+                        .expect("search reply dropped");
+                    assert!(found.get("error").is_none(), "{found}");
+                    assert_eq!(found["mode"], "hybrid", "{found}");
+                }
+                // Counted after every search is done: nothing wrote it twice.
+                let stored = stored.borrow();
+                assert_eq!(stored.len(), 1, "store landed {} times", stored.len());
+                assert_eq!(stored[0].content_hash, hash);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn store_is_not_held_behind_a_running_slow_search() {
+        store_is_not_held_behind(1).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn store_is_not_held_behind_a_running_and_a_queued_slow_search() {
+        store_is_not_held_behind(2).await;
+    }
+
+    /// The #63 deadline, for a spawned search: past its deadline a search
+    /// replies `error_kind: "timeout"` and frees the running permit, so the
+    /// search queued behind it runs, with its own full deadline, and does the
+    /// same.
+    #[tokio::test(start_paused = true)]
+    async fn search_past_its_deadline_times_out_and_frees_the_next() {
+        let limits = WorkerLimits {
+            cmd: SLOW_SEARCH / 3,
+            ..WorkerLimits::default()
+        };
+        with_slow_search_worker(limits, |tx, _, _| async move {
+            let start = tokio::time::Instant::now();
+            let first = send_hybrid_search(&tx).await;
+            let second = send_hybrid_search(&tx).await;
+            for (n, answer) in [first, second].into_iter().enumerate() {
+                let reply = tokio::time::timeout(NEVER, answer)
+                    .await
+                    .expect("search never replied — worker wedged")
+                    .expect("search reply dropped");
+                assert_eq!(reply["error_kind"], "timeout", "search {n}: {reply}");
+                // Run one after the other, each for its whole deadline.
+                assert_eq!(start.elapsed(), (SLOW_SEARCH / 3) * (n as u32 + 1));
+            }
+        })
+        .await;
+    }
+
+    /// Spawned searches have left the command channel, so the worker bounds
+    /// them itself, at the depth the channel refused at: past
+    /// `SEARCH_BACKLOG_MAX` outstanding a search is refused, as a full
+    /// channel is (MCP -32000, REST 503), and other commands still run.
+    #[tokio::test(start_paused = true)]
+    async fn search_backlog_is_bounded_and_refusal_blocks_nothing() {
+        use tokio::sync::oneshot::error::TryRecvError;
+
+        with_slow_search_worker(WorkerLimits::default(), |tx, _, _| async move {
+            let mut held = Vec::new();
+            for _ in 0..SEARCH_BACKLOG_MAX {
+                held.push(send_hybrid_search(&tx).await);
+            }
+            // Let the worker drain the channel, so the refusals below are the
+            // backlog's and not a full channel's.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            let handle = ServiceHandle { tx: tx.clone() };
+            let refusal = "search backlog full, try again later".to_string();
+
+            let (reply, answer) = oneshot::channel();
+            let rpc =
+                tokio::time::timeout(STORE_BUDGET, handle.call_rpc(hybrid_search(reply), answer))
+                    .await
+                    .expect("refusal queued behind the backlog");
+            assert_eq!(rpc.unwrap_err(), (-32000, refusal.clone()));
+
+            let (reply, answer) = oneshot::channel();
+            let (status, Json(body)) =
+                tokio::time::timeout(STORE_BUDGET, handle.call(hybrid_search(reply), answer))
+                    .await
+                    .expect("refusal queued behind the backlog");
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert_eq!(body["error"], json!(refusal));
+
+            let (ptx, prx) = oneshot::channel();
+            tx.send(Cmd {
+                inner: CmdInner::Ping { reply: ptx },
+                span: tracing::Span::none(),
+            })
+            .await
+            .unwrap();
+            let pong = tokio::time::timeout(STORE_BUDGET, prx)
+                .await
+                .expect("ping queued behind the backlog")
+                .unwrap();
+            assert_eq!(pong["ok"], true);
+            assert!(
+                held.iter_mut()
+                    .all(|r| matches!(r.try_recv(), Err(TryRecvError::Empty))),
+                "a held search answered or was dropped"
+            );
+        })
+        .await;
+    }
+
+    /// A queued search whose caller has gone is skipped when its turn comes,
+    /// so the search behind it starts at once, not a whole search later.
+    #[tokio::test(start_paused = true)]
+    async fn queued_search_whose_caller_left_is_skipped() {
+        with_slow_search_worker(WorkerLimits::default(), |tx, _, _| async move {
+            let start = tokio::time::Instant::now();
+            let first = send_hybrid_search(&tx).await;
+            drop(send_hybrid_search(&tx).await);
+            let third = send_hybrid_search(&tx).await;
+            for (answer, ends_at) in [(first, SLOW_SEARCH), (third, SLOW_SEARCH * 2)] {
+                let found = tokio::time::timeout(NEVER, answer)
+                    .await
+                    .expect("search never replied")
+                    .expect("search reply dropped");
+                assert!(found.get("error").is_none(), "{found}");
+                assert_eq!(start.elapsed(), ends_at);
+            }
+        })
+        .await;
+    }
+
+    /// A search that panics ends its own task only. Its caller sees the reply
+    /// dropped, the gate and slot are released, so the next search runs (and
+    /// panics the same way), and the loop keeps serving. Inline, a panicking
+    /// search took the worker, and with it the process, down.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_search_fails_alone() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::channel::<Cmd>(8);
+                // `HangVectors::get_all_tags` panics: hybrid search calls it first.
+                tokio::task::spawn_local(service_worker(
+                    rx,
+                    hanging_service(),
+                    Arc::new(AtomicU64::new(0)),
+                    WorkerLimits::default(),
+                ));
+                for call in 1..=2 {
+                    let answer = send_hybrid_search(&tx).await;
+                    let dropped = tokio::time::timeout(STORE_BUDGET, answer)
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!("search {call} wedged: the gate was never freed")
+                        });
+                    assert!(dropped.is_err(), "search {call} answered: {dropped:?}");
+                }
+                let (ptx, prx) = oneshot::channel();
+                tx.send(Cmd {
+                    inner: CmdInner::Ping { reply: ptx },
+                    span: tracing::Span::none(),
+                })
+                .await
+                .unwrap();
+                let pong = tokio::time::timeout(STORE_BUDGET, prx)
+                    .await
+                    .expect("the loop stopped after a search panicked")
+                    .unwrap();
+                assert_eq!(pong["ok"], true);
+            })
+            .await;
+    }
+
     /// Stall tests read this fixed monotonic "now", so a stamp of
     /// `TEST_NOW - n` is exactly `n` seconds old however long the test
     /// process has been up — a real `monotonic_secs()` reading is only ever
@@ -5343,6 +5925,7 @@ mod wedge_tests {
             stall_threshold: WORKER_STALL_THRESHOLD,
             clock: || TEST_NOW,
             qdrant_ok: Arc::new(AtomicBool::new(false)),
+            vitals: Default::default(),
         }
     }
 
@@ -5481,9 +6064,10 @@ mod wedge_tests {
 
     // ─── /health split (#77) ────────────────────────────────────────────────
 
-    /// Store and PATCH refuse a caller-set `metadata.superseded_by` with a 400
-    /// naming the key, before dispatch — the worker never sees it, so nothing
-    /// is written (LAB-6891). PATCH covers null too: null deletes the key.
+    /// Store and PATCH refuse a caller-set `metadata.superseded_by` or
+    /// `metadata.nearest_similarity` with a 400 naming the key, before
+    /// dispatch — the worker never sees it, so nothing is written (LAB-6891).
+    /// PATCH covers null too: null deletes the key.
     #[tokio::test]
     async fn rest_writes_refuse_reserved_metadata_key() {
         use tower::ServiceExt;
@@ -5491,24 +6075,29 @@ mod wedge_tests {
         let (tx, mut rx) = mpsc::channel(1);
         let app = protected_router(ServiceHandle { tx }, test_auth_state());
         let hash = "a".repeat(64);
-        let cases = [
-            (
-                "POST",
-                "/store".to_string(),
-                json!({"content": "live fact", "metadata": {"superseded_by": "b".repeat(64)}}),
-            ),
-            (
-                "PATCH",
-                format!("/memories/{hash}"),
-                json!({"metadata": {"superseded_by": null}}),
-            ),
-            (
-                "PATCH",
-                format!("/memories/{hash}"),
-                json!({"metadata": {"superseded_by": "b".repeat(64)}}),
-            ),
-        ];
-        for (method, uri, body) in cases {
+        let cases = ["superseded_by", "nearest_similarity"].map(|key| {
+            [
+                (
+                    "POST",
+                    "/store".to_string(),
+                    json!({"content": "live fact", "metadata": {key: "b".repeat(64)}}),
+                    key,
+                ),
+                (
+                    "PATCH",
+                    format!("/memories/{hash}"),
+                    json!({"metadata": {key: null}}),
+                    key,
+                ),
+                (
+                    "PATCH",
+                    format!("/memories/{hash}"),
+                    json!({"metadata": {key: 0.5}}),
+                    key,
+                ),
+            ]
+        });
+        for (method, uri, body, key) in cases.into_iter().flatten() {
             let resp = app
                 .clone()
                 .oneshot(
@@ -5529,7 +6118,7 @@ mod wedge_tests {
             let v: Value = serde_json::from_slice(&bytes).unwrap();
             let err = v["error"].as_str().unwrap_or_default();
             assert!(
-                err.contains("metadata.superseded_by"),
+                err.contains(&format!("metadata.{key}")),
                 "{method} {uri}: {v}"
             );
             assert!(rx.try_recv().is_err(), "{method} {uri} reached the worker");
@@ -5872,9 +6461,10 @@ mod wedge_tests {
             rerank_api_key: None,
             rerank_top_n: 0,
             rerank_timeout_ms: std::num::NonZeroU64::MIN,
+            selfcheck: None,
         };
         // `check_detail` fans out to all four probes.
-        HealthChecker::new(&config, Arc::new(AtomicU64::new(0)))
+        HealthChecker::new(&config, Arc::new(AtomicU64::new(0)), Default::default())
             .check_detail()
             .await;
 
@@ -5893,6 +6483,149 @@ mod wedge_tests {
         let mut seen = seen.lock().unwrap().clone();
         seen.sort();
         assert_eq!(seen, expected);
+    }
+
+    /// LAB-4026 AC-3: with the embedder unreachable, one self-check run makes
+    /// `/health/detail` and `GET /stats` name the broken step, while the
+    /// probe Kubernetes uses still answers 200 with its status alone. The
+    /// embedder sits under the production chain (cache over counter over
+    /// client). The cache bypass itself is `probe_bypasses_the_cache`.
+    #[tokio::test]
+    async fn embed_outage_shows_on_detail_and_stats_while_the_probe_stays_green() {
+        let vitals = Arc::new(Vitals::new("alaya-server-test".into(), 1_700_000_000, true));
+        let embeddings = cached_embedding::CachedEmbedding::new(
+            Box::new(CountingEmbedding::new(
+                // Port 1 refuses immediately — models an unreachable embedder.
+                Box::new(EmbeddingClient::new(
+                    "http://127.0.0.1:1".into(),
+                    "m".into(),
+                    4,
+                    1,
+                    None,
+                )),
+                vitals.clone(),
+            )),
+            10,
+            None,
+        );
+        let svc = MemoryService::new(
+            Box::new(HangVectors { batch: None }),
+            Box::new(embeddings),
+            Box::new(StubGraph { panic_stats: false }),
+            Box::new(StubHebbian),
+            Box::new(StubConsolidation),
+            None,
+        )
+        .with_vitals(vitals.clone());
+        let cfg = selfcheck::SelfCheckConfig {
+            query: "what is alaya".into(),
+            expect_hash: "a".repeat(64),
+            interval: Duration::from_secs(300),
+        };
+        // The stub graph and vectors never answer the stats aggregates; a
+        // short deadline lets /stats return, and its pod section must survive.
+        let limits = WorkerLimits {
+            cmd: Duration::from_millis(50),
+            ..WorkerLimits::default()
+        };
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::channel::<Cmd>(8);
+                tokio::task::spawn_local(service_worker(
+                    rx,
+                    svc,
+                    Arc::new(AtomicU64::new(0)),
+                    limits,
+                ));
+                let handle = ServiceHandle { tx };
+
+                selfcheck::run_once(&handle, &cfg, &vitals).await;
+
+                let health = health_routes(
+                    HealthChecker {
+                        vitals: vitals.clone(),
+                        ..test_checker(TEST_NOW)
+                    },
+                    test_auth_state(),
+                );
+                let (code, body) = probe(&health, "/health", None).await;
+                assert_eq!(code, StatusCode::OK);
+                assert_eq!(body.as_object().expect("object body").len(), 1, "{body}");
+
+                let (code, detail) = probe(&health, "/health/detail", Some(TEST_KEY)).await;
+                assert_eq!(code, StatusCode::OK);
+                assert_eq!(detail["status"], "degraded");
+                let stats_app = protected_router(handle, test_auth_state());
+                let (code, stats) = probe(&stats_app, "/stats", Some(TEST_KEY)).await;
+                assert_eq!(code, StatusCode::OK);
+
+                for (surface, doc) in [("/health/detail", &detail), ("/stats", &stats)] {
+                    let pod = &doc["pod"];
+                    assert_eq!(pod["name"], "alaya-server-test", "{surface}: {doc}");
+                    assert_eq!(pod["started_at"], 1_700_000_000, "{surface}");
+                    assert_eq!(pod["failures"]["embedding"], 1, "{surface}: {pod}");
+                    let sc = &pod["selfcheck"];
+                    assert_eq!(sc["enabled"], true, "{surface}");
+                    assert_eq!(sc["consecutive_failures"], 1, "{surface}");
+                    assert_eq!(sc["last"]["ok"], false, "{surface}");
+                    assert_eq!(sc["last"]["failing_step"], "embed", "{surface}: {sc}");
+                }
+            })
+            .await;
+    }
+
+    /// A store that fails on a backend counts; one refused as a bad request
+    /// does not — that is the caller's fault, not the service's (LAB-4026).
+    #[tokio::test]
+    async fn store_failures_count_backend_errors_not_bad_requests() {
+        let vitals = Arc::new(Vitals::default());
+        let svc = MemoryService::new(
+            Box::new(HangVectors { batch: None }),
+            Box::new(EmbeddingClient::new(
+                "http://127.0.0.1:1".into(),
+                "m".into(),
+                4,
+                1,
+                None,
+            )),
+            Box::new(StubGraph { panic_stats: false }),
+            Box::new(StubHebbian),
+            Box::new(StubConsolidation),
+            None,
+        )
+        .with_vitals(vitals.clone());
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::channel::<Cmd>(8);
+                tokio::task::spawn_local(service_worker(
+                    rx,
+                    svc,
+                    Arc::new(AtomicU64::new(0)),
+                    WorkerLimits::default(),
+                ));
+                for content in ["", "embedder is down"] {
+                    let (reply, rx) = oneshot::channel();
+                    tx.send(Cmd {
+                        inner: CmdInner::Store {
+                            params: serde_json::from_value(json!({ "content": content })).unwrap(),
+                            read_only: false,
+                            reply,
+                        },
+                        span: tracing::Span::none(),
+                    })
+                    .await
+                    .unwrap();
+                    let r = rx.await.expect("store reply");
+                    assert_eq!(r["success"], false, "{r}");
+                }
+            })
+            .await;
+
+        assert_eq!(vitals.snapshot()["failures"]["store"], 1);
     }
 
     /// The #63 contract is the HTTP code, not the body: a wedged worker must

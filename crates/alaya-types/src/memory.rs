@@ -43,6 +43,14 @@ pub struct Memory {
     /// store — and, like the log, returned by `get_memory` alone.
     #[serde(default, skip_serializing)]
     pub supersession_reason: Option<serde_json::Value>,
+    /// The `nearest_similarity` payload key: how close this memory's nearest
+    /// live neighbour was when it was last stored, `None` when the store-path
+    /// search was skipped, failed or found nothing. Write-only: the store
+    /// path sets it for its own write and reads never fill it, so a parsed
+    /// copy cannot carry a stale value; serde never reads or writes it, so no
+    /// caller input can carry one either.
+    #[serde(skip)]
+    pub nearest_similarity: Option<f64>,
 }
 
 /// A memory with a similarity/relevance score from search.
@@ -117,10 +125,21 @@ const MAX_METADATA_KEYS: usize = 50;
 /// Maximum length of summary.
 const MAX_SUMMARY_LEN: usize = 2000;
 
-/// Metadata keys only the server writes. `superseded_by` is the supersession
-/// marker: a caller writing it would hide or un-hide a memory with no
-/// SUPERSEDES edge, reason or audit entry, so only supersede and merge set it.
-pub const RESERVED_METADATA_KEYS: &[&str] = &["superseded_by"];
+/// Metadata keys only the server writes, each with why. `superseded_by` is
+/// the supersession marker: a caller writing it would hide or un-hide a
+/// memory with no SUPERSEDES edge, reason or audit entry, so only supersede
+/// and merge set it. `nearest_similarity` is the store's novelty measure; a
+/// caller's copy would pass for the server's.
+pub const RESERVED_METADATA_KEYS: &[(&str, &str)] = &[
+    (
+        "superseded_by",
+        "supersession changes only through supersede or unsupersede",
+    ),
+    (
+        "nearest_similarity",
+        "the server computes it on every store",
+    ),
+];
 
 /// Refuse caller metadata carrying a reserved key, whatever its value — null
 /// included, since a PATCH null deletes the key. The one check every
@@ -130,11 +149,9 @@ pub fn reject_reserved_metadata<V>(
 ) -> std::result::Result<(), String> {
     match RESERVED_METADATA_KEYS
         .iter()
-        .find(|k| metadata.contains_key(**k))
+        .find(|(k, _)| metadata.contains_key(*k))
     {
-        Some(k) => Err(format!(
-            "metadata.{k} is reserved: supersession changes only through supersede or unsupersede"
-        )),
+        Some((k, why)) => Err(format!("metadata.{k} is reserved: {why}")),
         None => Ok(()),
     }
 }
@@ -346,6 +363,41 @@ mod tests {
             };
             assert!(p.validate().unwrap_err().contains("metadata.superseded_by"));
         }
+    }
+
+    #[test]
+    fn reserved_metadata_refuses_nearest_similarity_on_store_and_patch() {
+        for v in [serde_json::Value::Null, serde_json::json!(0.99)] {
+            let md = HashMap::from([("nearest_similarity".to_string(), v)]);
+            let err = reject_reserved_metadata(&md).unwrap_err();
+            assert!(err.contains("metadata.nearest_similarity"), "{err}");
+            let p = PatchMemoryRequest {
+                metadata: Some(md),
+                ..Default::default()
+            };
+            assert!(p.validate().unwrap_err().contains("nearest_similarity"));
+        }
+    }
+
+    #[test]
+    fn memory_deserialize_never_takes_nearest_similarity() {
+        let m: Memory = serde_json::from_value(serde_json::json!({
+            "content": "c",
+            "content_hash": "a".repeat(64),
+            "tags": [],
+            "memory_type": "note",
+            "created_at": 1.0,
+            "updated_at": 1.0,
+            "nearest_similarity": 0.99,
+        }))
+        .unwrap();
+        assert_eq!(m.nearest_similarity, None);
+        let out = serde_json::to_value(Memory {
+            nearest_similarity: Some(0.5),
+            ..m
+        })
+        .unwrap();
+        assert!(out.get("nearest_similarity").is_none(), "{out}");
     }
 
     #[test]

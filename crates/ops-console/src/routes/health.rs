@@ -1,10 +1,11 @@
 //! Ālaya health pane (LAB-6881) — `/alaya/health`.
 //!
 //! GET only, plain tables, no JS. Renders alaya-server's `GET /stats`: the
+//! answering pod's self-check and failure counters (LAB-4026), the
 //! contradiction judge's verdict mix, stored failures, backlog, daily-cap
-//! usage and the corpus by edge type. A section whose source is down shows
+//! usage, the novelty of each day's writes and the corpus by edge type. A section whose source is down shows
 //! an "unavailable" banner, never zeros, so an outage cannot pass for an
-//! empty corpus.
+//! empty corpus; a failing self-check is a banner too.
 
 use axum::extract::State;
 use axum::response::Html;
@@ -14,7 +15,7 @@ use leptos::prelude::*;
 use serde_json::Value;
 
 use crate::error::AppError;
-use crate::routes::vs;
+use crate::routes::{fmt_epoch, vs};
 use crate::session::{Session, take_flash};
 use crate::state::AppState;
 use crate::ui::*;
@@ -33,13 +34,23 @@ const VERDICT_ROWS: [(&str, &str, &str); 6] = [
     ("never_judged", "never judged (backlog)", "unjudged"),
 ];
 
-/// Columns of the per-day table, in the server's key names.
-const DAY_COLUMNS: [&str; 5] = [
-    "contradiction",
-    "supersession",
-    "coexist",
-    "unrelated",
-    "unjudged",
+/// Columns of the judged-per-day table: `(the server's key in counts,
+/// heading)`.
+const DAY_COLUMNS: [(&str, &str); 5] = [
+    ("contradiction", "contradiction"),
+    ("supersession", "supersession"),
+    ("coexist", "coexist"),
+    ("unrelated", "unrelated"),
+    ("unjudged", "unjudged"),
+];
+
+/// Columns of the write-novelty table, by nearest-neighbour similarity.
+const NOVELTY_COLUMNS: [(&str, &str); 5] = [
+    ("0.95+", "≥ 0.95"),
+    ("0.85-0.95", "0.85–0.95"),
+    ("0.70-0.85", "0.70–0.85"),
+    ("below_0.70", "< 0.70"),
+    ("none", "none"),
 ];
 
 /// The four classes the judge answers with — the degenerate-reason rows.
@@ -62,10 +73,12 @@ pub async fn pane(
         }),
         Ok(s) => Either::Right(view! {
             <div class="space-y-6">
+                {pod_card(&s)}
                 {summary_card(&s)}
                 {verdicts_card(&s)}
                 {failures_card(&s)}
                 {per_day_card(&s)}
+                {novelty_card(&s)}
                 {degenerate_card(&s)}
                 {corpus_card(&s)}
             </div>
@@ -105,6 +118,120 @@ fn section<'a>(s: &'a Value, key: &str) -> Option<&'a Value> {
 
 fn link(href: String, text: String) -> impl IntoView + use<> {
     view! { <a class="text-primary underline-offset-4 hover:underline" href=href>{text}</a> }
+}
+
+// ─── Pod: self-check and failure counters (LAB-4026) ─────────────────────────
+
+/// Failure counters in display order: `(key in pod.failures, label)`.
+const FAILURE_ROWS: [(&str, &str); 3] = [
+    ("embedding", "embedding calls"),
+    ("rerank", "rerank fallbacks to RRF order"),
+    ("store", "stores"),
+];
+
+fn pod_card(s: &Value) -> impl IntoView + use<> {
+    let Some(pod) = section(s, "pod") else {
+        return Either::Left(view! {
+            <Card>
+                <CardHeader>
+                    <CardTitle>"Self-check"</CardTitle>
+                </CardHeader>
+                <CardContent>
+                    {unavailable("self-check and failure counters", "this alaya-server does not report them")}
+                </CardContent>
+            </Card>
+        });
+    };
+    let sc = pod.get("selfcheck");
+    let enabled = sc.and_then(|c| c.get("enabled")).and_then(Value::as_bool);
+    let last = sc.and_then(|c| c.get("last")).filter(|l| l.is_object());
+    let streak = count(sc.and_then(|c| c.get("consecutive_failures")));
+    let state = match (enabled, last) {
+        (Some(false), _) => Either::Left(view! {
+            <p class="text-sm">
+                <span class=badge(BadgeKind::Muted)>"disabled"</span>
+                " SELFCHECK_QUERY and SELFCHECK_EXPECT_HASH are unset on this pod."
+            </p>
+        }),
+        (_, None) => Either::Left(view! {
+            <p class="text-sm">
+                <span class=badge(BadgeKind::Muted)>"not run yet"</span>
+                " The first check runs at startup."
+            </p>
+        }),
+        (_, Some(l)) if l.get("ok").and_then(Value::as_bool) == Some(true) => {
+            let msg = format!(
+                "Last run {} UTC; rerank: {}.",
+                fmt_epoch(l["at"].as_f64().unwrap_or(0.0)),
+                vs(l, "rerank"),
+            );
+            Either::Right(Either::Left(view! {
+                <p class="text-sm">
+                    <span class=badge(BadgeKind::Success)>"passing"</span>
+                    " "{msg}
+                </p>
+            }))
+        }
+        (_, Some(l)) => {
+            let msg = format!(
+                "Self-check failing at step {}: {} ({} consecutive; last run {} UTC).",
+                vs(l, "failing_step"),
+                vs(l, "error"),
+                streak,
+                fmt_epoch(l["at"].as_f64().unwrap_or(0.0)),
+            );
+            Either::Right(Either::Right(view! {
+                <p class="text-sm" role="alert">
+                    <span class=badge(BadgeKind::Destructive)>"failing"</span>
+                    " "{msg}
+                </p>
+            }))
+        }
+    };
+    let rows = FAILURE_ROWS
+        .iter()
+        .map(|(key, label)| {
+            let (label, n) = (
+                label.to_string(),
+                count(pod.get("failures").and_then(|f| f.get(*key))),
+            );
+            view! {
+                <TableRow>
+                    <TableCell>{label}</TableCell>
+                    <TableCell>{n}</TableCell>
+                </TableRow>
+            }
+        })
+        .collect_view();
+    let (name, started) = (
+        vs(pod, "name"),
+        fmt_epoch(pod.get("started_at").and_then(Value::as_f64).unwrap_or(0.0)),
+    );
+    Either::Right(view! {
+        <Card>
+            <CardHeader>
+                <CardTitle>"Self-check"</CardTitle>
+                <CardDescription>
+                    {format!("Pod {name}, up since {started} UTC. ")}
+                    "Each pod embeds a fixed query and runs it as a read-only search every few minutes; the counts below run from the pod's start. With several replicas this is the pod that answered."
+                </CardDescription>
+            </CardHeader>
+            <CardContent>
+                <div class="mb-4">{state}</div>
+                <TableWrapper>
+                    <Table>
+                        <TableHeader>
+                            <TableRow>
+                                <TableHead>"Failed"</TableHead>
+                                <TableHead>"Since start"</TableHead>
+                            </TableRow>
+                        </TableHeader>
+                        <TableBody>{rows}</TableBody>
+                    </Table>
+                </TableWrapper>
+            </CardContent>
+        </Card>
+    })
 }
 
 // ─── Summary: errors, vector total, judge daily cap ──────────────────────────
@@ -293,48 +420,7 @@ fn per_day_card(s: &Value) -> impl IntoView + use<> {
     let days = section(s, "contradictions").and_then(|c| c.get("judged_per_day"));
     let body = match days.and_then(Value::as_array) {
         None => Either::Left(unavailable("contradiction stats", "see the errors above")),
-        Some(days) => {
-            let rows = days
-                .iter()
-                .map(|d| {
-                    let counts = d.get("counts");
-                    let cells = DAY_COLUMNS
-                        .iter()
-                        .map(|k| {
-                            let n = count(counts.and_then(|c| c.get(*k)));
-                            view! { <TableCell>{n}</TableCell> }
-                        })
-                        .collect_view();
-                    let date = vs(d, "date");
-                    view! {
-                        <TableRow>
-                            <TableCell>{date}</TableCell>
-                            {cells}
-                        </TableRow>
-                    }
-                })
-                .collect_view();
-            let heads = DAY_COLUMNS
-                .iter()
-                .map(|k| {
-                    let k = k.to_string();
-                    view! { <TableHead>{k}</TableHead> }
-                })
-                .collect_view();
-            Either::Right(view! {
-                <TableWrapper>
-                    <Table>
-                        <TableHeader>
-                            <TableRow>
-                                <TableHead>"UTC day"</TableHead>
-                                {heads}
-                            </TableRow>
-                        </TableHeader>
-                        <TableBody>{rows}</TableBody>
-                    </Table>
-                </TableWrapper>
-            })
-        }
+        Some(days) => Either::Right(day_table(days, &DAY_COLUMNS)),
     };
     view! {
         <Card>
@@ -342,6 +428,71 @@ fn per_day_card(s: &Value) -> impl IntoView + use<> {
                 <CardTitle>"Pairs judged per day"</CardTitle>
                 <CardDescription>
                     "Last 14 UTC days by the verdict each edge carries now, from judged_at. A re-judged edge counts once, on its latest day."
+                </CardDescription>
+            </CardHeader>
+            <CardContent>{body}</CardContent>
+        </Card>
+    }
+}
+
+/// `[{date, counts}]` as a table: one row per UTC day, one column per count.
+fn day_table(
+    days: &[Value],
+    columns: &'static [(&'static str, &'static str)],
+) -> impl IntoView + use<> {
+    let rows = days
+        .iter()
+        .map(|d| {
+            let counts = d.get("counts");
+            let cells = columns
+                .iter()
+                .map(|(k, _)| {
+                    let n = count(counts.and_then(|c| c.get(*k)));
+                    view! { <TableCell>{n}</TableCell> }
+                })
+                .collect_view();
+            let date = vs(d, "date");
+            view! {
+                <TableRow>
+                    <TableCell>{date}</TableCell>
+                    {cells}
+                </TableRow>
+            }
+        })
+        .collect_view();
+    let heads = columns
+        .iter()
+        .map(|(_, label)| view! { <TableHead>{*label}</TableHead> })
+        .collect_view();
+    view! {
+        <TableWrapper>
+            <Table>
+                <TableHeader>
+                    <TableRow>
+                        <TableHead>"UTC day"</TableHead>
+                        {heads}
+                    </TableRow>
+                </TableHeader>
+                <TableBody>{rows}</TableBody>
+            </Table>
+        </TableWrapper>
+    }
+}
+
+// ─── Write novelty ──────────────────────────────────────────────────────────
+
+fn novelty_card(s: &Value) -> impl IntoView + use<> {
+    let days = section(s, "writes").and_then(|w| w.get("novelty"));
+    let body = match days.and_then(Value::as_array) {
+        None => Either::Left(unavailable("write novelty", "see the errors above")),
+        Some(days) => Either::Right(day_table(days, &NOVELTY_COLUMNS)),
+    };
+    view! {
+        <Card>
+            <CardHeader>
+                <CardTitle>"Write novelty"</CardTitle>
+                <CardDescription>
+                    "Memories created per UTC day over the last 14 days, by their similarity to the nearest live memory when stored. None means no live neighbour was found, no neighbour search ran (read-only or failed), or the memory predates the measure. A re-store recomputes the value and keeps the creation day."
                 </CardDescription>
             </CardHeader>
             <CardContent>{body}</CardContent>

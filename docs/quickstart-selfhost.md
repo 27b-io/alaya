@@ -68,7 +68,7 @@ curl -fsS -H "Authorization: Bearer ${ALAYA_API_KEY}" \
   -X POST http://localhost:3001/store \
   -H 'Content-Type: application/json' \
   -d '{"content":"hello memory","tags":["demo"]}'
-# → {"content_hash":"e3b0c4...","stored":true,...}
+# → {"success":true,"content_hash":"…","created":true,...}
 
 # Search
 # Authorization header only when a key is set — omit on a localhost no-auth dev box.

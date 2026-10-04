@@ -33,13 +33,16 @@ pub struct QdrantClient {
     /// Serialises this client's writes to the memories collection. Every
     /// write is already conditional on the revision it read (see
     /// `update_points`), so this is no longer what keeps writes from undoing
-    /// one another; another process never sees it. What it still buys: the
-    /// service's spawned tasks (search-time access increments, enrichment,
-    /// duplicate merge) do not race each other, so the bounded CAS retries
-    /// are spent only on cross-process races — a burst of in-process
-    /// increments on one hot memory would otherwise exhaust them and drop
-    /// counts. Held by every writer; reads never take it (alaya#86, #130).
+    /// one another; another process never sees it. What it still buys: this
+    /// client's writers do not spend each other's bounded CAS retries. Held
+    /// by every writer for its whole read→write→read-back; reads never take
+    /// it (alaya#86, #130). The access increments never hold it: see
+    /// `access_turn`.
     write_lock: futures::lock::Mutex<()>,
+    /// Serialises the access increments among themselves, so a burst of
+    /// increments on one hot memory cannot spend each other's CAS retries
+    /// and drop counts (see `access_turn`).
+    access_lock: futures::lock::Mutex<()>,
     /// Random per client. With `writes`, makes every revision token unique
     /// across processes (see `stamp`).
     instance: u64,
@@ -87,6 +90,7 @@ impl QdrantClient {
             collection,
             tag_collection,
             write_lock: futures::lock::Mutex::new(()),
+            access_lock: futures::lock::Mutex::new(()),
             // OS-seeded per process on native targets. wasm32 (deferred, no
             // deployment) has no seed source in std and gets fixed keys.
             instance: std::collections::hash_map::RandomState::new().hash_one(0u8),
@@ -320,10 +324,30 @@ impl QdrantClient {
         Ok(outcome)
     }
 
+    /// The access increments' turn to write (LAB-6896). An increment runs
+    /// inside a search, so it must never hold `write_lock` across its Qdrant
+    /// calls: a store would wait on search I/O. Nor may it commit while a
+    /// write of this client is in progress: an increment that lands inside
+    /// a store's read→write window costs the store a round, and one search
+    /// after another can then take all eight. So it waits until no writer
+    /// holds `write_lock`, and lets go before its own I/O. A store therefore
+    /// loses at most one round to this client's increments: the one already
+    /// past this point when the store began. Every later increment waits for
+    /// the store to finish. The lock promises no fairness, so under a steady
+    /// run of writes an increment can wait out the run. The hybrid search
+    /// that awaits it bounds that wait (`ENRICH_BUDGET` in alaya-core) and
+    /// drops the increment past it, so the wait costs an access count, never
+    /// the search.
+    async fn access_turn(&self) -> futures::lock::MutexGuard<'_, ()> {
+        let turn = self.access_lock.lock().await;
+        drop(self.write_lock.lock().await);
+        turn
+    }
+
     /// Record one access on each point: count + 1 and a capped timestamp
     /// history, both computed from the copy the write is conditional on, so
     /// two processes counting the same hit record two accesses, not one.
-    /// The caller holds `write_lock`.
+    /// The caller holds its `access_turn`.
     async fn bump_access(&self, point_ids: &[String]) -> Result<HashMap<String, Update>> {
         let now = now_secs();
         self.update_points(
@@ -846,6 +870,9 @@ fn parse_payload(payload: &Value) -> Option<Memory> {
             }),
         supersession_log: payload.get(SUPERSESSION_LOG).cloned().map(log_entries),
         supersession_reason: payload.get(SUPERSESSION_REASON).cloned(),
+        // Write-only on `Memory`: only the store path sets it, from its own
+        // search, so a parsed copy written back can never carry a stale one.
+        nearest_similarity: None,
     })
 }
 
@@ -872,7 +899,9 @@ fn top_level_payload(updates: &MetadataUpdate) -> serde_json::Map<String, Value>
 
 /// Build the payload JSON for upsert from a Memory struct. Never writes
 /// `supersession_log` or `supersession_reason`: on a re-store `carry_over`
-/// alone keeps them.
+/// alone keeps them. `nearest_similarity` is written from the `Memory`, which
+/// only the server's store path sets, and never carried over: every store
+/// recomputes it.
 fn memory_to_payload(memory: &Memory) -> Value {
     let mut payload = json!({
         "content": memory.content,
@@ -904,9 +933,19 @@ fn memory_to_payload(memory: &Memory) -> Value {
     if let Some(ref se) = memory.summary_embedding {
         payload["summary_embedding"] = json!(se);
     }
+    if let Some(ns) = memory.nearest_similarity {
+        payload[NEAREST_SIMILARITY] = json!(ns);
+    }
 
     payload
 }
+
+/// Payload key: the similarity of a memory's nearest live neighbour when it
+/// was last stored (see `Memory::nearest_similarity`). Server-maintained.
+const NEAREST_SIMILARITY: &str = "nearest_similarity";
+
+/// Points per page of the `write_novelty` scroll.
+const NOVELTY_PAGE: usize = 1000;
 
 /// Payload key: the reversed supersessions of a memory, oldest first (see
 /// `VectorStorage::reverse_supersession`). Server-maintained.
@@ -1712,6 +1751,58 @@ impl VectorStorage for QdrantClient {
     }
 
     #[tracing::instrument(skip(self))]
+    async fn write_novelty(&self, since: f64) -> Result<Vec<(f64, Option<f64>)>> {
+        let mut rows = Vec::new();
+        let mut offset: Option<Value> = None;
+        loop {
+            let mut body = json!({
+                "limit": NOVELTY_PAGE,
+                "filter": {"must": [{"key": "created_at", "range": {"gte": since}}]},
+                "with_payload": ["created_at", NEAREST_SIMILARITY],
+                "with_vector": false,
+            });
+            if let Some(off) = offset.take() {
+                body["offset"] = off;
+            }
+
+            let resp = self
+                .client
+                .post(format!(
+                    "{}/collections/{}/points/scroll",
+                    self.base_url, self.collection
+                ))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
+            if !resp.status().is_success() {
+                return Err(qdrant_error(resp).await);
+            }
+            let data: QdrantResponse<ScrollResponse> = resp
+                .json()
+                .await
+                .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
+            // A page with no result is a protocol violation, not an empty
+            // window: fail rather than report zero writes.
+            let page = data
+                .result
+                .ok_or_else(|| AlayaError::Storage("Qdrant scroll returned no result".into()))?;
+
+            rows.extend(page.points.iter().filter_map(|p| {
+                let payload = p.get("payload")?;
+                Some((
+                    payload.get("created_at")?.as_f64()?,
+                    payload.get(NEAREST_SIMILARITY).and_then(Value::as_f64),
+                ))
+            }));
+            match page.next_page_offset {
+                Some(next) if !next.is_null() => offset = Some(next),
+                _ => return Ok(rows),
+            }
+        }
+    }
+
+    #[tracing::instrument(skip(self))]
     async fn get_all_tags(&self) -> Result<Vec<String>> {
         // Scroll the tag collection to get all tags
         let mut all_tags = Vec::new();
@@ -1770,7 +1861,7 @@ impl VectorStorage for QdrantClient {
 
     async fn increment_access_count(&self, content_hash: &str) -> Result<()> {
         let point_id = hash_to_uuid(content_hash)?;
-        let _write = self.write_lock.lock().await;
+        let _turn = self.access_turn().await;
         match self
             .bump_access(std::slice::from_ref(&point_id))
             .await?
@@ -1786,8 +1877,8 @@ impl VectorStorage for QdrantClient {
 
     #[tracing::instrument(skip(self), fields(n = content_hashes.len()))]
     async fn increment_access_count_batch(&self, content_hashes: &[&str]) -> Result<()> {
-        // Non-fatal throughout: an access count is ranking input, and this
-        // runs fire-and-forget after a search that has already answered.
+        // Non-fatal throughout: an access count is ranking input, and the
+        // search that awaits this has its results already.
         let point_ids: Vec<String> = content_hashes
             .iter()
             .filter_map(|h| hash_to_uuid(h).ok())
@@ -1796,7 +1887,7 @@ impl VectorStorage for QdrantClient {
             return Ok(());
         }
 
-        let _write = self.write_lock.lock().await;
+        let _turn = self.access_turn().await;
         let outcome = match self.bump_access(&point_ids).await {
             Ok(o) => o,
             Err(e) => {
@@ -2120,6 +2211,7 @@ mod tests {
             summary_embedding: None,
             supersession_log: None,
             supersession_reason: None,
+            nearest_similarity: None,
         };
         let payload = memory_to_payload(&mem);
         assert_eq!(payload["content"], "test content");
@@ -2159,6 +2251,25 @@ mod tests {
         assert_eq!(mem.supersession_reason, Some(json!("wrong merge")));
         let written = memory_to_payload(&mem);
         assert!(written.get("supersession_reason").is_none(), "{written}");
+    }
+
+    /// Written from the store's own value, never read back: a parsed copy
+    /// re-stored as-is writes none rather than a stale one.
+    #[test]
+    fn nearest_similarity_is_written_by_the_store_and_never_read_back() {
+        let payload = json!({
+            "content": "c",
+            "content_hash": "c".repeat(64),
+            "nearest_similarity": 0.87,
+        });
+        let mem = parse_payload(&payload).expect("parses");
+        assert_eq!(mem.nearest_similarity, None);
+        assert!(memory_to_payload(&mem).get("nearest_similarity").is_none());
+        let fresh = Memory {
+            nearest_similarity: Some(0.42),
+            ..mem
+        };
+        assert_eq!(memory_to_payload(&fresh)["nearest_similarity"], json!(0.42));
     }
 
     #[test]

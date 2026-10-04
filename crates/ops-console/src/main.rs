@@ -1206,8 +1206,30 @@ mod tests {
                     "contradiction": 1, "supersession": 6, "coexist": 32, "unrelated": 31,
                 },
             },
+            "writes": { "novelty": [
+                { "date": "2026-09-30", "counts": {
+                    "0.95+": 61, "0.85-0.95": 212, "0.70-0.85": 433, "below_0.70": 97, "none": 3,
+                }},
+                { "date": "2026-10-01", "counts": {
+                    "0.95+": 0, "0.85-0.95": 0, "0.70-0.85": 0, "below_0.70": 0, "none": 818,
+                }},
+            ]},
             "judge_daily_cap": { "cap": 1000, "admitted_today": 41, "utc_day": "2026-10-01" },
+            "pod": pod(serde_json::json!({
+                "at": 1_791_000_000, "ok": true, "failing_step": null, "error": null,
+                "rerank": "ran", "elapsed_ms": 812,
+            }), 0),
             "errors": [],
+        })
+    }
+
+    /// The `pod` section of `GET /stats` (LAB-4026) with `last` as the
+    /// latest self-check.
+    fn pod(last: serde_json::Value, consecutive: u64) -> serde_json::Value {
+        serde_json::json!({
+            "name": "alaya-server-7d9f", "started_at": 1_790_990_000,
+            "failures": { "embedding": 3, "rerank": 11, "store": 2 },
+            "selfcheck": { "enabled": true, "consecutive_failures": consecutive, "last": last },
         })
     }
 
@@ -1262,6 +1284,48 @@ mod tests {
         assert!(!body.contains("<script"), "no JS on the pane");
     }
 
+    /// Write novelty is one row per UTC day with a column per similarity
+    /// band, in the server's order, each count in its own cell.
+    #[tokio::test]
+    async fn health_pane_renders_write_novelty_as_a_day_table() {
+        let (status, body) = health_page(full_stats()).await;
+        assert_eq!(status, StatusCode::OK);
+        let card = &body[body.find("Write novelty").expect("novelty card")..];
+        let card = &card[..card.find("</table>").expect("a table")];
+        let heads = [
+            "UTC day",
+            "≥ 0.95",
+            "0.85–0.95",
+            "0.70–0.85",
+            "&lt; 0.70",
+            "none",
+        ];
+        let mut at = 0;
+        for h in heads {
+            at += card[at..]
+                .find(h)
+                .unwrap_or_else(|| panic!("{h} out of order in {card}"));
+        }
+        let row = &card[card.find("2026-09-30").expect("day row")..];
+        let mut at = 0;
+        for n in [">61<", ">212<", ">433<", ">97<", ">3<"] {
+            at += row[at..]
+                .find(n)
+                .unwrap_or_else(|| panic!("{n} out of order in {row}"));
+        }
+        assert!(card.contains(">818<"), "{card}");
+
+        // Section nulled server-side: a banner, never a table of zeros.
+        let mut down = full_stats();
+        down["writes"] = serde_json::Value::Null;
+        down["errors"] = serde_json::json!(["write novelty: Storage error"]);
+        let (_, body) = health_page(down).await;
+        let card = &body[body.find("Write novelty").expect("novelty card")..];
+        let card = &card[..card.find("Degenerate judge reasons").expect("next card")];
+        assert!(card.contains("unavailable"), "{card}");
+        assert!(!body.contains("≥ 0.95"), "no novelty table");
+    }
+
     /// AC-4/AC-6: the bridge down nulls the graph sections server-side; the
     /// pane says so per section and never renders them as zeros.
     #[tokio::test]
@@ -1300,6 +1364,74 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("unavailable"));
         assert!(body.contains("stats timed out after 30s"));
+    }
+
+    /// LAB-4026 AC-5: a passing self-check renders as a badge beside the
+    /// pod's counters; no alert.
+    #[tokio::test]
+    async fn health_pane_shows_a_passing_self_check_and_the_counters() {
+        let (status, body) = health_page(full_stats()).await;
+        assert_eq!(status, StatusCode::OK);
+        for needle in [
+            ">passing<",
+            "rerank: ran",
+            "alaya-server-7d9f",
+            "embedding calls",
+            ">3<",
+            ">11<",
+            ">2<",
+        ] {
+            assert!(body.contains(needle), "missing {needle:?} in {body}");
+        }
+        assert!(!body.contains(r#"role="alert""#), "{body}");
+    }
+
+    /// LAB-4026 AC-5: a failing self-check is an alert banner naming the
+    /// step and the error — never a quiet row of zeros.
+    #[tokio::test]
+    async fn health_pane_renders_a_failing_self_check_as_a_banner() {
+        let mut stats = full_stats();
+        stats["pod"] = pod(
+            serde_json::json!({
+                "at": 1_791_000_000, "ok": false, "failing_step": "embed",
+                "error": "embedding error: connection refused", "rerank": null, "elapsed_ms": 4,
+            }),
+            4,
+        );
+        let (status, body) = health_page(stats).await;
+        assert_eq!(status, StatusCode::OK);
+        let alert = body
+            .split(r#"role="alert""#)
+            .nth(1)
+            .expect("an alert banner");
+        for needle in [
+            ">failing<",
+            "step embed",
+            "embedding error: connection refused",
+            "4 consecutive",
+        ] {
+            assert!(alert.contains(needle), "missing {needle:?} in {body}");
+        }
+        assert!(!body.contains(">passing<"));
+    }
+
+    /// A server without the section (older build) says so; a disabled check
+    /// says it is disabled. Neither passes for a healthy check.
+    #[tokio::test]
+    async fn health_pane_self_check_absent_or_disabled_is_never_passing() {
+        let mut stats = full_stats();
+        stats.as_object_mut().unwrap().remove("pod");
+        let (_, body) = health_page(stats.clone()).await;
+        assert!(body.contains("self-check and failure counters"), "{body}");
+        assert!(body.contains("unavailable") && !body.contains(">passing<"));
+
+        stats["pod"] = pod(serde_json::Value::Null, 0);
+        stats["pod"]["selfcheck"]["enabled"] = false.into();
+        let (_, body) = health_page(stats).await;
+        assert!(
+            body.contains(">disabled<") && !body.contains(">passing<"),
+            "{body}"
+        );
     }
 
     /// The pane's link targets must load on today's contradictions page:
