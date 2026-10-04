@@ -184,8 +184,16 @@ const ENRICH_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 const MAX_DEDUP_SCAN: usize = 200;
 
 /// Nearest neighbours the store path searches for (interference detection,
-/// novelty, the `neighbours` response field).
-const NEIGHBOUR_SEARCH_K: usize = 10;
+/// novelty, the `neighbours` response field). Over-fetched past the
+/// detection window because superseded memories are filtered out after the
+/// search: a store behind this many superseded near-copies still finds no
+/// live neighbour and records no novelty.
+const NEIGHBOUR_SEARCH_K: usize = 20;
+
+/// Nearest other memories interference detection weighs, superseded ones
+/// included: the window it had when the search followed the write and took
+/// ten results, the stored memory among them.
+const DETECTION_WINDOW: usize = 9;
 
 /// Live neighbours a store response reports, nearest first.
 const MAX_STORE_NEIGHBOURS: usize = 5;
@@ -617,13 +625,11 @@ impl MemoryService {
         // `relation` tool).
         let mut contradiction_signals = Vec::new();
         if let Some(similar) = &similar {
-            // Detection weighs the nine nearest other memories, superseded
-            // ones included (skipped below): the window it had when the search
-            // followed the write and the stored memory took the tenth slot.
+            // Superseded memories hold window slots but are skipped below.
             let detection_window: Vec<&ScoredMemory> = similar
                 .iter()
                 .filter(|s| s.memory.content_hash != content_hash)
-                .take(NEIGHBOUR_SEARCH_K - 1)
+                .take(DETECTION_WINDOW)
                 .collect();
             let mut edges_to_create: Vec<(String, String, UserRelationType, EdgeMeta)> = Vec::new();
 
@@ -4463,14 +4469,14 @@ mod tests {
         async fn search_by_vector(
             &self,
             _e: &[f32],
-            _l: usize,
+            limit: usize,
             _f: Option<PayloadFilter>,
         ) -> Result<Vec<ScoredMemory>> {
             self.searches.set(self.searches.get() + 1);
             if self.search_fails {
                 return Err(AlayaError::Storage("qdrant down".into()));
             }
-            Ok(self.similar_memories.clone())
+            Ok(self.similar_memories.iter().take(limit).cloned().collect())
         }
         async fn search_by_tags(
             &self,
@@ -4668,6 +4674,42 @@ mod tests {
             serde_json::json!(format!("{}...", "s".repeat(200)))
         );
         assert_eq!(stored.borrow()[0].nearest_similarity, Some(0.93));
+    }
+
+    /// Superseded near-copies ranked ahead of every live match (a supersede
+    /// chain of snapshots) must not hide it: the over-fetch reaches past them,
+    /// so the write records the live match's similarity and reports it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_finds_a_live_neighbour_behind_ten_superseded_copies() {
+        let mut similar: Vec<ScoredMemory> = (0..10)
+            .map(|i| {
+                superseded(make_contradicting_memory(
+                    &format!("{i:064}"),
+                    "old snapshot",
+                    0.99,
+                ))
+            })
+            .collect();
+        similar.push(make_contradicting_memory(&"a".repeat(64), "live", 0.96));
+        let mock = MockVectorsWithSimilar {
+            similar_memories: similar,
+            ..Default::default()
+        };
+        let stored = mock.stored.clone();
+
+        let result = novelty_service(mock)
+            .store_memory(novelty_params())
+            .await
+            .unwrap();
+
+        let neighbours = result["neighbours"].as_array().unwrap();
+        assert_eq!(neighbours.len(), 1, "{neighbours:?}");
+        assert_eq!(
+            neighbours[0]["content_hash"],
+            serde_json::json!("a".repeat(64))
+        );
+        assert_eq!(neighbours[0]["similarity"], serde_json::json!(0.96));
+        assert_eq!(stored.borrow()[0].nearest_similarity, Some(0.96));
     }
 
     /// The search succeeded and found no live memory: an empty list and no

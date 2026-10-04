@@ -128,8 +128,10 @@ const MAX_SUMMARY_LEN: usize = 2000;
 /// Metadata keys only the server writes, each with why. `superseded_by` is
 /// the supersession marker: a caller writing it would hide or un-hide a
 /// memory with no SUPERSEDES edge, reason or audit entry, so only supersede
-/// and merge set it. `nearest_similarity` is the store's novelty measure; a
-/// caller's copy would pass for the server's.
+/// and merge set it. `nearest_similarity` is only reserved, never written
+/// here: the server records the store's novelty in the root-level
+/// `nearest_similarity` payload key, and a caller's metadata copy would pass
+/// for it.
 pub const RESERVED_METADATA_KEYS: &[(&str, &str)] = &[
     (
         "superseded_by",
@@ -137,7 +139,7 @@ pub const RESERVED_METADATA_KEYS: &[(&str, &str)] = &[
     ),
     (
         "nearest_similarity",
-        "the server computes it on every store",
+        "the server records novelty in its own field on every store",
     ),
 ];
 
