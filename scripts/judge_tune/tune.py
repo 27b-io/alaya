@@ -509,14 +509,41 @@ PLACEHOLDER = r"(?:<(?:secret|url|email|ip)>)"
 # a secret-named key's value may sit on a later line (`.../DB_PASSWORD:\n  x`);
 # any other chain stays on its line, so a value ending in `=` padding or `:`
 # takes nothing from the lines after it. `>?`: the separator may be `=>`.
-SECRET_KEY_ENDS = (
-    "key", "keys", "token", "tokens", "secret", "secrets", "password", "passwords",
-    "passwd", "pwd", "passphrase", "credential", "credentials",
+#
+# "Secret-named" is SECRET_NAME's test: a secret word anywhere in the last
+# name, so `DB_PASSWORD_PROD` and `SECRET_KEY_ID` count, not only names that
+# end in the word. Python needs a fixed-width look-behind, so there is one per
+# total width, each an alternation of every word followed by just enough name
+# characters to fill it; up to SECRET_SUFFIX_MAX of them may follow the word.
+SECRET_WORDS = (
+    "_key", "-key", "apikey", "accountkey", "token", "secret", "password", "passwd",
+    "passphrase", "pwd", "credential",
 )  # fmt: skip
-ENDS_SECRET_KEY = "|".join(f"(?<={w})" for w in SECRET_KEY_ENDS)
+SECRET_SUFFIX_MAX = 32
+
+
+def ends_in_secret_name(tail: str) -> str:
+    """Look-behinds true where a secret word, then at most SECRET_SUFFIX_MAX
+    name characters, then `tail` end just before the current position."""
+    widths = sorted(
+        {len(w) + k for w in SECRET_WORDS for k in range(SECRET_SUFFIX_MAX + 1)}
+    )
+    return "|".join(
+        "(?<=(?:"
+        + "|".join(
+            f"{re.escape(w)}[\\w.-]{{{n - len(w)}}}"
+            for w in SECRET_WORDS
+            if 0 <= n - len(w) <= SECRET_SUFFIX_MAX
+        )
+        + f"){tail})"
+        for n in widths
+    )
+
+
+ENDS_SECRET_KEY = ends_in_secret_name("")
 # The value took the separator too, and with it a `]` (a value never holds a
 # quote, so only the bracket of KEY_CLOSE can come along).
-ENDS_SECRET_KEY_SEP = "|".join(f"(?<={w}[:=])|(?<={w}\\][:=])" for w in SECRET_KEY_ENDS)
+ENDS_SECRET_KEY_SEP = ends_in_secret_name("[:=]") + "|" + ends_in_secret_name("\\][:=]")
 NEXT_VALUES = (
     rf"(?:(?:(?:{ENDS_SECRET_KEY_SEP})>?\s*+"
     rf"|(?:{ENDS_SECRET_KEY}){KEY_CLOSE}\s*+(?:=>|[:=])\s*+"

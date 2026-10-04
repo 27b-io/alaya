@@ -440,6 +440,8 @@ def check_scrub() -> None:
         s(padded + "\n\nnext paragraph here")
         == "SECRET=<secret>\n\nnext paragraph here"
     )
+    # A word that holds `key` is no secret name: SECRET_NAME needs `_key` or `-key`.
+    assert s("SECRET=YWJjZGVm/monkey:\nnext line") == "SECRET=<secret>\nnext line"
     # ...but a value that ran into a secret key still takes that key's value
     # from the next line.
     # The key may close with what SECRET_KEY_NAME accepts, and its separator
@@ -451,6 +453,11 @@ def check_scrub() -> None:
         'token=abcdefgh/DB_PASSWORD"]:\n',
         "token=abcdefgh/DB_PASSWORD']=>\n",
         "token=abcdefgh/DB_PASSWORD\n: ",
+        # A secret word anywhere in the name, as SECRET_NAME reads it.
+        "token=abcdefgh/DB_PASSWORD_PROD:\n  ",
+        "token=abcdefgh/SECRET_KEY_ID:\n",
+        "token=abcdefgh/API_TOKEN_V2]:\n",
+        "token=abcdefgh/password_hash\n: ",
     ):
         out = s(text + "Pa55w0rd99")
         assert "Pa55w0rd99" not in out and s.leaks(out) == [], out
