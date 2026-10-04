@@ -116,6 +116,7 @@ pub struct Vitals {
     embed_failures: AtomicU64,
     rerank_failures: AtomicU64,
     store_failures: AtomicU64,
+    enrich_overruns: AtomicU64,
     selfcheck: Mutex<SelfCheckState>,
 }
 
@@ -139,6 +140,10 @@ impl Vitals {
 
     pub fn store_failed(&self) {
         self.store_failures.fetch_add(1, Relaxed);
+    }
+
+    pub fn enrich_overrun(&self) {
+        self.enrich_overruns.fetch_add(1, Relaxed);
     }
 
     /// Record a self-check run; returns the consecutive failures it leaves.
@@ -178,6 +183,7 @@ impl Vitals {
                 "embedding": self.embed_failures.load(Relaxed),
                 "rerank": self.rerank_failures.load(Relaxed),
                 "store": self.store_failures.load(Relaxed),
+                "enrich_overrun": self.enrich_overruns.load(Relaxed),
             },
             "selfcheck": {
                 "enabled": self.selfcheck_enabled,

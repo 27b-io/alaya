@@ -172,10 +172,12 @@ const TAG_CACHE_TTL: f64 = 60.0;
 
 /// How long a non-read-only search waits for its own side-effect writes (the
 /// access-count bump and the Hebbian co-access enqueue) once its results are
-/// built. Healthy, those are a dozen fast Qdrant calls and one bridge call. The
-/// bump can also queue behind this process's writes (`QdrantClient`'s access
-/// turn), so past this budget the search answers without them: they are
-/// ranking input, not part of the answer (LAB-6896).
+/// built. Healthy, those are one bridge call and `page_size` + 2 sequential
+/// Qdrant calls: a dozen at the default page of 10, more for a bigger page,
+/// and `search_with` puts no upper bound on `page_size`. The bump can also
+/// queue behind this process's writes (`QdrantClient`'s access turn), so past
+/// this budget the search answers without them: they are ranking input, not
+/// part of the answer (LAB-6896).
 const ENRICH_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Maximum number of memories to scan in `find_duplicates`. Embedding large
@@ -1363,11 +1365,27 @@ impl MemoryService {
         // Suppressed under read_only: access_count + Hebbian touch shared
         // owner ranking state. Skipping leaves rankings unchanged.
         let page_hashes: Vec<&str> = page_results.iter().map(|(h, _)| h.as_str()).collect();
+        // Whether this search's access bump finished and succeeded: only then
+        // does the response report the incremented count.
+        let mut bumped = false;
 
         if !read_only {
             let _span = tracing::info_span!("enrich", results = page_hashes.len()).entered();
             let _stage = stages.stage(Stage::Enrich);
-            let access_fut = self.vectors.increment_access_count_batch(&page_hashes);
+            // Each side records that it finished, so an overrun can say which
+            // one it was still waiting on. `bump` is `Some(succeeded)` once done.
+            let bump = std::cell::Cell::new(None);
+            let hebbian_done = std::cell::Cell::new(false);
+            let access_fut = async {
+                let r = self
+                    .vectors
+                    .increment_access_count_batch(&page_hashes)
+                    .await;
+                if let Err(e) = &r {
+                    tracing::warn!(error = %e, "search access bump failed");
+                }
+                bump.set(Some(r.is_ok()));
+            };
 
             let hebbian_enqueue_fut = async {
                 if page_hashes.len() >= 2 {
@@ -1382,20 +1400,27 @@ impl MemoryService {
                         .collect();
                     let _ = self.hebbian.enqueue_strengthen(&pairs).await;
                 }
+                hebbian_done.set(true);
             };
 
             // Bounded: the results are built and these are ranking input. Past
-            // the budget they are dropped mid-flight; every write is
-            // conditional, so a cut-off bump lands whole or not at all.
+            // the budget they are dropped mid-flight. Each access write is
+            // conditional and covers one point, so a cut-off bump lands whole
+            // or not at all per point, not per batch: some results on the page
+            // can be counted and others not.
             let side_effects = async { futures::join!(access_fut, hebbian_enqueue_fut) };
             if with_budget(ENRICH_BUDGET, side_effects).await.is_none() {
+                self.vitals.enrich_overrun();
                 tracing::warn!(
                     results = page_hashes.len(),
                     budget_ms = ENRICH_BUDGET.as_millis() as u64,
+                    access_done = bump.get().is_some(),
+                    hebbian_done = hebbian_done.get(),
                     "search side-effect writes ran past their budget; \
                      access counts and co-access pairs may not be recorded"
                 );
             }
+            bumped = bump.get() == Some(true);
         }
 
         // Stage 7: Format response
@@ -1407,14 +1432,15 @@ impl MemoryService {
             .filter_map(|(hash, score)| {
                 let sm = memory_map.get(hash)?;
                 let mut item = format_memory_result(&sm.memory, *score, params.output);
-                // Reflect the post-increment access_count (batch already wrote N+1)
-                // — except under read_only, where the batch was skipped and the
-                // stored value is what's still on disk.
+                // Reflect the post-increment access_count (the bump wrote N+1)
+                // only when this search's bump finished. Under read_only it was
+                // skipped, and past ENRICH_BUDGET it may not have landed: report
+                // the stored value rather than a count Qdrant never recorded.
                 if let Some(obj) = item.as_object_mut() {
-                    let reported = if read_only {
-                        sm.memory.access_count
-                    } else {
+                    let reported = if bumped {
                         sm.memory.access_count.saturating_add(1)
+                    } else {
+                        sm.memory.access_count
                     };
                     obj.insert("access_count".into(), serde_json::json!(reported));
                 }
@@ -3217,9 +3243,10 @@ mod tests {
     struct MockVectors {
         get_all_tags_calls: Rc<Cell<usize>>,
         tags: Vec<String>,
-        /// Set by `stuck_access`: every vector search answers this memory, and
-        /// the batch access increment never finishes.
-        stuck_access: Option<Memory>,
+        /// Every vector search answers these memories.
+        found: Vec<Memory>,
+        /// The batch access increment never finishes.
+        stuck_access: bool,
     }
 
     impl MockVectors {
@@ -3227,17 +3254,36 @@ mod tests {
             Self {
                 get_all_tags_calls: counter,
                 tags,
-                stuck_access: None,
+                found: vec![],
+                stuck_access: false,
+            }
+        }
+
+        /// Answers `n` memories, each stored with `STORED_ACCESS_COUNT`.
+        fn finding(n: u8) -> Self {
+            let found = (b'a'..b'a' + n)
+                .map(|c| Memory {
+                    content_hash: char::from(c).to_string().repeat(64),
+                    access_count: STORED_ACCESS_COUNT,
+                    ..dummy_memory()
+                })
+                .collect();
+            Self {
+                found,
+                ..Self::new(vec![], Rc::new(Cell::new(0)))
             }
         }
 
         fn stuck_access() -> Self {
             Self {
-                stuck_access: Some(dummy_memory()),
-                ..Self::new(vec![], Rc::new(Cell::new(0)))
+                stuck_access: true,
+                ..Self::finding(1)
             }
         }
     }
+
+    /// What `MockVectors::finding` stores as each memory's access count.
+    const STORED_ACCESS_COUNT: u64 = 7;
 
     fn dummy_memory() -> Memory {
         Memory {
@@ -3306,7 +3352,7 @@ mod tests {
             _f: Option<PayloadFilter>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(self
-                .stuck_access
+                .found
                 .iter()
                 .map(|m| ScoredMemory {
                     memory: m.clone(),
@@ -3355,7 +3401,7 @@ mod tests {
             Ok(())
         }
         async fn increment_access_count_batch(&self, _h: &[&str]) -> Result<()> {
-            if self.stuck_access.is_some() {
+            if self.stuck_access {
                 std::future::pending::<()>().await;
             }
             Ok(())
@@ -3542,6 +3588,15 @@ mod tests {
         }
     }
 
+    /// An enqueue that never finishes.
+    struct StuckHebbian;
+    #[async_trait(?Send)]
+    impl HebbianService for StuckHebbian {
+        async fn enqueue_strengthen(&self, _p: &[CoAccessPair]) -> Result<()> {
+            std::future::pending().await
+        }
+    }
+
     struct MockConsolidation;
     #[async_trait(?Send)]
     impl ConsolidationService for MockConsolidation {
@@ -3684,19 +3739,19 @@ mod tests {
         );
     }
 
-    /// A search does not wait out its own side-effect writes (LAB-6896). The
-    /// access bump is ranking input and the results are built; a bump queued
-    /// behind this process's writes must not turn a finished search into a
-    /// timeout. Paused clock: a bump that never finishes costs the search
-    /// exactly `ENRICH_BUDGET`. Lose the bound and the outer timeout fails
-    /// the test instead of hanging it.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn search_does_not_wait_out_a_stuck_access_bump() {
+    /// Run a hybrid search whose side-effect writes never finish, and return
+    /// its response. Paused clock: the search must cost
+    /// exactly `ENRICH_BUDGET`. Lose the bound and the outer timeout fails the
+    /// test instead of hanging it.
+    async fn search_past_the_budget(
+        vectors: MockVectors,
+        hebbian: impl HebbianService + 'static,
+    ) -> Value {
         let svc = MemoryService::new(
-            Box::new(MockVectors::stuck_access()),
+            Box::new(vectors),
             Box::new(MockEmbeddings),
             Box::new(MockGraph),
-            Box::new(MockHebbian),
+            Box::new(hebbian),
             Box::new(MockConsolidation),
             None,
         );
@@ -3716,6 +3771,7 @@ mod tests {
             output: OutputMode::Full,
             cursor: None,
         };
+        assert_eq!(svc.vitals.snapshot()["failures"]["enrich_overrun"], 0);
 
         let started = tokio::time::Instant::now();
         let found = tokio::time::timeout(
@@ -3723,12 +3779,51 @@ mod tests {
             svc.search_with(params, false),
         )
         .await
-        .expect("the search waited on its access bump")
+        .expect("the search waited on its side-effect writes")
         .expect("search succeeds");
         assert_eq!(started.elapsed(), ENRICH_BUDGET);
         assert_eq!(
-            found["results"].as_array().map(Vec::len),
-            Some(1),
+            svc.vitals.snapshot()["failures"]["enrich_overrun"],
+            1,
+            "the overrun is counted once"
+        );
+        found
+    }
+
+    fn reported_access_counts(found: &Value) -> Vec<u64> {
+        found["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|r| r["access_count"].as_u64().expect("access_count"))
+            .collect()
+    }
+
+    /// A search does not wait out its own access bump (LAB-6896). The bump is
+    /// ranking input and the results are built; a bump queued behind this
+    /// process's writes must not turn a finished search into a timeout. The
+    /// bump never finished, so the search reports the stored count, not one
+    /// Qdrant may never have recorded.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn search_does_not_wait_out_a_stuck_access_bump() {
+        let found = search_past_the_budget(MockVectors::stuck_access(), MockHebbian).await;
+        assert_eq!(
+            reported_access_counts(&found),
+            [STORED_ACCESS_COUNT],
+            "{found}"
+        );
+    }
+
+    /// The Hebbian enqueue is on the same clock: it runs only for
+    /// two results or more, and one that never finishes costs the search
+    /// `ENRICH_BUDGET` too. The access bump did finish, so the results
+    /// report the incremented count.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn search_does_not_wait_out_a_stuck_hebbian_enqueue() {
+        let found = search_past_the_budget(MockVectors::finding(2), StuckHebbian).await;
+        assert_eq!(
+            reported_access_counts(&found),
+            [STORED_ACCESS_COUNT + 1, STORED_ACCESS_COUNT + 1],
             "{found}"
         );
     }
