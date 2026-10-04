@@ -72,6 +72,7 @@ fn memory(hash: char, trust: f64) -> Memory {
         summary_embedding: None,
         supersession_log: None,
         supersession_reason: None,
+        nearest_similarity: None,
     }
 }
 
