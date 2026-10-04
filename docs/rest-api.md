@@ -190,7 +190,7 @@ Content-Type: application/json
 
 Required: `content`. Optional: `tags`, `memory_type` (`note`|`decision`|`task`|`reference`), `metadata`, `client_hostname`, `summary`, `dedup_threshold`.
 
-Two metadata keys are reserved, and a request carrying either, with any value, returns `400` and stores nothing: `metadata.superseded_by` (the server sets it on supersede and merge) and `metadata.nearest_similarity` (the server computes the store's novelty, below).
+Two metadata keys are reserved, and a request carrying either, with any value, returns `400` and stores nothing: `metadata.superseded_by` (the server sets it on supersede and merge) and `metadata.nearest_similarity` (reserved only: the server never writes it, and records the store's novelty in its own root-level `nearest_similarity` field, below).
 
 **Response:**
 
@@ -222,10 +222,10 @@ Two metadata keys are reserved, and a request carrying either, with any value, r
 |:--|:--|
 | `created` | `false` when this content was already stored: the record was updated in place (`message` is `"Memory updated"`), keeping its creation time and access history. |
 | `tags` | Present only when the memory has tags. |
-| `neighbours` | Up to 5 of the nearest **live** (not superseded) memories, nearest first, never the stored memory itself: `content_hash`, cosine `similarity`, `memory_type`, and `summary` clipped to 200 characters (the content, clipped, when no summary exists yet). They come from the search the store already runs for contradiction detection. `[]` when that search found no live memory. **Absent** when no search ran: a read-only principal's store, or a failed search. A failed search never fails the store. |
+| `neighbours` | Up to 5 of the nearest **live** (not superseded) memories, nearest first, never the stored memory itself: `content_hash`, cosine `similarity`, `memory_type`, and `summary` clipped to 200 characters (the content, clipped, when no summary exists yet). They come from the search the store already runs for contradiction detection, over the 20 nearest memories. `[]` when none of those 20 is live. **Absent** when no search ran: a read-only principal's store, or a failed search. A failed search never fails the store. |
 | `interference.contradictions` | Present only when contradiction cues were detected against a live neighbour with similarity ≥ 0.7; each one is also written as a `CONTRADICTS` edge. The neighbour search runs before the write, so two related stores that race on different server processes can each miss the other, and neither gets the edge. |
 
-Every store also records its novelty on the memory: `nearest_similarity`, the first neighbour's similarity, or none when there was no neighbour or no search. A re-store recomputes it. It is server-maintained and not returned by reads; `GET /stats` aggregates it as `writes.novelty`.
+Every store also records its novelty on the memory: `nearest_similarity`, the first neighbour's similarity, or none when there was no neighbour or no search. A store behind 20 or more superseded near-copies finds no live neighbour and records none. A re-store recomputes it. It is server-maintained and not returned by reads; `GET /stats` aggregates it as `writes.novelty`.
 
 **With `dedup_threshold`.** The server first searches the 5 nearest memories. When the nearest live one has similarity ≥ `dedup_threshold`, nothing is written and the response is:
 
@@ -311,7 +311,7 @@ Content-Type: application/json
 
 Updatable fields: `summary`, `tags`, `metadata`. Content and `content_hash` are immutable by design — to change content, store a new memory and supersede the old.
 
-`metadata.superseded_by` is reserved and cannot be patched, not even to `null`: only supersede, merge and unsupersede change supersession state. `metadata.nearest_similarity` is reserved the same way: the server computes it on each store. A patch carrying either returns `400` and changes nothing.
+`metadata.superseded_by` is reserved and cannot be patched, not even to `null`: only supersede, merge and unsupersede change supersession state. `metadata.nearest_similarity` is reserved the same way, though the server never writes it: novelty lives in the root-level `nearest_similarity` field, which the server computes on each store. A patch carrying either returns `400` and changes nothing.
 
 Changing `summary` also drops the stored summary embedding (the hybrid-search boost vector) so the two never disagree; the boost returns when the summary is next generated server-side.
 

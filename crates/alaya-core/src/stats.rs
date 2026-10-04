@@ -2,9 +2,8 @@
 //!
 //! Read-only by construction: one vector-store count, one vector-store scroll
 //! of the window's writes and two graph aggregates, nothing else — no access
-//! bump, no edge write. Each source
-//! degrades on its own: a failed backend nulls its sections and adds an
-//! error note, and never reads as zero.
+//! bump, no edge write. Each call degrades on its own: a failed call nulls
+//! its section and adds an error note, and never reads as zero.
 
 use std::collections::BTreeMap;
 
@@ -21,10 +20,20 @@ const DAY_SECS: f64 = 86_400.0;
 /// included.
 pub const STATS_WINDOW_DAYS: i64 = 14;
 
-/// `writes.novelty` count keys, by the write's `nearest_similarity`:
-/// three similarity bands, below the lowest, and none recorded (no live
-/// neighbour, no search, or a memory stored before the field existed).
-const NOVELTY_BUCKETS: [&str; 5] = ["0.95+", "0.85-0.95", "0.70-0.85", "below_0.70", "none"];
+/// `writes.novelty` count keys by the write's `nearest_similarity`, each
+/// with its lower-inclusive floor, highest first: three similarity bands,
+/// then below the lowest. The zero-fill and `novelty_bucket` both read this
+/// table, so a renamed key cannot drop a count.
+const NOVELTY_BANDS: [(&str, f64); 4] = [
+    ("0.95+", 0.95),
+    ("0.85-0.95", 0.85),
+    ("0.70-0.85", 0.70),
+    ("below_0.70", f64::NEG_INFINITY),
+];
+
+/// `writes.novelty` key for no value recorded: no live neighbour, no search,
+/// or a memory stored before the field existed.
+const NO_NOVELTY: &str = "none";
 
 /// Key for an edge never judged (NULL verdict): the backlog.
 const NEVER_JUDGED: &str = "never_judged";
@@ -108,20 +117,23 @@ fn dated(per_day: BTreeMap<i64, BTreeMap<&str, usize>>) -> Vec<Value> {
 }
 
 fn novelty_bucket(nearest_similarity: Option<f64>) -> &'static str {
-    match nearest_similarity {
-        None => "none",
-        Some(s) if s >= 0.95 => "0.95+",
-        Some(s) if s >= 0.85 => "0.85-0.95",
-        Some(s) if s >= 0.70 => "0.70-0.85",
-        Some(_) => "below_0.70",
-    }
+    let Some(s) = nearest_similarity else {
+        return NO_NOVELTY;
+    };
+    NOVELTY_BANDS
+        .iter()
+        .find(|(_, floor)| s >= *floor)
+        .map_or(NO_NOVELTY, |(key, _)| key)
 }
 
 /// Each UTC creation day's writes by novelty bucket, zero-filled. A re-store
 /// recomputes a memory's value but keeps its creation day.
 fn novelty_per_day(rows: &[(f64, Option<f64>)], first_day: i64, today: i64) -> Vec<Value> {
     let mut per_day: BTreeMap<i64, BTreeMap<&str, usize>> = (first_day..=today)
-        .map(|d| (d, NOVELTY_BUCKETS.iter().map(|b| (*b, 0)).collect()))
+        .map(|d| {
+            let keys = NOVELTY_BANDS.iter().map(|(k, _)| *k).chain([NO_NOVELTY]);
+            (d, keys.map(|k| (k, 0)).collect())
+        })
         .collect();
     for (created_at, nearest) in rows {
         let day = (created_at / DAY_SECS).floor() as i64;

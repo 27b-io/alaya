@@ -1796,8 +1796,8 @@ impl VectorStorage for QdrantClient {
                 ))
             }));
             match page.next_page_offset {
-                Some(next) if !next.is_null() => offset = Some(next),
-                _ => return Ok(rows),
+                Some(next) => offset = Some(next),
+                None => return Ok(rows),
             }
         }
     }
