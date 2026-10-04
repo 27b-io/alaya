@@ -505,50 +505,29 @@ URL_ENDING_KEY = rf"{SECRET_NAME}(?:(?=[\"'\]\s]){KEY_CLOSE}\s*+{SEPARATOR}|{SEP
 VALUE_CHAR = r"[^\s\"'<>,;]"
 PLACEHOLDER = r"(?:<(?:secret|url|email|ip)>)"
 # A value that ran into the next key's name took that key's separator with it,
-# leaving the next value with no key in front: the key rules take it too. Only
-# a secret-named key's value may sit on a later line (`.../DB_PASSWORD:\n  x`);
-# any other chain stays on its line, so a value ending in `=` padding or `:`
-# takes nothing from the lines after it. `>?`: the separator may be `=>`.
-#
-# "Secret-named" is SECRET_NAME's test: a secret word anywhere in the last
-# name, so `DB_PASSWORD_PROD` and `SECRET_KEY_ID` count, not only names that
-# end in the word. Python needs a fixed-width look-behind, so there is one per
-# total width, each an alternation of every word followed by just enough name
-# characters to fill it; up to SECRET_SUFFIX_MAX of them may follow the word.
-SECRET_WORDS = (
-    "_key", "-key", "apikey", "accountkey", "token", "secret", "password", "passwd",
-    "passphrase", "pwd", "credential",
-)  # fmt: skip
-SECRET_SUFFIX_MAX = 32
-
-
-def ends_in_secret_name(tail: str) -> str:
-    """Look-behinds true where a secret word, then at most SECRET_SUFFIX_MAX
-    name characters, then `tail` end just before the current position."""
-    widths = sorted(
-        {len(w) + k for w in SECRET_WORDS for k in range(SECRET_SUFFIX_MAX + 1)}
-    )
-    return "|".join(
-        "(?<=(?:"
-        + "|".join(
-            f"{re.escape(w)}[\\w.-]{{{n - len(w)}}}"
-            for w in SECRET_WORDS
-            if 0 <= n - len(w) <= SECRET_SUFFIX_MAX
-        )
-        + f"){tail})"
-        for n in widths
-    )
-
-
-ENDS_SECRET_KEY = ends_in_secret_name("")
-# The value took the separator too, and with it a `]` (a value never holds a
-# quote, so only the bracket of KEY_CLOSE can come along).
-ENDS_SECRET_KEY_SEP = ends_in_secret_name("[:=]") + "|" + ends_in_secret_name("\\][:=]")
+# leaving the next value with no key in front: the key rules take it too, on
+# the same line only, so a value ending in `=` padding or `:` takes nothing
+# from the lines after it. A secret key whose value sits on a later line is
+# the NEXT_LINE_SECRET rule's. `>?`: the separator may be `=>`.
 NEXT_VALUES = (
-    rf"(?:(?:(?:{ENDS_SECRET_KEY_SEP})>?\s*+"
-    rf"|(?:{ENDS_SECRET_KEY}){KEY_CLOSE}\s*+(?:=>|[:=])\s*+"
-    r"|(?<=[:=])>?[ \t]*+|[ \t]++(?:=>|[:=])[ \t]*+)[\"']?"
+    r"(?:(?:(?<=[:=])>?[ \t]*+|[ \t]++(?:=>|[:=])[ \t]*+)[\"']?"
     rf"(?:{VALUE_CHAR}|{PLACEHOLDER})++)*+"
+)
+# A secret value, whole or as what an earlier placeholder left of it: the
+# tail a bracket left, or the rest around an IP, URL or email inside it.
+SECRET_VALUE = (
+    rf"(?:(?:{VALUE_CHAR}++{PLACEHOLDER}++|{PLACEHOLDER}++{VALUE_CHAR})"
+    rf"(?:{VALUE_CHAR}++|{PLACEHOLDER})*+|{VALUE_CHAR}{{8,}})"
+)
+# A secret key whose separator meets a line break, its value on a later line.
+# SECRET_KEY_NAME's own grammar, so any name it reads as secret, at any length
+# and with any closer. It runs before the key rules, which would otherwise
+# let a value that ran into this key (`token=x/DB_PASSWORD_PROD:` then the
+# value on the next line) take the key and leave its value behind.
+NEXT_LINE_SECRET = (
+    rf"(?P<keep>{SECRET_NAME}{KEY_CLOSE}(?:[ \t]*+\r?\n\s*+(?:=>|[:=])"
+    r"|[ \t]*+(?:=>|[:=])[ \t]*+\r?\n)\s*+[\"']?)"
+    rf"{SECRET_VALUE}{NEXT_VALUES}"
 )
 # (class, pattern). A `keep` group survives in front of the placeholder.
 SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
@@ -606,6 +585,7 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
             re.I,
         ),
     ),
+    ("secret", re.compile(NEXT_LINE_SECRET, re.I)),
     # A secret-named key's value: first one that stops at a bracket, so a call
     # such as `token => login(password: "...")` cannot hide the inner key; then
     # any value, brackets included. The flag rule runs first: a placeholder it
@@ -617,15 +597,9 @@ SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
             re.I,
         ),
     ),
-    (  # ...and what is left of a value an earlier placeholder split: the
-        # tail a bracket left, or the rest around an IP, URL or email in it
+    (  # ...and what is left of a value an earlier placeholder split
         "secret",
-        re.compile(
-            rf"(?P<keep>{SECRET_KEY_NAME})(?:"
-            rf"(?:{VALUE_CHAR}++{PLACEHOLDER}++|{PLACEHOLDER}++{VALUE_CHAR})"
-            rf"(?:{VALUE_CHAR}++|{PLACEHOLDER})*+|{VALUE_CHAR}{{8,}}){NEXT_VALUES}",
-            re.I,
-        ),
+        re.compile(rf"(?P<keep>{SECRET_KEY_NAME}){SECRET_VALUE}{NEXT_VALUES}", re.I),
     ),
     (
         "host",

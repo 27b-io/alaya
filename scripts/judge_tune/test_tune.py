@@ -458,6 +458,9 @@ def check_scrub() -> None:
         "token=abcdefgh/SECRET_KEY_ID:\n",
         "token=abcdefgh/API_TOKEN_V2]:\n",
         "token=abcdefgh/password_hash\n: ",
+        # ...at any length, as SECRET_NAME has no limit either.
+        "token=abcdefgh/X_API_KEY_APPLICATION_PRODUCTION_EU_WEST_01:\n",
+        "token=abcdefgh/DB_PASSWORD_" + "X" * 300 + "]:\n",
     ):
         out = s(text + "Pa55w0rd99")
         assert "Pa55w0rd99" not in out and s.leaks(out) == [], out
