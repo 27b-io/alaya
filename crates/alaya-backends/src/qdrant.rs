@@ -334,9 +334,10 @@ impl QdrantClient {
     /// loses at most one round to this client's increments: the one already
     /// past this point when the store began. Every later increment waits for
     /// the store to finish. The lock promises no fairness, so under a steady
-    /// run of writes an increment, and the search awaiting it, can wait out
-    /// the run: a search waited behind every queued write on the serial
-    /// worker loop before, too.
+    /// run of writes an increment can wait out the run. The hybrid search
+    /// that awaits it bounds that wait (`ENRICH_BUDGET` in alaya-core) and
+    /// drops the increment past it, so the wait costs an access count, never
+    /// the search.
     async fn access_turn(&self) -> futures::lock::MutexGuard<'_, ()> {
         let turn = self.access_lock.lock().await;
         drop(self.write_lock.lock().await);
