@@ -464,12 +464,35 @@ def check_scrub() -> None:
     ):
         out = s(text + "Pa55w0rd99")
         assert "Pa55w0rd99" not in out and s.leaks(out) == [], out
+    # A next-line value may end in, or be, another such key: the chain goes whole.
+    for text in (
+        "password:\nYWJjZGVmZ2hp/api_key:\n",
+        "token=abcdefgh/password:\nYWJjZGVmZ2hp/api_key:\n",
+        "password:\nab/SECRET:\nYWJjZGVmZ2hp/x-api-key\n= ",
+        "password:\nmy_token_value:\n",
+        "secrets:\n  db_password:\n    value: ",
+    ):
+        out = s(text + "Pa55w0rd99")
+        assert "Pa55w0rd99" not in out and "YWJj" not in out, out
+        assert s(out) == out and s.leaks(out) == [], out
     # A secret-named value cannot swallow the next secret-named key.
     out = s(':auth_token => login(password: "' + "Zx9Qw8Er7Ty6" + '")')
     assert "Zx9Qw8Er7Ty6" not in out and s.leaks(out) == [], out
     # Every rule stays near linear on long adversarial runs (some were
     # quadratic or worse: 64k characters took minutes).
-    for run in ("x", "a.", "1.", "_key", "token", "--key", "-", "a@", "ab:"):
+    for run in (
+        "x",
+        "a.",
+        "1.",
+        "_key",
+        "token",
+        "--key",
+        "-",
+        "a@",
+        "ab:",
+        "pwd:\n",
+        "pwd:\nx ",
+    ):
         text = (run * 64_000)[:64_000]
         start = tune.time.perf_counter()
         s(text)

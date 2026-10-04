@@ -521,13 +521,20 @@ SECRET_VALUE = (
 )
 # A secret key whose separator meets a line break, its value on a later line.
 # SECRET_KEY_NAME's own grammar, so any name it reads as secret, at any length
-# and with any closer. It runs before the key rules, which would otherwise
-# let a value that ran into this key (`token=x/DB_PASSWORD_PROD:` then the
-# value on the next line) take the key and leave its value behind.
+# and with any closer.
+NEXT_LINE_KEY = (
+    rf"{SECRET_NAME}{KEY_CLOSE}(?:[ \t]*+\r?\n\s*+(?:=>|[:=])"
+    r"|[ \t]*+(?:=>|[:=])[ \t]*+\r?\n)\s*+[\"']?"
+)
+# Its value. The rule runs before the key rules, which would otherwise let a
+# value that ran into such a key (`token=x/DB_PASSWORD_PROD:` then the value
+# on the next line) take the key and leave its value behind. The value line
+# may itself end in such a key (`x/API_KEY:`, a nested YAML key): then the
+# rule takes the whole chain, each key and the last value, for the same
+# reason. A value character never starts such a key, so nothing backtracks.
 NEXT_LINE_SECRET = (
-    rf"(?P<keep>{SECRET_NAME}{KEY_CLOSE}(?:[ \t]*+\r?\n\s*+(?:=>|[:=])"
-    r"|[ \t]*+(?:=>|[:=])[ \t]*+\r?\n)\s*+[\"']?)"
-    rf"{SECRET_VALUE}{NEXT_VALUES}"
+    rf"(?P<keep>{NEXT_LINE_KEY})(?:(?:(?:(?!{NEXT_LINE_KEY}){VALUE_CHAR}|{PLACEHOLDER})*+"
+    rf"{NEXT_LINE_KEY})++(?:{VALUE_CHAR}|{PLACEHOLDER})*+|{SECRET_VALUE}){NEXT_VALUES}"
 )
 # (class, pattern). A `keep` group survives in front of the placeholder.
 SCRUB_RULES: tuple[tuple[str, re.Pattern], ...] = (
