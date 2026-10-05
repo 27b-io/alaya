@@ -11,6 +11,7 @@ use crate::alaya::AlayaClient;
 use crate::config::Config;
 use crate::lb::{LbClient, MetricsClient};
 use crate::oidc::OidcRp;
+use crate::selecta::SelectaClient;
 
 /// anthropic-lb monitoring module upstreams, present only when the module
 /// is configured — see `LbConfig`. One value, not two `Option`s: the
@@ -26,6 +27,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub alaya: AlayaClient,
     pub lb: Option<LbModule>,
+    /// selecta read-only pane; `None` = module not configured.
+    pub selecta: Option<SelectaClient>,
     pub oidc: Arc<OidcRp>,
     /// AES-GCM key for the private cookie jar, derived from
     /// CONSOLE_SESSION_SECRET at startup.
@@ -64,6 +67,10 @@ impl AppState {
             client: LbClient::new(c.url.clone(), c.api_key.clone()),
             metrics: MetricsClient::new(c.metrics_url.clone()),
         });
+        let selecta = config
+            .selecta
+            .as_ref()
+            .map(|c| SelectaClient::new(c.url.clone(), c.api_key.clone()));
         let oidc = Arc::new(OidcRp::new(
             config.oidc_issuer.clone(),
             config.oidc_client_id.clone(),
@@ -74,6 +81,7 @@ impl AppState {
             config,
             alaya,
             lb,
+            selecta,
             oidc,
             key,
             revoked: Arc::new(Mutex::new(HashMap::new())),

@@ -10,12 +10,13 @@
 #   - own Deployment + own label (app: ops-console) — never colocated behind
 #     `app: alaya-server`
 #   - own NetworkPolicy with egress pinned to the module upstreams (Ālaya API;
-#     anthropic-lb + a Prometheus-compatible query route for the LB pane) and
-#     the OIDC IdP (external :443) only; NO egress to any shared datastore.
+#     anthropic-lb + a Prometheus-compatible query route for the LB pane;
+#     selecta's HTTP port for the selecta pane) and the OIDC IdP (external
+#     :443) only; NO egress to any shared datastore.
 #     Defined alongside the deployed manifest, verified from the live pod.
 #   - single replica BY DESIGN: logout revocation is in-memory
 #   - Reloader annotation — editing the ops-console-env Secret rolls the pod
-#   - plain env for the non-secret settings; the six credentials come from
+#   - plain env for the non-secret settings; the seven credentials come from
 #     the Secret; the console is fail-closed (see envFrom note below)
 #   - TLS terminates at the edge in front of this Service:3002, not in the pod
 apiVersion: apps/v1
@@ -73,6 +74,12 @@ spec:
             # here; deploy it behind a route that exposes nothing else.
             - name: METRICS_URL
               value: "http://<query-route>:8427" # deployed: a path-scoped proxy in front of the metrics store
+            # selecta read-only pane. SELECTA_URL (here) and SELECTA_API_KEY
+            # (Secret) are ONE both-or-neither group. The host:port is sent as
+            # the Host header and selecta 421s any Host outside its
+            # allowed_hosts: use exactly the name selecta allow-lists.
+            - name: SELECTA_URL
+              value: "http://selecta.<namespace>.svc.cluster.local:8080"
             # OIDC relying party. redirect_uri is derived as
             # {CONSOLE_PUBLIC_URL}/auth/callback and must match the client
             # registration on the IdP exactly.
@@ -87,9 +94,11 @@ spec:
           # Credentials come from the Secret (secret manager → ESO):
           #   CONSOLE_OIDC_CLIENT_ID, CONSOLE_OIDC_CLIENT_SECRET,
           #   CONSOLE_ALLOWED_SUBJECTS, CONSOLE_SESSION_SECRET, ALAYA_API_KEY,
-          #   LB_API_KEY (anthropic-lb operator key, sent as x-api-key)
+          #   LB_API_KEY (anthropic-lb operator key, sent as x-api-key),
+          #   SELECTA_API_KEY (selecta read-only token, sent as Bearer)
           # The console is fail-closed: it refuses to start if any of the first
-          # five is missing, or if the LB_* group is only partially set.
+          # five is missing, or if the LB_* or SELECTA_* group is only partially
+          # set.
           envFrom:
             - secretRef:
                 name: ops-console-env

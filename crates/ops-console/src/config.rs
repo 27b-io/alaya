@@ -34,6 +34,8 @@ pub struct Config {
     pub alaya_api_key: String,
     /// anthropic-lb monitoring module; `None` = module disabled.
     pub lb: Option<LbConfig>,
+    /// selecta read-only pane; `None` = module disabled.
+    pub selecta: Option<SelectaConfig>,
 }
 
 /// anthropic-lb read-only module. Optional as a GROUP: a
@@ -102,6 +104,47 @@ impl LbConfig {
     }
 }
 
+/// selecta read-only pane. Optional as a GROUP, for the same deploy-ordering
+/// reason as `LbConfig`: both set → enabled, neither → the card reads "not
+/// configured", one alone refuses startup.
+pub struct SelectaConfig {
+    /// selecta's own HTTP port. Its MCP layer answers 421 to any Host outside
+    /// its `allowed_hosts`, and reqwest sends this URL's host:port as the
+    /// Host, so it must be the exact in-cluster name selecta allow-lists.
+    pub url: url::Url,
+    /// A selecta READ-ONLY bearer, sent server-side as `Authorization:
+    /// Bearer` to the read-only MCP mount, which registers no verb that
+    /// enqueues work. Never reaches the browser.
+    pub api_key: String,
+}
+
+impl SelectaConfig {
+    pub fn from_parts(
+        url: Option<String>,
+        api_key: Option<String>,
+    ) -> Result<Option<Self>, String> {
+        match (url, api_key) {
+            (None, None) => Ok(None),
+            (Some(u), Some(k)) => {
+                let url: url::Url = u
+                    .parse()
+                    .map_err(|e| format!("SELECTA_URL is not a valid URL: {e}"))?;
+                validate_upstream_url("SELECTA_URL", &url)?;
+                reject_query_or_fragment("SELECTA_URL", &url)?;
+                Ok(Some(SelectaConfig { url, api_key: k }))
+            }
+            (u, _) => Err(format!(
+                "selecta module is half-configured — set both SELECTA_URL and SELECTA_API_KEY or neither (missing: {})",
+                if u.is_none() {
+                    "SELECTA_URL"
+                } else {
+                    "SELECTA_API_KEY"
+                }
+            )),
+        }
+    }
+}
+
 // Never derive Debug for Config — it holds credentials. Upstream URLs render
 // as origin only: userinfo and query strings can carry more.
 impl fmt::Debug for Config {
@@ -117,6 +160,10 @@ impl fmt::Debug for Config {
             .field(
                 "metrics_url",
                 &self.lb.as_ref().map(|l| origin_of(&l.metrics_url)),
+            )
+            .field(
+                "selecta_url",
+                &self.selecta.as_ref().map(|s| origin_of(&s.url)),
             )
             .finish_non_exhaustive()
     }
@@ -392,6 +439,10 @@ impl Config {
                 optional("LB_API_KEY"),
                 optional("METRICS_URL"),
             )?,
+            selecta: SelectaConfig::from_parts(
+                optional("SELECTA_URL"),
+                optional("SELECTA_API_KEY"),
+            )?,
         })
     }
 }
@@ -571,11 +622,17 @@ mod tests {
                     .parse()
                     .unwrap(),
             }),
+            selecta: Some(SelectaConfig {
+                url: "http://selecta.test:8080".parse().unwrap(),
+                api_key: "SELECTA_KEY_VALUE".into(),
+            }),
         };
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("SECRET_VALUE"));
         assert!(!dbg.contains("BEARER_VALUE"));
         assert!(!dbg.contains("LB_KEY_VALUE"));
+        assert!(!dbg.contains("SELECTA_KEY_VALUE"), "{dbg}");
+        assert!(dbg.contains("selecta.test:8080"), "{dbg}");
         assert!(!dbg.contains("URL_USERINFO_VALUE"), "{dbg}");
         assert!(!dbg.contains("URL_QUERY_VALUE"), "{dbg}");
         assert!(dbg.contains("anthropic-lb.mcp.svc"));
@@ -631,5 +688,28 @@ mod tests {
             .err()
             .expect("METRICS_URL with a query must be refused");
         assert!(err.contains("query string or fragment"), "{err}");
+    }
+
+    #[test]
+    fn selecta_config_is_all_or_nothing() {
+        let u = || Some("http://selecta.ns.svc.cluster.local:8080".to_string());
+        let k = || Some("k".repeat(40));
+        assert!(SelectaConfig::from_parts(None, None).unwrap().is_none());
+        assert!(SelectaConfig::from_parts(u(), k()).unwrap().is_some());
+        // `.err()`: SelectaConfig has no Debug impl — it holds the bearer.
+        let err = SelectaConfig::from_parts(u(), None)
+            .err()
+            .expect("half-set must refuse");
+        assert!(err.ends_with("(missing: SELECTA_API_KEY)"), "{err}");
+        let err = SelectaConfig::from_parts(None, k())
+            .err()
+            .expect("half-set must refuse");
+        assert!(err.ends_with("(missing: SELECTA_URL)"), "{err}");
+        // Same transport and concatenation gates as every other upstream.
+        assert!(
+            SelectaConfig::from_parts(Some("http://selecta.example.com:8080".into()), k()).is_err()
+        );
+        assert!(SelectaConfig::from_parts(Some("http://selecta:8080?x=1".into()), k()).is_err());
+        assert!(SelectaConfig::from_parts(Some("not a url".into()), k()).is_err());
     }
 }

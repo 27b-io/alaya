@@ -1,6 +1,6 @@
-//! Console home: one card per module. Two-tenant from day one (LAB-1641
-//! constraint A): the Ālaya curation module and the anthropic-lb read-only
-//! monitoring pane.
+//! Console home: one card per module. Multi-tenant from day one (LAB-1641
+//! constraint A): the Ālaya curation module and the anthropic-lb and selecta
+//! read-only panes.
 
 use axum::extract::State;
 use axum::response::Html;
@@ -22,7 +22,7 @@ pub async fn home(
 ) -> Result<(PrivateCookieJar, Html<String>), AppError> {
     let (jar, flash) = take_flash(jar);
 
-    // Both probes are informational — a degraded upstream must not take the
+    // Every probe is informational — a degraded upstream must not take the
     // console home page down with it. Fetched concurrently.
     let lb_probe = async {
         match state.lb.as_ref() {
@@ -30,7 +30,15 @@ pub async fn home(
             None => None,
         }
     };
-    let (health, lb_stats) = tokio::join!(state.alaya.health(), lb_probe);
+    // The one read that both proves the token and says what matters most.
+    let selecta_probe = async {
+        match state.selecta.as_ref() {
+            Some(s) => Some(s.list_tasks("awaiting_approval", 100).await),
+            None => None,
+        }
+    };
+    let (health, lb_stats, selecta_awaiting) =
+        tokio::join!(state.alaya.health(), lb_probe, selecta_probe);
     let health = health.ok();
     let (status, memories) = match &health {
         Some(h) => (
@@ -92,6 +100,46 @@ pub async fn home(
         }
     };
 
+    let selecta_card = match &selecta_awaiting {
+        None => Either::Left(view! {
+            <div class="text-sm">
+                <span class=badge(BadgeKind::Muted)>"not configured"</span>
+                <p class="text-muted-foreground mt-2">
+                    "Set SELECTA_URL and SELECTA_API_KEY on the console to enable."
+                </p>
+            </div>
+        }),
+        Some(probe) => {
+            let (class, label, summary) = match probe {
+                Ok(rows) => {
+                    let no_pr = rows.iter().filter(|r| r.pr_url.is_none()).count();
+                    let class = if no_pr > 0 {
+                        badge(BadgeKind::Destructive)
+                    } else {
+                        badge(BadgeKind::Success)
+                    };
+                    let mut summary = format!("{} awaiting your approval", rows.len());
+                    if no_pr > 0 {
+                        summary.push_str(&format!(" · {no_pr} with no PR"));
+                    }
+                    (class, "reachable", summary)
+                }
+                Err(e) => (
+                    badge(BadgeKind::Destructive),
+                    "unreachable",
+                    e.detail().to_string(),
+                ),
+            };
+            Either::Right(view! {
+                <div class="flex items-center gap-3 text-sm mb-4">
+                    <span class=class>{label}</span>
+                    <span class="text-muted-foreground">{summary}</span>
+                </div>
+                <a href="/selecta" class=btn(Btn::Default)>"Open module"</a>
+            })
+        }
+    };
+
     let content = view! {
         <div class="grid gap-6 sm:grid-cols-2">
             <Card>
@@ -117,6 +165,15 @@ pub async fn home(
                     </CardDescription>
                 </CardHeader>
                 <CardContent>{lb_card}</CardContent>
+            </Card>
+            <Card>
+                <CardHeader>
+                    <CardTitle>"selecta — what it is doing"</CardTitle>
+                    <CardDescription>
+                        "Read-only: failures and why, tasks waiting on your approval, and whether selecta is parked, fenced or stalled. Approvals happen on GitHub."
+                    </CardDescription>
+                </CardHeader>
+                <CardContent>{selecta_card}</CardContent>
             </Card>
         </div>
     };
