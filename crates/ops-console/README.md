@@ -186,7 +186,8 @@ security review first.
   200-character audit excerpt, each linking to `/selecta/task/<id>`, which
   renders `selecta_get_task` with the whole audit.
 - **Tasks by state** — `queue_depth` per state. All time: selecta never
-  deletes a queue row.
+  deletes a queue row. A state the console does not know still gets a
+  tile, and is flagged as an error.
 - **Download health** — `selecta_download_health` signals and alerts.
 
 Each read is one stateless JSON-RPC `tools/call` POST (no `initialize`),

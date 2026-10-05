@@ -116,7 +116,8 @@ pub struct Liveness {
 
 /// The control-plane gauges the pane renders.
 pub struct Gauges {
-    /// MCP state → rows. All time: selecta never deletes a queue row.
+    /// MCP state → rows. All time: selecta never deletes a queue row. May
+    /// hold a state not in `STATES`, when selecta has added one.
     pub queue_depth: BTreeMap<String, f64>,
     pub budget: Budget,
     /// cap → (used today, limit). Empty until selecta seeds its caps.
@@ -398,13 +399,11 @@ fn parse_gauges(text: &str) -> Result<Gauges, String> {
     for s in &samples {
         match (s.name.as_str(), s.label("state"), s.label("cap")) {
             ("queue_depth", Some(state), _) => {
-                // A state the pane does not know would be counted and never
-                // rendered, reading as 0: refuse it instead.
-                let state = mcp_state(state);
-                if !STATES.contains(&state) {
-                    return Err(format!("unknown queue_depth state {state:?}"));
-                }
-                *queue_depth.entry(state.to_string()).or_insert(0.0) += s.value;
+                // A state not in STATES is kept: the pane flags it, and it
+                // costs none of the other gauges.
+                *queue_depth
+                    .entry(mcp_state(state).to_string())
+                    .or_insert(0.0) += s.value;
             }
             ("day_cap_used", _, Some(cap)) => {
                 day_caps.entry(cap.to_string()).or_default().0 = Some(s.value)
@@ -577,18 +576,18 @@ lease_remaining_s 41.5
         assert!(g.day_caps.is_empty());
     }
 
-    /// A state selecta adds later must not be counted and silently dropped
-    /// from the tiles, which would read as 0.
+    /// A state selecta adds later keeps its count for the pane to flag, and
+    /// costs none of the other gauges.
     #[test]
-    fn gauges_refuse_an_unknown_queue_state() {
+    fn gauges_keep_an_unknown_queue_state() {
         let text = METRICS.replace(
             r#"queue_depth{state="ready"} 3"#,
             "queue_depth{state=\"ready\"} 3\nqueue_depth{state=\"quarantined\"} 5",
         );
-        assert_eq!(
-            parse_gauges(&text).err().as_deref(),
-            Some(r#"unknown queue_depth state "quarantined""#)
-        );
+        let g = parse_gauges(&text).unwrap();
+        assert_eq!(g.queue_depth["quarantined"], 5.0);
+        assert_eq!(g.queue_depth["queued"], 3.0);
+        assert_eq!(g.lease_remaining_s, 41.5);
     }
 
     #[test]

@@ -2857,6 +2857,41 @@ mod tests {
         );
     }
 
+    /// A queue state the console does not know renders as its own tile under
+    /// an error naming it, and every other gauge still renders.
+    #[tokio::test]
+    async fn selecta_pane_flags_an_unknown_queue_state_and_keeps_the_rest() {
+        let seen = SelectaSeen::default();
+        let metrics: &'static str = Box::leak(
+            SELECTA_METRICS
+                .replace(
+                    "queue_depth{state=\"ready\"} 3\n",
+                    "queue_depth{state=\"ready\"} 3\nqueue_depth{state=\"quarantined\"} 5\n",
+                )
+                .into_boxed_str(),
+        );
+        let state = fake_selecta(
+            &seen,
+            selecta_answer,
+            metrics,
+            (StatusCode::OK, r#"{"status":"ok","seq":9124}"#),
+        )
+        .await;
+        let (_, html) = render(state, "/selecta").await;
+        assert!(
+            html.contains("selecta reports queue states this console does not know: quarantined."),
+            "{html}"
+        );
+        assert!(
+            html.contains(">quarantined<") && html.contains(">5<"),
+            "{html}"
+        );
+        assert!(html.contains("held, 42s left"), "{html}");
+        assert!(html.contains("<progress value=\"12\" max=\"40\""), "{html}");
+        assert!(html.contains("Showing the newest 1 of 412."), "{html}");
+        assert!(!html.contains("selecta /metrics:"), "{html}");
+    }
+
     #[tokio::test]
     async fn selecta_task_detail_renders_the_whole_audit() {
         let seen = SelectaSeen::default();

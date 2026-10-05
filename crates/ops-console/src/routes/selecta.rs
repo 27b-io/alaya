@@ -482,9 +482,29 @@ fn states_card(gauges: &Result<Gauges, AppError>) -> impl IntoView + use<> {
     let body = match gauges {
         Err(e) => Either::Left(unavailable("task counts", e)),
         Ok(g) => {
+            // A state this console does not know gets a tile too, under an
+            // error: hidden, it would read as 0.
+            let unknown: Vec<&str> = g
+                .queue_depth
+                .keys()
+                .map(String::as_str)
+                .filter(|s| !STATES.contains(s))
+                .collect();
+            let unknown_note = (!unknown.is_empty()).then(|| {
+                let msg = format!(
+                    " selecta reports queue states this console does not know: {}.",
+                    unknown.join(", ")
+                );
+                view! {
+                    <p class="text-sm mb-4">
+                        <span class=badge(BadgeKind::Destructive)>"error"</span>{msg}
+                    </p>
+                }
+            });
             // selecta omits zero-count states: every state renders, absent = 0.
             let tiles = STATES
                 .iter()
+                .chain(&unknown)
                 .map(|s| {
                     let n = g.queue_depth.get(*s).copied().unwrap_or(0.0);
                     let class = match *s {
@@ -502,6 +522,7 @@ fn states_card(gauges: &Result<Gauges, AppError>) -> impl IntoView + use<> {
                 })
                 .collect_view();
             Either::Right(view! {
+                {unknown_note}
                 <dl class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">{tiles}</dl>
             })
         }
