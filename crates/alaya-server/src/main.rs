@@ -6048,6 +6048,39 @@ mod wedge_tests {
         }
     }
 
+    /// LAB-7878: the rerank call records no query text in its span. A
+    /// refused connection is enough: the span opens and closes either way.
+    #[tokio::test]
+    async fn rerank_span_carries_no_query_text() {
+        use alaya_backends::RerankingService;
+        use tracing_subscriber::fmt::format::FmtSpan;
+
+        let log = crate::testlog::LogBuf::default();
+        let _guard = crate::testlog::scoped(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_span_events(FmtSpan::CLOSE)
+                .with_writer(log.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let refused = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("free port");
+        let client = RerankClient::new(format!("http://{refused}"), 1, None, NEVER).unwrap();
+        assert!(client.rerank("QUERY-MARKER", &["x"]).await.is_err());
+
+        let log = log.text();
+        assert!(
+            log.contains("rerank{n=1}"),
+            "positive control: no rerank span in:\n{log}"
+        );
+        assert!(
+            !log.contains("QUERY-MARKER"),
+            "query text reached the log:\n{log}"
+        );
+    }
+
     /// A search that panics ends its own task only. Its caller sees the reply
     /// dropped, the gate and slot are released, so the next search runs (and
     /// panics the same way), and the loop keeps serving. Inline, a panicking

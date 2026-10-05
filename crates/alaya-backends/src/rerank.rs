@@ -78,7 +78,8 @@ impl RerankClient {
 
 #[async_trait(?Send)]
 impl RerankingService for RerankClient {
-    #[tracing::instrument(skip(self, texts), fields(n = texts.len()))]
+    // The query is caller free text, so it stays out of the span (LAB-7878).
+    #[tracing::instrument(skip(self, query, texts), fields(n = texts.len()))]
     async fn rerank(&self, query: &str, texts: &[&str]) -> Result<Vec<f32>> {
         if texts.is_empty() {
             return Ok(Vec::new());
