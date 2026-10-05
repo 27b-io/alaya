@@ -1,11 +1,11 @@
 //! ops-console — OIDC-gated web console for the 27b workspace (LAB-1684).
 //!
-//! Two-tenant console (LAB-1641 constraint A): the Ālaya memory-curation
-//! module and the anthropic-lb read-only monitoring pane as a second route
-//! module. Trust model (D2, ratified 2026-08-15): the browser
+//! Multi-tenant console (LAB-1641 constraint A): the Ālaya memory-curation
+//! module, plus read-only panes for anthropic-lb and selecta as further
+//! route modules. Trust model (D2, ratified 2026-08-15): the browser
 //! authenticates with an OIDC session; every upstream call (alaya-server
-//! bearer, anthropic-lb operator key) happens server-side. No credential
-//! reaches the browser.
+//! bearer, anthropic-lb operator key, selecta read-only bearer) happens
+//! server-side. No credential reaches the browser.
 //!
 //! Session posture (LAB-1694 panel, pass/fail set): CSRF token + Origin check
 //! on every POST, `HttpOnly`/`SameSite`/`Secure` cookies, session regeneration
@@ -18,6 +18,7 @@ mod http;
 mod lb;
 mod oidc;
 mod routes;
+mod selecta;
 mod session;
 mod state;
 #[cfg(test)]
@@ -186,6 +187,10 @@ fn app(state: AppState) -> Router {
         // anthropic-lb module: GET only, by design. No POST route to the LB
         // exists and none may be added here.
         .route("/lb", get(routes::lb::pane))
+        // selecta module: GET only, by design. The console holds a read-only
+        // selecta credential and no POST route to selecta may be added here.
+        .route("/selecta", get(routes::selecta::pane))
+        .route("/selecta/task/{id}", get(routes::selecta::task))
         .layer(middleware::from_fn_with_state(state.clone(), origin_check))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -291,6 +296,7 @@ mod tests {
             alaya_url: "http://127.0.0.1:1".parse().unwrap(),
             alaya_api_key: "alaya-bearer-secret-value".into(),
             lb: None,
+            selecta: None,
         }
     }
 
@@ -298,13 +304,18 @@ mod tests {
         AppState::new(test_config())
     }
 
-    /// LB module configured against closed ports: both upstreams fail fast.
+    /// LB and selecta modules configured against closed ports: every upstream
+    /// fails fast.
     fn test_state_with_lb() -> AppState {
         let mut config = test_config();
         config.lb = Some(config::LbConfig {
             url: "http://127.0.0.1:1".parse().unwrap(),
             api_key: LB_KEY.into(),
             metrics_url: "http://127.0.0.1:1".parse().unwrap(),
+        });
+        config.selecta = Some(config::SelectaConfig {
+            url: "http://127.0.0.1:1".parse().unwrap(),
+            api_key: SELECTA_KEY.into(),
         });
         AppState::new(config)
     }
@@ -470,15 +481,17 @@ mod tests {
     }
 
     /// AC8: no server-held credential may ever appear in a rendered page —
-    /// including on the home page and the LB pane, whose upstream calls all
-    /// fail here (every error path renders).
+    /// including on the home page and the LB and selecta panes, whose
+    /// upstream calls all fail here (every error path renders). The
+    /// happy-path selecta pane is checked in its own test.
     #[tokio::test]
     async fn rendered_pages_never_contain_credentials() {
         let state = test_state_with_lb();
         let sess = session::new_session("admin-sub".into(), None, None);
         let cookie_header = session_cookie_header(&state, &sess);
         let app = app(state);
-        for path in ["/", "/lb"] {
+        let task = format!("/selecta/task/{FAILED_ID}");
+        for path in ["/", "/lb", "/selecta", task.as_str()] {
             let resp = app
                 .clone()
                 .oneshot(
@@ -494,6 +507,7 @@ mod tests {
             assert!(!html.contains("alaya-bearer-secret-value"), "{path}");
             assert!(!html.contains("oidc-client-secret-value"), "{path}");
             assert!(!html.contains(LB_KEY), "{path}");
+            assert!(!html.contains(SELECTA_KEY), "{path}");
         }
     }
 
@@ -508,15 +522,15 @@ mod tests {
         assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/auth/login");
     }
 
-    /// Module disabled (no LB_* env): the pane and the home card say so
-    /// explicitly rather than 404ing or rendering an empty table.
+    /// Modules disabled (no LB_* / SELECTA_* env): each pane and the home
+    /// card say so explicitly rather than 404ing or rendering an empty table.
     #[tokio::test]
-    async fn lb_pane_reports_an_unconfigured_module() {
+    async fn read_only_panes_report_an_unconfigured_module() {
         let state = test_state();
         let sess = session::new_session("admin-sub".into(), None, None);
         let cookie_header = session_cookie_header(&state, &sess);
         let app = app(state);
-        for path in ["/lb", "/"] {
+        for path in ["/lb", "/selecta", "/"] {
             let resp = app
                 .clone()
                 .oneshot(
@@ -2541,5 +2555,474 @@ mod tests {
         let resp = submit('e').await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         assert!(body_string(resp).await.contains("alaya-server: graph down"));
+    }
+
+    // ─── selecta read-only pane (LAB-6674) ────────────────────────────────
+
+    const SELECTA_KEY: &str = "selecta-readonly-bearer-secret-value";
+    const FAILED_ID: &str = "0123456789abcdef0123456789abcdef";
+    const GATED_ID: &str = "fedcba9876543210fedcba9876543210";
+    const ORPHAN_ID: &str = "00000000000000000000000000000001";
+
+    /// What the fake selecta saw: one entry per MCP call.
+    #[derive(Clone, Default)]
+    struct SelectaSeen(
+        std::sync::Arc<std::sync::Mutex<Vec<(axum::http::HeaderMap, serde_json::Value)>>>,
+    );
+
+    fn selecta_row(
+        id: &str,
+        state: &str,
+        verb: &str,
+        pr: Option<&str>,
+        audit: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({"task_id": id, "state": state, "tier": "gated", "verb": verb,
+            "enqueued_at": 1_790_000_000.0, "pr_url": pr, "audit": audit})
+    }
+
+    /// A JSON-RPC `tools/call` success, shaped as FastMCP returns it: the
+    /// payload in `structuredContent`, one text block per row in `content`.
+    fn rpc_ok(sc: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"jsonrpc": "2.0", "id": 1,
+            "result": {"content": [{"type": "text", "text": "ignored"}], "structuredContent": sc, "isError": false}})
+    }
+
+    fn rpc_tool_error(text: &str) -> serde_json::Value {
+        serde_json::json!({"jsonrpc": "2.0", "id": 1,
+            "result": {"content": [{"type": "text", "text": text}], "isError": true}})
+    }
+
+    /// The happy-path MCP answers, keyed on tool name and `state`.
+    fn selecta_answer(body: &serde_json::Value) -> serde_json::Value {
+        let tool = body
+            .pointer("/params/name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let args = &body["params"]["arguments"];
+        match (tool, args.get("state").and_then(|v| v.as_str())) {
+            ("selecta_list_tasks", Some("failed")) => rpc_ok(serde_json::json!({"result": [
+                selecta_row(FAILED_ID, "failed", "selecta_discover", None,
+                    Some("lidarr 503 on artist lookup <script>x</script>…")),
+            ]})),
+            ("selecta_list_tasks", Some("awaiting_approval")) => {
+                rpc_ok(serde_json::json!({"result": [
+                    selecta_row(GATED_ID, "awaiting_approval", "selecta_curate_playlist",
+                        Some("https://github.com/acme/agent/pull/7"), None),
+                    selecta_row(ORPHAN_ID, "awaiting_approval", "selecta_hunt_artist", None, None),
+                ]}))
+            }
+            ("selecta_get_task", _) if args["task_id"] == FAILED_ID => rpc_ok(serde_json::json!({
+                "task_id": FAILED_ID, "state": "failed", "tier": "auto", "verb": "selecta_discover",
+                "result_path": null, "audit": "lidarr 503 on artist lookup\nfull trace line two",
+                "pr_url": null})),
+            ("selecta_get_task", _) => {
+                rpc_tool_error("Error executing tool selecta_get_task: get_task: unknown task")
+            }
+            ("selecta_download_health", _) => rpc_ok(serde_json::json!({
+                "scope": "all", "window": "1h",
+                "signals": {"queue_count": 4.0, "vpn_up": 1.0},
+                "alerts": ["slskd unreachable: connection refused"]})),
+            _ => rpc_tool_error(&format!("Unknown tool: {tool}")),
+        }
+    }
+
+    const SELECTA_METRICS: &str = "# TYPE budget_consumed_tokens gauge\nbudget_consumed_tokens 1834201\n\
+        # TYPE budget_consumed_wallclock gauge\nbudget_consumed_wallclock 1200.0\n\
+        # TYPE budget_consumed_toolcalls gauge\nbudget_consumed_toolcalls 212\n\
+        # TYPE budget_parked gauge\nbudget_parked{reason=\"token cap reached (2000001/2000000)\"} 1\n\
+        # TYPE watchdog_heartbeat_seq gauge\nwatchdog_heartbeat_seq 9124\n\
+        # TYPE queue_depth gauge\nqueue_depth{state=\"awaiting_approval\"} 2\nqueue_depth{state=\"failed\"} 412\n\
+        queue_depth{state=\"ready\"} 3\n\
+        # TYPE velocity_tier gauge\nvelocity_tier{tier=\"full\"} 1\n\
+        # TYPE day_cap_used gauge\nday_cap_used{cap=\"adds\"} 12\n\
+        # TYPE day_cap_limit gauge\nday_cap_limit{cap=\"adds\"} 40\n\
+        # TYPE lease_remaining_s gauge\nlease_remaining_s 41.5\n";
+
+    /// A fake selecta: MCP on `/readonly/mcp` answered by `answer`, plus
+    /// `/metrics` and `/healthz`. Records every MCP request.
+    async fn fake_selecta<F>(
+        seen: &SelectaSeen,
+        answer: F,
+        metrics: &'static str,
+        healthz: (StatusCode, &'static str),
+    ) -> AppState
+    where
+        F: Fn(&serde_json::Value) -> serde_json::Value + Clone + Send + Sync + 'static,
+    {
+        let rec = seen.clone();
+        let upstream = Router::new()
+            .route(
+                "/readonly/mcp",
+                post(
+                    move |headers: axum::http::HeaderMap,
+                          axum::Json(body): axum::Json<serde_json::Value>| {
+                        let (rec, answer) = (rec.clone(), answer.clone());
+                        async move {
+                            let out = answer(&body);
+                            rec.0.lock().unwrap().push((headers, body));
+                            axum::Json(out)
+                        }
+                    },
+                ),
+            )
+            .route("/metrics", get(move || std::future::ready(metrics)))
+            .route(
+                "/healthz",
+                get(move || std::future::ready((healthz.0, healthz.1))),
+            );
+        let mut config = test_config();
+        config.selecta = Some(config::SelectaConfig {
+            url: fake_upstream(upstream).await.parse().unwrap(),
+            api_key: SELECTA_KEY.into(),
+        });
+        AppState::new(config)
+    }
+
+    async fn happy_selecta(seen: &SelectaSeen) -> AppState {
+        fake_selecta(
+            seen,
+            selecta_answer,
+            SELECTA_METRICS,
+            (StatusCode::OK, r#"{"status":"ok","seq":9124}"#),
+        )
+        .await
+    }
+
+    /// AC1 + AC3: the pane renders every section from live data, and its
+    /// only form is the shell's logout — approvals are links to GitHub.
+    #[tokio::test]
+    async fn selecta_pane_renders_every_section_and_has_no_write_path() {
+        let seen = SelectaSeen::default();
+        let (status, html) = render(happy_selecta(&seen).await, "/selecta").await;
+        assert_eq!(status, StatusCode::OK);
+        // Runner: heartbeat, lease, parked budget with its reason, daily cap.
+        assert!(html.contains(">advancing<"), "{html}");
+        assert!(html.contains("held, 42s left"), "{html}");
+        assert!(
+            html.contains("parked — token cap reached (2000001/2000000)"),
+            "{html}"
+        );
+        assert!(html.contains("1.8M"), "{html}");
+        assert!(html.contains("<progress value=\"12\" max=\"40\""), "{html}");
+        // Waiting on you: the PR as a link, the PR-less task flagged.
+        assert!(
+            html.contains("href=\"https://github.com/acme/agent/pull/7\""),
+            "{html}"
+        );
+        assert!(html.contains("PR #7"));
+        assert!(html.contains("no PR — cannot be approved"), "{html}");
+        assert!(
+            html.contains("1 gated task(s) have no usable approval PR"),
+            "{html}"
+        );
+        // Failures: verb, escaped audit excerpt, detail link.
+        assert!(html.contains("selecta_discover"));
+        assert!(
+            html.contains("lidarr 503 on artist lookup &lt;script&gt;"),
+            "{html}"
+        );
+        assert!(!html.contains("<script>x"));
+        assert!(html.contains(&format!("href=\"/selecta/task/{FAILED_ID}\"")));
+        // Showing 1 of the 412 failed rows selecta holds.
+        assert!(html.contains("Showing the newest 1 of 412."), "{html}");
+        // Counts: internal `ready` renders as `queued`; absent states are 0.
+        assert!(
+            html.contains(">queued<") && html.contains(">412<"),
+            "{html}"
+        );
+        assert!(!html.contains(">ready<"));
+        // Download health: alerts and signals.
+        assert!(html.contains("slskd unreachable: connection refused"));
+        assert!(html.contains("queue_count"));
+        // AC3: the logout form is the only form; no approve/enqueue button.
+        assert_eq!(html.matches("<form").count(), 1, "{html}");
+        assert!(html.contains("action=\"/auth/logout\""));
+        assert_eq!(html.matches("<button").count(), 1, "{html}");
+        assert!(!html.contains(SELECTA_KEY));
+    }
+
+    /// AC2: every read is one stateless `tools/call` POST to the read-only
+    /// mount, carrying the read-only token as a Bearer, asking for JSON, with
+    /// a bounded `limit` and no `Origin` (selecta 403s one on this route).
+    #[tokio::test]
+    async fn selecta_pane_reads_only_through_the_read_only_mount() {
+        let seen = SelectaSeen::default();
+        render(happy_selecta(&seen).await, "/selecta").await;
+        let calls = seen.0.lock().unwrap().clone();
+        let mut tools: Vec<String> = calls
+            .iter()
+            .map(|(_, b)| {
+                format!(
+                    "{} {}",
+                    b["params"]["name"].as_str().unwrap(),
+                    b["params"]["arguments"]
+                )
+            })
+            .collect();
+        tools.sort();
+        assert_eq!(
+            tools,
+            [
+                "selecta_download_health {}",
+                r#"selecta_list_tasks {"limit":100,"state":"awaiting_approval"}"#,
+                r#"selecta_list_tasks {"limit":20,"state":"failed"}"#,
+            ]
+        );
+        for (headers, body) in &calls {
+            assert_eq!(body["jsonrpc"], "2.0");
+            assert_eq!(body["method"], "tools/call");
+            assert_eq!(
+                headers.get(header::AUTHORIZATION).unwrap(),
+                &format!("Bearer {SELECTA_KEY}")
+            );
+            assert_eq!(headers.get(header::ACCEPT).unwrap(), "application/json");
+            assert!(headers.get(header::ORIGIN).is_none());
+        }
+    }
+
+    /// AC4: a payload the pane cannot parse, or a tool error, renders an
+    /// error naming the tool or source — never an empty "all quiet" list.
+    #[tokio::test]
+    async fn selecta_pane_fails_loud_per_section() {
+        let seen = SelectaSeen::default();
+        let answer = |body: &serde_json::Value| -> serde_json::Value {
+            match body
+                .pointer("/params/arguments/state")
+                .and_then(|v| v.as_str())
+            {
+                // A list tool whose rows are not under `result`.
+                Some("failed") => rpc_ok(serde_json::json!({"rows": []})),
+                // A row missing a required field.
+                Some("awaiting_approval") => {
+                    rpc_ok(serde_json::json!({"result": [{"task_id": GATED_ID}]}))
+                }
+                _ => rpc_tool_error("Error executing tool selecta_download_health: lidarr down"),
+            }
+        };
+        let state = fake_selecta(
+            &seen,
+            answer,
+            "# TYPE budget_consumed_tokens gauge\nbudget_consumed_tokens 1\n",
+            (StatusCode::INTERNAL_SERVER_ERROR, "boom"),
+        )
+        .await;
+        let (status, html) = render(state, "/selecta").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains(
+                "selecta_list_tasks: unparseable payload (structuredContent has no result list)"
+            ),
+            "{html}"
+        );
+        assert!(html.contains("missing field"), "{html}");
+        assert!(
+            html.contains("selecta_download_health failed: Error executing tool selecta_download_health: lidarr down"),
+            "{html}"
+        );
+        assert!(html.contains("selecta /metrics: missing"), "{html}");
+        assert!(
+            html.contains("selecta /healthz: unexpected status 500"),
+            "{html}"
+        );
+        // Nothing reads as all-quiet.
+        assert!(!html.contains("Nothing is waiting on you."), "{html}");
+        assert!(!html.contains("No failed tasks."), "{html}");
+        assert!(!html.contains("No alerts."), "{html}");
+    }
+
+    #[tokio::test]
+    async fn selecta_pane_shows_a_stalled_heartbeat_and_an_unheld_lease() {
+        let seen = SelectaSeen::default();
+        let metrics: &'static str = Box::leak(
+            SELECTA_METRICS
+                .replace("lease_remaining_s 41.5", "lease_remaining_s 0.0")
+                .into_boxed_str(),
+        );
+        let state = fake_selecta(
+            &seen,
+            selecta_answer,
+            metrics,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"status":"stale","detail":"heartbeat not advancing","seq":9124}"#,
+            ),
+        )
+        .await;
+        let (_, html) = render(state, "/selecta").await;
+        assert!(html.contains("stalled — heartbeat not advancing"), "{html}");
+        assert!(
+            html.contains("not held — irreversible work is refused"),
+            "{html}"
+        );
+    }
+
+    /// A queue state the console does not know renders as its own tile under
+    /// an error naming it, and every other gauge still renders.
+    #[tokio::test]
+    async fn selecta_pane_flags_an_unknown_queue_state_and_keeps_the_rest() {
+        let seen = SelectaSeen::default();
+        let metrics: &'static str = Box::leak(
+            SELECTA_METRICS
+                .replace(
+                    "queue_depth{state=\"ready\"} 3\n",
+                    "queue_depth{state=\"ready\"} 3\nqueue_depth{state=\"quarantined\"} 5\n",
+                )
+                .into_boxed_str(),
+        );
+        let state = fake_selecta(
+            &seen,
+            selecta_answer,
+            metrics,
+            (StatusCode::OK, r#"{"status":"ok","seq":9124}"#),
+        )
+        .await;
+        let (_, html) = render(state, "/selecta").await;
+        assert!(
+            html.contains("selecta reports queue states this console does not know: quarantined."),
+            "{html}"
+        );
+        assert!(
+            html.contains(">quarantined<") && html.contains(">5<"),
+            "{html}"
+        );
+        assert!(html.contains("held, 42s left"), "{html}");
+        assert!(html.contains("<progress value=\"12\" max=\"40\""), "{html}");
+        assert!(html.contains("Showing the newest 1 of 412."), "{html}");
+        assert!(!html.contains("selecta /metrics:"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn selecta_task_detail_renders_the_whole_audit() {
+        let seen = SelectaSeen::default();
+        let state = happy_selecta(&seen).await;
+        let (status, html) = render(state.clone(), &format!("/selecta/task/{FAILED_ID}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("full trace line two"), "{html}");
+        assert_eq!(html.matches("<form").count(), 1);
+        // A task selecta does not know: the tool error, named — not a blank.
+        let (status, html) = render(state, &format!("/selecta/task/{GATED_ID}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains("selecta_get_task failed: Error executing tool selecta_get_task: get_task: unknown task"),
+            "{html}"
+        );
+    }
+
+    /// A malformed id never reaches selecta.
+    #[tokio::test]
+    async fn selecta_task_detail_refuses_a_malformed_id() {
+        let seen = SelectaSeen::default();
+        let state = happy_selecta(&seen).await;
+        for id in [
+            "abc",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "..%2F..%2Fmetrics",
+        ] {
+            let (status, _) = render(state.clone(), &format!("/selecta/task/{id}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{id}");
+        }
+        assert!(seen.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn selecta_pane_requires_a_session() {
+        let seen = SelectaSeen::default();
+        let app = app(happy_selecta(&seen).await);
+        for path in ["/selecta".to_string(), format!("/selecta/task/{FAILED_ID}")] {
+            let resp = app
+                .clone()
+                .oneshot(HttpRequest::get(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER, "{path}");
+        }
+        assert!(seen.0.lock().unwrap().is_empty());
+    }
+
+    /// Home card: reachable, how many tasks wait, and how many have no PR.
+    #[tokio::test]
+    async fn home_card_summarises_selecta_approvals() {
+        let seen = SelectaSeen::default();
+        let (_, html) = render(happy_selecta(&seen).await, "/").await;
+        assert!(
+            html.contains("2 awaiting your approval · 1 with no PR"),
+            "{html}"
+        );
+        assert!(html.contains("href=\"/selecta\""));
+    }
+
+    /// An unusable `pr_url` is as unapprovable as a missing one: both count
+    /// as "no PR" on the pane and on the home card. A full probe says "N+",
+    /// and a failing probe reads "error", not "unreachable".
+    #[tokio::test]
+    async fn selecta_counts_unusable_pr_links_as_missing_and_flags_a_full_probe() {
+        let seen = SelectaSeen::default();
+        let answer = |body: &serde_json::Value| -> serde_json::Value {
+            match body
+                .pointer("/params/arguments/state")
+                .and_then(|v| v.as_str())
+            {
+                Some("awaiting_approval") => {
+                    let mut rows: Vec<serde_json::Value> = (0..99)
+                        .map(|i| {
+                            selecta_row(
+                                &format!("{i:032x}"),
+                                "awaiting_approval",
+                                "selecta_hunt_album",
+                                Some("https://github.com/acme/agent/pull/9"),
+                                None,
+                            )
+                        })
+                        .collect();
+                    rows.push(selecta_row(
+                        ORPHAN_ID,
+                        "awaiting_approval",
+                        "selecta_hunt_album",
+                        Some("javascript:alert(1)"),
+                        None,
+                    ));
+                    rpc_ok(serde_json::json!({ "result": rows }))
+                }
+                _ => selecta_answer(body),
+            }
+        };
+        let state = fake_selecta(
+            &seen,
+            answer,
+            SELECTA_METRICS,
+            (StatusCode::OK, r#"{"status":"ok","seq":1}"#),
+        )
+        .await;
+        let (_, home) = render(state.clone(), "/").await;
+        assert!(
+            home.contains("100+ awaiting your approval · 1 with no PR"),
+            "{home}"
+        );
+        let (_, pane) = render(state, "/selecta").await;
+        assert!(
+            pane.contains("1 gated task(s) have no usable approval PR"),
+            "{pane}"
+        );
+        assert!(pane.contains("unrecognised PR link"), "{pane}");
+        assert!(!pane.contains("href=\"javascript:"), "{pane}");
+
+        let failing =
+            |_: &serde_json::Value| rpc_tool_error("Error executing tool selecta_list_tasks: boom");
+        let state = fake_selecta(
+            &seen,
+            failing,
+            SELECTA_METRICS,
+            (StatusCode::OK, r#"{"status":"ok","seq":1}"#),
+        )
+        .await;
+        let (_, home) = render(state, "/").await;
+        assert!(home.contains(">error<"), "{home}");
+        assert!(
+            home.contains(
+                "selecta_list_tasks failed: Error executing tool selecta_list_tasks: boom"
+            ),
+            "{home}"
+        );
     }
 }

@@ -3,8 +3,12 @@ pub mod auth;
 pub mod health;
 pub mod home;
 pub mod lb;
+pub mod selecta;
+
+use leptos::prelude::*;
 
 use crate::error::AppError;
+use crate::ui::{BadgeKind, badge};
 
 const MAX_NEXT_BYTES: usize = 512;
 
@@ -112,6 +116,19 @@ pub fn fmt_epoch(secs: f64) -> String {
                 .unwrap_or_else(|_| "-".into())
         }
         Err(_) => "-".into(),
+    }
+}
+
+/// One dark section, named: rendered in place of that section's content so
+/// the rest of the page stays up, and so a failure never reads as an empty
+/// (all-quiet) list. Shared by the read-only panes.
+pub fn unavailable(what: &str, e: &AppError) -> impl IntoView + use<> {
+    let msg = format!("{what}: {}", e.detail());
+    view! {
+        <p class="text-sm mb-4">
+            <span class=badge(BadgeKind::Destructive)>"unavailable"</span>
+            " "{msg}
+        </p>
     }
 }
 

@@ -1,8 +1,9 @@
 # ops-console
 
-OIDC-gated web console for the 27b workspace (LAB-1684 / LAB-1641). Two
-route modules in one crate: Ālaya memory curation, and the anthropic-lb
-read-only monitoring pane (LAB-1964).
+OIDC-gated web console for the 27b workspace (LAB-1684 / LAB-1641). Three
+route modules in one crate: Ālaya memory curation, the anthropic-lb
+read-only monitoring pane (LAB-1964), and the selecta read-only pane
+(LAB-6674).
 
 ## Trust model (D2 — ratified 2026-08-15, do not re-litigate here)
 
@@ -43,9 +44,10 @@ CSP (`default-src 'none'`).
 | `ALAYA_URL` | `http://alaya-server.mcp.svc:3001` |
 | `ALAYA_API_KEY` | Static bearer (full write) — server-side only. |
 | `CONSOLE_LISTEN_ADDR` | Optional, default `0.0.0.0:3002`. |
+| `SELECTA_URL` / `SELECTA_API_KEY` | selecta module — **both or neither**, same rules as the LB group. `SELECTA_URL` = selecta's HTTP base URL; its host:port is sent as the `Host` header, and selecta answers 421 to any Host outside its `allowed_hosts`, so use exactly the name selecta allow-lists. `SELECTA_API_KEY` = a selecta **read-only** token, sent server-side as `Authorization: Bearer` to `/readonly/mcp`. |
 | `LB_URL` / `LB_API_KEY` / `METRICS_URL` | anthropic-lb module — **all three or none**. None: the module is disabled and the home card says so. A partial set refuses startup. `LB_URL` = the LB's base URL; `LB_API_KEY` = an LB **operator** client key, sent server-side as `x-api-key` (the LB rejects `Authorization: Bearer` on `/_stats`); `METRICS_URL` = a Prometheus-compatible query API for the 7-day history — the console only ever calls `/api/v1/query_range` on it, so point it at a route that exposes nothing else. |
 
-Every upstream URL (`ALAYA_URL`, `LB_URL`, `METRICS_URL`) must be https, or plain http to a cluster-local host (`*.svc`, `*.svc.cluster.local`, `*.internal`, a single-label name, or a loopback/private IP literal), and must carry no query string or fragment. Anything else refuses startup — `METRICS_URL` included, keyless or not: off-cluster plaintext leaves the budget history both readable and rewritable in flight. `CONSOLE_OIDC_ISSUER` is stricter still: https only, no cluster-local exemption, and no userinfo (it is printed verbatim in the startup config log).
+Every upstream URL (`ALAYA_URL`, `LB_URL`, `METRICS_URL`, `SELECTA_URL`) must be https, or plain http to a cluster-local host (`*.svc`, `*.svc.cluster.local`, `*.internal`, a single-label name, or a loopback/private IP literal), and must carry no query string or fragment. Anything else refuses startup — `METRICS_URL` included, keyless or not: off-cluster plaintext leaves the budget history both readable and rewritable in flight. `CONSOLE_OIDC_ISSUER` is stricter still: https only, no cluster-local exemption, and no userinfo (it is printed verbatim in the startup config log).
 
 Logs are JSON, one object per line on stdout, so structured fields (`sub`,
 `op`, `issuer`, `cause`, ...) are queryable as `fields.<name>` rather than
@@ -155,6 +157,44 @@ Each card degrades on its own: a dark metrics store leaves live headroom
 up, an LB outage leaves the burn history up. Every upstream client in the
 console refuses redirects (no credential ever rides a 3xx off-host).
 
+## selecta module (read-only)
+
+Scope: the console **renders** what selecta is doing; nothing in it changes
+selecta. The console has **no write route to selecta** and this module must
+not grow one. Approvals render **only as links to their GitHub pull
+request**, never as a button: merging that PR is selecta's only approval
+channel. The guarantee also holds at selecta, not just here: the console's
+token is a selecta read-only token, accepted only on the `/readonly/mcp`
+mount, which registers `selecta_list_tasks`, `selecta_get_task`,
+`selecta_download_health` and `selecta_list_queues` and no verb that
+enqueues work. Enqueue actions from the console would need their own
+security review first.
+
+`/selecta` shows, each card from its own source:
+
+- **Runner** — heartbeat (selecta's own `GET /healthz` verdict: advancing,
+  or stalled with its reason), lease (held with seconds left, or not held:
+  selecta then refuses irreversible work), run budget (parked or not, with
+  selecta's reason) and what the run consumed, and the daily caps used
+  against their limits. Source: `GET /metrics`. selecta does not export its
+  run caps; a cap shows inside the parked reason once it is hit.
+- **Waiting on you** — tasks in `awaiting_approval`, newest first, each with
+  its approval PR link. A task with no PR cannot be approved at all and is
+  flagged as an error. Only a URL of the form
+  `https://github.com/<owner>/<repo>/pull/<n>` becomes a link.
+- **Recent failures** — the newest failed tasks: verb, enqueued time and the
+  200-character audit excerpt, each linking to `/selecta/task/<id>`, which
+  renders `selecta_get_task` with the whole audit.
+- **Tasks by state** — `queue_depth` per state. All time: selecta never
+  deletes a queue row. A state the console does not know still gets a
+  tile, and is flagged as an error.
+- **Download health** — `selecta_download_health` signals and alerts.
+
+Each read is one stateless JSON-RPC `tools/call` POST (no `initialize`),
+parsed from `structuredContent`. **Fail loud**: a tool error, or a payload
+or metric the pane cannot parse, renders as an error naming the tool or
+source — never as an empty list, which would read as "all quiet".
+
 ## Deploy
 
 Deployed from the private infra repo's Kubernetes manifests (LAB-2712).
@@ -171,11 +211,11 @@ console rolls with alaya-server. The binary ships in the existing public
 since LAB-3719 — no pull secret.
 
 Config split: `CONSOLE_PUBLIC_URL`, `CONSOLE_OIDC_ISSUER`, `ALAYA_URL`,
-`LB_URL`, `METRICS_URL` are plain env in the manifest;
+`LB_URL`, `METRICS_URL`, `SELECTA_URL` are plain env in the manifest;
 `CONSOLE_OIDC_CLIENT_ID`, `CONSOLE_OIDC_CLIENT_SECRET`,
-`CONSOLE_ALLOWED_SUBJECTS`, `CONSOLE_SESSION_SECRET`, `ALAYA_API_KEY` and
-`LB_API_KEY` come from a secret manager, rendered by ESO into Secret
-`ops-console-env`. Editing the Secret rolls the pod (Reloader annotation).
+`CONSOLE_ALLOWED_SUBJECTS`, `CONSOLE_SESSION_SECRET`, `ALAYA_API_KEY`,
+`LB_API_KEY` and `SELECTA_API_KEY` come from a secret manager, rendered by
+ESO into Secret `ops-console-env`. Editing the Secret rolls the pod (Reloader annotation).
 `LB_URL`, `METRICS_URL` (manifest) and `LB_API_KEY` (Secret) are one
 all-or-nothing group: land all three in the same change — a half-set group
 refuses startup by design (see the `LB_URL` comment in
@@ -196,8 +236,8 @@ kubectl -n mcp exec deploy/ops-console -- sh -c '
   curl -sS -m3 -o /dev/null -w "alaya=%{http_code}\n" http://alaya-server.mcp.svc:3001/health'
 ```
 
-The equivalent probes for the LB pane's two upstreams live with the deployed
-manifest.
+The equivalent probes for the LB and selecta panes' upstreams live with the
+deployed manifest.
 
 ## Development
 

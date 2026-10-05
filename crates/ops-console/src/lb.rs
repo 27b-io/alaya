@@ -19,7 +19,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::error::AppError;
-use crate::http;
+use crate::http::{self, join, json_body};
 
 /// Columns in the burn history: today plus the six preceding UTC days.
 const DAYS: usize = 7;
@@ -33,31 +33,6 @@ const DAYS: usize = 7;
 /// the previous day's total — a plain `[1d]` window would credit yesterday's
 /// peak to today.
 const BURN_QUERY: &str = "max by (client) (max_over_time(anthropic_cluster_budget_used[23h58m]))";
-
-fn join(base: &url::Url, path: &str) -> String {
-    format!("{}{path}", base.as_str().trim_end_matches('/'))
-}
-
-/// Send and read a JSON body, bounded (`http::body_text` — an upstream must
-/// not be able to OOM the console). Transport errors collapse to a one-phrase
-/// kind (they can embed the request URL); of a non-2xx body only a JSON
-/// `error` field is surfaced (`AppError::non_success`). Query errors arrive as
-/// non-2xx on the Prometheus API, so this is the only error path a caller
-/// needs.
-async fn json_body(what: &str, req: reqwest::RequestBuilder) -> Result<Value, AppError> {
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| AppError::transport(what, &e))?;
-    let status = resp.status();
-    let text = http::body_text(what, resp)
-        .await
-        .map_err(|e| AppError::body(what, e))?;
-    if !status.is_success() {
-        return Err(AppError::non_success(what, status, &text));
-    }
-    serde_json::from_str(&text).map_err(|_| AppError::Upstream(format!("{what} returned non-JSON")))
-}
 
 #[derive(Clone)]
 pub struct LbClient {

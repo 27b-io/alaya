@@ -8,6 +8,10 @@
 
 use std::time::Duration;
 
+use serde_json::Value;
+
+use crate::error::AppError;
+
 /// Ceiling on any upstream response body. reqwest reads to EOF with no
 /// default cap, so a compromised or MITM'd upstream answering with a
 /// multi-gigabyte — or endless — body would grow the heap until the OOM
@@ -80,6 +84,41 @@ pub async fn body_text(what: &str, mut resp: reqwest::Response) -> Result<String
     // both copies live and double the peak the cap is there to bound.
     Ok(String::from_utf8(buf)
         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+}
+
+/// `path` appended to `base`'s whole string — which is why every base URL
+/// is refused at boot if it carries a query or fragment (`config.rs`).
+pub fn join(base: &url::Url, path: &str) -> String {
+    format!("{}{path}", base.as_str().trim_end_matches('/'))
+}
+
+/// Send and read the body as text, bounded (`body_text` — an upstream must
+/// not be able to OOM the console), whatever the status. Transport errors
+/// collapse to a one-phrase kind: they can embed the request URL.
+pub async fn text_body(
+    what: &str,
+    req: reqwest::RequestBuilder,
+) -> Result<(reqwest::StatusCode, String), AppError> {
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| AppError::transport(what, &e))?;
+    let status = resp.status();
+    let text = body_text(what, resp)
+        .await
+        .map_err(|e| AppError::body(what, e))?;
+    Ok((status, text))
+}
+
+/// `text_body`, then JSON. Of a non-2xx body only a JSON `error` field is
+/// surfaced (`AppError::non_success`). Query errors arrive as non-2xx on the
+/// Prometheus API, so for it this is the only error path a caller needs.
+pub async fn json_body(what: &str, req: reqwest::RequestBuilder) -> Result<Value, AppError> {
+    let (status, text) = text_body(what, req).await?;
+    if !status.is_success() {
+        return Err(AppError::non_success(what, status, &text));
+    }
+    serde_json::from_str(&text).map_err(|_| AppError::Upstream(format!("{what} returned non-JSON")))
 }
 
 #[cfg(test)]

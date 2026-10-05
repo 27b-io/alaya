@@ -23,7 +23,7 @@ use serde_json::Value;
 
 use crate::error::AppError;
 use crate::lb::{DailyBurn, fmt_tokens, live_budgets};
-use crate::routes::{fmt_epoch, vf, vs};
+use crate::routes::{fmt_epoch, unavailable, vf, vs};
 use crate::session::{Session, take_flash};
 use crate::state::AppState;
 use crate::ui::*;
@@ -85,16 +85,6 @@ fn fmt_day(midnight: i64) -> String {
         .get(5..10)
         .unwrap_or("—")
         .to_string()
-}
-
-fn unavailable(what: &str, e: &AppError) -> impl IntoView + use<> {
-    let msg = format!("{what}: {}", e.detail());
-    view! {
-        <p class="text-sm mb-4">
-            <span class=badge(BadgeKind::Destructive)>"unavailable"</span>
-            " "{msg}
-        </p>
-    }
 }
 
 // ─── Fleet: strategy, replicas, shared state ────────────────────────────────

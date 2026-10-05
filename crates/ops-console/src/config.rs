@@ -34,6 +34,8 @@ pub struct Config {
     pub alaya_api_key: String,
     /// anthropic-lb monitoring module; `None` = module disabled.
     pub lb: Option<LbConfig>,
+    /// selecta read-only pane; `None` = module disabled.
+    pub selecta: Option<SelectaConfig>,
 }
 
 /// anthropic-lb read-only module. Optional as a GROUP: a
@@ -66,23 +68,12 @@ impl LbConfig {
         // would otherwise boot clean and fail at the first render as a blank
         // history section — which reads as an LB outage, sending the
         // operator after the wrong system. AC10 is refuse-at-startup.
-        // Annotated because every error path now leaves through `?`, and a
-        // closure with no explicit `Err` cannot infer what it converts into.
-        let parse = |key: &str, v: String| -> Result<url::Url, String> {
-            let url: url::Url = v
-                .parse()
-                .map_err(|e| format!("{key} is not a valid URL: {e}"))?;
-            validate_upstream_url(key, &url)?;
-            // `join` (lb.rs) appends the endpoint path to `Url::as_str()`.
-            reject_query_or_fragment(key, &url)?;
-            Ok(url)
-        };
         match (url, api_key, metrics_url) {
             (None, None, None) => Ok(None),
             (Some(u), Some(k), Some(m)) => Ok(Some(LbConfig {
-                url: parse("LB_URL", u)?,
+                url: parse_upstream("LB_URL", &u)?,
                 api_key: k,
-                metrics_url: parse("METRICS_URL", m)?,
+                metrics_url: parse_upstream("METRICS_URL", &m)?,
             })),
             (u, k, m) => {
                 let missing: Vec<&str> = [
@@ -98,6 +89,43 @@ impl LbConfig {
                     missing.join(", ")
                 ))
             }
+        }
+    }
+}
+
+/// selecta read-only pane. Optional as a GROUP, for the same deploy-ordering
+/// reason as `LbConfig`: both set → enabled, neither → the card reads "not
+/// configured", one alone refuses startup.
+pub struct SelectaConfig {
+    /// selecta's own HTTP port. Its MCP layer answers 421 to any Host outside
+    /// its `allowed_hosts`, and reqwest sends this URL's host:port as the
+    /// Host, so it must be the exact in-cluster name selecta allow-lists.
+    pub url: url::Url,
+    /// A selecta READ-ONLY bearer, sent server-side as `Authorization:
+    /// Bearer` to the read-only MCP mount, which registers no verb that
+    /// enqueues work. Never reaches the browser.
+    pub api_key: String,
+}
+
+impl SelectaConfig {
+    pub fn from_parts(
+        url: Option<String>,
+        api_key: Option<String>,
+    ) -> Result<Option<Self>, String> {
+        match (url, api_key) {
+            (None, None) => Ok(None),
+            (Some(u), Some(k)) => Ok(Some(SelectaConfig {
+                url: parse_upstream("SELECTA_URL", &u)?,
+                api_key: k,
+            })),
+            (u, _) => Err(format!(
+                "selecta module is half-configured — set both SELECTA_URL and SELECTA_API_KEY or neither (missing: {})",
+                if u.is_none() {
+                    "SELECTA_URL"
+                } else {
+                    "SELECTA_API_KEY"
+                }
+            )),
         }
     }
 }
@@ -118,12 +146,16 @@ impl fmt::Debug for Config {
                 "metrics_url",
                 &self.lb.as_ref().map(|l| origin_of(&l.metrics_url)),
             )
+            .field(
+                "selecta_url",
+                &self.selecta.as_ref().map(|s| origin_of(&s.url)),
+            )
             .finish_non_exhaustive()
     }
 }
 
 /// Every base in this config is later grown by concatenation onto its WHOLE
-/// string — `join` in `lb.rs`, `format!` in `alaya.rs`, the discovery path
+/// string — `http::join`, `format!` in `alaya.rs`, the discovery path
 /// and `redirect_uri`. A query or fragment therefore swallows the path that
 /// should follow it: `…/select?token=x` requests
 /// `/select?token=x/api/v1/…`, and `https://id.test/realms/ops#x` requests
@@ -268,6 +300,18 @@ fn validate_upstream_url(var: &str, url: &url::Url) -> Result<(), String> {
     }
 }
 
+/// A data upstream's base URL, parsed and held to both boot gates: the
+/// transport rule (`validate_upstream_url`) and no query or fragment, since
+/// `http::join` appends each endpoint path to `Url::as_str()`.
+fn parse_upstream(key: &str, raw: &str) -> Result<url::Url, String> {
+    let url: url::Url = raw
+        .parse()
+        .map_err(|e| format!("{key} is not a valid URL: {e}"))?;
+    validate_upstream_url(key, &url)?;
+    reject_query_or_fragment(key, &url)?;
+    Ok(url)
+}
+
 /// The IdP is stricter than every other upstream: https only, with no
 /// cluster-local exemption — and no userinfo.
 ///
@@ -368,13 +412,9 @@ impl Config {
             return Err("CONSOLE_SESSION_SECRET must be at least 32 bytes".into());
         }
 
-        let alaya_url: url::Url = required("ALAYA_URL")?
-            .parse()
-            .map_err(|e| format!("ALAYA_URL is not a valid URL: {e}"))?;
-        validate_upstream_url("ALAYA_URL", &alaya_url)?;
-        // The fifth base on the same rule: `AlayaClient::url` (`alaya.rs`)
-        // builds every request as `format!("{}{path}", base.as_str()…)`.
-        reject_query_or_fragment("ALAYA_URL", &alaya_url)?;
+        // `AlayaClient::url` (`alaya.rs`) builds every request as
+        // `format!("{}{path}", base.as_str()…)`, so the same gate applies.
+        let alaya_url = parse_upstream("ALAYA_URL", &required("ALAYA_URL")?)?;
 
         Ok(Config {
             listen_addr: std::env::var("CONSOLE_LISTEN_ADDR")
@@ -391,6 +431,10 @@ impl Config {
                 optional("LB_URL"),
                 optional("LB_API_KEY"),
                 optional("METRICS_URL"),
+            )?,
+            selecta: SelectaConfig::from_parts(
+                optional("SELECTA_URL"),
+                optional("SELECTA_API_KEY"),
             )?,
         })
     }
@@ -571,11 +615,17 @@ mod tests {
                     .parse()
                     .unwrap(),
             }),
+            selecta: Some(SelectaConfig {
+                url: "http://selecta.test:8080".parse().unwrap(),
+                api_key: "SELECTA_KEY_VALUE".into(),
+            }),
         };
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("SECRET_VALUE"));
         assert!(!dbg.contains("BEARER_VALUE"));
         assert!(!dbg.contains("LB_KEY_VALUE"));
+        assert!(!dbg.contains("SELECTA_KEY_VALUE"), "{dbg}");
+        assert!(dbg.contains("selecta.test:8080"), "{dbg}");
         assert!(!dbg.contains("URL_USERINFO_VALUE"), "{dbg}");
         assert!(!dbg.contains("URL_QUERY_VALUE"), "{dbg}");
         assert!(dbg.contains("anthropic-lb.mcp.svc"));
@@ -624,12 +674,35 @@ mod tests {
             err.contains("metrics.example.com") && !err.contains("hunter2"),
             "{err}"
         );
-        // `join` appends the endpoint path to `as_str()`, so a base carrying
+        // `http::join` appends the endpoint path to `as_str()`, so a base carrying
         // a query would request `/select?token=x/api/v1/query_range` and
         // leave the card dark behind a non-2xx. Refused at boot instead.
         let err = LbConfig::from_parts(u(), k(), Some("http://vm:8428/select?token=x".into()))
             .err()
             .expect("METRICS_URL with a query must be refused");
         assert!(err.contains("query string or fragment"), "{err}");
+    }
+
+    #[test]
+    fn selecta_config_is_all_or_nothing() {
+        let u = || Some("http://selecta.ns.svc.cluster.local:8080".to_string());
+        let k = || Some("k".repeat(40));
+        assert!(SelectaConfig::from_parts(None, None).unwrap().is_none());
+        assert!(SelectaConfig::from_parts(u(), k()).unwrap().is_some());
+        // `.err()`: SelectaConfig has no Debug impl — it holds the bearer.
+        let err = SelectaConfig::from_parts(u(), None)
+            .err()
+            .expect("half-set must refuse");
+        assert!(err.ends_with("(missing: SELECTA_API_KEY)"), "{err}");
+        let err = SelectaConfig::from_parts(None, k())
+            .err()
+            .expect("half-set must refuse");
+        assert!(err.ends_with("(missing: SELECTA_URL)"), "{err}");
+        // Same transport and concatenation gates as every other upstream.
+        assert!(
+            SelectaConfig::from_parts(Some("http://selecta.example.com:8080".into()), k()).is_err()
+        );
+        assert!(SelectaConfig::from_parts(Some("http://selecta:8080?x=1".into()), k()).is_err());
+        assert!(SelectaConfig::from_parts(Some("not a url".into()), k()).is_err());
     }
 }

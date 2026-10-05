@@ -10,7 +10,7 @@ use crate::routes::clip;
 /// Ceiling on an upstream's JSON `error` field on a page. Needed because the
 /// field is upstream text bounded only by the body cap, and it renders on an
 /// operator's error page.
-const MAX_SHOWN_ERROR_CHARS: usize = 160;
+pub(crate) const MAX_SHOWN_ERROR_CHARS: usize = 160;
 
 pub enum AppError {
     /// Not logged in — bounce to login (GET only; POSTs get 403 instead).
