@@ -2713,7 +2713,7 @@ mod tests {
         assert!(html.contains("PR #7"));
         assert!(html.contains("no PR — cannot be approved"), "{html}");
         assert!(
-            html.contains("1 gated task(s) have no approval PR"),
+            html.contains("1 gated task(s) have no usable approval PR"),
             "{html}"
         );
         // Failures: verb, escaped audit excerpt, detail link.
@@ -2915,5 +2915,79 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("href=\"/selecta\""));
+    }
+
+    /// An unusable `pr_url` is as unapprovable as a missing one: both count
+    /// as "no PR" on the pane and on the home card. A full probe says "N+",
+    /// and a failing probe reads "error", not "unreachable".
+    #[tokio::test]
+    async fn selecta_counts_unusable_pr_links_as_missing_and_flags_a_full_probe() {
+        let seen = SelectaSeen::default();
+        let answer = |body: &serde_json::Value| -> serde_json::Value {
+            match body
+                .pointer("/params/arguments/state")
+                .and_then(|v| v.as_str())
+            {
+                Some("awaiting_approval") => {
+                    let mut rows: Vec<serde_json::Value> = (0..99)
+                        .map(|i| {
+                            selecta_row(
+                                &format!("{i:032x}"),
+                                "awaiting_approval",
+                                "selecta_hunt_album",
+                                Some("https://github.com/acme/agent/pull/9"),
+                                None,
+                            )
+                        })
+                        .collect();
+                    rows.push(selecta_row(
+                        ORPHAN_ID,
+                        "awaiting_approval",
+                        "selecta_hunt_album",
+                        Some("javascript:alert(1)"),
+                        None,
+                    ));
+                    rpc_ok(serde_json::json!({ "result": rows }))
+                }
+                _ => selecta_answer(body),
+            }
+        };
+        let state = fake_selecta(
+            &seen,
+            answer,
+            SELECTA_METRICS,
+            (StatusCode::OK, r#"{"status":"ok","seq":1}"#),
+        )
+        .await;
+        let (_, home) = render(state.clone(), "/").await;
+        assert!(
+            home.contains("100+ awaiting your approval · 1 with no PR"),
+            "{home}"
+        );
+        let (_, pane) = render(state, "/selecta").await;
+        assert!(
+            pane.contains("1 gated task(s) have no usable approval PR"),
+            "{pane}"
+        );
+        assert!(pane.contains("unrecognised PR link"), "{pane}");
+        assert!(!pane.contains("href=\"javascript:"), "{pane}");
+
+        let failing =
+            |_: &serde_json::Value| rpc_tool_error("Error executing tool selecta_list_tasks: boom");
+        let state = fake_selecta(
+            &seen,
+            failing,
+            SELECTA_METRICS,
+            (StatusCode::OK, r#"{"status":"ok","seq":1}"#),
+        )
+        .await;
+        let (_, home) = render(state, "/").await;
+        assert!(home.contains(">error<"), "{home}");
+        assert!(
+            home.contains(
+                "selecta_list_tasks failed: Error executing tool selecta_list_tasks: boom"
+            ),
+            "{home}"
+        );
     }
 }

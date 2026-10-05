@@ -65,7 +65,6 @@ pub fn valid_task_id(id: &str) -> bool {
 #[derive(Debug, Deserialize)]
 pub struct TaskRow {
     pub task_id: String,
-    pub state: String,
     pub tier: String,
     pub verb: String,
     /// Epoch seconds.
@@ -75,10 +74,18 @@ pub struct TaskRow {
     pub audit: Option<String>,
 }
 
+impl TaskRow {
+    /// The approval PR as a renderable link. `None` for a missing `pr_url`
+    /// and for one that is not a GitHub PR URL alike: either way there is no
+    /// link the operator can follow to approve the task.
+    pub fn approval_pr(&self) -> Option<String> {
+        self.pr_url.as_deref().and_then(github_pr)
+    }
+}
+
 /// `selecta_get_task`.
 #[derive(Debug, Deserialize)]
 pub struct TaskView {
-    pub task_id: String,
     pub state: String,
     pub tier: String,
     pub verb: String,
@@ -175,7 +182,7 @@ impl SelectaClient {
         let sc = self
             .call(LIST_TASKS, json!({ "state": state, "limit": limit }))
             .await?;
-        let rows: Vec<TaskRow> = rows_of(LIST_TASKS, sc)?;
+        let rows = task_rows(sc)?;
         if let Some(bad) = rows.iter().find(|r| !valid_task_id(&r.task_id)) {
             return Err(unparseable(
                 LIST_TASKS,
@@ -197,16 +204,8 @@ impl SelectaClient {
 
     pub async fn gauges(&self) -> Result<Gauges, AppError> {
         const WHAT: &str = "selecta /metrics";
-        let resp = self
-            .http
-            .get(join(&self.base, "/metrics"))
-            .send()
-            .await
-            .map_err(|e| AppError::transport(WHAT, &e))?;
-        let status = resp.status();
-        let text = http::body_text(WHAT, resp)
-            .await
-            .map_err(|e| AppError::body(WHAT, e))?;
+        let req = self.http.get(join(&self.base, "/metrics"));
+        let (status, text) = http::text_body(WHAT, req).await?;
         if !status.is_success() {
             return Err(AppError::Upstream(format!("{WHAT} {status}")));
         }
@@ -217,16 +216,8 @@ impl SelectaClient {
     /// reason when it does not; both are answers, not failures.
     pub async fn liveness(&self) -> Result<Liveness, AppError> {
         const WHAT: &str = "selecta /healthz";
-        let resp = self
-            .http
-            .get(join(&self.base, "/healthz"))
-            .send()
-            .await
-            .map_err(|e| AppError::transport(WHAT, &e))?;
-        let status = resp.status();
-        let text = http::body_text(WHAT, resp)
-            .await
-            .map_err(|e| AppError::body(WHAT, e))?;
+        let req = self.http.get(join(&self.base, "/healthz"));
+        let (status, text) = http::text_body(WHAT, req).await?;
         parse_liveness(status.as_u16(), &text)
             .map_err(|e| AppError::Upstream(format!("{WHAT}: {e}")))
     }
@@ -271,15 +262,18 @@ fn structured(tool: &str, v: Value) -> Result<Value, AppError> {
     }
 }
 
-/// The rows of a list tool's `{"result": [...]}`. A missing or non-list
-/// `result` is an error, never an empty list: an empty list reads as "all
-/// quiet".
-fn rows_of<T: serde::de::DeserializeOwned>(tool: &str, mut sc: Value) -> Result<Vec<T>, AppError> {
+/// The rows of `selecta_list_tasks`' `{"result": [...]}`. A missing or
+/// non-list `result` is an error, never an empty list: an empty list reads
+/// as "all quiet".
+fn task_rows(mut sc: Value) -> Result<Vec<TaskRow>, AppError> {
     match sc.get_mut("result").map(Value::take) {
         Some(rows @ Value::Array(_)) => {
-            serde_json::from_value(rows).map_err(|e| unparseable(tool, &e.to_string()))
+            serde_json::from_value(rows).map_err(|e| unparseable(LIST_TASKS, &e.to_string()))
         }
-        _ => Err(unparseable(tool, "structuredContent has no result list")),
+        _ => Err(unparseable(
+            LIST_TASKS,
+            "structuredContent has no result list",
+        )),
     }
 }
 
@@ -404,9 +398,13 @@ fn parse_gauges(text: &str) -> Result<Gauges, String> {
     for s in &samples {
         match (s.name.as_str(), s.label("state"), s.label("cap")) {
             ("queue_depth", Some(state), _) => {
-                *queue_depth
-                    .entry(mcp_state(state).to_string())
-                    .or_insert(0.0) += s.value;
+                // A state the pane does not know would be counted and never
+                // rendered, reading as 0: refuse it instead.
+                let state = mcp_state(state);
+                if !STATES.contains(&state) {
+                    return Err(format!("unknown queue_depth state {state:?}"));
+                }
+                *queue_depth.entry(state.to_string()).or_insert(0.0) += s.value;
             }
             ("day_cap_used", _, Some(cap)) => {
                 day_caps.entry(cap.to_string()).or_default().0 = Some(s.value)
@@ -521,6 +519,8 @@ lease_remaining_s 41.5
         assert_eq!(g.lease_remaining_s, 41.5);
     }
 
+    /// The only test that pins `parked = false`: every other fixture is
+    /// parked, so a `parked: true` mutant survives without it.
     #[test]
     fn gauges_unparked_budget_has_an_empty_reason() {
         let text = METRICS.replace(
@@ -577,6 +577,20 @@ lease_remaining_s 41.5
         assert!(g.day_caps.is_empty());
     }
 
+    /// A state selecta adds later must not be counted and silently dropped
+    /// from the tiles, which would read as 0.
+    #[test]
+    fn gauges_refuse_an_unknown_queue_state() {
+        let text = METRICS.replace(
+            r#"queue_depth{state="ready"} 3"#,
+            "queue_depth{state=\"ready\"} 3\nqueue_depth{state=\"quarantined\"} 5",
+        );
+        assert_eq!(
+            parse_gauges(&text).err().as_deref(),
+            Some(r#"unknown queue_depth state "quarantined""#)
+        );
+    }
+
     #[test]
     fn sample_parser_handles_multiple_labels_and_rejects_junk() {
         let s = parse_sample(r#"m{a="1",b="x,y}z"} 2.5"#).unwrap();
@@ -591,13 +605,6 @@ lease_remaining_s 41.5
 
     fn rpc_result(result: Value) -> Value {
         json!({"jsonrpc": "2.0", "id": 1, "result": result})
-    }
-
-    #[test]
-    fn structured_returns_the_structured_content() {
-        let sc = json!({"result": []});
-        let v = rpc_result(json!({"content": [], "structuredContent": sc, "isError": false}));
-        assert_eq!(structured(LIST_TASKS, v).ok(), Some(json!({"result": []})));
     }
 
     /// Every failure names the tool. A tool error arrives as HTTP 200 with
@@ -646,24 +653,22 @@ lease_remaining_s 41.5
     #[test]
     fn rows_parse_and_never_degrade_to_an_empty_list() {
         let id = "a".repeat(32);
-        let rows: Vec<TaskRow> = rows_of(LIST_TASKS, json!({"result": [row(&id)]}))
-            .ok()
-            .unwrap();
+        let rows = task_rows(json!({"result": [row(&id)]})).ok().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].enqueued_at, 1_790_000_000.25);
         assert_eq!(rows[0].audit.as_deref(), Some("boom"));
         let detail = |r: Result<Vec<TaskRow>, AppError>| r.err().unwrap().detail().to_string();
         assert_eq!(
-            detail(rows_of(LIST_TASKS, json!({"rows": []}))),
+            detail(task_rows(json!({"rows": []}))),
             "selecta_list_tasks: unparseable payload (structuredContent has no result list)"
         );
         assert_eq!(
-            detail(rows_of(LIST_TASKS, json!({"result": {}}))),
+            detail(task_rows(json!({"result": {}}))),
             "selecta_list_tasks: unparseable payload (structuredContent has no result list)"
         );
         let mut bad = row(&id);
         bad.as_object_mut().unwrap().remove("verb");
-        let err = detail(rows_of(LIST_TASKS, json!({"result": [bad]})));
+        let err = detail(task_rows(json!({"result": [bad]})));
         assert!(err.contains("missing field `verb`"), "{err}");
     }
 

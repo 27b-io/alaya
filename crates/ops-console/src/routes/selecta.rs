@@ -32,7 +32,8 @@ use crate::ui::*;
 
 const TITLE: &str = "selecta — ops console";
 const FAILED_SHOWN: u32 = 20;
-const AWAITING_SHOWN: u32 = 100;
+/// Also the home card's probe size: it says "N+" when a list fills it.
+pub const AWAITING_SHOWN: u32 = 100;
 
 fn not_configured() -> impl IntoView + use<> {
     view! {
@@ -352,10 +353,10 @@ fn approvals_card(
             <p class="text-sm text-muted-foreground">"Nothing is waiting on you."</p>
         })),
         Ok(rows) => {
-            let no_pr = rows.iter().filter(|r| r.pr_url.is_none()).count();
+            let no_pr = rows.iter().filter(|r| r.approval_pr().is_none()).count();
             let no_pr_note = (no_pr > 0).then(|| {
                 let msg = format!(
-                    " {no_pr} gated task(s) have no approval PR, so nothing can approve them: selecta did not open the PR."
+                    " {no_pr} gated task(s) have no usable approval PR, so nothing can approve them."
                 );
                 view! {
                     <p class="text-sm mb-4">

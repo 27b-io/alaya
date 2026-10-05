@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::error::AppError;
 use crate::lb::live_budgets;
+use crate::routes;
 use crate::session::{Session, take_flash};
 use crate::state::AppState;
 use crate::ui::*;
@@ -33,7 +34,10 @@ pub async fn home(
     // The one read that both proves the token and says what matters most.
     let selecta_probe = async {
         match state.selecta.as_ref() {
-            Some(s) => Some(s.list_tasks("awaiting_approval", 100).await),
+            Some(s) => Some(
+                s.list_tasks("awaiting_approval", routes::selecta::AWAITING_SHOWN)
+                    .await,
+            ),
             None => None,
         }
     };
@@ -112,21 +116,29 @@ pub async fn home(
         Some(probe) => {
             let (class, label, summary) = match probe {
                 Ok(rows) => {
-                    let no_pr = rows.iter().filter(|r| r.pr_url.is_none()).count();
+                    let no_pr = rows.iter().filter(|r| r.approval_pr().is_none()).count();
                     let class = if no_pr > 0 {
                         badge(BadgeKind::Destructive)
                     } else {
                         badge(BadgeKind::Success)
                     };
-                    let mut summary = format!("{} awaiting your approval", rows.len());
+                    // A full probe means the list was cut, not that it is exact.
+                    let full = rows.len() >= routes::selecta::AWAITING_SHOWN as usize;
+                    let mut summary = format!(
+                        "{}{} awaiting your approval",
+                        rows.len(),
+                        if full { "+" } else { "" }
+                    );
                     if no_pr > 0 {
                         summary.push_str(&format!(" · {no_pr} with no PR"));
                     }
                     (class, "reachable", summary)
                 }
+                // "error", not "unreachable": a 401 or a tool error arrives
+                // over a healthy network. The detail names the kind.
                 Err(e) => (
                     badge(BadgeKind::Destructive),
-                    "unreachable",
+                    "error",
                     e.detail().to_string(),
                 ),
             };
