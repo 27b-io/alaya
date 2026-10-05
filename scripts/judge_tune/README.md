@@ -62,7 +62,8 @@ Every output lands under `scripts/judge_tune/runs/<name>/`, which is gitignored:
 `eval_<pairs>_<judge>_<model>_<scrubbed|raw>_<regime>_k<passes>_<sha>.json`
 plus `_records.jsonl` (every verdict of every pass, keyed by both hashes) and
 `_sent.json` (every pair it sends, written before the first request), and
-appends its spend to the run's `spend_log.jsonl`; `rows`
+appends each chunk's spend to the run's `spend_log.jsonl` as it lands. An
+`eval` whose `_records.jsonl` already exists refuses to start; `rows`
 writes `rows.json`; `compare` writes `compare.json` and `compare.md`. The
 harness writes no memory content to disk, but the run directory holds model
 output about it (candidate prompts, verdict reasons, hash prefixes), so it
@@ -191,7 +192,13 @@ that is unmeasured, while no pair carries the label.
 
 `--max-usd` is checked between chunks of 20 calls. The first chunk's cost is
 projected over the whole run, so a run the cap cannot cover with 10 % headroom
-stops after one chunk. Every call that returned is booked before an abort.
+stops after one chunk. Every call that returned is booked before an abort,
+and each chunk's spend is in `spend_log.jsonl` before the next starts. The
+run directory holds `unbooked.json` from before a chunk's first request until
+its spend is in the log, so a killed `eval`, or an append that fails, leaves it
+behind, and no later `eval` in the run starts until someone books that chunk
+and deletes the file. A failed append prints the spend and the exact line it
+owed; after a kill, take the chunk's spend from the provider's usage.
 
 `--regime default` is the production request (no `thinking` parameter, so
 `claude-sonnet-5` runs adaptive thinking). `--regime thinking-off` adds

@@ -246,15 +246,78 @@ def check_judge_passes() -> None:
         return verdict(tokens=(1_000, 10))
 
     votes: list = [[] for _ in texts]
-    ledger = tune.Ledger()
+    ledger, chunks = tune.Ledger(), []
     try:
-        tune.judge_passes(flaky, "claude-sonnet-5", texts, 3, ledger, 1e9, votes)
+        tune.judge_passes(
+            flaky, "claude-sonnet-5", texts, 3, ledger, 1e9, votes, chunks.append
+        )
     except tune.AuthError:
         pass
     else:
         raise AssertionError("an auth error must abort the run")
     assert sum(map(len, votes)) == tune.SPEND_CHECK_EVERY - 1 and not votes[7]
     assert ledger.rows[("judge", "claude-sonnet-5")][0] == tune.SPEND_CHECK_EVERY - 1
+    # ... and handed to `book` before the raise: a kill now loses no paid call.
+    assert len(chunks) == 1 and chunks[0].rows == ledger.rows
+
+    # A booking that fails carries the judge error as its context: neither is lost.
+    def unwritable(spent):
+        raise OSError(28, "No space left on device")
+
+    try:
+        tune.judge_passes(
+            flaky,
+            "claude-sonnet-5",
+            texts,
+            1,
+            tune.Ledger(),
+            1e9,
+            [[] for _ in texts],
+            unwritable,
+        )
+    except OSError as e:
+        assert isinstance(e.__context__, tune.AuthError), repr(e.__context__)
+    else:
+        raise AssertionError("a failed booking must abort the run")
+    # Each chunk is booked as it lands, so the spend log sums to the ledger.
+    votes, ledger, chunks = [[] for _ in texts], tune.Ledger(), []
+    tune.judge_passes(
+        lambda t: verdict(tokens=(1_000, 10)),
+        "claude-sonnet-5",
+        texts,
+        2,
+        ledger,
+        1e9,
+        votes,
+        chunks.append,
+    )
+    assert len(chunks) == 2 * -(-len(texts) // tune.SPEND_CHECK_EVERY)
+    assert abs(sum(c.usd() for c in chunks) - ledger.usd()) < 1e-9
+    # Each chunk is owed before its first request and settled after its last,
+    # a chunk whose every call raised included: nothing is left marked unpaid.
+    events: list[str] = []
+
+    def denied(t):
+        events.append("call")
+        raise tune.AuthError("HTTP 401")
+
+    try:
+        tune.judge_passes(
+            denied,
+            "claude-sonnet-5",
+            texts[:2],
+            1,
+            tune.Ledger(),
+            1e9,
+            [[], []],
+            lambda spent: events.append(f"book {spent.usd()}"),
+            lambda: events.append("owe"),
+        )
+    except tune.AuthError:
+        pass
+    else:
+        raise AssertionError("an auth error must abort the run")
+    assert events == ["owe", "call", "call", "book 0.0"], events
     # A failed pair is booked and kept; a chunk of nothing but failures aborts.
     gone = verdict(verdict=tune.FAILED, reason="HTTP 503", tokens=(0, 0))
     votes, ledger, err = run(lambda t, n: gone if t == texts[3] else verdict(), 1e9)
@@ -1078,6 +1141,147 @@ def check_compare_run() -> None:
             raise AssertionError("a torn records line must exit")
 
 
+def check_judge_batch(pairs: list) -> None:
+    """tune's batch books every call that returned before an error aborts it:
+    those calls were paid for, and spend.json must say so."""
+    batch = pairs[:6]
+    memories = {h: mem(h, 1.0) for p in batch for h in (p.a, p.b)}
+    failing = tune.render_pair(memories[batch[2].a], memories[batch[2].b])
+
+    def judge_pair(client, model, prompt, text, regime="default"):
+        if text == failing:
+            raise tune.ApiError("HTTP 529")
+        return verdict(tokens=(1_000, 10))
+
+    real, tune.judge_pair = tune.judge_pair, judge_pair
+    try:
+        ledger = tune.Ledger()
+        try:
+            tune.judge_batch(None, "claude-sonnet-5", "p", memories, batch, ledger)
+        except tune.ApiError:
+            pass
+        else:
+            raise AssertionError("an API error must abort the batch")
+        assert ledger.rows[("judge", "claude-sonnet-5")] == [5, 5_000, 50]
+        ledger = tune.Ledger()
+        got = tune.judge_batch(
+            None, "claude-sonnet-5", "p", memories, batch[3:], ledger
+        )
+        assert len(got) == 3 and ledger.rows[("judge", "claude-sonnet-5")][0] == 3
+        # A pair that cannot be rendered aborts before any call goes out: a call
+        # already sent would be paid for and never booked.
+        sent: list = []
+        tune.judge_pair = lambda c, m, pr, text, regime="default": sent.append(text)
+        lost = tune.Pair(999, "0" * 64, batch[0].b, "coexist", None, "test")
+        try:
+            tune.judge_batch(
+                None, "claude-sonnet-5", "p", memories, [*batch, lost], tune.Ledger()
+            )
+        except KeyError:
+            pass
+        else:
+            raise AssertionError("a pair with no memory must abort the batch")
+        assert not sent, f"{len(sent)} calls sent before the abort"
+    finally:
+        tune.judge_pair = real
+
+
+def check_new_records() -> None:
+    """A rerun of the same eval refuses to start rather than overwrite (or,
+    aborted, truncate) the records an earlier result points at."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        path = tune.new_records(out, "eval_s")
+        assert path == out / "eval_s_records.jsonl" and not path.exists()
+        path.write_text("{}\n")
+        try:
+            tune.new_records(out, "eval_s")
+        except SystemExit as e:
+            assert "eval_s_records.jsonl exists" in str(e), e
+        else:
+            raise AssertionError("an existing records file must refuse the eval")
+        assert path.read_text() == "{}\n"
+
+
+def check_book_spend() -> None:
+    """Each chunk's spend is appended to the run's log, and the run is marked
+    from before the chunk's first request until then. A failed append names
+    the spend and the line it owed, and leaves the mark: no eval in the run
+    starts on a cap that leaves that chunk out."""
+    spent = tune.Ledger()
+    spent.add("judge", "claude-sonnet-5", 100_000, 1_000)
+    entry = {"stem": "eval_s", "judge": "anthropic", "model": "claude-sonnet-5"}
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        assert tune.run_spent(out) == 0
+        tune.owe_spend(out, entry)
+        tune.book_spend(out, entry, spent)
+        tune.book_spend(out, entry, spent)
+        assert tune.spend_log(out) == [entry | spent.summary()] * 2
+        assert tune.run_spent(out) == 2 * spent.summary()["total_usd"]
+        (out / tune.SPEND_LOG).unlink()
+        (out / tune.SPEND_LOG).mkdir()  # the append now fails
+
+        # Wired as `cmd_eval` wires it: the chunk is paid, its append fails.
+        def book(chunk):
+            tune.book_spend(out, entry, chunk)
+
+        try:
+            tune.judge_passes(
+                lambda t: verdict(tokens=(100_000, 1_000)),
+                "claude-sonnet-5",
+                ["x"],
+                1,
+                tune.Ledger(),
+                1e9,
+                [[]],
+                book,
+                lambda: tune.owe_spend(out, entry),
+            )
+        except OSError as e:
+            note = "\n".join(getattr(e, "__notes__", []))
+            assert f"${spent.usd():.4f} not booked" in note, note
+            assert json.dumps(entry | spent.summary()) in note, note
+        else:
+            raise AssertionError("a failed append must abort the eval")
+        # The directory recovers and a new eval starts: the paid chunk is in
+        # no log line, so its cap would be the run's whole cap. It must refuse.
+        (out / tune.SPEND_LOG).rmdir()
+        try:
+            tune.run_spent(out)
+        except SystemExit as e:
+            assert tune.UNBOOKED_FILE in str(e) and "eval_s" in str(e), e
+        else:
+            raise AssertionError("an unbooked chunk must stop the next eval")
+        # The line the error named appended by hand, the mark deleted: the
+        # run's cap counts the chunk.
+        (out / tune.SPEND_LOG).write_text(json.dumps(entry | spent.summary()) + "\n")
+        (out / tune.UNBOOKED_FILE).unlink()
+        assert tune.run_spent(out) == spent.summary()["total_usd"]
+        # A mark that cannot be written stops the chunk before any request.
+        (out / tune.UNBOOKED_FILE).mkdir()  # the write now fails
+        sent = []
+        try:
+            tune.judge_passes(
+                lambda t: sent.append(t) or verdict(),
+                "claude-sonnet-5",
+                ["x"],
+                1,
+                tune.Ledger(),
+                1e9,
+                [[]],
+                book,
+                lambda: tune.owe_spend(out, entry),
+            )
+        except OSError as e:
+            note = "\n".join(getattr(e, "__notes__", []))
+            assert "no request sent and no spend owed" in note, note
+            assert str(out / tune.UNBOOKED_FILE) in note, note
+        else:
+            raise AssertionError("a failed mark must abort the eval")
+        assert sent == [] and tune.spend_log(out) == [entry | spent.summary()]
+
+
 def main() -> None:
     if not __debug__:  # every check below is an assert; -O would strip them all
         sys.exit("run this file without -O")
@@ -1240,7 +1444,7 @@ def main() -> None:
     )
     real = tune.judge_batch
     try:
-        tune.judge_batch = lambda c, m, pr, mem, batch: [
+        tune.judge_batch = lambda c, m, pr, mem, batch, ledger: [
             {
                 "verdict": p.label,
                 "survivor": (
@@ -1264,6 +1468,10 @@ def main() -> None:
         assert len(adapter.val_evals) == 1
     finally:
         tune.judge_batch = real
+
+    check_judge_batch(all_pairs)
+    check_new_records()
+    check_book_spend()
 
     # GEPA's proposer dereferences this attribute without getattr.
     assert tune.JudgeAdapter.propose_new_texts is None
