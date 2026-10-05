@@ -1970,7 +1970,8 @@ impl MemoryService {
 
     // ─── Tool 6: memory_supersede ───────────────────────────────────────
 
-    #[tracing::instrument(skip(self))]
+    // `reason` is caller free text, so it stays out of the span (LAB-7878).
+    #[tracing::instrument(skip(self, reason))]
     pub async fn memory_supersede(
         &self,
         old_hash: &str,
@@ -2138,7 +2139,7 @@ impl MemoryService {
     /// whole, its edge restored, and reported as `superseded_by_changed`. A
     /// memory that is not superseded is `not_superseded`: a typed no-op,
     /// never a success. Nothing is deleted but SUPERSEDES edges.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, reason))]
     pub async fn memory_unsupersede(
         &self,
         content_hash: &str,
@@ -2244,7 +2245,6 @@ impl MemoryService {
                     hash = content_hash,
                     superseded_by = %marker,
                     via,
-                    reason,
                     edges_removed = ?edges_removed,
                     stamped = ?stamped,
                     "supersession reversed"
@@ -2735,7 +2735,7 @@ impl MemoryService {
 
     // ─── Tool 9: merge_duplicates ───────────────────────────────────────
 
-    #[tracing::instrument(skip(self, duplicate_hashes))]
+    #[tracing::instrument(skip(self, duplicate_hashes, reason))]
     pub async fn merge_duplicates(
         &self,
         canonical_hash: &str,
@@ -9934,7 +9934,76 @@ mod tests {
         assert_eq!(events.len(), 1, "one audit event: {events:?}");
         assert_eq!(events[0]["hash"], a);
         assert_eq!(events[0]["via"], "operator:test");
-        assert_eq!(events[0]["reason"], "wrong merge");
+        assert!(
+            !events[0].contains_key("reason"),
+            "the reason is caller free text; the audit entry keeps it: {events:?}"
+        );
+    }
+
+    /// LAB-7878: a supersede, unsupersede or merge `reason` is caller free
+    /// text, so at INFO it reaches no span field and no event — with span
+    /// close events on, the fmt layer prints every field a span recorded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reason_text_reaches_no_span_field_or_event_at_info() {
+        const MARKER: &str = "REASON-MARKER";
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Buf::default();
+        let writer = buf.clone();
+        std::sync::LazyLock::force(&KEEPALIVE);
+        let capture = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+
+        let (a, b) = (h('a'), h('b'));
+        let svc = Ledger::with(&[&a, &b]).service();
+        let (canonical, dup) = (h('c'), h('d'));
+        let (merge_svc, rec) = build_merge_service();
+        rec.seed(&[&canonical, &dup]);
+        async {
+            svc.memory_supersede(&a, &b, MARKER).await.unwrap();
+            let out = svc
+                .memory_unsupersede(&a, MARKER, "operator:test")
+                .await
+                .unwrap();
+            assert_eq!(out["status"], "unsuperseded", "{out}");
+            merge_svc
+                .merge_duplicates(&canonical, &[&dup], MARKER, false)
+                .await
+                .unwrap();
+        }
+        .with_subscriber(capture)
+        .await;
+
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        for seen in [
+            "memory_supersede",
+            "memory_unsupersede",
+            "merge_duplicates",
+            "supersession reversed",
+        ] {
+            assert!(
+                log.contains(seen),
+                "positive control: no `{seen}` in:\n{log}"
+            );
+        }
+        assert!(!log.contains(MARKER), "reason text reached the log:\n{log}");
     }
 
     /// Not superseded is a typed no-op: `success: false`, a status saying

@@ -1539,7 +1539,9 @@ async fn service_worker(
                     .try_acquire_owned()
                     .expect("checked by the arm above, on this thread");
                 let mode = format!("{:?}", params.mode).to_lowercase();
-                let query_preview = truncate(&params.query, 80);
+                // Query text is caller free text and can carry personal data
+                // or a pasted secret, so only its length is logged (LAB-7878).
+                let query_len = params.query.len();
                 let page = params.page;
                 let page_size = params.page_size;
                 let tag_count = params.tags.as_ref().map(|t| t.len()).unwrap_or(0);
@@ -1562,7 +1564,7 @@ async fn service_worker(
                         if reply.is_closed() {
                             tracing::info!(
                                 op,
-                                query = query_preview.as_str(),
+                                query_len,
                                 "caller gone before the search ran; skipped"
                             );
                             return;
@@ -1578,7 +1580,7 @@ async fn service_worker(
                                 tracing::info!(
                                     op,
                                     mode = mode.as_str(),
-                                    query = query_preview.as_str(),
+                                    query_len,
                                     results = n,
                                     has_more,
                                     page,
@@ -1688,7 +1690,7 @@ async fn service_worker(
                 let span = tracing::info_span!(parent: &ps, "supersede");
                 let old_h = truncate_hash(&old_hash);
                 let new_h = truncate_hash(&new_hash);
-                let reason_preview = truncate(&reason, 60);
+                let reason_len = reason.len();
                 let result = match timeout(
                     limits.cmd,
                     svc.memory_supersede(&old_hash, &new_hash, &reason)
@@ -1701,7 +1703,7 @@ async fn service_worker(
                             op,
                             old = old_h.as_str(),
                             new = new_h.as_str(),
-                            reason = reason_preview.as_str(),
+                            reason_len,
                             elapsed_ms = ms(start),
                             "ok"
                         );
@@ -2584,15 +2586,6 @@ fn result_count(v: &Value) -> u64 {
         .and_then(|r| r.as_array())
         .map(|a| a.len() as u64)
         .unwrap_or(0)
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let boundary = s.floor_char_boundary(max);
-        format!("{}…", &s[..boundary])
-    }
 }
 
 fn truncate_hash(s: &str) -> String {
@@ -5222,7 +5215,7 @@ mod wedge_tests {
             _rel: SystemRelationType,
             _created_at: f64,
         ) -> Result<bool> {
-            unimplemented!()
+            Ok(true)
         }
         async fn get_all_contradictions(
             &self,
@@ -5599,8 +5592,9 @@ mod wedge_tests {
     /// search calls it, and every one does, the tag cache notwithstanding:
     /// `get_all_tags` answers "flag", a keyword of the test query. The store
     /// path runs at full speed: its `search_by_vector` answers `neighbour` at
-    /// once, and `stored` records every write. Methods neither path calls
-    /// panic.
+    /// once, and `stored` records every write. A supersede finds every hash
+    /// it names, as a copy of `neighbour`, and its marker write succeeds.
+    /// Methods none of these paths calls panic.
     struct SlowSearchVectors {
         neighbour: Memory,
         stored: std::rc::Rc<std::cell::RefCell<Vec<Memory>>>,
@@ -5631,8 +5625,14 @@ mod wedge_tests {
         ) -> Result<bool> {
             unimplemented!()
         }
-        async fn get_batch(&self, _hashes: &[&str]) -> Result<Vec<Memory>> {
-            unimplemented!()
+        async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>> {
+            Ok(hashes
+                .iter()
+                .map(|h| Memory {
+                    content_hash: (*h).to_string(),
+                    ..self.neighbour.clone()
+                })
+                .collect())
         }
         async fn delete(&self, _content_hash: &str) -> Result<bool> {
             unimplemented!()
@@ -5642,7 +5642,7 @@ mod wedge_tests {
             _content_hash: &str,
             _updates: MetadataUpdate,
         ) -> Result<()> {
-            unimplemented!()
+            Ok(())
         }
         async fn patch_memory(
             &self,
@@ -5961,6 +5961,124 @@ mod wedge_tests {
             }
         })
         .await;
+    }
+
+    /// LAB-7878: a search query and a supersede reason are caller free text,
+    /// so no line at INFO carries them: not the search `ok` line, not the
+    /// line for a search skipped because its caller left, not the supersede
+    /// `ok` line, and not a span field (span close events print every field
+    /// a span recorded, alaya-core's `memory_supersede` span included).
+    #[tokio::test(start_paused = true)]
+    async fn search_and_supersede_lines_carry_no_query_or_reason_text() {
+        use tracing_subscriber::fmt::format::FmtSpan;
+
+        let log = crate::testlog::LogBuf::default();
+        let _guard = crate::testlog::scoped(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_span_events(FmtSpan::CLOSE)
+                .with_writer(log.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+
+        with_slow_search_worker(WorkerLimits::default(), |tx, neighbour, _| async move {
+            let search = |reply| {
+                let params: SearchParams = serde_json::from_value(
+                    json!({ "query": "flag QUERY-MARKER", "mode": "hybrid" }),
+                )
+                .expect("search params");
+                Cmd {
+                    inner: CmdInner::Search {
+                        params,
+                        read_only: false,
+                        reply,
+                    },
+                    span: tracing::Span::none(),
+                }
+            };
+            // The second search's caller leaves while the first holds the
+            // gate, so it is skipped; the third runs after it.
+            let mut answers = Vec::new();
+            for _ in 0..3 {
+                let (reply, answer) = oneshot::channel();
+                tx.send(search(reply)).await.unwrap();
+                answers.push(answer);
+            }
+            drop(answers.remove(1));
+            for answer in answers {
+                let found = tokio::time::timeout(NEVER, answer)
+                    .await
+                    .expect("search never replied")
+                    .expect("search reply dropped");
+                assert!(found.get("error").is_none(), "{found}");
+            }
+
+            let (reply, answer) = oneshot::channel();
+            tx.send(Cmd {
+                inner: CmdInner::Supersede {
+                    old_hash: "a".repeat(64),
+                    new_hash: neighbour.content_hash,
+                    reason: "REASON-MARKER".into(),
+                    reply,
+                },
+                span: tracing::Span::none(),
+            })
+            .await
+            .unwrap();
+            let out = answer.await.expect("supersede reply");
+            assert_eq!(out["success"], true, "{out}");
+        })
+        .await;
+
+        let log = log.text();
+        for seen in [
+            "query_len=17",
+            "caller gone before the search ran; skipped",
+            "reason_len=13",
+            "memory_supersede",
+        ] {
+            assert!(
+                log.contains(seen),
+                "positive control: no `{seen}` in:\n{log}"
+            );
+        }
+        for marker in ["QUERY-MARKER", "REASON-MARKER"] {
+            assert!(!log.contains(marker), "`{marker}` reached the log:\n{log}");
+        }
+    }
+
+    /// LAB-7878: the rerank call records no query text in its span. A
+    /// refused connection is enough: the span opens and closes either way.
+    #[tokio::test]
+    async fn rerank_span_carries_no_query_text() {
+        use alaya_backends::RerankingService;
+        use tracing_subscriber::fmt::format::FmtSpan;
+
+        let log = crate::testlog::LogBuf::default();
+        let _guard = crate::testlog::scoped(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_span_events(FmtSpan::CLOSE)
+                .with_writer(log.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let refused = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("free port");
+        let client = RerankClient::new(format!("http://{refused}"), 1, None, NEVER).unwrap();
+        assert!(client.rerank("QUERY-MARKER", &["x"]).await.is_err());
+
+        let log = log.text();
+        assert!(
+            log.contains("rerank{n=1}"),
+            "positive control: no rerank span in:\n{log}"
+        );
+        assert!(
+            !log.contains("QUERY-MARKER"),
+            "query text reached the log:\n{log}"
+        );
     }
 
     /// A search that panics ends its own task only. Its caller sees the reply
