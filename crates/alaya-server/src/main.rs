@@ -1661,8 +1661,7 @@ async fn service_worker(
                     .as_deref()
                     .map(truncate_hash)
                     .unwrap_or_default();
-                let rel_type =
-                    clip_for_log(params.relation_type.as_deref().unwrap_or_default()).into_owned();
+                let rel_type = params.relation_type.clone().unwrap_or_default();
                 let span = tracing::info_span!(parent: &ps, "relation", %action);
                 let result = match timeout(limits.cmd, svc.relation(params).instrument(span)).await
                 {
@@ -3050,7 +3049,11 @@ fn protected_router(handle: ServiceHandle, auth_state: AuthState) -> Router {
 /// request/response events. `DefaultMakeSpan` can set the span's level but
 /// cannot drop its `uri` field, so a custom `MakeSpan` is required.
 fn request_span(req: &Request) -> tracing::Span {
-    tracing::info_span!("request", method = %req.method(), path = %clip_for_log(req.uri().path()))
+    tracing::info_span!(
+        "request",
+        method = %clip_for_log(req.method().as_str()),
+        path = %clip_for_log(req.uri().path())
+    )
 }
 
 async fn shutdown_signal() {
@@ -5000,6 +5003,44 @@ mod tests {
             "query text reached the log:\n{log}"
         );
     }
+
+    /// LAB-8297: a tag search records how many tags it was given, not the
+    /// tags: a search's tags are caller text, and hybrid search passes the
+    /// query words that match a stored tag.
+    #[tokio::test]
+    async fn tag_search_span_carries_no_tag_text() {
+        use alaya_backends::VectorStorage;
+        use tracing_subscriber::fmt::format::FmtSpan;
+
+        let log = crate::testlog::LogBuf::default();
+        let _guard = crate::testlog::scoped(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_span_events(FmtSpan::CLOSE)
+                .with_writer(log.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let refused = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("free port");
+        let client =
+            QdrantClient::new(format!("http://{refused}"), "memories".into(), None).unwrap();
+        let found = client
+            .search_by_tags(&["TAG-MARKER"], false, 10, Some("note"), None)
+            .await;
+        assert!(found.is_err());
+
+        let log = log.text();
+        assert!(
+            log.contains("search_by_tags{") && log.contains("n_tags=1"),
+            "positive control: no tag search span in:\n{log}"
+        );
+        assert!(
+            !log.contains("TAG-MARKER"),
+            "tag text reached the log:\n{log}"
+        );
+    }
 }
 
 /// Regression tests for #63: one stuck backend await must never wedge the
@@ -6013,7 +6054,7 @@ mod wedge_tests {
     /// so no line at INFO carries them: not the search `ok` line, not the
     /// line for a search skipped because its caller left, not the supersede
     /// `ok` line, and not a span field (span close events print every field
-    /// a span recorded, alaya-core's `memory_supersede` span included).
+    /// a span recorded).
     #[tokio::test(start_paused = true)]
     async fn search_and_supersede_lines_carry_no_query_or_reason_text() {
         use tracing_subscriber::fmt::format::FmtSpan;
@@ -6115,7 +6156,9 @@ mod wedge_tests {
         );
 
         let path = format!("/memories/{label}");
-        let req = axum::http::Request::get(path.as_str())
+        let req = axum::http::Request::builder()
+            .method(label.to_uppercase().as_str())
+            .uri(path.as_str())
             .body(axum::body::Body::empty())
             .unwrap();
         drop(request_span(&req).entered());
@@ -6165,18 +6208,24 @@ mod wedge_tests {
         let log = log.text();
         let clipped = clip_for_log(&label);
         for seen in [
+            format!("method={}", clip_for_log(&label.to_uppercase())),
             format!("path={}", clip_for_log(&path)),
-            format!("store{{content_len=29 mem_type={clipped}"),
-            format!("mem_type=\"{clipped}\" content_len=29"),
+            format!("mem_type={clipped}"),
             format!("client=\"{clipped}\""),
-            format!("mem_type=\"{clipped}\" elapsed_ms"),
-            format!("relation{{action={clipped}}}"),
+            format!("action={clipped}"),
             format!("unknown action: {clipped}"),
         ] {
             assert!(log.contains(&seen), "no `{seen}` in:\n{log}");
         }
+        // The store `ok` line and the search `ok` line.
+        let ok_lines = format!("mem_type=\"{clipped}\"");
+        assert_eq!(
+            log.matches(&ok_lines).count(),
+            2,
+            "no two `{ok_lines}` in:\n{log}"
+        );
         assert!(
-            !log.contains(TAIL),
+            !log.contains(TAIL) && !log.contains(&TAIL.to_uppercase()),
             "a whole caller label reached the log:\n{log}"
         );
     }

@@ -1474,7 +1474,7 @@ impl VectorStorage for QdrantClient {
             .collect())
     }
 
-    #[tracing::instrument(skip(self, memory_type), fields(n_tags = tags.len(), match_all, limit, memory_type = ?memory_type.map(crate::clip_for_log)))]
+    #[tracing::instrument(skip(self, tags, memory_type), fields(n_tags = tags.len(), match_all, limit, memory_type = ?memory_type.map(crate::clip_for_log)))]
     async fn search_by_tags(
         &self,
         tags: &[&str],

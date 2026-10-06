@@ -85,9 +85,14 @@ pub fn clip_for_log(s: &str) -> std::borrow::Cow<'_, str> {
 /// The body of a non-2xx response, clipped for the error message it goes
 /// into: every such message is logged, and an upstream that echoes the
 /// request (an OpenAI-compatible proxy's 422 does) would echo memory content.
+/// Control characters are dropped, not escaped: a deterministic judge failure
+/// stores this text on the edge through `sanitize_reason`, which drops them.
 pub(crate) async fn error_body(resp: reqwest::Response) -> String {
     match resp.text().await {
-        Ok(body) => clip_for_log(&body).into_owned(),
+        Ok(body) => {
+            let body: String = body.chars().filter(|c| !c.is_control()).collect();
+            clip_for_log(&body).into_owned()
+        }
         Err(_) => "<unreadable>".into(),
     }
 }

@@ -1979,6 +1979,13 @@ impl MemoryService {
         new_hash: &str,
         reason: &str,
     ) -> Result<Value> {
+        for h in [old_hash, new_hash] {
+            if !alaya_types::memory::validate_content_hash(h) {
+                return Err(AlayaError::Validation(
+                    "invalid content_hash: expected 64-char lowercase SHA-256 hex".into(),
+                ));
+            }
+        }
         if old_hash == new_hash {
             return Err(AlayaError::Validation(
                 "old_hash and new_hash must differ".into(),
@@ -10059,6 +10066,10 @@ mod tests {
         .await;
         for e in &errors {
             assert!(matches!(e, AlayaError::Validation(_)), "{e:?}");
+            assert!(
+                !e.to_string().contains(TAIL),
+                "the error echoes the label: {e}"
+            );
         }
 
         let log = read_log();

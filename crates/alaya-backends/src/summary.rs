@@ -175,10 +175,11 @@ mod tests {
 
         /// An OpenAI-compatible proxy's 422 can echo the request, memory
         /// content included. The error, which is logged, keeps the status
-        /// and a clipped head of the body, never the whole of it.
+        /// and a clipped head of the body, never the whole of it, with its
+        /// line breaks dropped as the judge's stored reason drops them.
         #[tokio::test]
         async fn an_echoed_request_body_is_clipped_in_the_error() {
-            let echo = format!("{{\"detail\":\"{}CONTENT-TAIL\"}}", "x".repeat(1000));
+            let echo = format!("{{\n  \"detail\": \"{}CONTENT-TAIL\"\n}}", "x".repeat(1000));
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .respond_with(ResponseTemplate::new(422).set_body_string(echo.clone()))
@@ -190,8 +191,13 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(msg.contains("422"), "{msg}");
-            assert!(msg.contains(&format!("… ({} bytes)", echo.len())), "{msg}");
+            assert!(msg.contains("{  \"detail\": \"xxx"), "{msg}");
+            assert!(
+                msg.contains(&format!("… ({} bytes)", echo.len() - 2)),
+                "{msg}"
+            );
             assert!(!msg.contains("CONTENT-TAIL"), "{msg}");
+            assert!(!msg.contains('\n') && !msg.contains("\\n"), "{msg}");
             assert!(
                 msg.len() < crate::LOG_CLIP_BYTES + 128,
                 "{} bytes: {msg}",
