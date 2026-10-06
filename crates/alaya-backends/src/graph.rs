@@ -75,7 +75,7 @@ async fn handle_response<T: serde::de::DeserializeOwned>(resp: reqwest::Response
             .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))
     } else {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = crate::error_body(resp).await;
         if status.is_client_error() {
             Err(AlayaError::Validation(format!("Bridge: {status} {body}")))
         } else {
@@ -90,7 +90,7 @@ async fn check_success(resp: reqwest::Response) -> Result<()> {
         Ok(())
     } else {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = crate::error_body(resp).await;
         if status.is_client_error() {
             Err(AlayaError::Validation(format!("Bridge: {status} {body}")))
         } else {
@@ -105,7 +105,7 @@ async fn check_accepted(resp: reqwest::Response) -> Result<()> {
     if status == reqwest::StatusCode::ACCEPTED {
         Ok(())
     } else {
-        let body = resp.text().await.unwrap_or_default();
+        let body = crate::error_body(resp).await;
         Err(AlayaError::Graph(format!("Bridge: {status} {body}")))
     }
 }

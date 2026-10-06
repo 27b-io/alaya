@@ -173,6 +173,32 @@ mod tests {
             assert!(matches!(e, AlayaError::Summary(_)), "{e:?}");
         }
 
+        /// An OpenAI-compatible proxy's 422 can echo the request, memory
+        /// content included. The error, which is logged, keeps the status
+        /// and a clipped head of the body, never the whole of it.
+        #[tokio::test]
+        async fn an_echoed_request_body_is_clipped_in_the_error() {
+            let echo = format!("{{\"detail\":\"{}CONTENT-TAIL\"}}", "x".repeat(1000));
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(422).set_body_string(echo.clone()))
+                .mount(&server)
+                .await;
+            let msg = client(&server)
+                .summarize("x")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("422"), "{msg}");
+            assert!(msg.contains(&format!("… ({} bytes)", echo.len())), "{msg}");
+            assert!(!msg.contains("CONTENT-TAIL"), "{msg}");
+            assert!(
+                msg.len() < crate::LOG_CLIP_BYTES + 128,
+                "{} bytes: {msg}",
+                msg.len()
+            );
+        }
+
         /// Reasoning ate the budget: no content, `finish_reason: "length"`.
         /// The stop reason must reach the error, as it does for the judge.
         #[tokio::test]

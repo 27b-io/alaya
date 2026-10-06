@@ -39,7 +39,7 @@ use tokio::sync::{mpsc, oneshot};
 use tower_http::trace::TraceLayer;
 
 use alaya_backends::{
-    Provider,
+    Provider, clip_for_log,
     embedding::EmbeddingClient,
     graph::GraphHttpClient,
     graph_ref::{ConsolidationRef, GraphRef, HebbianRef},
@@ -1415,10 +1415,13 @@ async fn service_worker(
                 reply,
             } => {
                 let content_len = params.content.len();
-                let mem_type = params.memory_type.as_deref().unwrap_or("note").to_string();
+                // Caller labels with no length limit of their own (LAB-8297).
+                let mem_type =
+                    clip_for_log(params.memory_type.as_deref().unwrap_or("note")).into_owned();
                 let tag_count = params.tags.as_ref().map(|t| t.len()).unwrap_or(0);
                 let has_dedup = params.dedup_threshold.is_some();
-                let client = params.client_hostname.clone().unwrap_or_default();
+                let client = clip_for_log(params.client_hostname.as_deref().unwrap_or_default())
+                    .into_owned();
 
                 // Capture for fire-and-forget summary generation. Suppressed
                 // under read_only — the summary path patches the stored record
@@ -1545,7 +1548,8 @@ async fn service_worker(
                 let page = params.page;
                 let page_size = params.page_size;
                 let tag_count = params.tags.as_ref().map(|t| t.len()).unwrap_or(0);
-                let mem_type = params.memory_type.clone().unwrap_or_default();
+                let mem_type =
+                    clip_for_log(params.memory_type.as_deref().unwrap_or_default()).into_owned();
                 // `queued_ms` is recorded once the search holds the gate, so
                 // its ok, failed and timeout lines all carry the wait.
                 let span = tracing::info_span!(parent: &ps, "search", %mode, read_only,
@@ -1650,14 +1654,15 @@ async fn service_worker(
                 let _ = reply.send(result);
             }
             CmdInner::Relation { params, reply } => {
-                let action = params.action.clone();
+                let action = clip_for_log(&params.action).into_owned();
                 let hash = truncate_hash(&params.content_hash);
                 let target = params
                     .target_hash
                     .as_deref()
                     .map(truncate_hash)
                     .unwrap_or_default();
-                let rel_type = params.relation_type.clone().unwrap_or_default();
+                let rel_type =
+                    clip_for_log(params.relation_type.as_deref().unwrap_or_default()).into_owned();
                 let span = tracing::info_span!(parent: &ps, "relation", %action);
                 let result = match timeout(limits.cmd, svc.relation(params).instrument(span)).await
                 {
@@ -1746,7 +1751,7 @@ async fn service_worker(
                             op,
                             hash = h.as_str(),
                             status = r["status"].as_str().unwrap_or_default(),
-                            via = via.as_str(),
+                            via = clip_for_log(&via).as_ref(),
                             elapsed_ms = ms(start),
                             "ok"
                         );
@@ -1863,7 +1868,7 @@ async fn service_worker(
                             a = a.as_str(),
                             b = b.as_str(),
                             resolution = stamp,
-                            via = resolved_via.as_str(),
+                            via = clip_for_log(&resolved_via).as_ref(),
                             elapsed_ms = ms(start),
                             "ok"
                         );
@@ -3045,7 +3050,7 @@ fn protected_router(handle: ServiceHandle, auth_state: AuthState) -> Router {
 /// request/response events. `DefaultMakeSpan` can set the span's level but
 /// cannot drop its `uri` field, so a custom `MakeSpan` is required.
 fn request_span(req: &Request) -> tracing::Span {
-    tracing::info_span!("request", method = %req.method(), path = %req.uri().path())
+    tracing::info_span!("request", method = %req.method(), path = %clip_for_log(req.uri().path()))
 }
 
 async fn shutdown_signal() {
@@ -4956,6 +4961,45 @@ mod tests {
             "read-back after reconnect must hit the new server"
         );
     }
+
+    /// LAB-7878: the rerank call records no query text in its span. A
+    /// refused connection is enough: the span opens and closes either way.
+    #[tokio::test]
+    async fn rerank_span_carries_no_query_text() {
+        use alaya_backends::RerankingService;
+        use tracing_subscriber::fmt::format::FmtSpan;
+
+        let log = crate::testlog::LogBuf::default();
+        let _guard = crate::testlog::scoped(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_span_events(FmtSpan::CLOSE)
+                .with_writer(log.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let refused = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("free port");
+        let client = RerankClient::new(
+            format!("http://{refused}"),
+            1,
+            None,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(client.rerank("QUERY-MARKER", &["x"]).await.is_err());
+
+        let log = log.text();
+        assert!(
+            log.contains("rerank{n=1}"),
+            "positive control: no rerank span in:\n{log}"
+        );
+        assert!(
+            !log.contains("QUERY-MARKER"),
+            "query text reached the log:\n{log}"
+        );
+    }
 }
 
 /// Regression tests for #63: one stuck backend await must never wedge the
@@ -5749,11 +5793,13 @@ mod wedge_tests {
             .await;
     }
 
-    /// The hybrid search every test here sends: its keyword "flag" is the
-    /// tag `SlowSearchVectors` knows.
+    /// The query of the hybrid search every test here sends: its keyword
+    /// "flag" is the tag `SlowSearchVectors` knows.
+    const SEARCH_QUERY: &str = "flag state";
+
     fn hybrid_search(reply: oneshot::Sender<Value>) -> CmdInner {
         let params: SearchParams =
-            serde_json::from_value(json!({ "query": "flag state", "mode": "hybrid" }))
+            serde_json::from_value(json!({ "query": SEARCH_QUERY, "mode": "hybrid" }))
                 .expect("search params");
         CmdInner::Search {
             params,
@@ -5983,30 +6029,12 @@ mod wedge_tests {
         );
 
         with_slow_search_worker(WorkerLimits::default(), |tx, neighbour, _| async move {
-            let search = |reply| {
-                let params: SearchParams = serde_json::from_value(
-                    json!({ "query": "flag QUERY-MARKER", "mode": "hybrid" }),
-                )
-                .expect("search params");
-                Cmd {
-                    inner: CmdInner::Search {
-                        params,
-                        read_only: false,
-                        reply,
-                    },
-                    span: tracing::Span::none(),
-                }
-            };
             // The second search's caller leaves while the first holds the
             // gate, so it is skipped; the third runs after it.
-            let mut answers = Vec::new();
-            for _ in 0..3 {
-                let (reply, answer) = oneshot::channel();
-                tx.send(search(reply)).await.unwrap();
-                answers.push(answer);
-            }
-            drop(answers.remove(1));
-            for answer in answers {
+            let first = send_hybrid_search(&tx).await;
+            drop(send_hybrid_search(&tx).await);
+            let third = send_hybrid_search(&tx).await;
+            for answer in [first, third] {
                 let found = tokio::time::timeout(NEVER, answer)
                     .await
                     .expect("search never replied")
@@ -6032,28 +6060,49 @@ mod wedge_tests {
         .await;
 
         let log = log.text();
+        let query_len = format!("query_len={}", SEARCH_QUERY.len());
         for seen in [
-            "query_len=17",
+            query_len.as_str(),
             "caller gone before the search ran; skipped",
             "reason_len=13",
-            "memory_supersede",
         ] {
             assert!(
                 log.contains(seen),
                 "positive control: no `{seen}` in:\n{log}"
             );
         }
-        for marker in ["QUERY-MARKER", "REASON-MARKER"] {
+        for marker in [SEARCH_QUERY, "REASON-MARKER"] {
             assert!(!log.contains(marker), "`{marker}` reached the log:\n{log}");
         }
     }
 
-    /// LAB-7878: the rerank call records no query text in its span. A
-    /// refused connection is enough: the span opens and closes either way.
-    #[tokio::test]
-    async fn rerank_span_carries_no_query_text() {
-        use alaya_backends::RerankingService;
+    /// LAB-8297: a request path, a store's `client_hostname` and
+    /// `memory_type`, a search's `memory_type` and a relation `action` are
+    /// caller strings with no length limit of their own, so every span,
+    /// line and error message they reach carries a clipped copy.
+    #[tokio::test(start_paused = true)]
+    async fn caller_labels_reach_the_log_clipped() {
         use tracing_subscriber::fmt::format::FmtSpan;
+        const TAIL: &str = "LABEL-TAIL";
+        let label = format!("{}{TAIL}", "x".repeat(alaya_backends::LOG_CLIP_BYTES));
+
+        async fn ask(
+            tx: &mpsc::Sender<Cmd>,
+            inner: impl FnOnce(oneshot::Sender<Value>) -> CmdInner,
+        ) -> Value {
+            let (reply, answer) = oneshot::channel();
+            let span = tracing::Span::none();
+            tx.send(Cmd {
+                inner: inner(reply),
+                span,
+            })
+            .await
+            .unwrap();
+            tokio::time::timeout(NEVER, answer)
+                .await
+                .expect("never replied")
+                .expect("reply dropped")
+        }
 
         let log = crate::testlog::LogBuf::default();
         let _guard = crate::testlog::scoped(
@@ -6064,20 +6113,71 @@ mod wedge_tests {
                 .with_ansi(false)
                 .finish(),
         );
-        let refused = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|l| l.local_addr())
-            .expect("free port");
-        let client = RerankClient::new(format!("http://{refused}"), 1, None, NEVER).unwrap();
-        assert!(client.rerank("QUERY-MARKER", &["x"]).await.is_err());
+
+        let path = format!("/memories/{label}");
+        let req = axum::http::Request::get(path.as_str())
+            .body(axum::body::Body::empty())
+            .unwrap();
+        drop(request_span(&req).entered());
+
+        let labels = label.clone();
+        with_slow_search_worker(WorkerLimits::default(), |tx, neighbour, _| async move {
+            let params = StoreParams {
+                content: "a store with oversized labels".into(),
+                tags: None,
+                memory_type: Some(labels.clone()),
+                metadata: None,
+                client_hostname: Some(labels.clone()),
+                summary: None,
+                dedup_threshold: None,
+            };
+            let out = ask(&tx, |reply| CmdInner::Store {
+                params,
+                read_only: false,
+                reply,
+            })
+            .await;
+            assert_eq!(out["success"], true, "{out}");
+
+            let params: SearchParams = serde_json::from_value(
+                json!({ "query": SEARCH_QUERY, "mode": "hybrid", "memory_type": labels }),
+            )
+            .expect("search params");
+            let out = ask(&tx, |reply| CmdInner::Search {
+                params,
+                read_only: false,
+                reply,
+            })
+            .await;
+            assert!(out.get("error").is_none(), "{out}");
+
+            let params = RelationParams {
+                action: labels,
+                content_hash: neighbour.content_hash,
+                target_hash: None,
+                relation_type: None,
+            };
+            let out = ask(&tx, |reply| CmdInner::Relation { params, reply }).await;
+            assert_eq!(out["success"], false, "{out}");
+        })
+        .await;
 
         let log = log.text();
+        let clipped = clip_for_log(&label);
+        for seen in [
+            format!("path={}", clip_for_log(&path)),
+            format!("store{{content_len=29 mem_type={clipped}"),
+            format!("mem_type=\"{clipped}\" content_len=29"),
+            format!("client=\"{clipped}\""),
+            format!("mem_type=\"{clipped}\" elapsed_ms"),
+            format!("relation{{action={clipped}}}"),
+            format!("unknown action: {clipped}"),
+        ] {
+            assert!(log.contains(&seen), "no `{seen}` in:\n{log}");
+        }
         assert!(
-            log.contains("rerank{n=1}"),
-            "positive control: no rerank span in:\n{log}"
-        );
-        assert!(
-            !log.contains("QUERY-MARKER"),
-            "query text reached the log:\n{log}"
+            !log.contains(TAIL),
+            "a whole caller label reached the log:\n{log}"
         );
     }
 

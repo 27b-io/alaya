@@ -104,7 +104,7 @@ impl EmbeddingProvider for EmbeddingClient {
 
                 if !resp.status().is_success() {
                     let status = resp.status();
-                    let body = resp.text().await.unwrap_or_else(|_| "<unreadable>".into());
+                    let body = crate::error_body(resp).await;
                     return Err(AlayaError::Embedding(format!(
                         "embedding API returned {status}: {body}"
                     )));
