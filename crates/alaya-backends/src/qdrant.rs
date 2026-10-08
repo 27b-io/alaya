@@ -3,7 +3,7 @@
 //! All calls use raw `reqwest` HTTP to stay WASM-compatible (no qdrant-client crate).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -41,7 +41,10 @@ pub struct QdrantClient {
     write_lock: futures::lock::Mutex<()>,
     /// Serialises the access increments among themselves, so a burst of
     /// increments on one hot memory cannot spend each other's CAS retries
-    /// and drop counts (see `access_turn`).
+    /// and drop counts (see `access_turn`). In alaya-server only searches
+    /// increment, and while its `SEARCH_CONCURRENCY` is 1 they run one at a
+    /// time, so this lock is uncontended there. It matters once that value
+    /// is raised.
     access_lock: futures::lock::Mutex<()>,
     /// Random per client. With `writes`, makes every revision token unique
     /// across processes (see `stamp`).
@@ -205,7 +208,10 @@ impl QdrantClient {
     /// written; a read error aborts too. A failed write is that point's
     /// outcome alone: the rest of the batch still goes out, and the caller
     /// learns per point what landed. `commit` also decides what a point
-    /// absent from a read does.
+    /// absent from a read does. The writes go out one point at a time, in
+    /// the order of `ids` (a repeat is dropped), so a caller cut off mid-batch
+    /// keeps a prefix of its own order: a search passes its page in rank
+    /// order.
     async fn update_points(
         &self,
         ids: &[String],
@@ -220,9 +226,8 @@ impl QdrantClient {
             Commit::Payload(..) => keys.clone(),
             Commit::Upsert { .. } => Some(vec![REV, REV_LOG]),
         };
-        let mut pending: Vec<String> = ids.to_vec();
-        pending.sort();
-        pending.dedup();
+        let mut seen = HashSet::new();
+        let mut pending: Vec<String> = ids.iter().filter(|id| seen.insert(*id)).cloned().collect();
         let mut outcome = HashMap::new();
 
         for round in 0..MAX_WRITE_ATTEMPTS {
@@ -329,15 +334,26 @@ impl QdrantClient {
     /// calls: a store would wait on search I/O. Nor may it commit while a
     /// write of this client is in progress: an increment that lands inside
     /// a store's read→write window costs the store a round, and one search
-    /// after another can then take all eight. So it waits until no writer
-    /// holds `write_lock`, and lets go before its own I/O. A store therefore
-    /// loses at most one round to this client's increments: the one already
-    /// past this point when the store began. Every later increment waits for
-    /// the store to finish. The lock promises no fairness, so under a steady
-    /// run of writes an increment can wait out the run. The hybrid search
-    /// that awaits it bounds that wait (`ENRICH_BUDGET` in alaya-core) and
-    /// drops the increment past it, so the wait costs an access count, never
-    /// the search.
+    /// after another can then take all eight. So it takes `access_lock`,
+    /// waits until no writer holds `write_lock`, and releases `write_lock`
+    /// alone: the guard it returns keeps `access_lock` through its I/O.
+    ///
+    /// That held guard is what bounds a store's loss to one round: the
+    /// increment already past the gate when the store took `write_lock`.
+    /// Every later increment queues on `access_lock` before it reaches the
+    /// gate, so it waits for the store to finish. Gate first and an
+    /// increment could pass the gate, queue on `access_lock`, and commit
+    /// inside a store that began meanwhile. One exception: a search cut off
+    /// at its budget drops the guard while a write it already sent is still
+    /// in flight. That write can land after the next store has begun and
+    /// cost it one more round. It is conditional, so no count is lost or
+    /// doubled.
+    ///
+    /// The lock promises no fairness, so under a steady run of writes an
+    /// increment can wait out the run. The hybrid search that awaits it
+    /// bounds that wait at `ENRICH_BUDGET` (alaya-core) and answers without
+    /// the increment past it: the search pays up to that budget and can
+    /// lose every count on its page.
     async fn access_turn(&self) -> futures::lock::MutexGuard<'_, ()> {
         let turn = self.access_lock.lock().await;
         drop(self.write_lock.lock().await);
@@ -535,7 +551,7 @@ enum Batch {
     /// back `Skipped`). For writes that name the memories they change — a
     /// supersession, a patch.
     Strict,
-    /// An absent point is skipped. For fire-and-forget writes (access counts).
+    /// An absent point is skipped. For non-fatal writes (access counts).
     BestEffort,
 }
 

@@ -369,8 +369,8 @@ async fn batch_update_with_an_absent_memory_writes_nothing() {
     }
 }
 
-/// Access counts are fire-and-forget: one point's failed write is that
-/// point's loss alone, and the rest of the batch is still counted.
+/// Access counts are non-fatal: one point's failed write is that point's
+/// loss alone, and the rest of the batch is still counted.
 #[tokio::test]
 async fn batch_access_increment_survives_one_failed_write() {
     let (server, fake) = fake_with(&[('a', Some("r1")), ('b', None), ('c', Some("r3"))]).await;
@@ -387,7 +387,7 @@ async fn batch_access_increment_survives_one_failed_write() {
     client_for(&server)
         .increment_access_count_batch(&[hash('a').as_str(), hash('b').as_str(), hash('c').as_str()])
         .await
-        .expect("fire-and-forget: a failed point is logged, not returned");
+        .expect("non-fatal: a failed point is logged, not returned");
     assert_eq!(fake.point(&id('a')).unwrap()["access_count"], json!(3));
     assert_eq!(
         fake.point(&id('b')).unwrap()["access_count"],
@@ -395,6 +395,39 @@ async fn batch_access_increment_survives_one_failed_write() {
         "its write failed"
     );
     assert_eq!(fake.point(&id('c')).unwrap()["access_count"], json!(3));
+}
+
+/// The access writes go out in the order the caller passed the hashes, a
+/// repeat dropped, not in point-id order. A search passes its
+/// page in rank order, so a budget that cuts the batch off keeps the top of
+/// the page, not the lowest point ids.
+#[tokio::test]
+async fn batch_access_increment_writes_in_caller_order() {
+    let (server, fake) = fake_with(&[('a', Some("r1")), ('b', None), ('c', Some("r3"))]).await;
+
+    client_for(&server)
+        .increment_access_count_batch(&[
+            hash('c').as_str(),
+            hash('a').as_str(),
+            hash('c').as_str(),
+            hash('b').as_str(),
+        ])
+        .await
+        .expect("batch increment succeeds");
+
+    let order: Vec<Value> = writes(&server)
+        .await
+        .into_iter()
+        .map(|(_, body)| body["filter"]["must"][0]["has_id"][0].clone())
+        .collect();
+    assert_eq!(order, [json!(id('c')), json!(id('a')), json!(id('b'))]);
+    for c in ['a', 'b', 'c'] {
+        assert_eq!(
+            fake.point(&id(c)).unwrap()["access_count"],
+            json!(3),
+            "{c} counted once"
+        );
+    }
 }
 
 /// Writes are atomic per memory, not per batch: one point's failed write does

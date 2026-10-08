@@ -945,21 +945,54 @@ async fn one_clients_access_increments_wait_for_each_other() {
     assert_eq!(stored["access_timestamps"].as_array().unwrap().len(), 4);
 }
 
-/// Answers every full-payload read 100 ms late, counting them. Only a store's
-/// carry-over read asks for the whole payload: an increment reads its keys,
-/// and every read-back reads the revision keys.
-struct SlowFullRead {
+/// Answers each read it matches `delay` late, counting them.
+struct SlowRead {
     fake: FakeQdrant,
     reads: Arc<AtomicUsize>,
+    delay: Duration,
 }
 
-impl Respond for SlowFullRead {
+impl Respond for SlowRead {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         self.reads.fetch_add(1, Ordering::SeqCst);
-        self.fake
-            .respond(request)
-            .set_delay(Duration::from_millis(100))
+        self.fake.respond(request).set_delay(self.delay)
     }
+}
+
+/// Answer every read whose body `which` matches `delay` late; returns how
+/// many arrived.
+async fn slow_reads(
+    server: &MockServer,
+    fake: &FakeQdrant,
+    delay: Duration,
+    which: fn(&Value) -> bool,
+) -> Arc<AtomicUsize> {
+    let reads = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path(POINTS_PATH))
+        .and(move |r: &Request| r.body_json::<Value>().is_ok_and(|b| which(&b)))
+        .respond_with(SlowRead {
+            fake: fake.clone(),
+            reads: reads.clone(),
+            delay,
+        })
+        .with_priority(1)
+        .mount(server)
+        .await;
+    reads
+}
+
+/// A store's carry-over read: the only read that asks for the whole payload.
+/// Every read-back reads keys.
+fn store_read(body: &Value) -> bool {
+    body["with_payload"] == json!(true)
+}
+
+/// An increment's read, and its read-back: both ask for the access keys.
+fn increment_read(body: &Value) -> bool {
+    body["with_payload"]
+        .as_array()
+        .is_some_and(|keys| keys.contains(&json!("access_count")))
 }
 
 /// Serial search-time increments cannot starve a store of its retries
@@ -972,20 +1005,7 @@ impl Respond for SlowFullRead {
 #[tokio::test]
 async fn serial_access_increments_cannot_starve_a_store() {
     let (server, fake) = fake_with(Some(existing_payload())).await;
-    let store_reads = Arc::new(AtomicUsize::new(0));
-    Mock::given(method("POST"))
-        .and(path(POINTS_PATH))
-        .and(|r: &Request| {
-            r.body_json::<Value>()
-                .is_ok_and(|b| b["with_payload"] == json!(true))
-        })
-        .respond_with(SlowFullRead {
-            fake: fake.clone(),
-            reads: store_reads.clone(),
-        })
-        .with_priority(1)
-        .mount(&server)
-        .await;
+    let store_reads = slow_reads(&server, &fake, Duration::from_millis(100), store_read).await;
     let client = client_for(&server);
     let hash = hash();
     let hashes = [hash.as_str()];
@@ -1017,6 +1037,10 @@ async fn serial_access_increments_cannot_starve_a_store() {
     );
     stored.expect("the store lands");
 
+    assert!(
+        increments >= 1,
+        "no increment started inside the store's window: the test proved nothing"
+    );
     assert_eq!(
         store_reads.load(Ordering::SeqCst),
         1,
@@ -1027,6 +1051,60 @@ async fn serial_access_increments_cannot_starve_a_store() {
     assert_eq!(
         stored["access_count"],
         json!(5 + increments),
+        "every increment landed too"
+    );
+}
+
+/// The one round a store can lose to increments is the one already past the
+/// gate (`access_turn`). I1 is parked on its read, past the gate,
+/// holding `access_lock`. I2 to I8 queue behind it before the store takes
+/// `write_lock`. I1 commits inside the store's first read→write window and
+/// costs it that round. The rest queue on `access_lock` first, so none of
+/// them can reach the gate until the store is done, and its second round
+/// lands. Take the gate before `access_lock` and I2 to I8 would pass it
+/// while `write_lock` was free, then commit one per window and exhaust the
+/// store's eight rounds. The delays space the commits so that each window
+/// would hold one: an increment reads and reads back 100 ms late, a store
+/// reads 200 ms late.
+#[tokio::test]
+async fn store_loses_at_most_one_round_to_queued_increments() {
+    let (server, fake) = fake_with(Some(existing_payload())).await;
+    let store_reads = slow_reads(&server, &fake, Duration::from_millis(200), store_read).await;
+    slow_reads(&server, &fake, Duration::from_millis(100), increment_read).await;
+    let client = client_for(&server);
+    let hash = hash();
+    let hashes = [hash.as_str()];
+    let mem = incoming();
+
+    let (first, (queued, stored)) = tokio::join!(
+        client.increment_access_count_batch(&hashes),
+        once_first_read_arrived(&server, async {
+            // join! polls in order: the queued increments reach
+            // `access_turn` before the store takes `write_lock`.
+            tokio::join!(
+                futures::future::join_all(
+                    (2..=8).map(|_| client.increment_access_count_batch(&hashes))
+                ),
+                client.store(&mem, StoreMode::Upsert)
+            )
+        })
+    );
+
+    assert_eq!(
+        store_reads.load(Ordering::SeqCst),
+        2,
+        "the store must lose exactly one round: I1's"
+    );
+    stored.expect("the store lands");
+    first.expect("I1 succeeds");
+    for q in queued {
+        q.expect("a queued increment succeeds");
+    }
+    let stored = fake.point(ID).unwrap();
+    assert_eq!(stored["tags"], json!(["new-tag"]), "the store landed");
+    assert_eq!(
+        stored["access_count"],
+        json!(5 + 8),
         "every increment landed too"
     );
 }

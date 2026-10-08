@@ -253,7 +253,7 @@ curl -X POST http://localhost:3001/search \
   -d '{"query":"why did we switch package managers?","mode":"hybrid","page_size":5}'
 ```
 
-`read_only` (REST only, optional boolean, default `false`) makes the search a pure read. A hybrid search normally records that it was read: each returned memory's `access_count` goes up by one, and consecutive hits are queued for Hebbian co-access strengthening, so the search changes future ranking. With `"read_only": true` it does neither, and each result reports its stored `access_count`. The flag can only narrow: a principal that is already read-only (the read-only bearer, or an OIDC bearer) never writes, whatever the flag says. The other modes never write. A non-boolean value is a `422`.
+`read_only` (REST only, optional boolean, default `false`) makes the search a pure read. A hybrid search normally records that it was read: each returned memory's `access_count` goes up by one, and consecutive hits are queued for Hebbian co-access strengthening, so the search changes future ranking. Those writes get 2 s; past that the search answers without waiting for them. If the access-count writes had not finished by then, each result reports its stored `access_count`, since the increment may not have been recorded. With `"read_only": true` it does neither, and each result reports its stored `access_count`. The flag can only narrow: a principal that is already read-only (the read-only bearer, or an OIDC bearer) never writes, whatever the flag says. The other modes never write. A non-boolean value is a `422`.
 
 `min_trust_score` (optional number) keeps only memories whose stored `provenance.trust_score` is at least this value; a memory with no stored trust score is dropped. It applies to `hybrid` (every candidate pool, before fusion) and `similar` mode, and the other modes ignore it.
 
@@ -593,7 +593,7 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" http://localhost:3001/stats
   "pod": {
     "name": "alaya-server-7d9f",
     "started_at": 1790990000,
-    "failures": {"embedding": 3, "rerank": 11, "store": 2},
+    "failures": {"embedding": 3, "rerank": 11, "store": 2, "enrich_overrun": 0},
     "selfcheck": {
       "enabled": true,
       "consecutive_failures": 0,
@@ -635,6 +635,7 @@ the counts, and with several replicas each call shows the pod that answered.
 | `failures.embedding` | Embedding calls that failed. Cache hits are not calls and never count. |
 | `failures.rerank` | Hybrid searches whose rerank errored, timed out or returned the wrong number of scores, and so served RRF order. The search itself succeeded. |
 | `failures.store` | Stores that failed on a backend or hit the command deadline. A request refused as invalid (`Invalid request parameters`) is not counted. |
+| `failures.enrich_overrun` | Hybrid searches whose access-count bump or Hebbian co-access enqueue was still unfinished at the 2 s budget, so the search answered without it. The search itself succeeded. When the bump was the unfinished side, some access counts on its page may not be recorded, and its results report the counts as stored before the bump. |
 | `selfcheck.enabled` | Whether `SELFCHECK_QUERY` and `SELFCHECK_EXPECT_HASH` are set. |
 | `selfcheck.consecutive_failures` | Failed checks since the last pass. |
 | `selfcheck.last` | The latest check, or `null` before the first. `at` is Unix seconds; `ok`; `failing_step` is `null` on a pass, else one of the steps below; `error` is the failure detail; `rerank` is `ran`, `fell_back`, `no_candidates`, `not_configured`, or `null` when the search never finished; `elapsed_ms` covers the whole check. |
