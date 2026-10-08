@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::Instrument;
 
 use alaya_backends::judge::sanitize_reason;
 use alaya_backends::{ContradictionJudge, Judgement, Survivor};
@@ -491,10 +492,10 @@ impl MemoryService {
 
         // Generate embedding
         let embedding = {
-            let _span = tracing::info_span!("embed").entered();
             let embeddings = self
                 .embeddings
                 .embed_batch(&[params.content.as_str()], PromptName::Passage)
+                .instrument(tracing::info_span!("embed"))
                 .await?;
             embeddings.into_iter().next().ok_or_else(|| {
                 AlayaError::Embedding("embedding service returned empty result".into())
@@ -925,8 +926,12 @@ impl MemoryService {
 
         // Stage 1: Fan-out — embed starts immediately (no tag dependency),
         // tags→keywords→tag_search chains as a concurrent branch.
-        let (embed_result, mut tag_results, corpus_size, n_keywords) = {
-            let _span = tracing::info_span!("fan_out").entered();
+        //
+        // Each stage span is attached to the stage's future, never entered
+        // around an await: an entered span stays entered on the thread while
+        // the search is parked, so a task the LocalSet polls meanwhile (an
+        // inline store) would log inside it.
+        let (embed_result, mut tag_results, corpus_size, n_keywords) = async {
             let _stage = stages.stage(Stage::FanOut);
             let query_texts = [params.query.as_str()];
             let embed_fut = stages.time(
@@ -935,7 +940,6 @@ impl MemoryService {
             );
 
             let tag_search_fut = async {
-                let _span = tracing::info_span!("get_all_tags").entered();
                 let all_tags = stages
                     .time(Stage::Tags, async {
                         let cached = self.tag_cache.borrow().clone();
@@ -953,8 +957,8 @@ impl MemoryService {
                             fresh
                         }
                     })
+                    .instrument(tracing::info_span!("get_all_tags"))
                     .await;
-                drop(_span);
 
                 let tag_set: std::collections::HashSet<String> = all_tags.into_iter().collect();
                 let keywords = hybrid_search::extract_query_keywords(&params.query, Some(&tag_set));
@@ -983,7 +987,9 @@ impl MemoryService {
 
             let (embed, (tags, n_kw), count) = futures::join!(embed_fut, tag_search_fut, count_fut);
             (embed, tags, count, n_kw)
-        };
+        }
+        .instrument(tracing::info_span!("fan_out"))
+        .await;
 
         let query_embedding = embed_result?
             .into_iter()
@@ -1000,8 +1006,7 @@ impl MemoryService {
         // Stage 2: Vector search + semantic tag pipeline run concurrently.
         // search_similar_tags→search_by_tags chains inside one branch so the
         // 44-64ms semantic search overlaps with search_by_vector.
-        let (mut vector_results, semantic_tag_results) = {
-            let _span = tracing::info_span!("vector_search").entered();
+        let (vector_result, semantic_tag_results) = async {
             let _stage = stages.stage(Stage::VectorSearch);
             let vector_fut =
                 self.vectors
@@ -1029,9 +1034,11 @@ impl MemoryService {
                     .unwrap_or_default()
             };
 
-            let (vector_result, semantic) = futures::join!(vector_fut, semantic_pipeline_fut);
-            (vector_result?, semantic)
-        };
+            futures::join!(vector_fut, semantic_pipeline_fut)
+        }
+        .instrument(tracing::info_span!("vector_search"))
+        .await;
+        let mut vector_results = vector_result?;
 
         // Merge semantic tag matches into the keyword tag pool (deduplicated)
         if !semantic_tag_results.is_empty() {
@@ -1102,22 +1109,25 @@ impl MemoryService {
         let (spreading, hebbian_boosts) = if !self.ranking.graph {
             (HashMap::new(), HashMap::new())
         } else {
-            let _span = tracing::info_span!("graph_boost").entered();
-            let _stage = stages.stage(Stage::GraphBoost);
-            let result_hashes: Vec<&str> =
-                fused.iter().take(20).map(|(h, _, _)| h.as_str()).collect();
+            async {
+                let _stage = stages.stage(Stage::GraphBoost);
+                let result_hashes: Vec<&str> =
+                    fused.iter().take(20).map(|(h, _, _)| h.as_str()).collect();
 
-            let spreading_fut = self.graph.spreading_activation(
-                &result_hashes[..std::cmp::min(5, result_hashes.len())],
-                2,
-                0.5,
-                0.05,
-                50,
-            );
-            let hebbian_fut = self.graph.hebbian_boosts_within(&result_hashes);
+                let spreading_fut = self.graph.spreading_activation(
+                    &result_hashes[..std::cmp::min(5, result_hashes.len())],
+                    2,
+                    0.5,
+                    0.05,
+                    50,
+                );
+                let hebbian_fut = self.graph.hebbian_boosts_within(&result_hashes);
 
-            let (s, h) = futures::join!(spreading_fut, hebbian_fut);
-            (s.unwrap_or_default(), h.unwrap_or_default())
+                let (s, h) = futures::join!(spreading_fut, hebbian_fut);
+                (s.unwrap_or_default(), h.unwrap_or_default())
+            }
+            .instrument(tracing::info_span!("graph_boost"))
+            .await
         };
 
         // Stage 4b: Graph injection — activated neighbors that are NOT already
@@ -1125,65 +1135,70 @@ impl MemoryService {
         // candidate pool. This lets Hebbian-connected memories surface even
         // when their cosine similarity to the query is low.
         let injected_neighbors: Vec<ScoredMemory> = if !spreading.is_empty() {
-            let _span = tracing::info_span!("graph_inject").entered();
-            let _stage = stages.stage(Stage::GraphInject);
-            let fused_hashes: std::collections::HashSet<&str> =
-                fused.iter().map(|(h, _, _)| h.as_str()).collect();
+            async {
+                let _stage = stages.stage(Stage::GraphInject);
+                let fused_hashes: std::collections::HashSet<&str> =
+                    fused.iter().map(|(h, _, _)| h.as_str()).collect();
 
-            // Activated neighbors not already in results, strongest first.
-            // All are fetched (spreading_activation returns at most 50) so
-            // the top-10 cap counts only neighbours `admits` keeps: a
-            // wrong-type or superseded one must not take a weaker one's slot.
-            let mut inject_candidates: Vec<(&str, f64)> = spreading
-                .iter()
-                .filter(|(h, _)| !fused_hashes.contains(h.as_str()))
-                .map(|(h, s)| (h.as_str(), *s))
-                .collect();
-            inject_candidates
-                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-            if inject_candidates.is_empty() {
-                Vec::new()
-            } else {
-                let neighbor_hashes: Vec<&str> =
-                    inject_candidates.iter().map(|(h, _)| *h).collect();
-
-                // Use the minimum existing display score as a floor so
-                // injected memories don't get filtered by min_similarity.
-                let min_existing = fused
+                // Activated neighbors not already in results, strongest first.
+                // All are fetched (spreading_activation returns at most 50) so
+                // the top-10 cap counts only neighbours `admits` keeps: a
+                // wrong-type or superseded one must not take a weaker one's slot.
+                let mut inject_candidates: Vec<(&str, f64)> = spreading
                     .iter()
-                    .map(|(_, _, s)| *s)
-                    .fold(f64::INFINITY, f64::min)
-                    .max(0.1);
+                    .filter(|(h, _)| !fused_hashes.contains(h.as_str()))
+                    .map(|(h, s)| (h.as_str(), *s))
+                    .collect();
+                inject_candidates
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-                match self.vectors.get_batch(&neighbor_hashes).await {
-                    Ok(memories) => {
-                        let mut fetched: HashMap<String, Memory> = memories
-                            .into_iter()
-                            .map(|m| (m.content_hash.clone(), m))
-                            .collect();
-                        let result: Vec<ScoredMemory> = inject_candidates
-                            .iter()
-                            .filter_map(|(h, activation)| Some((fetched.remove(*h)?, *activation)))
-                            .filter(|(mem, _)| admits(mem))
-                            .take(10)
-                            .map(|(memory, activation)| ScoredMemory {
-                                memory,
-                                score: min_existing.max(activation),
-                            })
-                            .collect();
-                        tracing::debug!(
-                            injected = result.len(),
-                            "graph injection: added neighbors from spreading activation"
-                        );
-                        result
-                    }
-                    Err(e) => {
-                        tracing::warn!("graph injection fetch failed (non-fatal): {e}");
-                        Vec::new()
+                if inject_candidates.is_empty() {
+                    Vec::new()
+                } else {
+                    let neighbor_hashes: Vec<&str> =
+                        inject_candidates.iter().map(|(h, _)| *h).collect();
+
+                    // Use the minimum existing display score as a floor so
+                    // injected memories don't get filtered by min_similarity.
+                    let min_existing = fused
+                        .iter()
+                        .map(|(_, _, s)| *s)
+                        .fold(f64::INFINITY, f64::min)
+                        .max(0.1);
+
+                    match self.vectors.get_batch(&neighbor_hashes).await {
+                        Ok(memories) => {
+                            let mut fetched: HashMap<String, Memory> = memories
+                                .into_iter()
+                                .map(|m| (m.content_hash.clone(), m))
+                                .collect();
+                            let result: Vec<ScoredMemory> = inject_candidates
+                                .iter()
+                                .filter_map(|(h, activation)| {
+                                    Some((fetched.remove(*h)?, *activation))
+                                })
+                                .filter(|(mem, _)| admits(mem))
+                                .take(10)
+                                .map(|(memory, activation)| ScoredMemory {
+                                    memory,
+                                    score: min_existing.max(activation),
+                                })
+                                .collect();
+                            tracing::debug!(
+                                injected = result.len(),
+                                "graph injection: added neighbors from spreading activation"
+                            );
+                            result
+                        }
+                        Err(e) => {
+                            tracing::warn!("graph injection fetch failed (non-fatal): {e}");
+                            Vec::new()
+                        }
                     }
                 }
             }
+            .instrument(tracing::info_span!("graph_inject"))
+            .await
         } else {
             Vec::new()
         };
@@ -1212,84 +1227,88 @@ impl MemoryService {
             let Some(reranker) = self.reranker.as_ref() else {
                 break 'rerank (HashMap::new(), Rerank::NotConfigured);
             };
-            let _span = tracing::info_span!("rerank", top_n = reranker.top_n()).entered();
-            let _stage = stages.stage(Stage::Rerank);
-            let top_n = reranker.top_n().min(fused.len());
-            if top_n == 0 {
-                break 'rerank (HashMap::new(), Rerank::NoCandidates);
+            // A `return` in this block ends the rerank stage, not the search.
+            async {
+                let _stage = stages.stage(Stage::Rerank);
+                let top_n = reranker.top_n().min(fused.len());
+                if top_n == 0 {
+                    return (HashMap::new(), Rerank::NoCandidates);
+                }
+
+                let candidate_contents: Vec<&str> = fused
+                    .iter()
+                    .take(top_n)
+                    .map(|(hash, _, _)| {
+                        memory_map
+                            .get(hash)
+                            .map(|sm| sm.memory.content.as_str())
+                            .unwrap_or("")
+                    })
+                    .collect();
+
+                let budget = reranker.timeout();
+                let started = std::time::Instant::now();
+                let outcome =
+                    with_budget(budget, reranker.rerank(&params.query, &candidate_contents)).await;
+                let elapsed = started.elapsed();
+                let scores = match outcome {
+                    Some(Ok(s)) if s.len() == top_n => s,
+                    Some(Ok(s)) => {
+                        tracing::warn!(
+                            got = s.len(),
+                            expected = top_n,
+                            "rerank score count mismatch; skipping rerank"
+                        );
+                        self.vitals.rerank_failed();
+                        return (HashMap::new(), Rerank::FellBack("score count mismatch"));
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!(
+                            error = %e,
+                            budget_ms = budget.as_millis() as u64,
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            "rerank failed (non-fatal); using RRF order"
+                        );
+                        self.vitals.rerank_failed();
+                        return (HashMap::new(), Rerank::FellBack("error"));
+                    }
+                    None => {
+                        tracing::warn!(
+                            budget_ms = budget.as_millis() as u64,
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            "rerank timed out (non-fatal); using RRF order"
+                        );
+                        self.vitals.rerank_failed();
+                        return (HashMap::new(), Rerank::FellBack("timed out"));
+                    }
+                };
+
+                // Reorder the top-N slice of fused by rerank score desc, then
+                // splice it back to the front of `fused`.
+                let mut top_with_scores: Vec<((String, f64, f64), f64)> = fused
+                    .drain(..top_n)
+                    .zip(scores.iter().copied())
+                    .map(|(entry, s)| (entry, s as f64))
+                    .collect();
+                top_with_scores
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let map: HashMap<String, f64> = top_with_scores
+                    .iter()
+                    .map(|(entry, s)| (entry.0.clone(), *s))
+                    .collect();
+                let reordered: Vec<(String, f64, f64)> =
+                    top_with_scores.into_iter().map(|(e, _)| e).collect();
+                let mut new_fused = reordered;
+                new_fused.append(&mut fused);
+                fused = new_fused;
+                tracing::debug!(
+                    reranked = map.len(),
+                    "cross-encoder rerank reordered top-N candidates"
+                );
+                (map, Rerank::Ran)
             }
-
-            let candidate_contents: Vec<&str> = fused
-                .iter()
-                .take(top_n)
-                .map(|(hash, _, _)| {
-                    memory_map
-                        .get(hash)
-                        .map(|sm| sm.memory.content.as_str())
-                        .unwrap_or("")
-                })
-                .collect();
-
-            let budget = reranker.timeout();
-            let started = std::time::Instant::now();
-            let outcome =
-                with_budget(budget, reranker.rerank(&params.query, &candidate_contents)).await;
-            let elapsed = started.elapsed();
-            let scores = match outcome {
-                Some(Ok(s)) if s.len() == top_n => s,
-                Some(Ok(s)) => {
-                    tracing::warn!(
-                        got = s.len(),
-                        expected = top_n,
-                        "rerank score count mismatch; skipping rerank"
-                    );
-                    self.vitals.rerank_failed();
-                    break 'rerank (HashMap::new(), Rerank::FellBack("score count mismatch"));
-                }
-                Some(Err(e)) => {
-                    tracing::warn!(
-                        error = %e,
-                        budget_ms = budget.as_millis() as u64,
-                        elapsed_ms = elapsed.as_millis() as u64,
-                        "rerank failed (non-fatal); using RRF order"
-                    );
-                    self.vitals.rerank_failed();
-                    break 'rerank (HashMap::new(), Rerank::FellBack("error"));
-                }
-                None => {
-                    tracing::warn!(
-                        budget_ms = budget.as_millis() as u64,
-                        elapsed_ms = elapsed.as_millis() as u64,
-                        "rerank timed out (non-fatal); using RRF order"
-                    );
-                    self.vitals.rerank_failed();
-                    break 'rerank (HashMap::new(), Rerank::FellBack("timed out"));
-                }
-            };
-
-            // Reorder the top-N slice of fused by rerank score desc, then
-            // splice it back to the front of `fused`.
-            let mut top_with_scores: Vec<((String, f64, f64), f64)> = fused
-                .drain(..top_n)
-                .zip(scores.iter().copied())
-                .map(|(entry, s)| (entry, s as f64))
-                .collect();
-            top_with_scores
-                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let map: HashMap<String, f64> = top_with_scores
-                .iter()
-                .map(|(entry, s)| (entry.0.clone(), *s))
-                .collect();
-            let reordered: Vec<(String, f64, f64)> =
-                top_with_scores.into_iter().map(|(e, _)| e).collect();
-            let mut new_fused = reordered;
-            new_fused.append(&mut fused);
-            fused = new_fused;
-            tracing::debug!(
-                reranked = map.len(),
-                "cross-encoder rerank reordered top-N candidates"
-            );
-            (map, Rerank::Ran)
+            .instrument(tracing::info_span!("rerank", top_n = reranker.top_n()))
+            .await
         };
 
         // Normalize RRF scores to [0, 1] for blending with display_score (cosine).
@@ -1440,56 +1459,59 @@ impl MemoryService {
         let mut bumped = false;
 
         if !read_only {
-            let _span = tracing::info_span!("enrich", results = page_hashes.len()).entered();
-            let _stage = stages.stage(Stage::Enrich);
-            // Each side records that it finished, so an overrun can say which
-            // one it was still waiting on.
-            let access_done = std::cell::Cell::new(false);
-            let hebbian_done = std::cell::Cell::new(false);
-            let access_fut = async {
-                // Non-fatal: the implementations return Ok past a failed write
-                // (QdrantClient logs it).
-                let _ = self
-                    .vectors
-                    .increment_access_count_batch(&page_hashes)
-                    .await;
-                access_done.set(true);
-            };
+            bumped = async {
+                let _stage = stages.stage(Stage::Enrich);
+                // Each side records that it finished, so an overrun can say which
+                // one it was still waiting on.
+                let access_done = std::cell::Cell::new(false);
+                let hebbian_done = std::cell::Cell::new(false);
+                let access_fut = async {
+                    // Non-fatal: the implementations return Ok past a failed write
+                    // (QdrantClient logs it).
+                    let _ = self
+                        .vectors
+                        .increment_access_count_batch(&page_hashes)
+                        .await;
+                    access_done.set(true);
+                };
 
-            let hebbian_enqueue_fut = async {
-                if page_hashes.len() >= 2 {
-                    let pairs: Vec<CoAccessPair> = page_hashes
-                        .windows(2)
-                        .map(|w| CoAccessPair {
-                            src: w[0].to_string(),
-                            dst: w[1].to_string(),
-                            spacing_quality: 0.5,
-                            timestamp: now,
-                        })
-                        .collect();
-                    let _ = self.hebbian.enqueue_strengthen(&pairs).await;
+                let hebbian_enqueue_fut = async {
+                    if page_hashes.len() >= 2 {
+                        let pairs: Vec<CoAccessPair> = page_hashes
+                            .windows(2)
+                            .map(|w| CoAccessPair {
+                                src: w[0].to_string(),
+                                dst: w[1].to_string(),
+                                spacing_quality: 0.5,
+                                timestamp: now,
+                            })
+                            .collect();
+                        let _ = self.hebbian.enqueue_strengthen(&pairs).await;
+                    }
+                    hebbian_done.set(true);
+                };
+
+                // Bounded: the results are built and these are ranking input. Past
+                // the budget they are dropped mid-flight. Each access write is
+                // conditional and covers one point, so a cut-off bump lands whole
+                // or not at all per point, not per batch: some results on the page
+                // can be counted and others not.
+                let side_effects = async { futures::join!(access_fut, hebbian_enqueue_fut) };
+                if with_budget(ENRICH_BUDGET, side_effects).await.is_none() {
+                    self.vitals.enrich_overrun();
+                    tracing::warn!(
+                        results = page_hashes.len(),
+                        budget_ms = ENRICH_BUDGET.as_millis() as u64,
+                        access_done = access_done.get(),
+                        hebbian_done = hebbian_done.get(),
+                        "search side-effect writes ran past their budget; \
+                         the side not done may not be recorded"
+                    );
                 }
-                hebbian_done.set(true);
-            };
-
-            // Bounded: the results are built and these are ranking input. Past
-            // the budget they are dropped mid-flight. Each access write is
-            // conditional and covers one point, so a cut-off bump lands whole
-            // or not at all per point, not per batch: some results on the page
-            // can be counted and others not.
-            let side_effects = async { futures::join!(access_fut, hebbian_enqueue_fut) };
-            if with_budget(ENRICH_BUDGET, side_effects).await.is_none() {
-                self.vitals.enrich_overrun();
-                tracing::warn!(
-                    results = page_hashes.len(),
-                    budget_ms = ENRICH_BUDGET.as_millis() as u64,
-                    access_done = access_done.get(),
-                    hebbian_done = hebbian_done.get(),
-                    "search side-effect writes ran past their budget; \
-                     the side not done may not be recorded"
-                );
+                access_done.get()
             }
-            bumped = access_done.get();
+            .instrument(tracing::info_span!("enrich", results = page_hashes.len()))
+            .await;
         }
 
         // Stage 7: Format response
@@ -3322,6 +3344,36 @@ mod tests {
     };
     use async_trait::async_trait;
 
+    use tokio::sync::oneshot;
+
+    /// A suspension point the test controls. The first `park` signals that it
+    /// was reached, waits for the release, then logs `released` from wherever
+    /// it parked; later calls pass straight through.
+    #[derive(Default)]
+    struct Gate(RefCell<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>);
+
+    impl Gate {
+        /// The gate, plus the test's ends: `reached` and `release`.
+        fn armed() -> (Self, oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (reached_tx, reached) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel();
+            (
+                Self(RefCell::new(Some((reached_tx, release_rx)))),
+                reached,
+                release,
+            )
+        }
+
+        async fn park(&self) {
+            let armed = self.0.borrow_mut().take();
+            if let Some((reached, release)) = armed {
+                let _ = reached.send(());
+                let _ = release.await;
+                tracing::info!("released");
+            }
+        }
+    }
+
     /// Mock VectorStorage that counts `get_all_tags` calls.
     struct MockVectors {
         get_all_tags_calls: Rc<Cell<usize>>,
@@ -3330,6 +3382,8 @@ mod tests {
         found: Vec<Memory>,
         /// The batch access increment never finishes.
         stuck_access: bool,
+        /// Vector search parks here before it answers.
+        search_gate: Gate,
     }
 
     impl MockVectors {
@@ -3339,6 +3393,7 @@ mod tests {
                 tags,
                 found: vec![],
                 stuck_access: false,
+                search_gate: Gate::default(),
             }
         }
 
@@ -3403,6 +3458,7 @@ mod tests {
             unimplemented!()
         }
         async fn store(&self, _m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
+            tracing::info!("stored");
             Ok((true, "mock".into()))
         }
         async fn get_by_hash(&self, _h: &str) -> Result<Option<Memory>> {
@@ -3434,6 +3490,7 @@ mod tests {
             _l: usize,
             _f: Option<PayloadFilter>,
         ) -> Result<Vec<ScoredMemory>> {
+            self.search_gate.park().await;
             Ok(self
                 .found
                 .iter()
@@ -8424,18 +8481,61 @@ mod tests {
     static KEEPALIVE: std::sync::LazyLock<tracing::Dispatch> =
         std::sync::LazyLock::new(|| tracing::Dispatch::new(tracing_subscriber::registry()));
 
-    /// Runs `fut` and returns what it logged on `target`. Only the polling
-    /// thread is captured, and only while `fut` is being polled.
+    /// Runs `fut` with `layer` as the subscriber. Only the polling thread is
+    /// captured, and only while `fut` is being polled.
+    async fn with_layer<T>(
+        layer: impl tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
+        fut: impl std::future::Future<Output = T>,
+    ) -> T {
+        std::sync::LazyLock::force(&KEEPALIVE);
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
+        fut.with_subscriber(dispatch).await
+    }
+
+    /// Runs `fut` and returns what it logged on `target`.
     async fn captured<T>(
         target: &'static str,
         fut: impl std::future::Future<Output = T>,
     ) -> (T, Vec<HashMap<String, String>>) {
-        std::sync::LazyLock::force(&KEEPALIVE);
         let events = Arc::new(Mutex::new(Vec::new()));
-        let capture = tracing::Dispatch::new(
-            tracing_subscriber::registry().with(Capture(target, events.clone())),
-        );
-        let out = fut.with_subscriber(capture).await;
+        let out = with_layer(Capture(target, events.clone()), fut).await;
+        let collected = events.lock().unwrap().clone();
+        (out, collected)
+    }
+
+    /// An event's message and the names of the spans it was recorded in,
+    /// innermost first.
+    type ScopedEvent = (String, Vec<String>);
+
+    /// Collects every event, on any target, as a `ScopedEvent`.
+    struct Scopes(Arc<Mutex<Vec<ScopedEvent>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for Scopes
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = HashMap::new();
+            event.record(&mut Fields(&mut fields));
+            let spans = ctx
+                .event_scope(event)
+                .into_iter()
+                .flatten()
+                .map(|span| span.name().to_string())
+                .collect();
+            let message = fields.remove("message").unwrap_or_default();
+            self.0.lock().unwrap().push((message, spans));
+        }
+    }
+
+    /// Runs `fut` and returns every event it logged, with its span scope.
+    async fn scoped<T>(fut: impl std::future::Future<Output = T>) -> (T, Vec<ScopedEvent>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let out = with_layer(Scopes(events.clone()), fut).await;
         let collected = events.lock().unwrap().clone();
         (out, collected)
     }
@@ -8625,6 +8725,118 @@ mod tests {
                 "total_ms",
             ]
         );
+    }
+
+    // ─── Span scope across interleaved tasks (LAB-7851) ─────────────────
+
+    /// Embeds like `MockEmbeddings`, but a store's passage embed first parks
+    /// on the gate.
+    struct ParkingEmbeddings(Gate);
+
+    #[async_trait(?Send)]
+    impl EmbeddingProvider for ParkingEmbeddings {
+        async fn embed_batch(&self, texts: &[&str], prompt: PromptName) -> Result<Vec<Vec<f32>>> {
+            if matches!(prompt, PromptName::Passage) {
+                self.0.park().await;
+            }
+            MockEmbeddings.embed_batch(texts, prompt).await
+        }
+        fn dimensions(&self) -> usize {
+            1024
+        }
+        fn model_name(&self) -> &str {
+            "parking"
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            MockEmbeddings.health().await
+        }
+    }
+
+    fn shared_service(
+        vectors: MockVectors,
+        embeddings: impl EmbeddingProvider + 'static,
+    ) -> Rc<MemoryService> {
+        Rc::new(MemoryService::new(
+            Box::new(vectors),
+            Box::new(embeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        ))
+    }
+
+    /// The span scope, innermost first, of each event logged with `message`.
+    fn scopes_of<'a>(events: &'a [ScopedEvent], message: &str) -> Vec<Vec<&'a str>> {
+        events
+            .iter()
+            .filter(|(m, _)| m == message)
+            .map(|(_, spans)| spans.iter().map(String::as_str).collect())
+            .collect()
+    }
+
+    /// A search parked in a stage must not lend that stage's span to what the
+    /// LocalSet polls meanwhile — here an inline store, as the worker loop
+    /// runs one beside its spawned searches — and the stage's own events must
+    /// still land in it once it resumes. An entered span guard held across the
+    /// await broke both: it stayed entered on the thread while the search was
+    /// parked, and sat under the search's re-entered spans once it resumed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_beside_a_parked_search_keeps_out_of_its_spans() {
+        let (gate, reached, release) = Gate::armed();
+        let vectors = MockVectors {
+            search_gate: gate,
+            ..MockVectors::finding(1)
+        };
+        let svc = shared_service(vectors, MockEmbeddings);
+        let local = tokio::task::LocalSet::new();
+
+        let ((), events) = scoped(local.run_until(async {
+            let search = tokio::task::spawn_local({
+                let svc = svc.clone();
+                async move { svc.search(search_params("anything")).await }
+            });
+            reached
+                .await
+                .expect("the search parks in its vector search");
+            svc.store_memory(fact_h(None)).await.expect("store");
+            release.send(()).expect("the search is still parked");
+            search.await.expect("search task").expect("search");
+        }))
+        .await;
+
+        assert_eq!(scopes_of(&events, "stored"), [["store_memory"]]);
+        assert_eq!(
+            scopes_of(&events, "released"),
+            [["vector_search", "search_hybrid", "search_with", "search"]]
+        );
+    }
+
+    /// The reverse: a store parked in its `embed` stage must not adopt a
+    /// search that runs meanwhile.
+    #[tokio::test(flavor = "current_thread")]
+    async fn search_beside_a_parked_store_keeps_out_of_its_spans() {
+        let (gate, reached, release) = Gate::armed();
+        let svc = shared_service(MockVectors::finding(1), ParkingEmbeddings(gate));
+        let local = tokio::task::LocalSet::new();
+
+        let ((), events) = scoped(local.run_until(async {
+            let store = tokio::task::spawn_local({
+                let svc = svc.clone();
+                async move { svc.store_memory(fact_h(None)).await }
+            });
+            reached.await.expect("the store parks in its embed");
+            svc.search(search_params("anything")).await.expect("search");
+            release.send(()).expect("the store is still parked");
+            store.await.expect("store task").expect("store");
+        }))
+        .await;
+
+        assert_eq!(
+            scopes_of(&events, "hybrid stages"),
+            [["search_hybrid", "search_with", "search"]]
+        );
+        assert_eq!(scopes_of(&events, "released"), [["embed", "store_memory"]]);
     }
 
     // ─── Contradiction judge (LAB-3283: AC-2 failure paths, AC-4, AC-4b) ──
