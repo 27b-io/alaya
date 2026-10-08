@@ -1050,7 +1050,7 @@ fn carry_over(payload: &mut Value, prev: &Value) {
 
 async fn qdrant_error(resp: reqwest::Response) -> AlayaError {
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let body = crate::error_body(resp).await;
     AlayaError::Storage(format!("Qdrant {status}: {body}"))
 }
 
@@ -1490,7 +1490,7 @@ impl VectorStorage for QdrantClient {
             .collect())
     }
 
-    #[tracing::instrument(skip(self), fields(n_tags = tags.len(), match_all, limit))]
+    #[tracing::instrument(skip(self, tags, memory_type), fields(n_tags = tags.len(), match_all, limit, memory_type = ?memory_type.map(crate::clip_for_log)))]
     async fn search_by_tags(
         &self,
         tags: &[&str],

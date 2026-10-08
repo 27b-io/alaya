@@ -228,7 +228,7 @@ pub async fn mcp_handler(
             .and_then(|n| n.as_str())
             .unwrap_or("");
         if !principal.allows(tool) {
-            tracing::debug!(?principal, %tool, "authorization denied");
+            tracing::debug!(?principal, tool = %alaya_backends::clip_for_log(tool), "authorization denied");
             let resp = JsonRpcResponse::error(id, -32001, "forbidden for this principal");
             return make_response(resp, wants_sse);
         }

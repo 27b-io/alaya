@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::Instrument;
 
+use alaya_backends::clip_for_log;
 use alaya_backends::judge::sanitize_reason;
 use alaya_backends::{ContradictionJudge, Judgement, Survivor};
 use alaya_types::graph::{ContradictionQuery, EdgeVerdict, Resolution, Verdict};
@@ -1793,7 +1794,7 @@ impl MemoryService {
 
     // ─── Tool 3: delete_memory ──────────────────────────────────────────
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip_all, fields(content_hash = ?clip_for_log(content_hash)))]
     pub async fn delete_memory(&self, content_hash: &str) -> Result<HashMap<String, Value>> {
         if !alaya_types::memory::validate_content_hash(content_hash) {
             return Err(AlayaError::Validation("invalid content_hash format".into()));
@@ -1825,7 +1826,7 @@ impl MemoryService {
     ///
     /// Delegates to VectorStorage and invalidates tag cache when tags change.
     /// Returns the full updated Memory on success.
-    #[tracing::instrument(skip(self, patch))]
+    #[tracing::instrument(skip_all, fields(content_hash = ?clip_for_log(content_hash)))]
     pub async fn patch_memory(
         &self,
         content_hash: &str,
@@ -1927,7 +1928,7 @@ impl MemoryService {
 
     // ─── Tool 5: relation ───────────────────────────────────────────────
 
-    #[tracing::instrument(skip(self, params), fields(action = %params.action))]
+    #[tracing::instrument(skip_all, fields(action = %clip_for_log(&params.action)))]
     pub async fn relation(&self, params: RelationParams) -> Result<Value> {
         if !alaya_types::memory::validate_content_hash(&params.content_hash) {
             return Err(AlayaError::Validation("invalid content_hash".into()));
@@ -2011,7 +2012,7 @@ impl MemoryService {
             }
             _ => Err(AlayaError::Validation(format!(
                 "unknown action: {}",
-                params.action
+                clip_for_log(&params.action)
             ))),
         }
     }
@@ -2019,13 +2020,20 @@ impl MemoryService {
     // ─── Tool 6: memory_supersede ───────────────────────────────────────
 
     // `reason` is caller free text, so it stays out of the span (LAB-7878).
-    #[tracing::instrument(skip(self, reason))]
+    #[tracing::instrument(skip_all, fields(old_hash = ?clip_for_log(old_hash), new_hash = ?clip_for_log(new_hash)))]
     pub async fn memory_supersede(
         &self,
         old_hash: &str,
         new_hash: &str,
         reason: &str,
     ) -> Result<Value> {
+        for h in [old_hash, new_hash] {
+            if !alaya_types::memory::validate_content_hash(h) {
+                return Err(AlayaError::Validation(
+                    "invalid content_hash: expected 64-char lowercase SHA-256 hex".into(),
+                ));
+            }
+        }
         if old_hash == new_hash {
             return Err(AlayaError::Validation(
                 "old_hash and new_hash must differ".into(),
@@ -2187,7 +2195,7 @@ impl MemoryService {
     /// whole, its edge restored, and reported as `superseded_by_changed`. A
     /// memory that is not superseded is `not_superseded`: a typed no-op,
     /// never a success. Nothing is deleted but SUPERSEDES edges.
-    #[tracing::instrument(skip(self, reason))]
+    #[tracing::instrument(skip_all, fields(content_hash = ?clip_for_log(content_hash), via = ?clip_for_log(via)))]
     pub async fn memory_unsupersede(
         &self,
         content_hash: &str,
@@ -2548,7 +2556,7 @@ impl MemoryService {
     /// writes are non-fatal); that can only shorten a page, never hide the
     /// next one. `verdicts = None` applies `DEFAULT_VERDICT_FILTER`.
     /// `next_offset` is set while the graph page was full.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip_all, fields(limit = limit, offset = offset, include_resolved = include_resolved, verdicts = %clip_for_log(&format!("{verdicts:?}"))))]
     pub async fn memory_contradictions(
         &self,
         limit: usize,
@@ -2654,7 +2662,7 @@ impl MemoryService {
     /// error, not a warning. `resolved_via` is recorded verbatim
     /// (`operator:console`, `operator:mcp`, later `engine:<run-id>`);
     /// `resolved_at` is server-set.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip_all, fields(memory_a_hash = ?clip_for_log(memory_a_hash), memory_b_hash = ?clip_for_log(memory_b_hash), ?resolution, resolved_via = ?clip_for_log(resolved_via)))]
     pub async fn resolve_contradiction(
         &self,
         memory_a_hash: &str,
@@ -2783,7 +2791,7 @@ impl MemoryService {
 
     // ─── Tool 9: merge_duplicates ───────────────────────────────────────
 
-    #[tracing::instrument(skip(self, duplicate_hashes, reason))]
+    #[tracing::instrument(skip_all, fields(canonical_hash = ?clip_for_log(canonical_hash), dry_run = dry_run))]
     pub async fn merge_duplicates(
         &self,
         canonical_hash: &str,
@@ -2917,7 +2925,7 @@ impl MemoryService {
     /// superseded status. With `full` or `both` output, `supersession_reason`
     /// says why, and `supersession_log` lists the supersessions reversed so
     /// far. Pure read: no access-count mutation.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip_all, fields(content_hash = ?clip_for_log(content_hash), ?output))]
     pub async fn get_memory(&self, content_hash: &str, output: OutputMode) -> Result<Value> {
         if !alaya_types::memory::validate_content_hash(content_hash) {
             return Err(AlayaError::Validation(
@@ -3122,7 +3130,8 @@ pub fn parse_user_relation(s: &str) -> Result<UserRelationType> {
             "SUPERSEDES is system-only; use memory_supersede".into(),
         )),
         _ => Err(AlayaError::Validation(format!(
-            "unknown relation type: {s}"
+            "unknown relation type: {}",
+            clip_for_log(s)
         ))),
     }
 }
@@ -10247,13 +10256,9 @@ mod tests {
         );
     }
 
-    /// LAB-7878: a supersede, unsupersede or merge `reason` is caller free
-    /// text, so at INFO it reaches no span field and no event — with span
-    /// close events on, the fmt layer prints every field a span recorded.
-    #[tokio::test(flavor = "current_thread")]
-    async fn reason_text_reaches_no_span_field_or_event_at_info() {
-        const MARKER: &str = "REASON-MARKER";
-
+    /// An INFO fmt capture with span close events on, so it prints every
+    /// field a span recorded: the dispatch, and a read of what it wrote.
+    fn info_log_capture() -> (tracing::Dispatch, impl Fn() -> String) {
         #[derive(Clone, Default)]
         struct Buf(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for Buf {
@@ -10277,6 +10282,18 @@ mod tests {
                 .with_ansi(false)
                 .finish(),
         );
+        (capture, move || {
+            String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+        })
+    }
+
+    /// LAB-7878: a supersede, unsupersede or merge `reason` is caller free
+    /// text, so at INFO it reaches no span field and no event — with span
+    /// close events on, the fmt layer prints every field a span recorded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reason_text_reaches_no_span_field_or_event_at_info() {
+        const MARKER: &str = "REASON-MARKER";
+        let (capture, read_log) = info_log_capture();
 
         let (a, b) = (h('a'), h('b'));
         let svc = Ledger::with(&[&a, &b]).service();
@@ -10298,7 +10315,7 @@ mod tests {
         .with_subscriber(capture)
         .await;
 
-        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let log = read_log();
         for seen in [
             "memory_supersede",
             "memory_unsupersede",
@@ -10311,6 +10328,67 @@ mod tests {
             );
         }
         assert!(!log.contains(MARKER), "reason text reached the log:\n{log}");
+    }
+
+    /// LAB-8297: a span records a caller's hash, `*_via` label, verdict
+    /// filter or relation action before the validation that bounds it, so
+    /// it records a clipped copy: an oversized one fails validation with
+    /// only its head and length in the log.
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_caller_labels_reach_span_fields_clipped() {
+        const TAIL: &str = "LABEL-TAIL";
+        let junk = format!("{}{TAIL}", "x".repeat(alaya_backends::LOG_CLIP_BYTES));
+        let (capture, read_log) = info_log_capture();
+
+        let (a, b) = (h('a'), h('b'));
+        let svc = Ledger::with(&[&a, &b]).service();
+        let errors = async {
+            let relation = RelationParams {
+                action: junk.clone(),
+                content_hash: a.clone(),
+                target_hash: None,
+                relation_type: None,
+            };
+            vec![
+                svc.memory_unsupersede(&a, "why", &junk).await.unwrap_err(),
+                svc.resolve_contradiction(&a, &b, Some(Resolution::KeepBoth), &junk)
+                    .await
+                    .unwrap_err(),
+                svc.get_memory(&junk, OutputMode::Full).await.unwrap_err(),
+                svc.delete_memory(&junk).await.unwrap_err(),
+                svc.patch_memory(&junk, &PatchMemoryRequest::default())
+                    .await
+                    .unwrap_err(),
+                svc.memory_supersede(&junk, &b, "why").await.unwrap_err(),
+                svc.merge_duplicates(&junk, &[], "why", true)
+                    .await
+                    .unwrap_err(),
+                svc.memory_contradictions(10, 0, false, Some(std::slice::from_ref(&junk)))
+                    .await
+                    .unwrap_err(),
+                svc.relation(relation).await.unwrap_err(),
+            ]
+        }
+        .with_subscriber(capture)
+        .await;
+        for e in &errors {
+            assert!(matches!(e, AlayaError::Validation(_)), "{e:?}");
+            assert!(
+                !e.to_string().contains(TAIL),
+                "the error echoes the label: {e}"
+            );
+        }
+
+        let log = read_log();
+        assert_eq!(
+            log.matches("… (").count(),
+            errors.len(),
+            "one clipped copy per call:\n{log}"
+        );
+        assert!(
+            !log.contains(TAIL),
+            "a whole caller label reached the log:\n{log}"
+        );
     }
 
     /// Not superseded is a typed no-op: `success: false`, a status saying
