@@ -10,7 +10,7 @@
 
 services:
   qdrant:
-    image: docker.io/qdrant/qdrant:v1.19.1
+    image: docker.io/qdrant/qdrant:v1.19.2@sha256:b7b0444c4c351c970b98e90a6f89c2ee4287c65b44e52b4cb503fa5b2aa927ad
     environment:
       QDRANT__STORAGE__STORAGE_PATH: /tmp/qdrant_bench
     ports: ["127.0.0.1:16333:6333"]  # loopback-only (alaya runs auth-disabled); off default 6333 so the harness's data-safety guard can fail closed
@@ -23,7 +23,7 @@ services:
       start_period: 5s
 
   falkordb:
-    image: docker.io/falkordb/falkordb:v4.18.2
+    image: docker.io/falkordb/falkordb:v4.22.0@sha256:4ac83f55062d364dcf151692635138b0bd2e12578019a56eb86ef53d067b116b
     ports: ["127.0.0.1:16379:6379"]
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -h localhost -p 6379 PING || exit 1"]

@@ -18,7 +18,7 @@ services:
   # ── External backends ────────────────────────────────────────────
 
   falkordb:
-    image: falkordb/falkordb:v4.18.6
+    image: falkordb/falkordb:v4.22.0@sha256:4ac83f55062d364dcf151692635138b0bd2e12578019a56eb86ef53d067b116b
     restart: unless-stopped
     ports:
       - "${FALKORDB_PORT:-6379}:6379"
@@ -31,7 +31,7 @@ services:
       retries: 5
 
   qdrant:
-    image: qdrant/qdrant:v1.19.1
+    image: qdrant/qdrant:v1.19.2@sha256:b7b0444c4c351c970b98e90a6f89c2ee4287c65b44e52b4cb503fa5b2aa927ad
     restart: unless-stopped
     ports:
       - "${QDRANT_PORT:-6333}:6333"
