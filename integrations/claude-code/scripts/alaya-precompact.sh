@@ -38,7 +38,7 @@ fi
 
 # No recent save (or couldn't determine) — block and prompt Claude to save.
 cat >&2 <<'PROMPT'
-MEMORY SAVE REQUIRED before compaction. Call mcp__alaya__store_memory (up to 3 calls) to persist reusable knowledge from this session. Save ONLY:
+MEMORY CHECK before compaction. Review this session for reusable knowledge. If any qualifies, call mcp__alaya__store_memory (up to 3 calls) to persist it. Save ONLY:
 
 1. DECISIONS — architectural/design choices and their rationale (memory_type: decision)
 2. LESSONS — non-obvious findings, gotchas, undocumented behaviours, plus the fix (memory_type: reference)

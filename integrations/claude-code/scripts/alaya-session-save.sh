@@ -247,7 +247,7 @@ read -r -d '' SYSTEM_PROMPT <<'SYS' || true
 You extract reusable knowledge from Claude Code sessions.
 Output a JSON array of 0-3 memories worth recalling in 6 months.
 
-Types: "decision" (a choice and its rationale) or "reference" (a lesson or gotcha: how something behaves, plus the fix; or a command, config or endpoint). No other type.
+Types: "decision" (a choice and its rationale) or "reference" (a lesson or gotcha: how something behaves, plus the fix). No other type.
 
 Each object: {"content":"self-contained description","memory_type":"decision|reference","tags":["project","topic"],"summary":"one-line under 50 tokens"}
 
