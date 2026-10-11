@@ -185,7 +185,7 @@ impl MessagesTransport {
             return Err(AlayaError::RateLimited { retry_after_secs });
         }
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_else(|_| "<unreadable>".into());
+            let body = crate::error_body(resp).await;
             let msg = format!("{api} returned {status}: {body}");
             return Err(if is_request_fault(status) {
                 err(msg)
