@@ -14,7 +14,7 @@ JQ_DIR=$(dirname "$(command -v jq)")
 RC=0
 
 # stub curl: keep the extraction request and answer it with one memory; answer
-# the store POST with a 200 (the hook reads the code via -w '%{http_code}')
+# the store POST with a 200 and keep its body (the hook reads the code via -w '%{http_code}')
 mkdir -p "$T/bin"
 cat > "$T/bin/curl" <<'STUB'
 #!/bin/sh
@@ -23,7 +23,7 @@ for a; do [ "$prev" = "-d" ] && body=$a; prev=$a; done
 case "$*" in
   *llm.test*) cat "${body#@}" > "$CAP/llm.json"
     echo '{"choices":[{"message":{"content":"[{\"content\":\"stub memory\"}]"}}]}' ;;
-  *) printf 200 ;;
+  *) printf '%s' "$body" > "$CAP/store.json"; printf 200 ;;
 esac
 STUB
 chmod +x "$T/bin/curl"
@@ -85,6 +85,9 @@ lacks "string: interrupt marker dropped"      "[Request interrupted by user"
 lacks "string: sidechain task prompt dropped" "SIDECHAIN-TASK-TEXT"
 has   "string: last assistant text kept"      "assistant closing words"
 total "string: 5 message lines counted" 5
+# the stub memory carries no memory_type: the hook must type it a lesson, never run state
+got=$(jq -r '.memory_type' "$T/cap/store.json" 2>/dev/null)
+if [[ "$got" == reference ]]; then echo "ok    untyped memory stored as reference"; else echo "FAIL  untyped memory stored as [$got]"; RC=1; fi
 
 # SDK/agent session: prompts are block lists, a reminder can ride along as its own block
 {
