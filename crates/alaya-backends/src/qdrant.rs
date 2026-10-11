@@ -39,7 +39,7 @@ const KEYWORD_FILL_BATCH: usize = 64;
 /// A BM25 inference document over `text`, for a write or a query. Qdrant's
 /// defaults: English stemming and stop words, the word tokeniser (which
 /// splits `LAB-7716` into `lab` and `7716`), k 1.2, b 0.75 and an average
-/// length of 256 tokens, close to the memories' mean of about 270 words.
+/// length of 256 tokens, close to a typical memory's length.
 /// Qdrant requires the write and the query to use the same options, so they
 /// share this one function; changing an option means re-writing every
 /// keyword vector.
