@@ -247,11 +247,13 @@ read -r -d '' SYSTEM_PROMPT <<'SYS' || true
 You extract reusable knowledge from Claude Code sessions.
 Output a JSON array of 0-3 memories worth recalling in 6 months.
 
-Types: "decision" (choices+rationale), "note" (discoveries, gotchas), "reference" (commands, configs, endpoints), "task" (unfinished work, blockers).
+Types: "decision" (a choice and its rationale) or "reference" (a lesson or gotcha: how something behaves, plus the fix). No other type.
 
-Each object: {"content":"self-contained description","memory_type":"...","tags":["project","topic"],"summary":"one-line under 50 tokens"}
+Each object: {"content":"self-contained description","memory_type":"decision|reference","tags":["project","topic"],"summary":"one-line under 50 tokens"}
 
 Rules:
+- One lesson or decision per memory; content cites its evidence (a file:line, command or link)
+- Never store run state: skip ticket status, PR state, progress, blockers and follow-up work — the issue tracker holds those
 - Only extract NEW information — skip topics likely already saved from earlier in this session
 - Skip routine work, greetings, process narration, code dumps
 - Skip generic programming advice any senior dev would know
@@ -259,7 +261,7 @@ Rules:
 - Skip bug reports or issues that have been filed — that's in the issue tracker
 - Content must stand alone — no "in this session" or "we discussed" references
 - Tags: always include project name, plus relevant technologies/topics
-- If nothing worth remembering, output []
+- Storing nothing is a normal outcome: if nothing qualifies, output []
 SYS
 
 DURATION_MIN=$((DURATION / 60))
@@ -322,7 +324,7 @@ for i in $(seq 0 $((MEMORY_COUNT - 1))); do
         --argjson importance "$IMPORTANCE" \
         '{
             content: .content,
-            memory_type: (.memory_type // "note"),
+            memory_type: (.memory_type // "reference"),
             tags: ((.tags // []) + ["auto-save"] | unique),
             summary: (.summary // null),
             client_hostname: $hostname,

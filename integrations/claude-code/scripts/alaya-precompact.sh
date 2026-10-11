@@ -38,13 +38,17 @@ fi
 
 # No recent save (or couldn't determine) — block and prompt Claude to save.
 cat >&2 <<'PROMPT'
-MEMORY SAVE REQUIRED before compaction. Call mcp__alaya__store_memory (up to 3 calls) to persist valuable knowledge from this session. Save ONLY:
+MEMORY CHECK before compaction. Review this session for reusable knowledge. If any qualifies, call mcp__alaya__store_memory (up to 3 calls) to persist it. Save ONLY:
 
-1. DECISIONS — architectural/design choices and their rationale
-2. DISCOVERIES — non-obvious findings, gotchas, undocumented behaviors
-3. BLOCKERS — unresolved issues or follow-up work needed
+1. DECISIONS — architectural/design choices and their rationale (memory_type: decision)
+2. LESSONS — non-obvious findings, gotchas, undocumented behaviours, plus the fix (memory_type: reference)
 
-For each: set memory_type (decision/note/reference/task), add tags [project-name, topic], write a one-line summary, set dedup_threshold: 0.85. Skip routine/trivial work. If nothing worth saving, proceed without saving.
+Rules:
+- One lesson or decision per memory, citing its evidence (a file:line, command or link).
+- Never store run state: ticket status, PR state, progress, blockers, follow-up work or handoff narration. The issue tracker holds those.
+- Before each store, search Alaya for the lesson's key terms. If a live memory already says it, store nothing.
+- Add tags [project-name, topic], a one-line summary, and dedup_threshold: 0.85.
+- Storing nothing is a normal outcome. If nothing qualifies, proceed without saving.
 PROMPT
 
 exit 2
