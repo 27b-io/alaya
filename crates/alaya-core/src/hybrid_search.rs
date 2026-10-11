@@ -20,9 +20,9 @@ const STOP_WORDS: &[&str] = &[
 
 static STOP_SET: LazyLock<HashSet<&str>> = LazyLock::new(|| STOP_WORDS.iter().copied().collect());
 
-/// Tag-only base score (no cosine similarity available).
+/// Display score of a keyword-only hit (tag or BM25: no cosine similarity available).
 /// GEPA-optimized: lowered from 0.1 to reduce tag-only match influence.
-const TAG_ONLY_BASE_SCORE: f64 = 0.02;
+const KEYWORD_ONLY_BASE_SCORE: f64 = 0.02;
 
 /// RRF smoothing constant. Lower = sharper rank differentiation.
 /// GEPA-optimized: lowered from 60 to 20 for better top-k separation.
@@ -94,13 +94,17 @@ pub fn rrf_score(rank: usize, k: usize) -> f64 {
     1.0 / (k + rank) as f64
 }
 
-/// Combine vector search and tag search results via Reciprocal Rank Fusion.
+/// Combine vector search results with keyword pools via Reciprocal Rank
+/// Fusion.
 ///
-/// Each input is `(content_hash, original_score)`.
+/// Each input is `(content_hash, original_score)`, best first. The vector
+/// pool weighs `alpha` and each keyword pool `1 - alpha` (the tag pool, the
+/// BM25 pool, or both, LAB-7716); an empty pool adds nothing, so passing one
+/// is the same as leaving it out.
 /// Returns `(content_hash, combined_rrf_score, display_score)` sorted descending.
 pub fn combine_results_rrf(
     vector_results: &[(String, f64)],
-    tag_results: &[(String, f64)],
+    keyword_results: &[&[(String, f64)]],
     alpha: f64,
     k: usize,
 ) -> Vec<(String, f64, f64)> {
@@ -109,9 +113,12 @@ pub fn combine_results_rrf(
         vector_ranks.insert(hash.as_str(), (rank + 1, *score));
     }
 
-    let mut tag_ranks: HashMap<&str, usize> = HashMap::new();
-    for (rank, (hash, _)) in tag_results.iter().enumerate() {
-        tag_ranks.insert(hash.as_str(), rank + 1);
+    // Each hash's summed keyword RRF across the pools it appears in.
+    let mut keyword_rrf: HashMap<&str, f64> = HashMap::new();
+    for pool in keyword_results {
+        for (rank, (hash, _)) in pool.iter().enumerate() {
+            *keyword_rrf.entry(hash.as_str()).or_default() += rrf_score(rank + 1, k);
+        }
     }
 
     // Collect all unique hashes
@@ -119,9 +126,7 @@ pub fn combine_results_rrf(
     for (hash, _) in vector_results {
         all_hashes.insert(hash.as_str());
     }
-    for (hash, _) in tag_results {
-        all_hashes.insert(hash.as_str());
-    }
+    all_hashes.extend(keyword_rrf.keys());
 
     let mut results: Vec<(String, f64, f64)> = all_hashes
         .into_iter()
@@ -131,18 +136,15 @@ pub fn combine_results_rrf(
                 .map(|(rank, _)| rrf_score(*rank, k))
                 .unwrap_or(0.0);
 
-            let t_rrf = tag_ranks
-                .get(hash)
-                .map(|rank| rrf_score(*rank, k))
-                .unwrap_or(0.0);
+            let kw_rrf = keyword_rrf.get(hash).copied().unwrap_or(0.0);
 
-            let combined = alpha * v_rrf + (1.0 - alpha) * t_rrf;
+            let combined = alpha * v_rrf + (1.0 - alpha) * kw_rrf;
 
-            // Display score: cosine from vector search, or base for tag-only
+            // Display score: cosine from vector search, or base for keyword-only
             let display = vector_ranks
                 .get(hash)
                 .map(|(_, score)| *score)
-                .unwrap_or(TAG_ONLY_BASE_SCORE);
+                .unwrap_or(KEYWORD_ONLY_BASE_SCORE);
 
             (hash.to_string(), combined, display)
         })
@@ -284,7 +286,7 @@ mod tests {
     fn combine_rrf_vector_only() {
         let v = vec![("hash1".into(), 0.9), ("hash2".into(), 0.8)];
         let t: Vec<(String, f64)> = vec![];
-        let results = combine_results_rrf(&v, &t, 0.7, 60);
+        let results = combine_results_rrf(&v, &[&t], 0.7, 60);
         assert_eq!(results.len(), 2);
         // hash1 should be first (higher vector rank)
         assert_eq!(results[0].0, "hash1");
@@ -294,7 +296,7 @@ mod tests {
     fn combine_rrf_overlap() {
         let v = vec![("hash1".into(), 0.9), ("hash2".into(), 0.7)];
         let t = vec![("hash2".into(), 1.0), ("hash3".into(), 1.0)];
-        let results = combine_results_rrf(&v, &t, 0.5, 60);
+        let results = combine_results_rrf(&v, &[&t], 0.5, 60);
         assert_eq!(results.len(), 3);
         // hash2 appears in both — should get boosted
         let hash2_score = results.iter().find(|r| r.0 == "hash2").unwrap().1;
@@ -306,8 +308,39 @@ mod tests {
     fn combine_rrf_tag_only_display_score() {
         let v: Vec<(String, f64)> = vec![];
         let t = vec![("hash1".into(), 1.0)];
-        let results = combine_results_rrf(&v, &t, 0.5, 60);
-        assert_eq!(results[0].2, TAG_ONLY_BASE_SCORE);
+        let results = combine_results_rrf(&v, &[&t], 0.5, 60);
+        assert_eq!(results[0].2, KEYWORD_ONLY_BASE_SCORE);
+    }
+
+    #[test]
+    fn combine_rrf_an_empty_keyword_pool_changes_nothing() {
+        let v = vec![("hash1".into(), 0.9), ("hash2".into(), 0.7)];
+        let t = vec![("hash2".into(), 1.0), ("hash3".into(), 1.0)];
+        let none: Vec<(String, f64)> = vec![];
+        assert_eq!(
+            sorted(combine_results_rrf(&v, &[&t, &none], 0.8, 20)),
+            sorted(combine_results_rrf(&v, &[&t], 0.8, 20))
+        );
+    }
+
+    #[test]
+    fn combine_rrf_sums_each_keyword_pool_at_one_minus_alpha() {
+        let v = vec![("hash1".into(), 0.9)];
+        let tags = vec![("hash2".into(), 1.0)];
+        let bm25 = vec![("hash2".into(), 7.5), ("hash3".into(), 3.0)];
+        let results = combine_results_rrf(&v, &[&tags, &bm25], 0.8, 20);
+        let score = |h: &str| results.iter().find(|r| r.0 == h).unwrap();
+        // In both keyword pools at rank 1: twice one pool's weight.
+        assert!((score("hash2").1 - 0.2 * 2.0 * rrf_score(1, 20)).abs() < 1e-12);
+        assert!((score("hash3").1 - 0.2 * rrf_score(2, 20)).abs() < 1e-12);
+        assert!((score("hash1").1 - 0.8 * rrf_score(1, 20)).abs() < 1e-12);
+        assert_eq!(score("hash3").2, KEYWORD_ONLY_BASE_SCORE);
+        assert_eq!(results[0].0, "hash1");
+    }
+
+    fn sorted(mut r: Vec<(String, f64, f64)>) -> Vec<(String, f64, f64)> {
+        r.sort_by(|a, b| a.0.cmp(&b.0));
+        r
     }
 
     #[test]

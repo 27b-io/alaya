@@ -161,6 +161,41 @@ async fn store_reports_created_true_when_point_absent() {
     );
 }
 
+/// LAB-7716 AC-2: a store writes the BM25 keyword vector over the content
+/// beside the dense embedding, on an insert and on a re-store alike. Qdrant's
+/// upsert replaces the whole point, so a write without it would drop it.
+#[tokio::test]
+async fn store_and_restore_write_the_keyword_vector_beside_the_embedding() {
+    let want = json!({
+        "": [0.1_f32, 0.2_f32],
+        "bm25": { "text": "same content", "model": "qdrant/bm25" },
+    });
+    for existing in [None, Some(existing_payload())] {
+        let restore = existing.is_some();
+        let (server, _fake) = fake_with(existing).await;
+        let (created, _) = client_for(&server)
+            .store(&incoming(), StoreMode::Upsert)
+            .await
+            .expect("store succeeds");
+        assert_eq!(created, !restore);
+
+        let puts = upserts(&server).await;
+        assert_eq!(puts.len(), 1, "{puts:?}");
+        assert_eq!(
+            puts[0]["update_mode"],
+            json!(if restore {
+                "update_only"
+            } else {
+                "insert_only"
+            })
+        );
+        assert_eq!(
+            puts[0]["points"][0]["vector"], want,
+            "restore={restore}: every vector the point carries"
+        );
+    }
+}
+
 #[tokio::test]
 async fn store_reports_created_false_and_preserves_history_when_point_exists() {
     let (server, fake) = fake_with(Some(existing_payload())).await;

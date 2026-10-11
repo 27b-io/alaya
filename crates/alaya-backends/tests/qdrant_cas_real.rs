@@ -1,15 +1,15 @@
 //! Two-process write races against a real Qdrant (alaya#130).
 //!
-//! Ignored by default: they need `QDRANT_TEST_URL`, a disposable Qdrant >= 1.17
+//! Ignored by default: they need `QDRANT_TEST_URL`, a disposable Qdrant >= 1.18
 //! (every test makes and drops its own collection). CI runs them against a
 //! Qdrant service container; a run without the URL fails rather than passing
 //! silently:
 //!
-//!   docker run -d -p 16417:6333 qdrant/qdrant:v1.17.1
+//!   docker run -d -p 16417:6333 qdrant/qdrant:v1.19.1
 //!   QDRANT_TEST_URL=http://localhost:16417 \
 //!     cargo test -p alaya-backends --test qdrant_cas_real -- --include-ignored --test-threads=1
 //!
-//! `QDRANT_TEST_URL_OLD`, if set to a Qdrant < 1.17, also checks the startup
+//! `QDRANT_TEST_URL_OLD`, if set to a Qdrant < 1.18, also checks the startup
 //! refusal against it.
 //!
 //! Each race is forced, not hoped for. Writer A (this process) talks to Qdrant
@@ -35,7 +35,7 @@ const CHILD_RESULT: &str = "CAS_CHILD_RESULT ";
 
 fn qdrant_url() -> String {
     std::env::var("QDRANT_TEST_URL")
-        .expect("QDRANT_TEST_URL must point at a disposable Qdrant >= 1.17")
+        .expect("QDRANT_TEST_URL must point at a disposable Qdrant >= 1.18")
 }
 
 fn memory(content: &str, tags: &[&str]) -> Memory {
@@ -703,7 +703,7 @@ async fn server_version_gate_against_real_servers() {
         .unwrap()
         .check_server_version()
         .await
-        .expect("QDRANT_TEST_URL must be Qdrant >= 1.17");
+        .expect("QDRANT_TEST_URL must be Qdrant >= 1.18");
     assert!(!version.is_empty());
 
     let Ok(old) = std::env::var("QDRANT_TEST_URL_OLD") else {
@@ -713,6 +713,6 @@ async fn server_version_gate_against_real_servers() {
         .unwrap()
         .check_server_version()
         .await
-        .expect_err("a Qdrant < 1.17 must be refused");
+        .expect_err("a Qdrant < 1.18 must be refused");
     assert!(matches!(err, AlayaError::Config(_)), "got {err:?}");
 }

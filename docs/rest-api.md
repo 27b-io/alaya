@@ -61,6 +61,7 @@ Failed auth returns `401 Unauthorized` with a `WWW-Authenticate: Bearer …` hea
 | `POST` | `/duplicates/merge` | Supersede a duplicate cluster | yes |
 | `POST` | `/backfill/summaries` | Generate missing summaries | yes |
 | `POST` | `/backfill/contradictions` | Judge unjudged contradiction pairs | yes |
+| `POST` | `/backfill/keywords` | Write the BM25 keyword vector of memories that lack one | yes |
 | `GET`  | `/stats` | Corpus counts and contradiction-judge aggregates | yes |
 | `POST` | `/mcp` | MCP JSON-RPC entry point | yes |
 | `GET`  | `/.well-known/oauth-protected-resource[/mcp]` | OAuth resource metadata (404 unless `OIDC_ISSUER` set) | no |
@@ -551,6 +552,29 @@ Re-running is idempotent: only edges with no verdict at all are selected. **Swit
 
 One pass at a time per `alaya-server` process: a second call to the same process while one is running returns `{"success": false, "error": "backfill already running"}`. With more than one replica behind the Service, a second call can land on another process and run alongside the first. The two passes select the same unjudged pairs, so some pairs are judged, and billed, twice; each verdict write is last-writer-wins on the edge and touches no memory, so nothing is corrupted. Send backfills to one pod (`kubectl port-forward pod/...`) to avoid the double spend. The HTTP reply waits at most 630 s, so keep `limit` around 200 per call; a pass that outlives the reply still runs to completion and the next call is refused until it finishes.
 
+## `POST /backfill/keywords`
+
+Writes the BM25 keyword vector of up to `limit` memories that have none. Operator-only, same auth class as the other backfills — the read-only bearer gets `403`. Hybrid search's `bm25` and `both` keyword legs (`RANK_KEYWORD_LEG`) find only memories that carry this vector. Every store writes it, so this is for memories stored before the server had the keyword index, and for repairs.
+
+```http
+POST /backfill/keywords
+Content-Type: application/json
+
+{"limit": 5000}
+```
+
+Blocks until the pass completes and returns how many it wrote and how many still have none:
+
+```json
+{"success": true, "written": 5000, "missing": 16251}
+```
+
+Repeat until `missing` is `0`; `GET /stats` shows the same number as `keyword_index.missing`. `limit` defaults to `5000` and must be 1 to 20000. Qdrant tokenises and weighs each memory's content itself, so the pass makes no embedding or LLM call.
+
+It writes the keyword vector and nothing else: no payload key, no revision, no dense vector, so it runs safely beside live traffic and no store loses a compare-and-set round to it. It selects memories by "keyword vector missing", never by a saved position, so it is safe to re-run at any time. Run it once more after every rolling update that started from a server without the keyword index: until the last old server stops, its re-stores write the dense vector alone, which drops a memory's keyword vector (Qdrant's upsert replaces the whole point), and the next pass puts it back. A memory deleted during the pass is skipped. Nothing runs this at startup.
+
+One pass at a time per `alaya-server` process; a second call to the same process while one runs returns `{"success": false, "error": "keyword backfill already running"}`. Two processes running passes at once only write the same vectors twice.
+
 ## `GET /stats`
 
 Operator view of the corpus and the contradiction judge: the verdict mix, stored judge failures, the never-judged backlog, judge daily-cap usage, the novelty of each day's writes, and graph edges by type. Full static bearer only — OIDC principals and the read-only bearer get `403` (it carries judge failure text and process-local spend state). Pure read: no access-count bump, no edge write.
@@ -562,6 +586,7 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" http://localhost:3001/stats
 ```json
 {
   "memories": {"total": 5234},
+  "keyword_index": {"missing": 0},
   "graph": {
     "node_count": 5000,
     "edge_counts": {"CONTRADICTS": 4589, "HEBBIAN": 77, "PRECEDES": 3, "RELATES_TO": 12, "SUPERSEDES": 131}
@@ -607,6 +632,7 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" http://localhost:3001/stats
 | Field | Meaning |
 |:--|:--|
 | `memories.total` | Points in the vector store, superseded memories included. |
+| `keyword_index.missing` | Memories with no BM25 keyword vector, superseded ones included: what `POST /backfill/keywords` still has to write. `0` once it has run to the end; a rolling update from a server without the keyword index can raise it again. `keyword_index` is `null` when the count fails (`keyword index: …` in `errors`). |
 | `graph.node_count`, `graph.edge_counts` | Graph nodes, and edges per relationship type (`HEBBIAN` is the co-access edge). |
 | `contradictions.by_verdict` | Every `CONTRADICTS` edge, keyed by the verdict it carries now, split `open` / `resolved`. **Resolved** is exactly the default `POST /contradictions` queue's rule: either endpoint superseded (an incoming `SUPERSEDES` edge), or the pair stamped `keep_both` on either of its two edges. `unjudged` is a stored judge failure; `never_judged` is an edge with no verdict at all: the backlog of pairs the store path did not judge (daily cap, backlog bound, a transient judge failure), waiting for `POST /backfill/contradictions`. A verdict string the server does not know (only a direct graph write produces one) is left out. Edges, not pairs: a pair detected in both directions counts twice. |
 | `contradictions.failures` | Stored judge failures (`verdict = unjudged`) grouped by full `verdict_reason`: the ten most frequent in `top`, the rest summed in `other`; together they equal `by_verdict.unjudged`. Transient failures (`429`, timeouts, cap refusals) are retried and stored nowhere, so they are not counted. |
@@ -616,7 +642,7 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" http://localhost:3001/stats
 | `judge_daily_cap.cap` | `JUDGE_DAILY_CAP`, or `null` when no judge is configured. |
 | `judge_daily_cap.admitted_today`, `utc_day` | Store-path judge calls billed today (UTC) **by the process that answered** — the counter is per process, so with several replicas each reports its own. `POST /backfill/contradictions` is not counted. |
 | `pod` | The answering pod's self-check and failure counters; see [Self-check and failure counters](#self-check-and-failure-counters). Present on a timed-out reply too. |
-| `errors` | One note per failed call, prefixed with its source. Each section comes from its own call and is `null` only when that call fails: `memories` from the vector-store count (`vector store: …`), `writes` from the novelty scroll (`write novelty: …`), `graph` from the graph stats (`graph stats: …`) and `contradictions` from the contradiction aggregates (`contradiction stats: …`). So `memories` and `writes` can fail independently even though both read the vector store. A failed section is never zeros; the call still answers `200`. |
+| `errors` | One note per failed call, prefixed with its source. Each section comes from its own call and is `null` only when that call fails: `memories` from the vector-store count (`vector store: …`), `keyword_index` from the count of memories with no keyword vector (`keyword index: …`), `writes` from the novelty scroll (`write novelty: …`), `graph` from the graph stats (`graph stats: …`) and `contradictions` from the contradiction aggregates (`contradiction stats: …`). So `memories`, `keyword_index` and `writes` can fail independently even though all three read the vector store. A failed section is never zeros; the call still answers `200`. |
 
 Two different confidences exist on a pair and must not be read as one: `verdict_confidence` (on `POST /contradictions`) is the **judge's** confidence in its verdict, while `confidence` is the lexical **detector's** score for the edge when it was written. This endpoint aggregates neither; it counts verdicts and reasons only.
 

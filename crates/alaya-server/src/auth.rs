@@ -132,6 +132,7 @@ pub fn rest_route_op(method: &Method, path: &str) -> &'static str {
         ("POST", "/duplicates/merge") => "merge_duplicates",
         ("POST", "/backfill/summaries") => "backfill_summaries",
         ("POST", "/backfill/contradictions") => "backfill_contradictions",
+        ("POST", "/backfill/keywords") => "backfill_keywords",
         ("GET", "/health/detail") => "check_database_health",
         // Static-only by omission from both allowlists (LAB-6881): an
         // operator view that carries judge failure text and this process's
@@ -177,6 +178,7 @@ pub const ALL_OPS: &[(&str, bool)] = &[
     ("patch_memory", true),
     ("backfill_summaries", true),
     ("backfill_contradictions", true),
+    ("backfill_keywords", true),
 ];
 
 /// Read-only view of the auth configuration (LAB-1684 AC7): which principals
@@ -554,9 +556,14 @@ mod tests {
             rest_route_op(&Method::POST, "/backfill/contradictions"),
             "backfill_contradictions"
         );
+        assert_eq!(
+            rest_route_op(&Method::POST, "/backfill/keywords"),
+            "backfill_keywords"
+        );
         // Operator-only: neither restricted principal may run a backfill.
         for p in [AuthPrincipal::Oidc, AuthPrincipal::StaticReadOnly] {
             assert!(!p.allows("backfill_contradictions"));
+            assert!(!p.allows("backfill_keywords"));
         }
     }
 
