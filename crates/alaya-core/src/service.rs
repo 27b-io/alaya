@@ -3104,8 +3104,10 @@ impl Stage {
 /// whose result failed, whose `_ms` is complete; a validation error before any
 /// stage has no `stage`. A stage that did not run has no `_ms`. A fan-out
 /// branch only gets one when it completes, so in a dropped `fan_out` a missing
-/// `embed_ms`, `tags_ms` or `count_ms` is a branch that never answered, while
-/// `tag_search_ms` is also absent whenever no query word matched a tag.
+/// `embed_ms`, `tags_ms`, `bm25_search_ms` or `count_ms` is a branch that never
+/// answered, while `tag_search_ms` is also absent whenever no query word matched
+/// a tag. A keyword leg `RANK_KEYWORD_LEG` leaves out logs no `_ms` for its
+/// stages.
 struct StageClock {
     started: std::time::Instant,
     ms: RefCell<Vec<(Stage, u64)>>,
@@ -3165,6 +3167,7 @@ impl Drop for StageClock {
             embed_ms = ms(Stage::Embed),
             tags_ms = ms(Stage::Tags),
             tag_search_ms = ms(Stage::TagSearch),
+            bm25_search_ms = ms(Stage::Bm25Search),
             count_ms = ms(Stage::Count),
             vector_search_ms = ms(Stage::VectorSearch),
             rrf_fuse_ms = ms(Stage::RrfFuse),
@@ -8837,6 +8840,35 @@ mod tests {
                     .unwrap_or_else(|_| panic!("{k}={v} is not a u64"));
             }
         }
+    }
+
+    /// The BM25 leg times its search as `bm25_search_ms`; a leg without the
+    /// tag pools logs no tag stage.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bm25_leg_logs_its_search_and_no_tag_stage() {
+        let svc = MemoryService::new(
+            Box::new(MockVectorsWithInjection::default()),
+            Box::new(MockEmbeddings),
+            Box::new(MockGraph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        )
+        .with_ranking(RankingFlags {
+            keyword_leg: KeywordLeg::Bm25,
+            ..RankingFlags::default()
+        });
+
+        let (out, lines) = stage_lines(svc.search(search_params("stability notes"))).await;
+
+        out.expect("search succeeds");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let keys = keys(&lines[0]);
+        assert!(keys.contains(&"bm25_search_ms"), "{keys:?}");
+        assert!(
+            !keys.contains(&"tags_ms") && !keys.contains(&"tag_search_ms"),
+            "{keys:?}"
+        );
     }
 
     /// Graph injection and rerank run only with graph neighbours to inject and
