@@ -985,7 +985,7 @@ impl MemoryService {
         // around an await: an entered span stays entered on the thread while
         // the search is parked, so a task the LocalSet polls meanwhile (an
         // inline store) would log inside it.
-        let (embed_result, mut tag_results, bm25_results, corpus_size, n_keywords) = async {
+        let (embed_result, mut tag_results, mut bm25_results, corpus_size, n_keywords) = async {
             let _stage = stages.stage(Stage::FanOut);
             let query_texts = [params.query.as_str()];
             let embed_fut = stages.time(
@@ -1072,7 +1072,6 @@ impl MemoryService {
             .next()
             .ok_or_else(|| AlayaError::Embedding("empty embedding result".into()))?;
         let alpha = hybrid_search::get_adaptive_alpha(corpus_size.unwrap_or(0), n_keywords);
-        let mut bm25_results = bm25_results;
 
         // Stage 2: Vector search + semantic tag pipeline run concurrently.
         // search_similar_tags→search_by_tags chains inside one branch so the
@@ -6740,10 +6739,11 @@ mod tests {
     }
 
     /// With `min_trust_score` set, hybrid drops below-trust memories from
-    /// every non-vector pool (keyword tag, semantic tag, BM25, graph injection),
-    /// none of which apply the filter Qdrant-side. Each pool holds one memory
-    /// at trust 0.8 and one at 0.5; a memory with no stored score is dropped
-    /// too, as Qdrant's range filter drops it. The unfiltered run proves every
+    /// every non-vector pool (keyword tag, semantic tag, BM25, graph injection).
+    /// The tag mock filters trust as Qdrant does; BM25 hits and graph
+    /// neighbours come back unfiltered, so only `admits` drops them. Each pool
+    /// holds one memory at trust 0.8 and one at 0.5; a memory with no stored
+    /// score is dropped too, as Qdrant's range filter drops it. The unfiltered run proves every
     /// low-trust memory reached its pool.
     #[tokio::test(flavor = "current_thread")]
     async fn hybrid_min_trust_score_filters_every_candidate_pool() {

@@ -36,6 +36,12 @@ pub const KEYWORD_VECTOR: &str = "bm25";
 /// Memories a keyword backfill reads and writes per request.
 const KEYWORD_FILL_BATCH: usize = 64;
 
+/// The keyword vector's collection config, for a new collection and for the
+/// in-place add alike, so a fresh and an upgraded collection score the same.
+fn keyword_vector_config() -> Value {
+    json!({ "modifier": "idf" })
+}
+
 /// A BM25 inference document over `text`, for a write or a query. Qdrant's
 /// defaults: English stemming and stop words, the word tokeniser (which
 /// splits `LAB-7716` into `lab` and `7716`), k 1.2, b 0.75 and an average
@@ -522,7 +528,7 @@ impl QdrantClient {
         // Absent (404) → create with the configured vector size and Cosine distance.
         let mut body = json!({ "vectors": { "size": dimensions, "distance": "Cosine" } });
         if keyword {
-            body["sparse_vectors"] = json!({ KEYWORD_VECTOR: { "modifier": "idf" } });
+            body["sparse_vectors"] = json!({ KEYWORD_VECTOR: keyword_vector_config() });
         }
         let resp = self
             .client
@@ -567,7 +573,7 @@ impl QdrantClient {
                 "{}/collections/{}/vectors/{}?wait=true",
                 self.base_url, collection, KEYWORD_VECTOR
             ))
-            .json(&json!({ "sparse": { "modifier": "idf" } }))
+            .json(&json!({ "sparse": keyword_vector_config() }))
             .send()
             .await
             .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
@@ -1199,6 +1205,36 @@ impl QdrantClient {
         Ok(written)
     }
 
+    /// Exact count of the memories matching `filter` (all of them when
+    /// `None`). A 2xx with no `result` is an error, never a zero: `/stats`
+    /// must not report a count it did not get.
+    async fn count_where(&self, filter: Option<Value>) -> Result<usize> {
+        let mut body = json!({ "exact": true });
+        if let Some(f) = filter {
+            body["filter"] = f;
+        }
+        let resp = self
+            .client
+            .post(format!(
+                "{}/collections/{}/points/count",
+                self.base_url, self.collection
+            ))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
+        if !resp.status().is_success() {
+            return Err(qdrant_error(resp).await);
+        }
+        let data: QdrantResponse<CountResponse> = resp
+            .json()
+            .await
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
+        data.result
+            .map(|r| r.count)
+            .ok_or_else(|| AlayaError::Storage("Qdrant count returned no result".into()))
+    }
+
     /// Retrieve one raw point (payload, no vector) by id; `None` when absent.
     async fn retrieve_point(&self, point_id: &str) -> Result<Option<Value>> {
         Ok(self
@@ -1786,27 +1822,7 @@ impl VectorStorage for QdrantClient {
     }
 
     async fn count_missing_keyword_vectors(&self) -> Result<usize> {
-        let body = json!({ "filter": missing_keyword_vector(), "exact": true });
-        let resp = self
-            .client
-            .post(format!(
-                "{}/collections/{}/points/count",
-                self.base_url, self.collection
-            ))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
-        if !resp.status().is_success() {
-            return Err(qdrant_error(resp).await);
-        }
-        let data: QdrantResponse<CountResponse> = resp
-            .json()
-            .await
-            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
-        data.result
-            .map(|r| r.count)
-            .ok_or_else(|| AlayaError::Storage("Qdrant count returned no result".into()))
+        self.count_where(Some(missing_keyword_vector())).await
     }
 
     #[tracing::instrument(skip_all, fields(limit = limit))]
@@ -2015,29 +2031,7 @@ impl VectorStorage for QdrantClient {
 
     #[tracing::instrument(skip(self))]
     async fn count(&self) -> Result<usize> {
-        let body = json!({"exact": true});
-
-        let resp = self
-            .client
-            .post(format!(
-                "{}/collections/{}/points/count",
-                self.base_url, self.collection
-            ))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
-
-        if !resp.status().is_success() {
-            return Err(qdrant_error(resp).await);
-        }
-
-        let data: QdrantResponse<CountResponse> = resp
-            .json()
-            .await
-            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
-
-        Ok(data.result.map(|r| r.count).unwrap_or(0))
+        self.count_where(None).await
     }
 
     #[tracing::instrument(skip(self))]

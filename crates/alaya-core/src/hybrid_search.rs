@@ -22,7 +22,7 @@ static STOP_SET: LazyLock<HashSet<&str>> = LazyLock::new(|| STOP_WORDS.iter().co
 
 /// Display score of a keyword-only hit (tag or BM25: no cosine similarity available).
 /// GEPA-optimized: lowered from 0.1 to reduce tag-only match influence.
-const TAG_ONLY_BASE_SCORE: f64 = 0.02;
+const KEYWORD_ONLY_BASE_SCORE: f64 = 0.02;
 
 /// RRF smoothing constant. Lower = sharper rank differentiation.
 /// GEPA-optimized: lowered from 60 to 20 for better top-k separation.
@@ -144,7 +144,7 @@ pub fn combine_results_rrf(
             let display = vector_ranks
                 .get(hash)
                 .map(|(_, score)| *score)
-                .unwrap_or(TAG_ONLY_BASE_SCORE);
+                .unwrap_or(KEYWORD_ONLY_BASE_SCORE);
 
             (hash.to_string(), combined, display)
         })
@@ -309,7 +309,7 @@ mod tests {
         let v: Vec<(String, f64)> = vec![];
         let t = vec![("hash1".into(), 1.0)];
         let results = combine_results_rrf(&v, &[&t], 0.5, 60);
-        assert_eq!(results[0].2, TAG_ONLY_BASE_SCORE);
+        assert_eq!(results[0].2, KEYWORD_ONLY_BASE_SCORE);
     }
 
     #[test]
@@ -334,7 +334,7 @@ mod tests {
         assert!((score("hash2").1 - 0.2 * 2.0 * rrf_score(1, 20)).abs() < 1e-12);
         assert!((score("hash3").1 - 0.2 * rrf_score(2, 20)).abs() < 1e-12);
         assert!((score("hash1").1 - 0.8 * rrf_score(1, 20)).abs() < 1e-12);
-        assert_eq!(score("hash3").2, TAG_ONLY_BASE_SCORE);
+        assert_eq!(score("hash3").2, KEYWORD_ONLY_BASE_SCORE);
         assert_eq!(results[0].0, "hash1");
     }
 
