@@ -23,6 +23,37 @@ use alaya_types::{
 
 use crate::{ReversalOutcome, ReversalRecord, StoreMode, VectorStorage};
 
+// ─── Keyword vector (LAB-7716) ──────────────────────────────────────────────
+//
+// BM25 over memory content lives in the memories collection itself, as a
+// named sparse vector beside the unnamed dense one. Qdrant tokenises and
+// weighs the text (its built-in `qdrant/bm25` inference) on both the write
+// and the query, so both sides always use one tokeniser, and the collection's
+// `idf` modifier supplies the corpus statistics at query time.
+
+/// Name of the sparse vector that holds a memory's BM25 term weights.
+pub const KEYWORD_VECTOR: &str = "bm25";
+/// Memories a keyword backfill reads and writes per request.
+const KEYWORD_FILL_BATCH: usize = 64;
+
+/// A BM25 inference document over `text`, for a write or a query. Qdrant's
+/// defaults: English stemming and stop words, the word tokeniser (which
+/// splits `LAB-7716` into `lab` and `7716`), k 1.2, b 0.75 and an average
+/// length of 256 tokens, close to the memories' mean of about 270 words.
+/// Qdrant requires the write and the query to use the same options, so they
+/// share this one function; changing an option means re-writing every
+/// keyword vector.
+fn bm25_document(text: &str) -> Value {
+    json!({ "text": text, "model": "qdrant/bm25" })
+}
+
+/// Every vector a stored memory carries: the unnamed dense embedding and the
+/// BM25 vector over its content. Qdrant's upsert replaces the whole point, so
+/// a write that leaves one out removes it.
+fn point_vectors(embedding: &[f32], content: &str) -> Value {
+    json!({ "": embedding, KEYWORD_VECTOR: bm25_document(content) })
+}
+
 // ─── Client ──────────────────────────────────────────────────────────────────
 
 pub struct QdrantClient {
@@ -101,11 +132,13 @@ impl QdrantClient {
         })
     }
 
-    /// Refuse a Qdrant that cannot make writes conditional. `update_mode`
-    /// (insert-only / update-only upserts) arrived in 1.17, and older servers
-    /// silently ignore it: an insert-only write would overwrite an existing
-    /// memory and an update-only write would resurrect a deleted one
-    /// (alaya#130). Returns the server version. `Config` when the version is
+    /// Refuse a Qdrant that cannot make writes conditional or hold the
+    /// keyword vector. `update_mode` (insert-only / update-only upserts)
+    /// arrived in 1.17, and older servers silently ignore it: an insert-only
+    /// write would overwrite an existing memory and an update-only write would
+    /// resurrect a deleted one (alaya#130). Adding a vector to an existing
+    /// collection, which `ensure_collection` does for the BM25 vector
+    /// (LAB-7716), arrived in 1.18. Returns the server version. `Config` when the version is
     /// too old or unreadable — retrying will not help; `Storage` when Qdrant
     /// could not be asked.
     pub async fn check_server_version(&self) -> Result<String> {
@@ -129,8 +162,8 @@ impl QdrantClient {
         match meets_min_version(version) {
             Some(true) => Ok(version.to_string()),
             Some(false) => Err(AlayaError::Config(format!(
-                "Qdrant {version} is too old: conditional writes need Qdrant >= {}.{} \
-                 (update_mode); an older server ignores it and would overwrite",
+                "Qdrant {version} is too old: alaya needs Qdrant >= {}.{} \
+                 (conditional writes, and adding the keyword vector in place)",
                 MIN_QDRANT_VERSION.0, MIN_QDRANT_VERSION.1
             ))),
             None => Err(AlayaError::Config(format!(
@@ -282,9 +315,9 @@ impl QdrantClient {
                         self.write_payload_if(&id, read_rev.as_deref(), &write, how)
                             .await
                     }
-                    Commit::Upsert { vector, .. } => {
+                    Commit::Upsert { vectors, .. } => {
                         let condition = (!created).then(|| rev_condition(read_rev.as_deref()));
-                        self.upsert_point(&id, vector, &write, condition).await
+                        self.upsert_point(&id, vectors, &write, condition).await
                     }
                 };
                 match sent {
@@ -396,12 +429,12 @@ impl QdrantClient {
     async fn upsert_point(
         &self,
         point_id: &str,
-        vector: &[f32],
+        vectors: &Value,
         payload: &Value,
         condition: Option<Value>,
     ) -> Result<()> {
         let mut body = json!({
-            "points": [{ "id": point_id, "vector": vector, "payload": payload }],
+            "points": [{ "id": point_id, "vector": vectors, "payload": payload }],
             "update_mode": if condition.is_some() { "update_only" } else { "insert_only" },
         });
         // `update_filter` takes a whole Filter; a bare condition is a 400.
@@ -430,13 +463,22 @@ impl QdrantClient {
     /// Run once at startup so a fresh Qdrant volume accepts writes with no
     /// manual `curl -X PUT` bootstrap (#31).
     ///
+    /// The main collection also carries the BM25 sparse vector
+    /// (`KEYWORD_VECTOR`, LAB-7716): created with it, or given it in place
+    /// when it lacks it (Qdrant >= 1.18). Adding the vector changes no point;
+    /// every point simply has no keyword vector until a store or the keyword
+    /// backfill writes one.
+    ///
     /// The main collection is required: an error propagates so the caller can
     /// retry (Qdrant may not be ready yet at boot). The `{collection}_tags`
     /// sidecar is best-effort — tag upserts and semantic-tag search are already
     /// non-fatal in the service layer, so its absence must not block startup.
     pub async fn ensure_collection(&self, dimensions: usize) -> Result<()> {
-        self.ensure_one(&self.collection, dimensions).await?;
-        if let Err(e) = self.ensure_one(&self.tag_collection, dimensions).await {
+        self.ensure_one(&self.collection, dimensions, true).await?;
+        if let Err(e) = self
+            .ensure_one(&self.tag_collection, dimensions, false)
+            .await
+        {
             tracing::warn!(
                 collection = %self.tag_collection,
                 error = %e,
@@ -447,12 +489,14 @@ impl QdrantClient {
     }
 
     /// Create `collection` with `dimensions`-wide Cosine vectors if it does not
-    /// already exist; a present collection is a no-op.
-    async fn ensure_one(&self, collection: &str, dimensions: usize) -> Result<()> {
-        // Existence probe: a 2xx means present (no-op), a 404 means absent
-        // (create). Any other status or a transport error is a real fault —
-        // propagate it so the startup retry backs off on the true cause rather
-        // than misreading it as "missing" and firing a doomed create.
+    /// already exist; with `keyword`, also the BM25 sparse vector, added in
+    /// place to a present collection that lacks it. Otherwise a present
+    /// collection is a no-op.
+    async fn ensure_one(&self, collection: &str, dimensions: usize, keyword: bool) -> Result<()> {
+        // Existence probe: a 2xx means present, a 404 means absent (create).
+        // Any other status or a transport error is a real fault — propagate it
+        // so the startup retry backs off on the true cause rather than
+        // misreading it as "missing" and firing a doomed create.
         let resp = self
             .client
             .get(format!("{}/collections/{}", self.base_url, collection))
@@ -462,14 +506,24 @@ impl QdrantClient {
 
         if resp.status().is_success() {
             tracing::debug!(collection = %collection, "Qdrant collection present");
-            return Ok(());
+            if !keyword {
+                return Ok(());
+            }
+            let info: Value = resp
+                .json()
+                .await
+                .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
+            return self.ensure_keyword_vector(collection, &info).await;
         }
         if resp.status() != reqwest::StatusCode::NOT_FOUND {
             return Err(qdrant_error(resp).await);
         }
 
         // Absent (404) → create with the configured vector size and Cosine distance.
-        let body = json!({ "vectors": { "size": dimensions, "distance": "Cosine" } });
+        let mut body = json!({ "vectors": { "size": dimensions, "distance": "Cosine" } });
+        if keyword {
+            body["sparse_vectors"] = json!({ KEYWORD_VECTOR: { "modifier": "idf" } });
+        }
         let resp = self
             .client
             .put(format!("{}/collections/{}", self.base_url, collection))
@@ -485,7 +539,46 @@ impl QdrantClient {
         tracing::info!(
             collection = %collection,
             dimensions,
+            keyword,
             "created Qdrant collection (distance=Cosine)"
+        );
+        Ok(())
+    }
+
+    /// Add the BM25 sparse vector to `collection` unless the collection info
+    /// `info` (`GET /collections/{c}`) already lists it. Presence is read from
+    /// `config.params.sparse_vectors`: Qdrant answers 200 to adding a vector
+    /// that is already there with the same config, and to deleting one that
+    /// is not, so no status says whether it exists.
+    async fn ensure_keyword_vector(&self, collection: &str, info: &Value) -> Result<()> {
+        let params = info
+            .pointer("/result/config/params")
+            .ok_or_else(|| AlayaError::Storage("Qdrant collection info has no config".into()))?;
+        if params
+            .get("sparse_vectors")
+            .and_then(|v| v.get(KEYWORD_VECTOR))
+            .is_some()
+        {
+            return Ok(());
+        }
+        let resp = self
+            .client
+            .put(format!(
+                "{}/collections/{}/vectors/{}?wait=true",
+                self.base_url, collection, KEYWORD_VECTOR
+            ))
+            .json(&json!({ "sparse": { "modifier": "idf" } }))
+            .send()
+            .await
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
+        if !resp.status().is_success() {
+            return Err(qdrant_error(resp).await);
+        }
+        tracing::info!(
+            collection = %collection,
+            vector = KEYWORD_VECTOR,
+            "added the BM25 sparse vector to the Qdrant collection; \
+             POST /backfill/keywords fills it for existing memories"
         );
         Ok(())
     }
@@ -501,11 +594,12 @@ impl QdrantClient {
 // landed; the token it conditioned on still in the log without its own means
 // it lost the race and rebuilds from a fresh read.
 
-/// Oldest Qdrant that honours `update_mode`; older servers ignore it. The
-/// protocol also assumes one copy of each point (single node,
-/// `replication_factor` 1): under Qdrant's default weak write ordering each
-/// replica evaluates a condition on its own.
-const MIN_QDRANT_VERSION: (u64, u64) = (1, 17);
+/// Oldest Qdrant alaya runs on: 1.17 honours `update_mode` (older servers
+/// ignore it), 1.18 adds a vector to an existing collection (the keyword
+/// vector, LAB-7716). The protocol also assumes one copy of each point
+/// (single node, `replication_factor` 1): under Qdrant's default weak write
+/// ordering each replica evaluates a condition on its own.
+const MIN_QDRANT_VERSION: (u64, u64) = (1, 18);
 /// Payload key: the revision token of the last write. Absent on points last
 /// written before conditional writes, which count as the zero revision.
 const REV: &str = "rev";
@@ -537,9 +631,10 @@ enum Commit<'a> {
     /// Upsert the point with `vector`: `update_only` with an `update_filter`
     /// on the revision read for a present point (the write `modify` built),
     /// `insert_only` of `insert` whenever a read finds it absent. For
-    /// `store`, one point at a time.
+    /// `store`, one point at a time. `vectors` is every vector the point
+    /// carries (`point_vectors`).
     Upsert {
-        vector: &'a [f32],
+        vectors: &'a Value,
         insert: &'a Value,
     },
 }
@@ -583,7 +678,7 @@ enum Landed {
     Gone,
 }
 
-/// Whether `version` (e.g. `1.17.1`) is at least `MIN_QDRANT_VERSION`;
+/// Whether `version` (e.g. `1.18.0`) is at least `MIN_QDRANT_VERSION`;
 /// `None` when it does not parse.
 fn meets_min_version(version: &str) -> Option<bool> {
     let mut parts = version.trim().split('.');
@@ -1054,7 +1149,56 @@ async fn qdrant_error(resp: reqwest::Response) -> AlayaError {
     AlayaError::Storage(format!("Qdrant {status}: {body}"))
 }
 
+/// Points with no keyword vector. `has_vector` is a vector-storage check, so
+/// it is reliable where an `is_null` payload check is not.
+fn missing_keyword_vector() -> Value {
+    json!({ "must_not": [{ "has_vector": KEYWORD_VECTOR }] })
+}
+
 impl QdrantClient {
+    /// Set the keyword vector of each of `points` (`{id, vector}`), touching
+    /// no other vector and no payload. Qdrant rejects the whole request with
+    /// a 404 when one point is gone, after writing the rest, so a 404 is
+    /// retried point by point and the gone ones skipped. Returns how many
+    /// points it wrote.
+    async fn write_keyword_vectors(&self, points: &[Value]) -> Result<usize> {
+        if points.is_empty() {
+            return Ok(0);
+        }
+        let put = |points: &[Value]| {
+            self.client
+                .put(format!(
+                    "{}/collections/{}/points/vectors?wait=true",
+                    self.base_url, self.collection
+                ))
+                .json(&json!({ "points": points }))
+                .send()
+        };
+        let resp = put(points)
+            .await
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
+        if resp.status().is_success() {
+            return Ok(points.len());
+        }
+        if resp.status() != reqwest::StatusCode::NOT_FOUND {
+            return Err(qdrant_error(resp).await);
+        }
+        let mut written = 0;
+        for point in points {
+            let resp = put(std::slice::from_ref(point))
+                .await
+                .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
+            if resp.status().is_success() {
+                written += 1;
+            } else if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                tracing::debug!(id = %point["id"], "memory deleted before its keyword vector was written");
+            } else {
+                return Err(qdrant_error(resp).await);
+            }
+        }
+        Ok(written)
+    }
+
     /// Retrieve one raw point (payload, no vector) by id; `None` when absent.
     async fn retrieve_point(&self, point_id: &str) -> Result<Option<Value>> {
         Ok(self
@@ -1116,6 +1260,7 @@ impl VectorStorage for QdrantClient {
             .ok_or_else(|| AlayaError::Validation("memory has no embedding".into()))?;
 
         let fresh = memory_to_payload(memory);
+        let vectors = point_vectors(embedding, &memory.content);
 
         let _write = self.write_lock.lock().await;
 
@@ -1133,7 +1278,7 @@ impl VectorStorage for QdrantClient {
                 std::slice::from_ref(&point_id),
                 None,
                 Commit::Upsert {
-                    vector: embedding,
+                    vectors: &vectors,
                     insert: &fresh,
                 },
                 |prev| {
@@ -1593,6 +1738,135 @@ impl VectorStorage for QdrantClient {
                     .map(String::from)
             })
             .collect())
+    }
+
+    #[tracing::instrument(skip_all, fields(limit = limit))]
+    async fn search_by_text(
+        &self,
+        query: &str,
+        limit: usize,
+        filters: Option<PayloadFilter>,
+    ) -> Result<Vec<ScoredMemory>> {
+        let mut body = json!({
+            "query": bm25_document(query),
+            "using": KEYWORD_VECTOR,
+            "limit": limit,
+            "with_payload": true,
+            "with_vector": false,
+        });
+        if let Some(ref f) = filters {
+            let filter = build_filter(f);
+            if filter != json!({}) {
+                body["filter"] = filter;
+            }
+        }
+
+        let resp = self
+            .client
+            .post(format!(
+                "{}/collections/{}/points/query",
+                self.base_url, self.collection
+            ))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
+        if !resp.status().is_success() {
+            return Err(qdrant_error(resp).await);
+        }
+        let data: QdrantResponse<ScrollResponse> = resp
+            .json()
+            .await
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
+        let points = data
+            .result
+            .ok_or_else(|| AlayaError::Storage("Qdrant query returned no result".into()))?
+            .points;
+        Ok(points.iter().filter_map(point_to_scored).collect())
+    }
+
+    async fn count_missing_keyword_vectors(&self) -> Result<usize> {
+        let body = json!({ "filter": missing_keyword_vector(), "exact": true });
+        let resp = self
+            .client
+            .post(format!(
+                "{}/collections/{}/points/count",
+                self.base_url, self.collection
+            ))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
+        if !resp.status().is_success() {
+            return Err(qdrant_error(resp).await);
+        }
+        let data: QdrantResponse<CountResponse> = resp
+            .json()
+            .await
+            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
+        data.result
+            .map(|r| r.count)
+            .ok_or_else(|| AlayaError::Storage("Qdrant count returned no result".into()))
+    }
+
+    #[tracing::instrument(skip_all, fields(limit = limit))]
+    async fn fill_keyword_vectors(&self, limit: usize) -> Result<usize> {
+        let mut written = 0;
+        // The cursor only bounds this run: written memories leave the
+        // filter, and one this run cannot index (no content) stays in it.
+        let mut offset: Option<Value> = None;
+        while written < limit {
+            let mut body = json!({
+                "filter": missing_keyword_vector(),
+                "limit": KEYWORD_FILL_BATCH.min(limit - written),
+                "with_payload": ["content"],
+                "with_vector": false,
+            });
+            if let Some(o) = offset.take() {
+                body["offset"] = o;
+            }
+            let resp = self
+                .client
+                .post(format!(
+                    "{}/collections/{}/points/scroll",
+                    self.base_url, self.collection
+                ))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
+            if !resp.status().is_success() {
+                return Err(qdrant_error(resp).await);
+            }
+            let data: QdrantResponse<ScrollResponse> = resp
+                .json()
+                .await
+                .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
+            let page = data
+                .result
+                .ok_or_else(|| AlayaError::Storage("Qdrant scroll returned no result".into()))?;
+
+            let mut points = Vec::with_capacity(page.points.len());
+            for p in &page.points {
+                let (Some(id), Some(content)) = (
+                    p.get("id"),
+                    p.pointer("/payload/content").and_then(Value::as_str),
+                ) else {
+                    tracing::warn!(id = ?p.get("id"), "memory has no content to index; skipped");
+                    continue;
+                };
+                points.push(
+                    json!({ "id": id, "vector": { KEYWORD_VECTOR: bm25_document(content) } }),
+                );
+            }
+            written += self.write_keyword_vectors(&points).await?;
+
+            match page.next_page_offset {
+                Some(next) if !next.is_null() => offset = Some(next),
+                _ => break,
+            }
+        }
+        Ok(written)
     }
 
     async fn upsert_tags(&self, tags: &[(&str, Vec<f32>)]) -> Result<()> {
@@ -2417,13 +2691,14 @@ mod tests {
     }
 
     #[test]
-    fn meets_min_version_requires_1_17() {
+    fn meets_min_version_requires_1_18() {
         for (version, want) in [
             ("1.16.3", Some(false)),
             ("0.99.0", Some(false)),
-            ("1.17.0", Some(true)),
-            ("1.17.1", Some(true)),
+            ("1.17.1", Some(false)),
+            ("1.18.0", Some(true)),
             ("1.18.0-dev", Some(true)),
+            ("1.19.1", Some(true)),
             ("2.0.0", Some(true)),
             ("garbage", None),
             ("1", None),
@@ -2565,6 +2840,98 @@ mod tests {
         assert_eq!(apply_patch(&stored(), &patch, 9.0), want);
     }
 
+    /// LAB-7716: Qdrant rejects a whole `PUT /points/vectors` with a 404
+    /// when one point is gone (after writing the others), so the backfill
+    /// retries point by point and skips the gone one instead of failing.
+    #[cfg(not(target_arch = "wasm32"))]
+    mod keyword_fill {
+        use super::*;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[tokio::test]
+        async fn a_point_deleted_mid_backfill_is_skipped() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/collections/memories/points/scroll"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "result": {
+                        "points": [
+                            {"id": "p1", "payload": {"content": "kept"}},
+                            {"id": "p2", "payload": {"content": "deleted meanwhile"}},
+                            {"id": "p3", "payload": {}},
+                        ],
+                        "next_page_offset": null,
+                    },
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            // p2 is gone: any request naming it 404s, the batch included.
+            Mock::given(method("PUT"))
+                .and(path("/collections/memories/points/vectors"))
+                .respond_with(|req: &wiremock::Request| {
+                    let body: Value = serde_json::from_slice(&req.body).unwrap();
+                    let names_p2 = body["points"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|p| p["id"] == "p2");
+                    if names_p2 {
+                        ResponseTemplate::new(404)
+                    } else {
+                        ResponseTemplate::new(200).set_body_json(json!({"result": {}}))
+                    }
+                })
+                .mount(&server)
+                .await;
+
+            let written = QdrantClient::new(server.uri(), "memories".into(), None)
+                .unwrap()
+                .fill_keyword_vectors(10)
+                .await
+                .expect("a gone point is not an error");
+            assert_eq!(written, 1);
+
+            let reqs = server.received_requests().await.unwrap();
+            let bodies: Vec<Value> = reqs
+                .iter()
+                .filter(|r| r.method.as_str() == "PUT")
+                .map(|r| serde_json::from_slice(&r.body).unwrap())
+                .collect();
+            // One batch (p3 has no content to index), then one PUT per point.
+            assert_eq!(bodies.len(), 3, "{bodies:?}");
+            assert_eq!(bodies[0]["points"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                bodies[0]["points"][0],
+                json!({"id": "p1", "vector": {"bm25": {"text": "kept", "model": "qdrant/bm25"}}}),
+                "only the keyword vector, no payload"
+            );
+        }
+
+        #[tokio::test]
+        async fn any_other_write_error_fails_the_run() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/collections/memories/points/scroll"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "result": {"points": [{"id": "p1", "payload": {"content": "x"}}]},
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+            let err = QdrantClient::new(server.uri(), "memories".into(), None)
+                .unwrap()
+                .fill_keyword_vectors(10)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AlayaError::Storage(_)), "{err:?}");
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     mod server_version {
         use super::*;
@@ -2593,15 +2960,15 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn accepts_a_qdrant_that_honours_update_mode() {
-            assert_eq!(check(root(Some("1.17.1"))).await.unwrap(), "1.17.1");
+        async fn accepts_a_qdrant_that_can_add_the_keyword_vector() {
+            assert_eq!(check(root(Some("1.18.0"))).await.unwrap(), "1.18.0");
         }
 
         #[tokio::test]
         async fn refuses_an_older_qdrant_naming_its_version() {
-            let err = check(root(Some("1.16.3"))).await.unwrap_err();
+            let err = check(root(Some("1.17.1"))).await.unwrap_err();
             assert!(
-                matches!(err, AlayaError::Config(ref m) if m.contains("1.16.3")),
+                matches!(err, AlayaError::Config(ref m) if m.contains("1.17.1")),
                 "{err:?}"
             );
         }

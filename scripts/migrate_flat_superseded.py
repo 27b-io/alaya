@@ -10,7 +10,7 @@ server's compare-and-set protocol (alaya#130): the nested metadata.superseded_by
 in (an existing nested value wins; the flat key is only the fallback), the literal flat
 key comes out, and a fresh `rev` is stamped onto `rev_log`. The write applies only while
 the point still carries the `rev` just read, so a concurrent alaya-server write is never
-rolled back; a lost race is re-read and retried. Needs Qdrant >= 1.17, like the server.
+rolled back; a lost race is re-read and retried. Needs Qdrant >= 1.17 (the server needs 1.18).
 
 Only write once EVERY alaya-server process runs a compare-and-set build. An older
 server changes points without stamping `rev`, so this whole-payload write could

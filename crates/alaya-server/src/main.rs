@@ -51,8 +51,8 @@ use alaya_backends::{
 use alaya_core::calendar::utc_date_str;
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{
-    JudgeOutcome, MemoryService, OutputMode, RankingFlags, RelationParams, SearchParams,
-    StoreParams, parse_user_relation,
+    JudgeOutcome, KeywordLeg, MemoryService, OutputMode, RankingFlags, RelationParams,
+    SearchParams, StoreParams, parse_user_relation,
 };
 use alaya_core::vitals::{CountingEmbedding, SelfCheckOutcome, Vitals};
 use alaya_types::graph::{Contradiction, ContradictionQuery, Resolution};
@@ -618,7 +618,8 @@ async fn init_l2_cache() -> Option<cachekit::CacheKit> {
 
 /// Refuse to run against a Qdrant that cannot make writes conditional
 /// (alaya#130): below 1.17 `update_mode` is silently ignored, so an insert-only
-/// write overwrites and an update-only write resurrects. Retries while Qdrant is
+/// write overwrites and an update-only write resurrects. Below 1.18 the keyword
+/// vector cannot be added to an existing collection (LAB-7716). Retries while Qdrant is
 /// unreachable (cluster cold start, as `ensure_qdrant_collection`), then panics —
 /// `supervise` turns that into exit 101 — on a version that is too old or
 /// unreadable, or when Qdrant never answers: without a verified version no write
@@ -842,6 +843,12 @@ pub(crate) enum CmdInner {
         rejudge: bool,
         reply: oneshot::Sender<Value>,
     },
+    /// Write the BM25 keyword vector of up to `limit` memories that have
+    /// none (LAB-7716).
+    BackfillKeywords {
+        limit: usize,
+        reply: oneshot::Sender<Value>,
+    },
     /// `GET /stats` (LAB-6881): corpus counts, contradiction-judge
     /// aggregates and this process's judge daily cap. Read-only.
     Stats {
@@ -864,7 +871,8 @@ impl CmdInner {
             CmdInner::FindDuplicates { .. }
             | CmdInner::MergeDuplicates { .. }
             | CmdInner::BackfillSummaries { .. }
-            | CmdInner::BackfillContradictions { .. } => LONG_CMD_DEADLINE,
+            | CmdInner::BackfillContradictions { .. }
+            | CmdInner::BackfillKeywords { .. } => LONG_CMD_DEADLINE,
             _ => CMD_DEADLINE,
         }
     }
@@ -889,6 +897,7 @@ impl Cmd {
             CmdInner::Patch { .. } => "patch",
             CmdInner::BackfillSummaries { .. } => "backfill_summaries",
             CmdInner::BackfillContradictions { .. } => "backfill_contradictions",
+            CmdInner::BackfillKeywords { .. } => "backfill_keywords",
             CmdInner::Stats { .. } => "stats",
             CmdInner::SelfCheck { .. } => "selfcheck",
         }
@@ -1369,6 +1378,10 @@ async fn service_worker(
     // and overlapping runs contend for the graph (see the bridge handler),
     // so a refresh while one is in flight is refused rather than stacked.
     let stats_running = std::rc::Rc::new(std::cell::Cell::new(false));
+    // Keyword backfill single-flight: an operator retry after the reply
+    // deadline would otherwise scan and write beside a pass still running.
+    // Per process, like the others; two passes only rewrite the same vectors.
+    let keyword_fill_running = std::rc::Rc::new(std::cell::Cell::new(false));
     let judge_limiter = std::rc::Rc::new(std::cell::RefCell::new(JudgeDailyCap::new(
         limits.judge_daily_cap,
     )));
@@ -2033,6 +2046,45 @@ async fn service_worker(
                     .instrument(span),
                 );
             }
+            CmdInner::BackfillKeywords { reply, .. } if keyword_fill_running.get() => {
+                let _ = reply.send(json!({
+                    "success": false,
+                    "error": "keyword backfill already running"
+                }));
+            }
+            CmdInner::BackfillKeywords { limit, reply } => {
+                let flight = InFlight::start(&keyword_fill_running);
+                let span = tracing::info_span!(parent: &ps, "backfill_keywords", limit = limit);
+                let svc = svc.clone();
+                let deadline = limits.long;
+                // Spawned: a pass over the whole corpus must not hold up the
+                // stores and searches queued behind it.
+                tokio::task::spawn_local(
+                    async move {
+                        let _flight = flight;
+                        let result = match timeout(deadline, svc.fill_keyword_vectors(limit)).await
+                        {
+                            Ok(Ok(r)) => {
+                                tracing::info!(
+                                    op,
+                                    written = r["written"].as_u64(),
+                                    missing = r["missing"].as_u64(),
+                                    elapsed_ms = ms(start),
+                                    "ok"
+                                );
+                                r
+                            }
+                            Ok(Err(e)) => {
+                                log_err(op, &e, start);
+                                json!({"success": false, "error": e.safe_message()})
+                            }
+                            Err(_) => deadline_exceeded(op, deadline, start),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    .instrument(span),
+                );
+            }
             CmdInner::Stats { reply } if stats_running.get() => {
                 let _ = reply.send(json!({
                     "success": false,
@@ -2146,10 +2198,11 @@ fn parse_provider(var: &str, raw: Option<String>, fallback: Provider) -> Result<
     })
 }
 
-/// The `RANK_*` switches (LAB-7714). Unset leaves every boost on. Set, a
-/// switch takes only `true` or `false`, and the exempt list only known memory
-/// types with no empty entry, so a typo refuses boot instead of silently
-/// ranking as before. Read raw, not through `env_non_empty`: a blank value is
+/// The `RANK_*` switches (LAB-7714). Unset leaves every boost on and the tag
+/// keyword leg. Set, a switch takes only `true` or `false`, the exempt list
+/// only known memory types with no empty entry, and `RANK_KEYWORD_LEG`
+/// (LAB-7716) only `tags`, `bm25` or `both`, so a typo refuses boot instead of
+/// silently ranking as before. Read raw, not through `env_non_empty`: a blank value is
 /// set, and an operator who blanked one meant something by it.
 fn parse_ranking(env: impl Fn(&str) -> Option<String>) -> Result<RankingFlags, String> {
     let switch = |var: &str| match env(var) {
@@ -2177,11 +2230,23 @@ fn parse_ranking(env: impl Fn(&str) -> Option<String>) -> Result<RankingFlags, S
             })
             .collect::<Result<Vec<_>, _>>()?,
     };
+    let keyword_leg = match env("RANK_KEYWORD_LEG") {
+        None => KeywordLeg::Tags,
+        Some(s) => {
+            let want = s.trim().to_ascii_lowercase();
+            KeywordLeg::ALL
+                .iter()
+                .find(|(name, _)| *name == want)
+                .map(|(_, leg)| *leg)
+                .ok_or_else(|| format!("RANK_KEYWORD_LEG must be tags, bm25 or both, got {s:?}"))?
+        }
+    };
     Ok(RankingFlags {
         access_salience: switch("RANK_ACCESS_BOOST")?,
         spacing: switch("RANK_SPACING_BOOST")?,
         graph: switch("RANK_GRAPH_BOOST")?,
         decay_exempt_types,
+        keyword_leg,
     })
 }
 
@@ -2795,6 +2860,7 @@ fn main() {
             spacing_boost = config.ranking.spacing,
             graph_boost = config.ranking.graph,
             decay_exempt_types = ?config.ranking.decay_exempt_types,
+            keyword_leg = ?config.ranking.keyword_leg,
             "hybrid ranking switches"
         );
 
@@ -3027,6 +3093,7 @@ fn protected_router(handle: ServiceHandle, auth_state: AuthState) -> Router {
         .route("/memories/{content_hash}/relations", get(get_relations))
         .route("/backfill/summaries", post(backfill_summaries))
         .route("/backfill/contradictions", post(backfill_contradictions))
+        .route("/backfill/keywords", post(backfill_keywords))
         .route("/stats", get(stats))
         .layer(middleware::from_fn_with_state(
             auth_state,
@@ -3616,6 +3683,49 @@ async fn backfill_contradictions(
     .await
 }
 
+/// Memories one keyword backfill call writes at most. A batch of 64 takes
+/// Qdrant well under a second, so a full-size call ends far inside the long
+/// command deadline; a larger corpus takes more calls.
+const MAX_KEYWORD_FILL_LIMIT: usize = 20_000;
+
+#[derive(Deserialize)]
+struct BackfillKeywordsParams {
+    #[serde(default = "default_keyword_fill_limit")]
+    limit: usize,
+}
+fn default_keyword_fill_limit() -> usize {
+    5_000
+}
+
+/// Operator-only (same auth class as the other backfills, enforced in
+/// `auth::rest_route_op`). Blocks until the pass completes and returns
+/// `{written, missing}`; repeat until `missing` is 0. Selects memories with no
+/// keyword vector each time, so a re-run after a rollout repairs any that an
+/// older server re-stored without one.
+async fn backfill_keywords(
+    axum::extract::State(h): axum::extract::State<ServiceHandle>,
+    Json(params): Json<BackfillKeywordsParams>,
+) -> (StatusCode, Json<Value>) {
+    if !(1..=MAX_KEYWORD_FILL_LIMIT).contains(&params.limit) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "error": format!("limit must be 1..={MAX_KEYWORD_FILL_LIMIT}")
+            })),
+        );
+    }
+    let (tx, rx) = oneshot::channel();
+    h.call(
+        CmdInner::BackfillKeywords {
+            limit: params.limit,
+            reply: tx,
+        },
+        rx,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3891,6 +4001,7 @@ mod tests {
             ("RANK_SPACING_BOOST", "FALSE"),
             ("RANK_GRAPH_BOOST", " false "),
             ("RANK_DECAY_EXEMPT_TYPES", " decision, reference"),
+            ("RANK_KEYWORD_LEG", " Both "),
         ]))
         .unwrap();
         assert_eq!(
@@ -3900,8 +4011,17 @@ mod tests {
                 spacing: false,
                 graph: false,
                 decay_exempt_types: vec!["decision".into(), "reference".into()],
+                keyword_leg: KeywordLeg::Both,
             }
         );
+        for (value, leg) in [
+            ("tags", KeywordLeg::Tags),
+            ("bm25", KeywordLeg::Bm25),
+            ("BM25", KeywordLeg::Bm25),
+        ] {
+            let got = parse_ranking(|v| (v == "RANK_KEYWORD_LEG").then(|| value.to_string()));
+            assert_eq!(got.unwrap().keyword_leg, leg, "{value:?}");
+        }
         assert_eq!(
             parse_ranking(env(&[("RANK_GRAPH_BOOST", "true")])).unwrap(),
             RankingFlags::default()
@@ -3921,6 +4041,10 @@ mod tests {
             ("RANK_DECAY_EXEMPT_TYPES", ","),
             ("RANK_DECAY_EXEMPT_TYPES", "decision,"),
             ("RANK_DECAY_EXEMPT_TYPES", "decision,,reference"),
+            ("RANK_KEYWORD_LEG", ""),
+            ("RANK_KEYWORD_LEG", " "),
+            ("RANK_KEYWORD_LEG", "keywords"),
+            ("RANK_KEYWORD_LEG", "tags,bm25"),
         ] {
             let err = parse_ranking(|v| (v == var).then(|| value.to_string())).unwrap_err();
             assert!(err.starts_with(var), "{var}={value:?}: {err}");

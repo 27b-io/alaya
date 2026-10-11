@@ -149,7 +149,7 @@ Migrations: none for the Rust server itself, but if you change `EMBEDDING_MODEL`
 If you'd rather run native binaries:
 
 ```bash
-# 1. Bring up the three external backends however you like — falkordb, qdrant (1.17 or
+# 1. Bring up the three external backends however you like — falkordb, qdrant (1.18 or
 #    newer: alaya-server refuses an older one), tei.
 
 # 2. Point at them and run:

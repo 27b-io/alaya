@@ -186,6 +186,46 @@ pub trait VectorStorage {
     async fn search_similar_tags(&self, tag_embedding: &[f32], limit: usize)
     -> Result<Vec<String>>;
 
+    // Keyword (BM25) index over memory content (LAB-7716)
+
+    /// BM25 keyword search over memory content, best match first. A memory
+    /// whose keyword vector has not been written yet is not found. `filters`
+    /// apply as for `search_by_vector`. Default: unsupported, so a backend
+    /// that lacks it reports an error rather than an empty pool.
+    async fn search_by_text(
+        &self,
+        query: &str,
+        limit: usize,
+        filters: Option<PayloadFilter>,
+    ) -> Result<Vec<ScoredMemory>> {
+        let _ = (query, limit, filters);
+        Err(AlayaError::Storage(
+            "keyword search is not supported by this backend".into(),
+        ))
+    }
+
+    /// How many memories have no keyword vector, superseded ones included.
+    /// Read-only. Default: unsupported.
+    async fn count_missing_keyword_vectors(&self) -> Result<usize> {
+        Err(AlayaError::Storage(
+            "the keyword index is not supported by this backend".into(),
+        ))
+    }
+
+    /// Write the keyword vector of up to `limit` memories that have none,
+    /// and nothing else: no payload key and no revision changes, so no
+    /// conditional writer loses a race to it. Selects by "keyword vector
+    /// missing", never by a saved cursor, so a later run also repairs a
+    /// memory that a write without the vector (a server from before the
+    /// keyword index, mid-rollout) re-stored. A memory deleted meanwhile is
+    /// skipped. Returns how many it wrote. Default: unsupported.
+    async fn fill_keyword_vectors(&self, limit: usize) -> Result<usize> {
+        let _ = limit;
+        Err(AlayaError::Storage(
+            "the keyword index is not supported by this backend".into(),
+        ))
+    }
+
     /// Upsert tag embeddings into the tag collection.
     /// Each entry is `(tag_name, embedding_vector)`.
     async fn upsert_tags(&self, tags: &[(&str, Vec<f32>)]) -> Result<()>;

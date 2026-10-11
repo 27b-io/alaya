@@ -1,8 +1,8 @@
 //! Corpus and contradiction-judge statistics (LAB-6881) behind `GET /stats`.
 //!
-//! Read-only by construction: one vector-store count, one vector-store scroll
-//! of the window's writes and two graph aggregates, nothing else — no access
-//! bump, no edge write. Each call degrades on its own: a failed call nulls
+//! Read-only by construction: two vector-store counts, one vector-store
+//! scroll of the window's writes and two graph aggregates, nothing else — no
+//! access bump, no edge write. Each call degrades on its own: a failed call nulls
 //! its section and adds an error note, and never reads as zero.
 
 use std::collections::BTreeMap;
@@ -46,8 +46,9 @@ impl MemoryService {
         let today = (now / DAY_SECS).floor() as i64;
         let first_day = today - (STATS_WINDOW_DAYS - 1);
         let since = first_day as f64 * DAY_SECS;
-        let (total, novelty, graph, contradictions) = futures::join!(
+        let (total, missing_keyword, novelty, graph, contradictions) = futures::join!(
             self.vectors.count(),
+            self.vectors.count_missing_keyword_vectors(),
             self.vectors.write_novelty(since),
             self.graph.get_stats(),
             self.graph.get_contradiction_stats(since),
@@ -63,6 +64,11 @@ impl MemoryService {
             }
         };
         let memories = section("vector store", total.map(|n| json!({ "total": n })));
+        // Keyword backfill progress (LAB-7716): 0 once every memory has one.
+        let keyword_index = section(
+            "keyword index",
+            missing_keyword.map(|n| json!({ "missing": n })),
+        );
         let writes = section(
             "write novelty",
             novelty.map(|rows| json!({ "novelty": novelty_per_day(&rows, first_day, today) })),
@@ -75,6 +81,7 @@ impl MemoryService {
 
         json!({
             "memories": memories,
+            "keyword_index": keyword_index,
             "graph": graph,
             "contradictions": contradictions,
             "writes": writes,
@@ -348,6 +355,12 @@ mod tests {
                 return Err(AlayaError::Storage("qdrant down".into()));
             }
             Ok(1234)
+        }
+        async fn count_missing_keyword_vectors(&self) -> Result<usize> {
+            if self.fail {
+                return Err(AlayaError::Storage("qdrant down".into()));
+            }
+            Ok(34)
         }
         async fn write_novelty(&self, since: f64) -> Result<Vec<(f64, Option<f64>)>> {
             if self.fail {
@@ -706,6 +719,7 @@ mod tests {
         assert_eq!(since.get(), (TODAY - 13) as f64 * DAY_SECS);
         assert_eq!(v["errors"], json!([]));
         assert_eq!(v["memories"], json!({ "total": 1234 }));
+        assert_eq!(v["keyword_index"], json!({ "missing": 34 }));
         assert_eq!(
             v["graph"],
             json!({ "node_count": 50, "edge_counts": {
@@ -771,7 +785,7 @@ mod tests {
         );
     }
 
-    /// Qdrant down nulls both vector sections with a note, never zeros, and
+    /// Qdrant down nulls every vector section with a note, never zeros, and
     /// keeps the graph's.
     #[tokio::test]
     async fn vector_store_unavailable_nulls_memories_and_writes() {
@@ -780,10 +794,16 @@ mod tests {
 
         assert_eq!(writes.get(), 0);
         assert!(v["memories"].is_null());
+        assert!(v["keyword_index"].is_null(), "never zeros: {v}");
         assert!(v["writes"].is_null(), "never zeros: {v}");
         assert!(v["graph"].is_object());
         let errors = v["errors"].as_array().unwrap();
-        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.as_str().unwrap().starts_with("keyword index:"))
+        );
         assert!(
             errors
                 .iter()

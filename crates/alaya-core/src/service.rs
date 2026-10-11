@@ -258,6 +258,8 @@ pub struct RankingFlags {
     pub graph: bool,
     /// Memory types recency decay skips.
     pub decay_exempt_types: Vec<String>,
+    /// The keyword pools fused beside the dense one (LAB-7716).
+    pub keyword_leg: KeywordLeg,
 }
 
 impl Default for RankingFlags {
@@ -267,7 +269,39 @@ impl Default for RankingFlags {
             spacing: true,
             graph: true,
             decay_exempt_types: Vec::new(),
+            keyword_leg: KeywordLeg::Tags,
         }
+    }
+}
+
+/// Which keyword pools hybrid search fuses with the dense one (LAB-7716).
+/// Each pool has its own RRF ranks at weight `1 - alpha`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeywordLeg {
+    /// The tag pools: memories tagged with a query word, plus memories
+    /// tagged with a tag whose embedding is near the query's. No memory
+    /// content is keyword-matched.
+    Tags,
+    /// BM25 over memory content instead of the tag pools.
+    Bm25,
+    /// The tag pools and BM25: three-way fusion.
+    Both,
+}
+
+impl KeywordLeg {
+    /// Every leg, by the name `RANK_KEYWORD_LEG` takes.
+    pub const ALL: [(&'static str, KeywordLeg); 3] = [
+        ("tags", KeywordLeg::Tags),
+        ("bm25", KeywordLeg::Bm25),
+        ("both", KeywordLeg::Both),
+    ];
+
+    fn tags(self) -> bool {
+        self != KeywordLeg::Bm25
+    }
+
+    fn bm25(self) -> bool {
+        self != KeywordLeg::Tags
     }
 }
 
@@ -859,6 +893,17 @@ impl MemoryService {
         }
     }
 
+    /// The keyword backfill (LAB-7716): write the BM25 vector of up to
+    /// `limit` memories that have none, then count how many still have none.
+    /// Writes only that vector (see `VectorStorage::fill_keyword_vectors`), so
+    /// it runs safely beside live traffic and is safe to re-run; a run after a
+    /// rollout repairs memories an older server re-stored without it.
+    pub async fn fill_keyword_vectors(&self, limit: usize) -> Result<Value> {
+        let written = self.vectors.fill_keyword_vectors(limit).await?;
+        let missing = self.vectors.count_missing_keyword_vectors().await?;
+        Ok(serde_json::json!({ "success": true, "written": written, "missing": missing }))
+    }
+
     // ─── Tool 2: search ─────────────────────────────────────────────────
 
     /// Default-policy wrapper — runs Hybrid with full side effects.
@@ -923,15 +968,24 @@ impl MemoryService {
             std::cmp::max(params.page_size * 3, params.page * params.page_size),
             100,
         );
+        let leg = self.ranking.keyword_leg;
+
+        let filter = PayloadFilter {
+            memory_type: params.memory_type.clone(),
+            min_trust_score: params.min_trust_score,
+            ..Default::default()
+        };
 
         // Stage 1: Fan-out — embed starts immediately (no tag dependency),
-        // tags→keywords→tag_search chains as a concurrent branch.
+        // tags→keywords→tag_search chains as a concurrent branch, and the
+        // BM25 search (it needs no embedding) as another. A leg the flag
+        // leaves out returns an empty pool without a backend call.
         //
         // Each stage span is attached to the stage's future, never entered
         // around an await: an entered span stays entered on the thread while
         // the search is parked, so a task the LocalSet polls meanwhile (an
         // inline store) would log inside it.
-        let (embed_result, mut tag_results, corpus_size, n_keywords) = async {
+        let (embed_result, mut tag_results, bm25_results, corpus_size, n_keywords) = async {
             let _stage = stages.stage(Stage::FanOut);
             let query_texts = [params.query.as_str()];
             let embed_fut = stages.time(
@@ -940,6 +994,9 @@ impl MemoryService {
             );
 
             let tag_search_fut = async {
+                if !leg.tags() {
+                    return (Vec::new(), 0);
+                }
                 let all_tags = stages
                     .time(Stage::Tags, async {
                         let cached = self.tag_cache.borrow().clone();
@@ -983,10 +1040,29 @@ impl MemoryService {
                 (results, n_keywords)
             };
 
+            let bm25_fut = async {
+                if !leg.bm25() {
+                    return Vec::new();
+                }
+                let search =
+                    self.vectors
+                        .search_by_text(&params.query, fetch_size, Some(filter.clone()));
+                // Non-fatal like the tag pools, but never silent: a backend
+                // that cannot answer leaves the search dense-only.
+                stages
+                    .time(Stage::Bm25Search, search)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "BM25 search failed (non-fatal); no keyword pool");
+                        Vec::new()
+                    })
+            };
+
             let count_fut = stages.time(Stage::Count, self.vectors.count());
 
-            let (embed, (tags, n_kw), count) = futures::join!(embed_fut, tag_search_fut, count_fut);
-            (embed, tags, count, n_kw)
+            let (embed, (tags, n_kw), bm25, count) =
+                futures::join!(embed_fut, tag_search_fut, bm25_fut, count_fut);
+            (embed, tags, bm25, count, n_kw)
         }
         .instrument(tracing::info_span!("fan_out"))
         .await;
@@ -996,12 +1072,7 @@ impl MemoryService {
             .next()
             .ok_or_else(|| AlayaError::Embedding("empty embedding result".into()))?;
         let alpha = hybrid_search::get_adaptive_alpha(corpus_size.unwrap_or(0), n_keywords);
-
-        let filter = PayloadFilter {
-            memory_type: params.memory_type.clone(),
-            min_trust_score: params.min_trust_score,
-            ..Default::default()
-        };
+        let mut bm25_results = bm25_results;
 
         // Stage 2: Vector search + semantic tag pipeline run concurrently.
         // search_similar_tags→search_by_tags chains inside one branch so the
@@ -1013,6 +1084,9 @@ impl MemoryService {
                     .search_by_vector(&query_embedding, fetch_size, Some(filter));
 
             let semantic_pipeline_fut = async {
+                if !leg.tags() {
+                    return Vec::new();
+                }
                 let tags = self
                     .vectors
                     .search_similar_tags(&query_embedding, 10)
@@ -1055,13 +1129,14 @@ impl MemoryService {
 
         // Drop superseded, wrong-type and below-trust memories from every
         // candidate pool before fusion, so excluded entries consume no RRF
-        // ranks, rerank slots, or spreading-activation seeds. Neither
-        // search_by_vector nor search_by_tags filters supersession (see
-        // is_superseded). Both apply memory_type Qdrant-side, so wrong-type
-        // hits cannot crowd the right type out of fetch_size; checking it
-        // again here keeps one predicate for every pool, graph injection
-        // included. Both also apply min_trust_score Qdrant-side; graph
-        // neighbours rely on this check alone for both.
+        // ranks, rerank slots, or spreading-activation seeds. None of
+        // search_by_vector, search_by_tags and search_by_text filters
+        // supersession (see is_superseded). All three apply memory_type
+        // Qdrant-side, so wrong-type hits cannot crowd the right type out of
+        // fetch_size; checking it again here keeps one predicate for every
+        // pool, graph injection included. All three also apply
+        // min_trust_score Qdrant-side; graph neighbours rely on this check
+        // alone for both.
         let admits = |m: &Memory| {
             (params.include_superseded || !is_superseded(m))
                 && params
@@ -1072,13 +1147,16 @@ impl MemoryService {
         };
         vector_results.retain(|sm| admits(&sm.memory));
         tag_results.retain(|sm| admits(&sm.memory));
+        bm25_results.retain(|sm| admits(&sm.memory));
 
-        // Stage 3: Fuse (RRF) — pure computation
+        // Stage 3: Fuse (RRF) — pure computation. A pool the keyword leg
+        // leaves out is empty and adds nothing.
         let mut fused = {
             let _span = tracing::info_span!(
                 "rrf_fuse",
                 vectors = vector_results.len(),
-                tags = tag_results.len()
+                tags = tag_results.len(),
+                bm25 = bm25_results.len()
             )
             .entered();
             let _stage = stages.stage(Stage::RrfFuse);
@@ -1090,8 +1168,12 @@ impl MemoryService {
                 .iter()
                 .map(|s| (s.memory.content_hash.clone(), s.score))
                 .collect();
+            let b_tuples: Vec<(String, f64)> = bm25_results
+                .iter()
+                .map(|s| (s.memory.content_hash.clone(), s.score))
+                .collect();
 
-            hybrid_search::combine_results_rrf(&v_tuples, &t_tuples, alpha, RRF_K)
+            hybrid_search::combine_results_rrf(&v_tuples, &[&t_tuples, &b_tuples], alpha, RRF_K)
         };
 
         // Build hash→memory lookup
@@ -1099,7 +1181,7 @@ impl MemoryService {
         for sm in &vector_results {
             memory_map.insert(sm.memory.content_hash.clone(), sm);
         }
-        for sm in &tag_results {
+        for sm in tag_results.iter().chain(&bm25_results) {
             memory_map
                 .entry(sm.memory.content_hash.clone())
                 .or_insert(sm);
@@ -2974,13 +3056,15 @@ pub(crate) async fn with_budget<T>(
 }
 
 /// A hybrid-search stage timed by [`StageClock`]. `Embed`, `Tags`,
-/// `TagSearch` and `Count` are the concurrent branches of `FanOut`.
+/// `TagSearch`, `Bm25Search` and `Count` are the concurrent branches of
+/// `FanOut`.
 #[derive(Clone, Copy, PartialEq)]
 enum Stage {
     FanOut,
     Embed,
     Tags,
     TagSearch,
+    Bm25Search,
     Count,
     VectorSearch,
     RrfFuse,
@@ -2997,6 +3081,7 @@ impl Stage {
             Stage::Embed => "embed",
             Stage::Tags => "tags",
             Stage::TagSearch => "tag_search",
+            Stage::Bm25Search => "bm25_search",
             Stage::Count => "count",
             Stage::VectorSearch => "vector_search",
             Stage::RrfFuse => "rrf_fuse",
@@ -5895,15 +5980,20 @@ mod tests {
     /// and can serve specific memories from get_batch (for graph injection).
     /// `tag_pools` answers search_by_tags per tag, honouring its limit and
     /// memory_type as Qdrant does, and `similar_tags` is what
-    /// search_similar_tags returns.
-    /// Counts access-count increments, so a test can see search's writes.
+    /// search_similar_tags returns. `bm25_pool` is what search_by_text
+    /// returns, unfiltered, so only the service's own filter can drop a
+    /// member. Counts access-count increments, so a test can see search's
+    /// writes, and the calls to each keyword pool's backend.
     #[derive(Default)]
     struct MockVectorsWithInjection {
         search_results: Vec<ScoredMemory>,
         injectable_memories: HashMap<String, Memory>,
         tag_pools: HashMap<String, Vec<ScoredMemory>>,
         similar_tags: Vec<String>,
+        bm25_pool: Vec<ScoredMemory>,
         access_increments: Rc<Cell<usize>>,
+        tag_calls: Rc<Cell<usize>>,
+        bm25_calls: Rc<Cell<usize>>,
     }
 
     #[async_trait(?Send)]
@@ -5961,6 +6051,7 @@ mod tests {
             memory_type: Option<&str>,
             min_trust_score: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
+            self.tag_calls.set(self.tag_calls.get() + 1);
             Ok(tags
                 .iter()
                 .filter_map(|t| self.tag_pools.get(*t))
@@ -5972,7 +6063,17 @@ mod tests {
                 .collect())
         }
         async fn search_similar_tags(&self, _e: &[f32], _l: usize) -> Result<Vec<String>> {
+            self.tag_calls.set(self.tag_calls.get() + 1);
             Ok(self.similar_tags.clone())
+        }
+        async fn search_by_text(
+            &self,
+            _q: &str,
+            _l: usize,
+            _f: Option<PayloadFilter>,
+        ) -> Result<Vec<ScoredMemory>> {
+            self.bm25_calls.set(self.bm25_calls.get() + 1);
+            Ok(self.bm25_pool.clone())
         }
         async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
             Ok(())
@@ -6453,11 +6554,89 @@ mod tests {
         assert_eq!(queries.get(), 0, "the graph is not queried");
     }
 
+    /// `RANK_KEYWORD_LEG` (LAB-7716) decides which keyword pools a hybrid
+    /// search queries and fuses: `tags` never calls the BM25 search, `bm25`
+    /// never calls the tag searches, `both` calls all of them. A pool's hit
+    /// reaches the page only when its leg is on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn keyword_leg_selects_the_pools_queried_and_fused() {
+        let vector_hit = make_scored_memory(&"a".repeat(64), "vector hit", 0.9);
+        let tag_hit = make_scored_memory(&"b".repeat(64), "tag hit", 1.0);
+        let bm25_hit = make_scored_memory(&"c".repeat(64), "bm25 hit", 7.5);
+        let run = |leg: KeywordLeg| {
+            let (vector_hit, tag_hit, bm25_hit) =
+                (vector_hit.clone(), tag_hit.clone(), bm25_hit.clone());
+            async move {
+                let mock = MockVectorsWithInjection {
+                    search_results: vec![vector_hit],
+                    tag_pools: HashMap::from([("stability".into(), vec![tag_hit])]),
+                    bm25_pool: vec![bm25_hit],
+                    ..Default::default()
+                };
+                let (tag_calls, bm25_calls) = (mock.tag_calls.clone(), mock.bm25_calls.clone());
+                let svc = MemoryService::new(
+                    Box::new(mock),
+                    Box::new(MockEmbeddings),
+                    Box::new(MockGraph),
+                    Box::new(MockHebbian),
+                    Box::new(MockConsolidation),
+                    None,
+                )
+                .with_ranking(RankingFlags {
+                    keyword_leg: leg,
+                    ..RankingFlags::default()
+                });
+                let found = svc
+                    .search(search_params("stability notes"))
+                    .await
+                    .expect("search succeeds");
+                let mut hashes: Vec<String> = found["results"]
+                    .as_array()
+                    .expect("results array")
+                    .iter()
+                    .filter_map(|r| r["content_hash"].as_str().map(|h| h[..1].to_string()))
+                    .collect();
+                hashes.sort();
+                (hashes, tag_calls.get(), bm25_calls.get())
+            }
+        };
+
+        let (tags, tag_calls, bm25_calls) = run(KeywordLeg::Tags).await;
+        assert_eq!(tags, ["a", "b"]);
+        assert!(tag_calls > 0);
+        assert_eq!(bm25_calls, 0, "tags never queries BM25");
+
+        let (bm25, tag_calls, bm25_calls) = run(KeywordLeg::Bm25).await;
+        assert_eq!(bm25, ["a", "c"]);
+        assert_eq!(tag_calls, 0, "bm25 never queries the tag pools");
+        assert_eq!(bm25_calls, 1);
+
+        let (both, tag_calls, bm25_calls) = run(KeywordLeg::Both).await;
+        assert_eq!(both, ["a", "b", "c"]);
+        assert!(tag_calls > 0);
+        assert_eq!(bm25_calls, 1);
+    }
+
+    /// A BM25 search that fails leaves the search to its other pools, as a
+    /// failed tag search does, rather than failing it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_bm25_search_is_not_fatal() {
+        // MockVectors keeps the trait's default search_by_text: an error.
+        let (svc, _) = build_mock_service(vec![]);
+        let svc = svc.with_ranking(RankingFlags {
+            keyword_leg: KeywordLeg::Bm25,
+            ..RankingFlags::default()
+        });
+        svc.search(search_params("anything"))
+            .await
+            .expect("a BM25 error leaves a dense-only search");
+    }
+
     /// With `memory_type` set, hybrid returns only that type from every
-    /// candidate pool. Each non-vector pool (keyword tag, semantic tag, graph
-    /// injection) is seeded with one memory of the type and one of another
-    /// type. The tag mock filters the type as Qdrant does; graph neighbours
-    /// are filtered by the service alone. The unfiltered run proves every
+    /// candidate pool. Each non-vector pool (keyword tag, semantic tag, BM25,
+    /// graph injection) is seeded with one memory of the type and one of
+    /// another type. The tag mock filters the type as Qdrant does; BM25 hits
+    /// and graph neighbours are filtered by the service alone. The unfiltered run proves every
     /// wrong-type memory reached its pool.
     #[tokio::test(flavor = "current_thread")]
     async fn hybrid_memory_type_filters_every_candidate_pool() {
@@ -6473,12 +6652,14 @@ mod tests {
         let semantic_bad = typed('e', "task");
         let graph_ok = typed('f', "decision");
         let graph_bad = typed('1', "reference");
+        let bm25_ok = typed('3', "decision");
+        let bm25_bad = typed('4', "note");
         let hashes = |sms: &[&ScoredMemory]| -> std::collections::HashSet<String> {
             sms.iter()
                 .map(|sm| sm.memory.content_hash.clone())
                 .collect()
         };
-        let wanted = hashes(&[&vector_ok, &keyword_ok, &semantic_ok, &graph_ok]);
+        let wanted = hashes(&[&vector_ok, &keyword_ok, &semantic_ok, &graph_ok, &bm25_ok]);
         let everything = hashes(&[
             &vector_ok,
             &keyword_ok,
@@ -6487,6 +6668,8 @@ mod tests {
             &semantic_bad,
             &graph_ok,
             &graph_bad,
+            &bm25_ok,
+            &bm25_bad,
         ]);
 
         let svc = MemoryService::new(
@@ -6508,6 +6691,7 @@ mod tests {
                     ),
                 ]),
                 similar_tags: vec!["semantic".into()],
+                bm25_pool: vec![bm25_ok.clone(), bm25_bad.clone()],
                 ..Default::default()
             }),
             Box::new(MockEmbeddings),
@@ -6521,7 +6705,11 @@ mod tests {
             Box::new(MockHebbian),
             Box::new(MockConsolidation),
             None,
-        );
+        )
+        .with_ranking(RankingFlags {
+            keyword_leg: KeywordLeg::Both,
+            ..RankingFlags::default()
+        });
 
         let returned = |result: Value| -> std::collections::HashSet<String> {
             result["results"]
@@ -6549,7 +6737,7 @@ mod tests {
     }
 
     /// With `min_trust_score` set, hybrid drops below-trust memories from
-    /// every non-vector pool (keyword tag, semantic tag, graph injection),
+    /// every non-vector pool (keyword tag, semantic tag, BM25, graph injection),
     /// none of which apply the filter Qdrant-side. Each pool holds one memory
     /// at trust 0.8 and one at 0.5; a memory with no stored score is dropped
     /// too, as Qdrant's range filter drops it. The unfiltered run proves every
@@ -6570,12 +6758,14 @@ mod tests {
         let graph_ok = trusted('f', Some(0.8));
         let graph_bad = trusted('1', Some(0.5));
         let graph_unscored = trusted('2', None);
+        let bm25_ok = trusted('3', Some(0.8));
+        let bm25_bad = trusted('4', Some(0.5));
         let hashes = |sms: &[&ScoredMemory]| -> std::collections::HashSet<String> {
             sms.iter()
                 .map(|sm| sm.memory.content_hash.clone())
                 .collect()
         };
-        let wanted = hashes(&[&vector_ok, &keyword_ok, &semantic_ok, &graph_ok]);
+        let wanted = hashes(&[&vector_ok, &keyword_ok, &semantic_ok, &graph_ok, &bm25_ok]);
         let everything = hashes(&[
             &vector_ok,
             &keyword_ok,
@@ -6585,6 +6775,8 @@ mod tests {
             &graph_ok,
             &graph_bad,
             &graph_unscored,
+            &bm25_ok,
+            &bm25_bad,
         ]);
         let graph = [&graph_ok, &graph_bad, &graph_unscored];
 
@@ -6607,6 +6799,7 @@ mod tests {
                     ),
                 ]),
                 similar_tags: vec!["semantic".into()],
+                bm25_pool: vec![bm25_ok.clone(), bm25_bad.clone()],
                 ..Default::default()
             }),
             Box::new(MockEmbeddings),
@@ -6620,7 +6813,11 @@ mod tests {
             Box::new(MockHebbian),
             Box::new(MockConsolidation),
             None,
-        );
+        )
+        .with_ranking(RankingFlags {
+            keyword_leg: KeywordLeg::Both,
+            ..RankingFlags::default()
+        });
 
         let returned = |result: Value| -> std::collections::HashSet<String> {
             result["results"]
@@ -8311,6 +8508,14 @@ mod tests {
         async fn search_similar_tags(&self, _e: &[f32], _l: usize) -> Result<Vec<String>> {
             Ok(vec![])
         }
+        async fn search_by_text(
+            &self,
+            _q: &str,
+            limit: usize,
+            _f: Option<PayloadFilter>,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(self.scored(limit))
+        }
         async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
             Ok(())
         }
@@ -8384,6 +8589,14 @@ mod tests {
         mode: SearchMode,
         include_superseded: bool,
     ) -> std::collections::HashSet<String> {
+        corpus_search_hashes_with(mode, include_superseded, KeywordLeg::Tags).await
+    }
+
+    async fn corpus_search_hashes_with(
+        mode: SearchMode,
+        include_superseded: bool,
+        keyword_leg: KeywordLeg,
+    ) -> std::collections::HashSet<String> {
         let svc = MemoryService::new(
             Box::new(MockVectorsCorpus {
                 memories: superseded_corpus(),
@@ -8393,8 +8606,33 @@ mod tests {
             Box::new(MockHebbian),
             Box::new(MockConsolidation),
             None,
-        );
+        )
+        .with_ranking(RankingFlags {
+            keyword_leg,
+            ..RankingFlags::default()
+        });
         result_hashes(&svc, mode, include_superseded).await
+    }
+
+    /// Hybrid's BM25 pool (LAB-7716) drops superseded memories like the
+    /// others: the mock's BM25 search returns the whole corpus, unfiltered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn superseded_memories_hidden_from_the_bm25_pool() {
+        let live: std::collections::HashSet<String> =
+            (0..10).step_by(2).map(|i| format!("{i:064x}")).collect();
+        let all: std::collections::HashSet<String> = (0..10).map(|i| format!("{i:064x}")).collect();
+        for leg in [KeywordLeg::Bm25, KeywordLeg::Both] {
+            assert_eq!(
+                corpus_search_hashes_with(SearchMode::Hybrid, false, leg).await,
+                live,
+                "{leg:?}: superseded must not leak"
+            );
+            assert_eq!(
+                corpus_search_hashes_with(SearchMode::Hybrid, true, leg).await,
+                all,
+                "{leg:?}: include_superseded returns them"
+            );
+        }
     }
 
     const ALL_MODES: [SearchMode; 5] = [

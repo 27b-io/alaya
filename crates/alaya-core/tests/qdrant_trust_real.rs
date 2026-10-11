@@ -6,7 +6,7 @@
 //! test makes and drops its own collections). Embeddings are a fixed stub and
 //! the graph is unreachable (non-fatal), so only Qdrant is real:
 //!
-//!   docker run -d -p 16417:6333 qdrant/qdrant:v1.17.1
+//!   docker run -d -p 16417:6333 qdrant/qdrant:v1.19.1
 //!   QDRANT_TEST_URL=http://localhost:16417 \
 //!     cargo test -p alaya-core --test qdrant_trust_real -- --include-ignored
 
