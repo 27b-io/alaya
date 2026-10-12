@@ -40,7 +40,7 @@ base | case_ "no store, no marker: blocks" 2
   | case_ "marker trailing a sentence: blocks" 2
 { base; assistant "[{\"type\":\"text\",\"text\":\"The flag is \`$M\`.\\n\`$M\`\"}]"; } \
   | case_ "marker in backticks: blocks" 2
-# a standalone marker counts only as the reply's last line: a fenced example or one followed by prose blocks
+# a standalone marker counts only as the last line of its block: a fenced example or one followed by prose blocks
 say() { jq -cn --arg t "$1" '{type:"assistant", message:{role:"assistant", content:[{type:"text", text:$t}]}}'; }
 { base; say "Here is the README example; I have not checked whether to store anything:
 \`\`\`text
@@ -54,6 +54,26 @@ $M
 { base; say "$M
 That is what you would write if nothing qualified."; } | case_ "own-line marker followed by prose: blocks" 2
 { base; say "$(printf 'Reviewed the session: nothing qualifies.\n\n  %s  \r\n \n' "$M")"; } | case_ "marker as the last line with surrounding whitespace: passes" 0
+
+# the marker must end the assistant's turn: Claude Code writes each block of a reply as its own
+# line, so a later block of the same turn (text or a tool call) means the marker was not the decision
+EX="Here is the standalone no-save marker from the docs, as an example, not my decision:\\n$M"
+READ='{"type":"tool_use","id":"t9","name":"Read","input":{"file_path":"/x"}}'
+{ base; assistant "[{\"type\":\"text\",\"text\":\"$EX\"},$READ]"; } \
+  | case_ "marker block then a tool call in the same entry: blocks" 2
+{ base; assistant "[{\"type\":\"text\",\"text\":\"$EX\"}]"; assistant "[$READ]"; } \
+  | case_ "marker block then a tool call on the next line: blocks" 2
+{ base; assistant "[{\"type\":\"text\",\"text\":\"$EX\"}]"; assistant "[$READ]"
+  user '[{"type":"tool_result","tool_use_id":"t9","content":"file body"}]'; } \
+  | case_ "marker block, tool call, tool result: blocks" 2
+{ base; assistant "[{\"type\":\"text\",\"text\":\"$EX\"}]"; say "That was only an example."; } \
+  | case_ "marker block then another text block: blocks" 2
+{ base; say "Nothing qualifies.
+$M"; user '"next task please"'; assistant '[{"type":"text","text":"On it."}]'; } \
+  | case_ "marker ending an earlier turn, then more turns: passes" 0
+{ base; say "Nothing qualifies.
+$M"; assistant '[{"type":"text","text":"x"}]' '{"isSidechain":true}'; } \
+  | case_ "marker turn end not cleared by a sidechain entry: passes" 0
 
 { base; assistant '[{"type":"tool_use","id":"t1","name":"mcp__alaya__store_memory","input":{"content":"x"}}]'; } \
   | case_ "store_memory tool_use: passes" 0

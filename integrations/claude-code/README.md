@@ -9,7 +9,8 @@ memory server:
 - **PreCompact** (`scripts/alaya-precompact.sh`) — blocks compaction (exit 2) unless a
   `mcp__alaya__store_memory` call shows up in the last 500 transcript lines, so valuable
   context doesn't get compacted away unsaved. When nothing qualifies, Claude writes
-  `ALAYA_NOTHING_TO_SAVE` alone as the last line of its reply instead; only Claude's own text
+  `ALAYA_NOTHING_TO_SAVE` alone as the last line of its reply instead (nothing after it in that
+  turn, not even a tool call); only Claude's own text
   counts, never tool results, user turns or tool inputs, and a mention of the marker inside
   a sentence, a quote or a code-block example does not count. Fails closed (blocks) if the transcript or the hook input can't
   be read or parsed — treated the same as "no recent save." Individual malformed transcript
@@ -153,7 +154,7 @@ scripts/test-precompact-gate.sh
 Runs the real PreCompact hook against fixture transcripts. It proves the gate passes on a recent
 `store_memory` call or on `ALAYA_NOTHING_TO_SAVE` alone as the last line of Claude's own reply
 text, and still blocks when the marker is only mentioned inside a sentence or shown in a fenced
-example or followed by more text, or appears only in a tool
+example or followed by more text or a tool call in the same turn, or appears only in a tool
 result, a user turn, a tool input, a quoted file, a thinking block or a subagent reply, when the
 transcript is missing or holds no parseable line, and when the marker has scrolled out of the
 window (with a control showing the same marker passes inside it).
@@ -165,7 +166,7 @@ window (with a control showing the same marker passes inside it).
   or hung secret command, dead LLM endpoint, unexpected LLM output shape, failed store call)
   logs one line there — see LAB-170: a silent failure here once cost 5 days of unsaved memories.
 - **PreCompact keeps blocking** — it only unblocks once an `mcp__alaya__store_memory` tool
-  call, or an assistant text block ending with `ALAYA_NOTHING_TO_SAVE` alone on its last line (Claude's
+  call, or an assistant reply whose final line is `ALAYA_NOTHING_TO_SAVE` alone (Claude's
   deliberate "nothing worth saving"), appears in the last `ALAYA_PRECOMPACT_RECENT_LINES`
   transcript lines. The marker counts only in Claude's own reply text, so a file, tool result
   or user message that contains it cannot open the gate. This is deliberate: the two hooks are

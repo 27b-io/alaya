@@ -36,27 +36,32 @@ if [ -n "$transcript" ] && [ -r "$transcript" ]; then
         | grep -Eq '"name"[[:space:]]*:[[:space:]]*"mcp__alaya__store_memory"'; then
         exit 0
     fi
-    # Deliberate no-save: the marker counts only as the last non-empty line of a
-    # text block of a main-thread assistant entry. User turns, tool results,
-    # tool_use inputs and file contents never count, so text Claude reads cannot
-    # open the gate; subagent (sidechain) replies are excluded because a subagent
-    # echoes what it was fed. The last-line rule keeps Claude mentioning, quoting
-    # or showing the marker (in prose, or a fenced example whose closing fence
-    # follows it) from counting as a decision.
+    # Deliberate no-save: the marker counts only as the last non-empty line of the
+    # last block of a main-thread assistant turn — the turn ends there, at the next
+    # user entry or at the end of the tail. User turns, tool results, tool_use
+    # inputs and file contents never count, so text Claude reads cannot open the
+    # gate; subagent (sidechain) replies are excluded because a subagent echoes
+    # what it was fed. Claude Code writes each block of a reply as its own line,
+    # so any later assistant block (more text, a fence's closing line, a tool
+    # call) clears the marker: mentioning, quoting or showing it is not a decision.
     if tail -n "$RECENT_LINES" "$transcript" 2>/dev/null | python3 -c '
 import json, sys
+ended_with_marker = False
 for line in sys.stdin:
     try:
         e = json.loads(line)
-        if e.get("type") != "assistant" or e.get("isSidechain"):
+        if e.get("isSidechain"):
+            continue
+        if e.get("type") == "user" and ended_with_marker:
+            sys.exit(0)
+        if e.get("type") != "assistant":
             continue
         for b in e["message"]["content"]:
             last_line = b.get("text", "").strip().rsplit("\n", 1)[-1].strip()
-            if b.get("type") == "text" and last_line == "ALAYA_NOTHING_TO_SAVE":
-                sys.exit(0)
+            ended_with_marker = b.get("type") == "text" and last_line == "ALAYA_NOTHING_TO_SAVE"
     except (ValueError, KeyError, TypeError, AttributeError):
         continue
-sys.exit(1)
+sys.exit(0 if ended_with_marker else 1)
 ' 2>/dev/null; then
         exit 0
     fi
