@@ -14,7 +14,8 @@ memory server:
   counts, never tool results, user turns or tool inputs, and a mention of the marker inside
   a sentence, a quote or a code-block example does not count. Fails closed (blocks) if the transcript or the hook input can't
   be read or parsed — treated the same as "no recent save." Individual malformed transcript
-  lines are skipped, not fatal.
+  lines are skipped, not fatal, but one that follows the marker clears it, so a parse error
+  can only block.
 
 ## Prerequisites
 

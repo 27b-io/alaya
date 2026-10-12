@@ -23,7 +23,8 @@ base() { # an ordinary exchange with no store and no marker
 expect() {
   printf '{"session_id":"s1","transcript_path":"%s"}' "$3" | bash "$HOOK" >/dev/null 2>&1
   local got=$?
-  if [[ $got -eq $2 ]]; then echo "ok    $1"; else echo "FAIL  $1: want exit $2, got $got"; RC=1; fi
+  # case_ runs in a pipeline subshell, where RC=1 is lost: the marker file reaches the parent
+  if [[ $got -eq $2 ]]; then echo "ok    $1"; else echo "FAIL  $1: want exit $2, got $got"; RC=1; : > "$T/failed"; fi
 }
 # case <name> <want-exit> — the transcript is read from stdin
 case_() { cat > "$T/$1.jsonl"; expect "$1" "$2" "$T/$1.jsonl"; }
@@ -68,6 +69,12 @@ READ='{"type":"tool_use","id":"t9","name":"Read","input":{"file_path":"/x"}}'
   | case_ "marker block, tool call, tool result: blocks" 2
 { base; assistant "[{\"type\":\"text\",\"text\":\"$EX\"}]"; say "That was only an example."; } \
   | case_ "marker block then another text block: blocks" 2
+# a tool result is not a turn end: the turn goes on past it
+TR='[{"type":"tool_result","tool_use_id":"t9","content":"file body"}]'
+{ base; assistant "[$READ,{\"type\":\"text\",\"text\":\"$EX\"}]"; user "$TR"; } \
+  | case_ "tool call then marker block in one entry, then its tool result: blocks" 2
+{ base; assistant "[$READ]"; assistant "[{\"type\":\"text\",\"text\":\"$EX\"}]"; user "$TR"; } \
+  | case_ "tool call, marker block, then its tool result: blocks" 2
 { base; say "Nothing qualifies.
 $M"; user '"next task please"'; assistant '[{"type":"text","text":"On it."}]'; } \
   | case_ "marker ending an earlier turn, then more turns: passes" 0
@@ -87,6 +94,7 @@ malformed "assistant text block with a non-string text" '{"type":"assistant","me
 malformed "assistant entry with a null block"     '{"type":"assistant","message":{"content":[null]}}'
 malformed "an unparseable line"                   'not json {'
 malformed "a JSON line that is not an object"     '[1,2]'
+malformed "user entry with no message"            '{"type":"user"}'
 
 { base; assistant '[{"type":"tool_use","id":"t1","name":"mcp__alaya__store_memory","input":{"content":"x"}}]'; } \
   | case_ "store_memory tool_use: passes" 0
@@ -112,8 +120,9 @@ malformed "a JSON line that is not an object"     '[1,2]'
 # fail closed
 expect "missing transcript: blocks" 2 "$T/does-not-exist.jsonl"
 printf 'not json {{{\n' > "$T/garbage.jsonl"; expect "unparseable transcript: blocks" 2 "$T/garbage.jsonl"
-if printf 'not json' | bash "$HOOK" >/dev/null 2>&1; then echo "FAIL  unparseable hook input: passed"; RC=1
-else echo "ok    unparseable hook input: blocks"; fi
+printf 'not json' | bash "$HOOK" >/dev/null 2>&1; got=$?
+if [[ $got -eq 2 ]]; then echo "ok    unparseable hook input: blocks"
+else echo "FAIL  unparseable hook input: want exit 2, got $got"; RC=1; fi
 
 # the window: a marker older than the last N lines no longer counts
 { assistant "[{\"type\":\"text\",\"text\":\"$M\"}]"; base; base; } > "$T/old.jsonl"
@@ -132,5 +141,6 @@ for want in "end your reply with the marker $M alone on its own line" "Storing n
   if grep -qF -- "$want" <<< "$msg"; then echo "ok    prompt names [$want]"; else echo "FAIL  prompt lacks [$want]"; RC=1; fi
 done
 
+[[ -e "$T/failed" ]] && RC=1
 [[ $RC -eq 0 ]] && echo "ALL PASS: store or assistant-text marker opens the gate; no forged marker does; failures block"
 exit $RC

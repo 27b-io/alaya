@@ -38,7 +38,8 @@ if [ -n "$transcript" ] && [ -r "$transcript" ]; then
     fi
     # Deliberate no-save: the marker counts only as the last non-empty line of the
     # last block of a main-thread assistant turn — the turn ends there, at the next
-    # user entry or at the end of the tail. User turns, tool results, tool_use
+    # user entry that is not a tool result, or at the end of the tail; a tool result
+    # means the turn went on, so it clears the marker. User turns, tool results, tool_use
     # inputs and file contents never count, so text Claude reads cannot open the
     # gate; subagent (sidechain) replies are excluded because a subagent echoes
     # what it was fed. Claude Code writes each block of a reply as its own line,
@@ -58,8 +59,16 @@ for line in sys.stdin:
         continue
     if e.get("isSidechain"):
         continue
-    if e.get("type") == "user" and ended_with_marker:
-        sys.exit(0)
+    if e.get("type") == "user":
+        try:
+            content = e["message"]["content"]
+            tool_result = not isinstance(content, str) and any(b["type"] == "tool_result" for b in content)
+        except (KeyError, TypeError, AttributeError):
+            tool_result = True  # unreadable: never confirms a turn end
+        if ended_with_marker and not tool_result:
+            sys.exit(0)
+        ended_with_marker = False  # a tool result means the turn went on past the marker
+        continue
     if e.get("type") != "assistant":
         continue
     ended_with_marker = False  # any later assistant entry clears it, even a malformed one
