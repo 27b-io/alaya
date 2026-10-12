@@ -40,6 +40,20 @@ base | case_ "no store, no marker: blocks" 2
   | case_ "marker trailing a sentence: blocks" 2
 { base; assistant "[{\"type\":\"text\",\"text\":\"The flag is \`$M\`.\\n\`$M\`\"}]"; } \
   | case_ "marker in backticks: blocks" 2
+# a standalone marker counts only as the reply's last line: a fenced example or one followed by prose blocks
+say() { jq -cn --arg t "$1" '{type:"assistant", message:{role:"assistant", content:[{type:"text", text:$t}]}}'; }
+{ base; say "Here is the README example; I have not checked whether to store anything:
+\`\`\`text
+$M
+\`\`\`
+This is documentation, not my decision."; } | case_ "marker alone inside a fenced example: blocks" 2
+{ base; say "Example:
+\`\`\`
+$M
+\`\`\`"; } | case_ "marker alone in a fence that ends the reply: blocks" 2
+{ base; say "$M
+That is what you would write if nothing qualified."; } | case_ "own-line marker followed by prose: blocks" 2
+{ base; say "$(printf 'Reviewed the session: nothing qualifies.\n\n  %s  \r\n \n' "$M")"; } | case_ "marker as the last line with surrounding whitespace: passes" 0
 
 { base; assistant '[{"type":"tool_use","id":"t1","name":"mcp__alaya__store_memory","input":{"content":"x"}}]'; } \
   | case_ "store_memory tool_use: passes" 0
@@ -81,7 +95,7 @@ if window 5; then echo "ok    same marker inside the window: passes"; else echo 
 # prompt's own mention of the marker is inline, so Claude quoting it cannot open the gate
 base > "$T/msg.jsonl"
 msg=$(printf '{"transcript_path":"%s"}' "$T/msg.jsonl" | bash "$HOOK" 2>&1 >/dev/null)
-for want in "$M alone on its own line" "Storing nothing is a normal outcome"; do
+for want in "end your reply with the marker $M alone on its own line" "Storing nothing is a normal outcome"; do
   if grep -qF -- "$want" <<< "$msg"; then echo "ok    prompt names [$want]"; else echo "FAIL  prompt lacks [$want]"; RC=1; fi
 done
 
