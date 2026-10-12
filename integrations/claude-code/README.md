@@ -8,7 +8,9 @@ memory server:
   gates against saving too often and a dedup threshold to catch LLM rephrases of the same fact.
 - **PreCompact** (`scripts/alaya-precompact.sh`) — blocks compaction (exit 2) unless a
   `mcp__alaya__store_memory` call shows up in the last 500 transcript lines, so valuable
-  context doesn't get compacted away unsaved. Fails closed (blocks) if the transcript can't be read or parsed — treated the same as "no recent save."
+  context doesn't get compacted away unsaved. When nothing qualifies, Claude writes
+  `ALAYA_NOTHING_TO_SAVE` in a reply instead; only Claude's own text counts, never tool
+  results, user turns or tool inputs. Fails closed (blocks) if the transcript can't be read or parsed — treated the same as "no recent save."
 
 ## Prerequisites
 
@@ -141,6 +143,16 @@ transcript to also run a smoke replay. It checks only that a non-zero message co
 extractor, not which lines those are, and it turns off the duration and message-count save gates
 so a short or still-running session counts too.
 
+```bash
+scripts/test-precompact-gate.sh
+```
+
+Runs the real PreCompact hook against fixture transcripts. It proves the gate passes on a recent
+`store_memory` call or on `ALAYA_NOTHING_TO_SAVE` in Claude's own reply text, and still blocks
+when the marker appears only in a tool result, a user turn, a tool input, a quoted file, a
+thinking block or a subagent reply, when the transcript is missing or unparseable, and when the
+marker has scrolled out of the window.
+
 ## Troubleshooting
 
 - **No memories are showing up** — check `$ALAYA_HOOK_STATE_DIR/failures.log` (default
@@ -148,7 +160,10 @@ so a short or still-running session counts too.
   or hung secret command, dead LLM endpoint, unexpected LLM output shape, failed store call)
   logs one line there — see LAB-170: a silent failure here once cost 5 days of unsaved memories.
 - **PreCompact keeps blocking** — it only unblocks once an `mcp__alaya__store_memory` tool
-  call appears in the last `ALAYA_PRECOMPACT_RECENT_LINES` transcript lines. This is deliberate:
+  call, or an assistant text block containing `ALAYA_NOTHING_TO_SAVE` (Claude's deliberate
+  "nothing worth saving"), appears in the last `ALAYA_PRECOMPACT_RECENT_LINES` transcript
+  lines. The marker counts only in Claude's own reply text, so a file, tool result or user
+  message that contains it cannot open the gate. This is deliberate:
   the two hooks are independent persistence paths, and the PreCompact gate wants a *curated*
   save made by Claude itself (via the Ālaya MCP server) before context is compacted away —
   the Stop hook's automatic REST extraction does not satisfy it and is not meant to. Ask Claude

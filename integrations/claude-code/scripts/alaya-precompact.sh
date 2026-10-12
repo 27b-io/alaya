@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# PreCompact hook: block compaction unless Claude has saved memories recently.
+# PreCompact hook: block compaction unless Claude has saved memories recently,
+# or has said on purpose that nothing qualifies.
 #
-# Recency rule: at least one mcp__alaya__store_memory tool_use call within
-# the last N lines (default 500) of the transcript. Roughly: "did Claude save
-# at any point in the recent few turns?"
+# Recency rule: within the last N lines (default 500) of the transcript, either
+# at least one mcp__alaya__store_memory tool_use call, or an assistant text block
+# containing ALAYA_NOTHING_TO_SAVE. Without the second path a session with nothing
+# worth saving could never compact, or would store filler just to pass.
 #
 # Exit 0 = allow, exit 2 = block (stderr injected into Claude's context).
 # Fails CLOSED (blocks) when the transcript can't be found or parsed, same as
@@ -34,6 +36,26 @@ if [ -n "$transcript" ] && [ -r "$transcript" ]; then
         | grep -Eq '"name"[[:space:]]*:[[:space:]]*"mcp__alaya__store_memory"'; then
         exit 0
     fi
+    # Deliberate no-save: the marker counts only in a text block of a main-thread
+    # assistant entry. User turns, tool results, tool_use inputs and file contents
+    # never count, so text Claude reads or quotes cannot open the gate; subagent
+    # (sidechain) replies are excluded because a subagent echoes what it was fed.
+    if tail -n "$RECENT_LINES" "$transcript" 2>/dev/null | python3 -c '
+import json, sys
+for line in sys.stdin:
+    try:
+        e = json.loads(line)
+        if e.get("type") != "assistant" or e.get("isSidechain"):
+            continue
+        for b in e["message"]["content"]:
+            if b.get("type") == "text" and "ALAYA_NOTHING_TO_SAVE" in b.get("text", ""):
+                sys.exit(0)
+    except (ValueError, KeyError, TypeError, AttributeError):
+        continue
+sys.exit(1)
+' 2>/dev/null; then
+        exit 0
+    fi
 fi
 
 # No recent save (or couldn't determine) — block and prompt Claude to save.
@@ -48,7 +70,7 @@ Rules:
 - Never store run state: ticket status, PR state, progress, blockers, follow-up work or handoff narration. The issue tracker holds those.
 - Before each store, search Alaya for the lesson's key terms. If a live memory already says it, store nothing.
 - Add tags [project-name, topic], a one-line summary, and dedup_threshold: 0.85.
-- Storing nothing is a normal outcome. If nothing qualifies, proceed without saving.
+- Storing nothing is a normal outcome. If nothing qualifies, write ALAYA_NOTHING_TO_SAVE in your reply (plain text, not inside a tool call) and proceed; that marker lets the next compaction through.
 PROMPT
 
 exit 2
