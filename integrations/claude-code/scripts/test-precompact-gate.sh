@@ -75,6 +75,19 @@ $M"; user '"next task please"'; assistant '[{"type":"text","text":"On it."}]'; }
 $M"; assistant '[{"type":"text","text":"x"}]' '{"isSidechain":true}'; } \
   | case_ "marker turn end not cleared by a sidechain entry: passes" 0
 
+# a malformed or unparseable later line must clear the marker too: a parse error never opens the gate
+# (labels stay plain: a case name becomes the fixture path inside the hook's JSON input)
+malformed() { # <label> <raw line>
+  { base; assistant "[{\"type\":\"text\",\"text\":\"$EX\"}]"; printf '%s\n' "$2"; user '"next"'; } \
+    | case_ "marker then $1: blocks" 2; }
+malformed "assistant entry with null content"     '{"type":"assistant","message":{"content":null}}'
+malformed "assistant entry with string content"   '{"type":"assistant","message":{"content":"x"}}'
+malformed "assistant entry with no message"       '{"type":"assistant"}'
+malformed "assistant text block with a non-string text" '{"type":"assistant","message":{"content":[{"type":"text","text":7}]}}'
+malformed "assistant entry with a null block"     '{"type":"assistant","message":{"content":[null]}}'
+malformed "an unparseable line"                   'not json {'
+malformed "a JSON line that is not an object"     '[1,2]'
+
 { base; assistant '[{"type":"tool_use","id":"t1","name":"mcp__alaya__store_memory","input":{"content":"x"}}]'; } \
   | case_ "store_memory tool_use: passes" 0
 

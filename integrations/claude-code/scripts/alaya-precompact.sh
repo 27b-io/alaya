@@ -44,23 +44,31 @@ if [ -n "$transcript" ] && [ -r "$transcript" ]; then
     # what it was fed. Claude Code writes each block of a reply as its own line,
     # so any later assistant block (more text, a fence's closing line, a tool
     # call) clears the marker: mentioning, quoting or showing it is not a decision.
+    # A malformed or unparseable later line clears it too, so parse errors block.
     if tail -n "$RECENT_LINES" "$transcript" 2>/dev/null | python3 -c '
 import json, sys
 ended_with_marker = False
 for line in sys.stdin:
     try:
         e = json.loads(line)
-        if e.get("isSidechain"):
-            continue
-        if e.get("type") == "user" and ended_with_marker:
-            sys.exit(0)
-        if e.get("type") != "assistant":
-            continue
-        for b in e["message"]["content"]:
-            last_line = b.get("text", "").strip().rsplit("\n", 1)[-1].strip()
-            ended_with_marker = b.get("type") == "text" and last_line == "ALAYA_NOTHING_TO_SAVE"
-    except (ValueError, KeyError, TypeError, AttributeError):
+        if not isinstance(e, dict):
+            raise TypeError
+    except (ValueError, TypeError):
+        ended_with_marker = False  # unknown line: it may have been a later block
         continue
+    if e.get("isSidechain"):
+        continue
+    if e.get("type") == "user" and ended_with_marker:
+        sys.exit(0)
+    if e.get("type") != "assistant":
+        continue
+    ended_with_marker = False  # any later assistant entry clears it, even a malformed one
+    try:
+        for b in e["message"]["content"]:
+            last_line = b["text"].strip().rsplit("\n", 1)[-1].strip() if b.get("type") == "text" else ""
+            ended_with_marker = last_line == "ALAYA_NOTHING_TO_SAVE"
+    except (KeyError, TypeError, AttributeError):
+        ended_with_marker = False
 sys.exit(0 if ended_with_marker else 1)
 ' 2>/dev/null; then
         exit 0
