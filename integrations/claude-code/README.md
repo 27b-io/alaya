@@ -9,8 +9,11 @@ memory server:
 - **PreCompact** (`scripts/alaya-precompact.sh`) — blocks compaction (exit 2) unless a
   `mcp__alaya__store_memory` call shows up in the last 500 transcript lines, so valuable
   context doesn't get compacted away unsaved. When nothing qualifies, Claude writes
-  `ALAYA_NOTHING_TO_SAVE` in a reply instead; only Claude's own text counts, never tool
-  results, user turns or tool inputs. Fails closed (blocks) if the transcript can't be read or parsed — treated the same as "no recent save."
+  `ALAYA_NOTHING_TO_SAVE` alone on a line of its reply instead; only Claude's own text
+  counts, never tool results, user turns or tool inputs, and a mention of the marker inside
+  a sentence does not count. Fails closed (blocks) if the transcript or the hook input can't
+  be read or parsed — treated the same as "no recent save." Individual malformed transcript
+  lines are skipped, not fatal.
 
 ## Prerequisites
 
@@ -148,10 +151,11 @@ scripts/test-precompact-gate.sh
 ```
 
 Runs the real PreCompact hook against fixture transcripts. It proves the gate passes on a recent
-`store_memory` call or on `ALAYA_NOTHING_TO_SAVE` in Claude's own reply text, and still blocks
-when the marker appears only in a tool result, a user turn, a tool input, a quoted file, a
-thinking block or a subagent reply, when the transcript is missing or unparseable, and when the
-marker has scrolled out of the window.
+`store_memory` call or on `ALAYA_NOTHING_TO_SAVE` alone on a line of Claude's own reply text,
+and still blocks when the marker is only mentioned inside a sentence, or appears only in a tool
+result, a user turn, a tool input, a quoted file, a thinking block or a subagent reply, when the
+transcript is missing or holds no parseable line, and when the marker has scrolled out of the
+window (with a control showing the same marker passes inside it).
 
 ## Troubleshooting
 
@@ -160,14 +164,14 @@ marker has scrolled out of the window.
   or hung secret command, dead LLM endpoint, unexpected LLM output shape, failed store call)
   logs one line there — see LAB-170: a silent failure here once cost 5 days of unsaved memories.
 - **PreCompact keeps blocking** — it only unblocks once an `mcp__alaya__store_memory` tool
-  call, or an assistant text block containing `ALAYA_NOTHING_TO_SAVE` (Claude's deliberate
-  "nothing worth saving"), appears in the last `ALAYA_PRECOMPACT_RECENT_LINES` transcript
-  lines. The marker counts only in Claude's own reply text, so a file, tool result or user
-  message that contains it cannot open the gate. This is deliberate:
-  the two hooks are independent persistence paths, and the PreCompact gate wants a *curated*
-  save made by Claude itself (via the Ālaya MCP server) before context is compacted away —
-  the Stop hook's automatic REST extraction does not satisfy it and is not meant to. Ask Claude
-  to save (the block message prompts it to), or disable the gate by removing the PreCompact
-  hook if you don't run the Ālaya MCP server.
+  call, or an assistant text block with `ALAYA_NOTHING_TO_SAVE` alone on a line (Claude's
+  deliberate "nothing worth saving"), appears in the last `ALAYA_PRECOMPACT_RECENT_LINES`
+  transcript lines. The marker counts only in Claude's own reply text, so a file, tool result
+  or user message that contains it cannot open the gate. This is deliberate: the two hooks are
+  independent persistence paths, and the PreCompact gate wants Claude itself to decide before
+  context is compacted away — a curated save via the Ālaya MCP server, or the marker. The Stop
+  hook's automatic REST extraction satisfies neither and is not meant to. Ask Claude to save or
+  to state the marker (the block message prompts it to), or disable the gate by removing the
+  PreCompact hook if you don't run the Ālaya MCP server.
 - **`claude plugin validate` fails** — run it with `--strict` locally before pushing; it flags
   unrecognized fields and missing metadata that the runtime otherwise tolerates silently.

@@ -30,8 +30,16 @@ case_() { cat > "$T/$1.jsonl"; expect "$1" "$2" "$T/$1.jsonl"; }
 
 base | case_ "no store, no marker: blocks" 2
 
+{ base; assistant "[{\"type\":\"text\",\"text\":\"Nothing qualifies.\\n\\n$M\"}]"; } \
+  | case_ "deliberate skip on its own line in assistant text: passes" 0
+
+# Claude explaining or quoting the rule is not a decision: the marker must stand alone on a line
+{ base; assistant "[{\"type\":\"text\",\"text\":\"The README says the gate accepts $M when nothing qualifies; I have not checked the session yet.\"}]"; } \
+  | case_ "marker mentioned in an assistant sentence: blocks" 2
 { base; assistant "[{\"type\":\"text\",\"text\":\"Nothing qualifies. $M\"}]"; } \
-  | case_ "deliberate skip in assistant text: passes" 0
+  | case_ "marker trailing a sentence: blocks" 2
+{ base; assistant "[{\"type\":\"text\",\"text\":\"The flag is \`$M\`.\\n\`$M\`\"}]"; } \
+  | case_ "marker in backticks: blocks" 2
 
 { base; assistant '[{"type":"tool_use","id":"t1","name":"mcp__alaya__store_memory","input":{"content":"x"}}]'; } \
   | case_ "store_memory tool_use: passes" 0
@@ -62,13 +70,18 @@ else echo "ok    unparseable hook input: blocks"; fi
 
 # the window: a marker older than the last N lines no longer counts
 { assistant "[{\"type\":\"text\",\"text\":\"$M\"}]"; base; base; } > "$T/old.jsonl"
-printf '{"session_id":"s1","transcript_path":"%s"}' "$T/old.jsonl" \
-  | ALAYA_PRECOMPACT_RECENT_LINES=2 bash "$HOOK" >/dev/null 2>&1
-if [[ $? -eq 2 ]]; then echo "ok    marker outside the window: blocks"; else echo "FAIL  marker outside the window: passed"; RC=1; fi
+window() { # <lines> — exit code of the hook over old.jsonl with that window
+  printf '{"session_id":"s1","transcript_path":"%s"}' "$T/old.jsonl" \
+    | ALAYA_PRECOMPACT_RECENT_LINES="$1" bash "$HOOK" >/dev/null 2>&1; }
+window 2; got=$?
+if [[ $got -eq 2 ]]; then echo "ok    marker outside the window: blocks"; else echo "FAIL  marker outside the window: got $got"; RC=1; fi
+if window 5; then echo "ok    same marker inside the window: passes"; else echo "FAIL  same marker inside the window: blocked"; RC=1; fi
 
-# the block message tells Claude about the marker and keeps "storing nothing is normal"
-msg=$(printf '{"transcript_path":"%s"}' "$T/no store, no marker: blocks.jsonl" | bash "$HOOK" 2>&1 >/dev/null)
-for want in "$M" "Storing nothing is a normal outcome"; do
+# the block message tells Claude about the marker, keeps "storing nothing is normal", and the
+# prompt's own mention of the marker is inline, so Claude quoting it cannot open the gate
+base > "$T/msg.jsonl"
+msg=$(printf '{"transcript_path":"%s"}' "$T/msg.jsonl" | bash "$HOOK" 2>&1 >/dev/null)
+for want in "$M alone on its own line" "Storing nothing is a normal outcome"; do
   if grep -qF -- "$want" <<< "$msg"; then echo "ok    prompt names [$want]"; else echo "FAIL  prompt lacks [$want]"; RC=1; fi
 done
 

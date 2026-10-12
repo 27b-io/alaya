@@ -36,10 +36,12 @@ if [ -n "$transcript" ] && [ -r "$transcript" ]; then
         | grep -Eq '"name"[[:space:]]*:[[:space:]]*"mcp__alaya__store_memory"'; then
         exit 0
     fi
-    # Deliberate no-save: the marker counts only in a text block of a main-thread
-    # assistant entry. User turns, tool results, tool_use inputs and file contents
-    # never count, so text Claude reads or quotes cannot open the gate; subagent
-    # (sidechain) replies are excluded because a subagent echoes what it was fed.
+    # Deliberate no-save: the marker counts only as a line of its own in a text
+    # block of a main-thread assistant entry. User turns, tool results, tool_use
+    # inputs and file contents never count, so text Claude reads cannot open the
+    # gate; subagent (sidechain) replies are excluded because a subagent echoes
+    # what it was fed. The own-line rule keeps Claude merely mentioning or
+    # explaining the marker in prose from counting as a decision.
     if tail -n "$RECENT_LINES" "$transcript" 2>/dev/null | python3 -c '
 import json, sys
 for line in sys.stdin:
@@ -48,7 +50,9 @@ for line in sys.stdin:
         if e.get("type") != "assistant" or e.get("isSidechain"):
             continue
         for b in e["message"]["content"]:
-            if b.get("type") == "text" and "ALAYA_NOTHING_TO_SAVE" in b.get("text", ""):
+            if b.get("type") == "text" and any(
+                l.strip() == "ALAYA_NOTHING_TO_SAVE" for l in b.get("text", "").splitlines()
+            ):
                 sys.exit(0)
     except (ValueError, KeyError, TypeError, AttributeError):
         continue
@@ -70,7 +74,7 @@ Rules:
 - Never store run state: ticket status, PR state, progress, blockers, follow-up work or handoff narration. The issue tracker holds those.
 - Before each store, search Alaya for the lesson's key terms. If a live memory already says it, store nothing.
 - Add tags [project-name, topic], a one-line summary, and dedup_threshold: 0.85.
-- Storing nothing is a normal outcome. If nothing qualifies, write ALAYA_NOTHING_TO_SAVE in your reply (plain text, not inside a tool call) and proceed; that marker lets the next compaction through.
+- Storing nothing is a normal outcome. If nothing qualifies, end your reply with the marker ALAYA_NOTHING_TO_SAVE alone on its own line (plain reply text: no quotes, backticks or tool call) and proceed; that line lets the next compaction through.
 PROMPT
 
 exit 2
