@@ -265,25 +265,35 @@ curl -X POST http://localhost:3001/search \
 - `hybrid` computes recency decay from T instead of the current time.
 - The response carries `"as_of": T`. A server that predates the field ignores it and omits the echo, so check for it.
 
-Some state cannot be rewound and is read as it is now: graph state (Hebbian weights, and which neighbours spreading activation injects, though each injected neighbour still passes the `as_of` bound and the supersession rule); access counts and access timestamps (the salience and spacing boosts); BM25 term statistics, computed over today's collection; the tag vocabulary that keyword extraction and the semantic tag pool read; tags, type, summary and trust patched since T; hard deletes; supersessions reversed by `/unsupersede`, which leave no marker, so the memory shows at every T; and a marker re-pointed to a second survivor, which names only the last one. The corpus size behind hybrid's fusion weight is today's too.
+Some state cannot be rewound and is read as it is now: graph state (Hebbian weights, and which neighbours spreading activation injects, though each injected neighbour still passes the `as_of` bound and the supersession rule); access counts and access timestamps (the salience and spacing boosts); BM25 term statistics, computed over today's collection; the tag vocabulary that keyword extraction and the semantic tag pool read; tags, type, summary and trust patched since T; hard deletes; supersessions reversed by `/unsupersede`, which leave no marker, so the memory passes the supersession check at every T (the `created_at` bound still applies); and a marker re-pointed to a second survivor, which names only the last one. The corpus size behind hybrid's fusion weight is today's too.
 
-**Response:** array of memories sorted by relevance.
+**Response:** an object whose `results` holds the memories sorted by relevance. Every mode adds `mode`, and a search sent with `as_of` adds `"as_of": T`. `hybrid` also pages (`page`, `page_size`, `total`, `total_pages`, `has_more`); `similar` returns `results` and `total`. A hybrid replay:
 
 ```json
-[
-  {
-    "content_hash": "a3f4...",
-    "content": "Migrated frontend from npm to pnpm…",
-    "similarity": 0.82,
-    "summary": null,
-    "tags": ["frontend", "tooling"],
-    "memory_type": "decision",
-    "metadata": {"importance": 0.7},
-    "created_at": "2026-05-12T09:31:04Z",
-    "salience": 0.62,
-    "rank": 1
-  }
-]
+{
+  "mode": "hybrid",
+  "as_of": 1778578264.0,
+  "page": 1,
+  "page_size": 5,
+  "total": 12,
+  "total_pages": 3,
+  "has_more": true,
+  "results": [
+    {
+      "content_hash": "a3f4...",
+      "content": "Migrated frontend from npm to pnpm…",
+      "tags": ["frontend", "tooling"],
+      "memory_type": "decision",
+      "metadata": {"importance": 0.7},
+      "created_at": 1778578000.5,
+      "updated_at": 1778578000.5,
+      "salience_score": 0.62,
+      "score": 0.82,
+      "provenance": null,
+      "access_count": 3
+    }
+  ]
+}
 ```
 
 ## `GET /memories/{content_hash}`

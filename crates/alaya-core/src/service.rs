@@ -919,7 +919,7 @@ impl MemoryService {
     /// `as_of` (epoch seconds, REST only) replays a read-only `hybrid` or
     /// `similar` search against the store as it stood then: see
     /// [`Visibility`] and [`validate_as_of`].
-    #[tracing::instrument(skip(self, params), fields(mode = ?params.mode, read_only, as_of))]
+    #[tracing::instrument(skip(self, params), fields(mode = ?params.mode))]
     pub async fn search_with(
         &self,
         params: SearchParams,
@@ -1839,7 +1839,10 @@ impl MemoryService {
 
             let survivors = self
                 .survivor_times(vis, raw.iter().map(|sm| &sm.memory))
-                .await?;
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!(error = %e, "as_of survivor lookup for an over-fetch round failed");
+                })?;
             let filtered: Vec<ScoredMemory> = raw
                 .into_iter()
                 .filter(|sm| vis.shows(&sm.memory, &survivors))
@@ -7428,17 +7431,56 @@ mod tests {
         );
     }
 
+    /// With `as_of = T`, `similar` sends the `created_at` bound to Qdrant with
+    /// its vector search and drops a late memory a backend returned anyway.
+    /// A live `similar` sends no bound.
+    #[tokio::test(flavor = "current_thread")]
+    async fn as_of_bounds_similar_at_qdrant() {
+        let early = make_scored_memory(&"a".repeat(64), "early", 0.9);
+        let mut late = make_scored_memory(&"b".repeat(64), "late", 0.8);
+        late.memory.created_at = AS_OF + 1.0;
+        let mock = MockVectorsWithInjection {
+            search_results: vec![early.clone(), late.clone()],
+            ..Default::default()
+        };
+        let bounds_seen = mock.bounds_seen.clone();
+        let svc = injection_svc(mock, MockGraphWithActivation::default());
+        let params = SearchParams {
+            mode: SearchMode::Similar,
+            ..search_params("similar")
+        };
+
+        let live = svc
+            .search_with(params.clone(), true, None)
+            .await
+            .expect("search succeeds");
+        assert_eq!(
+            returned_hashes(&live),
+            [early.memory.content_hash.clone(), late.memory.content_hash].into()
+        );
+        assert_eq!(*bounds_seen.borrow(), [None]);
+        bounds_seen.borrow_mut().clear();
+
+        let replay = svc
+            .search_with(params, true, Some(AS_OF))
+            .await
+            .expect("search succeeds");
+        assert_eq!(returned_hashes(&replay), [early.memory.content_hash].into());
+        assert_eq!(*bounds_seen.borrow(), [Some(AS_OF)]);
+    }
+
     /// A response echoes `as_of` when the search carried it and not
     /// otherwise, in both modes that take it, so a caller can tell a server
     /// that ignored the field.
     #[tokio::test(flavor = "current_thread")]
     async fn as_of_is_echoed_only_when_sent() {
-        let mock = MockVectorsWithInjection {
-            search_results: vec![make_scored_memory(&"a".repeat(64), "hit", 0.9)],
-            ..Default::default()
-        };
-        let bounds_seen = mock.bounds_seen.clone();
-        let svc = injection_svc(mock, MockGraphWithActivation::default());
+        let svc = injection_svc(
+            MockVectorsWithInjection {
+                search_results: vec![make_scored_memory(&"a".repeat(64), "hit", 0.9)],
+                ..Default::default()
+            },
+            MockGraphWithActivation::default(),
+        );
         for mode in [SearchMode::Hybrid, SearchMode::Similar] {
             let params = SearchParams {
                 mode,
@@ -7449,16 +7491,11 @@ mod tests {
                 .await
                 .expect("search succeeds");
             assert_eq!(replay["as_of"], serde_json::json!(AS_OF), "{mode:?}");
-            if mode == SearchMode::Similar {
-                // Similar's vector search carries the bound to Qdrant.
-                assert_eq!(*bounds_seen.borrow(), [Some(AS_OF)]);
-            }
             let live = svc
                 .search_with(params, true, None)
                 .await
                 .expect("search succeeds");
             assert!(live.get("as_of").is_none(), "{mode:?}: {live}");
-            bounds_seen.borrow_mut().clear();
         }
     }
 
