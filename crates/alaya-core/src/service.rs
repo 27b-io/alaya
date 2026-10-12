@@ -1173,6 +1173,9 @@ impl MemoryService {
                     .is_none_or(|t| m.memory_type == *t)
                 && params.min_trust_score.is_none_or(|min| meets_trust(m, min))
         };
+        // A failed survivor lookup fails the search: a replay that guessed at
+        // supersession would be wrong without saying so. Graph injection
+        // below degrades instead, as a failed injection fetch always has.
         let survivors = self
             .survivor_times(
                 vis,
@@ -1182,7 +1185,10 @@ impl MemoryService {
                     .chain(&bm25_results)
                     .map(|sm| &sm.memory),
             )
-            .await?;
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(error = %e, "as_of survivor lookup for the candidate pools failed");
+            })?;
         vector_results.retain(|sm| admits(&sm.memory, &survivors));
         tag_results.retain(|sm| admits(&sm.memory, &survivors));
         bm25_results.retain(|sm| admits(&sm.memory, &survivors));
@@ -1286,12 +1292,14 @@ impl MemoryService {
                         .fold(f64::INFINITY, f64::min)
                         .max(0.1);
 
+                    // Either failure skips injection, never the search.
                     let fetched = match self.vectors.get_batch(&neighbor_hashes).await {
                         Ok(memories) => self
                             .survivor_times(vis, &memories)
                             .await
-                            .map(|survivors| (memories, survivors)),
-                        Err(e) => Err(e),
+                            .map(|survivors| (memories, survivors))
+                            .map_err(|e| ("as_of survivor lookup", e)),
+                        Err(e) => Err(("fetch", e)),
                     };
                     match fetched {
                         Ok((memories, survivors)) => {
@@ -1317,8 +1325,8 @@ impl MemoryService {
                             );
                             result
                         }
-                        Err(e) => {
-                            tracing::warn!("graph injection fetch failed (non-fatal): {e}");
+                        Err((step, e)) => {
+                            tracing::warn!("graph injection {step} failed (non-fatal): {e}");
                             Vec::new()
                         }
                     }
@@ -3321,7 +3329,8 @@ impl Drop for StageTimer<'_> {
     }
 }
 
-fn current_timestamp() -> f64 {
+/// The wall clock in epoch seconds, the unit of `created_at`.
+pub fn current_timestamp() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -6157,6 +6166,9 @@ mod tests {
     /// returns, unfiltered, so only the service's own filter can drop a
     /// member. Counts access-count increments, so a test can see search's
     /// writes, and the calls to each keyword pool's backend and to get_batch.
+    /// `bounds_seen` records the `max_created_at` each vector, BM25 and tag
+    /// search was sent, since only the tag search honours it.
+    /// `failing_batch` makes get_batch fail whenever it is asked for that hash.
     #[derive(Default)]
     struct MockVectorsWithInjection {
         search_results: Vec<ScoredMemory>,
@@ -6168,6 +6180,8 @@ mod tests {
         tag_calls: Rc<Cell<usize>>,
         bm25_calls: Rc<Cell<usize>>,
         batch_calls: Rc<Cell<usize>>,
+        bounds_seen: Rc<std::cell::RefCell<Vec<Option<f64>>>>,
+        failing_batch: Option<String>,
     }
 
     #[async_trait(?Send)]
@@ -6196,6 +6210,11 @@ mod tests {
         }
         async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>> {
             self.batch_calls.set(self.batch_calls.get() + 1);
+            if let Some(failing) = &self.failing_batch
+                && hashes.contains(&failing.as_str())
+            {
+                return Err(AlayaError::Storage("mock get_batch failure".into()));
+            }
             Ok(hashes
                 .iter()
                 .filter_map(|h| self.injectable_memories.get(*h).cloned())
@@ -6214,8 +6233,11 @@ mod tests {
             &self,
             _e: &[f32],
             _l: usize,
-            _f: Option<PayloadFilter>,
+            f: Option<PayloadFilter>,
         ) -> Result<Vec<ScoredMemory>> {
+            self.bounds_seen
+                .borrow_mut()
+                .push(f.and_then(|f| f.max_created_at));
             Ok(self.search_results.clone())
         }
         async fn search_by_tags(
@@ -6228,6 +6250,7 @@ mod tests {
             max_created_at: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             self.tag_calls.set(self.tag_calls.get() + 1);
+            self.bounds_seen.borrow_mut().push(max_created_at);
             Ok(tags
                 .iter()
                 .filter_map(|t| self.tag_pools.get(*t))
@@ -6247,9 +6270,12 @@ mod tests {
             &self,
             _q: &str,
             _l: usize,
-            _f: Option<PayloadFilter>,
+            f: Option<PayloadFilter>,
         ) -> Result<Vec<ScoredMemory>> {
             self.bm25_calls.set(self.bm25_calls.get() + 1);
+            self.bounds_seen
+                .borrow_mut()
+                .push(f.and_then(|f| f.max_created_at));
             Ok(self.bm25_pool.clone())
         }
         async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
@@ -7097,28 +7123,30 @@ mod tests {
             &bm25_bad,
         ]);
 
+        let mock = MockVectorsWithInjection {
+            search_results: vec![vector_ok.clone(), vector_bad.clone()],
+            injectable_memories: [&graph_ok, &graph_bad]
+                .into_iter()
+                .map(|sm| (sm.memory.content_hash.clone(), sm.memory.clone()))
+                .collect(),
+            // "stability" is a known tag, so the query hits the keyword pool.
+            tag_pools: HashMap::from([
+                (
+                    "stability".into(),
+                    vec![keyword_ok.clone(), keyword_bad.clone()],
+                ),
+                (
+                    "semantic".into(),
+                    vec![semantic_ok.clone(), semantic_bad.clone()],
+                ),
+            ]),
+            similar_tags: vec!["semantic".into()],
+            bm25_pool: vec![bm25_ok.clone(), bm25_bad.clone()],
+            ..Default::default()
+        };
+        let bounds_seen = mock.bounds_seen.clone();
         let svc = injection_svc(
-            MockVectorsWithInjection {
-                search_results: vec![vector_ok.clone(), vector_bad.clone()],
-                injectable_memories: [&graph_ok, &graph_bad]
-                    .into_iter()
-                    .map(|sm| (sm.memory.content_hash.clone(), sm.memory.clone()))
-                    .collect(),
-                // "stability" is a known tag, so the query hits the keyword pool.
-                tag_pools: HashMap::from([
-                    (
-                        "stability".into(),
-                        vec![keyword_ok.clone(), keyword_bad.clone()],
-                    ),
-                    (
-                        "semantic".into(),
-                        vec![semantic_ok.clone(), semantic_bad.clone()],
-                    ),
-                ]),
-                similar_tags: vec!["semantic".into()],
-                bm25_pool: vec![bm25_ok.clone(), bm25_bad.clone()],
-                ..Default::default()
-            },
+            mock,
             MockGraphWithActivation {
                 activation: [&graph_ok, &graph_bad]
                     .into_iter()
@@ -7133,12 +7161,22 @@ mod tests {
             .await
             .expect("search succeeds");
         assert_eq!(returned_hashes(&live), everything);
+        assert_eq!(
+            *bounds_seen.borrow(),
+            [None; 4],
+            "a live search sends no bound"
+        );
+        bounds_seen.borrow_mut().clear();
 
         let replay = svc
             .search_with(search_params("stability notes"), true, Some(AS_OF))
             .await
             .expect("search succeeds");
         assert_eq!(returned_hashes(&replay), wanted);
+        // The bound reaches Qdrant on every leg (dense, BM25, keyword tag,
+        // semantic tag): `admits` alone would let late memories fill each
+        // leg's fetch window first.
+        assert_eq!(*bounds_seen.borrow(), [Some(AS_OF); 4]);
     }
 
     /// As of T, a superseded memory is hidden once its survivor existed (the
@@ -7232,6 +7270,128 @@ mod tests {
         }
     }
 
+    /// The supersession rule reaches graph-injected neighbours, which come
+    /// from `get_batch` with no filter: as of T, a neighbour whose survivor
+    /// came after T is injected and one whose survivor existed by T is not.
+    /// The neighbours' survivors are looked up in one batch of their own.
+    #[tokio::test(flavor = "current_thread")]
+    async fn as_of_applies_the_supersession_rule_to_injected_neighbours() {
+        let survivor = |hash: char, created_at: f64| {
+            let mut m = make_scored_memory(&hash.to_string().repeat(64), "survivor", 0.0).memory;
+            m.created_at = created_at;
+            m
+        };
+        let early_survivor = survivor('e', AS_OF);
+        let late_survivor = survivor('f', AS_OF + 60.0);
+        let neighbour = |hash: char, survivor: &Memory| {
+            let mut m = make_scored_memory(&hash.to_string().repeat(64), "neighbour", 0.0).memory;
+            m.metadata = Some(HashMap::from([(
+                "superseded_by".to_string(),
+                serde_json::json!(survivor.content_hash),
+            )]));
+            m
+        };
+        let shown = neighbour('b', &late_survivor);
+        let hidden = neighbour('c', &early_survivor);
+        let seed = make_scored_memory(&"a".repeat(64), "seed", 0.9);
+
+        let mock = MockVectorsWithInjection {
+            search_results: vec![seed.clone()],
+            injectable_memories: [&shown, &hidden, &early_survivor, &late_survivor]
+                .into_iter()
+                .map(|m| (m.content_hash.clone(), m.clone()))
+                .collect(),
+            ..Default::default()
+        };
+        let batch_calls = mock.batch_calls.clone();
+        let svc = injection_svc(
+            mock,
+            MockGraphWithActivation {
+                activation: [&shown, &hidden]
+                    .into_iter()
+                    .map(|m| (m.content_hash.clone(), 0.8))
+                    .collect(),
+                ..Default::default()
+            },
+        );
+
+        let replay = svc
+            .search_with(search_params("stability notes"), true, Some(AS_OF))
+            .await
+            .expect("search succeeds");
+        assert_eq!(
+            returned_hashes(&replay),
+            [seed.memory.content_hash, shown.content_hash].into()
+        );
+        // The neighbour fetch, then its survivor lookup; the unmarked pools
+        // need none.
+        assert_eq!(batch_calls.get(), 2);
+    }
+
+    /// A survivor lookup that fails on the candidate pools fails the search:
+    /// a replay that guessed at supersession would be wrong without saying
+    /// so. The same failure on graph-injected neighbours only skips the
+    /// injection, as a failed injection fetch always has.
+    #[tokio::test(flavor = "current_thread")]
+    async fn as_of_survivor_lookup_failure_fails_pools_and_skips_injection() {
+        let broken = "d".repeat(64);
+        let marked = |hash: char| {
+            let mut m = make_scored_memory(&hash.to_string().repeat(64), "superseded", 0.5).memory;
+            m.metadata = Some(HashMap::from([(
+                "superseded_by".to_string(),
+                serde_json::json!(broken),
+            )]));
+            m
+        };
+        let seed = make_scored_memory(&"a".repeat(64), "seed", 0.9);
+
+        // On the pools: a marked candidate's lookup fails, and so does the search.
+        let pool_svc = injection_svc(
+            MockVectorsWithInjection {
+                search_results: vec![
+                    seed.clone(),
+                    ScoredMemory {
+                        memory: marked('b'),
+                        score: 0.5,
+                    },
+                ],
+                failing_batch: Some(broken.clone()),
+                ..Default::default()
+            },
+            MockGraphWithActivation::default(),
+        );
+        let failed = pool_svc
+            .search_with(search_params("stability notes"), true, Some(AS_OF))
+            .await;
+        assert!(matches!(failed, Err(AlayaError::Storage(_))), "{failed:?}");
+
+        // On the neighbours: the search answers from its pools alone.
+        let neighbour = marked('c');
+        let inject_svc = injection_svc(
+            MockVectorsWithInjection {
+                search_results: vec![seed.clone()],
+                injectable_memories: HashMap::from([(
+                    neighbour.content_hash.clone(),
+                    neighbour.clone(),
+                )]),
+                failing_batch: Some(broken),
+                ..Default::default()
+            },
+            MockGraphWithActivation {
+                activation: HashMap::from([(neighbour.content_hash.clone(), 0.8)]),
+                ..Default::default()
+            },
+        );
+        let degraded = inject_svc
+            .search_with(search_params("stability notes"), true, Some(AS_OF))
+            .await
+            .expect("an injection failure never fails the search");
+        assert_eq!(
+            returned_hashes(&degraded),
+            [seed.memory.content_hash].into()
+        );
+    }
+
     /// With `as_of = T`, recency decay runs from T, not the clock: a memory
     /// replayed at its own creation time scores as a memory created now
     /// scores live. The tag cache keeps the clock.
@@ -7273,13 +7433,12 @@ mod tests {
     /// that ignored the field.
     #[tokio::test(flavor = "current_thread")]
     async fn as_of_is_echoed_only_when_sent() {
-        let svc = injection_svc(
-            MockVectorsWithInjection {
-                search_results: vec![make_scored_memory(&"a".repeat(64), "hit", 0.9)],
-                ..Default::default()
-            },
-            MockGraphWithActivation::default(),
-        );
+        let mock = MockVectorsWithInjection {
+            search_results: vec![make_scored_memory(&"a".repeat(64), "hit", 0.9)],
+            ..Default::default()
+        };
+        let bounds_seen = mock.bounds_seen.clone();
+        let svc = injection_svc(mock, MockGraphWithActivation::default());
         for mode in [SearchMode::Hybrid, SearchMode::Similar] {
             let params = SearchParams {
                 mode,
@@ -7290,11 +7449,16 @@ mod tests {
                 .await
                 .expect("search succeeds");
             assert_eq!(replay["as_of"], serde_json::json!(AS_OF), "{mode:?}");
+            if mode == SearchMode::Similar {
+                // Similar's vector search carries the bound to Qdrant.
+                assert_eq!(*bounds_seen.borrow(), [Some(AS_OF)]);
+            }
             let live = svc
                 .search_with(params, true, None)
                 .await
                 .expect("search succeeds");
             assert!(live.get("as_of").is_none(), "{mode:?}: {live}");
+            bounds_seen.borrow_mut().clear();
         }
     }
 

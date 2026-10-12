@@ -265,7 +265,7 @@ curl -X POST http://localhost:3001/search \
 - `hybrid` computes recency decay from T instead of the current time.
 - The response carries `"as_of": T`. A server that predates the field ignores it and omits the echo, so check for it.
 
-Some state cannot be rewound and is read as it is now: graph state (Hebbian weights, spreading activation and graph-injected neighbours); access counts and access timestamps (the salience and spacing boosts); BM25 term statistics, computed over today's collection; the tag vocabulary that keyword extraction and the semantic tag pool read; tags, type, summary and trust patched since T; hard deletes; supersessions reversed by `/unsupersede`, which leave no marker, so the memory shows at every T; and a marker re-pointed to a second survivor, which names only the last one. The corpus size behind hybrid's fusion weight is today's too.
+Some state cannot be rewound and is read as it is now: graph state (Hebbian weights, and which neighbours spreading activation injects, though each injected neighbour still passes the `as_of` bound and the supersession rule); access counts and access timestamps (the salience and spacing boosts); BM25 term statistics, computed over today's collection; the tag vocabulary that keyword extraction and the semantic tag pool read; tags, type, summary and trust patched since T; hard deletes; supersessions reversed by `/unsupersede`, which leave no marker, so the memory shows at every T; and a marker re-pointed to a second survivor, which names only the last one. The corpus size behind hybrid's fusion weight is today's too.
 
 **Response:** array of memories sorted by relevance.
 

@@ -52,7 +52,7 @@ use alaya_core::calendar::utc_date_str;
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{
     JudgeOutcome, KeywordLeg, MemoryService, OutputMode, RankingFlags, RelationParams,
-    SearchParams, StoreParams, parse_user_relation, validate_as_of,
+    SearchParams, StoreParams, current_timestamp, parse_user_relation, validate_as_of,
 };
 use alaya_core::vitals::{CountingEmbedding, SelfCheckOutcome, Vitals};
 use alaya_types::graph::{Contradiction, ContradictionQuery, Resolution};
@@ -3259,11 +3259,7 @@ async fn search(
     let read_only = read_only || WritePolicy::read_only_for(principal);
     // Refused here, before dispatch, so the caller gets a 400 rather than an
     // op error in a 200 body.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
-    if let Err(msg) = validate_as_of(as_of, params.mode, read_only, now) {
+    if let Err(msg) = validate_as_of(as_of, params.mode, read_only, current_timestamp()) {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": msg})));
     }
     let (tx, rx) = oneshot::channel();
