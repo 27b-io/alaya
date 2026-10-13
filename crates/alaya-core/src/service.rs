@@ -549,10 +549,13 @@ const MAX_VIA_LEN: usize = 128;
 /// Cap on a `memory_unsupersede` reason: it is stored on the memory for good.
 pub const MAX_UNSUPERSEDE_REASON_LEN: usize = 2000;
 
-/// Whether a sweep page holds the pass: more gone nodes than the floor and
-/// a tenth of its valid ones (`GRAPH_SWEEP_HOLD_FLOOR`).
-fn too_many_gone(missing: usize, valid: usize) -> bool {
-    missing > GRAPH_SWEEP_HOLD_FLOOR.max(valid / 10)
+/// Whether a sweep window holds the pass: more gone nodes than
+/// `GRAPH_SWEEP_HOLD_FLOOR`, or every valid node gone. An absolute floor,
+/// never a fraction: a fraction lets a window at the edge of a gone run, or
+/// a restore missing a few percent spread by hashing, delete up to that
+/// fraction of every window.
+fn window_holds(missing: usize, valid: usize) -> bool {
+    missing > GRAPH_SWEEP_HOLD_FLOOR || (missing > 0 && missing == valid)
 }
 
 /// A held graph sweep: nothing on the held page was written.
@@ -579,20 +582,21 @@ fn sweep_held(
         "swept": swept,
         "skipped": skipped,
         "held_after": held_after,
-        "page_valid": valid,
-        "page_missing": missing,
+        "window_valid": valid,
+        "window_missing": missing,
     })
 }
 
 /// Most `Memory` nodes one graph sweep call reads (LAB-9265).
 pub const MAX_GRAPH_SWEEP_LIMIT: usize = 20_000;
 
-/// Nodes per page of a graph sweep: one bridge read and one Qdrant read each.
+/// Nodes per graph sweep page, and per window each page is judged on: one
+/// bridge read and one Qdrant read each.
 const GRAPH_SWEEP_PAGE: usize = 500;
 
-/// A sweep page whose gone nodes exceed this many, and a tenth of its valid
-/// nodes, holds the sweep: that is a wrong or empty collection, not stray
-/// nodes (normally a handful), and a DETACH DELETE takes graph-only state
+/// A sweep window whose gone nodes exceed this many holds the sweep: that
+/// is a wrong, empty or partly restored collection, not stray nodes
+/// (normally a handful), and a DETACH DELETE takes graph-only state
 /// (verdicts, resolutions, refute reasons, SUPERSEDES edges) for good.
 const GRAPH_SWEEP_HOLD_FLOOR: usize = 3;
 
@@ -2718,17 +2722,18 @@ impl MemoryService {
     /// malformed is never touched (`skipped`).
     ///
     /// A hold keeps a wrong, empty or partly restored collection from
-    /// wiping the graph, whatever `after` and `limit` the caller picks: each
-    /// page is judged on a window of the next `GRAPH_SWEEP_PAGE` nodes from
-    /// its own start, never on the caller's page size, and holds before any
-    /// write when every node in the window is gone or `too_many_gone` says
-    /// so. A gone run of any length therefore holds from wherever a page
-    /// starts in it. The cost: stray nodes that are the last few in the
-    /// graph, with nothing live after them, are never swept; `delete_memory`
-    /// removes each (it calls `delete_node` even when the point is absent). A held call answers `status: held`, `success: false`, with
-    /// the window's counts.
-    /// Otherwise it returns `{scanned, swept, skipped, next_after}`; pass
-    /// `next_after` back until it is `null`.
+    /// wiping the graph: each page is judged, before any write, on a window
+    /// of the next `GRAPH_SWEEP_PAGE` nodes from its own start, never on the
+    /// caller's page size, and holds as `window_holds` says. Following
+    /// `next_after` from any start, such a collection costs at most
+    /// `GRAPH_SWEEP_HOLD_FLOOR` nodes per call before it holds. A caller who
+    /// hand-crafts `after` is outside that bound, as it holds `delete_memory`
+    /// anyway. Stray nodes the window holds (more than the floor within one
+    /// window, or the last few in the graph with nothing live after them)
+    /// are left for `delete_memory`, which calls `delete_node` even when the
+    /// point is absent. A held call answers `status: held`, `success: false`,
+    /// with the window's counts. Otherwise it returns `{scanned, swept,
+    /// skipped, next_after}`; pass `next_after` back until it is `null`.
     #[tracing::instrument(skip_all, fields(limit))]
     pub async fn sweep_gone_memory_nodes(
         &self,
@@ -2761,9 +2766,7 @@ impl MemoryService {
                 break;
             };
             let (window_valid, window_missing) = self.missing_points(&window).await?;
-            let held = window_missing.len() == window_valid
-                || too_many_gone(window_missing.len(), window_valid);
-            if !window_missing.is_empty() && held {
+            if window_holds(window_missing.len(), window_valid) {
                 return Ok(sweep_held(
                     &after,
                     scanned,
@@ -14536,29 +14539,45 @@ mod tests {
         let out = svc.sweep_gone_memory_nodes("", 100, "run-1").await.unwrap();
         assert_eq!(out["success"], false, "{out}");
         assert_eq!(out["status"], "held");
-        assert_eq!(out["page_missing"], 4);
-        assert_eq!(out["page_valid"], 10);
+        assert_eq!(out["window_missing"], 4);
+        assert_eq!(out["window_valid"], 10);
         assert_eq!(out["swept"], 0);
         assert_eq!(ledger.nodes.borrow().len(), 10, "nothing deleted");
         assert!(ledger.sweep_marks.borrow().is_empty(), "nothing marked");
         assert_eq!(ledger.contradicts.borrow().len(), 4, "edges kept");
     }
 
-    /// Past the floor, the hold is a tenth of the page's valid nodes: 6 of
-    /// 60 gone is swept, 7 of 60 holds with nothing written.
+    /// A window at the edge of a gone run holds on the absolute floor: 450
+    /// live then 550 gone, from the start at the default and the largest
+    /// pages, deletes nothing (a fraction of the window would let up to a
+    /// tenth of it go per call). Three gone in a window still sweep.
     #[tokio::test(flavor = "current_thread")]
-    async fn graph_sweep_holds_past_a_tenth_of_the_page() {
-        for (gone, held) in [(6, false), (7, true)] {
-            let hashes: Vec<String> = (0..60u32).map(|i| format!("{i:064x}")).collect();
-            let refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
-            let ledger = sweep_ledger(&refs[gone..], &refs[..gone]);
-            let svc = ledger.service();
-            let out = svc.sweep_gone_memory_nodes("", 100, "run-1").await.unwrap();
-            assert_eq!(out["status"] == "held", held, "gone={gone}: {out}");
-            let swept = if held { 0 } else { gone };
-            assert_eq!(out["swept"], swept, "gone={gone}: {out}");
-            assert_eq!(ledger.nodes.borrow().len(), 60 - swept);
+    async fn graph_sweep_holds_the_edge_of_a_gone_run_on_the_floor() {
+        let hashes: Vec<String> = (0..1000u32).map(|i| format!("{i:064x}")).collect();
+        let refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
+        let ledger = sweep_ledger(&refs[..450], &refs[450..]);
+        let svc = ledger.service();
+        for limit in [500, 5000] {
+            for _ in 0..2 {
+                let out = svc
+                    .sweep_gone_memory_nodes("", limit, "run-1")
+                    .await
+                    .unwrap();
+                assert_eq!(out["status"], "held", "limit={limit}: {out}");
+                assert_eq!(out["swept"], 0, "limit={limit}: {out}");
+            }
         }
+        assert_eq!(ledger.nodes.borrow().len(), 1000, "nothing deleted");
+        assert!(ledger.sweep_marks.borrow().is_empty(), "nothing marked");
+
+        let ledger = sweep_ledger(&refs[3..], &refs[..3]);
+        let svc = ledger.service();
+        let out = svc
+            .sweep_gone_memory_nodes("", 5000, "run-1")
+            .await
+            .unwrap();
+        assert_eq!(out["swept"], 3, "{out}");
+        assert_eq!(ledger.nodes.borrow().len(), 997);
     }
 
     /// Against an empty or wrong collection, no `limit` or `after` gets a
