@@ -3527,11 +3527,22 @@ async fn unsupersede(
 /// The status of a confirm or refute result: a refusal is a 4xx, a correction
 /// stored without its second step is a 500 whose body names it.
 fn outcome_status(v: &Value) -> StatusCode {
+    // A refute's `status: superseded` is its success, not a refusal.
+    if v["success"] == true {
+        return StatusCode::OK;
+    }
     match (v["status"].as_str(), v["error_kind"].as_str()) {
         (Some("not_found"), _) => StatusCode::NOT_FOUND,
-        (Some("superseded" | "correction_superseded" | "correction_exists" | "conflict"), _) => {
-            StatusCode::CONFLICT
-        }
+        (
+            Some(
+                "superseded"
+                | "correction_superseded"
+                | "correction_deleted"
+                | "correction_exists"
+                | "conflict",
+            ),
+            _,
+        ) => StatusCode::CONFLICT,
         (_, Some("validation")) => StatusCode::BAD_REQUEST,
         _ if v.get("error").is_some() => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::OK,
@@ -6996,6 +7007,16 @@ mod wedge_tests {
             (
                 "refute",
                 json!({"success": false, "status": "correction_superseded"}),
+                StatusCode::CONFLICT,
+            ),
+            (
+                "refute",
+                json!({"success": true, "status": "superseded", "correction_hash": fix}),
+                StatusCode::OK,
+            ),
+            (
+                "refute",
+                json!({"success": false, "status": "correction_deleted", "correction_hash": fix}),
                 StatusCode::CONFLICT,
             ),
             (

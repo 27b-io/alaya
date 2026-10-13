@@ -221,6 +221,8 @@ enum RefuteEnd {
     Conflict(Value),
     /// The correction was superseded meanwhile (its marker): nothing written.
     CorrectionHidden(Value),
+    /// The correction was deleted meanwhile: nothing written.
+    CorrectionDeleted,
     /// The supersession is there already, with another reason (the stored
     /// one): nothing written, and the caller's reason is not claimed.
     ReasonConflict(Option<Value>),
@@ -2648,6 +2650,13 @@ impl MemoryService {
                     )),
                 )
             }
+            RefuteEnd::CorrectionDeleted => (
+                "correction_deleted",
+                Some(format!(
+                    "The correction {correction_hash} was deleted meanwhile; nothing else was \
+                     written. Retry the refute to store it again"
+                )),
+            ),
             RefuteEnd::ReasonConflict(stored) => {
                 result["superseded_by"] = serde_json::json!(correction_hash);
                 result["supersession_reason"] = stored.unwrap_or(Value::Null);
@@ -2708,14 +2717,7 @@ impl MemoryService {
             Ok(Some(m)) => {
                 supersession_marker(&m).map(|marker| RefuteEnd::CorrectionHidden(marker.clone()))
             }
-            Ok(None) => Some(RefuteEnd::failed(
-                if plan.supersede {
-                    "supersede"
-                } else {
-                    "contradicts_edge"
-                },
-                AlayaError::NotFound("the correction was deleted meanwhile".into()),
-            )),
+            Ok(None) => Some(RefuteEnd::CorrectionDeleted),
             Err(e) => {
                 tracing::warn!(op = "refute.recheck", error = %e, "re-read of the correction failed");
                 None
@@ -2731,15 +2733,8 @@ impl MemoryService {
         }
         let requested = serde_json::json!(plan.reason);
         let reason = match self.vectors.supersede_if_live(old, new, &plan.reason).await {
-            Ok(ConditionalSupersede::Superseded) => Some(requested),
-            // A retry converges only on its own reason: another one stays
-            // the record and is reported, never claimed as this call's.
-            Ok(ConditionalSupersede::AlreadySuperseded { reason }) => {
-                if reason.as_ref() != Some(&requested) {
-                    return RefuteEnd::ReasonConflict(reason);
-                }
-                reason
-            }
+            Ok(ConditionalSupersede::Superseded) => Some(requested.clone()),
+            Ok(ConditionalSupersede::AlreadySuperseded { reason }) => reason,
             Ok(ConditionalSupersede::Conflict(marker)) => return RefuteEnd::Conflict(marker),
             // The write may have landed without being confirmed: the stored
             // marker decides.
@@ -2759,6 +2754,12 @@ impl MemoryService {
                 }
             },
         };
+        // A supersession this call did not write (a retry, or a write it
+        // could not confirm) counts only with this call's reason: another
+        // one stays the record and is reported, never claimed as this call's.
+        if reason.as_ref() != Some(&requested) {
+            return RefuteEnd::ReasonConflict(reason);
+        }
         // Also on a converged retry: an earlier call's edge may be missing.
         self.write_supersedes_edges(&[old], new).await;
         RefuteEnd::Superseded(reason)
@@ -10763,6 +10764,9 @@ mod tests {
         /// The next conditional supersede lands but answers an error, as a
         /// write whose read-back failed.
         supersede_unconfirmed: Cell<bool>,
+        /// With it: the reason that lands, as when a concurrent refute's
+        /// write wins with its own reason.
+        unconfirmed_reason: RefCell<Option<String>>,
     }
 
     impl Ledger {
@@ -10915,10 +10919,16 @@ mod tests {
                 return Err(AlayaError::Storage("ledger metadata write failed".into()));
             }
             self.0.set_marker(h, Some(serde_json::json!(new_hash)));
+            let landed = self
+                .0
+                .unconfirmed_reason
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| reason.to_string());
             self.0
                 .reasons
                 .borrow_mut()
-                .insert(h.into(), serde_json::json!(reason));
+                .insert(h.into(), serde_json::json!(landed));
             if self.0.supersede_unconfirmed.replace(false) {
                 return Err(AlayaError::Storage("write sent, read-back failed".into()));
             }
@@ -10937,14 +10947,19 @@ mod tests {
                 .insert("last_confirmed_at".into(), serde_json::json!(at));
             Ok(ConfirmOutcome::Confirmed)
         }
+        /// As the real parse does, with the stored `supersession_reason`.
         async fn get_by_hash(&self, h: &str) -> Result<Option<Memory>> {
-            Ok(self
+            let mut m = self
                 .0
                 .memories
                 .borrow()
                 .iter()
                 .find(|m| m.content_hash == h)
-                .cloned())
+                .cloned();
+            if let Some(m) = &mut m {
+                m.supersession_reason = self.0.reasons.borrow().get(h).cloned();
+            }
+            Ok(m)
         }
         async fn set_generated_summary(
             &self,
@@ -12423,7 +12438,7 @@ mod tests {
     /// The link branch checks the correction too, and links nothing to one
     /// hidden meanwhile.
     #[tokio::test(flavor = "current_thread")]
-    async fn refute_link_refuses_a_correction_hidden_meanwhile() {
+    async fn refute_finish_link_refuses_a_correction_hidden_meanwhile() {
         let (a, d) = (h('a'), h('d'));
         let ledger = Ledger::with(&[&a, &d]);
         let svc = ledger.service();
@@ -12513,5 +12528,51 @@ mod tests {
         r.citations = None;
         let out = svc.memory_refute(&a, r).await.unwrap();
         assert_eq!(out["status"], "contradicts", "{out}");
+    }
+
+    /// An unconfirmed supersede read back with another refute's reason is a
+    /// conflict, as on a retry: the stored reason is reported, never claimed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refute_read_back_with_another_reason_is_a_conflict() {
+        let a = h('a');
+        let ledger = Ledger::with(&[&a]);
+        ledger.supersede_unconfirmed.set(true);
+        *ledger.unconfirmed_reason.borrow_mut() = Some("a concurrent reason".into());
+        let svc = ledger.service();
+
+        let out = svc
+            .memory_refute(&a, refutation("the port is 3001", true))
+            .await
+            .unwrap();
+        assert_eq!(out["success"], false, "{out}");
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(out["supersession_reason"], "a concurrent reason");
+    }
+
+    /// A correction deleted between the phases is its own end, with nothing
+    /// written, never a `partial` that claims the correction is stored.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refute_reports_a_correction_deleted_meanwhile() {
+        for supersede in [true, false] {
+            let a = h('a');
+            let ledger = Ledger::with(&[&a]);
+            let svc = ledger.service();
+            let plan = plan_of(
+                svc.refute_store(&a, refutation("the port is 3001", supersede))
+                    .await
+                    .unwrap(),
+            );
+            ledger
+                .memories
+                .borrow_mut()
+                .retain(|m| m.content_hash != plan.correction_hash);
+            let out = svc.refute_finish(&plan).await;
+
+            assert_eq!(out["success"], false, "{out}");
+            assert_eq!(out["status"], "correction_deleted");
+            assert!(out.get("failed_step").is_none(), "{out}");
+            assert_eq!(ledger.marker(&a), None);
+            assert!(ledger.contradicts.borrow().is_empty());
+        }
     }
 }
