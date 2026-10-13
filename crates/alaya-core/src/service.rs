@@ -1621,7 +1621,14 @@ impl MemoryService {
                                 timestamp: now,
                             })
                             .collect();
-                        let _ = self.hebbian.enqueue_strengthen(&pairs).await;
+                        // Non-fatal, but logged: the bridge client logs nothing.
+                        if let Err(e) = self.hebbian.enqueue_strengthen(&pairs).await {
+                            tracing::warn!(
+                                pairs = pairs.len(),
+                                error = %e,
+                                "hebbian enqueue failed (non-fatal)"
+                            );
+                        }
                     }
                     hebbian_done.set(true);
                 };
@@ -4004,6 +4011,15 @@ mod tests {
         }
     }
 
+    /// An enqueue the bridge refuses.
+    struct FailingHebbian;
+    #[async_trait(?Send)]
+    impl HebbianService for FailingHebbian {
+        async fn enqueue_strengthen(&self, _p: &[CoAccessPair]) -> Result<()> {
+            Err(AlayaError::Graph("bridge refused".into()))
+        }
+    }
+
     struct MockConsolidation;
     #[async_trait(?Send)]
     impl ConsolidationService for MockConsolidation {
@@ -4232,6 +4248,59 @@ mod tests {
             reported_access_counts(&found),
             [STORED_ACCESS_COUNT + 1, STORED_ACCESS_COUNT + 1],
             "{found}"
+        );
+    }
+
+    /// A refused Hebbian enqueue leaves one warn line in the `enrich` span with
+    /// the pair count and the error, no hashes, and the search answers as if
+    /// the enqueue had landed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn search_logs_a_failed_hebbian_enqueue() {
+        let search = |hebbian: Box<dyn HebbianService>| async move {
+            MemoryService::new(
+                Box::new(MockVectors::finding(2)),
+                Box::new(MockEmbeddings),
+                Box::new(MockGraph),
+                hebbian,
+                Box::new(MockConsolidation),
+                None,
+            )
+            .search_with(search_params("anything"), false)
+            .await
+            .expect("search succeeds")
+        };
+        let message = "hebbian enqueue failed (non-fatal)";
+
+        let (found, events) =
+            captured("alaya_core::service", search(Box::new(FailingHebbian))).await;
+        let warns: Vec<_> = events
+            .iter()
+            .filter(|e| e.get("message").map(String::as_str) == Some(message))
+            .collect();
+        assert_eq!(warns.len(), 1, "{events:?}");
+        let mut fields: Vec<&str> = warns[0].keys().map(String::as_str).collect();
+        fields.sort_unstable();
+        assert_eq!(fields, ["error", "level", "message", "pairs"]);
+        assert_eq!(warns[0]["level"], "WARN");
+        assert_eq!(warns[0]["pairs"], "1");
+        assert_eq!(warns[0]["error"], "graph error: bridge refused");
+        // Scores decay with wall-clock time, so compare what was found.
+        let hits = |v: &Value| -> Vec<(Value, Value)> {
+            v["results"]
+                .as_array()
+                .expect("results")
+                .iter()
+                .map(|r| (r["content_hash"].clone(), r["access_count"].clone()))
+                .collect()
+        };
+        let baseline = search(Box::new(MockHebbian)).await;
+        assert_eq!(hits(&found), hits(&baseline));
+        assert_eq!(hits(&found).len(), 2, "{found}");
+
+        let (_, events) = scoped(search(Box::new(FailingHebbian))).await;
+        assert_eq!(
+            scopes_of(&events, message),
+            [["enrich", "search_hybrid", "search_with"]]
         );
     }
 
