@@ -24,7 +24,6 @@ import os
 import re
 import sys
 import time
-import urllib.request
 from collections import defaultdict
 from itertools import pairwise
 from pathlib import Path
@@ -33,8 +32,9 @@ import httpx
 import numpy as np
 from _stop_words import STOP_WORDS
 
-sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)
-sys.stderr = os.fdopen(sys.stderr.fileno(), "w", buffering=1)
+# Also makes stdout/stderr unbuffered on import; rewrapping them here would let
+# the first wrappers be collected and close fds 1 and 2.
+from longmemeval_bench import download_data
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
@@ -43,7 +43,6 @@ EMBEDDING_MODEL = "Snowflake/snowflake-arctic-embed-l-v2.0"
 EMBEDDING_DIM = 1024
 BATCH_SIZE = 6  # TEI on CPU limits to max_batch_requests=8
 
-LME_URL = "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json"
 LME_CACHE = "/tmp/longmemeval_s_cleaned.json"
 EMBED_CACHE_DIR = Path("benchmarks/cache")
 EMBED_CACHE_ARRAYS = EMBED_CACHE_DIR / "lme_embeddings.npz"
@@ -72,14 +71,6 @@ SEED_PARAMS = {
 }
 
 # ── Data helpers ─────────────────────────────────────────────────────────────
-
-
-def download_data(path: str) -> list[dict]:
-    if not os.path.exists(path):
-        print(f"  Downloading LongMemEval data to {path}...")
-        urllib.request.urlretrieve(LME_URL, path)
-    with open(path) as f:
-        return json.load(f)
 
 
 def build_session_doc(session: list[dict]) -> str:

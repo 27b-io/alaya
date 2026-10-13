@@ -52,6 +52,11 @@ DEFAULT_READER = "claude-sonnet-5-5"
 DEFAULT_JUDGE = "claude-opus-5-5"
 DEFAULT_K = 10
 LME_CACHE = "/tmp/longmemeval_s_cleaned.json"
+# The Hugging Face revision of LongMemEval-S the committed QA run read, and the
+# SHA-256 of its file. Pinned here, in this dependency-free module, so every
+# loader can refuse other bytes before a run spends a Qdrant or model call.
+LME_REVISION = "98d7416c24c778c2fee6e6f3006e7a073259d48f"
+LME_SHA256 = "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442"
 
 # The reader and judge see only the prompt: no tools, no project context, and an
 # empty system prompt, matching evaluate_qa.py's single user message.
@@ -225,6 +230,7 @@ def load_dataset(path: str) -> dict[str, dict]:
         sys.exit(
             f"  LongMemEval data not found at {path}; run longmemeval_bench.py first (it downloads it)."
         )
+    require_pinned_dataset(path)
     with open(path) as f:
         return {e["question_id"]: e for e in json.load(f)}
 
@@ -278,6 +284,17 @@ def file_sha256(path: str) -> str:
     except OSError as e:
         sys.exit(f"  cannot read {path}: {e}")
     return h.hexdigest()
+
+
+def require_pinned_dataset(path: str) -> None:
+    actual = file_sha256(path)
+    if actual != LME_SHA256:
+        sys.exit(
+            f"\n  REFUSING TO RUN: {path} is not the pinned LongMemEval-S file.\n"
+            f"  expected sha256 {LME_SHA256}\n"
+            f"  actual   sha256 {actual}\n"
+            f"  Delete {path} and rerun to download revision {LME_REVISION}.\n"
+        )
 
 
 def require_read_input(run_dir: str, key: str, value: str, what: str) -> None:

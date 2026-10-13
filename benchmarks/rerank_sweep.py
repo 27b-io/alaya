@@ -26,6 +26,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
+from longmemeval_bench import download_data  # noqa: E402
 from optimize_params import (  # noqa: E402
     build_session_doc,
     cosine_sim_batch,
@@ -147,7 +148,7 @@ def main() -> None:
         for qid in qids
     }
 
-    lme = {e["question_id"]: e for e in json.load(open(LME))}
+    lme = {e["question_id"]: e for e in download_data(LME)}
     print(f"  cached questions: {len(cached)}")
     print(f"  LME questions:    {len(lme)}")
 
