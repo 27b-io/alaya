@@ -2724,8 +2724,8 @@ impl MemoryService {
     /// write when every node in the window is gone or `too_many_gone` says
     /// so. A gone run of any length therefore holds from wherever a page
     /// starts in it. The cost: stray nodes that are the last few in the
-    /// graph, with nothing live after them, are never swept; remove those
-    /// by hand. A held call answers `status: held`, `success: false`, with
+    /// graph, with nothing live after them, are never swept; `delete_memory`
+    /// removes each (it calls `delete_node` even when the point is absent). A held call answers `status: held`, `success: false`, with
     /// the window's counts.
     /// Otherwise it returns `{scanned, swept, skipped, next_after}`; pass
     /// `next_after` back until it is `null`.
@@ -14563,7 +14563,7 @@ mod tests {
 
     /// Against an empty or wrong collection, no `limit` or `after` gets a
     /// node deleted: the fixed-size window holds every call, one-node pages
-    /// and short last pages included (Helly R).
+    /// and short last pages included.
     #[tokio::test(flavor = "current_thread")]
     async fn graph_sweep_holds_whatever_the_caller_pages() {
         for graph in [2, 12] {
@@ -14599,9 +14599,9 @@ mod tests {
         }
     }
 
-    /// A gone run past the head of the graph (a partly restored collection)
-    /// holds too: one-node pages from the run's start, or from anywhere in
-    /// it, never delete a node of it (Helly R at 910db03).
+    /// A gone run past a clean head (a partly restored collection) holds
+    /// too: pages of any size from the head's last hash, or from anywhere in
+    /// the run, never delete a node of it.
     #[tokio::test(flavor = "current_thread")]
     async fn graph_sweep_holds_a_gone_run_deep_in_the_graph() {
         let hashes: Vec<String> = (0..1000u32).map(|i| format!("{i:064x}")).collect();
@@ -14609,21 +14609,51 @@ mod tests {
         let ledger = sweep_ledger(&refs[..500], &refs[500..]);
         let svc = ledger.service();
         for start in [499, 500, 750, 996, 998] {
-            let mut after = hashes[start].clone();
-            for _ in 0..5 {
+            for limit in [1, 3, 100] {
                 let out = svc
-                    .sweep_gone_memory_nodes(&after, 1, "run-1")
+                    .sweep_gone_memory_nodes(&hashes[start], limit, "run-1")
                     .await
                     .unwrap();
-                assert_eq!(out["status"], "held", "start={start}: {out}");
-                let Some(next) = out["next_after"].as_str() else {
-                    break;
-                };
-                after = next.to_string();
+                assert_eq!(out["status"], "held", "start={start} limit={limit}: {out}");
             }
         }
         assert_eq!(ledger.nodes.borrow().len(), 1000, "nothing deleted");
         assert!(ledger.sweep_marks.borrow().is_empty(), "nothing marked");
+    }
+
+    /// A healthy graph with a few gone nodes well past its head is swept
+    /// one node per call, following `next_after` to the end.
+    #[tokio::test(flavor = "current_thread")]
+    async fn graph_sweep_sweeps_stray_nodes_past_the_head_one_per_call() {
+        let hashes: Vec<String> = (0..1000u32).map(|i| format!("{i:064x}")).collect();
+        let strays = [600, 700, 800];
+        let (mut live, mut gone) = (Vec::new(), Vec::new());
+        for (i, x) in hashes.iter().enumerate() {
+            if strays.contains(&i) {
+                gone.push(x.as_str())
+            } else {
+                live.push(x.as_str())
+            }
+        }
+        let ledger = sweep_ledger(&live, &gone);
+        let svc = ledger.service();
+        let (mut after, mut swept, mut calls) = (String::new(), 0, 0);
+        loop {
+            let out = svc
+                .sweep_gone_memory_nodes(&after, 1, "run-1")
+                .await
+                .unwrap();
+            assert_eq!(out["success"], true, "{out}");
+            swept += out["swept"].as_u64().unwrap();
+            calls += 1;
+            let Some(next) = out["next_after"].as_str() else {
+                break;
+            };
+            after = next.to_string();
+        }
+        assert_eq!(swept, 3);
+        assert_eq!(calls, 1001, "one per node, and one that finds the end");
+        assert_eq!(ledger.nodes.borrow().len(), 997);
     }
 
     /// A mostly-gone stretch with a live node every fourth (a restore that

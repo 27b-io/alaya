@@ -5977,6 +5977,9 @@ mod wedge_tests {
         async fn get_orphan_nodes(&self, _limit: usize) -> Result<Vec<String>> {
             unimplemented!()
         }
+        async fn list_memory_nodes(&self, _after: &str, _limit: usize) -> Result<Vec<String>> {
+            std::future::pending().await
+        }
     }
 
     pub(super) fn hanging_service() -> MemoryService {
@@ -6055,6 +6058,58 @@ mod wedge_tests {
                 assert_eq!(patched["content_hash"], json!(hash), "{patched}");
                 assert!(patched.get("supersession_log").is_none(), "{patched}");
                 assert!(patched.get("supersession_reason").is_none(), "{patched}");
+            })
+            .await;
+    }
+
+    /// A graph sweep runs off the loop, one per process: a second one while
+    /// the first hangs is refused with `status: busy` (a 409 by
+    /// `outcome_status`), and the guard is released at the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn graph_sweep_is_single_flight_and_refuses_as_busy() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::channel::<Cmd>(8);
+                let limits = WorkerLimits {
+                    long: Duration::from_millis(100),
+                    ..WorkerLimits::default()
+                };
+                tokio::task::spawn_local(service_worker(
+                    rx,
+                    hanging_service(),
+                    Arc::new(AtomicU64::new(0)),
+                    limits,
+                ));
+                let send_sweep = || {
+                    let (rtx, rrx) = oneshot::channel();
+                    tx.try_send(Cmd {
+                        inner: CmdInner::GraphSweep {
+                            after: String::new(),
+                            limit: 10,
+                            reply: rtx,
+                        },
+                        span: tracing::Span::none(),
+                    })
+                    .unwrap();
+                    rrx
+                };
+                let first = send_sweep();
+                let refused = send_sweep().await.unwrap();
+                assert_eq!(refused["status"], "busy", "{refused}");
+                assert_eq!(outcome_status(&refused), StatusCode::CONFLICT);
+
+                let reply = tokio::time::timeout(Duration::from_secs(60), first)
+                    .await
+                    .expect("sweep never replied")
+                    .unwrap();
+                assert_eq!(reply["error_kind"], "timeout");
+                let again = send_sweep();
+                let again = tokio::time::timeout(Duration::from_secs(60), again)
+                    .await
+                    .expect("sweep never replied")
+                    .unwrap();
+                assert_ne!(again["status"], "busy", "the guard is released: {again}");
             })
             .await;
     }
