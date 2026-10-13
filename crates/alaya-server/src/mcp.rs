@@ -563,7 +563,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "search",
-            "description": "Search and retrieve memories. Consolidates all retrieval modes into one tool. Each result includes a full 64-char content_hash — pass it to get_memory for an exact re-fetch, or to memory_supersede/delete_memory/relation.",
+            "description": "Search and retrieve memories. Consolidates all retrieval modes into one tool. Each result includes a full 64-char content_hash — pass it to get_memory for an exact re-fetch, or to memory_supersede/delete_memory/relation. A result may carry newer_related: [{content_hash, verdict_confidence}], newer memories the contradiction judge (an LLM) picked over this one. Nobody has reviewed that pick. Read both memories: this one often holds detail the newer one lacks.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -586,7 +586,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "get_memory",
-            "description": "Retrieve a single memory by its exact content_hash. Returns {\"found\": true, \"memory\": {...}} or {\"found\": false}. Use this to inspect a memory before supersede/delete/relation when you already hold its hash — e.g. from search results or a memory_contradictions report. Superseded memories are returned; check metadata.superseded_by. With full or both output, memory.supersession_reason says why it was superseded, and memory.supersession_log lists the supersessions reversed by memory_unsupersede, oldest first (who, when, why); absent when none.",
+            "description": "Retrieve a single memory by its exact content_hash. Returns {\"found\": true, \"memory\": {...}} or {\"found\": false}. Use this to inspect a memory before supersede/delete/relation when you already hold its hash — e.g. from search results or a memory_contradictions report. Superseded memories are returned; check metadata.superseded_by. With full or both output, memory.supersession_reason says why it was superseded, and memory.supersession_log lists the supersessions reversed by memory_unsupersede, oldest first (who, when, why); absent when none. memory.newer_related, when present, lists newer memories the contradiction judge (an LLM) picked over this one, unreviewed: read both.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

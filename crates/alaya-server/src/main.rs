@@ -99,6 +99,8 @@ struct Config {
     rerank_timeout_ms: std::num::NonZeroU64,
     /// Hybrid ranking boosts switched off by `RANK_*` (LAB-7714).
     ranking: RankingFlags,
+    /// The `newer_related` pointer's judge-confidence floor; `None` = off.
+    newer_related: Option<f64>,
     /// Periodic self-check (LAB-4026); `None` when its env vars are unset.
     selfcheck: Option<selfcheck::SelfCheckConfig>,
 }
@@ -166,6 +168,8 @@ impl Config {
                 .parse()
                 .expect("RERANK_TIMEOUT_MS must be a positive integer (ms)"),
             ranking: parse_ranking(|var| std::env::var(var).ok()).unwrap_or_else(|e| panic!("{e}")),
+            newer_related: parse_newer_related(|var| std::env::var(var).ok())
+                .unwrap_or_else(|e| panic!("{e}")),
             selfcheck: selfcheck::parse(
                 env_non_empty("SELFCHECK_QUERY"),
                 env_non_empty("SELFCHECK_EXPECT_HASH"),
@@ -2260,6 +2264,34 @@ fn parse_ranking(env: impl Fn(&str) -> Option<String>) -> Result<RankingFlags, S
     })
 }
 
+/// `NEWER_RELATED` (`true` / `false`, unset = on) and
+/// `NEWER_RELATED_MIN_CONFIDENCE` (the floor on the judge's
+/// `verdict_confidence`, `0 < x <= 1`, unset = 0.90). `None` turns the
+/// pointer off. Read raw, like `parse_ranking`: set-but-blank or any other
+/// value refuses boot.
+fn parse_newer_related(env: impl Fn(&str) -> Option<String>) -> Result<Option<f64>, String> {
+    let on = match env("NEWER_RELATED") {
+        None => true,
+        Some(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" => true,
+            "false" => false,
+            _ => return Err(format!("NEWER_RELATED must be true or false, got {s:?}")),
+        },
+    };
+    let min = match env("NEWER_RELATED_MIN_CONFIDENCE") {
+        None => alaya_core::newer_related::DEFAULT_MIN_CONFIDENCE,
+        Some(s) => s
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|x| *x > 0.0 && *x <= 1.0)
+            .ok_or_else(|| {
+                format!("NEWER_RELATED_MIN_CONFIDENCE must be a number in (0, 1], got {s:?}")
+            })?,
+    };
+    Ok(on.then_some(min))
+}
+
 /// Default daily cap for store-path judge calls (LAB-3895).
 const JUDGE_DAILY_CAP_DEFAULT: usize = 1000;
 
@@ -2873,6 +2905,10 @@ fn main() {
             keyword_leg = ?config.ranking.keyword_leg,
             "hybrid ranking switches"
         );
+        tracing::info!(
+            min_confidence = ?config.newer_related,
+            "newer_related pointer (None = off)"
+        );
 
         let judge: Option<JudgeClient> = if let Some(url) = &config.judge_url {
             tracing::info!(
@@ -2955,6 +2991,7 @@ fn main() {
                     svc = svc.with_reranker(Box::new(rerank));
                 }
                 svc = svc.with_ranking(cfg_clone.ranking);
+                svc = svc.with_newer_related(cfg_clone.newer_related);
 
                 let limits = WorkerLimits {
                     judge_daily_cap: cfg_clone.judge_daily_cap,
@@ -4076,6 +4113,55 @@ mod tests {
             let err = parse_ranking(|v| (v == var).then(|| value.to_string())).unwrap_err();
             assert!(err.starts_with(var), "{var}={value:?}: {err}");
         }
+    }
+
+    #[test]
+    fn parse_newer_related_defaults_and_validates() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |var: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == var)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(parse_newer_related(env(&[])).unwrap(), Some(0.90));
+        assert_eq!(
+            parse_newer_related(env(&[("NEWER_RELATED_MIN_CONFIDENCE", " 0.95 ")])).unwrap(),
+            Some(0.95)
+        );
+        assert_eq!(
+            parse_newer_related(env(&[("NEWER_RELATED_MIN_CONFIDENCE", "1")])).unwrap(),
+            Some(1.0)
+        );
+        assert_eq!(
+            parse_newer_related(env(&[("NEWER_RELATED", "FALSE")])).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_newer_related(env(&[("NEWER_RELATED", "true")])).unwrap(),
+            Some(0.90)
+        );
+        // A bad threshold refuses boot even with the pointer off.
+        for (var, value) in [
+            ("NEWER_RELATED", ""),
+            ("NEWER_RELATED", "off"),
+            ("NEWER_RELATED_MIN_CONFIDENCE", ""),
+            ("NEWER_RELATED_MIN_CONFIDENCE", "0"),
+            ("NEWER_RELATED_MIN_CONFIDENCE", "-0.5"),
+            ("NEWER_RELATED_MIN_CONFIDENCE", "1.01"),
+            ("NEWER_RELATED_MIN_CONFIDENCE", "90"),
+            ("NEWER_RELATED_MIN_CONFIDENCE", "NaN"),
+            ("NEWER_RELATED_MIN_CONFIDENCE", "high"),
+        ] {
+            let err = parse_newer_related(|v| (v == var).then(|| value.to_string())).unwrap_err();
+            assert!(err.starts_with(var), "{var}={value:?}: {err}");
+        }
+        let off_but_bad = parse_newer_related(env(&[
+            ("NEWER_RELATED", "false"),
+            ("NEWER_RELATED_MIN_CONFIDENCE", "2"),
+        ]));
+        assert!(off_but_bad.is_err());
     }
 
     const DAY1: u64 = 1789733949; // 2026-09-18
@@ -5475,7 +5561,8 @@ mod wedge_tests {
             &self,
             _hashes: &[&str],
         ) -> Result<HashMap<String, Vec<ContradictionRef>>> {
-            unimplemented!()
+            // Every search and get_memory reads it for `newer_related`.
+            Ok(HashMap::new())
         }
         async fn get_neighbors(
             &self,
@@ -6981,6 +7068,7 @@ mod wedge_tests {
             rerank_top_n: 0,
             rerank_timeout_ms: std::num::NonZeroU64::MIN,
             ranking: RankingFlags::default(),
+            newer_related: None,
             selfcheck: None,
         };
         // `check_detail` fans out to all four probes.

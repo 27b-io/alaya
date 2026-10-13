@@ -700,3 +700,82 @@ async fn unsettle_clears_only_its_own_exact_stamp() -> anyhow::Result<()> {
     ctx.cleanup().await;
     Ok(())
 }
+
+/// `get_contradictions_for_hashes`: every edge touching a requested hash
+/// comes back once, in its stored direction, with the verdict and
+/// resolution in the queue's columns and each endpoint's incoming
+/// `SUPERSEDES` count in columns 13 and 14. Edges between unrequested
+/// memories stay out.
+#[tokio::test]
+async fn for_hashes_returns_each_touching_edge_once_with_verdict_and_superseded_columns()
+-> anyhow::Result<()> {
+    let Some(ctx) = common::TestContext::new().await else {
+        return Ok(());
+    };
+    // Pairs (a_i)->(b_i) for i in 0..3; b_0 is superseded by a third memory.
+    seed_pairs(&ctx, 3, 1).await;
+    let (a0, b0, a1, b1, a2) = (hash(1000), hash(2000), hash(1001), hash(2001), hash(1002));
+    ctx.exec_tuple(cypher::set_contradiction_verdict(
+        &a1,
+        &b1,
+        &EdgeVerdict {
+            verdict: Verdict::Supersession,
+            verdict_survivor: Some(b1.clone()),
+            verdict_reason: "newer".into(),
+            verdict_confidence: 0.95,
+            verdict_model: "model-x".into(),
+            judged_at: 1.0,
+        },
+    ))
+    .await;
+    ctx.exec_tuple(cypher::set_contradiction_resolution(
+        &a0,
+        &b0,
+        Some(Resolution::KeepBoth),
+        "operator:console",
+        42.0,
+    ))
+    .await;
+
+    // a1 and b1 both requested: their one edge must not come back twice.
+    let rows = ctx
+        .exec_tuple(cypher::get_contradictions_for_hashes(&[&a0, &a1, &b1]))
+        .await;
+    let mut pairs: Vec<(String, String)> = rows
+        .result_set
+        .iter()
+        .map(|r| {
+            (
+                r[0].as_str().unwrap().to_string(),
+                r[1].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    pairs.sort();
+    assert_eq!(pairs, [(a0.clone(), b0.clone()), (a1.clone(), b1.clone())]);
+    assert!(
+        pairs.iter().all(|(a, _)| *a != a2),
+        "unrequested edge leaked"
+    );
+
+    let judged = row_for(&rows, &a1);
+    assert_eq!(judged[4], json!("supersession"));
+    assert_eq!(judged[5], json!(b1));
+    assert!((judged[7].as_f64().unwrap() - 0.95).abs() < 1e-6);
+    assert_eq!(judged[10], Value::Null);
+    assert_eq!(
+        (judged[13].as_f64(), judged[14].as_f64()),
+        (Some(0.0), Some(0.0))
+    );
+
+    let settled = row_for(&rows, &a0);
+    assert_eq!(settled[10], json!("keep_both"));
+    // b_0 has one incoming SUPERSEDES edge; a_0 none.
+    assert_eq!(
+        (settled[13].as_f64(), settled[14].as_f64()),
+        (Some(0.0), Some(1.0))
+    );
+
+    ctx.cleanup().await;
+    Ok(())
+}

@@ -35,6 +35,7 @@ from datetime import datetime
 
 import httpx
 from _stop_words import STOP_WORDS
+from longmemeval_qa import LME_REVISION, require_pinned_dataset
 
 
 # Force unbuffered stdout for piped contexts (uv run, background tasks)
@@ -51,9 +52,8 @@ COLLECTION = "bench_memories"
 TAG_COLLECTION = "bench_memories_tags"
 EMBEDDING_DIM = 1024
 
-# Pinned to the revision whose file has SHA-256 d6f21ea9...a3c442, the one the
-# committed QA run read, so a rerun fetches the same bytes.
-LME_REVISION = "98d7416c24c778c2fee6e6f3006e7a073259d48f"
+# Pinned to LME_REVISION (longmemeval_qa.py), so a rerun fetches the bytes the
+# committed QA run read; download_data refuses any other bytes, cached or fresh.
 LME_URL = (
     "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/"
     f"{LME_REVISION}/longmemeval_s_cleaned.json"
@@ -136,6 +136,7 @@ def download_data(path: str) -> list[dict]:
         print(f"  Downloading LongMemEval data to {path}...")
         urllib.request.urlretrieve(LME_URL, path)
         print("  Done.")
+    require_pinned_dataset(path)
     with open(path) as f:
         return json.load(f)
 

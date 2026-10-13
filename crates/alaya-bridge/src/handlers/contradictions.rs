@@ -355,7 +355,12 @@ fn move_to_resolved(tallies: &mut Vec<VerdictTally>, verdict: Option<String>, n:
 
 /// POST /contradictions/for
 ///
-/// Return CONTRADICTS pairs touching any of the supplied hashes, grouped by hash.
+/// Every CONTRADICTS edge touching any of the supplied hashes, grouped by
+/// requested hash (an edge between two requested hashes is listed under
+/// both). Each entry is a `Contradiction` (verdict and resolution included)
+/// plus `resolved` (any stamp, the queue's own test) and
+/// `memory_a_superseded` / `memory_b_superseded` (an incoming `SUPERSEDES`
+/// edge). Read-only.
 pub async fn for_hashes(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ContradictionsForRequest>,
@@ -371,45 +376,50 @@ pub async fn for_hashes(
     let (cypher, params, readonly) = cypher::get_contradictions_for_hashes(&hashes_ref);
     let result = exec_query(&state, &cypher, params, readonly).await?;
 
-    // Row: [a.content_hash, b.content_hash, e.confidence]
-    // Build per-hash map: each hash gets all pairs it participates in.
-    let mut map: HashMap<String, Vec<Value>> = HashMap::new();
-
-    // Pre-populate requested hashes so absent ones appear as empty arrays
-    for h in &req.hashes {
-        map.entry(h.clone()).or_default();
-    }
-
+    // Absent hashes still appear, as empty arrays.
+    let mut map: HashMap<String, Vec<Value>> =
+        req.hashes.iter().map(|h| (h.clone(), Vec::new())).collect();
     for row in &result.result_set {
-        if row.len() < 2 {
+        let Some(entry) = for_hashes_entry(row) else {
             continue;
-        }
-        let hash_a = row[0].as_str().unwrap_or("").to_string();
-        let hash_b = row[1].as_str().unwrap_or("").to_string();
-        if hash_a.is_empty() || hash_b.is_empty() {
-            continue;
-        }
-        let confidence = row.get(2).and_then(Value::as_f64);
-
-        let entry = json!({
-            "memory_a_hash": hash_a,
-            "memory_b_hash": hash_b,
-            "confidence": confidence
-        });
-
-        // Attach to both sides if they were in the request set
-        if map.contains_key(&hash_a) {
-            map.get_mut(&hash_a).unwrap().push(entry.clone());
-        }
-        if map.contains_key(&hash_b) {
-            map.get_mut(&hash_b).unwrap().push(entry);
+        };
+        for side in ["memory_a_hash", "memory_b_hash"] {
+            if let Some(list) = entry[side].as_str().and_then(|h| map.get_mut(h)) {
+                list.push(entry.clone());
+            }
         }
     }
 
-    let contradictions: serde_json::Map<String, Value> =
-        map.into_iter().map(|(k, v)| (k, json!(v))).collect();
+    Ok(Json(json!({ "contradictions": map })))
+}
 
-    Ok(Json(json!({ "contradictions": contradictions })))
+/// One `get_contradictions_for_hashes` row as its wire entry; `None` for a
+/// row without both endpoint hashes.
+fn for_hashes_entry(row: &[Value]) -> Option<Value> {
+    let memory_a_hash = row.first()?.as_str().filter(|h| !h.is_empty())?;
+    let memory_b_hash = row.get(1)?.as_str().filter(|h| !h.is_empty())?;
+    let (resolution, resolved_at, resolved_via) = parse_resolution(row);
+    let pair = Contradiction {
+        memory_a_hash: memory_a_hash.to_string(),
+        memory_b_hash: memory_b_hash.to_string(),
+        confidence: row.get(2).and_then(Value::as_f64),
+        created_at: row.get(3).and_then(Value::as_f64),
+        verdict: parse_verdict(row),
+        resolution,
+        resolved_at,
+        resolved_via,
+    };
+    let superseded = |i: usize| row.get(i).and_then(Value::as_f64).is_some_and(|n| n > 0.0);
+    let mut entry = serde_json::to_value(pair).ok()?;
+    let obj = entry.as_object_mut()?;
+    // Any stamp settles the pair, a value this build does not parse included.
+    obj.insert(
+        "resolved".into(),
+        json!(row.get(10).is_some_and(|v| !v.is_null())),
+    );
+    obj.insert("memory_a_superseded".into(), json!(superseded(13)));
+    obj.insert("memory_b_superseded".into(), json!(superseded(14)));
+    Some(entry)
 }
 
 #[cfg(test)]
@@ -457,5 +467,58 @@ mod tests {
         // No open row at all: nothing to move.
         move_to_resolved(&mut v, Some("unrelated".into()), 2);
         assert_eq!(v.len(), 2);
+    }
+
+    fn for_row(resolution: Value, a_sup: i64, b_sup: i64) -> Vec<Value> {
+        vec![
+            json!("a"),
+            json!("b"),
+            json!(0.7),
+            json!(1.0),
+            json!("supersession"),
+            json!("b"),
+            json!("newer"),
+            json!(0.95),
+            json!("m"),
+            json!(2.0),
+            resolution,
+            Value::Null,
+            Value::Null,
+            json!(a_sup),
+            json!(b_sup),
+        ]
+    }
+
+    #[test]
+    fn for_hashes_entry_carries_verdict_resolution_and_superseded_flags() {
+        let e = for_hashes_entry(&for_row(Value::Null, 0, 1)).unwrap();
+        assert_eq!(e["memory_a_hash"], "a");
+        assert_eq!(e["verdict"], "supersession");
+        assert_eq!(e["verdict_survivor"], "b");
+        assert_eq!(e["verdict_confidence"], 0.95);
+        assert_eq!(e["resolved"], false);
+        assert_eq!(e["memory_a_superseded"], false);
+        assert_eq!(e["memory_b_superseded"], true);
+
+        let stamped = for_hashes_entry(&for_row(json!("keep_both"), 0, 0)).unwrap();
+        assert_eq!(stamped["resolved"], true);
+        assert_eq!(stamped["resolution"], "keep_both");
+    }
+
+    /// A stamp this build cannot parse still settles the pair, as the
+    /// queue's `e.resolution IS NULL` test does.
+    #[test]
+    fn for_hashes_entry_reads_an_unknown_stamp_as_resolved() {
+        let e = for_hashes_entry(&for_row(json!("keep_neither"), 0, 0)).unwrap();
+        assert_eq!(e["resolved"], true);
+        assert!(e.get("resolution").is_none());
+    }
+
+    #[test]
+    fn for_hashes_entry_skips_a_row_without_both_hashes() {
+        let mut row = for_row(Value::Null, 0, 0);
+        row[1] = json!("");
+        assert!(for_hashes_entry(&row).is_none());
+        assert!(for_hashes_entry(&[json!("a")]).is_none());
     }
 }
