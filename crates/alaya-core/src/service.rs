@@ -2724,11 +2724,13 @@ impl MemoryService {
     /// A hold keeps a wrong, empty or partly restored collection from
     /// wiping the graph: each page is judged, before any write, on a window
     /// of the next `GRAPH_SWEEP_PAGE` nodes from its own start, never on the
-    /// caller's page size, and holds as `window_holds` says. Following
-    /// `next_after` from any start, such a collection costs at most
-    /// `GRAPH_SWEEP_HOLD_FLOOR` nodes per call before it holds. A caller who
-    /// hand-crafts `after` is outside that bound, as it holds `delete_memory`
-    /// anyway. Stray nodes the window holds (more than the floor within one
+    /// caller's page size, and holds as `window_holds` says. A call also
+    /// deletes at most `GRAPH_SWEEP_HOLD_FLOOR` nodes in total: a page whose
+    /// gone nodes would take it past that holds before any write on it, so
+    /// misses spread a few per window cannot add up within one call. Each
+    /// resumed call has the same allowance again; a `held` answer is where
+    /// to stop and check the collection. A caller who hand-crafts `after` is
+    /// outside the window bound, as it holds `delete_memory` anyway. Stray nodes the window holds (more than the floor within one
     /// window, or the last few in the graph with nothing live after them)
     /// are left for `delete_memory`, which calls `delete_node` even when the
     /// point is absent. A held call answers `status: held`, `success: false`,
@@ -2750,7 +2752,7 @@ impl MemoryService {
             return Err(AlayaError::Validation("a sweep token is required".into()));
         }
         let mut after = after.to_string();
-        let (mut scanned, mut swept, mut skipped) = (0, 0, 0);
+        let (mut scanned, mut swept, mut skipped, mut candidates) = (0, 0, 0, 0);
         let mut done = false;
         while scanned < limit {
             let want = GRAPH_SWEEP_PAGE.min(limit - scanned);
@@ -2781,6 +2783,18 @@ impl MemoryService {
                 .into_iter()
                 .filter(|h| *h <= last.as_str())
                 .collect();
+            // The per-call allowance, counted on candidates before any write.
+            if candidates + missing.len() > GRAPH_SWEEP_HOLD_FLOOR {
+                return Ok(sweep_held(
+                    &after,
+                    scanned,
+                    swept,
+                    skipped,
+                    window_valid,
+                    missing.len(),
+                ));
+            }
+            candidates += missing.len();
             let page_valid = page
                 .iter()
                 .filter(|h| alaya_types::memory::validate_content_hash(h))
@@ -14578,6 +14592,33 @@ mod tests {
             .unwrap();
         assert_eq!(out["swept"], 3, "{out}");
         assert_eq!(ledger.nodes.borrow().len(), 997);
+    }
+
+    /// Misses spread three per window (a restore that lost a few points
+    /// everywhere) never add up within one call: a call deletes at most
+    /// `GRAPH_SWEEP_HOLD_FLOOR` in total, then holds, at any `limit`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn graph_sweep_caps_deletions_per_call_across_windows() {
+        for limit in [5000, MAX_GRAPH_SWEEP_LIMIT] {
+            let hashes: Vec<String> = (0..5000u32).map(|i| format!("{i:064x}")).collect();
+            let (mut live, mut gone) = (Vec::new(), Vec::new());
+            for (i, x) in hashes.iter().enumerate() {
+                if i % 500 < 3 {
+                    gone.push(x.as_str())
+                } else {
+                    live.push(x.as_str())
+                }
+            }
+            let ledger = sweep_ledger(&live, &gone);
+            let svc = ledger.service();
+            let out = svc
+                .sweep_gone_memory_nodes("", limit, "run-1")
+                .await
+                .unwrap();
+            assert_eq!(out["status"], "held", "limit={limit}: {out}");
+            assert_eq!(out["swept"], 3, "limit={limit}: {out}");
+            assert_eq!(ledger.nodes.borrow().len(), 4997);
+        }
     }
 
     /// Against an empty or wrong collection, no `limit` or `after` gets a
