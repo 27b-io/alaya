@@ -80,6 +80,29 @@ pub fn create_typed_edge(
     (q, p, false)
 }
 
+/// MERGE the `src -> dst` CONTRADICTS edge a refute files, and stamp its
+/// `refute_reason` unless the edge carries one already: the first refute's
+/// reason stays the record. Returns the stored reason; no row when an
+/// endpoint node is missing (nothing written). An edge store-time detection
+/// made already keeps its own properties and gains the reason.
+pub fn link_refutation(src: &str, dst: &str, ts: f64, reason: &str) -> CypherQuery {
+    let q = "MATCH (a:Memory {content_hash: $src}), (b:Memory {content_hash: $dst}) \
+             MERGE (a)-[e:CONTRADICTS]->(b) \
+             ON CREATE SET e.created_at = $ts \
+             SET e.refute_reason = coalesce(e.refute_reason, $reason) \
+             RETURN e.refute_reason";
+    (
+        q.to_string(),
+        params(&[
+            ("src", json!(src)),
+            ("dst", json!(dst)),
+            ("ts", json!(ts)),
+            ("reason", json!(reason)),
+        ]),
+        false,
+    )
+}
+
 /// Query typed edges for a hash in the given direction.
 ///
 /// Returns one query per `UserRelationType` variant.  Caller unions the results.
@@ -211,7 +234,8 @@ const CONTRADICTION_COLUMNS: &str = "a.content_hash, b.content_hash, e.confidenc
      e.verdict_model, e.judged_at, \
      e.resolution, e.resolved_at, e.resolved_via";
 
-/// One page of CONTRADICTS pairs ordered by `created_at DESC`, every filter
+/// One page of CONTRADICTS pairs ordered by `created_at DESC`, as
+/// `CONTRADICTION_COLUMNS` plus the refute's reason (column 13), every filter
 /// applied in Cypher (see `ContradictionQuery`), so `SKIP`/`LIMIT` page over
 /// *matching* edges — app-side filtering over a LIMIT-only read starved the
 /// queue (LAB-3283 review). WHERE fragments are constant strings; every
@@ -297,7 +321,7 @@ pub fn get_all_contradictions(q: &ContradictionQuery) -> CypherQuery {
     let cypher = format!(
         "MATCH (a:Memory)-[e:CONTRADICTS]->(b:Memory) \
          {filter}\
-         RETURN {CONTRADICTION_COLUMNS} \
+         RETURN {CONTRADICTION_COLUMNS}, e.refute_reason \
          ORDER BY e.created_at DESC, a.content_hash, b.content_hash \
          SKIP $skip LIMIT $lim"
     );
@@ -427,13 +451,14 @@ pub fn unsettle_contradiction(
     )
 }
 
-/// Count `src -> dst` CONTRADICTS edges that carry a judge verdict or an
-/// operator resolution (LAB-3885 AC-6). `POST /edges/delete` refuses such
-/// an edge: it is the queue item and its audit trail, so it is resolved
-/// (keep_both or supersede), never deleted.
-pub fn count_judged_or_resolved_contradiction(src: &str, dst: &str) -> CypherQuery {
+/// Count `src -> dst` CONTRADICTS edges that carry a judge verdict, an
+/// operator resolution (LAB-3885 AC-6) or a refute's reason. `POST
+/// /edges/delete` refuses such an edge: it is the queue item and its audit
+/// trail, so it is resolved (keep_both or supersede), never deleted.
+pub fn count_audited_contradiction(src: &str, dst: &str) -> CypherQuery {
     let q = "MATCH (a:Memory {content_hash: $src})-[e:CONTRADICTS]->(b:Memory {content_hash: $dst}) \
              WHERE e.verdict IS NOT NULL OR e.resolution IS NOT NULL \
+             OR e.refute_reason IS NOT NULL \
              RETURN count(e)";
     (
         q.to_string(),
@@ -748,7 +773,9 @@ mod tests {
         let (q, p, ro) = get_all_contradictions(&ContradictionQuery { skip: 40, ..cq(20) });
         assert!(!q.contains("WHERE"));
         assert!(q.contains("e.verdict, e.verdict_survivor"));
-        assert!(q.contains("e.judged_at, e.resolution, e.resolved_at, e.resolved_via"));
+        assert!(
+            q.contains("e.resolution, e.resolved_at, e.resolved_via, e.refute_reason ORDER BY")
+        );
         assert!(q.ends_with(
             "ORDER BY e.created_at DESC, a.content_hash, b.content_hash SKIP $skip LIMIT $lim"
         ));
@@ -907,11 +934,14 @@ mod tests {
     }
 
     #[test]
-    fn count_judged_or_resolved_contradiction_is_a_read_over_verdict_or_resolution() {
-        let (q, p, ro) = count_judged_or_resolved_contradiction(&"a".repeat(64), &"b".repeat(64));
+    fn count_audited_contradiction_is_a_read_over_verdict_resolution_or_refute_reason() {
+        let (q, p, ro) = count_audited_contradiction(&"a".repeat(64), &"b".repeat(64));
         assert!(q.starts_with("MATCH"));
         assert!(q.contains("[e:CONTRADICTS]->"));
-        assert!(q.contains("WHERE e.verdict IS NOT NULL OR e.resolution IS NOT NULL"));
+        assert!(q.contains(
+            "WHERE e.verdict IS NOT NULL OR e.resolution IS NOT NULL \
+             OR e.refute_reason IS NOT NULL"
+        ));
         assert!(q.ends_with("RETURN count(e)"));
         assert!(!q.contains("DELETE"));
         assert_eq!(p["src"], json!("a".repeat(64)));
@@ -1026,6 +1056,16 @@ mod tests {
             "must omit confidence when None"
         );
         assert!(!p.contains_key("conf"));
+        assert!(!ro);
+    }
+
+    #[test]
+    fn link_refutation_keeps_the_first_reason_and_returns_the_stored_one() {
+        let (q, p, ro) = link_refutation("a", "b", 1.0, "why");
+        assert!(q.contains("MERGE (a)-[e:CONTRADICTS]->(b)"));
+        assert!(q.contains("SET e.refute_reason = coalesce(e.refute_reason, $reason)"));
+        assert!(q.ends_with("RETURN e.refute_reason"));
+        assert_eq!(p["reason"], json!("why"), "the reason is a parameter");
         assert!(!ro);
     }
 

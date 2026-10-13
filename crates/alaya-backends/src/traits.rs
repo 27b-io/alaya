@@ -379,6 +379,23 @@ pub trait GraphService {
         rel: UserRelationType,
         meta: EdgeMeta,
     ) -> Result<bool>;
+    /// A refute's `src -> dst` CONTRADICTS edge, MERGEd, with `reason`
+    /// stamped unless the edge carries a refute's reason already. `Some`:
+    /// the reason stored on the edge, an earlier refute's when it differs;
+    /// `None`: an endpoint node is missing and nothing was written.
+    /// Default: unsupported.
+    async fn link_refutation(
+        &self,
+        src: &str,
+        dst: &str,
+        created_at: f64,
+        reason: &str,
+    ) -> Result<Option<String>> {
+        let _ = (src, dst, created_at, reason);
+        Err(AlayaError::Graph(
+            "refute links are not supported by this backend".into(),
+        ))
+    }
     async fn get_typed_edges(
         &self,
         hash: &str,

@@ -499,12 +499,12 @@ async fn keep_both_leaves_the_default_queue_survives_merge_and_is_reversible() -
     // AC-6: the delete guard sees a verdict or a resolution; the bare pairs
     // (1000 -> 2000, and the fresh reverse edge) are free to delete.
     let guarded = ctx
-        .exec_tuple(cypher::count_judged_or_resolved_contradiction(&a, &b))
+        .exec_tuple(cypher::count_audited_contradiction(&a, &b))
         .await;
     assert_eq!(guarded.count(), Some(1));
     for (s, d) in [(hash(1000), hash(2000)), (b.clone(), a.clone())] {
         let free = ctx
-            .exec_tuple(cypher::count_judged_or_resolved_contradiction(&s, &d))
+            .exec_tuple(cypher::count_audited_contradiction(&s, &d))
             .await;
         assert_eq!(free.count(), Some(0), "{s} -> {d}");
     }
@@ -528,7 +528,7 @@ async fn keep_both_leaves_the_default_queue_survives_merge_and_is_reversible() -
     let row = row_for(&all, &a);
     assert_eq!(row[4], json!("coexist"), "clear does not touch the verdict");
     let guarded = ctx
-        .exec_tuple(cypher::count_judged_or_resolved_contradiction(&a, &b))
+        .exec_tuple(cypher::count_audited_contradiction(&a, &b))
         .await;
     assert_eq!(guarded.count(), Some(1), "a judged edge stays guarded");
 

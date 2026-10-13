@@ -124,6 +124,20 @@ struct DeleteNodeReq<'a> {
 }
 
 #[derive(Serialize)]
+struct RefuteEdgeReq<'a> {
+    source: &'a str,
+    target: &'a str,
+    created_at: f64,
+    reason: &'a str,
+}
+
+#[derive(Deserialize)]
+struct RefuteEdgeResp {
+    linked: bool,
+    refute_reason: Option<String>,
+}
+
+#[derive(Serialize)]
 struct CreateEdgeReq<'a> {
     source: &'a str,
     target: &'a str,
@@ -383,6 +397,37 @@ impl GraphService for GraphHttpClient {
         Ok(body.created)
     }
 
+    async fn link_refutation(
+        &self,
+        src: &str,
+        dst: &str,
+        created_at: f64,
+        reason: &str,
+    ) -> Result<Option<String>> {
+        let resp = self
+            .client
+            .post(format!("{}/edges/refute", self.base_url))
+            .json(&RefuteEdgeReq {
+                source: src,
+                target: dst,
+                created_at,
+                reason,
+            })
+            .send()
+            .await
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
+        let body: RefuteEdgeResp = handle_response(resp).await?;
+        // A linked edge always has a reason; an answer claiming one without
+        // it is not a link this call can report.
+        match (body.linked, body.refute_reason) {
+            (true, Some(stored)) => Ok(Some(stored)),
+            (false, None) => Ok(None),
+            _ => Err(AlayaError::Graph(
+                "bridge answered a refute link without its reason".into(),
+            )),
+        }
+    }
+
     #[tracing::instrument(skip(self, edges), fields(n = edges.len()))]
     async fn create_typed_edges_batch(
         &self,
@@ -464,7 +509,7 @@ impl GraphService for GraphHttpClient {
         // the pair instead of deleting it.
         if resp.status() == StatusCode::CONFLICT {
             return Err(AlayaError::Conflict(format!(
-                "CONTRADICTS {}.. -> {}.. carries a verdict or resolution",
+                "CONTRADICTS {}.. -> {}.. carries a verdict, a resolution or a refute's reason",
                 &src[..8.min(src.len())],
                 &dst[..8.min(dst.len())]
             )));

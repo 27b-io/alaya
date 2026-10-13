@@ -42,6 +42,16 @@ macro_rules! impl_graph_service {
             ) -> alaya_types::Result<bool> {
                 self.0.create_typed_edge(s, d, r, m).await
             }
+            // Delegated explicitly: the trait's default is unsupported.
+            async fn link_refutation(
+                &self,
+                s: &str,
+                d: &str,
+                t: f64,
+                r: &str,
+            ) -> alaya_types::Result<Option<String>> {
+                self.0.link_refutation(s, d, t, r).await
+            }
             async fn get_typed_edges(
                 &self,
                 h: &str,

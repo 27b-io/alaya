@@ -71,7 +71,7 @@ pub async fn all(
     let (cypher, params, readonly) = cypher::get_all_contradictions(&query);
     let result = exec_query(&state, &cypher, params, readonly).await?;
 
-    // Row layout: cypher::CONTRADICTION_COLUMNS
+    // Row layout: cypher::CONTRADICTION_COLUMNS, then the refute's reason.
     let mut contradictions: Vec<Contradiction> = Vec::with_capacity(result.result_set.len());
     for row in &result.result_set {
         if row.len() < 2 {
@@ -94,6 +94,7 @@ pub async fn all(
             resolution,
             resolved_at,
             resolved_via,
+            refute_reason: row.get(13).and_then(Value::as_str).map(str::to_string),
         });
     }
 
@@ -408,6 +409,8 @@ fn for_hashes_entry(row: &[Value]) -> Option<Value> {
         resolution,
         resolved_at,
         resolved_via,
+        // Not read here: `newer_related` has no use for it.
+        refute_reason: None,
     };
     let superseded = |i: usize| row.get(i).and_then(Value::as_f64).is_some_and(|n| n > 0.0);
     let mut entry = serde_json::to_value(pair).ok()?;

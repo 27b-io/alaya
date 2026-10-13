@@ -4861,6 +4861,7 @@ mod tests {
             resolution: None,
             resolved_at: None,
             resolved_via: None,
+            refute_reason: None,
         };
         let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(JUDGE_CONCURRENCY));
         let svc = wedge_tests::hanging_service().with_judge(Box::new(StubJudge));
@@ -7112,8 +7113,13 @@ mod wedge_tests {
             ),
             (
                 "refute",
-                json!({"success": true, "status": "contradicts", "correction_hash": fix}),
+                json!({"success": true, "status": "contradicts", "correction_hash": fix, "refute_reason": "wrong"}),
                 StatusCode::OK,
+            ),
+            (
+                "refute",
+                json!({"success": false, "status": "conflict", "correction_hash": fix, "refute_reason": "an earlier why"}),
+                StatusCode::CONFLICT,
             ),
             (
                 "refute",

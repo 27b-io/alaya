@@ -1,4 +1,4 @@
-//! Edge handlers — POST /edges/create, POST /edges/create-batch, POST /edges/get, POST /edges/delete,
+//! Edge handlers — POST /edges/create, POST /edges/refute, POST /edges/create-batch, POST /edges/get, POST /edges/delete,
 //! POST /edges/create-system{,-batch}, POST /edges/delete-system-incoming
 
 use std::sync::Arc;
@@ -23,6 +23,17 @@ pub struct CreateEdgeRequest {
     pub relation_type: String,
     pub created_at: Option<f64>,
     pub confidence: Option<f64>,
+}
+
+/// A refute's CONTRADICTS link (`POST /edges/refute`): always
+/// `source -> target` CONTRADICTS, with the refute's reason.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefuteEdgeRequest {
+    pub source: String,
+    pub target: String,
+    pub created_at: f64,
+    pub reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,6 +145,37 @@ pub async fn create(
     // missing and nothing was written.
     let count = result.count().unwrap_or(0);
     Ok(Json(json!({ "created": count > 0 })))
+}
+
+/// POST /edges/refute
+///
+/// MERGE a refute's CONTRADICTS edge and stamp its reason unless one is
+/// there already. Answers `{linked, refute_reason}`: the reason stored on
+/// the edge, which differs from the request's when an earlier refute's
+/// stands; `linked: false` (reason `null`) when an endpoint node is missing
+/// and nothing was written.
+pub async fn refute(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RefuteEdgeRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    if !validate_content_hash(&req.source)
+        || !validate_content_hash(&req.target)
+        || req.reason.trim().is_empty()
+    {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let (cypher, params, readonly) =
+        cypher::link_refutation(&req.source, &req.target, req.created_at, &req.reason);
+    let result = exec_query(&state, &cypher, params, readonly).await?;
+    let stored = result
+        .result_set
+        .first()
+        .and_then(|row| row.first())
+        .and_then(Value::as_str);
+    Ok(Json(json!({
+        "linked": stored.is_some(),
+        "refute_reason": stored,
+    })))
 }
 
 /// POST /edges/create-batch
@@ -257,14 +299,14 @@ pub async fn delete(
     }
 
     let rel = parse_user_relation(&req.relation_type)?;
-    // A CONTRADICTS edge that carries a verdict or a resolution is the
-    // queue item and its audit trail (LAB-3885 AC-6): refuse, mirroring the
+    // A CONTRADICTS edge that carries a verdict, a resolution or a refute's
+    // reason is the queue item and its audit trail (LAB-3885 AC-6): refuse, mirroring the
     // SUPERSEDES refusal on the user-relation parser. Resolve it instead.
     // Read-then-delete, not one statement: Cypher has no conditional
     // DELETE that also tells "absent" from "locked" apart.
     if rel == UserRelationType::Contradicts {
         let (cypher, params, readonly) =
-            cypher::count_judged_or_resolved_contradiction(&req.source, &req.target);
+            cypher::count_audited_contradiction(&req.source, &req.target);
         let guarded = exec_query(&state, &cypher, params, readonly).await?;
         if guarded.count().unwrap_or(0) > 0 {
             return Err(StatusCode::CONFLICT);

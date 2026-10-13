@@ -93,7 +93,7 @@ impl AlayaError {
             Self::Unavailable { .. } => "Upstream temporarily unavailable",
             Self::Serialization(_) => "Invalid request format",
             Self::Conflict(_) => {
-                "Edge carries a verdict or resolution; resolve it (keep_both / supersede) instead of deleting"
+                "Edge carries a verdict, a resolution or a refute's reason; resolve it (keep_both / supersede) instead of deleting"
             }
         }
     }

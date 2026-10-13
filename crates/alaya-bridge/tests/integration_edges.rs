@@ -401,3 +401,87 @@ async fn get_all_contradictions_returns_created_pairs() -> anyhow::Result<()> {
     ctx.cleanup().await;
     Ok(())
 }
+
+// ─── refute link (LAB-9265) ──────────────────────────────────────────────────
+
+/// A refute's link keeps the first reason, returns the stored one, leaves a
+/// detection edge's own properties alone, writes nothing without both nodes,
+/// and makes the edge undeletable by `POST /edges/delete`.
+#[tokio::test]
+async fn link_refutation_keeps_the_first_reason() -> anyhow::Result<()> {
+    let ctx = match common::TestContext::new().await {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+    seed_nodes(&ctx).await;
+    let stored = |r: &alaya_bridge::FalkorResult| {
+        r.result_set
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|v| v.as_str().map(str::to_string))
+    };
+
+    // A store-time detection edge exists first, with its confidence.
+    ctx.exec_tuple(cypher::create_typed_edge(
+        HASH_A,
+        HASH_B,
+        UserRelationType::Contradicts,
+        1.0,
+        Some(0.7),
+    ))
+    .await;
+    let first = ctx
+        .exec_tuple(cypher::link_refutation(HASH_A, HASH_B, 2.0, "first why"))
+        .await;
+    assert_eq!(stored(&first).as_deref(), Some("first why"));
+    let second = ctx
+        .exec_tuple(cypher::link_refutation(HASH_A, HASH_B, 3.0, "second why"))
+        .await;
+    assert_eq!(
+        stored(&second).as_deref(),
+        Some("first why"),
+        "the first reason stays and is returned"
+    );
+    let edge = ctx
+        .exec(
+            "MATCH (:Memory {content_hash: $src})-[e:CONTRADICTS]->(:Memory {content_hash: $dst}) \
+             RETURN count(e), e.confidence, e.created_at",
+            [
+                ("src".to_string(), serde_json::json!(HASH_A)),
+                ("dst".to_string(), serde_json::json!(HASH_B)),
+            ]
+            .into(),
+            true,
+        )
+        .await;
+    assert_eq!(edge.result_set[0][0].as_i64(), Some(1), "one edge, MERGEd");
+    assert_eq!(edge.result_set[0][1].as_f64(), Some(0.7));
+    assert_eq!(edge.result_set[0][2].as_f64(), Some(1.0));
+
+    let guarded = ctx
+        .exec_tuple(cypher::count_audited_contradiction(HASH_A, HASH_B))
+        .await;
+    assert_eq!(guarded.count(), Some(1), "a refuted edge is audited");
+
+    // The queue read carries the reason in column 13.
+    let page = ctx
+        .exec_tuple(cypher::get_all_contradictions(
+            &alaya_types::graph::ContradictionQuery {
+                limit: 10,
+                ..Default::default()
+            },
+        ))
+        .await;
+    assert_eq!(page.result_set.len(), 1);
+    assert_eq!(page.result_set[0][13].as_str(), Some("first why"));
+
+    // No node for the target: no row, nothing written.
+    let missing = "dddd0000000000000000000000000000000000000000000000000000000000dddd";
+    let none = ctx
+        .exec_tuple(cypher::link_refutation(HASH_A, missing, 4.0, "why"))
+        .await;
+    assert!(none.result_set.is_empty(), "{:?}", none.result_set);
+
+    ctx.cleanup().await;
+    Ok(())
+}

@@ -790,7 +790,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "memory_refute",
-            "description": "File a correction against a wrong memory in one call. The correction is stored like store_memory (never skipped as a duplicate); a live memory that already holds its exact text is used as is, with existing: true, so a retry is safe; any tags, memory_type, summary or citations you send must then match it. By default the pair is then linked correction -> wrong as CONTRADICTS: both stay searchable and the pair enters the contradiction queue. Pass supersede: true only when the correction carries every claim of the wrong memory that is still true; the wrong memory is then superseded by the correction with your reason. Refused before anything is written, with {success: false, status}: not_found, superseded (refute the survivor instead), correction_superseded or correction_exists. If another caller supersedes the wrong memory meanwhile, returns {success: false, status: conflict, superseded_by} with the correction stored; that survivor is never overwritten. If the correction itself is superseded or deleted before the second step, returns status correction_superseded (with correction_superseded_by) or correction_deleted, nothing written. A supersede reports supersession_reason, the reason stored on the memory; a retry with another reason than the stored one is a conflict. A link stores no reason. If the store succeeds but the supersede or link fails, returns {success: false, status: partial, correction_hash, failed_step}: retry the same refute, or finish with memory_supersede or relation.",
+            "description": "File a correction against a wrong memory in one call. The correction is stored like store_memory (never skipped as a duplicate, never overwriting a memory); a live memory already holding its exact text is reused (existing: true), and any tags, memory_type, summary or citations you send must match it. By default the pair is linked correction -> wrong as CONTRADICTS: both stay searchable and the pair enters the contradiction queue. Pass supersede: true only when the correction carries every still-true claim of the wrong memory; it is then superseded by the correction. Your reason is stored either way, as supersession_reason or as the link's refute_reason, and returned; a retry with another reason is a conflict naming the stored one. Every outcome is a typed status. Nothing written: not_found, superseded (refute its survivor), correction_superseded, correction_exists. After the store: conflict, correction_superseded, correction_deleted, or partial with failed_step (retry the same refute, or finish with memory_supersede or relation).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1008,8 +1008,48 @@ mod tests {
             refutation.tags,
             Some(vec!["a".to_string(), "b".to_string()])
         );
-        reply.send(json!({"success": true})).unwrap();
-        assert_eq!(call.await.unwrap().unwrap(), json!({"success": true}));
+        // The link's reason comes back as the worker answers it (LAB-9265).
+        let linked = json!({"success": true, "status": "contradicts", "refute_reason": "wrong"});
+        reply.send(linked.clone()).unwrap();
+        assert_eq!(call.await.unwrap().unwrap(), linked);
+    }
+
+    /// A link already filed with another reason is a typed result, not a
+    /// JSON-RPC error: the stored reason reaches the caller (LAB-9265).
+    #[tokio::test]
+    async fn refute_link_reason_conflict_is_a_result_carrying_the_stored_reason() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let handle = ServiceHandle { tx };
+        let hash = "a".repeat(64);
+        let args = json!({"content_hash": hash, "content": "fixed", "reason": "new why"});
+        let call = tokio::spawn(async move {
+            dispatch_tool("memory_refute", args, &handle, AuthPrincipal::Static).await
+        });
+        let CmdInner::Refute { reply, .. } = rx.recv().await.expect("dispatched").inner else {
+            panic!("expected CmdInner::Refute");
+        };
+        let conflict = json!({
+            "success": false,
+            "status": "conflict",
+            "correction_hash": "b".repeat(64),
+            "refute_reason": "first why",
+        });
+        reply.send(conflict.clone()).unwrap();
+        assert_eq!(call.await.unwrap().unwrap(), conflict);
+    }
+
+    #[test]
+    fn memory_refute_description_names_the_stored_reason() {
+        let schemas = tool_schemas();
+        let refute = schemas
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "memory_refute")
+            .unwrap();
+        let desc = refute["description"].as_str().unwrap();
+        assert!(desc.contains("refute_reason"), "{desc}");
+        assert!(!desc.contains("A link stores no reason"), "{desc}");
     }
 
     #[test]
