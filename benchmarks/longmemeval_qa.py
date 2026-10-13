@@ -197,10 +197,18 @@ def load_jsonl(path: str, missing_ok: bool = False) -> list[dict]:
         sys.exit(f"  Not found: {path}")
     rows = []
     with open(path) as f:
-        for line in f:
+        for n, line in enumerate(f, 1):
             line = line.strip()
-            if line:
+            if not line:
+                continue
+            try:
                 rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                # Skipping it would not be enough: a resumed stage appends to this
+                # file, and its next row would land on the end of the broken one.
+                sys.exit(
+                    f"  {path}:{n} is not valid JSON (an interrupted write?); delete that line and rerun"
+                )
     return rows
 
 

@@ -37,6 +37,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import string
 import sys
 import urllib.request
@@ -111,7 +112,15 @@ def load_rows(path: str, length: str = LENGTH) -> tuple[list[str], list[dict]]:
     """Facts and questions for one length; sh and mh share the same context."""
     if not os.path.exists(path):
         print(f"  Downloading MemoryAgentBench Conflict_Resolution to {path}...")
-        urllib.request.urlretrieve(MAB_URL, path)
+        try:
+            with (
+                urllib.request.urlopen(MAB_URL, timeout=60) as resp,
+                open(path + ".tmp", "wb") as f,
+            ):
+                shutil.copyfileobj(resp, f)
+        except OSError as e:  # URLError and socket timeouts are OSErrors
+            sys.exit(f"  Download of {MAB_URL} failed: {e}")
+        os.replace(path + ".tmp", path)  # never cache a partial download
     table = pq.read_table(path).to_pylist()
     rows = {r["metadata"]["source"]: r for r in table}
     sh, mh = (
@@ -151,25 +160,28 @@ def stage_retrieve(args) -> None:
         print(f"  retrieve: {out} exists; delete it to re-run retrieval")
         return
     alaya, qdrant = AlayaClient(args.alaya_url), QdrantAdmin(args.qdrant_url)
-    alaya.health()
-    qdrant.reset_collections()
-    print(
-        f"  retrieve: storing {len(facts)} facts, then {len(questions)} searches (k={args.k})"
-    )
-    for fact in facts:
-        alaya.store(content=fact, tags=extract_tags(fact), metadata={})
-    # Written whole, then renamed, so a crash never leaves a short file that a
-    # rerun would take as finished retrieval.
-    with open(out + ".tmp", "w") as f:
-        for q in questions:
-            resp = alaya.search(query=q["question"], mode="hybrid", k=args.k)
-            texts = [
-                r.get("memory", r).get("content", "") for r in resp.get("results", [])
-            ]
-            f.write(json.dumps({**q, "retrieved": texts[: args.k]}) + "\n")
-    os.replace(out + ".tmp", out)
-    alaya.close()
-    qdrant.close()
+    try:
+        alaya.health()
+        qdrant.reset_collections()
+        print(
+            f"  retrieve: storing {len(facts)} facts, then {len(questions)} searches (k={args.k})"
+        )
+        for fact in facts:
+            alaya.store(content=fact, tags=extract_tags(fact), metadata={})
+        # Written whole, then renamed, so a crash never leaves a short file that a
+        # rerun would take as finished retrieval.
+        with open(out + ".tmp", "w") as f:
+            for q in questions:
+                resp = alaya.search(query=q["question"], mode="hybrid", k=args.k)
+                texts = [
+                    r.get("memory", r).get("content", "")
+                    for r in resp.get("results", [])
+                ]
+                f.write(json.dumps({**q, "retrieved": texts[: args.k]}) + "\n")
+        os.replace(out + ".tmp", out)
+    finally:
+        alaya.close()
+        qdrant.close()
 
 
 def stage_read(args, cli: ClaudeCLI) -> int:
