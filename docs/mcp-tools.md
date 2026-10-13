@@ -45,7 +45,7 @@ Embed text and persist it. Returns the new memory's `content_hash` and its neare
 | `client_hostname` | string | | | Tagged on the memory for provenance / multi-host setups. |
 | `summary` | string | | | One-line summary (~50 tokens). Auto-generated if `SUMMARY_URL` is configured on the server. |
 | `dedup_threshold` | number | | | If set, skip storage when the nearest live memory's cosine similarity ≥ threshold. Use `0.95` for near-exact dedup. The skip runs before contradiction detection, so a correction close to the memory it corrects is dropped with no `CONTRADICTS` edge. File a correction with [`memory_refute`](#memory_refute) instead. |
-| `citations` | string[] | | | The sources the memory rests on, at most 10 of at most 500 characters. Each is `<owner>/<repo>@<sha>:<path>`, optionally `:<line>` or `:<line>-<line>`, with a 7–40 character hex sha, or an `https://` URL. Stored at `metadata.citations`, so every hit returns them. Setting both this and `metadata.citations`, or a malformed citation, is a `-32602` error and nothing is stored. The server never fetches a citation's target. |
+| `citations` | string[] | | | The sources the memory rests on, at most 10 of at most 500 characters. Each is `<owner>/<repo>@<sha>:<path>`, optionally `:<line>` or `:<line>-<line>`, with a 7–40 character hex sha, or an `https://` URL with a host. Stored at `metadata.citations`, so every hit returns them. Setting both this and `metadata.citations`, or a malformed citation, is a `-32602` error and nothing is stored. The server never fetches a citation's target. |
 
 **Returns:** `{ "success": true, "content_hash": "<64-hex>", "memory_type": "...", "created": true | false, "message": "...", "tags"?: [...], "neighbours"?: [...], "interference"?: {"contradictions": [...]} }`. `created` is `false` when the content was already stored and the record was updated in place. `neighbours` lists up to 5 of the nearest live memories, nearest first, never the stored one: `{content_hash, similarity, memory_type, summary}`, the summary clipped to 200 characters. It is `[]` when the search found no live memory and absent when no search ran (a read-only principal, or a failed search, which never fails the store). The store also records the nearest similarity on the memory as server-maintained novelty, which `GET /stats` aggregates. Field details: [REST `POST /store`](./rest-api.md#post-store).
 
@@ -309,7 +309,7 @@ Mutating, like a store: static bearer only. REST: [`POST /memories/{content_hash
 
 ## `memory_refute`
 
-File a correction against a wrong memory in one call. The correction is stored like `store_memory`, but never skipped as a duplicate: `dedup_threshold` does not apply. When a live memory already holds the correction's exact text (you stored the fix first, or this is a retry), it is used as it is, its tags, type and metadata kept, and the result says `existing: true`. Then the wrong memory is linked or superseded:
+File a correction against a wrong memory in one call. The correction is stored like `store_memory`, but never skipped as a duplicate: `dedup_threshold` does not apply. When a live memory already holds the correction's exact text (you stored the fix first, or this is a retry), it is used as it is, its tags, type and metadata kept, and the result says `existing: true`; any `tags`, `memory_type`, `summary` or `citations` you send must then match it (a field you leave out always does). Then the wrong memory is linked or superseded:
 
 - **`supersede: false` (the default)**: a `CONTRADICTS` edge from the correction to the wrong memory. Both stay searchable, and the pair enters [`memory_contradictions`](#memory_contradictions).
 - **`supersede: true`**: the wrong memory is superseded by the correction, with `reason` as the supersession reason. That hides the whole record, so pass it only when the correction carries every claim of the wrong memory that is still true.
@@ -332,10 +332,13 @@ Any other argument, `metadata` included, is a `-32602` error.
 | `status` | Meaning |
 |:--|:--|
 | `not_found` | The wrong memory does not exist. |
-| `superseded` | The wrong memory is already superseded; `superseded_by` names the survivor. Refute that one instead. |
+| `superseded` | The wrong memory is already superseded; `superseded_by` names the survivor. Refute that one instead. A `supersede: true` retry whose own correction is the survivor succeeds instead. |
 | `correction_superseded` | The correction's content is stored already as a superseded memory, and a store would keep it hidden. Unsupersede it, or word the correction differently. |
+| `correction_exists` | The correction's content is stored already as a live memory, and `field` names the first field you sent that it does not have. Refute without that field, or update that memory first. |
 
-If the correction is stored but the second step fails, the result is `{ success: false, status: "partial", correction_hash, failed_step: "supersede" | "contradicts_edge", error, existing, stored? }`; a link that found a graph node missing counts as a failed `contradicts_edge`. The correction **is stored**: retry the same refute, which reuses it, or finish with [`memory_supersede`](#memory_supersede) or [`relation`](#relation) (`create`, `CONTRADICTS`). A timeout error also leaves the correction possibly stored; retrying the refute is safe. The refusals are checked before the store but not atomically with the second step, so a supersede that lands in between is overwritten, as with `memory_supersede`.
+If the correction is stored but the second step fails, the result is `{ success: false, status: "partial", correction_hash, failed_step: "supersede" | "contradicts_edge", error, existing, stored? }`; a link that found a graph node missing counts as a failed `contradicts_edge`. The correction **is stored**: retry the same refute, which reuses it, or finish with [`memory_supersede`](#memory_supersede) or [`relation`](#relation) (`create`, `CONTRADICTS`). A timeout error also leaves the correction possibly stored; retrying the refute is safe.
+
+If another caller supersedes the wrong memory after the checks, the result is `{ success: false, status: "conflict", superseded_by, correction_hash, ... }` with the correction stored. The supersede is conditional on the memory still carrying no marker, and the link re-reads it, so that survivor is never overwritten and the link is never reported as a success. Refute the survivor instead, or reconcile the two.
 
 Mutating: static bearer only. REST: [`POST /memories/{content_hash}/refute`](./rest-api.md#post-memoriescontent_hashrefute).
 

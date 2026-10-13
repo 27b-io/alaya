@@ -59,8 +59,9 @@ where
 use tracing;
 
 use alaya_backends::{
-    ConfirmOutcome, ConsolidationService, EmbeddingProvider, GraphService, HebbianService,
-    RerankingService, ReversalOutcome, ReversalRecord, StoreMode, SummaryProvider, VectorStorage,
+    ConditionalSupersede, ConfirmOutcome, ConsolidationService, EmbeddingProvider, GraphService,
+    HebbianService, RerankingService, ReversalOutcome, ReversalRecord, StoreMode, SummaryProvider,
+    VectorStorage,
 };
 use alaya_types::{
     AlayaError, Result,
@@ -184,11 +185,44 @@ impl StoreParams {
 }
 
 /// What `memory_refute` did: the caller's result, and the correction's store
-/// result when this call stored it, for the worker's store follow-ups.
+/// result when this call stored it.
 #[derive(Debug)]
 pub struct RefuteOutcome {
     pub result: Value,
     pub stored: Option<HashMap<String, Value>>,
+}
+
+/// The end of refute's first phase: a typed refusal, nothing written, or a
+/// stored correction for the second phase.
+#[derive(Debug)]
+pub enum RefuteStage {
+    Refused(Value),
+    Stored(RefutePlan),
+}
+
+/// A correction that is stored, and what refute's second phase needs.
+#[derive(Debug)]
+pub struct RefutePlan {
+    pub content_hash: String,
+    pub correction_hash: String,
+    pub reason: String,
+    pub supersede: bool,
+    wrong_created_at: f64,
+    correction_created_at: f64,
+    /// The correction has no summary (a store without one, or an existing
+    /// memory still without one): the worker's summary follow-up applies.
+    pub summary_missing: bool,
+    /// The store's result when this call stored the correction; `None` when
+    /// an existing memory was used as it is.
+    pub stored: Option<HashMap<String, Value>>,
+}
+
+/// Why refute's second phase did not complete.
+enum RefuteFailure {
+    /// The wrong memory was superseded meanwhile (its marker).
+    Conflict(Value),
+    /// A write failed: the step's name and the error.
+    Step(&'static str, AlayaError),
 }
 
 /// A correction filed against a wrong memory by `memory_refute` (LAB-7721):
@@ -229,6 +263,41 @@ impl Refutation {
             return Err("content cannot be empty".into());
         }
         self.correction().validate()
+    }
+
+    /// The first field the caller sent that an existing memory with the
+    /// correction's text does not match. A field the caller left out matches.
+    fn differs_from(&self, existing: &Memory) -> Option<&'static str> {
+        let citations = existing
+            .metadata
+            .as_ref()
+            .and_then(|md| md.get(alaya_types::memory::CITATIONS_KEY));
+        let tags = self.correction().tags;
+        if tags.is_some_and(|t| t != existing.tags) {
+            return Some("tags");
+        }
+        if self
+            .memory_type
+            .as_ref()
+            .is_some_and(|t| *t != existing.memory_type)
+        {
+            return Some("memory_type");
+        }
+        if self
+            .summary
+            .as_ref()
+            .is_some_and(|s| Some(s) != existing.summary.as_ref())
+        {
+            return Some("summary");
+        }
+        if self
+            .citations
+            .as_ref()
+            .is_some_and(|c| Some(&serde_json::json!(c)) != citations)
+        {
+            return Some("citations");
+        }
+        None
     }
 
     /// The correction as a store. `dedup_threshold` is never set: a
@@ -2391,28 +2460,49 @@ impl MemoryService {
     /// correction carries every claim of the wrong memory that is still true,
     /// so the link is the default.
     ///
-    /// Refused before anything is written, as a typed outcome: a wrong memory
-    /// that is missing (`not_found`) or already superseded (`superseded`), and
-    /// a correction whose content is stored already as a superseded memory
-    /// (`correction_superseded`) — the store would keep that marker, so the
-    /// correction would be hidden too. The check and the second step are not
-    /// atomic: a supersede that lands between them is overwritten, as with
-    /// `memory_supersede`.
-    ///
-    /// The correction goes through the normal store path without
-    /// `dedup_threshold`. A live memory that already holds the correction's
-    /// text (a retry, or a fix stored first with `store_memory`) is used as
-    /// it is, `existing: true`: re-storing it would replace its tags,
-    /// metadata and type with this call's. When the second step fails, the
-    /// correction is already stored: the result is `status: partial`, naming
-    /// the correction's hash and the failed step, so the caller can finish
-    /// with `memory_supersede` or `relation`, or retry the same refute.
-    #[tracing::instrument(skip_all, fields(content_hash = ?clip_for_log(content_hash), supersede = refutation.supersede))]
+    /// Two phases, so the worker can launch the correction's store follow-ups
+    /// between them: [`refute_store`](Self::refute_store), then
+    /// [`refute_link`](Self::refute_link). A deadline that falls in the
+    /// second phase then never costs the correction its summary or judges.
     pub async fn memory_refute(
         &self,
         content_hash: &str,
         refutation: Refutation,
     ) -> Result<RefuteOutcome> {
+        Ok(match self.refute_store(content_hash, refutation).await? {
+            RefuteStage::Refused(result) => RefuteOutcome {
+                result,
+                stored: None,
+            },
+            RefuteStage::Stored(plan) => RefuteOutcome {
+                result: self.refute_link(&plan).await,
+                stored: plan.stored,
+            },
+        })
+    }
+
+    /// Refute's first phase: the checks, then the correction's store.
+    ///
+    /// Refused before anything is written, as a typed outcome: a wrong memory
+    /// that is missing (`not_found`) or already superseded (`superseded`),
+    /// unless a `supersede: true` retry finds it superseded by this very
+    /// correction; a correction whose text is stored already as a superseded
+    /// memory (`correction_superseded`), since the store would keep it hidden;
+    /// and one whose text is a live memory the caller's fields contradict
+    /// (`correction_exists`).
+    ///
+    /// The correction goes through the normal store path without
+    /// `dedup_threshold`. A live memory that already holds the correction's
+    /// text, with no field of the caller's that differs from it (a retry, or
+    /// a fix stored first with `store_memory`), is used as it is,
+    /// `existing: true`: re-storing it would replace its tags, metadata and
+    /// type.
+    #[tracing::instrument(skip_all, fields(content_hash = ?clip_for_log(content_hash), supersede = refutation.supersede))]
+    pub async fn refute_store(
+        &self,
+        content_hash: &str,
+        refutation: Refutation,
+    ) -> Result<RefuteStage> {
         if !alaya_types::memory::validate_content_hash(content_hash) {
             return Err(AlayaError::Validation(
                 "invalid content_hash: expected 64-char lowercase SHA-256 hex".into(),
@@ -2430,36 +2520,49 @@ impl MemoryService {
             .vectors
             .get_batch(&[content_hash, &correction_hash])
             .await?;
-        let refused = |result: Value| {
-            Ok(RefuteOutcome {
-                result,
-                stored: None,
-            })
-        };
         let Some(wrong) = found.iter().find(|m| m.content_hash == content_hash) else {
-            return refused(not_found_refusal(content_hash));
+            return Ok(RefuteStage::Refused(not_found_refusal(content_hash)));
         };
-        if let Some(marker) = supersession_marker(wrong) {
-            return refused(superseded_refusal(
+        if let Some(marker) = supersession_marker(wrong)
+            && !(refutation.supersede && marker.as_str() == Some(correction_hash.as_str()))
+        {
+            return Ok(RefuteStage::Refused(superseded_refusal(
                 content_hash,
                 marker,
                 "Memory is already superseded; refute its survivor instead",
-            ));
+            )));
         }
         let existing = found.iter().find(|m| m.content_hash == correction_hash);
-        if existing.is_some_and(is_superseded) {
-            return refused(serde_json::json!({
-                "success": false,
-                "status": "correction_superseded",
-                "content_hash": content_hash,
-                "correction_hash": correction_hash,
-                "error": "The correction's content is stored already as a superseded memory; \
-                          unsupersede it, or file a correction with different content",
-            }));
+        if let Some(existing) = existing {
+            if is_superseded(existing) {
+                return Ok(RefuteStage::Refused(serde_json::json!({
+                    "success": false,
+                    "status": "correction_superseded",
+                    "content_hash": content_hash,
+                    "correction_hash": correction_hash,
+                    "error": "The correction's content is stored already as a superseded memory; \
+                              unsupersede it, or file a correction with different content",
+                })));
+            }
+            if let Some(field) = refutation.differs_from(existing) {
+                return Ok(RefuteStage::Refused(serde_json::json!({
+                    "success": false,
+                    "status": "correction_exists",
+                    "content_hash": content_hash,
+                    "correction_hash": correction_hash,
+                    "field": field,
+                    "error": format!(
+                        "The correction's text is stored already, with a different {field}; \
+                         refute without {field}, or update that memory first"
+                    ),
+                })));
+            }
         }
 
-        let reason = refutation.reason.trim().to_string();
-        let supersede = refutation.supersede;
+        let summary_missing = match existing {
+            Some(m) => m.summary.is_none(),
+            None => refutation.summary.is_none(),
+        };
         let stored = match existing {
             Some(_) => None,
             None => Some(
@@ -2467,97 +2570,161 @@ impl MemoryService {
                     .await?,
             ),
         };
+        let now = (self.clock)();
+        Ok(RefuteStage::Stored(RefutePlan {
+            content_hash: content_hash.to_string(),
+            correction_hash,
+            reason: refutation.reason.trim().to_string(),
+            supersede: refutation.supersede,
+            wrong_created_at: wrong.created_at,
+            correction_created_at: existing.map_or(now, |m| m.created_at),
+            summary_missing,
+            stored,
+        }))
+    }
 
-        let (status, step) = if supersede {
+    /// Refute's second phase: supersede or link, on a correction that is
+    /// stored. Never an error: a failure here is `status: partial`, naming
+    /// the correction's hash and the failed step, so the caller can retry the
+    /// same refute (which reuses the correction) or finish by hand.
+    ///
+    /// Both branches are conditional on the wrong memory staying live. The
+    /// supersede writes only while the memory carries no marker
+    /// (`VectorStorage::supersede_if_live`); the link re-reads the memory
+    /// once the edge is written. Either way, a supersede that landed first
+    /// is reported as `status: conflict` with its `superseded_by`, never
+    /// overwritten and never reported as success.
+    pub async fn refute_link(&self, plan: &RefutePlan) -> Value {
+        let RefutePlan {
+            content_hash,
+            correction_hash,
+            reason,
+            ..
+        } = plan;
+        let step = if plan.supersede {
             match self
-                .mark_superseded(&[content_hash], &correction_hash, &reason)
+                .vectors
+                .supersede_if_live(content_hash, correction_hash, reason)
                 .await
             {
-                Ok(()) => ("superseded", None),
-                // The write failed, but the re-read shows the marker landed:
-                // the supersession happened, edge included.
-                Err(f) if f.marked.iter().any(|h| h == content_hash) => ("superseded", None),
-                Err(f) => {
-                    let what = if f.in_doubt.is_empty() {
-                        "failed"
-                    } else {
-                        "has an unknown outcome"
-                    };
-                    ("partial", Some(("supersede", what, f.error)))
+                Ok(ConditionalSupersede::Superseded) => {
+                    self.write_supersedes_edges(&[content_hash], correction_hash)
+                        .await;
+                    Ok("superseded")
                 }
+                Ok(ConditionalSupersede::Conflict(marker)) => Err(RefuteFailure::Conflict(marker)),
+                Err(e) => Err(RefuteFailure::Step("supersede", e)),
             }
         } else {
-            // The edge MATCHes both nodes, so a node the store's non-fatal
-            // ensure_node missed, or a memory that never had one, would leave
-            // no edge. MERGE: a node already there is untouched.
-            let now = (self.clock)();
-            for (hash, created_at) in [
-                (content_hash, wrong.created_at),
-                (&correction_hash, existing.map_or(now, |m| m.created_at)),
-            ] {
-                if let Err(e) = self.graph.ensure_node(hash, created_at).await {
-                    tracing::warn!("refute: ensure_node failed before the link: {e}");
-                }
-            }
-            let edge = self
-                .graph
-                .create_typed_edge(
-                    &correction_hash,
-                    content_hash,
-                    UserRelationType::Contradicts,
-                    EdgeMeta {
-                        created_at: Some(now),
-                        confidence: None,
-                    },
-                )
-                .await;
-            // `false` is not "already there": MERGE binds an existing edge
-            // too, so it means an endpoint node is missing and nothing landed.
-            match edge {
-                Ok(true) => ("contradicts", None),
-                Ok(false) => (
-                    "partial",
-                    Some((
-                        "contradicts_edge",
-                        "failed",
-                        AlayaError::Graph("an endpoint node is missing".into()),
-                    )),
-                ),
-                Err(e) => ("partial", Some(("contradicts_edge", "failed", e))),
-            }
+            self.refute_contradicts(plan).await
         };
 
         let mut result = serde_json::json!({
-            "success": step.is_none(),
-            "status": status,
+            "success": step.is_ok(),
+            "status": step.as_ref().copied().unwrap_or("partial"),
             "content_hash": content_hash,
             "correction_hash": correction_hash,
             "reason": reason,
-            "existing": stored.is_none(),
+            "existing": plan.stored.is_none(),
         });
-        if let Some(stored) = &stored {
+        if let Some(stored) = &plan.stored {
             result["stored"] = serde_json::json!(stored);
         }
-        if let Some((step, what, error)) = step {
-            tracing::error!(
-                correction = %clip_for_log(&correction_hash),
-                step,
-                error = %error,
-                "refute: correction stored, second step {what}"
-            );
-            result["failed_step"] = serde_json::json!(step);
-            result["error"] = serde_json::json!(format!(
-                "Correction stored as {correction_hash}, but the {step} step {what} ({}). \
-                 Finish it with {}, or retry the same refute.",
-                error.safe_message(),
-                if step == "supersede" {
-                    "memory_supersede"
-                } else {
-                    "relation create CONTRADICTS"
-                }
-            ));
+        match step {
+            Ok(_) => {}
+            Err(RefuteFailure::Conflict(marker)) => {
+                result["status"] = serde_json::json!("conflict");
+                result["superseded_by"] = marker;
+                result["error"] = serde_json::json!(format!(
+                    "Correction stored as {correction_hash}, but the memory was superseded \
+                     meanwhile (superseded_by); refute that survivor instead, or reconcile the two"
+                ));
+            }
+            Err(RefuteFailure::Step(step, error)) => {
+                tracing::error!(
+                    correction = %clip_for_log(correction_hash),
+                    step,
+                    error = %error,
+                    "refute: correction stored, second step failed"
+                );
+                result["failed_step"] = serde_json::json!(step);
+                result["error"] = serde_json::json!(format!(
+                    "Correction stored as {correction_hash}, but the {step} step failed ({}). \
+                     Retry the same refute, or finish it with {}.",
+                    error.safe_message(),
+                    if step == "supersede" {
+                        "memory_supersede"
+                    } else {
+                        "relation create CONTRADICTS"
+                    }
+                ));
+            }
         }
-        Ok(RefuteOutcome { result, stored })
+        result
+    }
+
+    /// The link branch: `correction -> wrong` CONTRADICTS, then a re-read of
+    /// the wrong memory, since the graph write cannot be conditional on it.
+    async fn refute_contradicts(
+        &self,
+        plan: &RefutePlan,
+    ) -> std::result::Result<&'static str, RefuteFailure> {
+        // The edge MATCHes both nodes, so a node the store's non-fatal
+        // ensure_node missed, or a memory that never had one, would leave no
+        // edge. MERGE: a node already there is untouched.
+        for (hash, created_at) in [
+            (&plan.content_hash, plan.wrong_created_at),
+            (&plan.correction_hash, plan.correction_created_at),
+        ] {
+            if let Err(e) = self.graph.ensure_node(hash, created_at).await {
+                tracing::warn!(
+                    op = "refute.ensure_node",
+                    node = %clip_for_log(hash),
+                    error = %e,
+                    "ensure_node failed before the link"
+                );
+            }
+        }
+        let edge = self
+            .graph
+            .create_typed_edge(
+                &plan.correction_hash,
+                &plan.content_hash,
+                UserRelationType::Contradicts,
+                EdgeMeta {
+                    created_at: Some((self.clock)()),
+                    confidence: None,
+                },
+            )
+            .await;
+        match edge {
+            Ok(true) => {}
+            // Not "already there": MERGE binds an existing edge too, so
+            // `false` means an endpoint node is missing and nothing landed.
+            Ok(false) => {
+                return Err(RefuteFailure::Step(
+                    "contradicts_edge",
+                    AlayaError::Graph("an endpoint node is missing".into()),
+                ));
+            }
+            Err(e) => return Err(RefuteFailure::Step("contradicts_edge", e)),
+        }
+        match self.vectors.get_by_hash(&plan.content_hash).await {
+            Ok(Some(m)) => match supersession_marker(&m) {
+                Some(marker) => Err(RefuteFailure::Conflict(marker.clone())),
+                None => Ok("contradicts"),
+            },
+            // Deleted meanwhile: nothing left to contradict.
+            Ok(None) => Err(RefuteFailure::Step(
+                "contradicts_edge",
+                AlayaError::NotFound("the refuted memory was deleted meanwhile".into()),
+            )),
+            // The edge landed; only the liveness check could not run.
+            Err(e) => {
+                tracing::warn!(op = "refute.recheck", error = %e, "re-read after the link failed");
+                Ok("contradicts")
+            }
+        }
     }
 
     // ─── Tool: memory_unsupersede (LAB-6876) ────────────────────────────
@@ -10475,9 +10642,11 @@ mod tests {
         resupersede_after: RefCell<Option<String>>,
         /// Every metadata update fails with nothing written (LAB-7721).
         metadata_down: Cell<bool>,
-        /// A typed edge finds an endpoint node missing: nothing is written
-        /// and the bridge answers `created: false` (LAB-7721).
-        node_missing: Cell<bool>,
+        /// Graph nodes. A typed edge needs both endpoints, as the bridge's
+        /// MATCH does, and answers `created: false` without one (LAB-7721).
+        nodes: RefCell<std::collections::HashSet<String>>,
+        /// `ensure_node` answers Ok but writes nothing.
+        ensure_node_lost: Cell<bool>,
     }
 
     impl Ledger {
@@ -10608,6 +10777,32 @@ mod tests {
                 None => mems.push(m.clone()),
             }
             Ok((true, m.content_hash.clone()))
+        }
+        async fn supersede_if_live(
+            &self,
+            h: &str,
+            new_hash: &str,
+            reason: &str,
+        ) -> Result<ConditionalSupersede> {
+            if self.get_by_hash(h).await?.is_none() {
+                return Err(AlayaError::NotFound(h.into()));
+            }
+            match self.0.marker(h) {
+                Some(m) if m == serde_json::json!(new_hash) => {
+                    return Ok(ConditionalSupersede::Superseded);
+                }
+                Some(m) => return Ok(ConditionalSupersede::Conflict(m)),
+                None => {}
+            }
+            if self.0.metadata_down.get() {
+                return Err(AlayaError::Storage("ledger metadata write failed".into()));
+            }
+            self.0.set_marker(h, Some(serde_json::json!(new_hash)));
+            self.0
+                .reasons
+                .borrow_mut()
+                .insert(h.into(), serde_json::json!(reason));
+            Ok(ConditionalSupersede::Superseded)
         }
         async fn confirm_memory(&self, h: &str, at: f64) -> Result<ConfirmOutcome> {
             if let Some(marker) = self.0.marker(h) {
@@ -10749,7 +10944,11 @@ mod tests {
             });
             Ok(sources)
         }
-        async fn ensure_node(&self, _h: &str, _t: f64) -> Result<()> {
+        async fn ensure_node(&self, h: &str, _t: f64) -> Result<()> {
+            self.0.graph_write()?;
+            if !self.0.ensure_node_lost.get() {
+                self.0.nodes.borrow_mut().insert(h.to_string());
+            }
             Ok(())
         }
         async fn delete_node(&self, _h: &str) -> Result<()> {
@@ -10768,7 +10967,8 @@ mod tests {
                 UserRelationType::Contradicts,
                 "the ledger keeps CONTRADICTS only"
             );
-            if self.0.node_missing.get() {
+            let nodes = self.0.nodes.borrow();
+            if !nodes.contains(s) || !nodes.contains(d) {
                 return Ok(false);
             }
             // MERGE: an existing edge is bound and reported like a new one.
@@ -11678,6 +11878,8 @@ mod tests {
         let a = h('a');
         let ledger = Ledger::with(&[&a]);
         let svc = ledger.service();
+        // The wrong memory has no graph node: refute's ensure_node gives it one.
+        assert!(ledger.nodes.borrow().is_empty());
 
         let out = svc
             .memory_refute(&a, refutation("the port is 3001", false))
@@ -11866,7 +12068,7 @@ mod tests {
     async fn refute_reports_a_link_that_found_no_node_as_partial() {
         let a = h('a');
         let ledger = Ledger::with(&[&a]);
-        ledger.node_missing.set(true);
+        ledger.ensure_node_lost.set(true);
         let svc = ledger.service();
 
         let out = svc
@@ -11947,5 +12149,139 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(fix, a)]
         );
+    }
+
+    fn plan_of(stage: RefuteStage) -> RefutePlan {
+        match stage {
+            RefuteStage::Stored(plan) => plan,
+            RefuteStage::Refused(v) => panic!("refused: {v}"),
+        }
+    }
+
+    /// Another caller supersedes the wrong memory between refute's phases:
+    /// the conditional supersede leaves that survivor in place and reports
+    /// the conflict, with the correction stored.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refute_never_overwrites_a_survivor_chosen_meanwhile() {
+        let (a, d) = (h('a'), h('d'));
+        let ledger = Ledger::with(&[&a, &d]);
+        let svc = ledger.service();
+
+        let plan = plan_of(
+            svc.refute_store(&a, refutation("the port is 3001", true))
+                .await
+                .unwrap(),
+        );
+        svc.memory_supersede(&a, &d, "other caller").await.unwrap();
+        let out = svc.refute_link(&plan).await;
+
+        assert_eq!(out["success"], false, "{out}");
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(out["superseded_by"], serde_json::json!(d));
+        assert_eq!(
+            ledger.marker(&a),
+            Some(serde_json::json!(d)),
+            "survivor kept"
+        );
+        assert_eq!(
+            ledger.reasons.borrow()[&a],
+            serde_json::json!("other caller")
+        );
+        assert!(
+            ledger
+                .memories
+                .borrow()
+                .iter()
+                .any(|m| m.content_hash == plan.correction_hash),
+            "the correction stays stored"
+        );
+    }
+
+    /// The same race on the link branch: the edge lands, but the wrong
+    /// memory is hidden now, so the result is a conflict, not `contradicts`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refute_reports_a_link_to_a_memory_superseded_meanwhile() {
+        let (a, d) = (h('a'), h('d'));
+        let ledger = Ledger::with(&[&a, &d]);
+        let svc = ledger.service();
+
+        let plan = plan_of(
+            svc.refute_store(&a, refutation("the port is 3001", false))
+                .await
+                .unwrap(),
+        );
+        svc.memory_supersede(&a, &d, "other caller").await.unwrap();
+        let out = svc.refute_link(&plan).await;
+
+        assert_eq!(out["success"], false, "{out}");
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(out["superseded_by"], serde_json::json!(d));
+    }
+
+    /// A `supersede: true` refute retried after it landed (a lost reply)
+    /// converges instead of refusing the memory it superseded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refute_with_supersede_retried_converges() {
+        let a = h('a');
+        let ledger = Ledger::with(&[&a]);
+        let svc = ledger.service();
+        for _ in 0..2 {
+            let out = svc
+                .memory_refute(&a, refutation("the port is 3001", true))
+                .await
+                .unwrap()
+                .result;
+            assert_eq!(out["success"], true, "{out}");
+            assert_eq!(out["status"], "superseded");
+        }
+        let fix = generate_content_hash("the port is 3001");
+        assert_eq!(ledger.marker(&a), Some(serde_json::json!(fix)));
+        // A link refute of the same memory is still refused: it is hidden.
+        let out = svc
+            .memory_refute(&a, refutation("the port is 3001", false))
+            .await
+            .unwrap()
+            .result;
+        assert_eq!(out["status"], "superseded", "{out}");
+    }
+
+    /// A caller field that contradicts the stored correction is refused, not
+    /// silently dropped; the same fields, as on a retry, are accepted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refute_refuses_fields_the_existing_correction_does_not_have() {
+        let a = h('a');
+        let ledger = Ledger::with(&[&a]);
+        let svc = ledger.service();
+        let mut first = cite_params("the port is 3001");
+        first.tags = Some(vec!["fix".into()]);
+        first.memory_type = Some("decision".into());
+        first.citations = Some(vec![CITED.into()]);
+        svc.store_memory(first).await.unwrap();
+
+        let mut other_cite = refutation("the port is 3001", false);
+        other_cite.citations = Some(vec!["https://example.com/elsewhere".into()]);
+        let mut other_tags = refutation("the port is 3001", false);
+        other_tags.tags = Some(vec!["other".into()]);
+        let mut other_type = refutation("the port is 3001", false);
+        other_type.memory_type = Some("note".into());
+        for (r, field) in [
+            (other_cite, "citations"),
+            (other_tags, "tags"),
+            (other_type, "memory_type"),
+        ] {
+            let out = svc.memory_refute(&a, r).await.unwrap().result;
+            assert_eq!(out["status"], "correction_exists", "{out}");
+            assert_eq!(out["field"], field);
+        }
+        assert!(ledger.contradicts.borrow().is_empty(), "nothing linked");
+
+        // `refutation()` carries the same tags, type and citations.
+        let out = svc
+            .memory_refute(&a, refutation("the port is 3001", false))
+            .await
+            .unwrap()
+            .result;
+        assert_eq!(out["status"], "contradicts", "{out}");
+        assert_eq!(out["existing"], true);
     }
 }

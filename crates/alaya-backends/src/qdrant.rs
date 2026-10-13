@@ -22,7 +22,9 @@ use alaya_types::{
     search::PayloadFilter,
 };
 
-use crate::{ConfirmOutcome, ReversalOutcome, ReversalRecord, StoreMode, VectorStorage};
+use crate::{
+    ConditionalSupersede, ConfirmOutcome, ReversalOutcome, ReversalRecord, StoreMode, VectorStorage,
+};
 
 // ─── Keyword vector (LAB-7716) ──────────────────────────────────────────────
 //
@@ -1537,6 +1539,62 @@ impl VectorStorage for QdrantClient {
             }),
             Some(Update::Unconfirmed(why)) => Err(AlayaError::Storage(format!(
                 "unsupersede of {content_hash}: {why}"
+            ))),
+            Some(Update::Absent | Update::Deleted) | None => Err(not_found()),
+        }
+    }
+
+    #[tracing::instrument(skip(self, reason), fields(hash = %content_hash))]
+    async fn supersede_if_live(
+        &self,
+        content_hash: &str,
+        new_hash: &str,
+        reason: &str,
+    ) -> Result<ConditionalSupersede> {
+        let point_id = hash_to_uuid(content_hash)?;
+        let not_found = || AlayaError::NotFound(format!("memory {content_hash} not found"));
+
+        let _write = self.write_lock.lock().await;
+
+        // As in update_metadata_batch, marker and reason land in one merge
+        // with the whole `metadata` object rebuilt from the copy just read;
+        // unlike it, a marker on that copy stops the write.
+        let marker: RefCell<Option<Value>> = RefCell::new(None);
+        let mut outcome = self
+            .update_points(
+                std::slice::from_ref(&point_id),
+                Some(&["metadata"]),
+                Commit::Payload(PayloadWrite::Merge, Batch::Strict),
+                |prev| {
+                    let mut metadata = match prev.get("metadata") {
+                        None | Some(Value::Null) => serde_json::Map::new(),
+                        Some(Value::Object(m)) => m.clone(),
+                        Some(_) => {
+                            return Err(AlayaError::Storage(
+                                "stored metadata is not an object; refusing to replace it".into(),
+                            ));
+                        }
+                    };
+                    *marker.borrow_mut() = metadata.get("superseded_by").cloned();
+                    if metadata.contains_key("superseded_by") {
+                        return Ok(None);
+                    }
+                    metadata.insert("superseded_by".into(), json!(new_hash));
+                    Ok(Some(json!({
+                        "metadata": metadata,
+                        SUPERSESSION_REASON: reason,
+                    })))
+                },
+            )
+            .await?;
+        match outcome.remove(&point_id) {
+            Some(Update::Landed { .. }) => Ok(ConditionalSupersede::Superseded),
+            Some(Update::Skipped) => match marker.take() {
+                Some(m) if m == json!(new_hash) => Ok(ConditionalSupersede::Superseded),
+                m => Ok(ConditionalSupersede::Conflict(m.unwrap_or(Value::Null))),
+            },
+            Some(Update::Unconfirmed(why)) => Err(AlayaError::Storage(format!(
+                "conditional supersede of {content_hash}: {why}"
             ))),
             Some(Update::Absent | Update::Deleted) | None => Err(not_found()),
         }

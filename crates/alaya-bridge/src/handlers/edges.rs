@@ -129,7 +129,9 @@ pub async fn create(
         cypher::create_typed_edge(&req.source, &req.target, rel, ts, req.confidence);
     let result = exec_query(&state, &cypher, params, readonly).await?;
 
-    // RETURN count(e) — 1 means created (ON CREATE fired), 0 means already existed
+    // RETURN count(e): MERGE binds an existing edge as well as a new one, so
+    // 1 means the edge is there (new or not) and 0 means an endpoint node is
+    // missing and nothing was written.
     let count = result.count().unwrap_or(0);
     Ok(Json(json!({ "created": count > 0 })))
 }

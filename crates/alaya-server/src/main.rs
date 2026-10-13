@@ -51,7 +51,7 @@ use alaya_backends::{
 use alaya_core::calendar::utc_date_str;
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{
-    JudgeOutcome, KeywordLeg, MemoryService, OutputMode, RankingFlags, Refutation, RefuteOutcome,
+    JudgeOutcome, KeywordLeg, MemoryService, OutputMode, RankingFlags, Refutation, RefuteStage,
     RelationParams, SearchParams, StoreParams, parse_user_relation,
 };
 use alaya_core::vitals::{CountingEmbedding, SelfCheckOutcome, Vitals};
@@ -1822,22 +1822,40 @@ async fn service_worker(
                 let span = tracing::info_span!(parent: &ps, "refute",
                     supersede = refutation.supersede);
                 let h = truncate_hash(&hash);
-                // The correction is a store: it gets a store's summary
-                // follow-up, under the same rule.
-                let content_for_summary = (refutation.summary.is_none() && svc.summary.is_some())
-                    .then(|| refutation.content.clone());
                 // Named in a timeout reply: the deadline may fall after the
                 // correction was stored, and the caller needs its hash to
-                // check (get_memory) and finish rather than store again.
-                let correction_hash =
-                    alaya_core::hashing::generate_content_hash(&refutation.content);
-                let result = match timeout(
-                    limits.cmd,
-                    svc.memory_refute(&hash, refutation).instrument(span),
-                )
-                .await
-                {
-                    Ok(Ok(RefuteOutcome { result, stored })) => {
+                // check (get_memory) or retry, which reuses it.
+                let content = refutation.content.clone();
+                let correction_hash = alaya_core::hashing::generate_content_hash(&content);
+                // The follow-ups launch between the phases, so a deadline in
+                // the second phase never costs the correction its summary or
+                // its judges; a retry that reuses a correction still without
+                // a summary launches that one.
+                let refute = async {
+                    let plan = match svc.refute_store(&hash, refutation).await? {
+                        RefuteStage::Refused(v) => return Ok(v),
+                        RefuteStage::Stored(plan) => plan,
+                    };
+                    let summary =
+                        (plan.summary_missing && svc.summary.is_some()).then_some(content);
+                    match (&plan.stored, summary) {
+                        (Some(stored), summary) => spawn_store_followups(
+                            &svc,
+                            &judge_gate,
+                            &judge_limiter,
+                            stored,
+                            summary,
+                            false,
+                        ),
+                        (None, Some(summary)) => {
+                            spawn_summary(&svc, &plan.correction_hash, summary)
+                        }
+                        (None, None) => {}
+                    }
+                    Ok::<_, alaya_types::AlayaError>(svc.refute_link(&plan).await)
+                };
+                let result = match timeout(limits.cmd, refute.instrument(span)).await {
+                    Ok(Ok(result)) => {
                         tracing::info!(
                             op,
                             hash = h.as_str(),
@@ -1845,17 +1863,6 @@ async fn service_worker(
                             elapsed_ms = ms(start),
                             "ok"
                         );
-                        // Stored even when the second step failed (`partial`).
-                        if let Some(stored) = &stored {
-                            spawn_store_followups(
-                                &svc,
-                                &judge_gate,
-                                &judge_limiter,
-                                stored,
-                                content_for_summary,
-                                false,
-                            );
-                        }
                         result
                     }
                     Ok(Err(e)) => {
@@ -2487,12 +2494,6 @@ fn judge_cap_view(limiter: &JudgeDailyCap, judge_configured: bool) -> Value {
     })
 }
 
-/// Spawns background contradiction judge tasks for new CONTRADICTS signals from a store result
-/// (LAB-3895). Returns the number of tasks spawned; a pair is skipped (left unjudged for
-/// backfill) once `JUDGE_STORE_BACKLOG_MAX` tasks are outstanding. The daily cap itself is
-/// applied inside each task, once it holds a gate permit and just before the call: a pair
-/// queued before UTC midnight is billed to the day it actually runs, so a process's calls in
-/// any UTC day never exceed the cap.
 /// A store's fire-and-forget follow-ups, for `/store` and for a refute's
 /// correction: the summary when the caller sent none (`summary_content`,
 /// `None` under read_only) and the stored content was not skipped as a
@@ -2515,15 +2516,27 @@ fn spawn_store_followups(
         && !skipped
         && let Some(hash) = result.get("content_hash").and_then(Value::as_str)
     {
-        let hash = hash.to_string();
-        let svc = svc.clone();
-        tokio::task::spawn_local(async move {
-            svc.enrich_summary(&hash, &content).await;
-        });
+        spawn_summary(svc, hash, content);
     }
     spawn_store_contradiction_judges(svc, judge_gate, limiter, result, read_only);
 }
 
+/// Generate a summary in the background (`MemoryService::enrich_summary`,
+/// which never overwrites a summary that exists by then).
+fn spawn_summary(svc: &std::rc::Rc<MemoryService>, hash: &str, content: String) {
+    let hash = hash.to_string();
+    let svc = svc.clone();
+    tokio::task::spawn_local(async move {
+        svc.enrich_summary(&hash, &content).await;
+    });
+}
+
+/// Spawns background contradiction judge tasks for new CONTRADICTS signals from a store result
+/// (LAB-3895). Returns the number of tasks spawned; a pair is skipped (left unjudged for
+/// backfill) once `JUDGE_STORE_BACKLOG_MAX` tasks are outstanding. The daily cap itself is
+/// applied inside each task, once it holds a gate permit and just before the call: a pair
+/// queued before UTC midnight is billed to the day it actually runs, so a process's calls in
+/// any UTC day never exceed the cap.
 fn spawn_store_contradiction_judges(
     svc: &std::rc::Rc<MemoryService>,
     judge_gate: &std::rc::Rc<tokio::sync::Semaphore>,
@@ -3516,7 +3529,9 @@ async fn unsupersede(
 fn outcome_status(v: &Value) -> StatusCode {
     match (v["status"].as_str(), v["error_kind"].as_str()) {
         (Some("not_found"), _) => StatusCode::NOT_FOUND,
-        (Some("superseded" | "correction_superseded"), _) => StatusCode::CONFLICT,
+        (Some("superseded" | "correction_superseded" | "correction_exists" | "conflict"), _) => {
+            StatusCode::CONFLICT
+        }
         (_, Some("validation")) => StatusCode::BAD_REQUEST,
         _ if v.get("error").is_some() => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::OK,
@@ -6981,6 +6996,16 @@ mod wedge_tests {
             (
                 "refute",
                 json!({"success": false, "status": "correction_superseded"}),
+                StatusCode::CONFLICT,
+            ),
+            (
+                "refute",
+                json!({"success": false, "status": "correction_exists", "field": "tags"}),
+                StatusCode::CONFLICT,
+            ),
+            (
+                "refute",
+                json!({"success": false, "status": "conflict", "superseded_by": fix, "correction_hash": fix}),
                 StatusCode::CONFLICT,
             ),
             (

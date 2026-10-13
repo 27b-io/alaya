@@ -219,9 +219,18 @@ fn is_token(s: &str) -> bool {
     !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
+/// `https://` with a host: the authority up to the first `/`, `?` or `#` is
+/// non-empty and holds only host and port characters (no userinfo).
 fn is_url_citation(c: &str) -> bool {
-    c.strip_prefix("https://")
-        .is_some_and(|rest| is_token(rest) && !rest.starts_with('/'))
+    let Some(rest) = c.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    is_token(rest)
+        && !host.is_empty()
+        && host
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.' | ':' | '[' | ']'))
 }
 
 /// `<owner>/<repo>@<sha>:<path>[:<line>[-<line>]]`. A trailing `:<digits>`
@@ -519,6 +528,9 @@ mod tests {
             "http://example.com/x",
             "https://",
             "https:///path",
+            "https://?source=claim",
+            "https://#frag",
+            "https://user@example.com/x",
             "https://exa mple.com",
             "alaya@4d63bad:README.md",
             "27b-io/alaya@4d63ba:README.md",

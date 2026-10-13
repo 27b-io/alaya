@@ -18,7 +18,8 @@ mod common;
 use std::collections::HashMap;
 
 use alaya_backends::{
-    ConfirmOutcome, ReversalOutcome, ReversalRecord, VectorStorage, qdrant::QdrantClient,
+    ConditionalSupersede, ConfirmOutcome, ReversalOutcome, ReversalRecord, VectorStorage,
+    qdrant::QdrantClient,
 };
 use alaya_types::{
     AlayaError,
@@ -852,4 +853,85 @@ async fn confirm_racing_a_supersede_sees_the_marker() {
         stored["metadata"].get("last_confirmed_at").is_none(),
         "{stored}"
     );
+}
+
+// ─── supersede_if_live (LAB-7721) ───────────────────────────────────────────
+
+/// A live memory gets marker and reason in one conditional merge, siblings
+/// kept, exactly as an unconditional supersede writes them.
+#[tokio::test]
+async fn supersede_if_live_marks_a_live_memory_in_one_conditional_write() {
+    let (server, fake) = fake_with(&[('a', Some("r1"))]).await;
+
+    let outcome = client_for(&server)
+        .supersede_if_live(&hash('a'), &hash('b'), "corrected")
+        .await
+        .expect("an outcome");
+    assert_eq!(outcome, ConditionalSupersede::Superseded);
+
+    let w = writes(&server).await;
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(is_conditional(&w[0].0, &w[0].1), "{w:?}");
+    let stored = fake.point(&id('a')).unwrap();
+    assert_eq!(stored["metadata"]["superseded_by"], json!(hash('b')));
+    assert_eq!(stored["metadata"]["source"], json!("import"));
+    assert_eq!(stored["supersession_reason"], json!("corrected"));
+}
+
+/// Another survivor's marker is never overwritten; the survivor's own is a
+/// converged retry. Neither writes.
+#[tokio::test]
+async fn supersede_if_live_leaves_a_superseded_memory_alone() {
+    let (server, fake) = fake_with(&[]).await;
+    let superseded = superseded_payload('a', 'd', Some("r1"));
+    fake.insert(&id('a'), superseded.clone());
+    let client = client_for(&server);
+
+    let other = client
+        .supersede_if_live(&hash('a'), &hash('b'), "corrected")
+        .await
+        .expect("an outcome");
+    assert_eq!(other, ConditionalSupersede::Conflict(json!(hash('d'))));
+    let same = client
+        .supersede_if_live(&hash('a'), &hash('d'), "corrected")
+        .await
+        .expect("an outcome");
+    assert_eq!(same, ConditionalSupersede::Superseded);
+
+    assert!(writes(&server).await.is_empty());
+    assert_eq!(fake.point(&id('a')).unwrap(), superseded);
+}
+
+/// A supersede from another process lands inside the read→write window: the
+/// write built from the live copy is rejected, and the re-read reports the
+/// other survivor instead of replacing it.
+#[tokio::test]
+async fn supersede_if_live_racing_another_supersede_reports_the_conflict() {
+    let (server, fake) = fake_with(&[('a', Some("r1"))]).await;
+    let a = id('a');
+    fake.before_writes(1, move |points| {
+        let mut metadata = points[&a]["metadata"].clone();
+        metadata["superseded_by"] = json!("d".repeat(64));
+        external_write(points, &a, json!({ "metadata": metadata }));
+    });
+
+    let outcome = client_for(&server)
+        .supersede_if_live(&hash('a'), &hash('b'), "corrected")
+        .await
+        .expect("an outcome");
+    assert_eq!(outcome, ConditionalSupersede::Conflict(json!(hash('d'))));
+    assert_eq!(
+        fake.point(&id('a')).unwrap()["metadata"]["superseded_by"],
+        json!(hash('d'))
+    );
+}
+
+#[tokio::test]
+async fn supersede_if_live_of_an_absent_memory_is_not_found() {
+    let (server, _fake) = fake_with(&[]).await;
+    let result = client_for(&server)
+        .supersede_if_live(&hash('a'), &hash('b'), "corrected")
+        .await;
+    assert!(matches!(result, Err(AlayaError::NotFound(_))), "{result:?}");
+    assert!(writes(&server).await.is_empty());
 }

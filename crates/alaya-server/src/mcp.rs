@@ -609,7 +609,7 @@ fn citations_schema() -> Value {
             },
             { "type": "null" }
         ],
-        "description": "The sources this memory rests on, returned on every hit at metadata.citations. Each is <owner>/<repo>@<sha>:<path>, optionally :<line> or :<line>-<line>, with a 7-40 char hex sha, or an https:// URL (a PR, an issue comment). A malformed one refuses the call."
+        "description": "The sources this memory rests on, returned on every hit at metadata.citations. Each is <owner>/<repo>@<sha>:<path>, optionally :<line> or :<line>-<line>, with a 7-40 char hex sha, or an https:// URL with a host (a PR, an issue comment). A malformed one refuses the call."
     })
 }
 
@@ -789,7 +789,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "memory_refute",
-            "description": "File a correction against a wrong memory in one call. The correction is stored like store_memory (never skipped as a duplicate); a live memory that already holds its exact text is used as is, with existing: true, so a retry is safe. By default the pair is then linked correction -> wrong as CONTRADICTS: both stay searchable and the pair enters the contradiction queue. Pass supersede: true only when the correction carries every claim of the wrong memory that is still true; the wrong memory is then superseded by the correction with your reason. Refused before anything is written, with {success: false, status}: not_found, superseded (refute the survivor instead) or correction_superseded. If the store succeeds but the supersede or link fails, returns {success: false, status: partial, correction_hash, failed_step}: retry the same refute, or finish with memory_supersede or relation.",
+            "description": "File a correction against a wrong memory in one call. The correction is stored like store_memory (never skipped as a duplicate); a live memory that already holds its exact text is used as is, with existing: true, so a retry is safe; any tags, memory_type, summary or citations you send must then match it. By default the pair is then linked correction -> wrong as CONTRADICTS: both stay searchable and the pair enters the contradiction queue. Pass supersede: true only when the correction carries every claim of the wrong memory that is still true; the wrong memory is then superseded by the correction with your reason. Refused before anything is written, with {success: false, status}: not_found, superseded (refute the survivor instead), correction_superseded or correction_exists. If another caller supersedes the wrong memory meanwhile, returns {success: false, status: conflict, superseded_by} with the correction stored; that survivor is never overwritten. If the store succeeds but the supersede or link fails, returns {success: false, status: partial, correction_hash, failed_step}: retry the same refute, or finish with memory_supersede or relation.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
