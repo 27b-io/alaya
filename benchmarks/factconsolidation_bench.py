@@ -188,9 +188,10 @@ def stage_retrieve(args) -> None:
 
 def stage_read(args, cli: ClaudeCLI) -> int:
     retrieval = load_jsonl(os.path.join(args.run_dir, "retrieval.jsonl"))
+    # The reader gets every retrieved memory, so k is what retrieve kept, not --k.
     config = {
         "model": args.reader,
-        "k": args.k,
+        "k": max(len(r["retrieved"]) for r in retrieval),
         "retrieval_sha256": retrieval_fingerprint(retrieval, "retrieved"),
     }
     bind_stage(args.run_dir, "read", **config)
