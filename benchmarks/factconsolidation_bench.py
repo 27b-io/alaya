@@ -57,11 +57,13 @@ from longmemeval_qa import (
     DEFAULT_JUDGE,
     DEFAULT_READER,
     ClaudeCLI,
+    bind_stage,
     get_anscheck_prompt,
     judge_label,
     load_json,
     load_jsonl,
     record_calls,
+    retrieval_fingerprint,
     run_parallel,
     score,
 )
@@ -186,6 +188,12 @@ def stage_retrieve(args) -> None:
 
 def stage_read(args, cli: ClaudeCLI) -> int:
     retrieval = load_jsonl(os.path.join(args.run_dir, "retrieval.jsonl"))
+    config = {
+        "model": args.reader,
+        "k": args.k,
+        "retrieval_sha256": retrieval_fingerprint(retrieval, "retrieved"),
+    }
+    bind_stage(args.run_dir, "read", **config)
     out = os.path.join(args.run_dir, "hypotheses.jsonl")
     done = {r["question_id"] for r in load_jsonl(out, missing_ok=True)}
     todo = [r for r in retrieval if r["question_id"] not in done]
@@ -202,7 +210,7 @@ def stage_read(args, cli: ClaudeCLI) -> int:
         }
 
     failures = run_parallel(todo, one, out, args.workers, "read")
-    record_calls(args.run_dir, "read", cli, args.reader, k=args.k)
+    record_calls(args.run_dir, "read", cli, **config)
     return failures
 
 
@@ -212,6 +220,7 @@ def stage_judge(args, cli: ClaudeCLI) -> int:
         for r in load_jsonl(os.path.join(args.run_dir, "retrieval.jsonl"))
     }
     hyps = load_jsonl(os.path.join(args.run_dir, "hypotheses.jsonl"))
+    bind_stage(args.run_dir, "judge", model=args.judge)
     out = os.path.join(args.run_dir, "judge_labels.jsonl")
     done = {r["question_id"] for r in load_jsonl(out, missing_ok=True)}
     todo = [h for h in hyps if h["question_id"] not in done]
@@ -241,7 +250,7 @@ def stage_judge(args, cli: ClaudeCLI) -> int:
         }
 
     failures = run_parallel(todo, one, out, args.workers, "judge")
-    record_calls(args.run_dir, "judge", cli, args.judge)
+    record_calls(args.run_dir, "judge", cli, model=args.judge)
     return failures
 
 
@@ -260,6 +269,10 @@ def stage_report(args) -> dict:
         )
     if "read" not in calls or "judge" not in calls:
         sys.exit(f"  {calls_path} lacks the read or judge stage")
+    if calls["read"].get("retrieval_sha256") != retrieval_fingerprint(
+        list(by_id.values()), "retrieved"
+    ):
+        sys.exit("  retrieval.jsonl is not the retrieval this run's reader read")
     if {r["autoeval_label"]["model"] for r in labels} != {calls["judge"]["model"]}:
         sys.exit(f"  labels are not all from judge {calls['judge']['model']}")
     em: dict[str, list[int]] = defaultdict(list)

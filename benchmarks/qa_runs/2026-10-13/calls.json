@@ -3,7 +3,8 @@
     "model": "claude-sonnet-5-5",
     "calls": 500,
     "cli": "2.1.285 (Claude Code)",
-    "k": 10
+    "k": 10,
+    "retrieval_sha256": "ef363a110f882c6fd1763c746c0cf421956f11e20e4754c55bbd039dc95cb6ec"
   },
   "judge": {
     "model": "claude-opus-5-5",

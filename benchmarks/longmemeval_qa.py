@@ -37,6 +37,7 @@ Usage (from benchmarks/, after a retrieval run):
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -261,21 +262,39 @@ def paths(run_dir: str) -> dict[str, str]:
     }
 
 
-def record_calls(run_dir: str, stage: str, cli: ClaudeCLI, model: str, **extra) -> None:
+def retrieval_fingerprint(rows: list[dict], key: str) -> str:
+    """SHA-256 over every question's ranked results: what the reader was given."""
+    ranked = sorted((r["question_id"], r[key]) for r in rows)
+    return hashlib.sha256(json.dumps(ranked).encode()).hexdigest()
+
+
+def bind_stage(run_dir: str, stage: str, **config) -> None:
+    """Refuse to resume a stage under a different config (model, k, retrieval).
+
+    A resume skips questions already done, so a changed config would silently
+    mix two runs in one file; the report then credits one run with the other's
+    answers.
+    """
+    p = paths(run_dir)["calls"]
+    prev = load_json(p).get(stage, {})
+    for key, value in config.items():
+        if prev and prev.get(key) != value:
+            sys.exit(
+                f"  {p} records {stage} {key}={prev.get(key)!r}, not {value!r}; use a new --run-dir"
+            )
+
+
+def record_calls(run_dir: str, stage: str, cli: ClaudeCLI, **config) -> None:
     """Accumulate per-stage call counts across resumed runs; the report reads the
-    models (and the reader's k) from here, so they describe the run, not argv."""
+    models, k and retrieval fingerprint from here, so they describe the run, not argv."""
+    bind_stage(run_dir, stage, **config)
     p = paths(run_dir)["calls"]
     calls = load_json(p)
     prev = calls.get(stage, {})
-    if prev and prev.get("model") != model:
-        sys.exit(
-            f"  {p} records {stage} model {prev['model']}, not {model}; use a new --run-dir"
-        )
     calls[stage] = {
-        "model": model,
+        **config,
         "calls": prev.get("calls", 0) + cli.calls,
         "cli": cli.version(),
-        **extra,
     }
     with open(p, "w") as f:
         json.dump(calls, f, indent=2)
@@ -287,6 +306,12 @@ def stage_read(args, cli: ClaudeCLI) -> int:
     retrieval = load_jsonl(args.retrieval)
     if not retrieval:
         sys.exit(f"  No retrieval rows in {args.retrieval}")
+    config = {
+        "model": args.reader,
+        "k": args.k,
+        "retrieval_sha256": retrieval_fingerprint(retrieval, "ranked_session_ids"),
+    }
+    bind_stage(args.run_dir, "read", **config)
     out = paths(args.run_dir)["hyp"]
     done = {r["question_id"] for r in load_jsonl(out, missing_ok=True)}
     todo = [r for r in retrieval if r["question_id"] not in done]
@@ -304,13 +329,14 @@ def stage_read(args, cli: ClaudeCLI) -> int:
         }
 
     failures = run_parallel(todo, one, out, args.workers, "read")
-    record_calls(args.run_dir, "read", cli, args.reader, k=args.k)
+    record_calls(args.run_dir, "read", cli, **config)
     return failures
 
 
 def stage_judge(args, cli: ClaudeCLI) -> int:
     data = load_dataset(args.data)
     hyps = load_jsonl(paths(args.run_dir)["hyp"])
+    bind_stage(args.run_dir, "judge", model=args.judge)
     out = paths(args.run_dir)["labels"]
     done = {r["question_id"] for r in load_jsonl(out, missing_ok=True)}
     todo = [h for h in hyps if h["question_id"] not in done]
@@ -338,7 +364,7 @@ def stage_judge(args, cli: ClaudeCLI) -> int:
         }
 
     failures = run_parallel(todo, one, out, args.workers, "judge")
-    record_calls(args.run_dir, "judge", cli, args.judge)
+    record_calls(args.run_dir, "judge", cli, model=args.judge)
     return failures
 
 
@@ -384,6 +410,12 @@ def stage_report(args) -> dict:
     reader, judge = calls.get("read", {}), calls.get("judge", {})
     if not reader or not judge:
         sys.exit(f"  {p['calls']} lacks the read or judge stage")
+    if reader.get("retrieval_sha256") != retrieval_fingerprint(
+        retrieval, "ranked_session_ids"
+    ):
+        sys.exit(
+            f"  {args.retrieval} is not the retrieval this run's reader read; pass that file"
+        )
     if {r["autoeval_label"]["model"] for r in labels} != {judge["model"]}:
         sys.exit(f"  labels in {p['labels']} are not all from judge {judge['model']}")
 
