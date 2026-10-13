@@ -1,6 +1,6 @@
 # MCP tool reference
 
-Twelve tools, grouped by what they do. The authoritative JSON schemas live in [`crates/alaya-server/src/mcp.rs`](../crates/alaya-server/src/mcp.rs) — if anything below disagrees with the source, the source wins.
+Fourteen tools, grouped by what they do. The authoritative JSON schemas live in [`crates/alaya-server/src/mcp.rs`](../crates/alaya-server/src/mcp.rs) — if anything below disagrees with the source, the source wins.
 
 For wiring an MCP client to a running server, see [Quickstart: MCP clients](./quickstart-mcp.md). For the REST equivalents (different field names in a few places), see [REST API reference](./rest-api.md).
 
@@ -23,6 +23,8 @@ Almost every tool below either returns or takes a `content_hash`. Two rules that
 | [`relation`](#relation) | Create / read / delete typed edges between memories | ✓ (`create`/`delete`) |
 | [`memory_supersede`](#memory_supersede) | Mark old memory as superseded by new | ✓ |
 | [`memory_unsupersede`](#memory_unsupersede) | Reverse a supersession, with an audit entry | ✓ |
+| [`memory_confirm`](#memory_confirm) | Record that a memory was re-checked and still holds | ✓ (one timestamp) |
+| [`memory_refute`](#memory_refute) | File a correction against a wrong memory | ✓ |
 | [`memory_contradictions`](#memory_contradictions) | List contradiction pairs with judge verdicts | |
 | [`resolve_contradiction`](#resolve_contradiction) | Keep both memories of a contradiction pair — non-destructive, reversible | ✓ (edge stamp only) |
 | [`find_duplicates`](#find_duplicates) | Scan for near-duplicate memories | |
@@ -39,10 +41,11 @@ Embed text and persist it. Returns the new memory's `content_hash` and its neare
 | `content` | string | ✓ | | The text to store. Embedded for semantic search. |
 | `tags` | string[] or string | | | Labels for tag-mode search. Accepts `["a","b"]` or `"a,b"`. |
 | `memory_type` | enum | | `note` | One of `note`, `decision`, `task`, `reference`. Used by `memory_type` filter on `search`. |
-| `metadata` | object | | | Arbitrary structured data. Special key: `importance` (float 0–1) boosts salience. Reserved keys: `superseded_by` is set only by supersede and merge, and `nearest_similarity` only by the server on each store; sending either is a `-32602` error and nothing is stored. |
+| `metadata` | object | | | Arbitrary structured data. Special key: `importance` (float 0–1) boosts salience. Reserved keys: `superseded_by` is set only by supersede and merge, `last_confirmed_at` only by [`memory_confirm`](#memory_confirm), and `nearest_similarity` only by the server on each store; sending any of them is a `-32602` error and nothing is stored. A `citations` key gets the same check as the `citations` param. |
 | `client_hostname` | string | | | Tagged on the memory for provenance / multi-host setups. |
 | `summary` | string | | | One-line summary (~50 tokens). Auto-generated if `SUMMARY_URL` is configured on the server. |
-| `dedup_threshold` | number | | | If set, skip storage when the nearest live memory's cosine similarity ≥ threshold. Use `0.95` for near-exact dedup. The skip runs before contradiction detection, so a correction close to the memory it corrects is dropped with no `CONTRADICTS` edge. |
+| `dedup_threshold` | number | | | If set, skip storage when the nearest live memory's cosine similarity ≥ threshold. Use `0.95` for near-exact dedup. The skip runs before contradiction detection, so a correction close to the memory it corrects is dropped with no `CONTRADICTS` edge. File a correction with [`memory_refute`](#memory_refute) instead. |
+| `citations` | string[] | | | The sources the memory rests on, at most 10 of at most 500 characters. Each is `<owner>/<repo>@<sha>:<path>`, optionally `:<line>` or `:<line>-<line>`, with a 7–40 character hex sha, or an `https://` URL. Stored at `metadata.citations`, so every hit returns them. Setting both this and `metadata.citations`, or a malformed citation, is a `-32602` error and nothing is stored. The server never fetches a citation's target. |
 
 **Returns:** `{ "success": true, "content_hash": "<64-hex>", "memory_type": "...", "created": true | false, "message": "...", "tags"?: [...], "neighbours"?: [...], "interference"?: {"contradictions": [...]} }`. `created` is `false` when the content was already stored and the record was updated in place. `neighbours` lists up to 5 of the nearest live memories, nearest first, never the stored one: `{content_hash, similarity, memory_type, summary}`, the summary clipped to 200 characters. It is `[]` when the search found no live memory and absent when no search ran (a read-only principal, or a failed search, which never fails the store). The store also records the nearest similarity on the memory as server-maintained novelty, which `GET /stats` aggregates. Field details: [REST `POST /store`](./rest-api.md#post-store).
 
@@ -57,7 +60,8 @@ When `dedup_threshold` skipped the write: `{ "success": true, "duplicate": true,
     "content": "Migrated frontend from npm to pnpm because of lockfile churn.",
     "tags": ["frontend", "tooling"],
     "memory_type": "decision",
-    "metadata": {"importance": 0.7}
+    "metadata": {"importance": 0.7},
+    "citations": ["27b-io/alaya@4d63bad:README.md:12-20"]
   }
 }
 ```
@@ -276,6 +280,75 @@ The reversal is recorded as `unsuperseded_via: "operator:mcp"`; the MCP surface 
   "arguments": {
     "content_hash": "a3f4...e891",
     "reason": "Not a duplicate: the two notes cover different caches."
+  }
+}
+```
+
+---
+
+## `memory_confirm`
+
+Record that you re-checked a memory against its sources (its `metadata.citations`, say) and it still holds. Sets `metadata.last_confirmed_at` to the server's time, in epoch seconds, which every hit then returns, and writes nothing else. A re-store of the same content keeps it.
+
+A confirm has **no effect on ranking**. Recency decay reads `created_at`, not the confirmation, and access counts, importance, trust, the summary boost and Hebbian weights are untouched, so a search returns the same order before and after.
+
+| Param | Type | Required | Notes |
+|:--|:--|:-:|:--|
+| `content_hash` | string | ✓ | The memory you re-checked. |
+
+**Returns:** `{ success: true, content_hash, last_confirmed_at }`, or `success: false` with nothing written:
+
+| `status` | Meaning |
+|:--|:--|
+| `not_found` | No memory has this hash. |
+| `superseded` | The memory is superseded; `superseded_by` names its survivor. Check that one instead. |
+
+Mutating, like a store: static bearer only. REST: [`POST /memories/{content_hash}/confirm`](./rest-api.md#post-memoriescontent_hashconfirm).
+
+---
+
+## `memory_refute`
+
+File a correction against a wrong memory in one call. The correction is stored like `store_memory`, but never skipped as a duplicate: `dedup_threshold` does not apply. Then the wrong memory is linked or superseded:
+
+- **`supersede: false` (the default)**: a `CONTRADICTS` edge from the correction to the wrong memory. Both stay searchable, and the pair enters [`memory_contradictions`](#memory_contradictions).
+- **`supersede: true`**: the wrong memory is superseded by the correction, with `reason` as the supersession reason. That hides the whole record, so pass it only when the correction carries every claim of the wrong memory that is still true.
+
+| Param | Type | Required | Default | Notes |
+|:--|:--|:-:|:--|:--|
+| `content_hash` | string | ✓ | | The wrong memory. |
+| `content` | string | ✓ | | The correction. |
+| `reason` | string | ✓ | | Why the memory is wrong (1–2000 chars). It is the audit record. |
+| `tags` | string[] or string | | | As on `store_memory`. |
+| `memory_type` | enum | | `note` | As on `store_memory`. |
+| `summary` | string | | | As on `store_memory`. |
+| `citations` | string[] | | | As on `store_memory`. |
+| `supersede` | bool | | `false` | Supersede instead of link. |
+
+Any other argument, `metadata` included, is a `-32602` error.
+
+**Returns:** `{ success: true, status: "contradicts" | "superseded", content_hash, correction_hash, reason, stored }`, where `stored` is the correction's `store_memory` result. These refusals return `success: false` before anything is written:
+
+| `status` | Meaning |
+|:--|:--|
+| `not_found` | The wrong memory does not exist. |
+| `superseded` | The wrong memory is already superseded; `superseded_by` names the survivor. Refute that one instead. |
+| `correction_superseded` | The correction's content is stored already as a superseded memory, and a store would keep it hidden. Unsupersede it, or word the correction differently. |
+
+If the correction is stored but the second step fails, the result is `{ success: false, status: "partial", correction_hash, failed_step: "supersede" | "contradicts_edge", error, stored }`. The correction **is stored**: finish with [`memory_supersede`](#memory_supersede) or [`relation`](#relation) (`create`, `CONTRADICTS`), not by refuting again. The refusals are checked before the store but not atomically with the second step, so a supersede that lands in between is overwritten, as with `memory_supersede`.
+
+Mutating: static bearer only. REST: [`POST /memories/{content_hash}/refute`](./rest-api.md#post-memoriescontent_hashrefute).
+
+**Example:**
+
+```json
+{
+  "name": "memory_refute",
+  "arguments": {
+    "content_hash": "a3f4...e891",
+    "content": "alaya-server listens on 3001, not 3000.",
+    "citations": ["27b-io/alaya@4d63bad:README.md:40"],
+    "reason": "The port changed when the bridge moved to 3000."
   }
 }
 ```

@@ -50,6 +50,15 @@ pub enum ReversalOutcome {
     SupersededByOther(serde_json::Value),
 }
 
+/// What `VectorStorage::confirm_memory` found on the memory.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfirmOutcome {
+    /// `metadata.last_confirmed_at` now holds the given time.
+    Confirmed,
+    /// The memory is superseded (its marker, as stored): nothing written.
+    Superseded(serde_json::Value),
+}
+
 /// Vector storage backend (Qdrant REST API).
 ///
 /// `?Send` bound because WASM is single-threaded.
@@ -140,6 +149,20 @@ pub trait VectorStorage {
         expected: &serde_json::Value,
         reversal: &ReversalRecord,
     ) -> Result<ReversalOutcome>;
+
+    /// Record that a caller re-checked a memory: set `metadata.last_confirmed_at`
+    /// to `at`, and nothing else, in one payload-only conditional write. The
+    /// supersession check is made on the copy the write is conditional on, so
+    /// a supersede that lands first is always seen. `AlayaError::NotFound`
+    /// when the memory does not exist. Like the marker, the key is
+    /// server-maintained: `store` carries it over and no caller field writes
+    /// it. Default: unsupported.
+    async fn confirm_memory(&self, content_hash: &str, at: f64) -> Result<ConfirmOutcome> {
+        let _ = (content_hash, at);
+        Err(AlayaError::Storage(
+            "confirm is not supported by this backend".into(),
+        ))
+    }
 
     /// Patch mutable fields on an existing memory.
     ///

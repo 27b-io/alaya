@@ -17,7 +17,9 @@ mod common;
 
 use std::collections::HashMap;
 
-use alaya_backends::{ReversalOutcome, ReversalRecord, VectorStorage, qdrant::QdrantClient};
+use alaya_backends::{
+    ConfirmOutcome, ReversalOutcome, ReversalRecord, VectorStorage, qdrant::QdrantClient,
+};
 use alaya_types::{
     AlayaError,
     memory::{Memory, MetadataUpdate},
@@ -738,5 +740,116 @@ async fn malformed_log_reads_back_and_never_hides_the_memory() {
             json!({"superseded_by": hash('b'), "reason": "first"}),
             json!(7),
         ])
+    );
+}
+
+// ─── confirm_memory (LAB-7721) ──────────────────────────────────────────────
+
+/// A confirm is one conditional merge of the `metadata` object alone: the
+/// timestamp lands beside the caller's keys, and no ranking input — the
+/// vector, `created_at`, `updated_at`, access history, provenance — is sent.
+#[tokio::test]
+async fn confirm_merges_only_the_timestamp_into_metadata_conditionally() {
+    let (server, fake) = fake_with(&[('a', Some("r1"))]).await;
+    let before = fake.point(&id('a')).unwrap();
+
+    let outcome = client_for(&server)
+        .confirm_memory(&hash('a'), 1234.5)
+        .await
+        .expect("confirm succeeds");
+    assert_eq!(outcome, ConfirmOutcome::Confirmed);
+
+    let w = writes(&server).await;
+    assert_eq!(w.len(), 1, "{w:?}");
+    let (line, body) = &w[0];
+    assert_eq!(
+        line,
+        &format!("POST {PAYLOAD_PATH}?wait=true"),
+        "a payload merge"
+    );
+    assert!(is_conditional(line, body), "{line} {body}");
+    let mut keys: Vec<&String> = body["payload"].as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(keys, ["metadata", "rev", "rev_log"], "{body}");
+    assert_eq!(
+        body["payload"]["metadata"],
+        json!({"source": "import", "provenance": {"trust": 0.9}, "last_confirmed_at": 1234.5}),
+    );
+
+    let stored = fake.point(&id('a')).unwrap();
+    for key in [
+        "content",
+        "created_at",
+        "updated_at",
+        "access_count",
+        "tags",
+    ] {
+        assert_eq!(stored[key], before[key], "{key} unchanged");
+    }
+    assert_eq!(stored["metadata"]["last_confirmed_at"], json!(1234.5));
+}
+
+#[tokio::test]
+async fn confirm_of_a_memory_with_no_metadata_creates_the_object() {
+    let (server, fake) = fake_with(&[]).await;
+    let mut bare = memory_payload('a', None);
+    bare.as_object_mut().unwrap().remove("metadata");
+    fake.insert(&id('a'), bare);
+
+    client_for(&server)
+        .confirm_memory(&hash('a'), 7.0)
+        .await
+        .expect("confirm succeeds");
+    assert_eq!(
+        fake.point(&id('a')).unwrap()["metadata"],
+        json!({"last_confirmed_at": 7.0})
+    );
+}
+
+#[tokio::test]
+async fn confirm_of_a_superseded_memory_writes_nothing_and_names_the_marker() {
+    let (server, fake) = fake_with(&[]).await;
+    let superseded = superseded_payload('a', 'b', Some("r1"));
+    fake.insert(&id('a'), superseded.clone());
+
+    let outcome = client_for(&server)
+        .confirm_memory(&hash('a'), 7.0)
+        .await
+        .expect("superseded is an outcome, not an error");
+    assert_eq!(outcome, ConfirmOutcome::Superseded(json!(hash('b'))));
+    assert!(writes(&server).await.is_empty());
+    assert_eq!(fake.point(&id('a')).unwrap(), superseded);
+}
+
+#[tokio::test]
+async fn confirm_of_an_absent_memory_is_not_found() {
+    let (server, _fake) = fake_with(&[]).await;
+    let result = client_for(&server).confirm_memory(&hash('a'), 7.0).await;
+    assert!(matches!(result, Err(AlayaError::NotFound(_))), "{result:?}");
+    assert!(writes(&server).await.is_empty());
+}
+
+/// A supersede from another process lands inside the read→write window: the
+/// confirm built from the stale copy is rejected, and the re-read sees the
+/// marker, so a superseded memory is never confirmed.
+#[tokio::test]
+async fn confirm_racing_a_supersede_sees_the_marker() {
+    let (server, fake) = fake_with(&[('a', Some("r1"))]).await;
+    let a = id('a');
+    fake.before_writes(1, move |points| {
+        let mut metadata = points[&a]["metadata"].clone();
+        metadata["superseded_by"] = json!("b".repeat(64));
+        external_write(points, &a, json!({ "metadata": metadata }));
+    });
+
+    let outcome = client_for(&server)
+        .confirm_memory(&hash('a'), 7.0)
+        .await
+        .expect("an outcome");
+    assert_eq!(outcome, ConfirmOutcome::Superseded(json!(hash('b'))));
+    let stored = fake.point(&id('a')).unwrap();
+    assert!(
+        stored["metadata"].get("last_confirmed_at").is_none(),
+        "{stored}"
     );
 }

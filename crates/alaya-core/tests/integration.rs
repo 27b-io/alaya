@@ -77,6 +77,7 @@ async fn store_and_retrieve() {
             client_hostname: Some("test-runner".into()),
             summary: Some("Test memory".into()),
             dedup_threshold: None,
+            citations: None,
         })
         .await
         .expect("store_memory should succeed");
@@ -130,6 +131,7 @@ async fn search_hybrid() {
                 client_hostname: None,
                 summary: None,
                 dedup_threshold: None,
+                citations: None,
             })
             .await
             .expect("store should succeed");
@@ -193,6 +195,7 @@ async fn dedup_threshold_skips_duplicate() {
             client_hostname: None,
             summary: None,
             dedup_threshold: None,
+            citations: None,
         })
         .await
         .expect("first store should succeed");
@@ -209,6 +212,7 @@ async fn dedup_threshold_skips_duplicate() {
             client_hostname: None,
             summary: None,
             dedup_threshold: Some(0.7), // Low threshold to catch near-duplicates
+            citations: None,
         })
         .await
         .expect("second store should succeed");
@@ -246,6 +250,7 @@ async fn search_by_tag() {
             client_hostname: None,
             summary: None,
             dedup_threshold: None,
+            citations: None,
         })
         .await
         .expect("store should succeed");

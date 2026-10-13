@@ -100,13 +100,15 @@ Connect any MCP client to `http://localhost:3001/mcp` (Streamable HTTP with SSE)
 
 | Tool | Description |
 |:-----|:------------|
-| `store_memory` | Store content with tags, metadata, and optional auto-summary |
+| `store_memory` | Store content with tags, metadata, citations, and optional auto-summary |
 | `search` | Hybrid semantic + tag-boosted retrieval (5 modes: hybrid, scan, similar, tag, recent) |
 | `get_memory` | Fetch a single memory by content hash |
 | `delete_memory` | Delete by content hash |
 | `relation` | Create / get / delete typed edges (RELATES_TO, PRECEDES, CONTRADICTS) |
 | `memory_supersede` | Mark one memory as superseded by another |
 | `memory_unsupersede` | Reverse a supersession, with an audit entry |
+| `memory_confirm` | Record that a memory was re-checked and still holds (no ranking effect) |
+| `memory_refute` | Store a correction and link it CONTRADICTS to the wrong memory, or supersede it when the correction carries every still-true claim |
 | `memory_contradictions` | List unresolved contradiction pairs with judge verdicts |
 | `resolve_contradiction` | Keep both memories of a contradiction pair — non-destructive, reversible |
 | `find_duplicates` | Cosine similarity scan for near-duplicate memories |
@@ -124,6 +126,8 @@ All endpoints accept/return JSON. Auth via `Authorization: Bearer` with either s
 | POST | `/delete` | Delete a memory |
 | POST | `/relation` | Manage graph edges |
 | POST | `/supersede` | Supersede a memory |
+| POST | `/memories/{hash}/confirm` | Record that a memory was re-checked (no ranking effect) |
+| POST | `/memories/{hash}/refute` | File a correction against a wrong memory |
 | POST | `/contradictions` | List contradictions |
 | POST | `/contradictions/resolution` | Keep both memories of a contradiction pair (or undo it) |
 | POST | `/duplicates/find` | Find duplicates |

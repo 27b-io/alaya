@@ -21,7 +21,7 @@ use alaya_types::{
     search::PayloadFilter,
 };
 
-use crate::{ReversalOutcome, ReversalRecord, StoreMode, VectorStorage};
+use crate::{ConfirmOutcome, ReversalOutcome, ReversalRecord, StoreMode, VectorStorage};
 
 // ─── Keyword vector (LAB-7716) ──────────────────────────────────────────────
 //
@@ -1072,6 +1072,10 @@ const SUPERSESSION_LOG: &str = "supersession_log";
 /// metadata update, removed by `reverse_supersession`. Server-maintained.
 const SUPERSESSION_REASON: &str = "supersession_reason";
 
+/// The `metadata` key `confirm_memory` writes: when a caller last re-checked
+/// the memory. Server-maintained, like the supersession marker beside it.
+const LAST_CONFIRMED_AT: &str = "last_confirmed_at";
+
 /// The entries of a stored `supersession_log`, in stored order. An audit
 /// trail is never dropped, even one in a shape no writer makes: a value that
 /// is not an array is one entry.
@@ -1129,11 +1133,15 @@ fn carry_over(payload: &mut Value, prev: &Value) {
     // the stored one, present or absent: a re-store neither resurrects a
     // superseded memory (alaya-core's is_superseded reads exactly this key)
     // nor re-hides a reversed one from a caller's stale copy of its metadata.
-    match prev.pointer("/metadata/superseded_by") {
-        Some(sb) => payload["metadata"]["superseded_by"] = sb.clone(),
-        None => {
-            if let Some(md) = payload.get_mut("metadata").and_then(Value::as_object_mut) {
-                md.remove("superseded_by");
+    // `last_confirmed_at` is written only by confirm_memory, so a re-store
+    // keeps the stored one the same way.
+    for key in ["superseded_by", LAST_CONFIRMED_AT] {
+        match prev.get("metadata").and_then(|md| md.get(key)) {
+            Some(v) => payload["metadata"][key] = v.clone(),
+            None => {
+                if let Some(md) = payload.get_mut("metadata").and_then(Value::as_object_mut) {
+                    md.remove(key);
+                }
             }
         }
     }
@@ -1532,6 +1540,54 @@ impl VectorStorage for QdrantClient {
             }),
             Some(Update::Unconfirmed(why)) => Err(AlayaError::Storage(format!(
                 "unsupersede of {content_hash}: {why}"
+            ))),
+            Some(Update::Absent | Update::Deleted) | None => Err(not_found()),
+        }
+    }
+
+    #[tracing::instrument(skip(self), fields(hash = %content_hash))]
+    async fn confirm_memory(&self, content_hash: &str, at: f64) -> Result<ConfirmOutcome> {
+        let point_id = hash_to_uuid(content_hash)?;
+        let not_found = || AlayaError::NotFound(format!("memory {content_hash} not found"));
+
+        let _write = self.write_lock.lock().await;
+
+        // A merge of the whole `metadata` object, rebuilt from the copy the
+        // write is conditional on: no other key, and never the vector, is
+        // sent, so no ranking input moves. `marker` keeps what the latest
+        // read held, as in reverse_supersession.
+        let marker: RefCell<Option<Value>> = RefCell::new(None);
+        let mut outcome = self
+            .update_points(
+                std::slice::from_ref(&point_id),
+                Some(&["metadata"]),
+                Commit::Payload(PayloadWrite::Merge, Batch::Strict),
+                |prev| {
+                    let mut metadata = match prev.get("metadata") {
+                        None | Some(Value::Null) => serde_json::Map::new(),
+                        Some(Value::Object(m)) => m.clone(),
+                        Some(_) => {
+                            return Err(AlayaError::Storage(
+                                "stored metadata is not an object; refusing to replace it".into(),
+                            ));
+                        }
+                    };
+                    *marker.borrow_mut() = metadata.get("superseded_by").cloned();
+                    if metadata.contains_key("superseded_by") {
+                        return Ok(None);
+                    }
+                    metadata.insert(LAST_CONFIRMED_AT.into(), json!(at));
+                    Ok(Some(json!({ "metadata": metadata })))
+                },
+            )
+            .await?;
+        match outcome.remove(&point_id) {
+            Some(Update::Landed { .. }) => Ok(ConfirmOutcome::Confirmed),
+            Some(Update::Skipped) => Ok(ConfirmOutcome::Superseded(
+                marker.take().unwrap_or(Value::Null),
+            )),
+            Some(Update::Unconfirmed(why)) => Err(AlayaError::Storage(format!(
+                "confirm of {content_hash}: {why}"
             ))),
             Some(Update::Absent | Update::Deleted) | None => Err(not_found()),
         }
