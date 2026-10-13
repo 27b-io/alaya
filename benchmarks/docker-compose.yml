@@ -16,7 +16,8 @@ services:
     ports: ["127.0.0.1:16333:6333"]  # loopback-only (alaya runs auth-disabled); off default 6333 so the harness's data-safety guard can fail closed
     tmpfs: ["/tmp/qdrant_bench"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:6333/healthz || exit 1"]
+      # The qdrant image ships no curl; probe /healthz over bash's /dev/tcp.
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333 && printf \"GET /healthz HTTP/1.0\\r\\n\\r\\n\" >&3 && grep -q \"200 OK\" <&3'"]
       interval: 5s
       timeout: 3s
       retries: 5

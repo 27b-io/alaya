@@ -1,0 +1,12 @@
+{
+  "read": {
+    "model": "claude-sonnet-5-5",
+    "calls": 500,
+    "cli": "2.1.285 (Claude Code)"
+  },
+  "judge": {
+    "model": "claude-opus-5-5",
+    "calls": 500,
+    "cli": "2.1.285 (Claude Code)"
+  }
+}

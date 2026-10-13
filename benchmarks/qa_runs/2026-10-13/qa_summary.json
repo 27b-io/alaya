@@ -1,0 +1,118 @@
+{
+  "dataset": "LongMemEval-S (longmemeval_s_cleaned.json)",
+  "reader": "claude-sonnet-5-5",
+  "judge": "claude-opus-5-5",
+  "k_sessions": 10,
+  "reader_prompt": "LongMemEval flat-session, JSON history, chain-of-thought; full sessions sorted by date",
+  "judge_prompt": "LongMemEval evaluate_qa.get_anscheck_prompt (per question type + abstention)",
+  "retrieval_file": "retrieval_500q.jsonl",
+  "retrieval_note": "hybrid, rerank on (BAAI/bge-reranker-v2-m3, top_n=20), keyword leg tags",
+  "claude_calls": {
+    "read": {
+      "model": "claude-sonnet-5-5",
+      "calls": 500,
+      "cli": "2.1.285 (Claude Code)"
+    },
+    "judge": {
+      "model": "claude-opus-5-5",
+      "calls": 500,
+      "cli": "2.1.285 (Claude Code)"
+    }
+  },
+  "qa": {
+    "overall": {
+      "n": 500,
+      "correct": 465,
+      "accuracy": 0.93,
+      "ci95": [
+        0.9042,
+        0.9492
+      ]
+    },
+    "per_type": {
+      "knowledge-update": {
+        "n": 72,
+        "correct": 69,
+        "accuracy": 0.9583,
+        "ci95": [
+          0.8845,
+          0.9857
+        ]
+      },
+      "multi-session": {
+        "n": 121,
+        "correct": 105,
+        "accuracy": 0.8678,
+        "ci95": [
+          0.796,
+          0.9169
+        ]
+      },
+      "single-session-assistant": {
+        "n": 56,
+        "correct": 56,
+        "accuracy": 1.0,
+        "ci95": [
+          0.9358,
+          1.0
+        ]
+      },
+      "single-session-preference": {
+        "n": 30,
+        "correct": 30,
+        "accuracy": 1.0,
+        "ci95": [
+          0.8865,
+          1.0
+        ]
+      },
+      "single-session-user": {
+        "n": 64,
+        "correct": 62,
+        "accuracy": 0.9688,
+        "ci95": [
+          0.893,
+          0.9914
+        ]
+      },
+      "temporal-reasoning": {
+        "n": 127,
+        "correct": 116,
+        "accuracy": 0.9134,
+        "ci95": [
+          0.8515,
+          0.9509
+        ]
+      }
+    },
+    "abstention": {
+      "n": 30,
+      "correct": 27,
+      "accuracy": 0.9,
+      "ci95": [
+        0.7438,
+        0.9654
+      ]
+    }
+  },
+  "retrieval_excluding_abstention": {
+    "hit_rate@5": {
+      "n": 470,
+      "correct": 464,
+      "accuracy": 0.9872,
+      "ci95": [
+        0.9724,
+        0.9941
+      ]
+    },
+    "recall_all@5": {
+      "n": 470,
+      "correct": 428,
+      "accuracy": 0.9106,
+      "ci95": [
+        0.8814,
+        0.9332
+      ]
+    }
+  }
+}

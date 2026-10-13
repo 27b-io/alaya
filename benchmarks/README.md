@@ -230,6 +230,35 @@ uv run longmemeval_bench.py --stratified 500 \
 docker compose down -v
 ```
 
+### 4. QA accuracy (reader + judge)
+
+[`longmemeval_qa.py`](longmemeval_qa.py) reads a retrieval file from step 3 and
+needs no stack. [`factconsolidation_bench.py`](factconsolidation_bench.py) stores
+its own facts, so run it while the stack is still up. Both call the Claude Code
+CLI (`claude -p`), which must be installed and logged in.
+
+```bash
+# LongMemEval-S: reader, judge and report from saved retrieval results.
+uv run longmemeval_qa.py all \
+  --retrieval results_rerank_on_full_500q.jsonl \
+  --retrieval-note "hybrid, rerank on (BAAI/bge-reranker-v2-m3, top_n=20), keyword leg tags" \
+  --run-dir qa_runs/my-run
+
+# MemoryAgentBench FactConsolidation (6k): store, retrieve, read, judge, report.
+uv run factconsolidation_bench.py all \
+  --retrieval-note "hybrid, rerank on (BAAI/bge-reranker-v2-m3, top_n=20), keyword leg tags" \
+  --run-dir qa_runs/my-run/factconsolidation
+```
+
+Every stage appends one row per question and skips rows already written, so a
+rerun of the same command resumes after a failure. To recompute the published
+scores from the committed labels without calling a model:
+
+```bash
+uv run longmemeval_qa.py report --retrieval qa_runs/2026-10-13/retrieval_500q.jsonl --run-dir qa_runs/2026-10-13
+uv run factconsolidation_bench.py report --run-dir qa_runs/2026-10-13/factconsolidation
+```
+
 ---
 
 ## Config
@@ -277,6 +306,92 @@ confidence interval: `95% CI [0.971, 0.993]; paired McNemar p≈5.5e-10 (36 ques
 > rows above or quoted as the headline. For the record, in that offline sweep the
 > cross-encoder at `top_n=20` pushed hit-rate@5 to the high-0.9s — read it as
 > evidence the algorithm works, not as a live-server result.
+
+---
+
+## QA accuracy
+
+Hit-rate says whether the right session was retrieved. Memory systems are more
+often compared on whether the question was then answered correctly, so we also
+report end-to-end QA accuracy: Ālaya retrieves, a reader model answers from what
+it retrieved, and a judge model scores the answer.
+
+| LongMemEval-S | n | Correct | Accuracy | 95% CI |
+|:--|--:|--:|--:|:--|
+| **Overall** | 500 | 465 | **0.930** | [0.904, 0.949] |
+| knowledge-update | 72 | 69 | 0.958 | [0.885, 0.986] |
+| multi-session | 121 | 105 | 0.868 | [0.796, 0.917] |
+| single-session-assistant | 56 | 56 | 1.000 | [0.936, 1.000] |
+| single-session-preference | 30 | 30 | 1.000 | [0.887, 1.000] |
+| single-session-user | 64 | 62 | 0.969 | [0.893, 0.991] |
+| temporal-reasoning | 127 | 116 | 0.913 | [0.852, 0.951] |
+| abstention | 30 | 27 | 0.900 | [0.744, 0.965] |
+
+> [!WARNING]
+> **The judge is a Claude model, not the paper's GPT-4o**, so this table is not a
+> like-for-like copy of numbers judged by GPT-4o. The judge prompts are
+> LongMemEval's own, unchanged.
+
+The per-type rows leave out the 30 abstention questions (ids ending `_abs`),
+which have their own row; the overall row covers all 500. Intervals are Wilson
+95% intervals.
+
+The same run's retrieval, on the 470 questions that are not abstention questions
+(LongMemEval's retrieval evaluation skips those):
+
+| Retrieval, same run | n | Correct | Rate | 95% CI |
+|:--|--:|--:|--:|:--|
+| hit-rate@5 (any ground-truth session in the top 5) | 470 | 464 | 0.987 | [0.972, 0.994] |
+| recall_all@5 (every ground-truth session in the top 5) | 470 | 428 | 0.911 | [0.881, 0.933] |
+
+On all 500 questions the run's hit-rate@5 is 0.986, the same as the published
+headline above.
+
+**How it was run.**
+
+- **Retrieval:** hybrid search, cross-encoder rerank on (`BAAI/bge-reranker-v2-m3`,
+  `RERANK_TOP_N=20`), keyword leg `tags` (the default), embedder
+  `Snowflake/snowflake-arctic-embed-l-v2.0`. Server built from commit `4d63bad`.
+  Run on `2026-10-13`. Rerank verified as for the table above: the reranker's
+  `te_predict_count` rose through the run and the server logged no rerank failure.
+- **Reader:** `claude-sonnet-5-5`, given the top **k = 10** retrieved sessions.
+  Retrieval indexes user turns only, but the reader gets each retrieved session
+  whole (both roles), sorted by date, in LongMemEval's own reading prompt
+  (flat-session, JSON history, chain-of-thought).
+- **Judge:** `claude-opus-5-5`, with LongMemEval's per-question-type judge prompts
+  (`get_anscheck_prompt` in its `evaluate_qa.py`) and its rule that an answer is
+  correct when the judge's reply contains "yes".
+- **Calls:** both models run through `claude -p` with no tools and an empty system
+  prompt (Claude Code `2.1.285`): 500 reader calls and 500 judge calls, recorded
+  in `calls.json`. The CLI exposes no temperature setting, so a rerun can differ
+  by a few questions.
+
+### FactConsolidation
+
+FactConsolidation is the conflict-resolution task of
+[MemoryAgentBench](https://arxiv.org/abs/2507.05257): a numbered list of facts in
+which later facts overwrite earlier ones, and questions that must be answered from
+the newest fact. Single-hop questions ask one fact; multi-hop questions chain
+several. We ran the shortest length, 6k (455 facts, 100 questions per sub-task),
+with the same reader and judge.
+
+| FactConsolidation 6k | n | Substring exact match | 95% CI | Judge accuracy | 95% CI |
+|:--|--:|--:|:--|--:|:--|
+| single-hop | 100 | 0.99 | [0.946, 0.998] | 0.99 | [0.946, 0.998] |
+| multi-hop | 100 | 0.27 | [0.193, 0.364] | 0.25 | [0.176, 0.343] |
+
+Substring exact match is the benchmark's own metric. Each numbered fact is stored as
+its own Ālaya memory, and each question retrieves the top 10 by hybrid search. The
+reader gets them with MemoryAgentBench's own query prompt for this task. That
+benchmark's RAG agents store about 4,096-token chunks, so at 6k they get the whole
+context back for every question. These rows are therefore not comparable with the
+paper's RAG rows. Multi-hop is low because the question names only the first entity
+in the chain: a single search cannot find the facts about the entities after it.
+
+The hypotheses, judge labels and call counts for both tables are in
+[`qa_runs/2026-10-13/`](qa_runs/2026-10-13/), beside the retrieval results they were
+read from, so the scores can be recomputed (see
+[step 4](#4-qa-accuracy-reader--judge)).
 
 ---
 

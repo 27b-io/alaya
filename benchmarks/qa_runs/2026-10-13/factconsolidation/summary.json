@@ -1,0 +1,60 @@
+{
+  "dataset": "MemoryAgentBench Conflict_Resolution factconsolidation_{sh,mh}_6k @ 7ea066982b140a19337e17e60d45d4076e042faf",
+  "ingest": "one Alaya memory per numbered fact, hybrid search",
+  "k": 10,
+  "reader": "claude-sonnet-5-5",
+  "judge": "claude-opus-5-5",
+  "retrieval_note": "hybrid, rerank on (BAAI/bge-reranker-v2-m3, top_n=20), keyword leg tags",
+  "claude_calls": {
+    "read": {
+      "model": "claude-sonnet-5-5",
+      "calls": 200,
+      "cli": "2.1.285 (Claude Code)"
+    },
+    "judge": {
+      "model": "claude-opus-5-5",
+      "calls": 200,
+      "cli": "2.1.285 (Claude Code)"
+    }
+  },
+  "substring_exact_match": {
+    "multi-hop": {
+      "n": 100,
+      "correct": 27,
+      "accuracy": 0.27,
+      "ci95": [
+        0.1927,
+        0.3643
+      ]
+    },
+    "single-hop": {
+      "n": 100,
+      "correct": 99,
+      "accuracy": 0.99,
+      "ci95": [
+        0.9455,
+        0.9982
+      ]
+    }
+  },
+  "judge_accuracy": {
+    "multi-hop": {
+      "n": 100,
+      "correct": 25,
+      "accuracy": 0.25,
+      "ci95": [
+        0.1755,
+        0.343
+      ]
+    },
+    "single-hop": {
+      "n": 100,
+      "correct": 99,
+      "accuracy": 0.99,
+      "ci95": [
+        0.9455,
+        0.9982
+      ]
+    }
+  }
+}
