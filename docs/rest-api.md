@@ -267,7 +267,7 @@ curl -X POST http://localhost:3001/search \
 
 Some state cannot be rewound and is read as it is now: graph state (Hebbian weights, and which neighbours spreading activation injects, though each injected neighbour still passes the `as_of` bound and the supersession rule); access counts and access timestamps (the salience and spacing boosts); BM25 term statistics, computed over today's collection; the tag vocabulary that keyword extraction and the semantic tag pool read; tags, type, summary and trust patched since T; hard deletes; supersessions reversed by `/unsupersede`, which leave no marker, so the memory passes the supersession check at every T (the `created_at` bound still applies); and a marker re-pointed to a second survivor, which names only the last one. The corpus size behind hybrid's fusion weight is today's too.
 
-**Response:** an object whose `results` holds the memories sorted by relevance. Every mode adds `mode`, and a search sent with `as_of` adds `"as_of": T`. `hybrid` also pages (`page`, `page_size`, `total`, `total_pages`, `has_more`); `similar` returns `results` and `total`. A hybrid replay:
+**Response:** an object whose `results` holds the matching memories. `hybrid` and `similar` sort them by relevance, `recent` returns the newest first, and `scan` and `tag` return them in store order. Every mode adds `mode`, and a search sent with `as_of` adds `"as_of": T`. The other keys vary by mode: `hybrid` pages with `page`, `page_size`, `total`, `total_pages` and `has_more`; `scan` and `tag` page with `page`, `page_size`, `count` and `has_more`; `recent` returns `page_size` and `has_more`, plus, when the page is not empty, `next_cursor` to pass as `cursor` for the next page; `similar` returns only `total`. A hybrid replay:
 
 ```json
 {

@@ -7417,7 +7417,8 @@ mod tests {
         };
         let seed = make_scored_memory(&"a".repeat(64), "seed", 0.9);
 
-        // On the pools: a marked candidate's lookup fails, and so does the search.
+        // On the pools: a marked candidate's lookup fails, and so does the
+        // search, in both modes that take as_of.
         let pool_svc = injection_svc(
             MockVectorsWithInjection {
                 search_results: vec![
@@ -7432,10 +7433,17 @@ mod tests {
             },
             MockGraphWithActivation::default(),
         );
-        let failed = pool_svc
-            .search_with(search_params("stability notes"), true, Some(AS_OF))
-            .await;
-        assert!(matches!(failed, Err(AlayaError::Storage(_))), "{failed:?}");
+        for mode in [SearchMode::Hybrid, SearchMode::Similar] {
+            let params = SearchParams {
+                mode,
+                ..search_params("stability notes")
+            };
+            let failed = pool_svc.search_with(params, true, Some(AS_OF)).await;
+            assert!(
+                matches!(failed, Err(AlayaError::Storage(_))),
+                "{mode:?}: {failed:?}"
+            );
+        }
 
         // On the neighbours: the search answers from its pools alone.
         let neighbour = marked('c');
