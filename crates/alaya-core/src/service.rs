@@ -2764,9 +2764,10 @@ impl MemoryService {
     /// written, as in the first phase. A supersede of the correction that
     /// lands later forms an ordinary chain (wrong -> correction -> its
     /// survivor), the state the same calls made one after another produce.
-    /// The link re-reads the wrong memory after the edge lands, since the
-    /// graph write cannot be conditional on it; that narrows the race
-    /// rather than closing it.
+    /// The link re-reads the wrong memory before its graph writes, so a
+    /// memory deleted meanwhile gets no node back, and again after the edge
+    /// lands, since the graph write cannot be conditional on it; that
+    /// narrows the race rather than closing it.
     pub async fn refute_finish(&self, plan: &RefutePlan) -> Value {
         let end = if plan.supersede {
             self.refute_supersede(plan).await
@@ -2924,10 +2925,35 @@ impl MemoryService {
         RefuteEnd::Superseded(reason)
     }
 
-    /// The link branch: `correction -> wrong` CONTRADICTS, then a re-read of
-    /// both memories, since the graph write cannot be conditional on them.
+    /// The wrong memory's state around the link: `None` while it is live (or
+    /// could not be read: the step goes ahead), else how the call ends.
+    async fn wrong_gone(&self, plan: &RefutePlan) -> Option<RefuteEnd> {
+        match self.vectors.get_by_hash(&plan.content_hash).await {
+            Ok(Some(m)) => {
+                supersession_marker(&m).map(|marker| RefuteEnd::Conflict(marker.clone()))
+            }
+            // Deleted meanwhile: nothing left to contradict.
+            Ok(None) => Some(RefuteEnd::failed(
+                "contradicts_edge",
+                AlayaError::NotFound("the refuted memory was deleted meanwhile".into()),
+            )),
+            Err(e) => {
+                tracing::warn!(op = "refute.recheck", error = %e, "re-read of the refuted memory failed");
+                None
+            }
+        }
+    }
+
+    /// The link branch: re-reads of both memories, `correction -> wrong`
+    /// CONTRADICTS, then the wrong memory again, since the graph write cannot
+    /// be conditional on it.
     async fn refute_contradicts(&self, plan: &RefutePlan) -> RefuteEnd {
         if let Some(end) = self.correction_hidden(plan).await {
+            return end;
+        }
+        // Before any graph write: ensure_node would put back the node a
+        // delete removed, and the edge would land on it.
+        if let Some(end) = self.wrong_gone(plan).await {
             return end;
         }
         // The edge MATCHes both nodes, so a node the store's non-fatal
@@ -2970,25 +2996,9 @@ impl MemoryService {
             }
             Err(e) => return RefuteEnd::failed("contradicts_edge", e),
         }
-        match self.vectors.get_by_hash(&plan.content_hash).await {
-            Ok(Some(m)) => {
-                if let Some(marker) = supersession_marker(&m) {
-                    return RefuteEnd::Conflict(marker.clone());
-                }
-            }
-            // Deleted meanwhile: nothing left to contradict.
-            Ok(None) => {
-                return RefuteEnd::failed(
-                    "contradicts_edge",
-                    AlayaError::NotFound("the refuted memory was deleted meanwhile".into()),
-                );
-            }
-            // The edge landed; only the liveness check could not run.
-            Err(e) => {
-                tracing::warn!(op = "refute.recheck", error = %e, "re-read after the link failed");
-            }
-        }
-        RefuteEnd::Contradicts
+        self.wrong_gone(plan)
+            .await
+            .unwrap_or(RefuteEnd::Contradicts)
     }
 
     /// Both phases in one call, as the worker runs them minus its follow-ups.
@@ -13841,5 +13851,28 @@ mod tests {
             assert_eq!(ledger.marker(&a), None);
             assert!(ledger.contradicts.borrow().is_empty());
         }
+    }
+
+    /// The wrong memory is deleted between the phases. The link branch reads
+    /// it before any graph write, so its node is not put back and no edge
+    /// lands on it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refute_link_writes_no_graph_state_for_a_memory_deleted_meanwhile() {
+        let a = h('a');
+        let ledger = Ledger::with(&[&a]);
+        let svc = ledger.service();
+        let plan = plan_of(
+            svc.refute_store(&a, refutation("the port is 3001", false))
+                .await
+                .unwrap(),
+        );
+        ledger.memories.borrow_mut().retain(|m| m.content_hash != a);
+        let out = svc.refute_finish(&plan).await;
+
+        assert_eq!(out["success"], false, "{out}");
+        assert_eq!(out["status"], "partial");
+        assert_eq!(out["failed_step"], "contradicts_edge");
+        assert!(!ledger.nodes.borrow().contains(&a), "node put back");
+        assert!(ledger.contradicts.borrow().is_empty(), "edge landed");
     }
 }
