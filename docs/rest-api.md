@@ -681,7 +681,7 @@ Nodes found without a point are marked for this run, Qdrant is read again, and o
 
 Two checks stop the pass before anything is written on the page they look at. Every call first reads the first 500 nodes of the graph, whatever `after` and `limit` say, and stops when all of them, or more than 3 and more than a tenth of them, have no point. Then each page is checked the same way, with the more-than-3-and-a-tenth rule. A stopped pass returns `409` with `{"success": false, "status": "held", "error", "scanned", "swept", "skipped", "held_after", "page_valid", "page_missing"}`. That is a wrong or empty `QDRANT_COLLECTION`, not stray nodes, and a removed node takes graph-only state with it (verdicts, resolutions, refute reasons, `SUPERSEDES` edges). Pages before it were swept as usual. A graph whose every probed node is gone is never swept: if that is real, remove those nodes by hand.
 
-One pass at a time per `alaya-server` process; a second call to the same process while one runs returns `{"success": false, "error": "graph sweep already running"}`. Passes in two processes carry different marks, so each removes only what it marked itself.
+One pass at a time per `alaya-server` process; a second call to the same process while one runs returns `409` with `{"success": false, "status": "busy", "error": "graph sweep already running"}`. Passes in two processes carry different marks, so each removes only what it marked itself.
 
 ## `GET /stats`
 

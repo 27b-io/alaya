@@ -564,7 +564,7 @@ pub trait ConsolidationService {
     async fn prune_weak_edges(&self, threshold: f64, limit: usize) -> Result<usize>;
     async fn get_orphan_nodes(&self, limit: usize) -> Result<Vec<String>>;
 
-    // The orphan-node sweep (LAB-9265): list, mark, delete what is still
+    // The gone-memory node sweep (LAB-9265): list, mark, delete what is still
     // marked. Defaults: unsupported.
 
     /// One page of Memory node hashes after `after`, in hash order.

@@ -2206,6 +2206,7 @@ async fn service_worker(
             CmdInner::GraphSweep { reply, .. } if graph_sweep_running.get() => {
                 let _ = reply.send(json!({
                     "success": false,
+                    "status": "busy",
                     "error": "graph sweep already running"
                 }));
             }
@@ -3657,6 +3658,7 @@ fn outcome_status(v: &Value) -> StatusCode {
                 | "correction_deleted"
                 | "correction_unreadable"
                 | "held"
+                | "busy"
                 | "correction_exists"
                 | "conflict",
             ),
@@ -7372,6 +7374,11 @@ mod wedge_tests {
             panic!("expected CmdInner::GraphSweep");
         };
         let held = json!({"success": false, "status": "held", "error": "Too many", "swept": 0});
+        // `busy` (a pass already running) shares the 409 below.
+        assert_eq!(
+            outcome_status(&json!({"success": false, "status": "busy", "error": "x"})),
+            StatusCode::CONFLICT
+        );
         reply.send(held.clone()).unwrap();
         let resp = resp.await.unwrap().unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);

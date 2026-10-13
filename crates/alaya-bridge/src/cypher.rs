@@ -717,15 +717,16 @@ pub fn prune_weak_edges(threshold: f64, limit: u32) -> CypherQuery {
     )
 }
 
-// ─── orphan-node sweep (LAB-9265) ─────────────────────────────────────────────
+// ─── gone-memory node sweep (LAB-9265) ────────────────────────────────────────
 //
 // A Memory node whose Qdrant point is gone (a delete whose non-fatal
 // delete_node failed, or a MERGE that re-created a node after the delete)
-// is removed in three steps, so a node with a point is never removed: the
-// caller marks the nodes it found without a point, checks Qdrant again, and
-// deletes only nodes that still carry its mark. ensure_node clears the
-// mark, and a store writes its point before ensure_node, so a store racing
-// the sweep either clears the mark or is seen by the second check.
+// is removed in three steps: the caller marks the nodes it found without a
+// point, checks Qdrant again, and deletes only nodes that still carry its
+// mark; ensure_node clears the mark. So a node goes only when its point was
+// absent at both checks and nothing ensured it since the mark. A store whose
+// point lands after the second check and whose ensure_node lands after the
+// delete gets a fresh node, losing only the gone memory's edges.
 
 /// One page of Memory node hashes after `after`, in hash order. Read-only.
 pub fn list_memory_nodes(after: &str, limit: u32) -> CypherQuery {

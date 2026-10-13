@@ -592,7 +592,7 @@ const GRAPH_SWEEP_PAGE: usize = 500;
 
 /// A sweep page whose gone nodes exceed this many, and a tenth of its valid
 /// nodes, holds the sweep: that is a wrong or empty collection, not stray
-/// nodes (live: about 2 in 24k), and a DETACH DELETE takes graph-only state
+/// nodes (normally a handful), and a DETACH DELETE takes graph-only state
 /// (verdicts, resolutions, refute reasons, SUPERSEDES edges) for good.
 const GRAPH_SWEEP_HOLD_FLOOR: usize = 3;
 
@@ -14532,6 +14532,23 @@ mod tests {
         assert_eq!(ledger.nodes.borrow().len(), 10, "nothing deleted");
         assert!(ledger.sweep_marks.borrow().is_empty(), "nothing marked");
         assert_eq!(ledger.contradicts.borrow().len(), 4, "edges kept");
+    }
+
+    /// Past the floor, the hold is a tenth of the page's valid nodes: 6 of
+    /// 60 gone is swept, 7 of 60 holds with nothing written.
+    #[tokio::test(flavor = "current_thread")]
+    async fn graph_sweep_holds_past_a_tenth_of_the_page() {
+        for (gone, held) in [(6, false), (7, true)] {
+            let hashes: Vec<String> = (0..60u32).map(|i| format!("{i:064x}")).collect();
+            let refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
+            let ledger = sweep_ledger(&refs[gone..], &refs[..gone]);
+            let svc = ledger.service();
+            let out = svc.sweep_gone_memory_nodes("", 100, "run-1").await.unwrap();
+            assert_eq!(out["status"] == "held", held, "gone={gone}: {out}");
+            let swept = if held { 0 } else { gone };
+            assert_eq!(out["swept"], swept, "gone={gone}: {out}");
+            assert_eq!(ledger.nodes.borrow().len(), 60 - swept);
+        }
     }
 
     /// Against an empty or wrong collection, no `limit` or `after` gets a

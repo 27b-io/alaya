@@ -143,7 +143,7 @@ async fn delete_node_nonexistent_is_silent() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ─── orphan-node sweep (LAB-9265) ─────────────────────────────────────────────
+// ─── gone-memory node sweep (LAB-9265) ────────────────────────────────────────
 
 /// Paging in hash order; a mark that `ensure_node` clears; a delete that
 /// takes only nodes still carrying its own token, with their edges.
