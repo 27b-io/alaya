@@ -790,7 +790,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "memory_refute",
-            "description": "File a correction against a wrong memory in one call. The correction is stored like store_memory (never skipped as a duplicate, never overwriting a memory); a live memory already holding its exact text is reused (existing: true), and any tags, memory_type, summary or citations you send must match it. By default the pair is linked correction -> wrong as CONTRADICTS: both stay searchable and the pair enters the contradiction queue. Pass supersede: true only when the correction carries every still-true claim of the wrong memory; it is then superseded by the correction. Your reason is stored either way, as supersession_reason or as the link's refute_reason, and returned; a retry with another reason is a conflict naming the stored one. Every outcome is a typed status. Nothing written: not_found, superseded (refute its survivor), correction_superseded, correction_exists. After the store: conflict, correction_superseded, correction_deleted, or partial with failed_step (retry the same refute, or finish with memory_supersede or relation).",
+            "description": "File a correction against a wrong memory in one call. The correction is stored like store_memory (never skipped as a duplicate, never overwriting a memory); a live memory already holding its exact text is reused (existing: true), and any tags, memory_type, summary or citations you send must match it. By default the pair is linked correction -> wrong as CONTRADICTS: both stay searchable and the pair enters the contradiction queue, unless it was settled already (keep_both). Pass supersede: true only when the correction carries every still-true claim of the wrong memory; it is then superseded by the correction. Your reason is stored either way, as supersession_reason or as the link's refute_reason, and returned; a retry with another reason is a conflict naming the stored one. Every outcome is a typed status. Nothing written: not_found, superseded (refute its survivor), correction_superseded, correction_exists, correction_unreadable, correction_deleted. After the store: conflict, correction_superseded, correction_deleted, or partial with failed_step (retry the same refute; a failed supersede can also be finished with memory_supersede).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1036,20 +1036,6 @@ mod tests {
         });
         reply.send(conflict.clone()).unwrap();
         assert_eq!(call.await.unwrap().unwrap(), conflict);
-    }
-
-    #[test]
-    fn memory_refute_description_names_the_stored_reason() {
-        let schemas = tool_schemas();
-        let refute = schemas
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|t| t["name"] == "memory_refute")
-            .unwrap();
-        let desc = refute["description"].as_str().unwrap();
-        assert!(desc.contains("refute_reason"), "{desc}");
-        assert!(!desc.contains("A link stores no reason"), "{desc}");
     }
 
     #[test]

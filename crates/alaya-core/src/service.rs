@@ -555,6 +555,12 @@ pub const MAX_GRAPH_SWEEP_LIMIT: usize = 20_000;
 /// Nodes per page of a graph sweep: one bridge read and one Qdrant read each.
 const GRAPH_SWEEP_PAGE: usize = 500;
 
+/// A sweep page whose gone nodes exceed this many, and a tenth of its valid
+/// nodes, holds the sweep: that is a wrong or empty collection, not stray
+/// nodes (live: about 2 in 24k), and a DETACH DELETE takes graph-only state
+/// (verdicts, resolutions, refute reasons, SUPERSEDES edges) for good.
+const GRAPH_SWEEP_HOLD_FLOOR: usize = 3;
+
 /// `resolved_via` stamped on the CONTRADICTS pair of a reversed supersession
 /// (LAB-6876), so an automatic apply of the judge's verdict can tell the pair
 /// is settled and never re-applies it.
@@ -2667,16 +2673,22 @@ impl MemoryService {
     /// re-creates a node after the delete (a store's or a refute's
     /// `ensure_node`).
     ///
-    /// Never a node whose point exists: the nodes found without one are
-    /// marked with `token`, Qdrant is read again, and only nodes still
-    /// marked are deleted. `ensure_node` clears the mark and every store
-    /// writes its point before `ensure_node`, so a store racing the sweep
-    /// either clears the mark or is seen by the second read. `token` must
-    /// be unique per run. A node whose hash is malformed is never touched
-    /// (`skipped`). Returns `{scanned, swept, skipped, next_after}`; pass
-    /// `next_after` back until it is `null`.
+    /// The nodes found without a point are marked with `token`, Qdrant is
+    /// read again, and only nodes still marked are deleted; `ensure_node`
+    /// clears the mark. So a node is removed only when its point was absent
+    /// at both reads and nothing ensured it since the mark. A store whose
+    /// point lands after the second read and whose `ensure_node` lands after
+    /// the delete gets a fresh node: it loses only edges of the memory that
+    /// was gone. `token` must be unique per run. A node whose hash is
+    /// malformed is never touched (`skipped`).
+    ///
+    /// A page with more gone nodes than `GRAPH_SWEEP_HOLD_FLOOR` and a tenth
+    /// of its valid nodes stops the pass before anything on it is written:
+    /// `status: held`, `success: false`, with that page's counts. Otherwise
+    /// returns `{scanned, swept, skipped, next_after}`; pass `next_after`
+    /// back until it is `null`.
     #[tracing::instrument(skip_all, fields(limit))]
-    pub async fn sweep_graph_orphans(
+    pub async fn sweep_gone_memory_nodes(
         &self,
         after: &str,
         limit: usize,
@@ -2700,18 +2712,40 @@ impl MemoryService {
                 done = true;
                 break;
             };
-            after = last.clone();
-            scanned += page.len();
             let (valid, bad): (Vec<&str>, Vec<&str>) = page
                 .iter()
                 .map(String::as_str)
                 .partition(|h| alaya_types::memory::validate_content_hash(h));
-            skipped += bad.len();
             let present = self.vectors.existing_hashes(&valid).await?;
+            let valid_count = valid.len();
             let missing: Vec<&str> = valid
                 .into_iter()
                 .filter(|h| !present.contains(*h))
                 .collect();
+            if missing.len() > GRAPH_SWEEP_HOLD_FLOOR.max(valid_count / 10) {
+                tracing::warn!(
+                    missing = missing.len(),
+                    valid = valid_count,
+                    swept,
+                    "graph sweep held: too many nodes without a point"
+                );
+                return Ok(serde_json::json!({
+                    "success": false,
+                    "status": "held",
+                    "error": "Too many graph nodes on one page have no Qdrant point; \
+                              check QDRANT_COLLECTION before sweeping. Nothing on this page \
+                              was written",
+                    "scanned": scanned,
+                    "swept": swept,
+                    "skipped": skipped,
+                    "held_after": after,
+                    "page_valid": valid_count,
+                    "page_missing": missing.len(),
+                }));
+            }
+            after = last.clone();
+            scanned += page.len();
+            skipped += bad.len();
             if !missing.is_empty() {
                 self.consolidation
                     .mark_memory_nodes(&missing, token)
@@ -2862,16 +2896,12 @@ impl MemoryService {
             {
                 Some(stored) => Some(stored),
                 None => {
-                    let m = self
-                        .vectors
-                        .get_by_hash(&correction_hash)
-                        .await?
-                        .ok_or_else(|| {
-                            AlayaError::Conflict(
-                                "the correction's text was stored and deleted meanwhile; retry"
-                                    .into(),
-                            )
-                        })?;
+                    let Some(m) = self.vectors.get_by_hash(&correction_hash).await? else {
+                        return Ok(RefuteStage::Refused(
+                            self.correction_unreadable(content_hash, &correction_hash)
+                                .await?,
+                        ));
+                    };
                     if let Some(refused) = refutation.refusal(&m, content_hash) {
                         return Ok(RefuteStage::Refused(refused));
                     }
@@ -2894,6 +2924,43 @@ impl MemoryService {
             correction_created_at: existing.as_ref().map_or(now, |m| m.created_at),
             summary_missing,
             stored,
+        }))
+    }
+
+    /// Why an insert-only store of the correction created nothing, yet no
+    /// memory reads back: a point under its hash whose payload does not
+    /// parse (`correction_unreadable`, which every retry would hit too), or
+    /// one deleted between the insert and the read (`correction_deleted`).
+    /// Nothing written either way.
+    async fn correction_unreadable(
+        &self,
+        content_hash: &str,
+        correction_hash: &str,
+    ) -> Result<Value> {
+        let unreadable = !self
+            .vectors
+            .existing_hashes(&[correction_hash])
+            .await?
+            .is_empty();
+        let (status, error) = if unreadable {
+            (
+                "correction_unreadable",
+                "A point holds the correction's content but its payload does not parse; \
+                 repair or delete that point, or word the correction differently",
+            )
+        } else {
+            (
+                "correction_deleted",
+                "The correction's content was stored by another caller and deleted \
+                 meanwhile; nothing was written. Retry the refute",
+            )
+        };
+        Ok(serde_json::json!({
+            "success": false,
+            "status": status,
+            "content_hash": content_hash,
+            "correction_hash": correction_hash,
+            "error": error,
         }))
     }
 
@@ -2999,17 +3066,19 @@ impl MemoryService {
                     "refute: correction stored, second step {what}"
                 );
                 result["failed_step"] = serde_json::json!(step);
+                // Only a refute's own link carries its reason: `relation
+                // create` would leave an edge without the audit record.
+                let finish = if step == "supersede" {
+                    ", or finish it with memory_supersede"
+                } else {
+                    ", which stores the reason on the link"
+                };
                 (
                     "partial",
                     Some(format!(
                         "Correction stored as {correction_hash}, but the {step} step {what} ({}). \
-                         Retry the same refute, or finish it with {}.",
+                         Retry the same refute{finish}.",
                         error.safe_message(),
-                        if step == "supersede" {
-                            "memory_supersede"
-                        } else {
-                            "relation create CONTRADICTS"
-                        }
                     )),
                 )
             }
@@ -11734,6 +11803,12 @@ mod tests {
         /// Another caller's store of this memory lands just before the next
         /// store's write (LAB-9265).
         store_lands_first: RefCell<Option<Memory>>,
+        /// Points whose payload does not parse: they exist for an insert
+        /// and `existing_hashes`, and read back as nothing (LAB-9265).
+        unreadable_points: RefCell<std::collections::HashSet<String>>,
+        /// The next store finds a point with this hash, which is deleted
+        /// before anything reads it back.
+        point_deleted_after_insert: RefCell<Option<String>>,
         /// A graph sweep's mark per node (LAB-9265).
         sweep_marks: RefCell<HashMap<String, String>>,
         /// A store's point write that lands just before the sweep's mark,
@@ -11911,6 +11986,17 @@ mod tests {
             if let Some(first) = self.0.store_lands_first.borrow_mut().take() {
                 mems.push(first);
             }
+            let raw = self.0.unreadable_points.borrow().contains(&m.content_hash)
+                || self
+                    .0
+                    .point_deleted_after_insert
+                    .borrow_mut()
+                    .take()
+                    .as_ref()
+                    == Some(&m.content_hash);
+            if raw && mode == StoreMode::InsertOnly {
+                return Ok((false, m.content_hash.clone()));
+            }
             match mems.iter_mut().find(|p| p.content_hash == m.content_hash) {
                 Some(_) if mode == StoreMode::InsertOnly => {}
                 Some(prev) => *prev = m.clone(),
@@ -12006,14 +12092,23 @@ mod tests {
             &self,
             hashes: &[&str],
         ) -> Result<std::collections::HashSet<String>> {
-            Ok(self
+            let mut found: std::collections::HashSet<String> = self
                 .0
                 .memories
                 .borrow()
                 .iter()
                 .filter(|m| hashes.contains(&m.content_hash.as_str()))
                 .map(|m| m.content_hash.clone())
-                .collect())
+                .collect();
+            found.extend(
+                self.0
+                    .unreadable_points
+                    .borrow()
+                    .iter()
+                    .filter(|h| hashes.contains(&h.as_str()))
+                    .cloned(),
+            );
+            Ok(found)
         }
         async fn delete(&self, _h: &str) -> Result<bool> {
             unimplemented!()
@@ -13730,6 +13825,36 @@ mod tests {
         assert!(ledger.contradicts.borrow().is_empty(), "nothing linked");
     }
 
+    /// An insert that finds a point it cannot read back is a typed
+    /// refusal, never a generic error: `correction_unreadable` for a payload
+    /// that does not parse (which every retry hits too), `correction_deleted`
+    /// for one deleted meanwhile (LAB-9265 review).
+    #[tokio::test(flavor = "current_thread")]
+    async fn refute_names_a_correction_point_it_cannot_read() {
+        let a = h('a');
+        let fix = generate_content_hash("the port is 3001");
+        for (unreadable, want) in [
+            (true, "correction_unreadable"),
+            (false, "correction_deleted"),
+        ] {
+            let ledger = Ledger::with(&[&a]);
+            if unreadable {
+                ledger.unreadable_points.borrow_mut().insert(fix.clone());
+            } else {
+                *ledger.point_deleted_after_insert.borrow_mut() = Some(fix.clone());
+            }
+            let svc = ledger.service();
+            let out = svc
+                .memory_refute(&a, refutation("the port is 3001", false))
+                .await
+                .unwrap();
+            assert_eq!(out["success"], false, "{out}");
+            assert_eq!(out["status"], want);
+            assert_eq!(out["correction_hash"], fix);
+            assert!(ledger.contradicts.borrow().is_empty(), "nothing linked");
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn refute_with_supersede_hides_the_wrong_memory_with_the_reason() {
         let a = h('a');
@@ -14298,7 +14423,7 @@ mod tests {
         let ledger = sweep_ledger(&[&a, &c], &[&b]);
         let svc = ledger.service();
 
-        let out = svc.sweep_graph_orphans("", 100, "run-1").await.unwrap();
+        let out = svc.sweep_gone_memory_nodes("", 100, "run-1").await.unwrap();
         assert_eq!(out["scanned"], 3, "{out}");
         assert_eq!(out["swept"], 1);
         assert_eq!(out["skipped"], 0);
@@ -14329,7 +14454,7 @@ mod tests {
             *ledger.point_lands_at_mark.borrow_mut() = Some((restored, ensure_after_mark));
             let svc = ledger.service();
 
-            let out = svc.sweep_graph_orphans("", 100, "run-1").await.unwrap();
+            let out = svc.sweep_gone_memory_nodes("", 100, "run-1").await.unwrap();
             assert_eq!(
                 out["swept"], 0,
                 "ensure_after_mark={ensure_after_mark}: {out}"
@@ -14338,31 +14463,27 @@ mod tests {
         }
     }
 
-    /// Only nodes that still carry this run's mark go: another run's mark
-    /// (or one an `ensure_node` cleared) leaves the node in place.
+    /// A sweep against a wrong or empty collection deletes nothing: the
+    /// first page with too many nodes without a point holds the pass
+    /// (LAB-9265 review).
     #[tokio::test(flavor = "current_thread")]
-    async fn graph_sweep_deletes_only_what_its_own_mark_holds() {
-        let (a, b) = (h('a'), h('b'));
-        let ledger = sweep_ledger(&[&a], &[&b]);
+    async fn graph_sweep_holds_a_page_where_too_many_points_are_missing() {
+        let live: Vec<String> = ('a'..='f').map(h).collect();
+        let gone: Vec<String> = ('0'..='3').map(h).collect();
+        let live_refs: Vec<&str> = live.iter().map(String::as_str).collect();
+        let gone_refs: Vec<&str> = gone.iter().map(String::as_str).collect();
+        let ledger = sweep_ledger(&live_refs, &gone_refs);
         let svc = ledger.service();
-        svc.consolidation
-            .mark_memory_nodes(&[&b], "run-1")
-            .await
-            .unwrap();
-        let deleted = svc
-            .consolidation
-            .delete_marked_nodes(&[&b], "run-2")
-            .await
-            .unwrap();
-        assert_eq!(deleted, 0);
-        svc.graph.ensure_node(&b, 1.0).await.unwrap();
-        let deleted = svc
-            .consolidation
-            .delete_marked_nodes(&[&b], "run-1")
-            .await
-            .unwrap();
-        assert_eq!(deleted, 0, "ensure_node cleared the mark");
-        assert!(ledger.nodes.borrow().contains(&b));
+
+        let out = svc.sweep_gone_memory_nodes("", 100, "run-1").await.unwrap();
+        assert_eq!(out["success"], false, "{out}");
+        assert_eq!(out["status"], "held");
+        assert_eq!(out["page_missing"], 4);
+        assert_eq!(out["page_valid"], 10);
+        assert_eq!(out["swept"], 0);
+        assert_eq!(ledger.nodes.borrow().len(), 10, "nothing deleted");
+        assert!(ledger.sweep_marks.borrow().is_empty(), "nothing marked");
+        assert_eq!(ledger.contradicts.borrow().len(), 4, "edges kept");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -14372,12 +14493,12 @@ mod tests {
         ledger.nodes.borrow_mut().insert("not-a-hash".to_string());
         let svc = ledger.service();
 
-        let first = svc.sweep_graph_orphans("", 2, "run-1").await.unwrap();
+        let first = svc.sweep_gone_memory_nodes("", 2, "run-1").await.unwrap();
         assert_eq!(first["scanned"], 2, "{first}");
         assert_eq!(first["swept"], 1);
         assert_eq!(first["next_after"], b, "resume after the last node read");
         let rest = svc
-            .sweep_graph_orphans(first["next_after"].as_str().unwrap(), 100, "run-2")
+            .sweep_gone_memory_nodes(first["next_after"].as_str().unwrap(), 100, "run-2")
             .await
             .unwrap();
         assert_eq!(rest["scanned"], 2, "{rest}");
@@ -14397,7 +14518,7 @@ mod tests {
         for (limit, token) in [(0, "t"), (MAX_GRAPH_SWEEP_LIMIT + 1, "t"), (1, "")] {
             assert!(
                 matches!(
-                    svc.sweep_graph_orphans("", limit, token).await,
+                    svc.sweep_gone_memory_nodes("", limit, token).await,
                     Err(AlayaError::Validation(_))
                 ),
                 "limit={limit} token={token:?}"

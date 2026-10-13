@@ -150,10 +150,9 @@ pub async fn create(
 /// POST /edges/refute
 ///
 /// MERGE a refute's CONTRADICTS edge and stamp its reason unless one is
-/// there already. Answers `{linked, refute_reason}`: the reason stored on
-/// the edge, which differs from the request's when an earlier refute's
-/// stands; `linked: false` (reason `null`) when an endpoint node is missing
-/// and nothing was written.
+/// there already. Answers `{refute_reason}`: the reason stored on the edge,
+/// which differs from the request's when an earlier refute's stands; `null`
+/// when an endpoint node is missing and nothing was written.
 pub async fn refute(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RefuteEdgeRequest>,
@@ -172,10 +171,7 @@ pub async fn refute(
         .first()
         .and_then(|row| row.first())
         .and_then(Value::as_str);
-    Ok(Json(json!({
-        "linked": stored.is_some(),
-        "refute_reason": stored,
-    })))
+    Ok(Json(json!({ "refute_reason": stored })))
 }
 
 /// POST /edges/create-batch

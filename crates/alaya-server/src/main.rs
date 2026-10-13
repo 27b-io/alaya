@@ -2224,26 +2224,28 @@ async fn service_worker(
                     async move {
                         let _flight = flight;
                         let token = sweep_token();
-                        let result =
-                            match timeout(deadline, svc.sweep_graph_orphans(&after, limit, &token))
-                                .await
-                            {
-                                Ok(Ok(r)) => {
-                                    tracing::info!(
-                                        op,
-                                        scanned = r["scanned"].as_u64(),
-                                        swept = r["swept"].as_u64(),
-                                        elapsed_ms = ms(start),
-                                        "ok"
-                                    );
-                                    r
-                                }
-                                Ok(Err(e)) => {
-                                    log_err(op, &e, start);
-                                    op_error(&e)
-                                }
-                                Err(_) => deadline_exceeded(op, deadline, start),
-                            };
+                        let result = match timeout(
+                            deadline,
+                            svc.sweep_gone_memory_nodes(&after, limit, &token),
+                        )
+                        .await
+                        {
+                            Ok(Ok(r)) => {
+                                tracing::info!(
+                                    op,
+                                    scanned = r["scanned"].as_u64(),
+                                    swept = r["swept"].as_u64(),
+                                    elapsed_ms = ms(start),
+                                    "ok"
+                                );
+                                r
+                            }
+                            Ok(Err(e)) => {
+                                log_err(op, &e, start);
+                                op_error(&e)
+                            }
+                            Err(_) => deadline_exceeded(op, deadline, start),
+                        };
                         let _ = reply.send(result);
                     }
                     .instrument(span),
@@ -3638,8 +3640,9 @@ async fn unsupersede(
     .await
 }
 
-/// The status of a confirm or refute result: a refusal is a 4xx, a correction
-/// stored without its second step is a 500 whose body names it.
+/// The status of a confirm, refute or graph sweep result: a refusal (a held
+/// sweep included) is a 4xx, a correction stored without its second step is
+/// a 500 whose body names it.
 fn outcome_status(v: &Value) -> StatusCode {
     // A refute's `status: superseded` is its success, not a refusal.
     if v["success"] == true {
@@ -3652,6 +3655,8 @@ fn outcome_status(v: &Value) -> StatusCode {
                 "superseded"
                 | "correction_superseded"
                 | "correction_deleted"
+                | "correction_unreadable"
+                | "held"
                 | "correction_exists"
                 | "conflict",
             ),
@@ -4118,7 +4123,9 @@ async fn graph_sweep(
         );
     }
     let (tx, rx) = oneshot::channel();
-    h.call(
+    // Answered by status like confirm and refute: a held pass is a 409.
+    outcome(
+        &h,
         CmdInner::GraphSweep {
             after: params.after,
             limit: params.limit,
@@ -7339,7 +7346,7 @@ mod wedge_tests {
         }
 
         let h = "a".repeat(64);
-        let resp = tokio::spawn(app.oneshot(post(json!({"after": h, "limit": 10}))));
+        let resp = tokio::spawn(app.clone().oneshot(post(json!({"after": h, "limit": 10}))));
         let CmdInner::GraphSweep {
             after,
             limit,
@@ -7358,6 +7365,20 @@ mod wedge_tests {
             .await
             .unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), body);
+
+        // A held pass is a refusal, with the worker's body.
+        let resp = tokio::spawn(app.oneshot(post(json!({}))));
+        let CmdInner::GraphSweep { reply, .. } = rx.recv().await.expect("dispatched").inner else {
+            panic!("expected CmdInner::GraphSweep");
+        };
+        let held = json!({"success": false, "status": "held", "error": "Too many", "swept": 0});
+        reply.send(held.clone()).unwrap();
+        let resp = resp.await.unwrap().unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), held);
     }
 
     /// `GET /memories/{hash}/relations` dispatches exactly the command

@@ -133,7 +133,6 @@ struct RefuteEdgeReq<'a> {
 
 #[derive(Deserialize)]
 struct RefuteEdgeResp {
-    linked: bool,
     refute_reason: Option<String>,
 }
 
@@ -417,15 +416,7 @@ impl GraphService for GraphHttpClient {
             .await
             .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
         let body: RefuteEdgeResp = handle_response(resp).await?;
-        // A linked edge always has a reason; an answer claiming one without
-        // it is not a link this call can report.
-        match (body.linked, body.refute_reason) {
-            (true, Some(stored)) => Ok(Some(stored)),
-            (false, None) => Ok(None),
-            _ => Err(AlayaError::Graph(
-                "bridge answered a refute link without its reason".into(),
-            )),
-        }
+        Ok(body.refute_reason)
     }
 
     #[tracing::instrument(skip(self, edges), fields(n = edges.len()))]
