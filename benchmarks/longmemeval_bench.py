@@ -35,6 +35,7 @@ from datetime import datetime
 
 import httpx
 from _stop_words import STOP_WORDS
+from longmemeval_qa import file_sha256
 
 
 # Force unbuffered stdout for piped contexts (uv run, background tasks)
@@ -51,9 +52,11 @@ COLLECTION = "bench_memories"
 TAG_COLLECTION = "bench_memories_tags"
 EMBEDDING_DIM = 1024
 
-# Pinned to the revision whose file has SHA-256 d6f21ea9...a3c442, the one the
-# committed QA run read, so a rerun fetches the same bytes.
+# Pinned to the revision whose file has LME_SHA256, the one the committed QA
+# run read, so a rerun fetches the same bytes. download_data refuses any other
+# bytes, cached or fresh, before a run spends a Qdrant or model call on them.
 LME_REVISION = "98d7416c24c778c2fee6e6f3006e7a073259d48f"
+LME_SHA256 = "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442"
 LME_URL = (
     "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/"
     f"{LME_REVISION}/longmemeval_s_cleaned.json"
@@ -136,6 +139,14 @@ def download_data(path: str) -> list[dict]:
         print(f"  Downloading LongMemEval data to {path}...")
         urllib.request.urlretrieve(LME_URL, path)
         print("  Done.")
+    actual = file_sha256(path)
+    if actual != LME_SHA256:
+        sys.exit(
+            f"\n  REFUSING TO RUN: {path} is not the pinned LongMemEval-S file.\n"
+            f"  expected sha256 {LME_SHA256}\n"
+            f"  actual   sha256 {actual}\n"
+            f"  Delete {path} and rerun to download revision {LME_REVISION}.\n"
+        )
     with open(path) as f:
         return json.load(f)
 
