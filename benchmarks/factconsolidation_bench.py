@@ -13,21 +13,21 @@ A numbered list of facts is memorised in order; later facts overwrite earlier
 ones, and each question must be answered from the newest fact. Single-hop (sh)
 questions ask one fact; multi-hop (mh) questions chain several.
 
-Protocol, per length (default: the shortest, 6k; sh and mh share one context):
+Protocol, at the shortest length, 6k (sh and mh share one context):
   retrieve  Reset the bench collections, store every numbered fact as its own
             Alaya memory (serial number kept in the text), then hybrid-search
             each question for the top-k memories. Needs the bench stack.
   read      Ask the reader with MemoryAgentBench's own rag-agent query prompt,
             the retrieved memories inserted as "Memory i:" in search order.
-  judge     Score with the benchmark's own metric, substring exact match over
-            its normalised answer, and with the same LongMemEval judge prompt
-            and judge model used for the LongMemEval QA table.
+  judge     Score with the same LongMemEval judge prompt and judge model used for
+            the LongMemEval QA table (the headline metric here), and with the
+            benchmark's own substring exact match, which is lenient: it also
+            counts an answer named anywhere in the reader's reasoning.
   report    Accuracy per sub-task, both metrics, with Wilson 95% intervals.
 
-MemoryAgentBench's own RAG agents store ~4096-token chunks, so at 6k the whole
-context comes back for every question and retrieval is a no-op. One memory per
-fact is how an agent would write these facts to Alaya, and it makes retrieval
-do the work. The result is therefore not a copy of the paper's RAG rows.
+MemoryAgentBench's RAG agents store the context as multi-sentence chunks. Here
+each fact is its own Alaya memory, which is how an agent would write these
+facts, so the result is not comparable with the paper's RAG rows.
 
 Usage (from benchmarks/, bench stack up):
     uv run factconsolidation_bench.py all --run-dir qa_runs/x/factconsolidation
@@ -48,7 +48,6 @@ from longmemeval_bench import (
     DEFAULT_ALAYA_URL,
     DEFAULT_QDRANT_URL,
     AlayaClient,
-    DuplicateMemory,
     QdrantAdmin,
     assert_bench_safe,
     extract_tags,
@@ -73,6 +72,7 @@ MAB_URL = (
 )
 MAB_CACHE = "/tmp/memoryagentbench_conflict_resolution.parquet"
 DEFAULT_K = 10
+LENGTH = "6k"
 
 # MemoryAgentBench utils/templates.py, the rag-agent query for fact consolidation,
 # verbatim (MIT licensed). {question} is filled per question.
@@ -107,7 +107,7 @@ def substring_exact_match(prediction: str, answers: list[str]) -> bool:
 # ── Data ─────────────────────────────────────────────────────────────────────
 
 
-def load_rows(path: str, length: str) -> tuple[list[str], list[dict]]:
+def load_rows(path: str, length: str = LENGTH) -> tuple[list[str], list[dict]]:
     """Facts and questions for one length; sh and mh share the same context."""
     if not os.path.exists(path):
         print(f"  Downloading MemoryAgentBench Conflict_Resolution to {path}...")
@@ -145,7 +145,7 @@ def load_rows(path: str, length: str) -> tuple[list[str], list[dict]]:
 
 def stage_retrieve(args) -> None:
     assert_bench_safe(args.qdrant_url)  # fail closed before the destructive reset
-    facts, questions = load_rows(args.data, args.length)
+    facts, questions = load_rows(args.data)
     out = os.path.join(args.run_dir, "retrieval.jsonl")
     if os.path.exists(out):
         print(f"  retrieve: {out} exists; delete it to re-run retrieval")
@@ -156,18 +156,18 @@ def stage_retrieve(args) -> None:
     print(
         f"  retrieve: storing {len(facts)} facts, then {len(questions)} searches (k={args.k})"
     )
-    for i, fact in enumerate(facts):
-        try:
-            alaya.store(content=fact, tags=extract_tags(fact), metadata={"serial": i})
-        except DuplicateMemory:
-            pass
-    with open(out, "w") as f:
+    for fact in facts:
+        alaya.store(content=fact, tags=extract_tags(fact), metadata={})
+    # Written whole, then renamed, so a crash never leaves a short file that a
+    # rerun would take as finished retrieval.
+    with open(out + ".tmp", "w") as f:
         for q in questions:
             resp = alaya.search(query=q["question"], mode="hybrid", k=args.k)
             texts = [
                 r.get("memory", r).get("content", "") for r in resp.get("results", [])
             ]
             f.write(json.dumps({**q, "retrieved": texts[: args.k]}) + "\n")
+    os.replace(out + ".tmp", out)
     alaya.close()
     qdrant.close()
 
@@ -175,7 +175,7 @@ def stage_retrieve(args) -> None:
 def stage_read(args, cli: ClaudeCLI) -> int:
     retrieval = load_jsonl(os.path.join(args.run_dir, "retrieval.jsonl"))
     out = os.path.join(args.run_dir, "hypotheses.jsonl")
-    done = {r["question_id"] for r in load_jsonl(out)}
+    done = {r["question_id"] for r in load_jsonl(out, missing_ok=True)}
     todo = [r for r in retrieval if r["question_id"] not in done]
     print(f"  read: {len(todo)} to do (reader {args.reader})")
 
@@ -190,7 +190,7 @@ def stage_read(args, cli: ClaudeCLI) -> int:
         }
 
     failures = run_parallel(todo, one, out, args.workers, "read")
-    record_calls(args.run_dir, "read", cli, args.reader)
+    record_calls(args.run_dir, "read", cli, args.reader, k=args.k)
     return failures
 
 
@@ -201,7 +201,7 @@ def stage_judge(args, cli: ClaudeCLI) -> int:
     }
     hyps = load_jsonl(os.path.join(args.run_dir, "hypotheses.jsonl"))
     out = os.path.join(args.run_dir, "judge_labels.jsonl")
-    done = {r["question_id"] for r in load_jsonl(out)}
+    done = {r["question_id"] for r in load_jsonl(out, missing_ok=True)}
     todo = [h for h in hyps if h["question_id"] not in done]
     print(f"  judge: {len(todo)} to do (judge {args.judge})")
 
@@ -239,34 +239,47 @@ def stage_report(args) -> dict:
         for r in load_jsonl(os.path.join(args.run_dir, "retrieval.jsonl"))
     }
     labels = load_jsonl(os.path.join(args.run_dir, "judge_labels.jsonl"))
+    calls_path = os.path.join(args.run_dir, "calls.json")
+    calls = load_json(calls_path)
+    ids = [r["question_id"] for r in labels]
+    if len(ids) != len(set(ids)) or set(ids) != set(by_id):
+        sys.exit(
+            f"  {len(ids)} labels ({len(set(ids))} distinct) for {len(by_id)} questions; finish the judge stage"
+        )
+    if "read" not in calls or "judge" not in calls:
+        sys.exit(f"  {calls_path} lacks the read or judge stage")
+    if {r["autoeval_label"]["model"] for r in labels} != {calls["judge"]["model"]}:
+        sys.exit(f"  labels are not all from judge {calls['judge']['model']}")
     em: dict[str, list[int]] = defaultdict(list)
     judged: dict[str, list[int]] = defaultdict(list)
     for row in labels:
         task = by_id[row["question_id"]]["task"]
         em[task].append(int(row["substring_exact_match"]))
         judged[task].append(int(row["autoeval_label"]["label"]))
-    calls_path = os.path.join(args.run_dir, "calls.json")
     summary_path = os.path.join(args.run_dir, "summary.json")
     summary = {
-        "dataset": f"MemoryAgentBench Conflict_Resolution factconsolidation_{{sh,mh}}_{args.length} @ {MAB_REVISION}",
+        "dataset": f"MemoryAgentBench Conflict_Resolution factconsolidation_{{sh,mh}}_{LENGTH} @ {MAB_REVISION}",
         "ingest": "one Alaya memory per numbered fact, hybrid search",
-        "k": args.k,
-        "reader": args.reader,
-        "judge": args.judge,
+        "k": calls["read"].get("k"),
+        "reader": calls["read"]["model"],
+        "judge": calls["judge"]["model"],
         "retrieval_note": args.retrieval_note
         or load_json(summary_path).get("retrieval_note", ""),
-        "claude_calls": load_json(calls_path),
-        "substring_exact_match": {
+        "claude_calls": calls,
+        "judge_accuracy": {t: score(sum(v), len(v)) for t, v in sorted(judged.items())},
+        "substring_exact_match_lenient": {
             t: score(sum(v), len(v)) for t, v in sorted(em.items())
         },
-        "judge_accuracy": {t: score(sum(v), len(v)) for t, v in sorted(judged.items())},
     }
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
         f.write("\n")
     print(
         json.dumps(
-            {k: summary[k] for k in ("substring_exact_match", "judge_accuracy")},
+            {
+                k: summary[k]
+                for k in ("judge_accuracy", "substring_exact_match_lenient")
+            },
             indent=2,
         )
     )
@@ -279,7 +292,6 @@ def main() -> None:
     )
     parser.add_argument("stage", choices=["retrieve", "read", "judge", "report", "all"])
     parser.add_argument("--run-dir", required=True)
-    parser.add_argument("--length", default="6k", choices=["6k", "32k", "64k", "262k"])
     parser.add_argument("--data", default=MAB_CACHE)
     parser.add_argument("--alaya-url", default=DEFAULT_ALAYA_URL)
     parser.add_argument("--qdrant-url", default=DEFAULT_QDRANT_URL)
@@ -292,7 +304,6 @@ def main() -> None:
     parser.add_argument("--judge", default=DEFAULT_JUDGE)
     parser.add_argument("--k", type=int, default=DEFAULT_K)
     parser.add_argument("--workers", type=int, default=6)
-    parser.add_argument("--claude-bin", default="claude")
     args = parser.parse_args()
     os.makedirs(args.run_dir, exist_ok=True)
 
@@ -300,13 +311,13 @@ def main() -> None:
     if args.stage in ("retrieve", "all"):
         stage_retrieve(args)
     if args.stage in ("read", "all"):
-        failures += stage_read(args, ClaudeCLI(args.claude_bin))
+        failures += stage_read(args, ClaudeCLI())
     if args.stage in ("judge", "all"):
-        failures += stage_judge(args, ClaudeCLI(args.claude_bin))
-    if args.stage in ("report", "all"):
-        stage_report(args)
+        failures += stage_judge(args, ClaudeCLI())
     if failures:
         sys.exit(f"  {failures} call(s) failed; rerun the same command to resume them.")
+    if args.stage in ("report", "all"):
+        stage_report(args)
 
 
 if __name__ == "__main__":

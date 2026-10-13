@@ -72,7 +72,7 @@ SYSTEM_PROMPT = ""
 class ClaudeCLI:
     """One `claude -p` call per prompt; counts calls so a run can report them."""
 
-    def __init__(self, binary: str, retries: int = 4, timeout: int = 600):
+    def __init__(self, binary: str = "claude", retries: int = 4, timeout: int = 600):
         self.binary = binary
         self.retries = retries
         self.timeout = timeout
@@ -189,9 +189,12 @@ def build_reader_prompt(entry: dict, ranked_session_ids: list[str], k: int) -> s
 # ── Files ────────────────────────────────────────────────────────────────────
 
 
-def load_jsonl(path: str) -> list[dict]:
+def load_jsonl(path: str, missing_ok: bool = False) -> list[dict]:
+    """Rows of a jsonl file. A missing file is an error unless missing_ok (resume)."""
     if not os.path.exists(path):
-        return []
+        if missing_ok:
+            return []
+        sys.exit(f"  Not found: {path}")
     rows = []
     with open(path) as f:
         for line in f:
@@ -250,15 +253,21 @@ def paths(run_dir: str) -> dict[str, str]:
     }
 
 
-def record_calls(run_dir: str, stage: str, cli: ClaudeCLI, model: str) -> None:
-    """Accumulate per-stage call counts across resumed runs."""
+def record_calls(run_dir: str, stage: str, cli: ClaudeCLI, model: str, **extra) -> None:
+    """Accumulate per-stage call counts across resumed runs; the report reads the
+    models (and the reader's k) from here, so they describe the run, not argv."""
     p = paths(run_dir)["calls"]
     calls = load_json(p)
     prev = calls.get(stage, {})
+    if prev and prev.get("model") != model:
+        sys.exit(
+            f"  {p} records {stage} model {prev['model']}, not {model}; use a new --run-dir"
+        )
     calls[stage] = {
         "model": model,
         "calls": prev.get("calls", 0) + cli.calls,
         "cli": cli.version(),
+        **extra,
     }
     with open(p, "w") as f:
         json.dump(calls, f, indent=2)
@@ -271,7 +280,7 @@ def stage_read(args, cli: ClaudeCLI) -> int:
     if not retrieval:
         sys.exit(f"  No retrieval rows in {args.retrieval}")
     out = paths(args.run_dir)["hyp"]
-    done = {r["question_id"] for r in load_jsonl(out)}
+    done = {r["question_id"] for r in load_jsonl(out, missing_ok=True)}
     todo = [r for r in retrieval if r["question_id"] not in done]
     print(
         f"  read: {len(todo)} to do, {len(done)} already in {out} (reader {args.reader}, k={args.k})"
@@ -287,7 +296,7 @@ def stage_read(args, cli: ClaudeCLI) -> int:
         }
 
     failures = run_parallel(todo, one, out, args.workers, "read")
-    record_calls(args.run_dir, "read", cli, args.reader)
+    record_calls(args.run_dir, "read", cli, args.reader, k=args.k)
     return failures
 
 
@@ -295,7 +304,7 @@ def stage_judge(args, cli: ClaudeCLI) -> int:
     data = load_dataset(args.data)
     hyps = load_jsonl(paths(args.run_dir)["hyp"])
     out = paths(args.run_dir)["labels"]
-    done = {r["question_id"] for r in load_jsonl(out)}
+    done = {r["question_id"] for r in load_jsonl(out, missing_ok=True)}
     todo = [h for h in hyps if h["question_id"] not in done]
     print(
         f"  judge: {len(todo)} to do, {len(done)} already in {out} (judge {args.judge})"
@@ -351,22 +360,37 @@ def recall_all_at_k(ranked: list[str], correct: list[str], k: int) -> float:
 
 
 def stage_report(args) -> dict:
-    data = load_dataset(args.data)
+    """Score a finished run. Reads only the run's own files, never the dataset."""
     p = paths(args.run_dir)
     labels = load_jsonl(p["labels"])
     retrieval = load_jsonl(args.retrieval)
-    if not labels:
-        sys.exit(f"  No judge labels in {p['labels']}")
+    calls = load_json(p["calls"])
 
+    # The labels must be exactly one per retrieved question, from this run's judge.
+    ids = [r["question_id"] for r in labels]
+    if len(ids) != len(set(ids)) or set(ids) != {r["question_id"] for r in retrieval}:
+        sys.exit(
+            f"  {p['labels']} has {len(ids)} rows ({len(set(ids))} distinct) for "
+            f"{len(retrieval)} retrieved questions; finish or redo the judge stage"
+        )
+    reader, judge = calls.get("read", {}), calls.get("judge", {})
+    if not reader or not judge:
+        sys.exit(f"  {p['calls']} lacks the read or judge stage")
+    if {r["autoeval_label"]["model"] for r in labels} != {judge["model"]}:
+        sys.exit(f"  labels in {p['labels']} are not all from judge {judge['model']}")
+
+    # Grouped as LongMemEval's print_qa_metrics.py: every question in its
+    # question_type (abstention questions included), and the _abs questions
+    # again in their own abstention row.
+    qtype = {r["question_id"]: r["question_type"] for r in retrieval}
     per_type: dict[str, list[int]] = defaultdict(list)
     abstention: list[int] = []
     for row in labels:
         hit = int(row["autoeval_label"]["label"])
+        per_type[qtype[row["question_id"]]].append(hit)
         if "_abs" in row["question_id"]:
             abstention.append(hit)
-        else:
-            per_type[data[row["question_id"]]["question_type"]].append(hit)
-    all_hits = [h for v in per_type.values() for h in v] + abstention
+    all_hits = [h for v in per_type.values() for h in v]
 
     # LongMemEval's retrieval evaluation skips abstention questions: their
     # answer sessions do not contain the asked-for fact.
@@ -377,20 +401,23 @@ def stage_report(args) -> dict:
         for r in ret
     )
 
-    calls = load_json(p["calls"])
     summary = {
         "dataset": "LongMemEval-S (longmemeval_s_cleaned.json)",
-        "reader": args.reader,
-        "judge": args.judge,
-        "k_sessions": args.k,
+        "reader": reader["model"],
+        "judge": judge["model"],
+        "k_sessions": reader.get("k"),
         "reader_prompt": "LongMemEval flat-session, JSON history, chain-of-thought; full sessions sorted by date",
         "judge_prompt": "LongMemEval evaluate_qa.get_anscheck_prompt (per question type + abstention)",
+        "grouping": "LongMemEval print_qa_metrics.py: abstention questions in their type and in the abstention row",
         "retrieval_file": os.path.basename(args.retrieval),
         "retrieval_note": args.retrieval_note
         or load_json(p["summary"]).get("retrieval_note", ""),
         "claude_calls": calls,
         "qa": {
             "overall": score(sum(all_hits), len(all_hits)),
+            "task_averaged": round(
+                sum(sum(v) / len(v) for v in per_type.values()) / len(per_type), 4
+            ),
             "per_type": {t: score(sum(v), len(v)) for t, v in sorted(per_type.items())},
             "abstention": score(sum(abstention), len(abstention)),
         },
@@ -443,7 +470,6 @@ def main() -> None:
     parser.add_argument(
         "--workers", type=int, default=6, help="Concurrent claude -p calls"
     )
-    parser.add_argument("--claude-bin", default="claude", help="Claude Code CLI binary")
     args = parser.parse_args()
 
     if args.stage in ("read", "report", "all") and not args.retrieval:
@@ -452,13 +478,13 @@ def main() -> None:
 
     failures = 0
     if args.stage in ("read", "all"):
-        failures += stage_read(args, ClaudeCLI(args.claude_bin))
+        failures += stage_read(args, ClaudeCLI())
     if args.stage in ("judge", "all"):
-        failures += stage_judge(args, ClaudeCLI(args.claude_bin))
-    if args.stage in ("report", "all"):
-        stage_report(args)
+        failures += stage_judge(args, ClaudeCLI())
     if failures:
         sys.exit(f"  {failures} call(s) failed; rerun the same command to resume them.")
+    if args.stage in ("report", "all"):
+        stage_report(args)
 
 
 if __name__ == "__main__":
