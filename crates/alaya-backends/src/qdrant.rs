@@ -16,7 +16,8 @@ use sha2::{Digest, Sha256};
 use alaya_types::{
     AlayaError, Result,
     memory::{
-        HealthStatus, Memory, MetadataUpdate, PatchMemoryRequest, ScoredMemory, ScrollResult,
+        HealthStatus, LAST_CONFIRMED_AT_KEY, Memory, MetadataUpdate, PatchMemoryRequest,
+        ScoredMemory, ScrollResult,
     },
     search::PayloadFilter,
 };
@@ -1072,10 +1073,6 @@ const SUPERSESSION_LOG: &str = "supersession_log";
 /// metadata update, removed by `reverse_supersession`. Server-maintained.
 const SUPERSESSION_REASON: &str = "supersession_reason";
 
-/// The `metadata` key `confirm_memory` writes: when a caller last re-checked
-/// the memory. Server-maintained, like the supersession marker beside it.
-const LAST_CONFIRMED_AT: &str = "last_confirmed_at";
-
 /// The entries of a stored `supersession_log`, in stored order. An audit
 /// trail is never dropped, even one in a shape no writer makes: a value that
 /// is not an array is one entry.
@@ -1135,7 +1132,7 @@ fn carry_over(payload: &mut Value, prev: &Value) {
     // nor re-hides a reversed one from a caller's stale copy of its metadata.
     // `last_confirmed_at` is written only by confirm_memory, so a re-store
     // keeps the stored one the same way.
-    for key in ["superseded_by", LAST_CONFIRMED_AT] {
+    for key in ["superseded_by", LAST_CONFIRMED_AT_KEY] {
         match prev.get("metadata").and_then(|md| md.get(key)) {
             Some(v) => payload["metadata"][key] = v.clone(),
             None => {
@@ -1576,7 +1573,7 @@ impl VectorStorage for QdrantClient {
                     if metadata.contains_key("superseded_by") {
                         return Ok(None);
                     }
-                    metadata.insert(LAST_CONFIRMED_AT.into(), json!(at));
+                    metadata.insert(LAST_CONFIRMED_AT_KEY.into(), json!(at));
                     Ok(Some(json!({ "metadata": metadata })))
                 },
             )

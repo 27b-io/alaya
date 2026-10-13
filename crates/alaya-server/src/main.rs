@@ -51,8 +51,8 @@ use alaya_backends::{
 use alaya_core::calendar::utc_date_str;
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{
-    JudgeOutcome, KeywordLeg, MemoryService, OutputMode, RankingFlags, Refutation, RelationParams,
-    SearchParams, StoreParams, parse_user_relation,
+    JudgeOutcome, KeywordLeg, MemoryService, OutputMode, RankingFlags, Refutation, RefuteOutcome,
+    RelationParams, SearchParams, StoreParams, parse_user_relation,
 };
 use alaya_core::vitals::{CountingEmbedding, SelfCheckOutcome, Vitals};
 use alaya_types::graph::{Contradiction, ContradictionQuery, Resolution};
@@ -1311,23 +1311,23 @@ impl Default for WorkerLimits {
     }
 }
 
-/// Reply for a command whose handler blew its deadline. The worker drops the
-/// in-flight future (cancelling its awaits) and keeps draining the queue —
-/// one stuck backend await must never wedge the service (#63).
 /// An op error as confirm and refute report it: the safe message, and a kind
-/// their REST routes map to a status.
+/// their REST routes map to a status. Neither returns `NotFound` as an error:
+/// a missing memory is a typed `status` in an `Ok` body.
 fn op_error(e: &alaya_types::AlayaError) -> Value {
     json!({
         "success": false,
         "error": e.safe_message(),
         "error_kind": match e {
-            alaya_types::AlayaError::NotFound(_) => "not_found",
             alaya_types::AlayaError::Validation(_) => "validation",
             _ => "internal",
         },
     })
 }
 
+/// Reply for a command whose handler blew its deadline. The worker drops the
+/// in-flight future (cancelling its awaits) and keeps draining the queue —
+/// one stuck backend await must never wedge the service (#63).
 fn deadline_exceeded(op: &str, deadline: std::time::Duration, start: std::time::Instant) -> Value {
     tracing::error!(
         op,
@@ -1505,32 +1505,12 @@ async fn service_worker(
                             "ok"
                         );
 
-                        // Fire-and-forget: generate summary in background
-                        if let Some(content) = content_for_summary
-                            && !skipped
-                            && let Some(full_hash) = r.get("content_hash").and_then(|v| v.as_str())
-                        {
-                            let hash_owned = full_hash.to_string();
-                            let svc = svc.clone();
-                            tokio::task::spawn_local(async move {
-                                svc.enrich_summary(&hash_owned, &content).await;
-                            });
-                        }
-
-                        // Fire-and-forget (LAB-3283 AC-4): judge each new
-                        // CONTRADICTS signal off the store path. Suppressed
-                        // under read_only — no edges were written — and when
-                        // no judge is configured. The edge direction is
-                        // (new) -> (existing), matching the batch write above.
-                        // Only a genuinely new memory: a re-store re-runs
-                        // interference but its edges (and verdicts) already
-                        // exist — re-judging would churn and re-bill them.
-                        // LAB-3895: store-path judge spend is capped per UTC day.
-                        spawn_store_contradiction_judges(
+                        spawn_store_followups(
                             &svc,
                             &judge_gate,
                             &judge_limiter,
                             &r,
+                            content_for_summary,
                             read_only,
                         );
 
@@ -1846,50 +1826,47 @@ async fn service_worker(
                 // follow-up, under the same rule.
                 let content_for_summary = (refutation.summary.is_none() && svc.summary.is_some())
                     .then(|| refutation.content.clone());
+                // Named in a timeout reply: the deadline may fall after the
+                // correction was stored, and the caller needs its hash to
+                // check (get_memory) and finish rather than store again.
+                let correction_hash =
+                    alaya_core::hashing::generate_content_hash(&refutation.content);
                 let result = match timeout(
                     limits.cmd,
                     svc.memory_refute(&hash, refutation).instrument(span),
                 )
                 .await
                 {
-                    Ok(Ok(r)) => {
+                    Ok(Ok(RefuteOutcome { result, stored })) => {
                         tracing::info!(
                             op,
                             hash = h.as_str(),
-                            status = r["status"].as_str().unwrap_or_default(),
+                            status = result["status"].as_str().unwrap_or_default(),
                             elapsed_ms = ms(start),
                             "ok"
                         );
-                        // Stored even when the second step failed (`partial`),
-                        // so the follow-ups run whenever `stored` is present.
-                        if let Some(stored) = r
-                            .get("stored")
-                            .and_then(|v| serde_json::from_value(v.clone()).ok())
-                        {
-                            if let Some(content) = content_for_summary
-                                && let Some(fix) = r["correction_hash"].as_str()
-                            {
-                                let fix = fix.to_string();
-                                let svc = svc.clone();
-                                tokio::task::spawn_local(async move {
-                                    svc.enrich_summary(&fix, &content).await;
-                                });
-                            }
-                            spawn_store_contradiction_judges(
+                        // Stored even when the second step failed (`partial`).
+                        if let Some(stored) = &stored {
+                            spawn_store_followups(
                                 &svc,
                                 &judge_gate,
                                 &judge_limiter,
-                                &stored,
+                                stored,
+                                content_for_summary,
                                 false,
                             );
                         }
-                        r
+                        result
                     }
                     Ok(Err(e)) => {
                         log_err(op, &e, start);
                         op_error(&e)
                     }
-                    Err(_) => deadline_exceeded(op, limits.cmd, start),
+                    Err(_) => {
+                        let mut v = deadline_exceeded(op, limits.cmd, start);
+                        v["correction_hash"] = json!(correction_hash);
+                        v
+                    }
                 };
                 let _ = reply.send(result);
             }
@@ -2516,6 +2493,37 @@ fn judge_cap_view(limiter: &JudgeDailyCap, judge_configured: bool) -> Value {
 /// applied inside each task, once it holds a gate permit and just before the call: a pair
 /// queued before UTC midnight is billed to the day it actually runs, so a process's calls in
 /// any UTC day never exceed the cap.
+/// A store's fire-and-forget follow-ups, for `/store` and for a refute's
+/// correction: the summary when the caller sent none (`summary_content`,
+/// `None` under read_only) and the stored content was not skipped as a
+/// duplicate, then the contradiction judges (LAB-3283 AC-4). The judges are
+/// suppressed under read_only — no edges were written — and when no judge
+/// is configured, and run only for a genuinely new memory: a re-store
+/// re-runs interference but its edges (and verdicts) already exist, so
+/// re-judging would churn and re-bill them. LAB-3895: store-path judge spend
+/// is capped per UTC day.
+fn spawn_store_followups(
+    svc: &std::rc::Rc<MemoryService>,
+    judge_gate: &std::rc::Rc<tokio::sync::Semaphore>,
+    limiter: &std::rc::Rc<std::cell::RefCell<JudgeDailyCap>>,
+    result: &std::collections::HashMap<String, Value>,
+    summary_content: Option<String>,
+    read_only: bool,
+) {
+    let skipped = result.get("duplicate").and_then(Value::as_bool) == Some(true);
+    if let Some(content) = summary_content
+        && !skipped
+        && let Some(hash) = result.get("content_hash").and_then(Value::as_str)
+    {
+        let hash = hash.to_string();
+        let svc = svc.clone();
+        tokio::task::spawn_local(async move {
+            svc.enrich_summary(&hash, &content).await;
+        });
+    }
+    spawn_store_contradiction_judges(svc, judge_gate, limiter, result, read_only);
+}
+
 fn spawn_store_contradiction_judges(
     svc: &std::rc::Rc<MemoryService>,
     judge_gate: &std::rc::Rc<tokio::sync::Semaphore>,
@@ -3507,7 +3515,7 @@ async fn unsupersede(
 /// stored without its second step is a 500 whose body names it.
 fn outcome_status(v: &Value) -> StatusCode {
     match (v["status"].as_str(), v["error_kind"].as_str()) {
-        (Some("not_found"), _) | (_, Some("not_found")) => StatusCode::NOT_FOUND,
+        (Some("not_found"), _) => StatusCode::NOT_FOUND,
         (Some("superseded" | "correction_superseded"), _) => StatusCode::CONFLICT,
         (_, Some("validation")) => StatusCode::BAD_REQUEST,
         _ if v.get("error").is_some() => StatusCode::INTERNAL_SERVER_ERROR,

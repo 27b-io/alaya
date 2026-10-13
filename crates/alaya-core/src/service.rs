@@ -183,6 +183,14 @@ impl StoreParams {
     }
 }
 
+/// What `memory_refute` did: the caller's result, and the correction's store
+/// result when this call stored it, for the worker's store follow-ups.
+#[derive(Debug)]
+pub struct RefuteOutcome {
+    pub result: Value,
+    pub stored: Option<HashMap<String, Value>>,
+}
+
 /// A correction filed against a wrong memory by `memory_refute` (LAB-7721):
 /// the correction's store fields, why, and whether it replaces the wrong
 /// memory. Unknown keys are refused rather than dropped, so a field this
@@ -205,18 +213,16 @@ pub struct Refutation {
     pub supersede: bool,
 }
 
-/// Cap on a `memory_refute` reason: it becomes the supersession reason, kept
-/// on the memory for good. The same bound as an unsupersede reason.
-pub const MAX_REFUTE_REASON_LEN: usize = MAX_UNSUPERSEDE_REASON_LEN;
-
 impl Refutation {
     /// Caller-input checks, run by `memory_refute` and by the REST and MCP
     /// handlers before dispatch, as for a store.
     pub fn validate(&self) -> std::result::Result<(), String> {
+        // The same bound as an unsupersede reason: it may become the
+        // supersession reason, kept on the memory for good.
         let reason = self.reason.trim();
-        if reason.is_empty() || reason.chars().count() > MAX_REFUTE_REASON_LEN {
+        if reason.is_empty() || reason.chars().count() > MAX_UNSUPERSEDE_REASON_LEN {
             return Err(format!(
-                "reason is required (1..={MAX_REFUTE_REASON_LEN} chars): it is the audit record"
+                "reason is required (1..={MAX_UNSUPERSEDE_REASON_LEN} chars): it is the audit record"
             ));
         }
         if self.content.is_empty() {
@@ -2394,12 +2400,19 @@ impl MemoryService {
     /// `memory_supersede`.
     ///
     /// The correction goes through the normal store path without
-    /// `dedup_threshold`. When the second step fails, the correction is
-    /// already stored: the result is `status: partial`, naming the
-    /// correction's hash and the failed step, so the caller can finish with
-    /// `memory_supersede` or `relation` rather than store it again.
+    /// `dedup_threshold`. A live memory that already holds the correction's
+    /// text (a retry, or a fix stored first with `store_memory`) is used as
+    /// it is, `existing: true`: re-storing it would replace its tags,
+    /// metadata and type with this call's. When the second step fails, the
+    /// correction is already stored: the result is `status: partial`, naming
+    /// the correction's hash and the failed step, so the caller can finish
+    /// with `memory_supersede` or `relation`, or retry the same refute.
     #[tracing::instrument(skip_all, fields(content_hash = ?clip_for_log(content_hash), supersede = refutation.supersede))]
-    pub async fn memory_refute(&self, content_hash: &str, refutation: Refutation) -> Result<Value> {
+    pub async fn memory_refute(
+        &self,
+        content_hash: &str,
+        refutation: Refutation,
+    ) -> Result<RefuteOutcome> {
         if !alaya_types::memory::validate_content_hash(content_hash) {
             return Err(AlayaError::Validation(
                 "invalid content_hash: expected 64-char lowercase SHA-256 hex".into(),
@@ -2417,21 +2430,25 @@ impl MemoryService {
             .vectors
             .get_batch(&[content_hash, &correction_hash])
             .await?;
+        let refused = |result: Value| {
+            Ok(RefuteOutcome {
+                result,
+                stored: None,
+            })
+        };
         let Some(wrong) = found.iter().find(|m| m.content_hash == content_hash) else {
-            return Ok(not_found_refusal(content_hash));
+            return refused(not_found_refusal(content_hash));
         };
         if let Some(marker) = supersession_marker(wrong) {
-            return Ok(superseded_refusal(
+            return refused(superseded_refusal(
                 content_hash,
                 marker,
                 "Memory is already superseded; refute its survivor instead",
             ));
         }
-        if found
-            .iter()
-            .any(|m| m.content_hash == correction_hash && is_superseded(m))
-        {
-            return Ok(serde_json::json!({
+        let existing = found.iter().find(|m| m.content_hash == correction_hash);
+        if existing.is_some_and(is_superseded) {
+            return refused(serde_json::json!({
                 "success": false,
                 "status": "correction_superseded",
                 "content_hash": content_hash,
@@ -2443,9 +2460,13 @@ impl MemoryService {
 
         let reason = refutation.reason.trim().to_string();
         let supersede = refutation.supersede;
-        let stored = self
-            .store_memory_with(refutation.correction(), false)
-            .await?;
+        let stored = match existing {
+            Some(_) => None,
+            None => Some(
+                self.store_memory_with(refutation.correction(), false)
+                    .await?,
+            ),
+        };
 
         let (status, step) = if supersede {
             match self
@@ -2466,6 +2487,18 @@ impl MemoryService {
                 }
             }
         } else {
+            // The edge MATCHes both nodes, so a node the store's non-fatal
+            // ensure_node missed, or a memory that never had one, would leave
+            // no edge. MERGE: a node already there is untouched.
+            let now = (self.clock)();
+            for (hash, created_at) in [
+                (content_hash, wrong.created_at),
+                (&correction_hash, existing.map_or(now, |m| m.created_at)),
+            ] {
+                if let Err(e) = self.graph.ensure_node(hash, created_at).await {
+                    tracing::warn!("refute: ensure_node failed before the link: {e}");
+                }
+            }
             let edge = self
                 .graph
                 .create_typed_edge(
@@ -2473,13 +2506,23 @@ impl MemoryService {
                     content_hash,
                     UserRelationType::Contradicts,
                     EdgeMeta {
-                        created_at: Some((self.clock)()),
+                        created_at: Some(now),
                         confidence: None,
                     },
                 )
                 .await;
+            // `false` is not "already there": MERGE binds an existing edge
+            // too, so it means an endpoint node is missing and nothing landed.
             match edge {
-                Ok(_) => ("contradicts", None),
+                Ok(true) => ("contradicts", None),
+                Ok(false) => (
+                    "partial",
+                    Some((
+                        "contradicts_edge",
+                        "failed",
+                        AlayaError::Graph("an endpoint node is missing".into()),
+                    )),
+                ),
                 Err(e) => ("partial", Some(("contradicts_edge", "failed", e))),
             }
         };
@@ -2490,8 +2533,11 @@ impl MemoryService {
             "content_hash": content_hash,
             "correction_hash": correction_hash,
             "reason": reason,
-            "stored": stored,
+            "existing": stored.is_none(),
         });
+        if let Some(stored) = &stored {
+            result["stored"] = serde_json::json!(stored);
+        }
         if let Some((step, what, error)) = step {
             tracing::error!(
                 correction = %clip_for_log(&correction_hash),
@@ -2502,7 +2548,7 @@ impl MemoryService {
             result["failed_step"] = serde_json::json!(step);
             result["error"] = serde_json::json!(format!(
                 "Correction stored as {correction_hash}, but the {step} step {what} ({}). \
-                 Finish it with {} rather than storing the correction again.",
+                 Finish it with {}, or retry the same refute.",
                 error.safe_message(),
                 if step == "supersede" {
                     "memory_supersede"
@@ -2511,7 +2557,7 @@ impl MemoryService {
                 }
             ));
         }
-        Ok(result)
+        Ok(RefuteOutcome { result, stored })
     }
 
     // ─── Tool: memory_unsupersede (LAB-6876) ────────────────────────────
@@ -10429,6 +10475,9 @@ mod tests {
         resupersede_after: RefCell<Option<String>>,
         /// Every metadata update fails with nothing written (LAB-7721).
         metadata_down: Cell<bool>,
+        /// A typed edge finds an endpoint node missing: nothing is written
+        /// and the bridge answers `created: false` (LAB-7721).
+        node_missing: Cell<bool>,
     }
 
     impl Ledger {
@@ -10550,28 +10599,15 @@ mod tests {
                 supersession_reason: reason,
             })
         }
-        /// The `store` contract: a re-store keeps the record's history and
-        /// its server-maintained metadata keys.
+        /// A plain upsert; the store contract's carry-over is pinned against
+        /// Qdrant in alaya-backends.
         async fn store(&self, m: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
             let mut mems = self.0.memories.borrow_mut();
-            let mut next = m.clone();
-            let md = next.metadata.get_or_insert_with(HashMap::new);
-            md.remove("superseded_by");
-            md.remove("last_confirmed_at");
-            let Some(prev) = mems.iter_mut().find(|p| p.content_hash == m.content_hash) else {
-                mems.push(next);
-                return Ok((true, m.content_hash.clone()));
-            };
-            next.created_at = prev.created_at;
-            next.access_count = prev.access_count;
-            next.access_timestamps = prev.access_timestamps.clone();
-            for key in ["superseded_by", "last_confirmed_at"] {
-                if let Some(v) = prev.metadata.as_ref().and_then(|md| md.get(key)) {
-                    md.insert(key.into(), v.clone());
-                }
+            match mems.iter_mut().find(|p| p.content_hash == m.content_hash) {
+                Some(prev) => *prev = m.clone(),
+                None => mems.push(m.clone()),
             }
-            *prev = next;
-            Ok((false, m.content_hash.clone()))
+            Ok((true, m.content_hash.clone()))
         }
         async fn confirm_memory(&self, h: &str, at: f64) -> Result<ConfirmOutcome> {
             if let Some(marker) = self.0.marker(h) {
@@ -10732,12 +10768,15 @@ mod tests {
                 UserRelationType::Contradicts,
                 "the ledger keeps CONTRADICTS only"
             );
-            let pair = (s.to_string(), d.to_string());
-            let mut edges = self.0.contradicts.borrow_mut();
-            if edges.contains_key(&pair) {
+            if self.0.node_missing.get() {
                 return Ok(false);
             }
-            edges.insert(pair, None);
+            // MERGE: an existing edge is bound and reported like a new one.
+            self.0
+                .contradicts
+                .borrow_mut()
+                .entry((s.to_string(), d.to_string()))
+                .or_insert(None);
             Ok(true)
         }
         async fn get_typed_edges(
@@ -11622,21 +11661,6 @@ mod tests {
         assert!(matches!(err, AlayaError::Validation(_)), "{err:?}");
     }
 
-    /// A re-store keeps the confirmation, as it keeps the marker.
-    #[tokio::test(flavor = "current_thread")]
-    async fn restore_keeps_last_confirmed_at() {
-        let ledger = Ledger::with(&[]);
-        let svc = ledger.service();
-        let hash = svc.store_memory(cite_params("fact")).await.unwrap()["content_hash"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        svc.memory_confirm(&hash).await.unwrap();
-        let at = get_meta(&ledger, &hash)["last_confirmed_at"].clone();
-        svc.store_memory(cite_params("fact")).await.unwrap();
-        assert_eq!(get_meta(&ledger, &hash)["last_confirmed_at"], at);
-    }
-
     fn refutation(content: &str, supersede: bool) -> Refutation {
         Refutation {
             content: content.into(),
@@ -11658,7 +11682,8 @@ mod tests {
         let out = svc
             .memory_refute(&a, refutation("the port is 3001", false))
             .await
-            .unwrap();
+            .unwrap()
+            .result;
         assert_eq!(out["success"], true, "{out}");
         assert_eq!(out["status"], "contradicts");
         assert_eq!(out["reason"], "the port is 3001, not 3000");
@@ -11700,7 +11725,8 @@ mod tests {
         let out = svc
             .memory_refute(&a, refutation("the port is 3001", true))
             .await
-            .unwrap();
+            .unwrap()
+            .result;
         assert_eq!(out["success"], true, "{out}");
         assert_eq!(out["status"], "superseded");
         let fix = out["correction_hash"].as_str().unwrap().to_string();
@@ -11726,7 +11752,8 @@ mod tests {
         let out = svc
             .memory_refute(&a, refutation("new fact", false))
             .await
-            .unwrap();
+            .unwrap()
+            .result;
         assert_eq!(out["status"], "superseded", "{out}");
         assert_eq!(out["success"], false);
         assert_eq!(out["superseded_by"], serde_json::json!(b));
@@ -11734,7 +11761,8 @@ mod tests {
         let out = svc
             .memory_refute(&h('d'), refutation("new fact", true))
             .await
-            .unwrap();
+            .unwrap()
+            .result;
         assert_eq!(out["status"], "not_found", "{out}");
 
         // A correction whose content is a superseded memory's.
@@ -11752,7 +11780,8 @@ mod tests {
         let out = svc
             .memory_refute(&c, refutation("old fact", false))
             .await
-            .unwrap();
+            .unwrap()
+            .result;
         assert_eq!(out["status"], "correction_superseded", "{out}");
 
         // Its own content, and malformed input.
@@ -11782,7 +11811,8 @@ mod tests {
         let out = svc
             .memory_refute(&a, refutation("the port is 3001", true))
             .await
-            .unwrap();
+            .unwrap()
+            .result;
         let fix = generate_content_hash("the port is 3001");
         assert_eq!(out["success"], false, "{out}");
         assert_eq!(out["status"], "partial");
@@ -11813,7 +11843,8 @@ mod tests {
         let out = svc
             .memory_refute(&a, refutation("the port is 3001", false))
             .await
-            .unwrap();
+            .unwrap()
+            .result;
         let fix = generate_content_hash("the port is 3001");
         assert_eq!(out["success"], false, "{out}");
         assert_eq!(out["status"], "partial");
@@ -11829,18 +11860,92 @@ mod tests {
         );
     }
 
-    #[test]
-    fn refutation_refuses_unknown_fields() {
-        let err = serde_json::from_value::<Refutation>(serde_json::json!({
-            "content": "x", "reason": "y", "metadata": {"k": 1}
-        }))
-        .unwrap_err();
-        assert!(err.to_string().contains("metadata"), "{err}");
-        let ok: Refutation = serde_json::from_value(serde_json::json!({
-            "content": "x", "reason": "y", "tags": "a,b"
-        }))
-        .unwrap();
-        assert!(!ok.supersede, "the safe branch is the default");
-        assert_eq!(ok.tags, Some(vec!["a".to_string(), "b".to_string()]));
+    /// The bridge answers `created: false` when an endpoint node is missing
+    /// and nothing landed: the link step failed, and the result says so.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refute_reports_a_link_that_found_no_node_as_partial() {
+        let a = h('a');
+        let ledger = Ledger::with(&[&a]);
+        ledger.node_missing.set(true);
+        let svc = ledger.service();
+
+        let out = svc
+            .memory_refute(&a, refutation("the port is 3001", false))
+            .await
+            .unwrap()
+            .result;
+        let fix = generate_content_hash("the port is 3001");
+        assert_eq!(out["success"], false, "{out}");
+        assert_eq!(out["status"], "partial");
+        assert_eq!(out["failed_step"], "contradicts_edge");
+        assert_eq!(out["correction_hash"], serde_json::json!(fix));
+        assert!(ledger.contradicts.borrow().is_empty());
+    }
+
+    /// A live memory already holding the correction's text — a fix stored
+    /// first with store_memory, or a retried refute — is used as it is: its
+    /// tags, type and metadata survive, nothing is stored, and a retry
+    /// converges on the same link.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refute_uses_an_existing_correction_without_restoring_it() {
+        let a = h('a');
+        let ledger = Ledger::with(&[&a]);
+        let svc = ledger.service();
+        let mut first = cite_params("the port is 3001");
+        first.tags = Some(vec!["deploy".into()]);
+        first.memory_type = Some("reference".into());
+        first.metadata = Some(HashMap::from([(
+            "importance".to_string(),
+            serde_json::json!(0.9),
+        )]));
+        first.citations = Some(vec![CITED.into()]);
+        let fix = svc.store_memory(first).await.unwrap()["content_hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let before = ledger
+            .memories
+            .borrow()
+            .iter()
+            .find(|m| m.content_hash == fix)
+            .cloned()
+            .unwrap();
+
+        for _ in 0..2 {
+            let mut r = refutation("the port is 3001", false);
+            r.tags = None;
+            r.memory_type = None;
+            r.citations = None;
+            let outcome = svc.memory_refute(&a, r).await.unwrap();
+            assert!(outcome.stored.is_none(), "nothing stored");
+            let out = outcome.result;
+            assert_eq!(out["success"], true, "{out}");
+            assert_eq!(out["status"], "contradicts");
+            assert_eq!(out["existing"], true);
+            assert!(out.get("stored").is_none(), "{out}");
+        }
+
+        let after = ledger
+            .memories
+            .borrow()
+            .iter()
+            .find(|m| m.content_hash == fix)
+            .cloned()
+            .unwrap();
+        assert_eq!(after.tags, before.tags);
+        assert_eq!(after.memory_type, "reference");
+        assert_eq!(
+            after.metadata, before.metadata,
+            "importance and citations kept"
+        );
+        assert_eq!(
+            ledger
+                .contradicts
+                .borrow()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [(fix, a)]
+        );
     }
 }

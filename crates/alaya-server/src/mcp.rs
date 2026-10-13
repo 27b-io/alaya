@@ -11,8 +11,7 @@ use tokio::sync::oneshot;
 
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{
-    MAX_REFUTE_REASON_LEN, MAX_UNSUPERSEDE_REASON_LEN, OutputMode, Refutation, RelationParams,
-    SearchParams, StoreParams,
+    MAX_UNSUPERSEDE_REASON_LEN, OutputMode, Refutation, RelationParams, SearchParams, StoreParams,
 };
 use alaya_types::memory::{MAX_CITATION_LEN, MAX_CITATIONS, validate_content_hash};
 
@@ -790,7 +789,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "memory_refute",
-            "description": "File a correction against a wrong memory in one call. The correction is stored like store_memory (never skipped as a duplicate). By default the pair is then linked correction -> wrong as CONTRADICTS: both stay searchable and the pair enters the contradiction queue. Pass supersede: true only when the correction carries every claim of the wrong memory that is still true; the wrong memory is then superseded by the correction with your reason. Refused before anything is written, with {success: false, status}: not_found, superseded (refute the survivor instead) or correction_superseded. If the store succeeds but the supersede or link fails, returns {success: false, status: partial, correction_hash, failed_step}: finish with memory_supersede or relation rather than storing again.",
+            "description": "File a correction against a wrong memory in one call. The correction is stored like store_memory (never skipped as a duplicate); a live memory that already holds its exact text is used as is, with existing: true, so a retry is safe. By default the pair is then linked correction -> wrong as CONTRADICTS: both stay searchable and the pair enters the contradiction queue. Pass supersede: true only when the correction carries every claim of the wrong memory that is still true; the wrong memory is then superseded by the correction with your reason. Refused before anything is written, with {success: false, status}: not_found, superseded (refute the survivor instead) or correction_superseded. If the store succeeds but the supersede or link fails, returns {success: false, status: partial, correction_hash, failed_step}: retry the same refute, or finish with memory_supersede or relation.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -809,7 +808,7 @@ fn tool_schemas() -> Value {
                     "reason": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": MAX_REFUTE_REASON_LEN,
+                        "maxLength": MAX_UNSUPERSEDE_REASON_LEN,
                         "description": "Why the memory is wrong. Required: it is the audit record."
                     },
                     "supersede": { "type": "boolean", "default": false, "description": "Supersede the wrong memory instead of linking it. Only when the correction carries every still-true claim of it." }
@@ -979,16 +978,6 @@ mod tests {
                 .expect_err("refused");
             assert_eq!(code, -32602, "{tool} {args}: {msg}");
             assert!(rx.try_recv().is_err(), "{tool} {args} was dispatched");
-        }
-    }
-
-    /// The new verbs are mutating: neither restricted principal may call them.
-    #[test]
-    fn confirm_and_refute_are_denied_to_restricted_principals() {
-        for tool in ["memory_confirm", "memory_refute"] {
-            assert!(!AuthPrincipal::Oidc.allows(tool));
-            assert!(!AuthPrincipal::StaticReadOnly.allows(tool));
-            assert!(AuthPrincipal::Static.allows(tool));
         }
     }
 

@@ -143,10 +143,14 @@ pub const RESERVED_METADATA_KEYS: &[(&str, &str)] = &[
         "the server records novelty in its own field on every store",
     ),
     (
-        "last_confirmed_at",
+        LAST_CONFIRMED_AT_KEY,
         "the server sets it when a memory is confirmed",
     ),
 ];
+
+/// The metadata key confirm writes: when a caller last re-checked the memory.
+/// Server-maintained, like the supersession marker, so a re-store keeps it.
+pub const LAST_CONFIRMED_AT_KEY: &str = "last_confirmed_at";
 
 /// The metadata key a memory's citations live under. Hits return `metadata`
 /// whole, so every read path returns them with no code of its own.

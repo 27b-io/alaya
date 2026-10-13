@@ -445,18 +445,19 @@ Content-Type: application/json
 
 Required: `content` and `reason` (1–2000 characters, kept as the audit record). Optional: `tags`, `memory_type`, `summary`, `citations` (checked as on `/store`) and `supersede` (default `false`). Any other key returns `422`; this route takes no `metadata` or `dedup_threshold`.
 
-The correction is stored through the normal store path, and `dedup_threshold` is never applied, so a correction close to the memory it corrects is never skipped. Then:
+The correction is stored through the normal store path, and `dedup_threshold` is never applied, so a correction close to the memory it corrects is never skipped. When a live memory already holds the correction's exact text (you stored the fix first, or this is a retry), it is used as it is and not stored again, so its tags, type and metadata are kept; the response says `"existing": true`. That makes a retried refute safe. Then:
 
 - **`supersede: false` (the default)** creates a `CONTRADICTS` edge from the correction to the wrong memory. Both stay searchable, and the pair enters the [contradiction queue](#post-contradictions).
 - **`supersede: true`** supersedes the wrong memory with the correction, with `reason` as the supersession reason. Superseding hides the whole record, so pass it only when the correction carries every claim of the wrong memory that is still true.
 
 | Status | Body |
 |:--|:--|
-| `200` | `{ "success": true, "status": "contradicts" \| "superseded", "content_hash", "correction_hash", "reason", "stored" }`. `stored` is the correction's `/store` response. |
-| `400` | Invalid `content_hash`, empty `content`, missing `reason`, malformed `citations`, or a correction whose content is the wrong memory's own. Nothing written. |
+| `200` | `{ "success": true, "status": "contradicts" \| "superseded", "content_hash", "correction_hash", "reason", "existing", "stored"? }`. `stored` is the correction's `/store` response, absent when `existing` is `true`. |
+| `400` | Invalid `content_hash`, empty `content`, blank `reason`, malformed `citations`, or a correction whose content is the wrong memory's own. Nothing written. |
 | `404` | `{ "success": false, "status": "not_found" }`: the wrong memory does not exist. Nothing written. |
 | `409` | `{ "success": false, "status": "superseded", "superseded_by" }` when the wrong memory is already superseded (refute its survivor instead), or `"status": "correction_superseded"` when the correction's content is stored already as a superseded memory. Nothing written. |
-| `500` | `{ "success": false, "status": "partial", "content_hash", "correction_hash", "failed_step": "supersede" \| "contradicts_edge", "error", "stored" }`: the correction **is stored**, but the second step failed. Finish with [`POST /supersede`](#post-supersede) or [`POST /relation`](#post-relation) (`create`, `CONTRADICTS`) rather than refuting again. Any other `500` is a backend failure before or during the store. |
+| `422` | A missing `content` or `reason`, a wrong type, or any other key. Nothing written. |
+| `500` | `{ "success": false, "status": "partial", "content_hash", "correction_hash", "failed_step": "supersede" \| "contradicts_edge", "error", "existing", "stored"? }`: the correction **is stored**, but the second step failed. A `contradicts_edge` failure includes a link that found a graph node missing. Retry the same refute, or finish with [`POST /supersede`](#post-supersede) or [`POST /relation`](#post-relation) (`create`, `CONTRADICTS`). A timeout (`"error_kind": "timeout"`) also carries `correction_hash`: the correction may already be stored, so check it with [`GET /memories/{content_hash}`](#get-memoriescontent_hash) or retry the refute. Any other `500` is a backend failure before or during the store. |
 
 The refusals are checked before the store, but not atomically with the second step: a supersede that lands in between is overwritten, as with `POST /supersede`. Mutating — static bearer only.
 
