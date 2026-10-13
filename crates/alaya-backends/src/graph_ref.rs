@@ -42,6 +42,16 @@ macro_rules! impl_graph_service {
             ) -> alaya_types::Result<bool> {
                 self.0.create_typed_edge(s, d, r, m).await
             }
+            // Delegated explicitly: the trait's default is unsupported.
+            async fn link_refutation(
+                &self,
+                s: &str,
+                d: &str,
+                t: f64,
+                r: &str,
+            ) -> alaya_types::Result<Option<String>> {
+                self.0.link_refutation(s, d, t, r).await
+            }
             async fn get_typed_edges(
                 &self,
                 h: &str,
@@ -212,5 +222,15 @@ impl ConsolidationService for ConsolidationRef {
     }
     async fn get_orphan_nodes(&self, l: usize) -> alaya_types::Result<Vec<String>> {
         self.0.get_orphan_nodes(l).await
+    }
+    // Delegated explicitly: the trait's defaults are unsupported.
+    async fn list_memory_nodes(&self, a: &str, l: usize) -> alaya_types::Result<Vec<String>> {
+        self.0.list_memory_nodes(a, l).await
+    }
+    async fn mark_memory_nodes(&self, h: &[&str], t: &str) -> alaya_types::Result<usize> {
+        self.0.mark_memory_nodes(h, t).await
+    }
+    async fn delete_marked_nodes(&self, h: &[&str], t: &str) -> alaya_types::Result<usize> {
+        self.0.delete_marked_nodes(h, t).await
     }
 }

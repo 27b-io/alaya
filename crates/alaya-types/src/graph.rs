@@ -240,6 +240,10 @@ pub struct Contradiction {
     pub resolved_at: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_via: Option<String>,
+    /// Why a `memory_refute` filed this edge (LAB-9265); `None` for an edge
+    /// no refute wrote. The first refute's reason stays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refute_reason: Option<String>,
 }
 
 #[cfg(test)]

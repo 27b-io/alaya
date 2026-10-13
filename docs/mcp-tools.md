@@ -212,7 +212,7 @@ Manage typed edges between two memories in the knowledge graph. One tool with th
 |:--|:--|
 | `RELATES_TO` | Generic association. Used by spreading-activation to boost search results. |
 | `PRECEDES` | Temporal ordering — `A PRECEDES B` means A happened before B. |
-| `CONTRADICTS` | Explicit contradiction. Surfaces in `memory_contradictions`. Resolve with `resolve_contradiction` (keep both) or `memory_supersede` (one memory misleads). `delete` refuses a `CONTRADICTS` edge that already carries a judge verdict or a resolution — it is the queue item and its audit trail (`Edge carries a verdict or resolution; resolve it (keep_both / supersede) instead of deleting`). |
+| `CONTRADICTS` | Explicit contradiction. Surfaces in `memory_contradictions`. Resolve with `resolve_contradiction` (keep both) or `memory_supersede` (one memory misleads). `delete` refuses a `CONTRADICTS` edge that already carries a judge verdict, a resolution or a refute's reason — it is the queue item and its audit trail (`Edge carries a verdict, a resolution or a refute's reason; resolve it (keep_both / supersede) instead of deleting`). |
 
 **Example (create):**
 
@@ -325,14 +325,14 @@ Mutating, like a store: static bearer only. REST: [`POST /memories/{content_hash
 
 File a correction against a wrong memory in one call. The correction is stored like `store_memory`, but never skipped as a duplicate: `dedup_threshold` does not apply. When a live memory already holds the correction's exact text (you stored the fix first, or this is a retry), it is used as it is, its tags, type and metadata kept, and the result says `existing: true`; any `tags`, `memory_type`, `summary` or `citations` you send must then match it (a field you leave out always does). Then the wrong memory is linked or superseded:
 
-- **`supersede: false` (the default)**: a `CONTRADICTS` edge from the correction to the wrong memory. Both stay searchable, and the pair enters [`memory_contradictions`](#memory_contradictions).
+- **`supersede: false` (the default)**: a `CONTRADICTS` edge from the correction to the wrong memory. Both stay searchable, and the pair enters [`memory_contradictions`](#memory_contradictions), unless it was settled already (`keep_both`): the stamp stays.
 - **`supersede: true`**: the wrong memory is superseded by the correction, with `reason` as the supersession reason. That hides the whole record, so pass it only when the correction carries every claim of the wrong memory that is still true.
 
 | Param | Type | Required | Default | Notes |
 |:--|:--|:-:|:--|:--|
 | `content_hash` | string | ✓ | | The wrong memory. |
 | `content` | string | ✓ | | The correction. |
-| `reason` | string | ✓ | | Why the memory is wrong (1–2000 chars). With `supersede: true` it is stored as the supersession reason. A link stores no reason: put anything worth keeping in the correction's text. |
+| `reason` | string | ✓ | | Why the memory is wrong (1–2000 chars), stored either way: with `supersede: true` as the supersession reason, with a link as the edge's `refute_reason`, which `memory_contradictions` returns. The first refute's reason stays on the edge. |
 | `tags` | string[] or string | | | As on `store_memory`. |
 | `memory_type` | enum | | `note` | As on `store_memory`. |
 | `summary` | string | | | As on `store_memory`. |
@@ -341,7 +341,7 @@ File a correction against a wrong memory in one call. The correction is stored l
 
 Any other argument, `metadata` included, is a `-32602` error.
 
-**Returns:** `{ success: true, status: "contradicts" | "superseded", content_hash, correction_hash, existing, stored?, supersession_reason? }`, where `stored` is the correction's `store_memory` result, absent when `existing` is `true`. `superseded` promises that the wrong memory now points at the correction, and `supersession_reason` is the reason stored with it. A retry that finds the supersession already there succeeds only when its reason matches the stored one. These refusals return `success: false` before anything is written:
+**Returns:** `{ success: true, status: "contradicts" | "superseded", content_hash, correction_hash, existing, stored?, refute_reason?, supersession_reason? }`, where `stored` is the correction's `store_memory` result, absent when `existing` is `true`. `superseded` promises that the wrong memory now points at the correction, and `supersession_reason` is the reason stored with it; `contradicts`, that the link is in place, and `refute_reason` is the reason stored on its edge. A retry that finds the supersession or the link already there succeeds only when its reason matches the stored one. These refusals return `success: false` before anything is written:
 
 | `status` | Meaning |
 |:--|:--|
@@ -349,10 +349,12 @@ Any other argument, `metadata` included, is a `-32602` error.
 | `superseded` | The wrong memory is already superseded; `superseded_by` names the survivor. Refute that one instead. A `supersede: true` retry whose own correction is the survivor succeeds instead. |
 | `correction_superseded` | The correction's content is stored already as a superseded memory, and a store would keep it hidden. Unsupersede it, or word the correction differently. |
 | `correction_exists` | The correction's content is stored already as a live memory, and `field` names the first field you sent that it does not have. Refute without that field, or update that memory first. |
+| `correction_unreadable` | A point holds the correction's content but its payload does not parse. Repair or delete that point, or word the correction differently. |
+| `correction_deleted` | Another caller stored the correction's content and deleted it while this call ran. Retry the refute. |
 
-If the correction is stored but the second step fails, or its outcome could not be read back ("unknown outcome" in the error; a supersede that was sent but not confirmed is read back first and reported as `superseded` when it landed), the result is `{ success: false, status: "partial", correction_hash, failed_step: "supersede" | "contradicts_edge", error, existing, stored? }`; a link that found a graph node missing counts as a failed `contradicts_edge`. The correction **is stored**: retry the same refute, which reuses it, or finish with [`memory_supersede`](#memory_supersede) or [`relation`](#relation) (`create`, `CONTRADICTS`). A timeout error also leaves the correction possibly stored; retrying the refute is safe.
+If the correction is stored but the second step fails, or its outcome could not be read back ("unknown outcome" in the error; a supersede that was sent but not confirmed is read back first and reported as `superseded` when it landed with your reason, else `conflict`), the result is `{ success: false, status: "partial", correction_hash, failed_step: "supersede" | "contradicts_edge", error, existing, stored? }`; a link that found a graph node missing counts as a failed `contradicts_edge`. The correction **is stored**: retry the same refute, which reuses it. A failed `supersede` can also be finished with [`memory_supersede`](#memory_supersede); a failed `contradicts_edge` only by the retry, since only a refute's own link stores the reason ([`relation`](#relation) `create` would leave the edge without it). A timeout error also leaves the correction possibly stored; retrying the refute is safe.
 
-If another caller supersedes the wrong memory after the checks, the result is `{ success: false, status: "conflict", superseded_by, correction_hash, ... }` with the correction stored. The supersede is conditional on the memory still carrying no marker, so that survivor is never overwritten. Refute it instead, or reconcile the two. The same `conflict` comes back, with nothing written, when the memory is superseded by this correction already but with another reason: `supersession_reason` is the stored one, and yours is not claimed.
+If another caller supersedes the wrong memory after the checks, the result is `{ success: false, status: "conflict", superseded_by, correction_hash, ... }` with the correction stored. The supersede is conditional on the memory still carrying no marker, so that survivor is never overwritten. Refute it instead, or reconcile the two. The same `conflict` comes back, with nothing written, when the memory is superseded by this correction already but with another reason (`supersession_reason` is the stored one), or linked to it already with another refute's reason (`refute_reason` is the stored one); yours is not claimed.
 
 If another caller supersedes the correction itself before the second step, the result is `{ success: false, status: "correction_superseded", correction_superseded_by, ... }`, with nothing else written; one that deletes it gives `status: "correction_deleted"`, also with nothing written, and a retry stores it again. One that lands after it forms an ordinary chain (wrong memory → correction → its survivor), the same state the calls made one after another produce, and the survivor stays searchable. The link re-reads the wrong memory before its graph writes, so one deleted meanwhile gets no graph node back, and again after its edge lands, since a graph write cannot be conditional on it; that narrows the race rather than closing it.
 
@@ -398,6 +400,7 @@ List pairs of memories the contradiction detector has flagged (via negation, ant
 | `survivor` | `content_hash` the judge recommends keeping, or `null`. Advisory — pass it to `memory_supersede` yourself. |
 | `verdict_confidence`, `verdict_model`, `judged_at` | Judge self-reported confidence (0–1), model id, epoch seconds. |
 | `resolution`, `resolved_at`, `resolved_via` | `keep_both` stamp from `resolve_contradiction` or `memory_unsupersede`, when it was set (epoch seconds, server clock) and by whom (`operator:mcp`, `operator:console`, `unsupersede`, …). All `null` on an unresolved pair. Only visible with `include_resolved: true`. |
+| `refute_reason` | Why a [`memory_refute`](#memory_refute) filed this edge: the first refute's reason. `null` on an edge no refute wrote. |
 
 The judge never writes to a memory: verdicts live on the graph edge, and resolution stays a human/agent call. A pair leaves the default page one of three ways:
 

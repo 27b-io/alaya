@@ -27,9 +27,12 @@ fn params(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
 // ─── node operations ─────────────────────────────────────────────────────────
 
 /// MERGE a Memory node, setting `created_at` only on creation.
+/// Clears a sweep's mark (`sweep_mark_memory_nodes`), so a node a store
+/// ensures after the mark is never swept.
 pub fn ensure_node(hash: &str, ts: f64) -> CypherQuery {
     let q = "MERGE (m:Memory {content_hash: $hash}) \
-             ON CREATE SET m.created_at = $ts"
+             ON CREATE SET m.created_at = $ts \
+             SET m.sweep_mark = null"
         .to_string();
     (
         q,
@@ -78,6 +81,29 @@ pub fn create_typed_edge(
         p.insert("conf".to_string(), json!(conf));
     }
     (q, p, false)
+}
+
+/// MERGE the `src -> dst` CONTRADICTS edge a refute files, and stamp its
+/// `refute_reason` unless the edge carries one already: the first refute's
+/// reason stays the record. Returns the stored reason; no row when an
+/// endpoint node is missing (nothing written). An edge store-time detection
+/// made already keeps its own properties and gains the reason.
+pub fn link_refutation(src: &str, dst: &str, ts: f64, reason: &str) -> CypherQuery {
+    let q = "MATCH (a:Memory {content_hash: $src}), (b:Memory {content_hash: $dst}) \
+             MERGE (a)-[e:CONTRADICTS]->(b) \
+             ON CREATE SET e.created_at = $ts \
+             SET e.refute_reason = coalesce(e.refute_reason, $reason) \
+             RETURN e.refute_reason";
+    (
+        q.to_string(),
+        params(&[
+            ("src", json!(src)),
+            ("dst", json!(dst)),
+            ("ts", json!(ts)),
+            ("reason", json!(reason)),
+        ]),
+        false,
+    )
 }
 
 /// Query typed edges for a hash in the given direction.
@@ -211,7 +237,8 @@ const CONTRADICTION_COLUMNS: &str = "a.content_hash, b.content_hash, e.confidenc
      e.verdict_model, e.judged_at, \
      e.resolution, e.resolved_at, e.resolved_via";
 
-/// One page of CONTRADICTS pairs ordered by `created_at DESC`, every filter
+/// One page of CONTRADICTS pairs ordered by `created_at DESC`, as
+/// `CONTRADICTION_COLUMNS` plus the refute's reason (column 13), every filter
 /// applied in Cypher (see `ContradictionQuery`), so `SKIP`/`LIMIT` page over
 /// *matching* edges — app-side filtering over a LIMIT-only read starved the
 /// queue (LAB-3283 review). WHERE fragments are constant strings; every
@@ -297,7 +324,7 @@ pub fn get_all_contradictions(q: &ContradictionQuery) -> CypherQuery {
     let cypher = format!(
         "MATCH (a:Memory)-[e:CONTRADICTS]->(b:Memory) \
          {filter}\
-         RETURN {CONTRADICTION_COLUMNS} \
+         RETURN {CONTRADICTION_COLUMNS}, e.refute_reason \
          ORDER BY e.created_at DESC, a.content_hash, b.content_hash \
          SKIP $skip LIMIT $lim"
     );
@@ -427,13 +454,14 @@ pub fn unsettle_contradiction(
     )
 }
 
-/// Count `src -> dst` CONTRADICTS edges that carry a judge verdict or an
-/// operator resolution (LAB-3885 AC-6). `POST /edges/delete` refuses such
-/// an edge: it is the queue item and its audit trail, so it is resolved
-/// (keep_both or supersede), never deleted.
-pub fn count_judged_or_resolved_contradiction(src: &str, dst: &str) -> CypherQuery {
+/// Count `src -> dst` CONTRADICTS edges that carry a judge verdict, an
+/// operator resolution (LAB-3885 AC-6) or a refute's reason. `POST
+/// /edges/delete` refuses such an edge: it is the queue item and its audit
+/// trail, so it is resolved (keep_both or supersede), never deleted.
+pub fn count_audited_contradiction(src: &str, dst: &str) -> CypherQuery {
     let q = "MATCH (a:Memory {content_hash: $src})-[e:CONTRADICTS]->(b:Memory {content_hash: $dst}) \
              WHERE e.verdict IS NOT NULL OR e.resolution IS NOT NULL \
+             OR e.refute_reason IS NOT NULL \
              RETURN count(e)";
     (
         q.to_string(),
@@ -689,6 +717,54 @@ pub fn prune_weak_edges(threshold: f64, limit: u32) -> CypherQuery {
     )
 }
 
+// ─── gone-memory node sweep (LAB-9265) ────────────────────────────────────────
+//
+// A Memory node whose Qdrant point is gone (a delete whose non-fatal
+// delete_node failed, or a MERGE that re-created a node after the delete)
+// is removed in three steps: the caller marks the nodes it found without a
+// point, checks Qdrant again, and deletes only nodes that still carry its
+// mark; ensure_node clears the mark. So a node goes only when its point was
+// absent at both checks and nothing ensured it since the mark. A store whose
+// point lands after the second check and whose ensure_node lands after the
+// delete gets a fresh node, losing only the gone memory's edges.
+
+/// One page of Memory node hashes after `after`, in hash order. Read-only.
+pub fn list_memory_nodes(after: &str, limit: u32) -> CypherQuery {
+    let q = "MATCH (m:Memory) WHERE m.content_hash > $after \
+             RETURN m.content_hash ORDER BY m.content_hash LIMIT $lim"
+        .to_string();
+    (
+        q,
+        params(&[("after", json!(after)), ("lim", json!(limit))]),
+        true,
+    )
+}
+
+/// Mark the given Memory nodes with a sweep's `token`; returns how many.
+pub fn sweep_mark_memory_nodes(hashes: &[&str], token: &str) -> CypherQuery {
+    let q = "MATCH (m:Memory) WHERE m.content_hash IN $hashes \
+             SET m.sweep_mark = $token RETURN count(m)"
+        .to_string();
+    (
+        q,
+        params(&[("hashes", json!(hashes)), ("token", json!(token))]),
+        false,
+    )
+}
+
+/// DETACH DELETE the given Memory nodes that still carry `token`; returns
+/// how many.
+pub fn sweep_delete_marked_nodes(hashes: &[&str], token: &str) -> CypherQuery {
+    let q = "MATCH (m:Memory) WHERE m.content_hash IN $hashes AND m.sweep_mark = $token \
+             DETACH DELETE m RETURN count(m)"
+        .to_string();
+    (
+        q,
+        params(&[("hashes", json!(hashes)), ("token", json!(token))]),
+        false,
+    )
+}
+
 /// Find Memory nodes with no edges of any tracked type.
 pub fn get_orphan_nodes(limit: u32) -> CypherQuery {
     let q = "MATCH (m:Memory) \
@@ -748,7 +824,9 @@ mod tests {
         let (q, p, ro) = get_all_contradictions(&ContradictionQuery { skip: 40, ..cq(20) });
         assert!(!q.contains("WHERE"));
         assert!(q.contains("e.verdict, e.verdict_survivor"));
-        assert!(q.contains("e.judged_at, e.resolution, e.resolved_at, e.resolved_via"));
+        assert!(
+            q.contains("e.resolution, e.resolved_at, e.resolved_via, e.refute_reason ORDER BY")
+        );
         assert!(q.ends_with(
             "ORDER BY e.created_at DESC, a.content_hash, b.content_hash SKIP $skip LIMIT $lim"
         ));
@@ -907,11 +985,14 @@ mod tests {
     }
 
     #[test]
-    fn count_judged_or_resolved_contradiction_is_a_read_over_verdict_or_resolution() {
-        let (q, p, ro) = count_judged_or_resolved_contradiction(&"a".repeat(64), &"b".repeat(64));
+    fn count_audited_contradiction_is_a_read_over_verdict_resolution_or_refute_reason() {
+        let (q, p, ro) = count_audited_contradiction(&"a".repeat(64), &"b".repeat(64));
         assert!(q.starts_with("MATCH"));
         assert!(q.contains("[e:CONTRADICTS]->"));
-        assert!(q.contains("WHERE e.verdict IS NOT NULL OR e.resolution IS NOT NULL"));
+        assert!(q.contains(
+            "WHERE e.verdict IS NOT NULL OR e.resolution IS NOT NULL \
+             OR e.refute_reason IS NOT NULL"
+        ));
         assert!(q.ends_with("RETURN count(e)"));
         assert!(!q.contains("DELETE"));
         assert_eq!(p["src"], json!("a".repeat(64)));
@@ -1026,6 +1107,16 @@ mod tests {
             "must omit confidence when None"
         );
         assert!(!p.contains_key("conf"));
+        assert!(!ro);
+    }
+
+    #[test]
+    fn link_refutation_keeps_the_first_reason_and_returns_the_stored_one() {
+        let (q, p, ro) = link_refutation("a", "b", 1.0, "why");
+        assert!(q.contains("MERGE (a)-[e:CONTRADICTS]->(b)"));
+        assert!(q.contains("SET e.refute_reason = coalesce(e.refute_reason, $reason)"));
+        assert!(q.ends_with("RETURN e.refute_reason"));
+        assert_eq!(p["reason"], json!("why"), "the reason is a parameter");
         assert!(!ro);
     }
 

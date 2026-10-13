@@ -18,7 +18,7 @@ It speaks two protocols against the same storage layer:
 
 | Topic | Read |
 |:--|:--|
-| All 10 MCP tools — schemas, params, examples | [MCP tool reference](./mcp-tools.md) |
+| Every MCP tool — schemas, params, examples | [MCP tool reference](./mcp-tools.md) |
 | REST endpoints — auth, request/response shapes | [REST API reference](./rest-api.md) |
 
 ## Gotchas

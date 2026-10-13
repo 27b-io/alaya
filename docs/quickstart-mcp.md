@@ -99,7 +99,7 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" \
      http://localhost:3001/mcp
 ```
 
-You should see all 10 tool schemas come back.
+You should see every tool schema come back.
 
 ## First memory, end-to-end
 

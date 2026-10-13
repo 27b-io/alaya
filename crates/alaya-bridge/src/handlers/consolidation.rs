@@ -1,4 +1,5 @@
-//! Consolidation handlers — decay, prune, and orphan detection.
+//! Consolidation handlers — decay, prune, orphan detection, and the sweep of
+//! nodes whose memory is gone.
 //!
 //! These are maintenance operations executed synchronously against FalkorDB.
 //! Each runs a bounded-limit batch to avoid long-running transactions.
@@ -45,7 +46,81 @@ pub struct OrphansRequest {
     pub limit: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListNodesRequest {
+    /// Hashes after this one, in hash order (`""` = from the start).
+    #[serde(default)]
+    pub after: String,
+    /// Page size (default 500, at most 5 000).
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SweepNodesRequest {
+    pub hashes: Vec<String>,
+    /// The sweep run's mark.
+    pub token: String,
+}
+
+/// At most this many hashes per mark or delete call.
+const MAX_SWEEP_BATCH: usize = 5_000;
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
+
+/// POST /consolidation/nodes
+///
+/// One page of Memory node hashes after `after`, in hash order.
+pub async fn list_nodes(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ListNodesRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    let limit = req.limit.unwrap_or(500).clamp(1, MAX_SWEEP_BATCH as i64) as u32;
+    let (cypher, params, readonly) = cypher::list_memory_nodes(&req.after, limit);
+    let result = exec_query(&state, &cypher, params, readonly).await?;
+    let hashes: Vec<&str> = result
+        .result_set
+        .iter()
+        .filter_map(|row| row.first()?.as_str())
+        .collect();
+    Ok(Json(json!({ "hashes": hashes })))
+}
+
+/// The hashes and token of a sweep step, checked: 422 on an empty token or
+/// an oversized batch.
+fn sweep_args(req: &SweepNodesRequest) -> Result<Vec<&str>, StatusCode> {
+    if req.token.trim().is_empty() || req.hashes.len() > MAX_SWEEP_BATCH {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    Ok(req.hashes.iter().map(String::as_str).collect())
+}
+
+/// POST /consolidation/sweep-mark
+///
+/// Mark the given Memory nodes with the sweep's token.
+pub async fn sweep_mark(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SweepNodesRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    let hashes = sweep_args(&req)?;
+    let (cypher, params, readonly) = cypher::sweep_mark_memory_nodes(&hashes, &req.token);
+    let result = exec_query(&state, &cypher, params, readonly).await?;
+    Ok(Json(json!({ "marked": result.count().unwrap_or(0) })))
+}
+
+/// POST /consolidation/sweep-delete
+///
+/// DETACH DELETE the given Memory nodes that still carry the sweep's token.
+pub async fn sweep_delete(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SweepNodesRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    let hashes = sweep_args(&req)?;
+    let (cypher, params, readonly) = cypher::sweep_delete_marked_nodes(&hashes, &req.token);
+    let result = exec_query(&state, &cypher, params, readonly).await?;
+    Ok(Json(json!({ "deleted": result.count().unwrap_or(0) })))
+}
 
 /// POST /consolidation/decay-all
 ///

@@ -13,6 +13,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/nodes/ensure", post(handlers::nodes::ensure))
         .route("/nodes/delete", post(handlers::nodes::delete))
         .route("/edges/create", post(handlers::edges::create))
+        .route("/edges/refute", post(handlers::edges::refute))
         .route("/edges/create-batch", post(handlers::edges::create_batch))
         .route("/edges/create-system", post(handlers::edges::create_system))
         .route(
@@ -59,6 +60,18 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(handlers::consolidation::decay_stale),
         )
         .route("/consolidation/prune", post(handlers::consolidation::prune))
+        .route(
+            "/consolidation/nodes",
+            post(handlers::consolidation::list_nodes),
+        )
+        .route(
+            "/consolidation/sweep-mark",
+            post(handlers::consolidation::sweep_mark),
+        )
+        .route(
+            "/consolidation/sweep-delete",
+            post(handlers::consolidation::sweep_delete),
+        )
         .route(
             "/consolidation/orphans",
             post(handlers::consolidation::orphans),

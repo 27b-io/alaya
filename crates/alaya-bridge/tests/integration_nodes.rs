@@ -142,3 +142,72 @@ async fn delete_node_nonexistent_is_silent() -> anyhow::Result<()> {
     ctx.cleanup().await;
     Ok(())
 }
+
+// ─── gone-memory node sweep (LAB-9265) ────────────────────────────────────────
+
+/// Paging in hash order; a mark that `ensure_node` clears; a delete that
+/// takes only nodes still carrying its own token, with their edges.
+#[tokio::test]
+async fn sweep_marks_and_deletes_only_still_marked_nodes() -> anyhow::Result<()> {
+    let ctx = match common::TestContext::new().await {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+    let h = |c: char| c.to_string().repeat(64);
+    let (a, b, c) = (h('a'), h('b'), h('c'));
+    for x in [&a, &b, &c] {
+        ctx.exec_tuple(cypher::ensure_node(x, 1.0)).await;
+    }
+    ctx.exec_tuple(cypher::create_typed_edge(
+        &b,
+        &a,
+        alaya_types::graph::UserRelationType::Contradicts,
+        1.0,
+        None,
+    ))
+    .await;
+    let hashes = |r: &alaya_bridge::FalkorResult| -> Vec<String> {
+        r.result_set
+            .iter()
+            .filter_map(|row| row.first()?.as_str().map(str::to_string))
+            .collect()
+    };
+
+    let first = ctx.exec_tuple(cypher::list_memory_nodes("", 2)).await;
+    assert_eq!(hashes(&first), [a.clone(), b.clone()]);
+    let rest = ctx.exec_tuple(cypher::list_memory_nodes(&b, 2)).await;
+    assert_eq!(hashes(&rest), std::slice::from_ref(&c));
+
+    let marked = ctx
+        .exec_tuple(cypher::sweep_mark_memory_nodes(&[&b, &c], "run-1"))
+        .await;
+    assert_eq!(marked.count(), Some(2));
+    // A store re-ensures c after the mark: c is alive again.
+    ctx.exec_tuple(cypher::ensure_node(&c, 2.0)).await;
+    let other = ctx
+        .exec_tuple(cypher::sweep_delete_marked_nodes(&[&b, &c], "run-2"))
+        .await;
+    assert_eq!(
+        other.count(),
+        Some(0),
+        "another run's token deletes nothing"
+    );
+    let deleted = ctx
+        .exec_tuple(cypher::sweep_delete_marked_nodes(&[&b, &c], "run-1"))
+        .await;
+    assert_eq!(deleted.count(), Some(1), "only b still carries the mark");
+
+    let left = ctx.exec_tuple(cypher::list_memory_nodes("", 10)).await;
+    assert_eq!(hashes(&left), [a.clone(), c.clone()]);
+    let edges = ctx
+        .exec(
+            "MATCH ()-[e:CONTRADICTS]->() RETURN count(e)",
+            Default::default(),
+            true,
+        )
+        .await;
+    assert_eq!(edges.count(), Some(0), "DETACH took b's edge");
+
+    ctx.cleanup().await;
+    Ok(())
+}

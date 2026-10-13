@@ -90,7 +90,7 @@ Six Rust crates, five compiled:
 |:------|:--------|
 | `alaya-types` | Shared types (Memory, Edge, SearchMode, AlayaError) |
 | `alaya-backends` | Trait definitions + HTTP clients (Qdrant, Embedding, Graph, Summary) |
-| `alaya-core` | MemoryService orchestration — all 10 MCP tools, hybrid search, interference detection |
+| `alaya-core` | MemoryService orchestration — every MCP tool, hybrid search, interference detection |
 | `alaya-bridge` | FalkorDB typed RPC bridge (axum + Redis, Cypher query builders) |
 | `alaya-server` | REST API + MCP Streamable HTTP (axum, channel-based) |
 

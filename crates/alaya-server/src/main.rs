@@ -867,6 +867,13 @@ pub(crate) enum CmdInner {
         limit: usize,
         reply: oneshot::Sender<Value>,
     },
+    /// Remove the graph nodes of memories that are gone, up to `limit`
+    /// nodes read after `after` (LAB-9265).
+    GraphSweep {
+        after: String,
+        limit: usize,
+        reply: oneshot::Sender<Value>,
+    },
     /// `GET /stats` (LAB-6881): corpus counts, contradiction-judge
     /// aggregates and this process's judge daily cap. Read-only.
     Stats {
@@ -890,7 +897,8 @@ impl CmdInner {
             | CmdInner::MergeDuplicates { .. }
             | CmdInner::BackfillSummaries { .. }
             | CmdInner::BackfillContradictions { .. }
-            | CmdInner::BackfillKeywords { .. } => LONG_CMD_DEADLINE,
+            | CmdInner::BackfillKeywords { .. }
+            | CmdInner::GraphSweep { .. } => LONG_CMD_DEADLINE,
             _ => CMD_DEADLINE,
         }
     }
@@ -918,6 +926,7 @@ impl Cmd {
             CmdInner::BackfillSummaries { .. } => "backfill_summaries",
             CmdInner::BackfillContradictions { .. } => "backfill_contradictions",
             CmdInner::BackfillKeywords { .. } => "backfill_keywords",
+            CmdInner::GraphSweep { .. } => "graph_sweep",
             CmdInner::Stats { .. } => "stats",
             CmdInner::SelfCheck { .. } => "selfcheck",
         }
@@ -1416,6 +1425,7 @@ async fn service_worker(
     // deadline would otherwise scan and write beside a pass still running.
     // Per process, like the others; two passes only rewrite the same vectors.
     let keyword_fill_running = std::rc::Rc::new(std::cell::Cell::new(false));
+    let graph_sweep_running = std::rc::Rc::new(std::cell::Cell::new(false));
     let judge_limiter = std::rc::Rc::new(std::cell::RefCell::new(JudgeDailyCap::new(
         limits.judge_daily_cap,
     )));
@@ -2185,6 +2195,55 @@ async fn service_worker(
                             Ok(Err(e)) => {
                                 log_err(op, &e, start);
                                 json!({"success": false, "error": e.safe_message()})
+                            }
+                            Err(_) => deadline_exceeded(op, deadline, start),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    .instrument(span),
+                );
+            }
+            CmdInner::GraphSweep { reply, .. } if graph_sweep_running.get() => {
+                let _ = reply.send(json!({
+                    "success": false,
+                    "status": "busy",
+                    "error": "graph sweep already running"
+                }));
+            }
+            CmdInner::GraphSweep {
+                after,
+                limit,
+                reply,
+            } => {
+                let flight = InFlight::start(&graph_sweep_running);
+                let span = tracing::info_span!(parent: &ps, "graph_sweep", limit = limit);
+                let svc = svc.clone();
+                let deadline = limits.long;
+                // Spawned, like the backfills: a pass over the whole graph
+                // must not hold up the stores and searches queued behind it.
+                tokio::task::spawn_local(
+                    async move {
+                        let _flight = flight;
+                        let token = sweep_token();
+                        let result = match timeout(
+                            deadline,
+                            svc.sweep_gone_memory_nodes(&after, limit, &token),
+                        )
+                        .await
+                        {
+                            Ok(Ok(r)) => {
+                                tracing::info!(
+                                    op,
+                                    scanned = r["scanned"].as_u64(),
+                                    swept = r["swept"].as_u64(),
+                                    elapsed_ms = ms(start),
+                                    "ok"
+                                );
+                                r
+                            }
+                            Ok(Err(e)) => {
+                                log_err(op, &e, start);
+                                op_error(&e)
                             }
                             Err(_) => deadline_exceeded(op, deadline, start),
                         };
@@ -3274,6 +3333,7 @@ fn protected_router(handle: ServiceHandle, auth_state: AuthState) -> Router {
         .route("/backfill/summaries", post(backfill_summaries))
         .route("/backfill/contradictions", post(backfill_contradictions))
         .route("/backfill/keywords", post(backfill_keywords))
+        .route("/consolidation/sweep", post(graph_sweep))
         .route("/stats", get(stats))
         .layer(middleware::from_fn_with_state(
             auth_state,
@@ -3581,8 +3641,9 @@ async fn unsupersede(
     .await
 }
 
-/// The status of a confirm or refute result: a refusal is a 4xx, a correction
-/// stored without its second step is a 500 whose body names it.
+/// The status of a confirm, refute or graph sweep result: a refusal (a held
+/// sweep included) is a 4xx, a correction stored without its second step is
+/// a 500 whose body names it.
 fn outcome_status(v: &Value) -> StatusCode {
     // A refute's `status: superseded` is its success, not a refusal.
     if v["success"] == true {
@@ -3595,6 +3656,9 @@ fn outcome_status(v: &Value) -> StatusCode {
                 "superseded"
                 | "correction_superseded"
                 | "correction_deleted"
+                | "correction_unreadable"
+                | "held"
+                | "busy"
                 | "correction_exists"
                 | "conflict",
             ),
@@ -4005,6 +4069,67 @@ async fn backfill_keywords(
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::BackfillKeywords {
+            limit: params.limit,
+            reply: tx,
+        },
+        rx,
+    )
+    .await
+}
+
+/// A graph sweep run's mark: unique per run, across processes too, since a
+/// run deletes only the nodes that still carry its own (LAB-9265).
+fn sweep_token() -> String {
+    use std::hash::BuildHasher;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    // RandomState is seeded from the OS per process.
+    let random = std::collections::hash_map::RandomState::new().hash_one(now);
+    format!("{now:x}-{random:016x}")
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphSweepParams {
+    /// Resume after this node hash (`next_after` of the previous call).
+    #[serde(default)]
+    after: String,
+    #[serde(default = "default_graph_sweep_limit")]
+    limit: usize,
+}
+fn default_graph_sweep_limit() -> usize {
+    5_000
+}
+
+/// `POST /consolidation/sweep` (LAB-9265): remove the graph nodes, and
+/// their edges, of memories whose Qdrant point is gone. Operator-only, as
+/// the backfills are (`auth::rest_route_op`). Blocks until the pass ends and
+/// returns `{scanned, swept, skipped, next_after}`; repeat with `after:
+/// next_after` until it is `null`.
+async fn graph_sweep(
+    axum::extract::State(h): axum::extract::State<ServiceHandle>,
+    Json(params): Json<GraphSweepParams>,
+) -> (StatusCode, Json<Value>) {
+    if !(1..=alaya_core::service::MAX_GRAPH_SWEEP_LIMIT).contains(&params.limit) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "error": format!(
+                    "limit must be 1..={}",
+                    alaya_core::service::MAX_GRAPH_SWEEP_LIMIT
+                )
+            })),
+        );
+    }
+    let (tx, rx) = oneshot::channel();
+    // Answered by status like confirm and refute: a held pass is a 409.
+    outcome(
+        &h,
+        CmdInner::GraphSweep {
+            after: params.after,
             limit: params.limit,
             reply: tx,
         },
@@ -4861,6 +4986,7 @@ mod tests {
             resolution: None,
             resolved_at: None,
             resolved_via: None,
+            refute_reason: None,
         };
         let gate = std::rc::Rc::new(tokio::sync::Semaphore::new(JUDGE_CONCURRENCY));
         let svc = wedge_tests::hanging_service().with_judge(Box::new(StubJudge));
@@ -5851,6 +5977,9 @@ mod wedge_tests {
         async fn get_orphan_nodes(&self, _limit: usize) -> Result<Vec<String>> {
             unimplemented!()
         }
+        async fn list_memory_nodes(&self, _after: &str, _limit: usize) -> Result<Vec<String>> {
+            std::future::pending().await
+        }
     }
 
     pub(super) fn hanging_service() -> MemoryService {
@@ -5929,6 +6058,58 @@ mod wedge_tests {
                 assert_eq!(patched["content_hash"], json!(hash), "{patched}");
                 assert!(patched.get("supersession_log").is_none(), "{patched}");
                 assert!(patched.get("supersession_reason").is_none(), "{patched}");
+            })
+            .await;
+    }
+
+    /// A graph sweep runs off the loop, one per process: a second one while
+    /// the first hangs is refused with `status: busy` (a 409 by
+    /// `outcome_status`), and the guard is released at the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn graph_sweep_is_single_flight_and_refuses_as_busy() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::channel::<Cmd>(8);
+                let limits = WorkerLimits {
+                    long: Duration::from_millis(100),
+                    ..WorkerLimits::default()
+                };
+                tokio::task::spawn_local(service_worker(
+                    rx,
+                    hanging_service(),
+                    Arc::new(AtomicU64::new(0)),
+                    limits,
+                ));
+                let send_sweep = || {
+                    let (rtx, rrx) = oneshot::channel();
+                    tx.try_send(Cmd {
+                        inner: CmdInner::GraphSweep {
+                            after: String::new(),
+                            limit: 10,
+                            reply: rtx,
+                        },
+                        span: tracing::Span::none(),
+                    })
+                    .unwrap();
+                    rrx
+                };
+                let first = send_sweep();
+                let refused = send_sweep().await.unwrap();
+                assert_eq!(refused["status"], "busy", "{refused}");
+                assert_eq!(outcome_status(&refused), StatusCode::CONFLICT);
+
+                let reply = tokio::time::timeout(Duration::from_secs(60), first)
+                    .await
+                    .expect("sweep never replied")
+                    .unwrap();
+                assert_eq!(reply["error_kind"], "timeout");
+                let again = send_sweep();
+                let again = tokio::time::timeout(Duration::from_secs(60), again)
+                    .await
+                    .expect("sweep never replied")
+                    .unwrap();
+                assert_ne!(again["status"], "busy", "the guard is released: {again}");
             })
             .await;
     }
@@ -7112,8 +7293,13 @@ mod wedge_tests {
             ),
             (
                 "refute",
-                json!({"success": true, "status": "contradicts", "correction_hash": fix}),
+                json!({"success": true, "status": "contradicts", "correction_hash": fix, "refute_reason": "wrong"}),
                 StatusCode::OK,
+            ),
+            (
+                "refute",
+                json!({"success": false, "status": "conflict", "correction_hash": fix, "refute_reason": "an earlier why"}),
+                StatusCode::CONFLICT,
             ),
             (
                 "refute",
@@ -7185,6 +7371,76 @@ mod wedge_tests {
             let got: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(got, reply_body, "the outcome body is passed through");
         }
+    }
+
+    /// `POST /consolidation/sweep` (LAB-9265) refuses a bad limit or an
+    /// unknown key before dispatch, and otherwise dispatches the cursor and
+    /// limit and answers with the worker's body.
+    #[tokio::test]
+    async fn graph_sweep_route_checks_then_dispatches() {
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let app = protected_router(ServiceHandle { tx }, test_auth_state());
+        let post = |body: Value| {
+            axum::http::Request::post("/consolidation/sweep")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        for (body, want) in [
+            (json!({"limit": 0}), StatusCode::BAD_REQUEST),
+            (
+                json!({"limit": alaya_core::service::MAX_GRAPH_SWEEP_LIMIT + 1}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (json!({"token": "mine"}), StatusCode::UNPROCESSABLE_ENTITY),
+        ] {
+            let resp = app.clone().oneshot(post(body.clone())).await.unwrap();
+            assert_eq!(resp.status(), want, "{body}");
+            assert!(rx.try_recv().is_err(), "{body} was dispatched");
+        }
+
+        let h = "a".repeat(64);
+        let resp = tokio::spawn(app.clone().oneshot(post(json!({"after": h, "limit": 10}))));
+        let CmdInner::GraphSweep {
+            after,
+            limit,
+            reply,
+        } = rx.recv().await.expect("dispatched").inner
+        else {
+            panic!("expected CmdInner::GraphSweep");
+        };
+        assert_eq!((after.as_str(), limit), (h.as_str(), 10));
+        let body =
+            json!({"success": true, "scanned": 10, "swept": 1, "skipped": 0, "next_after": h});
+        reply.send(body.clone()).unwrap();
+        let resp = resp.await.unwrap().unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), body);
+
+        // A held pass is a refusal, with the worker's body.
+        let resp = tokio::spawn(app.oneshot(post(json!({}))));
+        let CmdInner::GraphSweep { reply, .. } = rx.recv().await.expect("dispatched").inner else {
+            panic!("expected CmdInner::GraphSweep");
+        };
+        let held = json!({"success": false, "status": "held", "error": "Too many", "swept": 0});
+        // `busy` (a pass already running) shares the 409 below.
+        assert_eq!(
+            outcome_status(&json!({"success": false, "status": "busy", "error": "x"})),
+            StatusCode::CONFLICT
+        );
+        reply.send(held.clone()).unwrap();
+        let resp = resp.await.unwrap().unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), held);
     }
 
     /// `GET /memories/{hash}/relations` dispatches exactly the command
