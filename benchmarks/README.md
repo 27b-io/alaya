@@ -104,8 +104,8 @@ What this means for honest reading of the numbers:
   ground-truth answer lives in one or more of those sessions.
 - The harness downloads it once and caches it to `/tmp/longmemeval_s_cleaned.json`
   (`LME_CACHE` in [`longmemeval_bench.py`](longmemeval_bench.py)); subsequent runs read
-  the cache, but first check its SHA-256 against the pinned `LME_SHA256` and refuse a
-  mismatch.
+  the cache, but first check its SHA-256 against the pinned `LME_SHA256` (in
+  [`longmemeval_qa.py`](longmemeval_qa.py)) and refuse a mismatch.
 
 ---
 
