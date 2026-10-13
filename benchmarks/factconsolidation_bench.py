@@ -64,6 +64,7 @@ from longmemeval_qa import (
     load_json,
     load_jsonl,
     record_calls,
+    require_read_input,
     rows_fingerprint,
     run_parallel,
     score,
@@ -222,6 +223,13 @@ def stage_judge(args, cli: ClaudeCLI) -> int:
         for r in load_jsonl(os.path.join(args.run_dir, "retrieval.jsonl"))
     }
     hyps = load_jsonl(os.path.join(args.run_dir, "hypotheses.jsonl"))
+    # Gold answers come from retrieval.jsonl, so it must be the file the reader read.
+    require_read_input(
+        args.run_dir,
+        "retrieval_sha256",
+        rows_fingerprint(list(by_id.values())),
+        "retrieval.jsonl",
+    )
     bind_stage(args.run_dir, "judge", model=args.judge)
     out = os.path.join(args.run_dir, "judge_labels.jsonl")
     existing = load_jsonl(out, missing_ok=True)

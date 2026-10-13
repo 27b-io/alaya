@@ -271,10 +271,23 @@ def rows_fingerprint(rows: list[dict]) -> str:
 
 def file_sha256(path: str) -> str:
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            h.update(block)
+    try:
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+    except OSError as e:
+        sys.exit(f"  cannot read {path}: {e}")
     return h.hexdigest()
+
+
+def require_read_input(run_dir: str, key: str, value: str, what: str) -> None:
+    """The judge scores against gold from the same input the reader read; a
+    changed file between the two stages would score answers to other questions."""
+    read = load_json(paths(run_dir)["calls"]).get("read", {})
+    if read.get(key) != value:
+        sys.exit(
+            f"  {what} is not the one this run's reader read ({key} differs); use the reader's input"
+        )
 
 
 def bind_stage(run_dir: str, stage: str, **config) -> None:
@@ -370,7 +383,11 @@ def stage_read(args, cli: ClaudeCLI) -> int:
 def stage_judge(args, cli: ClaudeCLI) -> int:
     data = load_dataset(args.data)
     hyps = load_jsonl(paths(args.run_dir)["hyp"])
-    bind_stage(args.run_dir, "judge", model=args.judge)
+    config = {"model": args.judge, "dataset_sha256": file_sha256(args.data)}
+    require_read_input(
+        args.run_dir, "dataset_sha256", config["dataset_sha256"], args.data
+    )
+    bind_stage(args.run_dir, "judge", **config)
     out = paths(args.run_dir)["labels"]
     existing = load_jsonl(out, missing_ok=True)
     check_labels(hyps, existing, out)
@@ -400,7 +417,7 @@ def stage_judge(args, cli: ClaudeCLI) -> int:
         }
 
     failures = run_parallel(todo, one, out, args.workers, "judge")
-    record_calls(args.run_dir, "judge", cli, model=args.judge)
+    record_calls(args.run_dir, "judge", cli, **config)
     return failures
 
 
@@ -447,6 +464,10 @@ def stage_report(args) -> dict:
     reader, judge = calls.get("read", {}), calls.get("judge", {})
     if not reader or not judge:
         sys.exit(f"  {p['calls']} lacks the read or judge stage")
+    if judge.get("dataset_sha256") != reader.get("dataset_sha256"):
+        sys.exit(
+            f"  {p['calls']}: the judge scored against a different dataset from the one the reader read"
+        )
     if reader.get("retrieval_sha256") != rows_fingerprint(retrieval):
         sys.exit(
             f"  {args.retrieval} is not the retrieval this run's reader read; pass that file"
