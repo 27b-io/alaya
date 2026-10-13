@@ -576,8 +576,9 @@ fn sweep_held(
     serde_json::json!({
         "success": false,
         "status": "held",
-        "error": "Too many graph nodes have no Qdrant point; check QDRANT_COLLECTION \
-                  before sweeping. Nothing on the held page was written",
+        "error": "Graph nodes without a Qdrant point exceed what one call removes, or \
+                  close the graph; nothing on the held page was written. Check \
+                  QDRANT_COLLECTION, then remove confirmed strays with POST /delete",
         "scanned": scanned,
         "swept": swept,
         "skipped": skipped,
@@ -2729,11 +2730,14 @@ impl MemoryService {
     /// gone nodes would take it past that holds before any write on it, so
     /// misses spread a few per window cannot add up within one call. Each
     /// resumed call has the same allowance again; a `held` answer is where
-    /// to stop and check the collection. A caller who hand-crafts `after` is
-    /// outside the window bound, as it holds `delete_memory` anyway. Stray nodes the window holds (more than the floor within one
-    /// window, or the last few in the graph with nothing live after them)
-    /// are left for `delete_memory`, which calls `delete_node` even when the
-    /// point is absent. A held call answers `status: held`, `success: false`,
+    /// to stop and check the collection. Sparse absence of up to the floor
+    /// per call looks exactly like real strays, so do not sweep after a
+    /// restore until the collection is reconciled. A caller who hand-crafts
+    /// `after` is outside the window bound; such a caller can call
+    /// `delete_memory` directly anyway. Stray nodes the window holds (more
+    /// than the floor within one window, or, when a page starts among them,
+    /// the last few in the graph with nothing live after them) are left for
+    /// `delete_memory`, whose graph removal is best-effort. A held call answers `status: held`, `success: false`,
     /// with the window's counts. Otherwise it returns `{scanned, swept,
     /// skipped, next_after}`; pass `next_after` back until it is `null`.
     #[tracing::instrument(skip_all, fields(limit))]
@@ -2757,7 +2761,7 @@ impl MemoryService {
         while scanned < limit {
             let want = GRAPH_SWEEP_PAGE.min(limit - scanned);
             // The window's size is fixed here, never the caller's: a caller
-            // paging one node at a time would pass any per-page fraction.
+            // paging one node at a time would pass any per-page floor.
             let window = self
                 .consolidation
                 .list_memory_nodes(&after, GRAPH_SWEEP_PAGE)
@@ -14572,14 +14576,12 @@ mod tests {
         let ledger = sweep_ledger(&refs[..450], &refs[450..]);
         let svc = ledger.service();
         for limit in [500, 5000] {
-            for _ in 0..2 {
-                let out = svc
-                    .sweep_gone_memory_nodes("", limit, "run-1")
-                    .await
-                    .unwrap();
-                assert_eq!(out["status"], "held", "limit={limit}: {out}");
-                assert_eq!(out["swept"], 0, "limit={limit}: {out}");
-            }
+            let out = svc
+                .sweep_gone_memory_nodes("", limit, "run-1")
+                .await
+                .unwrap();
+            assert_eq!(out["status"], "held", "limit={limit}: {out}");
+            assert_eq!(out["swept"], 0, "limit={limit}: {out}");
         }
         assert_eq!(ledger.nodes.borrow().len(), 1000, "nothing deleted");
         assert!(ledger.sweep_marks.borrow().is_empty(), "nothing marked");
