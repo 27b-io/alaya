@@ -182,6 +182,16 @@ const TAG_CACHE_TTL: f64 = 60.0;
 /// part of the answer (LAB-6896).
 const ENRICH_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long a search or `get_memory` waits for its `newer_related` lookup:
+/// one graph read, then one vector read when a result has a candidate.
+/// Past it the results go out without the pointer.
+const NEWER_RELATED_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Hashes per `newer_related` graph read: the bridge's
+/// `POST /contradictions/for` refuses more. Only a page bigger than this
+/// takes a second read.
+const NEWER_RELATED_CHUNK: usize = 500;
+
 /// Maximum number of memories to scan in `find_duplicates`. Embedding large
 /// batches blocks the LocalSet for tens of seconds. 200 memories = ~4 embedding
 /// batches of 64, keeping the total under ~10-20s instead of ~40s at 500.
@@ -391,6 +401,9 @@ pub struct MemoryService {
     pub vitals: std::sync::Arc<Vitals>,
     /// Which hybrid ranking boosts are on.
     pub ranking: RankingFlags,
+    /// The `newer_related` pointer's floor on the judge's
+    /// `verdict_confidence`; `None` turns the pointer off.
+    pub newer_related: Option<f64>,
     /// Cached (timestamp, tags) from `get_all_tags()`. RefCell is fine:
     /// MemoryService runs single-threaded on a LocalSet (`!Send`).
     tag_cache: RefCell<Option<(f64, Vec<String>)>>,
@@ -418,6 +431,7 @@ impl MemoryService {
             reranker: None,
             vitals: Default::default(),
             ranking: RankingFlags::default(),
+            newer_related: Some(crate::newer_related::DEFAULT_MIN_CONFIDENCE),
             tag_cache: RefCell::new(None),
             clock: current_timestamp,
         }
@@ -440,6 +454,12 @@ impl MemoryService {
     /// Builder: switch hybrid ranking boosts off.
     pub fn with_ranking(mut self, ranking: RankingFlags) -> Self {
         self.ranking = ranking;
+        self
+    }
+
+    /// Builder: the `newer_related` threshold, or `None` to turn it off.
+    pub fn with_newer_related(mut self, min_confidence: Option<f64>) -> Self {
+        self.newer_related = min_confidence;
         self
     }
 
@@ -470,6 +490,7 @@ impl MemoryService {
             reranker: None,
             vitals: Default::default(),
             ranking: RankingFlags::default(),
+            newer_related: Some(crate::newer_related::DEFAULT_MIN_CONFIDENCE),
             tag_cache: RefCell::new(None),
             clock,
         }
@@ -939,6 +960,13 @@ impl MemoryService {
             SearchMode::Tag => self.search_tag(&params).await?,
             SearchMode::Recent => self.search_recent(&params).await?,
         };
+        // Not under as_of: verdicts, resolution stamps and survivors are read as they are
+        // now and cannot be rewound, so a replay would name memories from after T.
+        if as_of.is_none()
+            && let Some(results) = result.get_mut("results").and_then(Value::as_array_mut)
+        {
+            self.add_newer_related(results).await;
+        }
         // Inject mode into every search response for caller context, and
         // echo as_of so a caller can tell a server that ignored it.
         if let Some(obj) = result.as_object_mut() {
@@ -3160,6 +3188,7 @@ impl MemoryService {
                 if matches!(output, OutputMode::Full | OutputMode::Both) {
                     add_supersession_audit(&mut v, &memory);
                 }
+                self.add_newer_related(std::slice::from_mut(&mut v)).await;
                 Ok(serde_json::json!({"found": true, "memory": v}))
             }
             None => Ok(serde_json::json!({
@@ -3167,6 +3196,110 @@ impl MemoryService {
                 "content_hash": content_hash,
             })),
         }
+    }
+
+    // ─── newer_related pointer ──────────────────────────────────────────
+
+    /// Adds `newer_related` to each formatted result that qualifies (see
+    /// [`crate::newer_related`]). Runs after ranking and touches no other
+    /// key, so order and scores are the same with it on or off. Never
+    /// fatal: a failed or slow lookup leaves every result without the key
+    /// and logs a warning.
+    async fn add_newer_related(&self, results: &mut [Value]) {
+        let Some(min) = self.newer_related else {
+            return;
+        };
+        if results.is_empty() {
+            return;
+        }
+        let lookup = self
+            .newer_related_for(results, min)
+            .instrument(tracing::info_span!(
+                "newer_related",
+                results = results.len()
+            ));
+        let found = match with_budget(NEWER_RELATED_BUDGET, lookup).await {
+            Some(Ok(found)) => found,
+            Some(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "newer_related lookup failed (non-fatal); results returned without it"
+                );
+                return;
+            }
+            None => {
+                tracing::warn!(
+                    budget_ms = NEWER_RELATED_BUDGET.as_millis() as u64,
+                    "newer_related lookup ran past its budget (non-fatal); \
+                     results returned without it"
+                );
+                return;
+            }
+        };
+        for v in results {
+            let Some(hash) = v.get("content_hash").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(pointer) = found.get(hash).filter(|p| !p.is_empty()) else {
+                continue;
+            };
+            let pointer = crate::newer_related::to_value(pointer);
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(crate::newer_related::KEY.into(), pointer);
+            }
+        }
+    }
+
+    /// The pointer per result hash. Pure reads: one graph read per
+    /// `NEWER_RELATED_CHUNK` results, then one vector read for every
+    /// candidate survivor on the page.
+    async fn newer_related_for(
+        &self,
+        results: &[Value],
+        min: f64,
+    ) -> Result<HashMap<String, Vec<(String, f64)>>> {
+        use crate::newer_related::{Hit, graph_candidates, pointer};
+
+        let hits: Vec<Hit> = results
+            .iter()
+            .filter_map(Hit::from_result)
+            .filter(|h| !h.superseded)
+            .collect();
+        let hashes: Vec<&str> = hits.iter().map(|h| h.hash).collect();
+        let mut refs = HashMap::new();
+        for chunk in hashes.chunks(NEWER_RELATED_CHUNK) {
+            refs.extend(self.graph.get_contradictions_for_hashes(chunk).await?);
+        }
+        let candidates: Vec<(&Hit, HashMap<String, f64>)> = hits
+            .iter()
+            .map(|h| {
+                (
+                    h,
+                    graph_candidates(refs.get(h.hash).map_or(&[], Vec::as_slice), min),
+                )
+            })
+            .filter(|(_, c)| !c.is_empty())
+            .collect();
+        if candidates.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut wanted: Vec<&str> = candidates
+            .iter()
+            .flat_map(|(_, c)| c.keys().map(String::as_str))
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let survivors: HashMap<String, Memory> = self
+            .vectors
+            .get_batch(&wanted)
+            .await?
+            .into_iter()
+            .map(|m| (m.content_hash.clone(), m))
+            .collect();
+        Ok(candidates
+            .into_iter()
+            .map(|(h, c)| (h.hash.to_string(), pointer(h, &c, &survivors)))
+            .collect())
     }
 }
 
@@ -3374,7 +3507,7 @@ fn supersession_marker(m: &Memory) -> Option<&Value> {
 /// `PayloadFilter.exclude_superseded` flag is a documented no-op in the
 /// Qdrant backend because `is_null` on nested payload fields is unreliable
 /// without an explicit payload index (issue #30, repo CLAUDE.md).
-fn is_superseded(m: &Memory) -> bool {
+pub(crate) fn is_superseded(m: &Memory) -> bool {
     supersession_marker(m).is_some()
 }
 
@@ -10811,6 +10944,22 @@ mod tests {
         /// Another writer supersedes the memory to this hash right AFTER a
         /// reversal lands: marker, then edge.
         resupersede_after: RefCell<Option<String>>,
+        /// Judge verdicts on CONTRADICTS edges, (src, dst).
+        verdicts: RefCell<HashMap<(String, String), alaya_types::graph::EdgeVerdict>>,
+        /// `get_contradictions_for_hashes` answers, fails, or never answers.
+        contradictions_read: Cell<LedgerRead>,
+        /// `get_contradictions_for_hashes` calls.
+        contradiction_reads: Cell<usize>,
+        /// Every write call either backend took, whatever it changed.
+        writes: Cell<usize>,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    enum LedgerRead {
+        #[default]
+        Answers,
+        Fails,
+        Hangs,
     }
 
     impl Ledger {
@@ -10873,6 +11022,7 @@ mod tests {
         }
 
         fn graph_write(&self) -> Result<()> {
+            self.writes.set(self.writes.get() + 1);
             if self.graph_down.get() {
                 return Err(AlayaError::Graph("ledger graph down".into()));
             }
@@ -10891,6 +11041,7 @@ mod tests {
             r: &ReversalRecord,
         ) -> Result<ReversalOutcome> {
             let l = &self.0;
+            l.writes.set(l.writes.get() + 1);
             if let Some(other) = l.resupersede.borrow_mut().take() {
                 l.set_marker(h, Some(serde_json::json!(other)));
             }
@@ -10969,6 +11120,7 @@ mod tests {
             self.update_metadata_batch(&[h], u).await
         }
         async fn update_metadata_batch(&self, hashes: &[&str], u: MetadataUpdate) -> Result<()> {
+            self.0.writes.set(self.0.writes.get() + 1);
             for h in hashes {
                 if self.get_by_hash(h).await?.is_none() {
                     return Err(AlayaError::NotFound((*h).into()));
@@ -11033,6 +11185,7 @@ mod tests {
             Ok(vec![])
         }
         async fn increment_access_count(&self, _h: &str) -> Result<()> {
+            self.0.writes.set(self.0.writes.get() + 1);
             Ok(())
         }
         async fn health(&self) -> Result<HealthStatus> {
@@ -11168,9 +11321,36 @@ mod tests {
         }
         async fn get_contradictions_for_hashes(
             &self,
-            _h: &[&str],
+            hashes: &[&str],
         ) -> Result<HashMap<String, Vec<ContradictionRef>>> {
-            Ok(HashMap::new())
+            let l = &self.0;
+            l.contradiction_reads.set(l.contradiction_reads.get() + 1);
+            match l.contradictions_read.get() {
+                LedgerRead::Answers => {}
+                LedgerRead::Fails => return Err(AlayaError::Graph("ledger read failed".into())),
+                LedgerRead::Hangs => std::future::pending::<()>().await,
+            }
+            let superseded = |h: &str| l.supersedes.borrow().iter().any(|(_, d)| d == h);
+            let mut out: HashMap<String, Vec<ContradictionRef>> = HashMap::new();
+            for ((src, dst), stamp) in l.contradicts.borrow().iter() {
+                for (mine, other) in [(src, dst), (dst, src)] {
+                    if !hashes.contains(&mine.as_str()) {
+                        continue;
+                    }
+                    out.entry(mine.clone()).or_default().push(ContradictionRef {
+                        contradicts_hash: other.clone(),
+                        confidence: Some(0.7),
+                        verdict: l
+                            .verdicts
+                            .borrow()
+                            .get(&(src.clone(), dst.clone()))
+                            .cloned(),
+                        resolved: stamp.is_some(),
+                        endpoint_superseded: superseded(src) || superseded(dst),
+                    });
+                }
+            }
+            Ok(out)
         }
         async fn get_neighbors(
             &self,
@@ -11748,5 +11928,411 @@ mod tests {
         for seen in visible(&svc).await {
             assert_eq!(seen, set_of(&[&a]));
         }
+    }
+
+    // ─── newer_related pointer ──────────────────────────────────────────
+    //
+    // The ledger plays both backends. Its memories are created in order, so
+    // in `Ledger::with(&[a, b])` b is the newer one.
+
+    /// Record a CONTRADICTS edge `src -> dst` judged `verdict` with
+    /// `survivor` at `confidence`.
+    fn judged(ledger: &Ledger, src: &str, dst: &str, verdict: Verdict, survivor: &str, c: f64) {
+        let key = (src.to_string(), dst.to_string());
+        ledger.contradicts.borrow_mut().insert(key.clone(), None);
+        ledger.verdicts.borrow_mut().insert(
+            key,
+            alaya_types::graph::EdgeVerdict {
+                verdict,
+                verdict_survivor: Some(survivor.into()),
+                verdict_reason: "the newer one replaces it".into(),
+                verdict_confidence: c,
+                verdict_model: "m".into(),
+                judged_at: 1.0,
+            },
+        );
+    }
+
+    fn fixed_clock() -> f64 {
+        2_000_000.0
+    }
+
+    /// The ledger's service on a fixed clock, so two searches score alike.
+    fn ledger_svc(ledger: &Rc<Ledger>) -> MemoryService {
+        let mut svc = ledger.service();
+        svc.clock = fixed_clock;
+        svc
+    }
+
+    async fn page(
+        svc: &MemoryService,
+        mode: SearchMode,
+        output: OutputMode,
+        read_only: bool,
+    ) -> Vec<Value> {
+        let params = SearchParams {
+            query: "watchdog sidecar".into(),
+            mode,
+            page: 1,
+            page_size: 10,
+            tags: Some(vec!["watchdog".into()]),
+            match_all: false,
+            k: 10,
+            min_similarity: None,
+            memory_type: None,
+            encoding_context: None,
+            include_superseded: true,
+            min_trust_score: None,
+            output,
+            cursor: None,
+        };
+        svc.search_with(params, read_only, None)
+            .await
+            .expect("search succeeds")["results"]
+            .as_array()
+            .expect("results array")
+            .clone()
+    }
+
+    /// `newer_related` of `hash` in `results`; `None` when the key is absent.
+    fn pointer_on(results: &[Value], hash: &str) -> Option<Value> {
+        let hit = results
+            .iter()
+            .find(|r| r["content_hash"] == hash)
+            .unwrap_or_else(|| panic!("{hash} not in results"));
+        hit.get("newer_related").cloned()
+    }
+
+    async fn fetched_pointer(svc: &MemoryService, hash: &str, output: OutputMode) -> Option<Value> {
+        let v = svc.get_memory(hash, output).await.expect("get_memory");
+        v["memory"].get("newer_related").cloned()
+    }
+
+    const ALL_OUTPUTS: [OutputMode; 3] = [OutputMode::Full, OutputMode::Summary, OutputMode::Both];
+
+    /// AC-1 + AC-3: the loser names the survivor in every search mode and
+    /// output mode and in `get_memory`; the survivor carries no key.
+    #[tokio::test(flavor = "current_thread")]
+    async fn newer_related_names_the_survivor_everywhere_a_result_is_formatted() {
+        let (old, new) = (h('a'), h('b'));
+        let ledger = Ledger::with(&[&old, &new]);
+        // The detector writes (new)-[:CONTRADICTS]->(existing).
+        judged(&ledger, &new, &old, Verdict::Supersession, &new, 0.95);
+        let svc = ledger_svc(&ledger);
+        let want = serde_json::json!([{ "content_hash": new, "verdict_confidence": 0.95 }]);
+
+        for mode in ALL_MODES {
+            for output in ALL_OUTPUTS {
+                let results = page(&svc, mode, output, true).await;
+                assert_eq!(
+                    pointer_on(&results, &old),
+                    Some(want.clone()),
+                    "{mode:?} {output:?}"
+                );
+                assert_eq!(pointer_on(&results, &new), None, "{mode:?} {output:?}");
+            }
+        }
+        for output in ALL_OUTPUTS {
+            assert_eq!(
+                fetched_pointer(&svc, &old, output).await,
+                Some(want.clone())
+            );
+            assert_eq!(fetched_pointer(&svc, &new, output).await, None);
+        }
+    }
+
+    /// Several survivors list highest confidence first.
+    #[tokio::test(flavor = "current_thread")]
+    async fn newer_related_lists_survivors_highest_confidence_first() {
+        let (old, s1, s2) = (h('a'), h('b'), h('c'));
+        let ledger = Ledger::with(&[&old, &s1, &s2]);
+        judged(&ledger, &s1, &old, Verdict::Supersession, &s1, 0.91);
+        judged(&ledger, &s2, &old, Verdict::Supersession, &s2, 0.98);
+        let svc = ledger_svc(&ledger);
+        assert_eq!(
+            fetched_pointer(&svc, &old, OutputMode::Full).await,
+            Some(serde_json::json!([
+                { "content_hash": s2, "verdict_confidence": 0.98 },
+                { "content_hash": s1, "verdict_confidence": 0.91 },
+            ]))
+        );
+    }
+
+    /// AC-2: no pointer where it would mislead. Each case starts from the
+    /// qualifying pair of the test above and breaks one condition.
+    #[tokio::test(flavor = "current_thread")]
+    async fn newer_related_is_absent_where_it_would_mislead() {
+        type Breaker = fn(&Ledger, &str, &str);
+        let cases: [(&str, Breaker); 12] = [
+            ("keep_both on the judged edge", |l, old, new| {
+                l.contradicts.borrow_mut().insert(
+                    (new.into(), old.into()),
+                    Some(("operator:console".into(), 1.0)),
+                );
+            }),
+            ("keep_both on the reverse edge", |l, old, new| {
+                l.contradicts
+                    .borrow_mut()
+                    .insert((old.into(), new.into()), Some(("operator:mcp".into(), 1.0)));
+            }),
+            ("stamped by memory_unsupersede", |l, old, new| {
+                l.contradicts
+                    .borrow_mut()
+                    .insert((new.into(), old.into()), Some(("unsupersede".into(), 1.0)));
+            }),
+            ("survivor superseded by edge", |l, _, new| {
+                l.supersedes.borrow_mut().push((h('z'), new.into()));
+            }),
+            ("survivor superseded by marker", |l, _, new| {
+                l.set_marker(new, Some(serde_json::json!(h('z'))));
+            }),
+            ("result superseded by edge", |l, old, _| {
+                l.supersedes.borrow_mut().push((h('z'), old.into()));
+            }),
+            ("result superseded by marker", |l, old, _| {
+                l.set_marker(old, Some(serde_json::json!(h('z'))));
+            }),
+            ("survivor deleted", |l, _, new| {
+                l.memories.borrow_mut().retain(|m| m.content_hash != new);
+            }),
+            ("survivor created before the result", |l, _, new| {
+                let mut mems = l.memories.borrow_mut();
+                mems.iter_mut()
+                    .find(|m| m.content_hash == new)
+                    .unwrap()
+                    .created_at = 1.0;
+            }),
+            ("confidence below the threshold", |l, old, new| {
+                let mut v = l.verdicts.borrow_mut();
+                v.get_mut(&(new.to_string(), old.to_string()))
+                    .unwrap()
+                    .verdict_confidence = 0.89;
+            }),
+            ("verdict names the result as survivor", |l, old, new| {
+                let mut v = l.verdicts.borrow_mut();
+                v.get_mut(&(new.to_string(), old.to_string()))
+                    .unwrap()
+                    .verdict_survivor = Some(old.into());
+            }),
+            ("verdict is not supersession", |_, _, _| {}),
+        ];
+        for (name, breaker) in cases {
+            let verdicts: &[Verdict] = if name == "verdict is not supersession" {
+                &[
+                    Verdict::Contradiction,
+                    Verdict::Coexist,
+                    Verdict::Unrelated,
+                    Verdict::Unjudged,
+                ]
+            } else {
+                &[Verdict::Supersession]
+            };
+            for verdict in verdicts {
+                let (old, new) = (h('a'), h('b'));
+                let ledger = Ledger::with(&[&old, &new]);
+                judged(&ledger, &new, &old, *verdict, &new, 0.95);
+                breaker(&ledger, &old, &new);
+                let svc = ledger_svc(&ledger);
+                assert_eq!(
+                    fetched_pointer(&svc, &old, OutputMode::Full).await,
+                    None,
+                    "{name} {verdict:?}"
+                );
+                for mode in ALL_MODES {
+                    let results = page(&svc, mode, OutputMode::Full, true).await;
+                    if results.iter().any(|r| r["content_hash"] == old) {
+                        assert_eq!(
+                            pointer_on(&results, &old),
+                            None,
+                            "{name} {verdict:?} {mode:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// AC-4: with the pointer on and off, every mode returns the same hashes
+    /// in the same order with the same scores, and the lookup takes no write
+    /// of its own. Read-only, nothing is written at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn newer_related_changes_no_rank_score_or_write() {
+        let hashes: Vec<String> = ['a', 'b', 'c', 'd'].into_iter().map(h).collect();
+        let refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
+        let ledger = Ledger::with(&refs);
+        judged(
+            &ledger,
+            &hashes[3],
+            &hashes[0],
+            Verdict::Supersession,
+            &hashes[3],
+            0.95,
+        );
+        let on = ledger_svc(&ledger);
+        let off = ledger_svc(&ledger).with_newer_related(None);
+        let ranked = |results: &[Value]| -> Vec<(Value, Value)> {
+            results
+                .iter()
+                .map(|r| (r["content_hash"].clone(), r["score"].clone()))
+                .collect()
+        };
+
+        for mode in ALL_MODES {
+            for read_only in [true, false] {
+                let (w0, r0) = (ledger.writes.get(), ledger.contradiction_reads.get());
+                let with = page(&on, mode, OutputMode::Full, read_only).await;
+                let (w1, r1) = (ledger.writes.get(), ledger.contradiction_reads.get());
+                let without = page(&off, mode, OutputMode::Full, read_only).await;
+                let (w2, r2) = (ledger.writes.get(), ledger.contradiction_reads.get());
+
+                assert_eq!(
+                    ranked(&with),
+                    ranked(&without),
+                    "{mode:?} read_only={read_only}"
+                );
+                assert!(
+                    pointer_on(&with, &hashes[0]).is_some(),
+                    "{mode:?}: lookup did not run"
+                );
+                assert_eq!(
+                    (r1 - r0, r2 - r1),
+                    (1, 0),
+                    "{mode:?}: one graph read, only when on"
+                );
+                assert_eq!(
+                    w1 - w0,
+                    w2 - w1,
+                    "{mode:?} read_only={read_only}: lookup wrote"
+                );
+                if read_only {
+                    assert_eq!(w1 - w0, 0, "{mode:?}: a read-only search wrote");
+                }
+            }
+        }
+        let w0 = ledger.writes.get();
+        assert!(
+            fetched_pointer(&on, &hashes[0], OutputMode::Full)
+                .await
+                .is_some()
+        );
+        assert_eq!(ledger.writes.get(), w0, "get_memory wrote");
+    }
+
+    /// AC-5: a failed or hung graph read never fails the call. Results come
+    /// back unchanged and without the key, the hang is cut at the budget,
+    /// and a warning records each.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn newer_related_lookup_failure_or_overrun_is_non_fatal() {
+        let (old, new) = (h('a'), h('b'));
+        for (read, message) in [
+            (
+                LedgerRead::Fails,
+                "newer_related lookup failed (non-fatal); results returned without it",
+            ),
+            (
+                LedgerRead::Hangs,
+                "newer_related lookup ran past its budget (non-fatal); results returned without it",
+            ),
+        ] {
+            let ledger = Ledger::with(&[&old, &new]);
+            judged(&ledger, &new, &old, Verdict::Supersession, &new, 0.95);
+            ledger.contradictions_read.set(read);
+            let svc = ledger_svc(&ledger);
+
+            let started = tokio::time::Instant::now();
+            let (results, events) = captured(
+                "alaya_core::service",
+                page(&svc, SearchMode::Hybrid, OutputMode::Full, true),
+            )
+            .await;
+            assert!(started.elapsed() <= NEWER_RELATED_BUDGET);
+            assert_eq!(results.len(), 2);
+            assert!(results.iter().all(|r| r.get("newer_related").is_none()));
+            let warns = events
+                .iter()
+                .filter(|e| e.get("message").map(String::as_str) == Some(message))
+                .count();
+            assert_eq!(warns, 1, "{events:?}");
+
+            let fetched = svc
+                .get_memory(&old, OutputMode::Full)
+                .await
+                .expect("get_memory");
+            assert_eq!(fetched["found"], true);
+            assert!(fetched["memory"].get("newer_related").is_none());
+        }
+    }
+
+    /// An `as_of` replay never carries the pointer: verdicts, stamps and
+    /// survivors are read as they are now, so it would name memories from
+    /// after T. The same search without `as_of` does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn newer_related_is_absent_from_an_as_of_replay() {
+        let (old, new) = (h('a'), h('b'));
+        let ledger = Ledger::with(&[&old, &new]);
+        judged(&ledger, &new, &old, Verdict::Supersession, &new, 0.95);
+        let svc = ledger_svc(&ledger);
+        let params = SearchParams {
+            query: "watchdog sidecar".into(),
+            mode: SearchMode::Hybrid,
+            page: 1,
+            page_size: 10,
+            tags: None,
+            match_all: false,
+            k: 10,
+            min_similarity: None,
+            memory_type: None,
+            encoding_context: None,
+            include_superseded: true,
+            min_trust_score: None,
+            output: OutputMode::Full,
+            cursor: None,
+        };
+        let replay = svc
+            .search_with(params, true, Some(1_500_000.0))
+            .await
+            .expect("replay succeeds");
+        let replayed = replay["results"].as_array().expect("results");
+        assert!(!replayed.is_empty());
+        assert!(replayed.iter().all(|r| r.get("newer_related").is_none()));
+        assert_eq!(
+            ledger.contradiction_reads.get(),
+            0,
+            "a replay reads no verdicts"
+        );
+
+        let now = page(&svc, SearchMode::Hybrid, OutputMode::Full, true).await;
+        assert!(pointer_on(&now, &old).is_some());
+    }
+
+    /// Off, the lookup does not run at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn newer_related_off_reads_nothing() {
+        let (old, new) = (h('a'), h('b'));
+        let ledger = Ledger::with(&[&old, &new]);
+        judged(&ledger, &new, &old, Verdict::Supersession, &new, 0.95);
+        let svc = ledger_svc(&ledger).with_newer_related(None);
+        let results = page(&svc, SearchMode::Hybrid, OutputMode::Full, true).await;
+        assert_eq!(pointer_on(&results, &old), None);
+        assert_eq!(fetched_pointer(&svc, &old, OutputMode::Full).await, None);
+        assert_eq!(ledger.contradiction_reads.get(), 0);
+    }
+
+    /// A custom threshold moves the floor both ways.
+    #[tokio::test(flavor = "current_thread")]
+    async fn newer_related_threshold_is_configurable() {
+        let (old, new) = (h('a'), h('b'));
+        let ledger = Ledger::with(&[&old, &new]);
+        judged(&ledger, &new, &old, Verdict::Supersession, &new, 0.85);
+        assert_eq!(
+            fetched_pointer(&ledger_svc(&ledger), &old, OutputMode::Full).await,
+            None
+        );
+        let lowered = ledger_svc(&ledger).with_newer_related(Some(0.8));
+        assert!(
+            fetched_pointer(&lowered, &old, OutputMode::Full)
+                .await
+                .is_some()
+        );
     }
 }

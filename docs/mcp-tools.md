@@ -95,7 +95,19 @@ The one retrieval tool. Mode selects the algorithm.
 | `recent` | Reverse chronological. Use `cursor` to paginate. |
 | `scan` | Full collection scan, ordered by creation time. Expensive — use only for admin / migration. |
 
-**Returns:** array of `{ content_hash, content, similarity, summary?, metadata, ... }`.
+**Returns:** an object whose `results` array holds the memories in rank order, plus paging fields that depend on the mode, plus `mode`:
+
+| Mode | Envelope keys besides `results` and `mode` |
+|:--|:--|
+| `hybrid` | `page`, `total`, `page_size`, `has_more`, `total_pages` |
+| `scan` | `page`, `page_size`, `has_more`, `count` |
+| `similar` | `total` |
+| `tag` | `page`, `page_size`, `has_more`, `count` |
+| `recent` | `page_size`, `has_more`, `next_cursor` (absent on an empty page) |
+
+Each result carries `content_hash`, `tags`, `memory_type`, `metadata`, `created_at` and `updated_at` (epoch seconds), `salience_score`, `score` (the rank score; `1.0` in `scan` and `recent`), `provenance` and `access_count`. `output` adds `content` (`full`), `summary` (`summary`, falling back to the first 200 characters of content), or both (`both`).
+
+A result may also carry **`newer_related`**: `[{ "content_hash", "verdict_confidence" }]`, highest confidence first. Each entry is a newer memory that the server's contradiction judge, an LLM, picked over this one, with `verdict_confidence` at or above the server's threshold (`NEWER_RELATED_MIN_CONFIDENCE`, default `0.90`). Nobody has reviewed that pick. **Read both memories:** this one often holds detail the newer one lacks, so the pointer is a reason to fetch the other memory, never a reason to drop this one. An entry is listed only while the pair is unresolved (no [`resolve_contradiction`](#resolve_contradiction) keep-both stamp, in either direction), neither memory has been through [`memory_supersede`](#memory_supersede), and the listed memory still exists and was created after this one. The key is absent when nothing qualifies, so a result without it looks exactly as before. It changes no rank or score, and looking it up writes nothing. A server can turn it off (`NEWER_RELATED=false`); a failed or slow lookup also leaves it off for that response, and the search still answers. [`get_memory`](#get_memory) carries the same key.
 
 **Example:**
 
@@ -124,6 +136,8 @@ Fetch a single memory by its exact hash. Returns `{"found": false}` if it doesn'
 With `full` or `both` output, a superseded memory also carries `memory.supersession_reason`: the reason given to [`memory_supersede`](#memory_supersede) or [`merge_duplicates`](#merge_duplicates), as stored (`""` when none was given). The key is absent when no reason is stored, which includes every memory that is not superseded, since [`memory_unsupersede`](#memory_unsupersede) moves the reason into the log below. `summary` output and `search` results never carry it.
 
 With `full` or `both` output, a memory whose supersession was ever reversed also carries `memory.supersession_log`: its audit trail, oldest first, one entry per [`memory_unsupersede`](#memory_unsupersede) in the shape documented there. Entries come back in stored order; a stored value that is not an array comes back as one entry. A memory never reversed has no `supersession_log` key, and `summary` output and `search` results never carry it.
+
+In every output mode, the memory may carry `memory.newer_related`, exactly as on a [`search`](#search) result: newer memories the contradiction judge picked over this one, unreviewed. Read both.
 
 **Use when** you already hold a hash — typically from a `search` result, a `memory_contradictions` pair, or a `find_duplicates` cluster — and want to re-inspect it without searching again.
 
