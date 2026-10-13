@@ -2717,13 +2717,16 @@ impl MemoryService {
     /// was gone. `token` must be unique per run. A node whose hash is
     /// malformed is never touched (`skipped`).
     ///
-    /// Two holds keep a wrong or empty collection from wiping the graph,
-    /// whatever `after` and `limit` the caller picks. Every call first
-    /// probes the head of the graph, its first `GRAPH_SWEEP_PAGE` nodes in
-    /// hash order, and holds before any write when every probed node is
-    /// gone or `too_many_gone` says so. Then each page is held the same
-    /// way by `too_many_gone`, before anything on it is written. A held call
-    /// answers `status: held`, `success: false`, with the held page's counts.
+    /// A hold keeps a wrong, empty or partly restored collection from
+    /// wiping the graph, whatever `after` and `limit` the caller picks: each
+    /// page is judged on a window of the next `GRAPH_SWEEP_PAGE` nodes from
+    /// its own start, never on the caller's page size, and holds before any
+    /// write when every node in the window is gone or `too_many_gone` says
+    /// so. A gone run of any length therefore holds from wherever a page
+    /// starts in it. The cost: stray nodes that are the last few in the
+    /// graph, with nothing live after them, are never swept; remove those
+    /// by hand. A held call answers `status: held`, `success: false`, with
+    /// the window's counts.
     /// Otherwise it returns `{scanned, swept, skipped, next_after}`; pass
     /// `next_after` back until it is `null`.
     #[tracing::instrument(skip_all, fields(limit))]
@@ -2741,40 +2744,47 @@ impl MemoryService {
         if token.is_empty() {
             return Err(AlayaError::Validation("a sweep token is required".into()));
         }
-        // The probe's page size is fixed here, never the caller's: a caller
-        // paging one node at a time would pass any per-page fraction.
-        let head = self
-            .consolidation
-            .list_memory_nodes("", GRAPH_SWEEP_PAGE)
-            .await?;
-        let (valid, missing) = self.missing_points(&head).await?;
-        if !missing.is_empty() && (missing.len() == valid || too_many_gone(missing.len(), valid)) {
-            return Ok(sweep_held("", 0, 0, 0, valid, missing.len()));
-        }
         let mut after = after.to_string();
         let (mut scanned, mut swept, mut skipped) = (0, 0, 0);
         let mut done = false;
         while scanned < limit {
             let want = GRAPH_SWEEP_PAGE.min(limit - scanned);
-            let page = self.consolidation.list_memory_nodes(&after, want).await?;
+            // The window's size is fixed here, never the caller's: a caller
+            // paging one node at a time would pass any per-page fraction.
+            let window = self
+                .consolidation
+                .list_memory_nodes(&after, GRAPH_SWEEP_PAGE)
+                .await?;
+            let page = &window[..want.min(window.len())];
             let Some(last) = page.last() else {
                 done = true;
                 break;
             };
-            let (valid_count, missing) = self.missing_points(&page).await?;
-            if too_many_gone(missing.len(), valid_count) {
+            let (window_valid, window_missing) = self.missing_points(&window).await?;
+            let held = window_missing.len() == window_valid
+                || too_many_gone(window_missing.len(), window_valid);
+            if !window_missing.is_empty() && held {
                 return Ok(sweep_held(
                     &after,
                     scanned,
                     swept,
                     skipped,
-                    valid_count,
-                    missing.len(),
+                    window_valid,
+                    window_missing.len(),
                 ));
             }
+            // Hash order: the page is the window's prefix up to `last`.
+            let missing: Vec<&str> = window_missing
+                .into_iter()
+                .filter(|h| *h <= last.as_str())
+                .collect();
+            let page_valid = page
+                .iter()
+                .filter(|h| alaya_types::memory::validate_content_hash(h))
+                .count();
             after = last.clone();
             scanned += page.len();
-            skipped += page.len() - valid_count;
+            skipped += page.len() - page_valid;
             if !missing.is_empty() {
                 self.consolidation
                     .mark_memory_nodes(&missing, token)
@@ -14552,13 +14562,13 @@ mod tests {
     }
 
     /// Against an empty or wrong collection, no `limit` or `after` gets a
-    /// node deleted: the fixed-size probe of the graph's head holds every
-    /// call, one-node pages and short last pages included (Helly R).
+    /// node deleted: the fixed-size window holds every call, one-node pages
+    /// and short last pages included (Helly R).
     #[tokio::test(flavor = "current_thread")]
     async fn graph_sweep_holds_whatever_the_caller_pages() {
         for graph in [2, 12] {
             let ledger = Ledger::with(&[]);
-            let hashes: Vec<String> = ('a'..='z').take(graph).map(h).collect();
+            let hashes: Vec<String> = (0..graph as u32).map(|i| format!("{i:064x}")).collect();
             for x in &hashes {
                 ledger.nodes.borrow_mut().insert(x.clone());
             }
@@ -14571,8 +14581,14 @@ mod tests {
                         .sweep_gone_memory_nodes(after, limit, "run-1")
                         .await
                         .unwrap();
+                    // Past the last node there is nothing to judge or delete.
+                    let want = if after == hashes.last().unwrap() {
+                        Value::Null
+                    } else {
+                        serde_json::json!("held")
+                    };
                     assert_eq!(
-                        out["status"], "held",
+                        out["status"], want,
                         "graph={graph} after={after} limit={limit}: {out}"
                     );
                     assert_eq!(out["swept"], 0);
@@ -14583,10 +14599,58 @@ mod tests {
         }
     }
 
+    /// A gone run past the head of the graph (a partly restored collection)
+    /// holds too: one-node pages from the run's start, or from anywhere in
+    /// it, never delete a node of it (Helly R at 910db03).
+    #[tokio::test(flavor = "current_thread")]
+    async fn graph_sweep_holds_a_gone_run_deep_in_the_graph() {
+        let hashes: Vec<String> = (0..1000u32).map(|i| format!("{i:064x}")).collect();
+        let refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
+        let ledger = sweep_ledger(&refs[..500], &refs[500..]);
+        let svc = ledger.service();
+        for start in [499, 500, 750, 996, 998] {
+            let mut after = hashes[start].clone();
+            for _ in 0..5 {
+                let out = svc
+                    .sweep_gone_memory_nodes(&after, 1, "run-1")
+                    .await
+                    .unwrap();
+                assert_eq!(out["status"], "held", "start={start}: {out}");
+                let Some(next) = out["next_after"].as_str() else {
+                    break;
+                };
+                after = next.to_string();
+            }
+        }
+        assert_eq!(ledger.nodes.borrow().len(), 1000, "nothing deleted");
+        assert!(ledger.sweep_marks.borrow().is_empty(), "nothing marked");
+    }
+
+    /// A mostly-gone stretch with a live node every fourth (a restore that
+    /// kept a few points) holds too: a 4-node page with 3 gone passes any
+    /// per-page rule, but the fixed window it starts sees three quarters gone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn graph_sweep_judges_a_small_page_on_the_full_window() {
+        let hashes: Vec<String> = (0..400u32).map(|i| format!("{i:064x}")).collect();
+        let (mut live, mut gone) = (Vec::new(), Vec::new());
+        for (i, x) in hashes.iter().enumerate() {
+            if i % 4 == 3 {
+                live.push(x.as_str())
+            } else {
+                gone.push(x.as_str())
+            }
+        }
+        let ledger = sweep_ledger(&live, &gone);
+        let svc = ledger.service();
+        let out = svc.sweep_gone_memory_nodes("", 4, "run-1").await.unwrap();
+        assert_eq!(out["status"], "held", "{out}");
+        assert_eq!(ledger.nodes.borrow().len(), 400, "nothing deleted");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn graph_sweep_pages_by_limit_and_never_touches_a_malformed_hash() {
-        let (a, b, c) = (h('a'), h('b'), h('c'));
-        let ledger = sweep_ledger(&[&a], &[&b, &c]);
+        let (a, b, c, d) = (h('a'), h('b'), h('c'), h('d'));
+        let ledger = sweep_ledger(&[&a, &d], &[&b, &c]);
         ledger.nodes.borrow_mut().insert("not-a-hash".to_string());
         let svc = ledger.service();
 
@@ -14598,7 +14662,7 @@ mod tests {
             .sweep_gone_memory_nodes(first["next_after"].as_str().unwrap(), 100, "run-2")
             .await
             .unwrap();
-        assert_eq!(rest["scanned"], 2, "{rest}");
+        assert_eq!(rest["scanned"], 3, "{rest}");
         assert_eq!(rest["swept"], 1);
         assert_eq!(rest["skipped"], 1);
         assert_eq!(rest["next_after"], Value::Null);
@@ -14608,8 +14672,8 @@ mod tests {
                 nodes.contains("not-a-hash"),
                 "a malformed hash is never swept"
             );
-            assert!(nodes.contains(&a));
-            assert_eq!(nodes.len(), 2);
+            assert!(nodes.contains(&a) && nodes.contains(&d));
+            assert_eq!(nodes.len(), 3);
         }
 
         for (limit, token) in [(0, "t"), (MAX_GRAPH_SWEEP_LIMIT + 1, "t"), (1, "")] {
