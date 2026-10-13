@@ -55,6 +55,8 @@ Failed auth returns `401 Unauthorized` with a `WWW-Authenticate: Bearer …` hea
 | `POST` | `/relation` | Manage graph edges | yes |
 | `POST` | `/supersede` | Mark old → new | yes |
 | `POST` | `/unsupersede` | Reverse a supersession | yes |
+| `POST` | `/memories/{content_hash}/confirm` | Record that a memory was re-checked and still holds | yes |
+| `POST` | `/memories/{content_hash}/refute` | File a correction against a wrong memory | yes |
 | `POST` | `/contradictions` | List contradiction pairs with judge verdicts | yes |
 | `POST` | `/contradictions/resolution` | Keep both memories of a pair, or undo that | yes |
 | `POST` | `/duplicates/find` | Scan for near-duplicates | yes |
@@ -185,13 +187,16 @@ Content-Type: application/json
   "content": "Migrated frontend from npm to pnpm because of lockfile churn.",
   "tags": ["frontend", "tooling"],
   "memory_type": "decision",
-  "metadata": {"importance": 0.7}
+  "metadata": {"importance": 0.7},
+  "citations": ["27b-io/alaya@4d63bad:README.md:12-20"]
 }
 ```
 
-Required: `content`. Optional: `tags`, `memory_type` (`note`|`decision`|`task`|`reference`), `metadata`, `client_hostname`, `summary`, `dedup_threshold`.
+Required: `content`. Optional: `tags`, `memory_type` (`note`|`decision`|`task`|`reference`), `metadata`, `client_hostname`, `summary`, `dedup_threshold`, `citations`.
 
-Two metadata keys are reserved, and a request carrying either, with any value, returns `400` and stores nothing: `metadata.superseded_by` (the server sets it on supersede and merge) and `metadata.nearest_similarity` (reserved only: the server never writes it, and records the store's novelty in its own root-level `nearest_similarity` field, below).
+`citations` lists the sources the memory rests on: at most 10 strings of at most 500 characters, each either `<owner>/<repo>@<sha>:<path>`, optionally followed by `:<line>` or `:<line>-<line>`, with a 7- to 40-character hex sha, or an `https://` URL with a host (a PR, an issue comment). The server stores them at `metadata.citations`, so every read returns them in the memory's `metadata`. A caller may set `metadata.citations` directly instead; it gets the same check. Setting both, or a malformed citation, returns `400` and stores nothing. The server does not fetch or check a citation's target: checking it at use is the reader's job, recorded with [`POST /memories/{content_hash}/confirm`](#post-memoriescontent_hashconfirm).
+
+Three metadata keys are reserved, and a request carrying any of them, with any value, returns `400` and stores nothing: `metadata.superseded_by` (the server sets it on supersede and merge), `metadata.last_confirmed_at` (the server sets it on confirm) and `metadata.nearest_similarity` (reserved only: the server never writes it, and records the store's novelty in its own root-level `nearest_similarity` field, below). A re-store keeps the stored `superseded_by` and `last_confirmed_at`.
 
 **Response:**
 
@@ -337,7 +342,7 @@ Content-Type: application/json
 
 Updatable fields: `summary`, `tags`, `metadata`. Content and `content_hash` are immutable by design — to change content, store a new memory and supersede the old.
 
-`metadata.superseded_by` is reserved and cannot be patched, not even to `null`: only supersede, merge and unsupersede change supersession state. `metadata.nearest_similarity` is reserved the same way, though the server never writes it: novelty lives in the root-level `nearest_similarity` field, which the server computes on each store. A patch carrying either returns `400` and changes nothing.
+`metadata.superseded_by` is reserved and cannot be patched, not even to `null`: only supersede, merge and unsupersede change supersession state. `metadata.last_confirmed_at` is reserved the same way: only confirm sets it. So is `metadata.nearest_similarity`, though the server never writes it: novelty lives in the root-level `nearest_similarity` field, which the server computes on each store. A patch carrying any of them returns `400` and changes nothing. A patch of `metadata.citations` gets the store's citation check; `null` deletes the citations.
 
 Changing `summary` also drops the stored summary embedding (the hybrid-search boost vector) so the two never disagree; the boost returns when the summary is next generated server-side.
 
@@ -429,6 +434,57 @@ Content-Type: application/json
 ```
 
 All three fields are required: `reason` (1–2000 chars) and `unsuperseded_via` (1–128 chars, who is reversing it, recorded verbatim) form the audit entry. Returns `{ "success": true, "status": "unsuperseded", "content_hash", "superseded_by", "supersession_reason", "reason", "unsuperseded_via", "unsuperseded_at", "supersedes_edges_removed", "contradictions_stamped", "now_superseded_by" }`, or `"success": false` with a `status` of `not_superseded` or `superseded_by_changed`. Mutating — static bearer only.
+
+## `POST /memories/{content_hash}/confirm`
+
+Record that you re-checked a memory against its sources and it still holds. No body. Sets `metadata.last_confirmed_at` to the server's time (epoch seconds), which every read then returns in the memory's `metadata`, and writes nothing else.
+
+A confirm has **no effect on ranking**: recency decay, access counts, importance, trust, the summary boost and Hebbian weights are untouched, so a search returns the same order before and after.
+
+| Status | Body |
+|:--|:--|
+| `200` | `{ "success": true, "content_hash", "last_confirmed_at" }` |
+| `400` | Invalid `content_hash`. |
+| `404` | `{ "success": false, "status": "not_found", "content_hash", "error" }` |
+| `409` | `{ "success": false, "status": "superseded", "content_hash", "superseded_by", "error" }`: nothing written. Check the survivor instead. |
+
+Mutating — static bearer only.
+
+## `POST /memories/{content_hash}/refute`
+
+File a correction against a wrong memory in one call. `{content_hash}` is the wrong memory.
+
+```http
+POST /memories/7c1d.../refute
+Content-Type: application/json
+
+{
+  "content": "alaya-server listens on 3001, not 3000.",
+  "tags": ["alaya", "deploy"],
+  "memory_type": "reference",
+  "citations": ["27b-io/alaya@4d63bad:README.md:40"],
+  "reason": "The port changed when the bridge moved to 3000.",
+  "supersede": false
+}
+```
+
+Required: `content` and `reason` (1–2000 characters). With `supersede: true` the reason is stored as the supersession reason, the audit record of why the memory was hidden. With the default link it is checked but not stored, because the edge carries no reason: put anything worth keeping in the correction's text. Optional: `tags`, `memory_type`, `summary`, `citations` (checked as on `/store`) and `supersede` (default `false`). Any other key returns `422`; this route takes no `metadata` or `dedup_threshold`.
+
+The correction is stored through the normal store path, and `dedup_threshold` is never applied, so a correction close to the memory it corrects is never skipped. When a live memory already holds the correction's exact text (you stored the fix first, or this is a retry), it is used as it is and not stored again, so its tags, type and metadata are kept; the response says `"existing": true`. Any `tags`, `memory_type`, `summary` or `citations` you send must then match that memory, or the call is refused as `correction_exists`; a field you leave out always matches. That makes a retried refute safe. Then:
+
+- **`supersede: false` (the default)** creates a `CONTRADICTS` edge from the correction to the wrong memory. Both stay searchable, and the pair enters the [contradiction queue](#post-contradictions).
+- **`supersede: true`** supersedes the wrong memory with the correction, with `reason` as the supersession reason. Superseding hides the whole record, so pass it only when the correction carries every claim of the wrong memory that is still true.
+
+| Status | Body |
+|:--|:--|
+| `200` | `{ "success": true, "status": "contradicts" \| "superseded", "content_hash", "correction_hash", "existing", "stored"?, "supersession_reason"? }`. `stored` is the correction's `/store` response, absent when `existing` is `true`. `superseded` promises that the wrong memory now points at the correction, and `supersession_reason` is the reason stored with it. A retry that finds the supersession already there succeeds only when its reason matches the stored one. |
+| `400` | Invalid `content_hash`, empty `content`, blank `reason`, malformed `citations`, or a correction whose content is the wrong memory's own. Nothing written. |
+| `404` | `{ "success": false, "status": "not_found" }`: the wrong memory does not exist. Nothing written. |
+| `409` | Refused, nothing written: `"status": "superseded"` with `superseded_by` when the wrong memory is already superseded (refute its survivor instead; a `supersede: true` retry whose own correction is the survivor succeeds instead); `"correction_superseded"` when the correction's content is stored already as a superseded memory; `"correction_exists"` with the first differing `field` when it is stored as a live memory your fields contradict. Or, with the correction **stored**: `"status": "conflict"` with `superseded_by` when the wrong memory was superseded by another caller after the checks (that survivor is never overwritten; refute it instead, or reconcile the two), or the supersession is there already with another reason (`superseded_by` is the correction, `supersession_reason` the stored reason; nothing written, and your reason is not claimed). `"correction_superseded"` with `correction_superseded_by` when the correction itself was superseded meanwhile, seen before the second step, and `"correction_deleted"` when it was deleted meanwhile: nothing else is written. Retry the refute to store it again. A supersession found already in place, or read back after an unconfirmed write, counts as this call's only when its stored reason equals yours. |
+| `422` | A missing `content` or `reason`, a wrong type, or any other key. Nothing written. |
+| `500` | `{ "success": false, "status": "partial", "content_hash", "correction_hash", "failed_step": "supersede" \| "contradicts_edge", "error", "existing", "stored"? }`: the correction **is stored**, but the second step failed, or its outcome could not be read back (the error says "unknown outcome"). A supersede whose write was sent but not confirmed is read back first, and reported as `superseded` when it landed. A `contradicts_edge` failure includes a link that found a graph node missing. Retry the same refute, or finish with [`POST /supersede`](#post-supersede) or [`POST /relation`](#post-relation) (`create`, `CONTRADICTS`). A timeout (`"error_kind": "timeout"`) also carries `correction_hash`: the correction may already be stored, so check it with [`GET /memories/{content_hash}`](#get-memoriescontent_hash) or retry the refute. Any other `500` is a backend failure before or during the store. |
+
+The supersede is conditional on the wrong memory still carrying no marker, so a survivor another caller chose between the checks and the second step is never overwritten. A supersede of the correction that lands after the second step forms an ordinary chain (wrong memory → correction → its survivor), the same state the calls made one after another produce, and the survivor stays searchable. The link re-reads the wrong memory before its graph writes, so one deleted meanwhile gets no graph node back, and again after its edge lands, since a graph write cannot be conditional on it; that narrows the race rather than closing it. Mutating — static bearer only.
 
 ## `POST /contradictions`
 
@@ -737,8 +793,10 @@ REST endpoints use HTTP status codes plus a JSON body:
 |:--|:--|
 | `400` | Malformed JSON, invalid `content_hash` or `relation_type`, missing required field. Body: `{"error": "..."}`. |
 | `401` | Missing or wrong bearer token. |
-| `403` | Authenticated, but the principal is not authorized for this endpoint: the `ALAYA_READONLY_API_KEY` bearer on anything but a pure read, or an OIDC bearer on a mutating route (delete / supersede / unsupersede / contradictions/resolution / merge / relation / patch / backfill) or on `GET /memories/{content_hash}/relations`. OAuth scopes are not evaluated. |
-| `404` | Memory doesn't exist (`get_memory`, `patch_memory`). |
+| `403` | Authenticated, but the principal is not authorized for this endpoint: the `ALAYA_READONLY_API_KEY` bearer on anything but a pure read, or an OIDC bearer on a mutating route (delete / supersede / unsupersede / confirm / refute / contradictions/resolution / merge / relation / patch / backfill) or on `GET /memories/{content_hash}/relations`. OAuth scopes are not evaluated. |
+| `404` | Memory doesn't exist (`get_memory`, `patch_memory`, `confirm`, `refute`). |
+| `409` | Confirm or refute of a superseded memory. |
+| `422` | A body the route cannot deserialize: a wrong type, or an unknown key on `refute`. |
 | `413` | Request body over 1 MB. |
 | `429` | Rate limited (only when running behind a rate-limiting proxy). |
 | `500` | Backend failure — Qdrant/FalkorDB/TEI unreachable, embedding timeout. Body is sanitized; check server logs for detail. |

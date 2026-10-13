@@ -131,7 +131,8 @@ const MAX_SUMMARY_LEN: usize = 2000;
 /// and merge set it. `nearest_similarity` is only reserved, never written
 /// here: the server records the store's novelty in the root-level
 /// `nearest_similarity` payload key, and a caller's metadata copy would pass
-/// for it.
+/// for it. `last_confirmed_at` is the server's clock at the last confirm: a
+/// caller-set value would claim a re-check that never happened.
 pub const RESERVED_METADATA_KEYS: &[(&str, &str)] = &[
     (
         "superseded_by",
@@ -141,7 +142,147 @@ pub const RESERVED_METADATA_KEYS: &[(&str, &str)] = &[
         "nearest_similarity",
         "the server records novelty in its own field on every store",
     ),
+    (
+        LAST_CONFIRMED_AT_KEY,
+        "the server sets it when a memory is confirmed",
+    ),
 ];
+
+/// The metadata key confirm writes: when a caller last re-checked the memory.
+/// Server-maintained, like the supersession marker, so a re-store keeps it.
+pub const LAST_CONFIRMED_AT_KEY: &str = "last_confirmed_at";
+
+/// The metadata key a memory's citations live under. Hits return `metadata`
+/// whole, so every read path returns them with no code of its own.
+pub const CITATIONS_KEY: &str = "citations";
+
+/// Maximum citations on one memory.
+pub const MAX_CITATIONS: usize = 10;
+
+/// Maximum length of one citation, in characters.
+pub const MAX_CITATION_LEN: usize = 500;
+
+/// Check a citations value: an array of at most `MAX_CITATIONS` strings, each
+/// a `<owner>/<repo>@<sha>:<path>[:<line>[-<line>]]` reference or an
+/// `https://` URL. The one check behind the store field, a caller's own
+/// `metadata.citations` and PATCH.
+pub fn validate_citations(value: &serde_json::Value) -> std::result::Result<(), String> {
+    let Some(items) = value.as_array() else {
+        return Err("citations: must be an array of strings".into());
+    };
+    if items.len() > MAX_CITATIONS {
+        return Err(format!(
+            "citations: max {MAX_CITATIONS}, got {}",
+            items.len()
+        ));
+    }
+    for (i, item) in items.iter().enumerate() {
+        let Some(c) = item.as_str() else {
+            return Err(format!("citations[{i}]: must be a string"));
+        };
+        if c.chars().count() > MAX_CITATION_LEN {
+            return Err(format!("citations[{i}]: max {MAX_CITATION_LEN} chars"));
+        }
+        if !is_url_citation(c) && !is_repo_citation(c) {
+            return Err(format!(
+                "citations[{i}]: expected <owner>/<repo>@<sha>:<path>[:<line>[-<line>]] \
+                 with a 7-40 char hex sha, or an https:// URL"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate `metadata.citations` when present. A PATCH null deletes the key,
+/// so null passes there; a store has nothing to delete and refuses it.
+fn validate_metadata_citations(
+    metadata: &HashMap<String, serde_json::Value>,
+    null_deletes: bool,
+) -> std::result::Result<(), String> {
+    match metadata.get(CITATIONS_KEY) {
+        None => Ok(()),
+        Some(serde_json::Value::Null) if null_deletes => Ok(()),
+        Some(v) => validate_citations(v),
+    }
+}
+
+/// Store-side metadata check: reserved keys, then `metadata.citations`.
+pub fn validate_store_metadata(
+    metadata: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<(), String> {
+    reject_reserved_metadata(metadata)?;
+    validate_metadata_citations(metadata, false)
+}
+
+/// No whitespace or control characters: a citation is one token.
+fn is_token(s: &str) -> bool {
+    !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// `https://` with a host: the authority up to the first `/`, `?` or `#` is
+/// non-empty and holds only host and port characters (no userinfo).
+fn is_url_citation(c: &str) -> bool {
+    let Some(rest) = c.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    is_token(rest)
+        && !host.is_empty()
+        && host
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.' | ':' | '[' | ']'))
+}
+
+/// `<owner>/<repo>@<sha>:<path>[:<line>[-<line>]]`. A trailing `:<digits>`
+/// or `:<digits>-<digits>` is the line span; anything else after the sha is
+/// the path.
+fn is_repo_citation(c: &str) -> bool {
+    let Some((repo, rest)) = c.split_once('@') else {
+        return false;
+    };
+    let Some((owner, name)) = repo.split_once('/') else {
+        return false;
+    };
+    let ident = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    };
+    if !ident(owner) || !ident(name) {
+        return false;
+    }
+    let Some((sha, located)) = rest.split_once(':') else {
+        return false;
+    };
+    if !(7..=40).contains(&sha.len()) || !sha.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return false;
+    }
+    // A last segment of digits and dashes is a line span, and must be a
+    // valid one: `:0` or `:9-3` is a bad span, never part of the path.
+    let path = match located.rsplit_once(':') {
+        Some((path, span)) if span.chars().all(|ch| ch.is_ascii_digit() || ch == '-') => {
+            if !is_line_span(span) {
+                return false;
+            }
+            path
+        }
+        _ => located,
+    };
+    is_token(path)
+}
+
+/// `<line>` or `<line>-<line>`, lines from 1, the span not reversed.
+fn is_line_span(s: &str) -> bool {
+    let line = |n: &str| {
+        !n.is_empty()
+            && n.chars().all(|ch| ch.is_ascii_digit())
+            && n.parse::<u64>().is_ok_and(|v| v >= 1)
+    };
+    match s.split_once('-') {
+        None => line(s),
+        Some((a, b)) => line(a) && line(b) && a.parse::<u64>().ok() <= b.parse::<u64>().ok(),
+    }
+}
 
 /// Refuse caller metadata carrying a reserved key, whatever its value — null
 /// included, since a PATCH null deletes the key. The one check every
@@ -212,6 +353,7 @@ impl PatchMemoryRequest {
                 ));
             }
             reject_reserved_metadata(metadata)?;
+            validate_metadata_citations(metadata, true)?;
         }
         if let Some(ref summary) = self.summary
             && summary.len() > MAX_SUMMARY_LEN
@@ -364,6 +506,113 @@ mod tests {
                 ..Default::default()
             };
             assert!(p.validate().unwrap_err().contains("metadata.superseded_by"));
+        }
+    }
+
+    #[test]
+    fn citations_accept_repo_refs_and_https_urls() {
+        let ok = serde_json::json!([
+            "27b-io/alaya@4d63bad:crates/alaya-core/src/service.rs",
+            "27b-io/alaya@4d63bad:crates/alaya-core/src/service.rs:131",
+            "27b-io/alaya@4d63bad0123456789abcdef0123456789abcdef0:README.md:10-20",
+            "owner/repo.rs@ABCDEF1:src/a:b.rs:3",
+            "https://github.com/27b-io/alaya/pull/188",
+        ]);
+        assert_eq!(validate_citations(&ok), Ok(()));
+        assert_eq!(validate_citations(&serde_json::json!([])), Ok(()));
+    }
+
+    #[test]
+    fn citations_refuse_every_malformed_shape() {
+        for bad in [
+            "http://example.com/x",
+            "https://",
+            "https:///path",
+            "https://?source=claim",
+            "https://#frag",
+            "https://user@example.com/x",
+            "https://exa mple.com",
+            "alaya@4d63bad:README.md",
+            "27b-io/alaya@4d63ba:README.md",
+            "27b-io/alaya@4d63bad0123456789abcdef0123456789abcdef01:README.md",
+            "27b-io/alaya@4d63bxd:README.md",
+            "27b-io/alaya@4d63bad",
+            "27b-io/alaya@4d63bad:",
+            "27b-io/alaya@4d63bad:README.md:0",
+            "27b-io/alaya@4d63bad:README.md:9-3",
+            "27b-io/alaya@4d63bad:README.md:-3",
+            "27b-io/alaya@4d63bad:READ ME.md",
+            "27b io/alaya@4d63bad:README.md",
+            "a/b/c@4d63bad:README.md",
+            "",
+        ] {
+            let err = validate_citations(&serde_json::json!([bad])).unwrap_err();
+            assert!(err.starts_with("citations[0]"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn citations_refuse_wrong_types_and_over_limits() {
+        for bad in [
+            serde_json::json!("https://example.com"),
+            serde_json::json!({"a": 1}),
+            serde_json::Value::Null,
+            serde_json::json!([1]),
+        ] {
+            assert!(validate_citations(&bad).is_err(), "{bad}");
+        }
+        let eleven: Vec<String> = (0..11)
+            .map(|i| format!("https://example.com/{i}"))
+            .collect();
+        let err = validate_citations(&serde_json::json!(eleven)).unwrap_err();
+        assert!(err.contains("max 10"), "{err}");
+        let long = format!("https://example.com/{}", "a".repeat(MAX_CITATION_LEN));
+        let err = validate_citations(&serde_json::json!([long])).unwrap_err();
+        assert!(err.contains("max 500 chars"), "{err}");
+    }
+
+    #[test]
+    fn store_metadata_checks_citations_and_refuses_null() {
+        let ok = HashMap::from([(
+            "citations".to_string(),
+            serde_json::json!(["https://example.com/a"]),
+        )]);
+        assert_eq!(validate_store_metadata(&ok), Ok(()));
+        for bad in [serde_json::json!(["nope"]), serde_json::Value::Null] {
+            let md = HashMap::from([("citations".to_string(), bad)]);
+            assert!(validate_store_metadata(&md).is_err());
+        }
+    }
+
+    #[test]
+    fn patch_validates_citations_and_lets_null_delete_them() {
+        let patch = |v: serde_json::Value| PatchMemoryRequest {
+            metadata: Some(HashMap::from([("citations".to_string(), v)])),
+            ..Default::default()
+        };
+        assert!(
+            patch(serde_json::json!(["https://example.com/a"]))
+                .validate()
+                .is_ok()
+        );
+        assert!(patch(serde_json::Value::Null).validate().is_ok());
+        let err = patch(serde_json::json!(["not a citation"]))
+            .validate()
+            .unwrap_err();
+        assert!(err.starts_with("citations[0]"), "{err}");
+    }
+
+    #[test]
+    fn last_confirmed_at_is_reserved_on_store_and_patch() {
+        for v in [serde_json::Value::Null, serde_json::json!(1.0)] {
+            let md = HashMap::from([("last_confirmed_at".to_string(), v)]);
+            let err = validate_store_metadata(&md).unwrap_err();
+            assert!(err.contains("metadata.last_confirmed_at"), "{err}");
+            let p = PatchMemoryRequest {
+                metadata: Some(md),
+                ..Default::default()
+            };
+            assert!(p.validate().unwrap_err().contains("last_confirmed_at"));
         }
     }
 

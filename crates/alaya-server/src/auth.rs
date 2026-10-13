@@ -140,7 +140,9 @@ pub fn rest_route_op(method: &Method, path: &str) -> &'static str {
         ("GET", "/stats") => "corpus_stats",
         // Must precede the `/memories/` prefix arm: a relations read gets its
         // own op so a later edit to `get_memory` cannot change who reads edges.
-        ("GET", p) if is_relations_path(p) => "get_relations",
+        ("GET", p) if is_memory_path(p, "/relations") => "get_relations",
+        ("POST", p) if is_memory_path(p, "/confirm") => "memory_confirm",
+        ("POST", p) if is_memory_path(p, "/refute") => "memory_refute",
         ("GET", p) if p.starts_with("/memories/") => "get_memory",
         ("PATCH", p) if p.starts_with("/memories/") => "patch_memory",
         // Unmapped / unexpected method → fail-closed (not in allowlist).
@@ -148,12 +150,12 @@ pub fn rest_route_op(method: &Method, path: &str) -> &'static str {
     }
 }
 
-/// `/memories/{content_hash}/relations` — exactly one hash segment, empty
+/// `/memories/{content_hash}{suffix}` — exactly one hash segment, empty
 /// included, because axum routes `/memories//relations` to that handler too:
 /// the op must label every path the handler can receive.
-fn is_relations_path(path: &str) -> bool {
+fn is_memory_path(path: &str, suffix: &str) -> bool {
     path.strip_prefix("/memories/")
-        .and_then(|rest| rest.strip_suffix("/relations"))
+        .and_then(|rest| rest.strip_suffix(suffix))
         .is_some_and(|hash| !hash.contains('/'))
 }
 
@@ -172,6 +174,8 @@ pub const ALL_OPS: &[(&str, bool)] = &[
     ("delete_memory", true),
     ("memory_supersede", true),
     ("memory_unsupersede", true),
+    ("memory_confirm", true),
+    ("memory_refute", true),
     ("resolve_contradiction", true),
     ("merge_duplicates", true),
     ("relation", true),
@@ -464,6 +468,8 @@ mod tests {
             "delete_memory",
             "memory_supersede",
             "memory_unsupersede",
+            "memory_confirm",
+            "memory_refute",
             "merge_duplicates",
             "patch_memory",
             "relation",
@@ -527,6 +533,27 @@ mod tests {
         );
         assert_eq!(
             rest_route_op(&Method::POST, "/memories/abc123/relations"),
+            "__mutating__"
+        );
+    }
+
+    #[test]
+    fn rest_route_op_maps_confirm_and_refute_to_mutating_ops() {
+        for (p, op) in [
+            ("/memories/abc123/confirm", "memory_confirm"),
+            ("/memories//confirm", "memory_confirm"),
+            ("/memories/abc123/refute", "memory_refute"),
+        ] {
+            assert_eq!(rest_route_op(&Method::POST, p), op, "{p}");
+            assert!(ALL_OPS.contains(&(op, true)), "{op} is mutating");
+        }
+        // Only POST, only the one-segment shape.
+        assert_eq!(
+            rest_route_op(&Method::GET, "/memories/abc123/confirm"),
+            "get_memory"
+        );
+        assert_eq!(
+            rest_route_op(&Method::POST, "/memories/a/b/refute"),
             "__mutating__"
         );
     }
@@ -641,6 +668,8 @@ mod tests {
             rest_route_op(&Method::PATCH, "/memories/x"),
             rest_route_op(&Method::GET, "/stats"),
             rest_route_op(&Method::GET, "/memories/x/relations"),
+            rest_route_op(&Method::POST, "/memories/x/confirm"),
+            rest_route_op(&Method::POST, "/memories/x/refute"),
         ];
         for op in rest_ops {
             assert!(
@@ -787,6 +816,8 @@ mod tests {
             .route("/memories/{content_hash}", get(ok).patch(ok))
             .route("/stats", get(ok))
             .route("/memories/{content_hash}/relations", get(ok))
+            .route("/memories/{content_hash}/confirm", post(ok))
+            .route("/memories/{content_hash}/refute", post(ok))
             .layer(axum::middleware::from_fn_with_state(auth, require_auth))
     }
 
@@ -840,6 +871,8 @@ mod tests {
             (Method::POST, "/relation"),
             (Method::POST, "/duplicates/merge"),
             (Method::PATCH, "/memories/abc"),
+            (Method::POST, "/memories/abc/confirm"),
+            (Method::POST, "/memories/abc/refute"),
             (Method::POST, "/some/unmapped/route"),
         ] {
             assert_eq!(

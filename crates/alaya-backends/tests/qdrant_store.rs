@@ -336,6 +336,36 @@ async fn store_keeps_the_log_and_drops_a_stale_caller_marker_on_restore() {
     );
 }
 
+/// `last_confirmed_at` is written by confirm alone (LAB-7721): a re-store
+/// keeps the stored one, and drops one a caller's copy carried when the
+/// record has none.
+#[tokio::test]
+async fn store_carries_last_confirmed_at_over_and_drops_a_callers() {
+    let mut confirmed = existing_payload();
+    confirmed["metadata"] = json!({"last_confirmed_at": 1500.0});
+    let (server, fake) = fake_with(Some(confirmed)).await;
+    client_for(&server)
+        .store(&incoming(), StoreMode::Upsert)
+        .await
+        .expect("store succeeds");
+    assert_eq!(
+        fake.point(ID).unwrap()["metadata"],
+        json!({"last_confirmed_at": 1500.0})
+    );
+
+    let (server, fake) = fake_with(Some(existing_payload())).await;
+    let mut stale = incoming();
+    stale.metadata = Some(HashMap::from([
+        ("last_confirmed_at".to_string(), json!(9999.0)),
+        ("note".to_string(), json!("kept")),
+    ]));
+    client_for(&server)
+        .store(&stale, StoreMode::Upsert)
+        .await
+        .expect("store succeeds");
+    assert_eq!(fake.point(ID).unwrap()["metadata"], json!({"note": "kept"}));
+}
+
 /// `nearest_similarity` is server-computed per store, never carried over: a
 /// re-store writes the value it just computed, and one that computed none
 /// (search skipped or failed) leaves no stale value behind.

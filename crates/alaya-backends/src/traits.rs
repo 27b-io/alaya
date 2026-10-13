@@ -50,6 +50,28 @@ pub enum ReversalOutcome {
     SupersededByOther(serde_json::Value),
 }
 
+/// What `VectorStorage::confirm_memory` found on the memory.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfirmOutcome {
+    /// `metadata.last_confirmed_at` now holds the given time.
+    Confirmed,
+    /// The memory is superseded (its marker, as stored): nothing written.
+    Superseded(serde_json::Value),
+}
+
+/// What `VectorStorage::supersede_if_live` found on the memory.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConditionalSupersede {
+    /// Marker and reason were written now.
+    Superseded,
+    /// The marker named the requested survivor already: nothing written.
+    /// `reason` is the `supersession_reason` stored with it, which may not
+    /// be the one this call asked for.
+    AlreadySuperseded { reason: Option<serde_json::Value> },
+    /// Another survivor's marker is there (as stored): nothing written.
+    Conflict(serde_json::Value),
+}
+
 /// Vector storage backend (Qdrant REST API).
 ///
 /// `?Send` bound because WASM is single-threaded.
@@ -140,6 +162,40 @@ pub trait VectorStorage {
         expected: &serde_json::Value,
         reversal: &ReversalRecord,
     ) -> Result<ReversalOutcome>;
+
+    /// Supersede one memory only while it is live: set `metadata.superseded_by`
+    /// to `new_hash` and `supersession_reason` together, in one conditional
+    /// write, when the copy the write is conditional on carries no marker. A
+    /// marker naming `new_hash` already is `AlreadySuperseded` with the
+    /// reason stored then, nothing written, so a retry converges and never
+    /// claims its own reason landed; any other marker is `Conflict`, untouched, so a
+    /// survivor chosen meanwhile is never overwritten. `AlayaError::NotFound`
+    /// when the memory does not exist. Default: unsupported.
+    async fn supersede_if_live(
+        &self,
+        content_hash: &str,
+        new_hash: &str,
+        reason: &str,
+    ) -> Result<ConditionalSupersede> {
+        let _ = (content_hash, new_hash, reason);
+        Err(AlayaError::Storage(
+            "conditional supersede is not supported by this backend".into(),
+        ))
+    }
+
+    /// Record that a caller re-checked a memory: set `metadata.last_confirmed_at`
+    /// to `at`, and nothing else, in one payload-only conditional write. The
+    /// supersession check is made on the copy the write is conditional on, so
+    /// a supersede that lands first is always seen. `AlayaError::NotFound`
+    /// when the memory does not exist. Like the marker, the key is
+    /// server-maintained: `store` carries it over and no caller field writes
+    /// it. Default: unsupported.
+    async fn confirm_memory(&self, content_hash: &str, at: f64) -> Result<ConfirmOutcome> {
+        let _ = (content_hash, at);
+        Err(AlayaError::Storage(
+            "confirm is not supported by this backend".into(),
+        ))
+    }
 
     /// Patch mutable fields on an existing memory.
     ///
@@ -313,6 +369,9 @@ pub trait GraphService {
     async fn delete_node(&self, content_hash: &str) -> Result<()>;
 
     // Typed edge CRUD (user-created)
+    /// `Ok(true)` when the edge is there afterwards, new or already present
+    /// (the bridge MERGEs); `Ok(false)` when an endpoint node is missing and
+    /// nothing was written.
     async fn create_typed_edge(
         &self,
         src: &str,

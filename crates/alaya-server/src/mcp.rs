@@ -11,8 +11,9 @@ use tokio::sync::oneshot;
 
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{
-    MAX_UNSUPERSEDE_REASON_LEN, OutputMode, RelationParams, SearchParams, StoreParams,
+    MAX_UNSUPERSEDE_REASON_LEN, OutputMode, Refutation, RelationParams, SearchParams, StoreParams,
 };
+use alaya_types::memory::{MAX_CITATION_LEN, MAX_CITATIONS, validate_content_hash};
 
 use alaya_types::graph::Resolution;
 
@@ -45,6 +46,11 @@ struct SupersedeParams {
 struct UnsupersedeParams {
     content_hash: String,
     reason: String,
+}
+
+#[derive(Deserialize)]
+struct ConfirmParams {
+    content_hash: String,
 }
 
 #[derive(Deserialize)]
@@ -275,7 +281,7 @@ fn make_response(resp: JsonRpcResponse, sse: bool) -> Response {
 /// without it the rule is only stated per-input-field and never as a whole.
 const SERVER_INSTRUCTIONS: &str = "Ālaya is a persistent semantic memory service (vector search + knowledge graph).
 
-Memory identifiers: every memory is keyed by `content_hash`, a full 64-character SHA-256 hex string. `store_memory` and `search` return this hash on every result — pass it back verbatim to `get_memory`, `memory_supersede`, `memory_unsupersede`, `delete_memory`, `relation`, and `merge_duplicates`. Never truncate or abbreviate it; the 8-character prefixes shown in log lines and display output are not valid identifiers and will be rejected.
+Memory identifiers: every memory is keyed by `content_hash`, a full 64-character SHA-256 hex string. `store_memory` and `search` return this hash on every result — pass it back verbatim to `get_memory`, `memory_supersede`, `memory_unsupersede`, `memory_confirm`, `memory_refute`, `delete_memory`, `relation`, and `merge_duplicates`. Never truncate or abbreviate it; the 8-character prefixes shown in log lines and display output are not valid identifiers and will be rejected.
 
 Inspect before mutating: use `get_memory` to read a memory by hash before `memory_supersede` or `delete_memory`.";
 
@@ -466,6 +472,57 @@ async fn dispatch_tool(
                 )
                 .await
         }
+        "memory_confirm" => {
+            let p: ConfirmParams = serde_json::from_value(args)
+                .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
+            if !validate_content_hash(&p.content_hash) {
+                return Err((-32602, "Invalid params: invalid content_hash format".into()));
+            }
+            let (tx, rx) = oneshot::channel();
+            handle
+                .call_rpc(
+                    CmdInner::Confirm {
+                        hash: p.content_hash,
+                        reply: tx,
+                    },
+                    rx,
+                )
+                .await
+        }
+        "memory_refute" => {
+            // `content_hash` names the wrong memory; the rest of the
+            // arguments are the correction, refused whole on an unknown key.
+            let mut args = args;
+            let hash = args
+                .as_object_mut()
+                .and_then(|o| o.remove("content_hash"))
+                .and_then(|v| v.as_str().map(String::from))
+                .ok_or_else(|| {
+                    (
+                        -32602,
+                        "Invalid params: content_hash is required".to_string(),
+                    )
+                })?;
+            if !validate_content_hash(&hash) {
+                return Err((-32602, "Invalid params: invalid content_hash format".into()));
+            }
+            let refutation: Refutation = serde_json::from_value(args)
+                .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
+            refutation
+                .validate()
+                .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
+            let (tx, rx) = oneshot::channel();
+            handle
+                .call_rpc(
+                    CmdInner::Refute {
+                        hash,
+                        refutation,
+                        reply: tx,
+                    },
+                    rx,
+                )
+                .await
+        }
         "memory_contradictions" => {
             let p: ContradictionsParams = serde_json::from_value(args)
                 .map_err(|e| (-32602, format!("Invalid params: {e}")))?;
@@ -542,6 +599,21 @@ async fn dispatch_tool(
 
 // ─── Tool schemas ───────────────────────────────────────────────────────────
 
+/// The `citations` input of store_memory and memory_refute.
+fn citations_schema() -> Value {
+    json!({
+        "anyOf": [
+            {
+                "type": "array",
+                "maxItems": MAX_CITATIONS,
+                "items": { "type": "string", "maxLength": MAX_CITATION_LEN }
+            },
+            { "type": "null" }
+        ],
+        "description": "The sources this memory rests on, returned on every hit at metadata.citations. Each is <owner>/<repo>@<sha>:<path>, optionally :<line> or :<line>-<line>, with a 7-40 char hex sha, or an https:// URL with a host (a PR, an issue comment). A malformed one refuses the call."
+    })
+}
+
 fn tool_schemas() -> Value {
     json!([
         {
@@ -556,7 +628,8 @@ fn tool_schemas() -> Value {
                     "metadata": { "anyOf": [{"type": "object"}, {"type": "null"}], "description": "Structured data. Special key: importance (float 0.0-1.0)" },
                     "client_hostname": { "anyOf": [{"type": "string"}, {"type": "null"}] },
                     "summary": { "anyOf": [{"type": "string"}, {"type": "null"}], "description": "One-line summary (~50 tokens). Auto-generated if omitted." },
-                    "dedup_threshold": { "anyOf": [{"type": "number"}, {"type": "null"}], "description": "If set, skip storage when nearest neighbor similarity >= threshold (0.0-1.0)" }
+                    "dedup_threshold": { "anyOf": [{"type": "number"}, {"type": "null"}], "description": "If set, skip storage when nearest neighbor similarity >= threshold (0.0-1.0)" },
+                    "citations": citations_schema()
                 },
                 "required": ["content"]
             }
@@ -699,6 +772,53 @@ fn tool_schemas() -> Value {
             }
         },
         {
+            "name": "memory_confirm",
+            "description": "Record that you re-checked a memory against its sources and it still holds: sets metadata.last_confirmed_at to the server's time, which every hit then returns. Nothing else changes; it has no effect on ranking. A missing memory returns {success: false, status: not_found}; a superseded one returns {success: false, status: superseded, superseded_by}: check the survivor instead.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content_hash": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "Full 64-char SHA-256 hex content_hash of the memory you re-checked. Do not pass truncated display/log prefixes."
+                    }
+                },
+                "required": ["content_hash"]
+            }
+        },
+        {
+            "name": "memory_refute",
+            "description": "File a correction against a wrong memory in one call. The correction is stored like store_memory (never skipped as a duplicate); a live memory that already holds its exact text is used as is, with existing: true, so a retry is safe; any tags, memory_type, summary or citations you send must then match it. By default the pair is then linked correction -> wrong as CONTRADICTS: both stay searchable and the pair enters the contradiction queue. Pass supersede: true only when the correction carries every claim of the wrong memory that is still true; the wrong memory is then superseded by the correction with your reason. Refused before anything is written, with {success: false, status}: not_found, superseded (refute the survivor instead), correction_superseded or correction_exists. If another caller supersedes the wrong memory meanwhile, returns {success: false, status: conflict, superseded_by} with the correction stored; that survivor is never overwritten. If the correction itself is superseded or deleted before the second step, returns status correction_superseded (with correction_superseded_by) or correction_deleted, nothing written. A supersede reports supersession_reason, the reason stored on the memory; a retry with another reason than the stored one is a conflict. A link stores no reason. If the store succeeds but the supersede or link fails, returns {success: false, status: partial, correction_hash, failed_step}: retry the same refute, or finish with memory_supersede or relation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content_hash": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "Full 64-char SHA-256 hex content_hash of the wrong memory. Do not pass truncated display/log prefixes."
+                    },
+                    "content": { "type": "string", "minLength": 1, "description": "The correction's text" },
+                    "tags": { "anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "string"}, {"type": "null"}], "description": "Labels — accepts [\"tag1\", \"tag2\"] or \"tag1,tag2\"" },
+                    "memory_type": { "type": "string", "enum": ["note", "decision", "task", "reference"], "default": "note" },
+                    "summary": { "anyOf": [{"type": "string"}, {"type": "null"}], "description": "One-line summary. Auto-generated if omitted." },
+                    "citations": citations_schema(),
+                    "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_UNSUPERSEDE_REASON_LEN,
+                        "description": "Why the memory is wrong. Required: it is the audit record."
+                    },
+                    "supersede": { "type": "boolean", "default": false, "description": "Supersede the wrong memory instead of linking it. Only when the correction carries every still-true claim of it." }
+                },
+                "required": ["content_hash", "content", "reason"],
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "memory_contradictions",
             "description": "List CONTRADICTS pairs with the judge's verdict per pair (contradiction | supersession | coexist | unrelated | unjudged), the recommended survivor hash and a one-line reason. Pairs with a superseded endpoint, or stamped keep_both (by resolve_contradiction, or by memory_unsupersede as resolved_via unsupersede), are hidden unless include_resolved is true. Returns {pairs: [{memory_a_hash, memory_b_hash, confidence, created_at, memory_a_content, memory_b_content, memory_a_superseded, memory_b_superseded, verdict, verdict_reason, survivor, verdict_confidence, verdict_model, judged_at, resolution, resolved_at, resolved_via}], total, next_offset}. Page with offset = next_offset until it is null. To act on a pair: memory_supersede when one memory misleads (verdict supersession/contradiction); resolve_contradiction keep_both when both are true or the pair is noise (verdict coexist/unrelated) — non-destructive and reversible.",
             "inputSchema": {
@@ -812,6 +932,86 @@ mod tests {
         }
     }
 
+    /// Malformed citations and a caller-set `last_confirmed_at` are -32602
+    /// on store, as are a bad hash or correction on confirm and refute; none
+    /// reaches the worker (LAB-7721).
+    #[tokio::test]
+    async fn citation_and_verb_refusals_are_invalid_params_and_never_dispatch() {
+        let hash = "a".repeat(64);
+        let cases = [
+            (
+                "store_memory",
+                json!({"content": "x", "citations": ["see PR"]}),
+            ),
+            (
+                "store_memory",
+                json!({"content": "x", "metadata": {"citations": ["see PR"]}}),
+            ),
+            (
+                "store_memory",
+                json!({"content": "x", "metadata": {"last_confirmed_at": 1.0}}),
+            ),
+            ("memory_confirm", json!({"content_hash": "abc"})),
+            ("memory_confirm", json!({})),
+            ("memory_refute", json!({"content": "x", "reason": "y"})),
+            (
+                "memory_refute",
+                json!({"content_hash": "abc", "content": "x", "reason": "y"}),
+            ),
+            (
+                "memory_refute",
+                json!({"content_hash": hash, "content": "x"}),
+            ),
+            (
+                "memory_refute",
+                json!({"content_hash": hash, "content": "x", "reason": "y", "metadata": {}}),
+            ),
+            (
+                "memory_refute",
+                json!({"content_hash": hash, "content": "x", "reason": "y", "citations": ["see PR"]}),
+            ),
+        ];
+        for (tool, args) in cases {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let handle = ServiceHandle { tx };
+            let (code, msg) = dispatch_tool(tool, args.clone(), &handle, AuthPrincipal::Static)
+                .await
+                .expect_err("refused");
+            assert_eq!(code, -32602, "{tool} {args}: {msg}");
+            assert!(rx.try_recv().is_err(), "{tool} {args} was dispatched");
+        }
+    }
+
+    #[tokio::test]
+    async fn refute_dispatches_the_hash_apart_from_the_correction() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let handle = ServiceHandle { tx };
+        let hash = "a".repeat(64);
+        let args =
+            json!({"content_hash": hash, "content": "fixed", "reason": "wrong", "tags": "a,b"});
+        let call = tokio::spawn(async move {
+            dispatch_tool("memory_refute", args, &handle, AuthPrincipal::Static).await
+        });
+        let cmd = rx.recv().await.expect("dispatched");
+        let CmdInner::Refute {
+            hash: h,
+            refutation,
+            reply,
+        } = cmd.inner
+        else {
+            panic!("expected CmdInner::Refute");
+        };
+        assert_eq!(h, hash);
+        assert_eq!(refutation.content, "fixed");
+        assert!(!refutation.supersede, "link is the default");
+        assert_eq!(
+            refutation.tags,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        reply.send(json!({"success": true})).unwrap();
+        assert_eq!(call.await.unwrap().unwrap(), json!({"success": true}));
+    }
+
     #[test]
     fn parse_jsonrpc_request() {
         let raw = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
@@ -857,11 +1057,11 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_12_tools() {
+    fn tools_list_returns_14_tools() {
         let resp = handle_tools_list(json!(2));
         let v = serde_json::to_value(&resp).unwrap();
         let tools = v["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 14);
     }
 
     #[test]
@@ -881,6 +1081,8 @@ mod tests {
         assert!(names.contains(&"relation"));
         assert!(names.contains(&"memory_supersede"));
         assert!(names.contains(&"memory_unsupersede"));
+        assert!(names.contains(&"memory_confirm"));
+        assert!(names.contains(&"memory_refute"));
         assert!(names.contains(&"memory_contradictions"));
         assert!(names.contains(&"resolve_contradiction"));
         assert!(names.contains(&"find_duplicates"));
@@ -1092,6 +1294,8 @@ mod tests {
             ("memory_supersede", "old_id"),
             ("memory_supersede", "new_id"),
             ("memory_unsupersede", "content_hash"),
+            ("memory_confirm", "content_hash"),
+            ("memory_refute", "content_hash"),
             ("resolve_contradiction", "memory_a_hash"),
             ("resolve_contradiction", "memory_b_hash"),
         ] {

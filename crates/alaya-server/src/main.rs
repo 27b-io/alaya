@@ -51,8 +51,9 @@ use alaya_backends::{
 use alaya_core::calendar::utc_date_str;
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{
-    JudgeOutcome, KeywordLeg, MemoryService, OutputMode, RankingFlags, RelationParams,
-    SearchParams, StoreParams, current_timestamp, parse_user_relation, validate_as_of,
+    JudgeOutcome, KeywordLeg, MemoryService, OutputMode, RankingFlags, Refutation, RefuteStage,
+    RelationParams, SearchParams, StoreParams, current_timestamp, parse_user_relation,
+    validate_as_of,
 };
 use alaya_core::vitals::{CountingEmbedding, SelfCheckOutcome, Vitals};
 use alaya_types::graph::{Contradiction, ContradictionQuery, Resolution};
@@ -796,6 +797,17 @@ pub(crate) enum CmdInner {
         reason: String,
         reply: oneshot::Sender<Value>,
     },
+    /// Record that a caller re-checked a memory (LAB-7721).
+    Confirm {
+        hash: String,
+        reply: oneshot::Sender<Value>,
+    },
+    /// File a correction against a wrong memory (LAB-7721).
+    Refute {
+        hash: String,
+        refutation: Refutation,
+        reply: oneshot::Sender<Value>,
+    },
     /// Reverse a supersession (LAB-6876). `via` is who, recorded verbatim.
     Unsupersede {
         hash: String,
@@ -896,6 +908,8 @@ impl Cmd {
             CmdInner::Relation { .. } => "relation",
             CmdInner::Supersede { .. } => "supersede",
             CmdInner::Unsupersede { .. } => "unsupersede",
+            CmdInner::Confirm { .. } => "confirm",
+            CmdInner::Refute { .. } => "refute",
             CmdInner::Contradictions { .. } => "contradictions",
             CmdInner::ResolveContradiction { .. } => "resolve_contradiction",
             CmdInner::FindDuplicates { .. } => "find_duplicates",
@@ -1304,6 +1318,20 @@ impl Default for WorkerLimits {
     }
 }
 
+/// An op error as confirm and refute report it: the safe message, and a kind
+/// their REST routes map to a status. Neither returns `NotFound` as an error:
+/// a missing memory is a typed `status` in an `Ok` body.
+fn op_error(e: &alaya_types::AlayaError) -> Value {
+    json!({
+        "success": false,
+        "error": e.safe_message(),
+        "error_kind": match e {
+            alaya_types::AlayaError::Validation(_) => "validation",
+            _ => "internal",
+        },
+    })
+}
+
 /// Reply for a command whose handler blew its deadline. The worker drops the
 /// in-flight future (cancelling its awaits) and keeps draining the queue —
 /// one stuck backend await must never wedge the service (#63).
@@ -1346,10 +1374,10 @@ impl Drop for InFlight {
 /// merge_duplicates) and searches can be spawned as local tasks without
 /// blocking the command loop. Other commands continue processing while they
 /// run. The single-memory writes (store, delete, supersede, unsupersede,
-/// patch, relation, contradiction resolution) run inline, one at a time, in
-/// arrival order. Spawned tasks write too: merge_duplicates and both
-/// backfills, a search's access-count bump and Hebbian enqueue, and a store's
-/// summary and judge follow-ups. Their vector-store writes are ordered
+/// confirm, refute, patch, relation, contradiction resolution) run inline, one
+/// at a time, in arrival order. Spawned tasks write too: merge_duplicates and
+/// both backfills, a search's access-count bump and Hebbian enqueue, and a
+/// store's (or a refute's correction's) summary and judge follow-ups. Their vector-store writes are ordered
 /// against the inline ones only by the backend's compare-and-set and its
 /// locks; a search's access bump waits for a write in progress but holds no
 /// lock a store waits on. Their graph writes (Hebbian, judge verdicts,
@@ -1484,32 +1512,12 @@ async fn service_worker(
                             "ok"
                         );
 
-                        // Fire-and-forget: generate summary in background
-                        if let Some(content) = content_for_summary
-                            && !skipped
-                            && let Some(full_hash) = r.get("content_hash").and_then(|v| v.as_str())
-                        {
-                            let hash_owned = full_hash.to_string();
-                            let svc = svc.clone();
-                            tokio::task::spawn_local(async move {
-                                svc.enrich_summary(&hash_owned, &content).await;
-                            });
-                        }
-
-                        // Fire-and-forget (LAB-3283 AC-4): judge each new
-                        // CONTRADICTS signal off the store path. Suppressed
-                        // under read_only — no edges were written — and when
-                        // no judge is configured. The edge direction is
-                        // (new) -> (existing), matching the batch write above.
-                        // Only a genuinely new memory: a re-store re-runs
-                        // interference but its edges (and verdicts) already
-                        // exist — re-judging would churn and re-bill them.
-                        // LAB-3895: store-path judge spend is capped per UTC day.
-                        spawn_store_contradiction_judges(
+                        spawn_store_followups(
                             &svc,
                             &judge_gate,
                             &judge_limiter,
                             &r,
+                            content_for_summary,
                             read_only,
                         );
 
@@ -1791,6 +1799,92 @@ async fn service_worker(
                         json!({"success": false, "error": e.safe_message()})
                     }
                     Err(_) => deadline_exceeded(op, limits.cmd, start),
+                };
+                let _ = reply.send(result);
+            }
+            CmdInner::Confirm { hash, reply } => {
+                let span = tracing::info_span!(parent: &ps, "confirm");
+                let h = truncate_hash(&hash);
+                let result =
+                    match timeout(limits.cmd, svc.memory_confirm(&hash).instrument(span)).await {
+                        Ok(Ok(r)) => {
+                            tracing::info!(
+                                op,
+                                hash = h.as_str(),
+                                status = r["status"].as_str().unwrap_or("confirmed"),
+                                elapsed_ms = ms(start),
+                                "ok"
+                            );
+                            r
+                        }
+                        Ok(Err(e)) => {
+                            log_err(op, &e, start);
+                            op_error(&e)
+                        }
+                        Err(_) => deadline_exceeded(op, limits.cmd, start),
+                    };
+                let _ = reply.send(result);
+            }
+            CmdInner::Refute {
+                hash,
+                refutation,
+                reply,
+            } => {
+                let span = tracing::info_span!(parent: &ps, "refute",
+                    supersede = refutation.supersede);
+                let h = truncate_hash(&hash);
+                // Named in a timeout reply: the deadline may fall after the
+                // correction was stored, and the caller needs its hash to
+                // check (get_memory) or retry, which reuses it.
+                let content = refutation.content.clone();
+                let correction_hash = alaya_core::hashing::generate_content_hash(&content);
+                // The follow-ups launch between the phases, so a deadline in
+                // the second phase never costs the correction its summary or
+                // its judges; a retry that reuses a correction still without
+                // a summary launches that one.
+                let refute = async {
+                    let plan = match svc.refute_store(&hash, refutation).await? {
+                        RefuteStage::Refused(v) => return Ok(v),
+                        RefuteStage::Stored(plan) => plan,
+                    };
+                    let summary =
+                        (plan.summary_missing && svc.summary.is_some()).then_some(content);
+                    match (&plan.stored, summary) {
+                        (Some(stored), summary) => spawn_store_followups(
+                            &svc,
+                            &judge_gate,
+                            &judge_limiter,
+                            stored,
+                            summary,
+                            false,
+                        ),
+                        (None, Some(summary)) => {
+                            spawn_summary(&svc, &plan.correction_hash, summary)
+                        }
+                        (None, None) => {}
+                    }
+                    Ok::<_, alaya_types::AlayaError>(svc.refute_finish(&plan).await)
+                };
+                let result = match timeout(limits.cmd, refute.instrument(span)).await {
+                    Ok(Ok(result)) => {
+                        tracing::info!(
+                            op,
+                            hash = h.as_str(),
+                            status = result["status"].as_str().unwrap_or_default(),
+                            elapsed_ms = ms(start),
+                            "ok"
+                        );
+                        result
+                    }
+                    Ok(Err(e)) => {
+                        log_err(op, &e, start);
+                        op_error(&e)
+                    }
+                    Err(_) => {
+                        let mut v = deadline_exceeded(op, limits.cmd, start);
+                        v["correction_hash"] = json!(correction_hash);
+                        v
+                    }
                 };
                 let _ = reply.send(result);
             }
@@ -2437,6 +2531,43 @@ fn judge_cap_view(limiter: &JudgeDailyCap, judge_configured: bool) -> Value {
         "admitted_today": limiter.admitted_on(now),
         "utc_day": utc_date_str(now),
     })
+}
+
+/// A store's fire-and-forget follow-ups, for `/store` and for a refute's
+/// correction: the summary when the caller sent none (`summary_content`,
+/// `None` under read_only) and the stored content was not skipped as a
+/// duplicate, then the contradiction judges (LAB-3283 AC-4). The judges are
+/// suppressed under read_only — no edges were written — and when no judge
+/// is configured, and run only for a genuinely new memory: a re-store
+/// re-runs interference but its edges (and verdicts) already exist, so
+/// re-judging would churn and re-bill them. LAB-3895: store-path judge spend
+/// is capped per UTC day.
+fn spawn_store_followups(
+    svc: &std::rc::Rc<MemoryService>,
+    judge_gate: &std::rc::Rc<tokio::sync::Semaphore>,
+    limiter: &std::rc::Rc<std::cell::RefCell<JudgeDailyCap>>,
+    result: &std::collections::HashMap<String, Value>,
+    summary_content: Option<String>,
+    read_only: bool,
+) {
+    let skipped = result.get("duplicate").and_then(Value::as_bool) == Some(true);
+    if let Some(content) = summary_content
+        && !skipped
+        && let Some(hash) = result.get("content_hash").and_then(Value::as_str)
+    {
+        spawn_summary(svc, hash, content);
+    }
+    spawn_store_contradiction_judges(svc, judge_gate, limiter, result, read_only);
+}
+
+/// Generate a summary in the background (`MemoryService::enrich_summary`,
+/// which never overwrites a summary that exists by then).
+fn spawn_summary(svc: &std::rc::Rc<MemoryService>, hash: &str, content: String) {
+    let hash = hash.to_string();
+    let svc = svc.clone();
+    tokio::task::spawn_local(async move {
+        svc.enrich_summary(&hash, &content).await;
+    });
 }
 
 /// Spawns background contradiction judge tasks for new CONTRADICTS signals from a store result
@@ -3138,6 +3269,8 @@ fn protected_router(handle: ServiceHandle, auth_state: AuthState) -> Router {
             get(get_memory).patch(patch_memory),
         )
         .route("/memories/{content_hash}/relations", get(get_relations))
+        .route("/memories/{content_hash}/confirm", post(confirm))
+        .route("/memories/{content_hash}/refute", post(refute))
         .route("/backfill/summaries", post(backfill_summaries))
         .route("/backfill/contradictions", post(backfill_contradictions))
         .route("/backfill/keywords", post(backfill_keywords))
@@ -3441,6 +3574,96 @@ async fn unsupersede(
             hash: req.content_hash,
             reason: req.reason,
             via: req.unsuperseded_via,
+            reply: tx,
+        },
+        rx,
+    )
+    .await
+}
+
+/// The status of a confirm or refute result: a refusal is a 4xx, a correction
+/// stored without its second step is a 500 whose body names it.
+fn outcome_status(v: &Value) -> StatusCode {
+    // A refute's `status: superseded` is its success, not a refusal.
+    if v["success"] == true {
+        return StatusCode::OK;
+    }
+    match (v["status"].as_str(), v["error_kind"].as_str()) {
+        (Some("not_found"), _) => StatusCode::NOT_FOUND,
+        (
+            Some(
+                "superseded"
+                | "correction_superseded"
+                | "correction_deleted"
+                | "correction_exists"
+                | "conflict",
+            ),
+            _,
+        ) => StatusCode::CONFLICT,
+        (_, Some("validation")) => StatusCode::BAD_REQUEST,
+        _ if v.get("error").is_some() => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::OK,
+    }
+}
+
+/// Dispatch a confirm or refute and answer by `outcome_status`.
+async fn outcome(
+    h: &ServiceHandle,
+    inner: CmdInner,
+    rx: oneshot::Receiver<Value>,
+) -> (StatusCode, Json<Value>) {
+    match h.call_rpc(inner, rx).await {
+        Ok(v) => (outcome_status(&v), Json(v)),
+        Err((_code, msg)) => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": msg}))),
+    }
+}
+
+fn bad_hash() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "invalid content_hash format"})),
+    )
+}
+
+/// `POST /memories/{content_hash}/confirm` (LAB-7721): no body.
+async fn confirm(
+    axum::extract::State(h): axum::extract::State<ServiceHandle>,
+    axum::extract::Path(content_hash): axum::extract::Path<String>,
+) -> (StatusCode, Json<Value>) {
+    if !alaya_types::memory::validate_content_hash(&content_hash) {
+        return bad_hash();
+    }
+    let (tx, rx) = oneshot::channel();
+    outcome(
+        &h,
+        CmdInner::Confirm {
+            hash: content_hash,
+            reply: tx,
+        },
+        rx,
+    )
+    .await
+}
+
+/// `POST /memories/{content_hash}/refute` (LAB-7721): the body is a
+/// `Refutation`; an unknown key is refused, never dropped.
+async fn refute(
+    axum::extract::State(h): axum::extract::State<ServiceHandle>,
+    axum::extract::Path(content_hash): axum::extract::Path<String>,
+    Json(refutation): Json<Refutation>,
+) -> (StatusCode, Json<Value>) {
+    if !alaya_types::memory::validate_content_hash(&content_hash) {
+        return bad_hash();
+    }
+    if let Err(msg) = refutation.validate() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg})));
+    }
+    let (tx, rx) = oneshot::channel();
+    outcome(
+        &h,
+        CmdInner::Refute {
+            hash: content_hash,
+            refutation,
             reply: tx,
         },
         rx,
@@ -6125,6 +6348,7 @@ mod wedge_tests {
                             client_hostname: None,
                             summary: None,
                             dedup_threshold: None,
+                            citations: None,
                         },
                         read_only: false,
                         reply,
@@ -6406,6 +6630,7 @@ mod wedge_tests {
                 client_hostname: Some(labels.clone()),
                 summary: None,
                 dedup_threshold: None,
+                citations: None,
             };
             let out = ask(&tx, |reply| CmdInner::Store {
                 params,
@@ -6728,6 +6953,237 @@ mod wedge_tests {
                 "{method} {uri}: {v}"
             );
             assert!(rx.try_recv().is_err(), "{method} {uri} reached the worker");
+        }
+    }
+
+    /// Malformed citations, on the store field or in `metadata.citations`,
+    /// and a caller-set `last_confirmed_at` are a 400 before dispatch on store
+    /// and PATCH; a malformed refute body is a 400 or 422 the same way
+    /// (LAB-7721). A valid citation store does dispatch, citations folded in.
+    #[tokio::test]
+    async fn rest_refuses_bad_citations_and_confirmations_before_dispatch() {
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let app = protected_router(ServiceHandle { tx }, test_auth_state());
+        let hash = "a".repeat(64);
+        let cited = "27b-io/alaya@4d63bad:README.md:1-5";
+        let send = |method: &str, uri: String, body: Value| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        let cases = [
+            (
+                "POST",
+                "/store".to_string(),
+                json!({"content": "x", "citations": ["see PR"]}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "POST",
+                "/store".to_string(),
+                json!({"content": "x", "citations": "https://example.com"}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "POST",
+                "/store".to_string(),
+                json!({"content": "x", "metadata": {"citations": ["see PR"]}}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "POST",
+                "/store".to_string(),
+                json!({"content": "x", "citations": [cited], "metadata": {"citations": [cited]}}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "POST",
+                "/store".to_string(),
+                json!({"content": "x", "metadata": {"last_confirmed_at": 1.0}}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "PATCH",
+                format!("/memories/{hash}"),
+                json!({"metadata": {"citations": ["see PR"]}}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "PATCH",
+                format!("/memories/{hash}"),
+                json!({"metadata": {"last_confirmed_at": null}}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "POST",
+                "/memories/abc/confirm".to_string(),
+                json!({}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "POST",
+                format!("/memories/{hash}/refute"),
+                json!({"content": "x", "reason": " "}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "POST",
+                format!("/memories/{hash}/refute"),
+                json!({"content": "x", "reason": "y", "citations": ["see PR"]}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "POST",
+                format!("/memories/{hash}/refute"),
+                json!({"content": "x", "reason": "y", "metadata": {}}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "POST",
+                "/memories/abc/refute".to_string(),
+                json!({"content": "x", "reason": "y"}),
+                StatusCode::BAD_REQUEST,
+            ),
+        ];
+        for (method, uri, body, want) in cases {
+            let resp = app
+                .clone()
+                .oneshot(send(method, uri.clone(), body.clone()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), want, "{method} {uri} {body}");
+            assert!(
+                rx.try_recv().is_err(),
+                "{method} {uri} {body} reached the worker"
+            );
+        }
+
+        let resp = tokio::spawn(app.clone().oneshot(send(
+            "POST",
+            "/store".into(),
+            json!({"content": "x", "citations": [cited]}),
+        )));
+        let cmd = rx.recv().await.expect("a valid store is dispatched");
+        let CmdInner::Store { params, reply, .. } = cmd.inner else {
+            panic!("expected CmdInner::Store");
+        };
+        assert_eq!(params.citations, Some(vec![cited.to_string()]));
+        reply.send(json!({"success": true})).unwrap();
+        assert_eq!(resp.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    /// Confirm and refute answer a refusal by status, with the outcome body:
+    /// not found 404, superseded 409, a partial refute 500 naming the
+    /// stored correction, success 200.
+    #[tokio::test]
+    async fn confirm_and_refute_routes_answer_outcomes_by_status() {
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let app = protected_router(ServiceHandle { tx }, test_auth_state());
+        let hash = "a".repeat(64);
+        let fix = "b".repeat(64);
+        let cases = [
+            (
+                "confirm",
+                json!({"success": true, "content_hash": hash, "last_confirmed_at": 1.0}),
+                StatusCode::OK,
+            ),
+            (
+                "confirm",
+                json!({"success": false, "status": "not_found"}),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "confirm",
+                json!({"success": false, "status": "superseded", "superseded_by": fix}),
+                StatusCode::CONFLICT,
+            ),
+            (
+                "confirm",
+                json!({"success": false, "error": "Vector storage operation failed", "error_kind": "internal"}),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                "refute",
+                json!({"success": true, "status": "contradicts", "correction_hash": fix}),
+                StatusCode::OK,
+            ),
+            (
+                "refute",
+                json!({"success": false, "status": "correction_superseded"}),
+                StatusCode::CONFLICT,
+            ),
+            (
+                "refute",
+                json!({"success": true, "status": "superseded", "correction_hash": fix}),
+                StatusCode::OK,
+            ),
+            (
+                "refute",
+                json!({"success": false, "status": "correction_deleted", "correction_hash": fix}),
+                StatusCode::CONFLICT,
+            ),
+            (
+                "refute",
+                json!({"success": false, "status": "correction_exists", "field": "tags"}),
+                StatusCode::CONFLICT,
+            ),
+            (
+                "refute",
+                json!({"success": false, "status": "conflict", "superseded_by": fix, "correction_hash": fix}),
+                StatusCode::CONFLICT,
+            ),
+            (
+                "refute",
+                json!({"success": false, "status": "partial", "failed_step": "supersede", "correction_hash": fix, "error": "Correction stored as b…"}),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+        for (verb, reply_body, want) in cases {
+            let body = if verb == "refute" {
+                json!({"content": "fixed", "reason": "wrong", "supersede": true})
+            } else {
+                json!({})
+            };
+            let req = axum::http::Request::post(format!("/memories/{hash}/{verb}"))
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            let resp = tokio::spawn(app.clone().oneshot(req));
+            let cmd = rx.recv().await.expect("dispatched");
+            let reply = match cmd.inner {
+                CmdInner::Confirm { hash: h, reply } if verb == "confirm" => {
+                    assert_eq!(h, hash);
+                    reply
+                }
+                CmdInner::Refute {
+                    hash: h,
+                    refutation,
+                    reply,
+                } if verb == "refute" => {
+                    assert_eq!(h, hash);
+                    assert!(refutation.supersede);
+                    assert_eq!(refutation.content, "fixed");
+                    reply
+                }
+                _ => panic!("{verb}: wrong command"),
+            };
+            reply.send(reply_body.clone()).unwrap();
+            let resp = resp.await.unwrap().unwrap();
+            assert_eq!(resp.status(), want, "{verb} {reply_body}");
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let got: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(got, reply_body, "the outcome body is passed through");
         }
     }
 
