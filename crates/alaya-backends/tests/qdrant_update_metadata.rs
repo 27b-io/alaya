@@ -896,7 +896,13 @@ async fn supersede_if_live_leaves_a_superseded_memory_alone() {
         .supersede_if_live(&hash('a'), &hash('d'), "corrected")
         .await
         .expect("an outcome");
-    assert_eq!(same, ConditionalSupersede::Superseded);
+    assert_eq!(
+        same,
+        ConditionalSupersede::AlreadySuperseded {
+            reason: Some(json!("merged"))
+        },
+        "the reason stored, not this call's"
+    );
 
     assert!(writes(&server).await.is_empty());
     assert_eq!(fake.point(&id('a')).unwrap(), superseded);

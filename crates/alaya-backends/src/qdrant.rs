@@ -1113,6 +1113,71 @@ fn unsupersede_payload(
     (Value::Object(obj), reason)
 }
 
+impl QdrantClient {
+    /// One conditional merge into a live memory: `build` edits the `metadata`
+    /// object read and returns any top-level keys to write beside it. The
+    /// whole object is rebuilt from the copy the write is conditional on, so
+    /// sibling keys written meanwhile are never dropped, and a supersession
+    /// marker on that copy stops the write, so a supersede that wins the race
+    /// is always seen. `Ok(None)` when it landed; `Ok(Some(prev))`, the
+    /// payload read (`metadata` and `read_keys`), when the memory is
+    /// superseded and nothing was written. `AlayaError::NotFound` when the
+    /// memory does not exist.
+    async fn merge_while_live(
+        &self,
+        content_hash: &str,
+        what: &str,
+        read_keys: &[&str],
+        build: impl Fn(&mut serde_json::Map<String, Value>) -> serde_json::Map<String, Value>,
+    ) -> Result<Option<Value>> {
+        let point_id = hash_to_uuid(content_hash)?;
+        let keys: Vec<&str> = std::iter::once("metadata")
+            .chain(read_keys.iter().copied())
+            .collect();
+
+        let _write = self.write_lock.lock().await;
+
+        // What the latest read held when it stopped the write: a race re-runs
+        // the closure, so the last run describes the outcome.
+        let superseded: RefCell<Option<Value>> = RefCell::new(None);
+        let mut outcome = self
+            .update_points(
+                std::slice::from_ref(&point_id),
+                Some(&keys),
+                Commit::Payload(PayloadWrite::Merge, Batch::Strict),
+                |prev| {
+                    let mut metadata = match prev.get("metadata") {
+                        None | Some(Value::Null) => serde_json::Map::new(),
+                        Some(Value::Object(m)) => m.clone(),
+                        Some(_) => {
+                            return Err(AlayaError::Storage(
+                                "stored metadata is not an object; refusing to replace it".into(),
+                            ));
+                        }
+                    };
+                    if metadata.contains_key("superseded_by") {
+                        *superseded.borrow_mut() = Some(prev.clone());
+                        return Ok(None);
+                    }
+                    let mut write = build(&mut metadata);
+                    write.insert("metadata".into(), Value::Object(metadata));
+                    Ok(Some(Value::Object(write)))
+                },
+            )
+            .await?;
+        match outcome.remove(&point_id) {
+            Some(Update::Landed { .. }) => Ok(None),
+            Some(Update::Skipped) => Ok(Some(superseded.take().unwrap_or(Value::Null))),
+            Some(Update::Unconfirmed(why)) => Err(AlayaError::Storage(format!(
+                "{what} of {content_hash}: {why}"
+            ))),
+            Some(Update::Absent | Update::Deleted) | None => Err(AlayaError::NotFound(format!(
+                "memory {content_hash} not found"
+            ))),
+        }
+    }
+}
+
 /// Carry the server-maintained fields of `prev`, the stored payload, over the
 /// caller's `payload` on a re-store (see `VectorStorage::store`).
 fn carry_over(payload: &mut Value, prev: &Value) {
@@ -1551,101 +1616,52 @@ impl VectorStorage for QdrantClient {
         new_hash: &str,
         reason: &str,
     ) -> Result<ConditionalSupersede> {
-        let point_id = hash_to_uuid(content_hash)?;
-        let not_found = || AlayaError::NotFound(format!("memory {content_hash} not found"));
-
-        let _write = self.write_lock.lock().await;
-
-        // As in update_metadata_batch, marker and reason land in one merge
-        // with the whole `metadata` object rebuilt from the copy just read;
-        // unlike it, a marker on that copy stops the write.
-        let marker: RefCell<Option<Value>> = RefCell::new(None);
-        let mut outcome = self
-            .update_points(
-                std::slice::from_ref(&point_id),
-                Some(&["metadata"]),
-                Commit::Payload(PayloadWrite::Merge, Batch::Strict),
-                |prev| {
-                    let mut metadata = match prev.get("metadata") {
-                        None | Some(Value::Null) => serde_json::Map::new(),
-                        Some(Value::Object(m)) => m.clone(),
-                        Some(_) => {
-                            return Err(AlayaError::Storage(
-                                "stored metadata is not an object; refusing to replace it".into(),
-                            ));
-                        }
-                    };
-                    *marker.borrow_mut() = metadata.get("superseded_by").cloned();
-                    if metadata.contains_key("superseded_by") {
-                        return Ok(None);
-                    }
+        // As in update_metadata_batch, marker and reason land in one merge;
+        // unlike it, a marker already there stops the write.
+        let found = self
+            .merge_while_live(
+                content_hash,
+                "conditional supersede",
+                &[SUPERSESSION_REASON],
+                |metadata| {
                     metadata.insert("superseded_by".into(), json!(new_hash));
-                    Ok(Some(json!({
-                        "metadata": metadata,
-                        SUPERSESSION_REASON: reason,
-                    })))
+                    serde_json::Map::from_iter([(SUPERSESSION_REASON.into(), json!(reason))])
                 },
             )
             .await?;
-        match outcome.remove(&point_id) {
-            Some(Update::Landed { .. }) => Ok(ConditionalSupersede::Superseded),
-            Some(Update::Skipped) => match marker.take() {
-                Some(m) if m == json!(new_hash) => Ok(ConditionalSupersede::Superseded),
-                m => Ok(ConditionalSupersede::Conflict(m.unwrap_or(Value::Null))),
-            },
-            Some(Update::Unconfirmed(why)) => Err(AlayaError::Storage(format!(
-                "conditional supersede of {content_hash}: {why}"
-            ))),
-            Some(Update::Absent | Update::Deleted) | None => Err(not_found()),
-        }
+        let Some(prev) = found else {
+            return Ok(ConditionalSupersede::Superseded);
+        };
+        let marker = prev
+            .pointer("/metadata/superseded_by")
+            .cloned()
+            .unwrap_or(Value::Null);
+        Ok(if marker == json!(new_hash) {
+            ConditionalSupersede::AlreadySuperseded {
+                reason: prev.get(SUPERSESSION_REASON).cloned(),
+            }
+        } else {
+            ConditionalSupersede::Conflict(marker)
+        })
     }
 
     #[tracing::instrument(skip(self), fields(hash = %content_hash))]
     async fn confirm_memory(&self, content_hash: &str, at: f64) -> Result<ConfirmOutcome> {
-        let point_id = hash_to_uuid(content_hash)?;
-        let not_found = || AlayaError::NotFound(format!("memory {content_hash} not found"));
-
-        let _write = self.write_lock.lock().await;
-
-        // A merge of the whole `metadata` object, rebuilt from the copy the
-        // write is conditional on: no other key, and never the vector, is
-        // sent, so no ranking input moves. `marker` keeps what the latest
-        // read held, as in reverse_supersession.
-        let marker: RefCell<Option<Value>> = RefCell::new(None);
-        let mut outcome = self
-            .update_points(
-                std::slice::from_ref(&point_id),
-                Some(&["metadata"]),
-                Commit::Payload(PayloadWrite::Merge, Batch::Strict),
-                |prev| {
-                    let mut metadata = match prev.get("metadata") {
-                        None | Some(Value::Null) => serde_json::Map::new(),
-                        Some(Value::Object(m)) => m.clone(),
-                        Some(_) => {
-                            return Err(AlayaError::Storage(
-                                "stored metadata is not an object; refusing to replace it".into(),
-                            ));
-                        }
-                    };
-                    *marker.borrow_mut() = metadata.get("superseded_by").cloned();
-                    if metadata.contains_key("superseded_by") {
-                        return Ok(None);
-                    }
-                    metadata.insert(LAST_CONFIRMED_AT_KEY.into(), json!(at));
-                    Ok(Some(json!({ "metadata": metadata })))
-                },
-            )
+        // Only `metadata` is sent, never the vector, so no ranking input moves.
+        let found = self
+            .merge_while_live(content_hash, "confirm", &[], |metadata| {
+                metadata.insert(LAST_CONFIRMED_AT_KEY.into(), json!(at));
+                serde_json::Map::new()
+            })
             .await?;
-        match outcome.remove(&point_id) {
-            Some(Update::Landed { .. }) => Ok(ConfirmOutcome::Confirmed),
-            Some(Update::Skipped) => Ok(ConfirmOutcome::Superseded(
-                marker.take().unwrap_or(Value::Null),
-            )),
-            Some(Update::Unconfirmed(why)) => Err(AlayaError::Storage(format!(
-                "confirm of {content_hash}: {why}"
-            ))),
-            Some(Update::Absent | Update::Deleted) | None => Err(not_found()),
-        }
+        Ok(match found {
+            None => ConfirmOutcome::Confirmed,
+            Some(prev) => ConfirmOutcome::Superseded(
+                prev.pointer("/metadata/superseded_by")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+        })
     }
 
     #[tracing::instrument(skip(self, patch), fields(hash = %content_hash))]

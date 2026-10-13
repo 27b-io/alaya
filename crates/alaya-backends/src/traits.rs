@@ -62,8 +62,12 @@ pub enum ConfirmOutcome {
 /// What `VectorStorage::supersede_if_live` found on the memory.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConditionalSupersede {
-    /// The marker names the requested survivor: written now, or already so.
+    /// Marker and reason were written now.
     Superseded,
+    /// The marker named the requested survivor already: nothing written.
+    /// `reason` is the `supersession_reason` stored with it, which may not
+    /// be the one this call asked for.
+    AlreadySuperseded { reason: Option<serde_json::Value> },
     /// Another survivor's marker is there (as stored): nothing written.
     Conflict(serde_json::Value),
 }
@@ -162,8 +166,9 @@ pub trait VectorStorage {
     /// Supersede one memory only while it is live: set `metadata.superseded_by`
     /// to `new_hash` and `supersession_reason` together, in one conditional
     /// write, when the copy the write is conditional on carries no marker. A
-    /// marker naming `new_hash` already is `Superseded` with nothing written,
-    /// so a retry converges; any other marker is `Conflict`, untouched, so a
+    /// marker naming `new_hash` already is `AlreadySuperseded` with the
+    /// reason stored then, nothing written, so a retry converges and never
+    /// claims its own reason landed; any other marker is `Conflict`, untouched, so a
     /// survivor chosen meanwhile is never overwritten. `AlayaError::NotFound`
     /// when the memory does not exist. Default: unsupported.
     async fn supersede_if_live(

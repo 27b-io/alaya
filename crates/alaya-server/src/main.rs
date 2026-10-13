@@ -1852,7 +1852,7 @@ async fn service_worker(
                         }
                         (None, None) => {}
                     }
-                    Ok::<_, alaya_types::AlayaError>(svc.refute_link(&plan).await)
+                    Ok::<_, alaya_types::AlayaError>(svc.refute_finish(&plan).await)
                 };
                 let result = match timeout(limits.cmd, refute.instrument(span)).await {
                     Ok(Ok(result)) => {
