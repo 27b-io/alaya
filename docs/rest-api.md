@@ -64,6 +64,7 @@ Failed auth returns `401 Unauthorized` with a `WWW-Authenticate: Bearer …` hea
 | `POST` | `/backfill/summaries` | Generate missing summaries | yes |
 | `POST` | `/backfill/contradictions` | Judge unjudged contradiction pairs | yes |
 | `POST` | `/backfill/keywords` | Write the BM25 keyword vector of memories that lack one | yes |
+| `POST` | `/consolidation/sweep` | Remove the graph nodes of memories that are gone | yes |
 | `GET`  | `/stats` | Corpus counts and contradiction-judge aggregates | yes |
 | `POST` | `/mcp` | MCP JSON-RPC entry point | yes |
 | `GET`  | `/.well-known/oauth-protected-resource[/mcp]` | OAuth resource metadata (404 unless `OIDC_ISSUER` set) | no |
@@ -656,6 +657,29 @@ Repeat until `missing` is `0`; `GET /stats` shows the same number as `keyword_in
 It writes the keyword vector and nothing else: no payload key, no revision, no dense vector, so it runs safely beside live traffic and no store loses a compare-and-set round to it. It selects memories by "keyword vector missing", never by a saved position, so it is safe to re-run at any time. Run it once more after every rolling update that started from a server without the keyword index: until the last old server stops, its re-stores write the dense vector alone, which drops a memory's keyword vector (Qdrant's upsert replaces the whole point), and the next pass puts it back. A memory deleted during the pass is skipped. Nothing runs this at startup.
 
 One pass at a time per `alaya-server` process; a second call to the same process while one runs returns `{"success": false, "error": "keyword backfill already running"}`. Two processes running passes at once only write the same vectors twice.
+
+## `POST /consolidation/sweep`
+
+Removes the graph state of memories that are gone: every graph node, with its edges, whose memory has no Qdrant point. A delete removes the node too, but that graph write is non-fatal, so a failure leaves the node behind; and a store or refute racing a delete can create the node again after it. Operator-only, same auth class as the backfills: the read-only bearer and OIDC principals get `403`.
+
+```http
+POST /consolidation/sweep
+Content-Type: application/json
+
+{"limit": 5000}
+```
+
+It reads up to `limit` nodes (default `5000`, 1 to 20000) in hash order, after `after` when given, and blocks until the pass ends:
+
+```json
+{"success": true, "scanned": 5000, "swept": 3, "skipped": 0, "next_after": "7c1d..."}
+```
+
+Repeat with `"after": next_after` until `next_after` is `null`. `swept` counts the nodes removed; `skipped` counts nodes whose hash is not a valid content hash, which the sweep never touches.
+
+It never removes a node whose memory exists, unparseable payloads included. Nodes found without a point are marked for this run, Qdrant is read again, and only nodes that still carry the mark are removed. A store re-creating the node clears its mark, and a store writes its point before its node, so a store racing the sweep either clears the mark or is seen by the second read. The sweep writes nothing to Qdrant, and nothing runs it on a schedule.
+
+One pass at a time per `alaya-server` process; a second call to the same process while one runs returns `{"success": false, "error": "graph sweep already running"}`. Passes in two processes carry different marks, so each removes only what it marked itself.
 
 ## `GET /stats`
 

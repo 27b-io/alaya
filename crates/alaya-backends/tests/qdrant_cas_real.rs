@@ -716,3 +716,44 @@ async fn server_version_gate_against_real_servers() {
         .expect_err("a Qdrant < 1.18 must be refused");
     assert!(matches!(err, AlayaError::Config(_)), "got {err:?}");
 }
+
+/// The graph sweep's existence check (LAB-9265) is on the raw point: a
+/// stored memory and a point whose payload no longer parses both exist, an
+/// absent hash does not.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs QDRANT_TEST_URL"]
+async fn existing_hashes_judges_the_raw_point() {
+    let url = qdrant_url();
+    let coll = Collection::new(&url, "exists").await;
+    let client = coll.client(&url);
+    let stored = memory("exists probe", &[]);
+    client.store(&stored, StoreMode::Upsert).await.unwrap();
+    let junk = memory("junk payload probe", &[]).content_hash;
+    let id = uuid::Uuid::parse_str(&junk[..32]).unwrap().to_string();
+    #[allow(clippy::disallowed_methods, reason = "test-only client")]
+    let put = reqwest::Client::new()
+        .put(format!(
+            "{}/collections/{}/points?wait=true",
+            coll.url, coll.name
+        ))
+        .json(&json!({"points": [{"id": id, "vector": [0.5, 0.75], "payload": {"junk": 1}}]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(put.status().is_success(), "{}", put.text().await.unwrap());
+    assert!(
+        client.get_batch(&[&junk]).await.unwrap().is_empty(),
+        "the junk point does not parse as a memory"
+    );
+    let absent = memory("never stored", &[]).content_hash;
+
+    let found = client
+        .existing_hashes(&[&stored.content_hash, &junk, &absent])
+        .await
+        .unwrap();
+    assert!(found.contains(&stored.content_hash));
+    assert!(found.contains(&junk), "an unparseable point still exists");
+    assert!(!found.contains(&absent));
+    assert_eq!(found.len(), 2);
+    coll.cleanup().await;
+}

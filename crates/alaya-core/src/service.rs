@@ -549,6 +549,12 @@ const MAX_VIA_LEN: usize = 128;
 /// Cap on a `memory_unsupersede` reason: it is stored on the memory for good.
 pub const MAX_UNSUPERSEDE_REASON_LEN: usize = 2000;
 
+/// Most `Memory` nodes one graph sweep call reads (LAB-9265).
+pub const MAX_GRAPH_SWEEP_LIMIT: usize = 20_000;
+
+/// Nodes per page of a graph sweep: one bridge read and one Qdrant read each.
+const GRAPH_SWEEP_PAGE: usize = 500;
+
 /// `resolved_via` stamped on the CONTRADICTS pair of a reversed supersession
 /// (LAB-6876), so an automatic apply of the judge's verdict can tell the pair
 /// is settled and never re-applies it.
@@ -2650,6 +2656,88 @@ impl MemoryService {
         if let Err(e) = self.graph.create_system_edges_batch(&edges).await {
             tracing::warn!("failed to create SUPERSEDES edge(s): {e}");
         }
+    }
+
+    // ─── Graph sweep (LAB-9265) ─────────────────────────────────────────
+
+    /// Remove the graph state of memories that are gone: every `Memory`
+    /// node after `after` in hash order, up to `limit`, whose Qdrant point
+    /// does not exist is DETACH DELETEd with its edges. A delete whose
+    /// non-fatal `delete_node` failed leaves one, as does a MERGE that
+    /// re-creates a node after the delete (a store's or a refute's
+    /// `ensure_node`).
+    ///
+    /// Never a node whose point exists: the nodes found without one are
+    /// marked with `token`, Qdrant is read again, and only nodes still
+    /// marked are deleted. `ensure_node` clears the mark and every store
+    /// writes its point before `ensure_node`, so a store racing the sweep
+    /// either clears the mark or is seen by the second read. `token` must
+    /// be unique per run. A node whose hash is malformed is never touched
+    /// (`skipped`). Returns `{scanned, swept, skipped, next_after}`; pass
+    /// `next_after` back until it is `null`.
+    #[tracing::instrument(skip_all, fields(limit))]
+    pub async fn sweep_graph_orphans(
+        &self,
+        after: &str,
+        limit: usize,
+        token: &str,
+    ) -> Result<Value> {
+        if !(1..=MAX_GRAPH_SWEEP_LIMIT).contains(&limit) {
+            return Err(AlayaError::Validation(format!(
+                "limit must be 1..={MAX_GRAPH_SWEEP_LIMIT}"
+            )));
+        }
+        if token.is_empty() {
+            return Err(AlayaError::Validation("a sweep token is required".into()));
+        }
+        let mut after = after.to_string();
+        let (mut scanned, mut swept, mut skipped) = (0, 0, 0);
+        let mut done = false;
+        while scanned < limit {
+            let want = GRAPH_SWEEP_PAGE.min(limit - scanned);
+            let page = self.consolidation.list_memory_nodes(&after, want).await?;
+            let Some(last) = page.last() else {
+                done = true;
+                break;
+            };
+            after = last.clone();
+            scanned += page.len();
+            let (valid, bad): (Vec<&str>, Vec<&str>) = page
+                .iter()
+                .map(String::as_str)
+                .partition(|h| alaya_types::memory::validate_content_hash(h));
+            skipped += bad.len();
+            let present = self.vectors.existing_hashes(&valid).await?;
+            let missing: Vec<&str> = valid
+                .into_iter()
+                .filter(|h| !present.contains(*h))
+                .collect();
+            if !missing.is_empty() {
+                self.consolidation
+                    .mark_memory_nodes(&missing, token)
+                    .await?;
+                let present = self.vectors.existing_hashes(&missing).await?;
+                let gone: Vec<&str> = missing
+                    .into_iter()
+                    .filter(|h| !present.contains(*h))
+                    .collect();
+                if !gone.is_empty() {
+                    swept += self.consolidation.delete_marked_nodes(&gone, token).await?;
+                }
+            }
+            if page.len() < want {
+                done = true;
+                break;
+            }
+        }
+        tracing::info!(scanned, swept, skipped, done, "graph sweep");
+        Ok(serde_json::json!({
+            "success": true,
+            "scanned": scanned,
+            "swept": swept,
+            "skipped": skipped,
+            "next_after": (!done).then_some(after),
+        }))
     }
 
     // ─── Tool: memory_confirm (LAB-7721) ────────────────────────────────
@@ -11646,6 +11734,11 @@ mod tests {
         /// Another caller's store of this memory lands just before the next
         /// store's write (LAB-9265).
         store_lands_first: RefCell<Option<Memory>>,
+        /// A graph sweep's mark per node (LAB-9265).
+        sweep_marks: RefCell<HashMap<String, String>>,
+        /// A store's point write that lands just before the sweep's mark,
+        /// its `ensure_node` before the mark (`false`) or after it (`true`).
+        point_lands_at_mark: RefCell<Option<(Memory, bool)>>,
         /// Every graph write fails, as when FalkorDB is down.
         graph_down: Cell<bool>,
         /// Another writer re-supersedes the memory to this hash inside the
@@ -11710,7 +11803,7 @@ mod tests {
                 Box::new(MockEmbeddings),
                 Box::new(LedgerGraph(self.clone())),
                 Box::new(MockHebbian),
-                Box::new(MockConsolidation),
+                Box::new(LedgerConsolidation(self.clone())),
                 None,
             )
         }
@@ -11909,6 +12002,19 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        async fn existing_hashes(
+            &self,
+            hashes: &[&str],
+        ) -> Result<std::collections::HashSet<String>> {
+            Ok(self
+                .0
+                .memories
+                .borrow()
+                .iter()
+                .filter(|m| hashes.contains(&m.content_hash.as_str()))
+                .map(|m| m.content_hash.clone())
+                .collect())
+        }
         async fn delete(&self, _h: &str) -> Result<bool> {
             unimplemented!()
         }
@@ -11994,6 +12100,81 @@ mod tests {
 
     struct LedgerGraph(Rc<Ledger>);
 
+    /// The graph sweep's three calls over the ledger's nodes (LAB-9265).
+    struct LedgerConsolidation(Rc<Ledger>);
+
+    #[async_trait(?Send)]
+    impl ConsolidationService for LedgerConsolidation {
+        async fn decay_all_edges(&self, _d: f64, _l: usize) -> Result<usize> {
+            Ok(0)
+        }
+        async fn decay_stale_edges(&self, _s: f64, _d: f64, _l: usize) -> Result<usize> {
+            Ok(0)
+        }
+        async fn prune_weak_edges(&self, _t: f64, _l: usize) -> Result<usize> {
+            Ok(0)
+        }
+        async fn get_orphan_nodes(&self, _l: usize) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn list_memory_nodes(&self, after: &str, limit: usize) -> Result<Vec<String>> {
+            let mut page: Vec<String> = self
+                .0
+                .nodes
+                .borrow()
+                .iter()
+                .filter(|h| h.as_str() > after)
+                .cloned()
+                .collect();
+            page.sort();
+            page.truncate(limit);
+            Ok(page)
+        }
+        async fn mark_memory_nodes(&self, hashes: &[&str], token: &str) -> Result<usize> {
+            let l = &self.0;
+            let late = l.point_lands_at_mark.borrow_mut().take();
+            let ensure_after = match late {
+                Some((m, after)) => {
+                    let h = m.content_hash.clone();
+                    l.memories.borrow_mut().push(m);
+                    after.then_some(h)
+                }
+                None => None,
+            };
+            let nodes = l.nodes.borrow();
+            let mut marked = 0;
+            for h in hashes.iter().filter(|h| nodes.contains(**h)) {
+                l.sweep_marks
+                    .borrow_mut()
+                    .insert((*h).to_string(), token.to_string());
+                marked += 1;
+            }
+            drop(nodes);
+            if let Some(h) = ensure_after {
+                l.sweep_marks.borrow_mut().remove(&h);
+            }
+            Ok(marked)
+        }
+        async fn delete_marked_nodes(&self, hashes: &[&str], token: &str) -> Result<usize> {
+            let l = &self.0;
+            let mut deleted = 0;
+            for h in hashes {
+                if l.sweep_marks.borrow().get(*h).map(String::as_str) != Some(token) {
+                    continue;
+                }
+                l.sweep_marks.borrow_mut().remove(*h);
+                l.nodes.borrow_mut().remove(*h);
+                // DETACH: its edges go with it.
+                l.contradicts
+                    .borrow_mut()
+                    .retain(|(s, d), _| s != h && d != h);
+                l.supersedes.borrow_mut().retain(|(s, d)| s != h && d != h);
+                deleted += 1;
+            }
+            Ok(deleted)
+        }
+    }
+
     #[async_trait(?Send)]
     impl GraphService for LedgerGraph {
         async fn delete_incoming_system_edges(
@@ -12016,6 +12197,8 @@ mod tests {
             self.0.graph_write()?;
             if !self.0.ensure_node_lost.get() {
                 self.0.nodes.borrow_mut().insert(h.to_string());
+                // As the bridge's MERGE: the node is alive again.
+                self.0.sweep_marks.borrow_mut().remove(h);
             }
             Ok(())
         }
@@ -14089,5 +14272,136 @@ mod tests {
         assert_eq!(out["failed_step"], "contradicts_edge");
         assert!(!ledger.nodes.borrow().contains(&a), "node put back");
         assert!(ledger.contradicts.borrow().is_empty(), "edge landed");
+    }
+
+    // ─── graph sweep (LAB-9265) ─────────────────────────────────────────
+
+    /// A ledger with points for `live`, and graph nodes for `live` and
+    /// `gone`; every gone node has an edge to the first live one.
+    fn sweep_ledger(live: &[&str], gone: &[&str]) -> Rc<Ledger> {
+        let ledger = Ledger::with(live);
+        for h in live.iter().chain(gone) {
+            ledger.nodes.borrow_mut().insert((*h).to_string());
+        }
+        for h in gone {
+            ledger
+                .contradicts
+                .borrow_mut()
+                .insert(((*h).to_string(), live[0].to_string()), None);
+        }
+        ledger
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn graph_sweep_removes_a_node_without_a_point_and_keeps_one_with_a_point() {
+        let (a, b, c) = (h('a'), h('b'), h('c'));
+        let ledger = sweep_ledger(&[&a, &c], &[&b]);
+        let svc = ledger.service();
+
+        let out = svc.sweep_graph_orphans("", 100, "run-1").await.unwrap();
+        assert_eq!(out["scanned"], 3, "{out}");
+        assert_eq!(out["swept"], 1);
+        assert_eq!(out["skipped"], 0);
+        assert_eq!(out["next_after"], Value::Null, "the graph is done");
+        let nodes = ledger.nodes.borrow();
+        assert!(!nodes.contains(&b), "the node without a point is swept");
+        assert!(
+            nodes.contains(&a) && nodes.contains(&c),
+            "nodes with points stay"
+        );
+        assert!(
+            ledger.contradicts.borrow().is_empty(),
+            "its edge goes with it"
+        );
+        assert_eq!(ledger.memories.borrow().len(), 2, "no point is touched");
+    }
+
+    /// A store of a swept memory that lands inside the sweep is never
+    /// undone: its point lands before the mark (then the second read sees
+    /// it), and its `ensure_node` before or after the mark.
+    #[tokio::test(flavor = "current_thread")]
+    async fn graph_sweep_never_removes_a_node_whose_point_lands_meanwhile() {
+        for ensure_after_mark in [false, true] {
+            let (a, b) = (h('a'), h('b'));
+            let ledger = sweep_ledger(&[&a], &[&b]);
+            let mut restored = dummy_memory();
+            restored.content_hash = b.clone();
+            *ledger.point_lands_at_mark.borrow_mut() = Some((restored, ensure_after_mark));
+            let svc = ledger.service();
+
+            let out = svc.sweep_graph_orphans("", 100, "run-1").await.unwrap();
+            assert_eq!(
+                out["swept"], 0,
+                "ensure_after_mark={ensure_after_mark}: {out}"
+            );
+            assert!(ledger.nodes.borrow().contains(&b));
+        }
+    }
+
+    /// Only nodes that still carry this run's mark go: another run's mark
+    /// (or one an `ensure_node` cleared) leaves the node in place.
+    #[tokio::test(flavor = "current_thread")]
+    async fn graph_sweep_deletes_only_what_its_own_mark_holds() {
+        let (a, b) = (h('a'), h('b'));
+        let ledger = sweep_ledger(&[&a], &[&b]);
+        let svc = ledger.service();
+        svc.consolidation
+            .mark_memory_nodes(&[&b], "run-1")
+            .await
+            .unwrap();
+        let deleted = svc
+            .consolidation
+            .delete_marked_nodes(&[&b], "run-2")
+            .await
+            .unwrap();
+        assert_eq!(deleted, 0);
+        svc.graph.ensure_node(&b, 1.0).await.unwrap();
+        let deleted = svc
+            .consolidation
+            .delete_marked_nodes(&[&b], "run-1")
+            .await
+            .unwrap();
+        assert_eq!(deleted, 0, "ensure_node cleared the mark");
+        assert!(ledger.nodes.borrow().contains(&b));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn graph_sweep_pages_by_limit_and_never_touches_a_malformed_hash() {
+        let (a, b, c) = (h('a'), h('b'), h('c'));
+        let ledger = sweep_ledger(&[&a], &[&b, &c]);
+        ledger.nodes.borrow_mut().insert("not-a-hash".to_string());
+        let svc = ledger.service();
+
+        let first = svc.sweep_graph_orphans("", 2, "run-1").await.unwrap();
+        assert_eq!(first["scanned"], 2, "{first}");
+        assert_eq!(first["swept"], 1);
+        assert_eq!(first["next_after"], b, "resume after the last node read");
+        let rest = svc
+            .sweep_graph_orphans(first["next_after"].as_str().unwrap(), 100, "run-2")
+            .await
+            .unwrap();
+        assert_eq!(rest["scanned"], 2, "{rest}");
+        assert_eq!(rest["swept"], 1);
+        assert_eq!(rest["skipped"], 1);
+        assert_eq!(rest["next_after"], Value::Null);
+        {
+            let nodes = ledger.nodes.borrow();
+            assert!(
+                nodes.contains("not-a-hash"),
+                "a malformed hash is never swept"
+            );
+            assert!(nodes.contains(&a));
+            assert_eq!(nodes.len(), 2);
+        }
+
+        for (limit, token) in [(0, "t"), (MAX_GRAPH_SWEEP_LIMIT + 1, "t"), (1, "")] {
+            assert!(
+                matches!(
+                    svc.sweep_graph_orphans("", limit, token).await,
+                    Err(AlayaError::Validation(_))
+                ),
+                "limit={limit} token={token:?}"
+            );
+        }
     }
 }

@@ -27,9 +27,12 @@ fn params(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
 // ─── node operations ─────────────────────────────────────────────────────────
 
 /// MERGE a Memory node, setting `created_at` only on creation.
+/// Clears a sweep's mark (`sweep_mark_memory_nodes`), so a node a store
+/// ensures after the mark is never swept.
 pub fn ensure_node(hash: &str, ts: f64) -> CypherQuery {
     let q = "MERGE (m:Memory {content_hash: $hash}) \
-             ON CREATE SET m.created_at = $ts"
+             ON CREATE SET m.created_at = $ts \
+             SET m.sweep_mark = null"
         .to_string();
     (
         q,
@@ -710,6 +713,53 @@ pub fn prune_weak_edges(threshold: f64, limit: u32) -> CypherQuery {
     (
         q,
         params(&[("thresh", json!(threshold)), ("lim", json!(limit))]),
+        false,
+    )
+}
+
+// ─── orphan-node sweep (LAB-9265) ─────────────────────────────────────────────
+//
+// A Memory node whose Qdrant point is gone (a delete whose non-fatal
+// delete_node failed, or a MERGE that re-created a node after the delete)
+// is removed in three steps, so a node with a point is never removed: the
+// caller marks the nodes it found without a point, checks Qdrant again, and
+// deletes only nodes that still carry its mark. ensure_node clears the
+// mark, and a store writes its point before ensure_node, so a store racing
+// the sweep either clears the mark or is seen by the second check.
+
+/// One page of Memory node hashes after `after`, in hash order. Read-only.
+pub fn list_memory_nodes(after: &str, limit: u32) -> CypherQuery {
+    let q = "MATCH (m:Memory) WHERE m.content_hash > $after \
+             RETURN m.content_hash ORDER BY m.content_hash LIMIT $lim"
+        .to_string();
+    (
+        q,
+        params(&[("after", json!(after)), ("lim", json!(limit))]),
+        true,
+    )
+}
+
+/// Mark the given Memory nodes with a sweep's `token`; returns how many.
+pub fn sweep_mark_memory_nodes(hashes: &[&str], token: &str) -> CypherQuery {
+    let q = "MATCH (m:Memory) WHERE m.content_hash IN $hashes \
+             SET m.sweep_mark = $token RETURN count(m)"
+        .to_string();
+    (
+        q,
+        params(&[("hashes", json!(hashes)), ("token", json!(token))]),
+        false,
+    )
+}
+
+/// DETACH DELETE the given Memory nodes that still carry `token`; returns
+/// how many.
+pub fn sweep_delete_marked_nodes(hashes: &[&str], token: &str) -> CypherQuery {
+    let q = "MATCH (m:Memory) WHERE m.content_hash IN $hashes AND m.sweep_mark = $token \
+             DETACH DELETE m RETURN count(m)"
+        .to_string();
+    (
+        q,
+        params(&[("hashes", json!(hashes)), ("token", json!(token))]),
         false,
     )
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 
@@ -123,6 +123,15 @@ pub trait VectorStorage {
     async fn store(&self, memory: &Memory, mode: StoreMode) -> Result<(bool, String)>;
     async fn get_by_hash(&self, content_hash: &str) -> Result<Option<Memory>>;
     async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>>;
+    /// Which of `hashes` have a point, judged on the raw point: a payload
+    /// that no longer parses as a `Memory` still exists (LAB-9265, the
+    /// graph sweep). Default: unsupported.
+    async fn existing_hashes(&self, hashes: &[&str]) -> Result<HashSet<String>> {
+        let _ = hashes;
+        Err(AlayaError::Storage(
+            "existence checks are not supported by this backend".into(),
+        ))
+    }
     async fn delete(&self, content_hash: &str) -> Result<bool>;
     async fn update_metadata(&self, content_hash: &str, updates: MetadataUpdate) -> Result<()>;
 
@@ -554,6 +563,27 @@ pub trait ConsolidationService {
     ) -> Result<usize>;
     async fn prune_weak_edges(&self, threshold: f64, limit: usize) -> Result<usize>;
     async fn get_orphan_nodes(&self, limit: usize) -> Result<Vec<String>>;
+
+    // The orphan-node sweep (LAB-9265): list, mark, delete what is still
+    // marked. Defaults: unsupported.
+
+    /// One page of Memory node hashes after `after`, in hash order.
+    async fn list_memory_nodes(&self, after: &str, limit: usize) -> Result<Vec<String>> {
+        let _ = (after, limit);
+        Err(AlayaError::Graph("node listing is not supported".into()))
+    }
+    /// Mark these nodes with a sweep's `token`; a later `ensure_node`
+    /// clears the mark. Returns how many were marked.
+    async fn mark_memory_nodes(&self, hashes: &[&str], token: &str) -> Result<usize> {
+        let _ = (hashes, token);
+        Err(AlayaError::Graph("node sweeps are not supported".into()))
+    }
+    /// DETACH DELETE those of these nodes that still carry `token`. Returns
+    /// how many were deleted.
+    async fn delete_marked_nodes(&self, hashes: &[&str], token: &str) -> Result<usize> {
+        let _ = (hashes, token);
+        Err(AlayaError::Graph("node sweeps are not supported".into()))
+    }
 }
 
 /// Summary generation backend (e.g. Anthropic Messages API).

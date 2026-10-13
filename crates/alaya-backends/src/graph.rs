@@ -917,6 +917,54 @@ impl ConsolidationService for GraphHttpClient {
         let body: OrphansResp = handle_response(resp).await?;
         Ok(body.orphans)
     }
+
+    async fn list_memory_nodes(&self, after: &str, limit: usize) -> Result<Vec<String>> {
+        let resp = self
+            .client
+            .post(format!("{}/consolidation/nodes", self.base_url))
+            .json(&serde_json::json!({ "after": after, "limit": limit }))
+            .send()
+            .await
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
+        #[derive(Deserialize)]
+        struct R {
+            hashes: Vec<String>,
+        }
+        let body: R = handle_response(resp).await?;
+        Ok(body.hashes)
+    }
+
+    async fn mark_memory_nodes(&self, hashes: &[&str], token: &str) -> Result<usize> {
+        let resp = self
+            .client
+            .post(format!("{}/consolidation/sweep-mark", self.base_url))
+            .json(&serde_json::json!({ "hashes": hashes, "token": token }))
+            .send()
+            .await
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
+        #[derive(Deserialize)]
+        struct R {
+            marked: usize,
+        }
+        let body: R = handle_response(resp).await?;
+        Ok(body.marked)
+    }
+
+    async fn delete_marked_nodes(&self, hashes: &[&str], token: &str) -> Result<usize> {
+        let resp = self
+            .client
+            .post(format!("{}/consolidation/sweep-delete", self.base_url))
+            .json(&serde_json::json!({ "hashes": hashes, "token": token }))
+            .send()
+            .await
+            .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
+        #[derive(Deserialize)]
+        struct R {
+            deleted: usize,
+        }
+        let body: R = handle_response(resp).await?;
+        Ok(body.deleted)
+    }
 }
 
 /// The bridge's per-hash pairs as `ContradictionRef`s, each from its key's

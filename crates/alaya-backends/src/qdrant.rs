@@ -1324,11 +1324,17 @@ impl QdrantClient {
     }
 
     /// Retrieve raw points by id, no vectors; the payload restricted to
-    /// `keys`, or whole when `None`. Absent ids are simply missing.
+    /// `keys` (none when empty), or whole when `None`. Absent ids are simply
+    /// missing.
     async fn retrieve(&self, point_ids: &[String], keys: Option<&[&str]>) -> Result<Vec<Value>> {
+        let with_payload = match keys {
+            None => json!(true),
+            Some([]) => json!(false),
+            Some(k) => json!(k),
+        };
         let body = json!({
             "ids": point_ids,
-            "with_payload": keys.map_or(json!(true), |k| json!(k)),
+            "with_payload": with_payload,
             "with_vector": false,
         });
 
@@ -1455,6 +1461,30 @@ impl VectorStorage for QdrantClient {
             .await?
             .iter()
             .filter_map(point_to_memory)
+            .collect())
+    }
+
+    async fn existing_hashes(&self, hashes: &[&str]) -> Result<HashSet<String>> {
+        if hashes.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let ids: Vec<String> = hashes
+            .iter()
+            .map(|h| hash_to_uuid(h))
+            .collect::<Result<Vec<String>>>()?;
+        // No payload: existence is the point itself, whether or not its
+        // payload still parses.
+        let found: HashSet<String> = self
+            .retrieve(&ids, Some(&[]))
+            .await?
+            .iter()
+            .filter_map(|p| p.get("id")?.as_str().map(str::to_string))
+            .collect();
+        Ok(hashes
+            .iter()
+            .zip(&ids)
+            .filter(|(_, id)| found.contains(*id))
+            .map(|(h, _)| (*h).to_string())
             .collect())
     }
 
