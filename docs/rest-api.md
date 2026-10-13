@@ -258,7 +258,16 @@ curl -X POST http://localhost:3001/search \
 
 `min_trust_score` (optional number) keeps only memories whose stored `provenance.trust_score` is at least this value; a memory with no stored trust score is dropped. It applies to `hybrid` (every candidate pool, before fusion) and `similar` mode, and the other modes ignore it.
 
-**Response:** an object whose `results` array holds the memories in rank order, with the paging keys of the mode and `mode` itself. Per-mode keys and the result fields are listed under [MCP: `search`](./mcp-tools.md#search). A hybrid page looks like this:
+`as_of` (REST only, optional number, epoch seconds like `created_at`) replays the search against the store as it stood at that time, for evaluation harnesses that score a past query. It is accepted only on a read-only search (`"read_only": true`, or a read-only principal) in `hybrid` or `similar` mode; otherwise, or when it is later than the server's clock (as an epoch-milliseconds value is), the request is a `400` naming the problem. With `as_of = T`:
+
+- No memory created after T is returned, from any candidate pool.
+- A superseded memory is hidden when the memory that superseded it (its survivor) was created at or before T, and shown when the survivor was created after T. No supersession time is stored, so the survivor's `created_at` stands in for it. A survivor is always written before the supersede, so the error runs one way: a memory can be hidden from the moment its survivor was written until it was actually superseded, never shown after that. A memory whose survivor is no longer in the store, or whose marker names none, is hidden at every T. `include_superseded: true` turns this check off, never the `created_at` bound.
+- `hybrid` computes recency decay from T instead of the current time.
+- The response carries `"as_of": T`. A server that predates the field ignores it and omits the echo, so check for it.
+
+Some state cannot be rewound and is read as it is now: graph state (Hebbian weights, and which neighbours spreading activation injects, though each injected neighbour still passes the `as_of` bound and the supersession rule); access counts and access timestamps (the salience and spacing boosts); BM25 term statistics, computed over today's collection; the tag vocabulary that keyword extraction and the semantic tag pool read; tags, type, summary and trust patched since T; hard deletes; supersessions reversed by `/unsupersede`, which leave no marker, so the memory passes the supersession check at every T (the `created_at` bound still applies); and a marker re-pointed to a second survivor, which names only the last one. The corpus size behind hybrid's fusion weight is today's too.
+
+**Response:** an object whose `results` array holds the memories in rank order, with the paging keys of the mode and `mode` itself; a search sent with `as_of` also echoes `"as_of": T`. Per-mode keys and the result fields are listed under [MCP: `search`](./mcp-tools.md#search). A hybrid page looks like this:
 
 ```json
 {
@@ -289,7 +298,7 @@ curl -X POST http://localhost:3001/search \
 }
 ```
 
-`newer_related` is optional, and absent when nothing qualifies. It lists newer memories the contradiction judge picked over this one at or above `NEWER_RELATED_MIN_CONFIDENCE`. Nobody has reviewed the pick, so read both memories. When it appears, and what it never changes, is under [MCP: `search`](./mcp-tools.md#search). `GET /memories/{content_hash}` carries the same key.
+`newer_related` is optional, and absent when nothing qualifies. It lists newer memories the contradiction judge picked over this one at or above `NEWER_RELATED_MIN_CONFIDENCE`. Nobody has reviewed the pick, so read both memories. When it appears, and what it never changes, is under [MCP: `search`](./mcp-tools.md#search). `GET /memories/{content_hash}` carries the same key. A search sent with `as_of` never carries it: verdicts, resolutions and survivors are read as they are now, so a replay would name memories from after T.
 
 ## `GET /memories/{content_hash}`
 

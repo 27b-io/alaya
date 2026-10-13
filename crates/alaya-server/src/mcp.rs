@@ -384,6 +384,7 @@ async fn dispatch_tool(
                     CmdInner::Search {
                         params,
                         read_only,
+                        as_of: None,
                         reply: tx,
                     },
                     rx,
@@ -1050,6 +1051,20 @@ mod tests {
             .unwrap();
         let required = store["inputSchema"]["required"].as_array().unwrap();
         assert!(required.contains(&json!("content")));
+    }
+
+    /// `as_of` is a REST-only replay field: the MCP `search` tool neither
+    /// lists it nor reads it (`SearchParams` has no such field).
+    #[test]
+    fn search_schema_does_not_offer_as_of() {
+        let schemas = tool_schemas();
+        let search = schemas
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "search")
+            .unwrap();
+        assert!(search["inputSchema"]["properties"].get("as_of").is_none());
     }
 
     #[test]

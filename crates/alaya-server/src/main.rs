@@ -52,7 +52,7 @@ use alaya_core::calendar::utc_date_str;
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{
     JudgeOutcome, KeywordLeg, MemoryService, OutputMode, RankingFlags, RelationParams,
-    SearchParams, StoreParams, parse_user_relation,
+    SearchParams, StoreParams, current_timestamp, parse_user_relation, validate_as_of,
 };
 use alaya_core::vitals::{CountingEmbedding, SelfCheckOutcome, Vitals};
 use alaya_types::graph::{Contradiction, ContradictionQuery, Resolution};
@@ -773,6 +773,8 @@ pub(crate) enum CmdInner {
     Search {
         params: SearchParams,
         read_only: bool,
+        /// REST-only replay time (epoch seconds); MCP always sends `None`.
+        as_of: Option<f64>,
         reply: oneshot::Sender<Value>,
     },
     Delete {
@@ -1551,6 +1553,7 @@ async fn service_worker(
             CmdInner::Search {
                 params,
                 read_only,
+                as_of,
                 reply,
             } => {
                 search_backlog_warned = false;
@@ -1569,7 +1572,7 @@ async fn service_worker(
                     clip_for_log(params.memory_type.as_deref().unwrap_or_default()).into_owned();
                 // `queued_ms` is recorded once the search holds the gate, so
                 // its ok, failed and timeout lines all carry the wait.
-                let span = tracing::info_span!(parent: &ps, "search", %mode, read_only,
+                let span = tracing::info_span!(parent: &ps, "search", %mode, read_only, ?as_of,
                     queued_ms = tracing::field::Empty);
                 let svc = svc.clone();
                 let gate = search_gate.clone();
@@ -1591,8 +1594,11 @@ async fn service_worker(
                             return;
                         }
                         let running_since = std::time::Instant::now();
-                        let result = match timeout(deadline, svc.search_with(params, read_only))
-                            .await
+                        let result = match timeout(
+                            deadline,
+                            svc.search_with(params, read_only, as_of),
+                        )
+                        .await
                         {
                             Ok(Ok(r)) => {
                                 let n = result_count(&r);
@@ -3263,29 +3269,42 @@ async fn store(
     .await
 }
 
-/// `POST /search` body: the shared search params plus a REST-only
-/// `read_only` that a caller sets to make its own search a pure read. It can
-/// only narrow: it is OR'd with the principal's policy, so `false` never
-/// lifts a read-only principal into the side-effect writes.
+/// `POST /search` body: the shared search params plus two REST-only fields.
+/// `read_only` makes the caller's own search a pure read. It can only
+/// narrow: it is OR'd with the principal's policy, so `false` never lifts a
+/// read-only principal into the side-effect writes. `as_of` (epoch seconds)
+/// replays a read-only `hybrid` or `similar` search against the store as it
+/// stood then; MCP's `search` does not take it.
 #[derive(Deserialize)]
 struct SearchReq {
     #[serde(flatten)]
     params: SearchParams,
     #[serde(default)]
     read_only: bool,
+    as_of: Option<f64>,
 }
 
 async fn search(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
-    Json(SearchReq { params, read_only }): Json<SearchReq>,
+    Json(SearchReq {
+        params,
+        read_only,
+        as_of,
+    }): Json<SearchReq>,
 ) -> (StatusCode, Json<Value>) {
     let read_only = read_only || WritePolicy::read_only_for(principal);
+    // Refused here, before dispatch, so the caller gets a 400 rather than an
+    // op error in a 200 body.
+    if let Err(msg) = validate_as_of(as_of, params.mode, read_only, current_timestamp()) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg})));
+    }
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::Search {
             params,
             read_only,
+            as_of,
             reply: tx,
         },
         rx,
@@ -5237,7 +5256,7 @@ mod tests {
         let client =
             QdrantClient::new(format!("http://{refused}"), "memories".into(), None).unwrap();
         let found = client
-            .search_by_tags(&["TAG-MARKER"], false, 10, Some("note"), None)
+            .search_by_tags(&["TAG-MARKER"], false, 10, Some("note"), None, None)
             .await;
         assert!(found.is_err());
 
@@ -5373,6 +5392,7 @@ mod wedge_tests {
             _limit: usize,
             _mt: Option<&str>,
             _mts: Option<f64>,
+            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             unimplemented!()
         }
@@ -5965,6 +5985,7 @@ mod wedge_tests {
             _limit: usize,
             _mt: Option<&str>,
             _mts: Option<f64>,
+            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             tokio::time::sleep(SLOW_SEARCH).await;
             Ok(Vec::new())
@@ -6056,6 +6077,7 @@ mod wedge_tests {
         CmdInner::Search {
             params,
             read_only: false,
+            as_of: None,
             reply,
         }
     }
@@ -6400,6 +6422,7 @@ mod wedge_tests {
             let out = ask(&tx, |reply| CmdInner::Search {
                 params,
                 read_only: false,
+                as_of: None,
                 reply,
             })
             .await;
@@ -7366,6 +7389,7 @@ mod wedge_tests {
                     Some(CmdInner::Search {
                         params,
                         read_only,
+                        as_of: None,
                         reply,
                     }) => {
                         let _ = reply.send(json!({ "results": [] }));
@@ -7391,6 +7415,111 @@ mod wedge_tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(rx.try_recv().is_err(), "a refused call must not dispatch");
+    }
+
+    /// `POST /search` `as_of` reaches the worker only on a read-only `hybrid`
+    /// or `similar` search at a time not past the clock. Each refusal is a 400
+    /// naming the problem, before dispatch: a worker-side validation error
+    /// would reach the caller as a 200.
+    #[tokio::test]
+    async fn search_as_of_refusals_are_400s_before_dispatch() {
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = mpsc::channel::<Cmd>(4);
+        let mut auth = test_auth_state();
+        auth.readonly_api_key = Some("ro-key".into());
+        let app = protected_router(ServiceHandle { tx }, auth);
+        let post = |token: &str, body: Value| {
+            axum::http::Request::post("/search")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        let past = 1_700_000_000.5;
+
+        let refused = [
+            (
+                TEST_KEY,
+                json!({ "query": "q", "as_of": past }),
+                "read-only",
+            ),
+            (
+                TEST_KEY,
+                json!({ "query": "q", "as_of": past, "read_only": false }),
+                "read-only",
+            ),
+            (
+                TEST_KEY,
+                json!({ "query": "q", "mode": "recent", "as_of": past, "read_only": true }),
+                "hybrid and similar",
+            ),
+            (
+                "ro-key",
+                json!({ "query": "q", "mode": "tag", "tags": "a", "as_of": past }),
+                "hybrid and similar",
+            ),
+            (
+                "ro-key",
+                json!({ "query": "q", "mode": "scan", "as_of": past }),
+                "hybrid and similar",
+            ),
+            // Epoch milliseconds.
+            (
+                TEST_KEY,
+                json!({ "query": "q", "as_of": past * 1000.0, "read_only": true }),
+                "epoch seconds",
+            ),
+        ];
+        for (token, body, names) in refused {
+            let resp = app
+                .clone()
+                .oneshot(post(token, body.clone()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let err: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(
+                err["error"].as_str().is_some_and(|e| e.contains(names)),
+                "{body}: {err}"
+            );
+            assert!(rx.try_recv().is_err(), "a refused call must not dispatch");
+        }
+
+        let accepted = [
+            (
+                TEST_KEY,
+                json!({ "query": "q", "as_of": past, "read_only": true }),
+            ),
+            (
+                "ro-key",
+                json!({ "query": "q", "mode": "similar", "as_of": past }),
+            ),
+        ];
+        for (token, body) in accepted {
+            let worker = async {
+                match rx.recv().await.map(|c| c.inner) {
+                    Some(CmdInner::Search {
+                        read_only,
+                        as_of,
+                        reply,
+                        ..
+                    }) => {
+                        let _ = reply.send(json!({ "results": [] }));
+                        (read_only, as_of)
+                    }
+                    _ => panic!("expected a Search command"),
+                }
+            };
+            let (resp, (read_only, as_of)) =
+                tokio::join!(app.clone().oneshot(post(token, body.clone())), worker);
+            assert_eq!(resp.unwrap().status(), StatusCode::OK, "{body}");
+            assert!(read_only, "{body}");
+            assert_eq!(as_of, Some(past), "{body}");
+        }
     }
 
     /// The other half of #63's contract: a worker that IS draining must never
