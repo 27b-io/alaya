@@ -549,6 +549,41 @@ const MAX_VIA_LEN: usize = 128;
 /// Cap on a `memory_unsupersede` reason: it is stored on the memory for good.
 pub const MAX_UNSUPERSEDE_REASON_LEN: usize = 2000;
 
+/// Whether a sweep page holds the pass: more gone nodes than the floor and
+/// a tenth of its valid ones (`GRAPH_SWEEP_HOLD_FLOOR`).
+fn too_many_gone(missing: usize, valid: usize) -> bool {
+    missing > GRAPH_SWEEP_HOLD_FLOOR.max(valid / 10)
+}
+
+/// A held graph sweep: nothing on the held page was written.
+fn sweep_held(
+    held_after: &str,
+    scanned: usize,
+    swept: usize,
+    skipped: usize,
+    valid: usize,
+    missing: usize,
+) -> Value {
+    tracing::warn!(
+        missing,
+        valid,
+        swept,
+        "graph sweep held: too many nodes without a point"
+    );
+    serde_json::json!({
+        "success": false,
+        "status": "held",
+        "error": "Too many graph nodes have no Qdrant point; check QDRANT_COLLECTION \
+                  before sweeping. Nothing on the held page was written",
+        "scanned": scanned,
+        "swept": swept,
+        "skipped": skipped,
+        "held_after": held_after,
+        "page_valid": valid,
+        "page_missing": missing,
+    })
+}
+
 /// Most `Memory` nodes one graph sweep call reads (LAB-9265).
 pub const MAX_GRAPH_SWEEP_LIMIT: usize = 20_000;
 
@@ -2682,11 +2717,15 @@ impl MemoryService {
     /// was gone. `token` must be unique per run. A node whose hash is
     /// malformed is never touched (`skipped`).
     ///
-    /// A page with more gone nodes than `GRAPH_SWEEP_HOLD_FLOOR` and a tenth
-    /// of its valid nodes stops the pass before anything on it is written:
-    /// `status: held`, `success: false`, with that page's counts. Otherwise
-    /// returns `{scanned, swept, skipped, next_after}`; pass `next_after`
-    /// back until it is `null`.
+    /// Two holds keep a wrong or empty collection from wiping the graph,
+    /// whatever `after` and `limit` the caller picks. Every call first
+    /// probes the head of the graph, its first `GRAPH_SWEEP_PAGE` nodes in
+    /// hash order, and holds before any write when every probed node is
+    /// gone or `too_many_gone` says so. Then each page is held the same
+    /// way by `too_many_gone`, before anything on it is written. A held call
+    /// answers `status: held`, `success: false`, with the held page's counts.
+    /// Otherwise it returns `{scanned, swept, skipped, next_after}`; pass
+    /// `next_after` back until it is `null`.
     #[tracing::instrument(skip_all, fields(limit))]
     pub async fn sweep_gone_memory_nodes(
         &self,
@@ -2702,6 +2741,16 @@ impl MemoryService {
         if token.is_empty() {
             return Err(AlayaError::Validation("a sweep token is required".into()));
         }
+        // The probe's page size is fixed here, never the caller's: a caller
+        // paging one node at a time would pass any per-page fraction.
+        let head = self
+            .consolidation
+            .list_memory_nodes("", GRAPH_SWEEP_PAGE)
+            .await?;
+        let (valid, missing) = self.missing_points(&head).await?;
+        if !missing.is_empty() && (missing.len() == valid || too_many_gone(missing.len(), valid)) {
+            return Ok(sweep_held("", 0, 0, 0, valid, missing.len()));
+        }
         let mut after = after.to_string();
         let (mut scanned, mut swept, mut skipped) = (0, 0, 0);
         let mut done = false;
@@ -2712,40 +2761,20 @@ impl MemoryService {
                 done = true;
                 break;
             };
-            let (valid, bad): (Vec<&str>, Vec<&str>) = page
-                .iter()
-                .map(String::as_str)
-                .partition(|h| alaya_types::memory::validate_content_hash(h));
-            let present = self.vectors.existing_hashes(&valid).await?;
-            let valid_count = valid.len();
-            let missing: Vec<&str> = valid
-                .into_iter()
-                .filter(|h| !present.contains(*h))
-                .collect();
-            if missing.len() > GRAPH_SWEEP_HOLD_FLOOR.max(valid_count / 10) {
-                tracing::warn!(
-                    missing = missing.len(),
-                    valid = valid_count,
+            let (valid_count, missing) = self.missing_points(&page).await?;
+            if too_many_gone(missing.len(), valid_count) {
+                return Ok(sweep_held(
+                    &after,
+                    scanned,
                     swept,
-                    "graph sweep held: too many nodes without a point"
-                );
-                return Ok(serde_json::json!({
-                    "success": false,
-                    "status": "held",
-                    "error": "Too many graph nodes on one page have no Qdrant point; \
-                              check QDRANT_COLLECTION before sweeping. Nothing on this page \
-                              was written",
-                    "scanned": scanned,
-                    "swept": swept,
-                    "skipped": skipped,
-                    "held_after": after,
-                    "page_valid": valid_count,
-                    "page_missing": missing.len(),
-                }));
+                    skipped,
+                    valid_count,
+                    missing.len(),
+                ));
             }
             after = last.clone();
             scanned += page.len();
-            skipped += bad.len();
+            skipped += page.len() - valid_count;
             if !missing.is_empty() {
                 self.consolidation
                     .mark_memory_nodes(&missing, token)
@@ -2772,6 +2801,25 @@ impl MemoryService {
             "skipped": skipped,
             "next_after": (!done).then_some(after),
         }))
+    }
+
+    /// How many of `page` are valid content hashes, and which of those have
+    /// no Qdrant point.
+    async fn missing_points<'a>(&self, page: &'a [String]) -> Result<(usize, Vec<&'a str>)> {
+        let valid: Vec<&str> = page
+            .iter()
+            .map(String::as_str)
+            .filter(|h| alaya_types::memory::validate_content_hash(h))
+            .collect();
+        let present = self.vectors.existing_hashes(&valid).await?;
+        let count = valid.len();
+        Ok((
+            count,
+            valid
+                .into_iter()
+                .filter(|h| !present.contains(*h))
+                .collect(),
+        ))
     }
 
     // ─── Tool: memory_confirm (LAB-7721) ────────────────────────────────
@@ -14484,6 +14532,38 @@ mod tests {
         assert_eq!(ledger.nodes.borrow().len(), 10, "nothing deleted");
         assert!(ledger.sweep_marks.borrow().is_empty(), "nothing marked");
         assert_eq!(ledger.contradicts.borrow().len(), 4, "edges kept");
+    }
+
+    /// Against an empty or wrong collection, no `limit` or `after` gets a
+    /// node deleted: the fixed-size probe of the graph's head holds every
+    /// call, one-node pages and short last pages included (Helly R).
+    #[tokio::test(flavor = "current_thread")]
+    async fn graph_sweep_holds_whatever_the_caller_pages() {
+        for graph in [2, 12] {
+            let ledger = Ledger::with(&[]);
+            let hashes: Vec<String> = ('a'..='z').take(graph).map(h).collect();
+            for x in &hashes {
+                ledger.nodes.borrow_mut().insert(x.clone());
+            }
+            let svc = ledger.service();
+            let mut afters = vec![String::new()];
+            afters.extend(hashes.iter().cloned());
+            for after in &afters {
+                for limit in [1, 2, 100] {
+                    let out = svc
+                        .sweep_gone_memory_nodes(after, limit, "run-1")
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        out["status"], "held",
+                        "graph={graph} after={after} limit={limit}: {out}"
+                    );
+                    assert_eq!(out["swept"], 0);
+                }
+            }
+            assert_eq!(ledger.nodes.borrow().len(), graph, "nothing deleted");
+            assert!(ledger.sweep_marks.borrow().is_empty(), "nothing marked");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
