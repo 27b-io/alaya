@@ -3077,7 +3077,6 @@ impl MemoryService {
         if results.is_empty() {
             return;
         }
-        let started = std::time::Instant::now();
         let lookup = self
             .newer_related_for(results, min)
             .instrument(tracing::info_span!(
@@ -3096,7 +3095,6 @@ impl MemoryService {
             None => {
                 tracing::warn!(
                     budget_ms = NEWER_RELATED_BUDGET.as_millis() as u64,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
                     "newer_related lookup ran past its budget (non-fatal); \
                      results returned without it"
                 );
