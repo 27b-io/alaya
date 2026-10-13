@@ -258,24 +258,38 @@ curl -X POST http://localhost:3001/search \
 
 `min_trust_score` (optional number) keeps only memories whose stored `provenance.trust_score` is at least this value; a memory with no stored trust score is dropped. It applies to `hybrid` (every candidate pool, before fusion) and `similar` mode, and the other modes ignore it.
 
-**Response:** array of memories sorted by relevance.
+**Response:** an object whose `results` array holds the memories in rank order, with the paging keys of the mode and `mode` itself. Per-mode keys and the result fields are listed under [MCP: `search`](./mcp-tools.md#search). A hybrid page looks like this:
 
 ```json
-[
-  {
-    "content_hash": "a3f4...",
-    "content": "Migrated frontend from npm to pnpm…",
-    "similarity": 0.82,
-    "summary": null,
-    "tags": ["frontend", "tooling"],
-    "memory_type": "decision",
-    "metadata": {"importance": 0.7},
-    "created_at": "2026-05-12T09:31:04Z",
-    "salience": 0.62,
-    "rank": 1
-  }
-]
+{
+  "page": 1,
+  "total": 37,
+  "page_size": 5,
+  "has_more": true,
+  "total_pages": 8,
+  "mode": "hybrid",
+  "results": [
+    {
+      "content_hash": "a3f4...",
+      "content": "Migrated frontend from npm to pnpm…",
+      "tags": ["frontend", "tooling"],
+      "memory_type": "decision",
+      "metadata": {"importance": 0.7},
+      "created_at": 1778578264.0,
+      "updated_at": 1778578264.0,
+      "salience_score": 0.62,
+      "score": 0.82,
+      "provenance": null,
+      "access_count": 4,
+      "newer_related": [
+        {"content_hash": "9c1e...", "verdict_confidence": 0.95}
+      ]
+    }
+  ]
+}
 ```
+
+`newer_related` is optional, and absent when nothing qualifies. It lists newer memories the contradiction judge picked over this one at or above `NEWER_RELATED_MIN_CONFIDENCE`. Nobody has reviewed the pick, so read both memories. When it appears, and what it never changes, is under [MCP: `search`](./mcp-tools.md#search). `GET /memories/{content_hash}` carries the same key.
 
 ## `GET /memories/{content_hash}`
 
@@ -293,6 +307,8 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" \
 | `400 Bad Request` | `{ "error": "invalid content_hash format" }` — hash isn't 64 lowercase hex chars |
 
 Superseded memories return `200` with `memory.metadata.superseded_by` populated. With `output=full` (the default) or `output=both`, they also carry `memory.supersession_reason`: the reason given to [`POST /supersede`](#post-supersede) or [`POST /duplicates/merge`](#post-duplicatesmerge), as stored (`""` when none was given). It is optional and read-only: the key is absent when no reason is stored, which includes every memory that is not superseded, since [`POST /unsupersede`](#post-unsupersede) moves the reason into the log below. `output=summary`, `POST /search` and the `PATCH` reply never carry it.
+
+In every output mode, `memory.newer_related` may list newer memories the contradiction judge picked over this one, unreviewed, exactly as on a [`POST /search`](#post-search) result. Read both.
 
 With `output=full` or `output=both`, a memory whose supersession was ever reversed also carries `memory.supersession_log`: its audit trail, oldest first, one entry per [`POST /unsupersede`](#post-unsupersede) in the shape documented under [MCP: `memory_unsupersede`](./mcp-tools.md#memory_unsupersede). Entries come back in stored order; a stored value that is not an array comes back as one entry. The key is absent when nothing was ever reversed, and `output=summary`, `POST /search` and the `PATCH` reply never carry it. Like the rest of the memory, it is visible to every principal that may read the memory, read-only and OIDC bearers included.
 

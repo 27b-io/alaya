@@ -292,12 +292,18 @@ struct ContradictionsForResp {
     contradictions: HashMap<String, Vec<ContradictionRefRaw>>,
 }
 
-/// Raw contradiction ref from the bridge (may include extra fields).
+/// One `POST /contradictions/for` entry: a `Contradiction` plus the
+/// bridge's three resolved-state flags.
 #[derive(Deserialize)]
 struct ContradictionRefRaw {
-    memory_a_hash: String,
-    memory_b_hash: String,
-    confidence: Option<f64>,
+    #[serde(flatten)]
+    pair: Contradiction,
+    #[serde(default)]
+    resolved: bool,
+    #[serde(default)]
+    memory_a_superseded: bool,
+    #[serde(default)]
+    memory_b_superseded: bool,
 }
 
 #[derive(Deserialize)]
@@ -675,32 +681,7 @@ impl GraphService for GraphHttpClient {
             .map_err(|e| AlayaError::Graph(crate::redact_reqwest_error(e)))?;
 
         let body: ContradictionsForResp = handle_response(resp).await?;
-
-        // Convert raw bridge response to ContradictionRef
-        let result = body
-            .contradictions
-            .into_iter()
-            .map(|(hash, refs)| {
-                let converted = refs
-                    .into_iter()
-                    .map(|r| {
-                        // The "other" hash is whichever one isn't the key
-                        let contradicts_hash = if r.memory_a_hash == hash {
-                            r.memory_b_hash
-                        } else {
-                            r.memory_a_hash
-                        };
-                        ContradictionRef {
-                            contradicts_hash,
-                            confidence: r.confidence,
-                        }
-                    })
-                    .collect();
-                (hash, converted)
-            })
-            .collect();
-
-        Ok(result)
+        Ok(contradiction_refs(body))
     }
 
     async fn get_neighbors(
@@ -893,6 +874,35 @@ impl ConsolidationService for GraphHttpClient {
     }
 }
 
+/// The bridge's per-hash pairs as `ContradictionRef`s, each from its key's
+/// side.
+fn contradiction_refs(body: ContradictionsForResp) -> HashMap<String, Vec<ContradictionRef>> {
+    body.contradictions
+        .into_iter()
+        .map(|(hash, refs)| {
+            let converted = refs
+                .into_iter()
+                .map(|r| {
+                    // The "other" hash is whichever one isn't the key
+                    let contradicts_hash = if r.pair.memory_a_hash == hash {
+                        r.pair.memory_b_hash
+                    } else {
+                        r.pair.memory_a_hash
+                    };
+                    ContradictionRef {
+                        contradicts_hash,
+                        confidence: r.pair.confidence,
+                        verdict: r.pair.verdict,
+                        resolved: r.resolved,
+                        endpoint_superseded: r.memory_a_superseded || r.memory_b_superseded,
+                    }
+                })
+                .collect();
+            (hash, converted)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,5 +923,38 @@ mod tests {
     fn new_accepts_empty_and_plain_keys() {
         assert!(GraphHttpClient::new("http://bridge".into(), "").is_ok());
         assert!(GraphHttpClient::new("http://bridge".into(), "abc").is_ok());
+    }
+
+    /// The `/contradictions/for` wire, as the bridge writes it, reads into
+    /// refs from each key's side with the verdict and both resolved-state
+    /// flags; an entry from an older bridge (no flags) reads as unresolved.
+    #[test]
+    fn contradiction_refs_read_the_for_wire_from_each_side() {
+        let body: ContradictionsForResp = serde_json::from_value(serde_json::json!({
+            "contradictions": {
+                "a": [{
+                    "memory_a_hash": "a", "memory_b_hash": "b", "confidence": 0.7,
+                    "created_at": 1.0, "verdict": "supersession", "verdict_survivor": "b",
+                    "verdict_reason": "r", "verdict_confidence": 0.95,
+                    "verdict_model": "m", "judged_at": 2.0,
+                    "resolved": true, "memory_a_superseded": false, "memory_b_superseded": true
+                }],
+                "b": [{
+                    "memory_a_hash": "a", "memory_b_hash": "b", "confidence": 0.7,
+                    "created_at": 1.0
+                }]
+            }
+        }))
+        .unwrap();
+        let refs = contradiction_refs(body);
+        let a = &refs["a"][0];
+        assert_eq!(a.contradicts_hash, "b");
+        let v = a.verdict.as_ref().unwrap();
+        assert_eq!(v.verdict_survivor.as_deref(), Some("b"));
+        assert_eq!(v.verdict_confidence, 0.95);
+        assert!(a.resolved && a.endpoint_superseded);
+        let b = &refs["b"][0];
+        assert_eq!(b.contradicts_hash, "a");
+        assert!(b.verdict.is_none() && !b.resolved && !b.endpoint_superseded);
     }
 }

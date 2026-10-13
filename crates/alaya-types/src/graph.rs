@@ -302,11 +302,26 @@ mod verdict_wire_tests {
     }
 }
 
-/// Reference to a contradicting memory (used in search enrichment).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One `CONTRADICTS` edge touching a requested memory, seen from that
+/// memory's side (bridge `POST /contradictions/for`). Search reads it to
+/// point a hit at the judge's survivor, so it carries everything that
+/// decides whether the pointer would mislead.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContradictionRef {
+    /// The edge's other endpoint.
     pub contradicts_hash: String,
+    /// The lexical detector's score, not the judge's.
     pub confidence: Option<f64>,
+    /// The judge's verdict on this edge; `None` = unjudged.
+    #[serde(default)]
+    pub verdict: Option<EdgeVerdict>,
+    /// The edge carries any resolution stamp: the same test as the
+    /// contradiction queue's `e.resolution IS NULL`.
+    #[serde(default)]
+    pub resolved: bool,
+    /// Either endpoint has an incoming `SUPERSEDES` edge.
+    #[serde(default)]
+    pub endpoint_superseded: bool,
 }
 
 /// Hebbian co-access pair with spacing quality for adaptive LTP.
