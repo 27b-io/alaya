@@ -283,7 +283,7 @@ impl MemoryService {
                 output: OutputMode::Summary,
                 cursor: None,
             };
-            let (result, rerank) = self.search_hybrid(&params, true).await.map_err(|e| {
+            let (result, rerank) = self.search_hybrid(&params, true, None).await.map_err(|e| {
                 // The search embeds again; if that call is the one that
                 // failed, the embedder is the broken step.
                 let step = match e {

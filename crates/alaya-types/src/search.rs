@@ -13,6 +13,10 @@ pub struct PayloadFilter {
     pub exclude_superseded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_trust_score: Option<f64>,
+    /// Only memories whose `created_at` is at or before this time (epoch
+    /// seconds): a search replayed against the store as it stood then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_created_at: Option<f64>,
 }
 
 /// Search mode — dispatches to different code paths in MemoryService.

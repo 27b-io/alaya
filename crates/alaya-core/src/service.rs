@@ -910,28 +910,42 @@ impl MemoryService {
     /// Default-policy wrapper — runs Hybrid with full side effects.
     #[tracing::instrument(skip(self, params), fields(mode = ?params.mode))]
     pub async fn search(&self, params: SearchParams) -> Result<Value> {
-        self.search_with(params, false).await
+        self.search_with(params, false, None).await
     }
 
     /// Search. When `read_only` is true, Hybrid skips its side-effect writes
     /// (access-count increment, Hebbian co-access enqueue) and returns the
     /// un-incremented `access_count`. Non-Hybrid modes are pure reads already.
-    #[tracing::instrument(skip(self, params), fields(mode = ?params.mode, read_only))]
-    pub async fn search_with(&self, params: SearchParams, read_only: bool) -> Result<Value> {
+    /// `as_of` (epoch seconds, REST only) replays a read-only `hybrid` or
+    /// `similar` search against the store as it stood then: see
+    /// [`Visibility`] and [`validate_as_of`].
+    #[tracing::instrument(skip(self, params), fields(mode = ?params.mode))]
+    pub async fn search_with(
+        &self,
+        params: SearchParams,
+        read_only: bool,
+        as_of: Option<f64>,
+    ) -> Result<Value> {
         if params.page_size == 0 {
             return Err(AlayaError::Validation("page_size must be > 0".into()));
         }
+        validate_as_of(as_of, params.mode, read_only, (self.clock)())
+            .map_err(AlayaError::Validation)?;
         let mode_str = format!("{:?}", params.mode).to_lowercase();
         let mut result = match params.mode {
-            SearchMode::Hybrid => self.search_hybrid(&params, read_only).await?.0,
+            SearchMode::Hybrid => self.search_hybrid(&params, read_only, as_of).await?.0,
             SearchMode::Scan => self.search_scan(&params).await?,
-            SearchMode::Similar => self.search_similar(&params).await?,
+            SearchMode::Similar => self.search_similar(&params, as_of).await?,
             SearchMode::Tag => self.search_tag(&params).await?,
             SearchMode::Recent => self.search_recent(&params).await?,
         };
-        // Inject mode into every search response for caller context
+        // Inject mode into every search response for caller context, and
+        // echo as_of so a caller can tell a server that ignored it.
         if let Some(obj) = result.as_object_mut() {
             obj.insert("mode".into(), serde_json::json!(mode_str));
+            if let Some(t) = as_of {
+                obj.insert("as_of".into(), serde_json::json!(t));
+            }
         }
         Ok(result)
     }
@@ -943,9 +957,12 @@ impl MemoryService {
         &self,
         params: &SearchParams,
         read_only: bool,
+        as_of: Option<f64>,
     ) -> Result<(Value, Rerank)> {
         let stages = StageClock::start();
-        let result = self.search_hybrid_timed(params, read_only, &stages).await;
+        let result = self
+            .search_hybrid_timed(params, read_only, as_of, &stages)
+            .await;
         stages.finish(result.is_ok());
         result
     }
@@ -956,6 +973,7 @@ impl MemoryService {
         &self,
         params: &SearchParams,
         read_only: bool,
+        as_of: Option<f64>,
         stages: &StageClock,
     ) -> Result<(Value, Rerank)> {
         if params.query.trim().is_empty() {
@@ -963,7 +981,14 @@ impl MemoryService {
                 "query is required for hybrid mode".into(),
             ));
         }
+        // `now` stays the clock for the tag-cache TTL and the Hebbian stamps;
+        // recency decay ranks from the time the search is replayed at.
         let now = (self.clock)();
+        let rank_time = as_of.unwrap_or(now);
+        let vis = Visibility {
+            include_superseded: params.include_superseded,
+            as_of,
+        };
 
         let fetch_size = std::cmp::min(
             std::cmp::max(params.page_size * 3, params.page * params.page_size),
@@ -974,6 +999,7 @@ impl MemoryService {
         let filter = PayloadFilter {
             memory_type: params.memory_type.clone(),
             min_trust_score: params.min_trust_score,
+            max_created_at: as_of,
             ..Default::default()
         };
 
@@ -1032,6 +1058,7 @@ impl MemoryService {
                         fetch_size,
                         params.memory_type.as_deref(),
                         params.min_trust_score,
+                        as_of,
                     );
                     stages
                         .time(Stage::TagSearch, search)
@@ -1103,6 +1130,7 @@ impl MemoryService {
                         fetch_size,
                         params.memory_type.as_deref(),
                         params.min_trust_score,
+                        as_of,
                     )
                     .await
                     .unwrap_or_default()
@@ -1135,19 +1163,35 @@ impl MemoryService {
         // Qdrant-side, so wrong-type hits cannot crowd the right type out of
         // fetch_size; checking it again here keeps one predicate for every
         // pool, graph injection included. All three also apply
-        // min_trust_score Qdrant-side; graph neighbours rely on this check
-        // alone for both.
-        let admits = |m: &Memory| {
-            (params.include_superseded || !is_superseded(m))
+        // min_trust_score and the as_of `created_at` bound Qdrant-side;
+        // graph neighbours rely on this check alone for all three.
+        let admits = |m: &Memory, survivors: &HashMap<String, f64>| {
+            vis.shows(m, survivors)
                 && params
                     .memory_type
                     .as_ref()
                     .is_none_or(|t| m.memory_type == *t)
                 && params.min_trust_score.is_none_or(|min| meets_trust(m, min))
         };
-        vector_results.retain(|sm| admits(&sm.memory));
-        tag_results.retain(|sm| admits(&sm.memory));
-        bm25_results.retain(|sm| admits(&sm.memory));
+        // A failed survivor lookup fails the search: a replay that guessed at
+        // supersession would be wrong without saying so. Graph injection
+        // below degrades instead, as a failed injection fetch always has.
+        let survivors = self
+            .survivor_times(
+                vis,
+                vector_results
+                    .iter()
+                    .chain(&tag_results)
+                    .chain(&bm25_results)
+                    .map(|sm| &sm.memory),
+            )
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(error = %e, "as_of survivor lookup for the candidate pools failed");
+            })?;
+        vector_results.retain(|sm| admits(&sm.memory, &survivors));
+        tag_results.retain(|sm| admits(&sm.memory, &survivors));
+        bm25_results.retain(|sm| admits(&sm.memory, &survivors));
 
         // Stage 3: Fuse (RRF) — pure computation. A pool the keyword leg
         // leaves out is empty and adds nothing.
@@ -1248,8 +1292,17 @@ impl MemoryService {
                         .fold(f64::INFINITY, f64::min)
                         .max(0.1);
 
-                    match self.vectors.get_batch(&neighbor_hashes).await {
-                        Ok(memories) => {
+                    // Either failure skips injection, never the search.
+                    let fetched = match self.vectors.get_batch(&neighbor_hashes).await {
+                        Ok(memories) => self
+                            .survivor_times(vis, &memories)
+                            .await
+                            .map(|survivors| (memories, survivors))
+                            .map_err(|e| ("as_of survivor lookup", e)),
+                        Err(e) => Err(("fetch", e)),
+                    };
+                    match fetched {
+                        Ok((memories, survivors)) => {
                             let mut fetched: HashMap<String, Memory> = memories
                                 .into_iter()
                                 .map(|m| (m.content_hash.clone(), m))
@@ -1259,7 +1312,7 @@ impl MemoryService {
                                 .filter_map(|(h, activation)| {
                                     Some((fetched.remove(*h)?, *activation))
                                 })
-                                .filter(|(mem, _)| admits(mem))
+                                .filter(|(mem, _)| admits(mem, &survivors))
                                 .take(10)
                                 .map(|(memory, activation)| ScoredMemory {
                                     memory,
@@ -1272,8 +1325,8 @@ impl MemoryService {
                             );
                             result
                         }
-                        Err(e) => {
-                            tracing::warn!("graph injection fetch failed (non-fatal): {e}");
+                        Err((step, e)) => {
+                            tracing::warn!("graph injection {step} failed (non-fatal): {e}");
                             Vec::new()
                         }
                     }
@@ -1485,7 +1538,7 @@ impl MemoryService {
                         score = hybrid_search::apply_recency_decay(
                             score,
                             sm.memory.created_at,
-                            now,
+                            rank_time,
                             RECENCY_DECAY_LAMBDA,
                         );
                     }
@@ -1708,7 +1761,7 @@ impl MemoryService {
     }
 
     #[tracing::instrument(skip(self, params))]
-    async fn search_similar(&self, params: &SearchParams) -> Result<Value> {
+    async fn search_similar(&self, params: &SearchParams, as_of: Option<f64>) -> Result<Value> {
         if params.query.trim().is_empty() {
             return Err(AlayaError::Validation(
                 "query is required for similar mode".into(),
@@ -1724,13 +1777,19 @@ impl MemoryService {
 
         const MAX_SIMILAR_FETCH: usize = 5000;
 
-        // memory_type (exact match) and min_trust_score (a range on the
-        // top-level provenance.trust_score) are Qdrant-side filters; only
-        // superseded filtering must stay app-side.
+        // memory_type (exact match), min_trust_score (a range on the
+        // top-level provenance.trust_score) and the as_of bound on created_at
+        // are Qdrant-side filters; only superseded filtering must stay
+        // app-side.
         let filter = PayloadFilter {
             memory_type: params.memory_type.clone(),
             min_trust_score: params.min_trust_score,
+            max_created_at: as_of,
             ..Default::default()
+        };
+        let vis = Visibility {
+            include_superseded: params.include_superseded,
+            as_of,
         };
 
         let initial_fetch = if params.include_superseded {
@@ -1742,17 +1801,12 @@ impl MemoryService {
                 .min(MAX_SIMILAR_FETCH)
                 .max(params.k)
         };
-        let (mut results, _) = fetch_live_with_retry(
-            initial_fetch,
-            params.k,
-            MAX_SIMILAR_FETCH,
-            params.include_superseded,
-            |n| {
+        let (mut results, _) = self
+            .fetch_live_with_retry(initial_fetch, params.k, MAX_SIMILAR_FETCH, vis, |n| {
                 self.vectors
                     .search_by_vector(&query_embedding, n, Some(filter.clone()))
-            },
-        )
-        .await?;
+            })
+            .await?;
         results.truncate(params.k);
 
         let items: Vec<Value> = results
@@ -1764,6 +1818,78 @@ impl MemoryService {
             "results": items,
             "total": results.len(),
         }))
+    }
+
+    /// Over-fetch and filter superseded at the application layer (the
+    /// PayloadFilter route is a no-op — see is_superseded). Calls `fetch` with a
+    /// growing fetch size, doubling until `target` visible results are
+    /// collected, the backend is exhausted, or `max_fetch` is reached. Returns
+    /// the filtered results and whether the backend was exhausted, judged on
+    /// the raw page so filtering never reads as exhaustion. Each caller
+    /// supplies its own initial size, target, and cap — the loop shape is the
+    /// shared part.
+    async fn fetch_live_with_retry<F, Fut>(
+        &self,
+        mut fetch_size: usize,
+        target: usize,
+        max_fetch: usize,
+        vis: Visibility,
+        mut fetch: F,
+    ) -> Result<(Vec<ScoredMemory>, bool)>
+    where
+        F: FnMut(usize) -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<ScoredMemory>>>,
+    {
+        loop {
+            let raw = fetch(fetch_size).await?;
+            let exhausted = raw.len() < fetch_size;
+
+            let survivors = self
+                .survivor_times(vis, raw.iter().map(|sm| &sm.memory))
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!(error = %e, "as_of survivor lookup for an over-fetch round failed");
+                })?;
+            let filtered: Vec<ScoredMemory> = raw
+                .into_iter()
+                .filter(|sm| vis.shows(&sm.memory, &survivors))
+                .collect();
+
+            if filtered.len() >= target || exhausted || fetch_size >= max_fetch {
+                return Ok((filtered, exhausted));
+            }
+            fetch_size = (fetch_size * 2).min(max_fetch);
+        }
+    }
+
+    /// The `created_at` of each survivor the marked memories in `pool` name,
+    /// for [`Visibility::superseded`], in one `get_batch`. Makes no call
+    /// when `vis` does not need them or no memory in `pool` names one. A
+    /// survivor missing from the store is missing from the map.
+    async fn survivor_times<'a>(
+        &self,
+        vis: Visibility,
+        pool: impl IntoIterator<Item = &'a Memory>,
+    ) -> Result<HashMap<String, f64>> {
+        if !vis.needs_survivors() {
+            return Ok(HashMap::new());
+        }
+        let mut hashes: Vec<&str> = pool
+            .into_iter()
+            .filter_map(|m| survivor_of(supersession_marker(m)?, &m.content_hash))
+            .collect();
+        if hashes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        hashes.sort_unstable();
+        hashes.dedup();
+        Ok(self
+            .vectors
+            .get_batch(&hashes)
+            .await?
+            .into_iter()
+            .map(|m| (m.content_hash, m.created_at))
+            .collect())
     }
 
     #[tracing::instrument(skip(self, params))]
@@ -1779,19 +1905,24 @@ impl MemoryService {
         let target = offset + params.page_size + 1; // +1 to detect has_more
         let tag_refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
 
-        let (filtered, exhausted) = fetch_live_with_retry(
-            target * 2,
-            target,
-            MAX_TAG_FETCH,
-            params.include_superseded,
-            // Tag mode reads neither memory_type (the console says so) nor
-            // min_trust_score (the docs say so).
-            |n| {
-                self.vectors
-                    .search_by_tags(&tag_refs, params.match_all, n, None, None)
-            },
-        )
-        .await?;
+        let vis = Visibility {
+            include_superseded: params.include_superseded,
+            as_of: None,
+        };
+        let (filtered, exhausted) = self
+            .fetch_live_with_retry(
+                target * 2,
+                target,
+                MAX_TAG_FETCH,
+                vis,
+                // Tag mode reads neither memory_type (the console says so) nor
+                // min_trust_score (the docs say so).
+                |n| {
+                    self.vectors
+                        .search_by_tags(&tag_refs, params.match_all, n, None, None, None)
+                },
+            )
+            .await?;
 
         let has_more =
             filtered.len() > offset + params.page_size || (!exhausted && filtered.len() < target);
@@ -3208,7 +3339,8 @@ impl Drop for StageTimer<'_> {
     }
 }
 
-fn current_timestamp() -> f64 {
+/// The wall clock in epoch seconds, the unit of `created_at`.
+pub fn current_timestamp() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -3265,6 +3397,76 @@ fn survivor_of<'a>(marker: &'a Value, hash: &str) -> Option<&'a str> {
         .filter(|s| alaya_types::memory::validate_content_hash(s) && *s != hash)
 }
 
+/// Which memories a search may show: live ones now, or, with `as_of = T`,
+/// the store as it stood at T (`POST /search` `as_of`).
+#[derive(Debug, Clone, Copy)]
+struct Visibility {
+    include_superseded: bool,
+    as_of: Option<f64>,
+}
+
+impl Visibility {
+    /// Whether the search may show `m`. `survivors` holds the `created_at`
+    /// of the survivors `m`'s marker may name, from [`MemoryService::survivor_times`].
+    fn shows(&self, m: &Memory, survivors: &HashMap<String, f64>) -> bool {
+        self.as_of.is_none_or(|t| m.created_at <= t)
+            && (self.include_superseded || !self.superseded(m, survivors))
+    }
+
+    /// Whether `m` counts as superseded: now, whenever it carries a marker.
+    /// As of T, only once its survivor existed. No supersession time is
+    /// stored, so the survivor's `created_at` stands in for it. That is a
+    /// lower bound (the survivor is written first, superseded into after),
+    /// so the error runs one way: a memory can be hidden from the moment its
+    /// survivor was written until the supersede itself, never shown after
+    /// it. A marker with no survivor in the store (missing, or not a valid
+    /// hash) hides the memory at every T.
+    fn superseded(&self, m: &Memory, survivors: &HashMap<String, f64>) -> bool {
+        let Some(marker) = supersession_marker(m) else {
+            return false;
+        };
+        let Some(t) = self.as_of else {
+            return true;
+        };
+        survivor_of(marker, &m.content_hash)
+            .and_then(|s| survivors.get(s))
+            .is_none_or(|&created| created <= t)
+    }
+
+    /// Whether judging supersession needs the survivors' `created_at`.
+    fn needs_survivors(&self) -> bool {
+        self.as_of.is_some() && !self.include_superseded
+    }
+}
+
+/// Checks `as_of` on a search request, by the REST handler (so a refusal is a
+/// 400, not an op error in a 200 body) and again by `search_with`. An `as_of`
+/// replay must never write, and only `hybrid` and `similar` honour it. A
+/// value past `now` is refused, which also catches epoch milliseconds.
+pub fn validate_as_of(
+    as_of: Option<f64>,
+    mode: SearchMode,
+    read_only: bool,
+    now: f64,
+) -> std::result::Result<(), String> {
+    let Some(t) = as_of else {
+        return Ok(());
+    };
+    if !read_only {
+        return Err("as_of requires a read-only search (set read_only: true)".into());
+    }
+    if !matches!(mode, SearchMode::Hybrid | SearchMode::Similar) {
+        return Err("as_of applies only to hybrid and similar modes".into());
+    }
+    if !t.is_finite() || t > now {
+        return Err(
+            "as_of is later than the server's clock; it takes epoch seconds, not milliseconds"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// A trimmed `*_via` principal tag, 1..=`MAX_VIA_LEN` chars.
 fn require_via<'a>(field: &str, raw: &'a str) -> Result<&'a str> {
     let via = raw.trim();
@@ -3304,39 +3506,6 @@ const SUPERSEDE_OUTCOME_UNKNOWN: &str = "Outcome unknown: this memory may alread
 /// The hash `m` is superseded by, when set.
 fn superseded_by(m: &Memory) -> Option<&str> {
     supersession_marker(m).and_then(Value::as_str)
-}
-
-/// Over-fetch and filter superseded at the application layer (the
-/// PayloadFilter route is a no-op — see is_superseded). Calls `fetch` with a
-/// growing fetch size, doubling until `target` live results are collected,
-/// the backend is exhausted, or `max_fetch` is reached. Returns the filtered
-/// results and whether the backend was exhausted. Each caller supplies its
-/// own initial size, target, and cap — the loop shape is the shared part.
-async fn fetch_live_with_retry<F, Fut>(
-    mut fetch_size: usize,
-    target: usize,
-    max_fetch: usize,
-    include_superseded: bool,
-    mut fetch: F,
-) -> Result<(Vec<ScoredMemory>, bool)>
-where
-    F: FnMut(usize) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<ScoredMemory>>>,
-{
-    loop {
-        let raw = fetch(fetch_size).await?;
-        let exhausted = raw.len() < fetch_size;
-
-        let filtered: Vec<ScoredMemory> = raw
-            .into_iter()
-            .filter(|sm| include_superseded || !is_superseded(&sm.memory))
-            .collect();
-
-        if filtered.len() >= target || exhausted || fetch_size >= max_fetch {
-            return Ok((filtered, exhausted));
-        }
-        fetch_size = (fetch_size * 2).min(max_fetch);
-    }
 }
 
 fn format_memory_result(memory: &Memory, score: f64, output: OutputMode) -> Value {
@@ -3610,6 +3779,7 @@ mod tests {
             _l: usize,
             _mt: Option<&str>,
             _mts: Option<f64>,
+            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -4029,7 +4199,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let found = tokio::time::timeout(
             std::time::Duration::from_secs(3600),
-            svc.search_with(params, false),
+            svc.search_with(params, false, None),
         )
         .await
         .expect("the search waited on its side-effect writes")
@@ -4095,7 +4265,7 @@ mod tests {
                 Box::new(MockConsolidation),
                 None,
             )
-            .search_with(search_params("anything"), false)
+            .search_with(search_params("anything"), false, None)
             .await
             .expect("search succeeds")
         };
@@ -4427,6 +4597,7 @@ mod tests {
             _l: usize,
             _mt: Option<&str>,
             _mts: Option<f64>,
+            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -4856,6 +5027,7 @@ mod tests {
             _l: usize,
             _mt: Option<&str>,
             _mts: Option<f64>,
+            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -5472,6 +5644,7 @@ mod tests {
             _l: usize,
             _mt: Option<&str>,
             _mts: Option<f64>,
+            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -6058,12 +6231,16 @@ mod tests {
 
     /// Mock VectorStorage that returns pre-configured vector search results
     /// and can serve specific memories from get_batch (for graph injection).
-    /// `tag_pools` answers search_by_tags per tag, honouring its limit and
-    /// memory_type as Qdrant does, and `similar_tags` is what
+    /// `tag_pools` answers search_by_tags per tag, honouring its limit,
+    /// memory_type, min_trust_score and max_created_at as Qdrant does, and
+    /// `similar_tags` is what
     /// search_similar_tags returns. `bm25_pool` is what search_by_text
     /// returns, unfiltered, so only the service's own filter can drop a
     /// member. Counts access-count increments, so a test can see search's
-    /// writes, and the calls to each keyword pool's backend.
+    /// writes, and the calls to each keyword pool's backend and to get_batch.
+    /// `bounds_seen` records the `max_created_at` each vector, BM25 and tag
+    /// search was sent, since only the tag search honours it.
+    /// `failing_batch` makes get_batch fail whenever it is asked for that hash.
     #[derive(Default)]
     struct MockVectorsWithInjection {
         search_results: Vec<ScoredMemory>,
@@ -6074,6 +6251,9 @@ mod tests {
         access_increments: Rc<Cell<usize>>,
         tag_calls: Rc<Cell<usize>>,
         bm25_calls: Rc<Cell<usize>>,
+        batch_calls: Rc<Cell<usize>>,
+        bounds_seen: Rc<std::cell::RefCell<Vec<Option<f64>>>>,
+        failing_batch: Option<String>,
     }
 
     #[async_trait(?Send)]
@@ -6101,6 +6281,12 @@ mod tests {
             Ok(false)
         }
         async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>> {
+            self.batch_calls.set(self.batch_calls.get() + 1);
+            if let Some(failing) = &self.failing_batch
+                && hashes.contains(&failing.as_str())
+            {
+                return Err(AlayaError::Storage("mock get_batch failure".into()));
+            }
             Ok(hashes
                 .iter()
                 .filter_map(|h| self.injectable_memories.get(*h).cloned())
@@ -6119,8 +6305,11 @@ mod tests {
             &self,
             _e: &[f32],
             _l: usize,
-            _f: Option<PayloadFilter>,
+            f: Option<PayloadFilter>,
         ) -> Result<Vec<ScoredMemory>> {
+            self.bounds_seen
+                .borrow_mut()
+                .push(f.and_then(|f| f.max_created_at));
             Ok(self.search_results.clone())
         }
         async fn search_by_tags(
@@ -6130,14 +6319,17 @@ mod tests {
             limit: usize,
             memory_type: Option<&str>,
             min_trust_score: Option<f64>,
+            max_created_at: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             self.tag_calls.set(self.tag_calls.get() + 1);
+            self.bounds_seen.borrow_mut().push(max_created_at);
             Ok(tags
                 .iter()
                 .filter_map(|t| self.tag_pools.get(*t))
                 .flatten()
                 .filter(|sm| memory_type.is_none_or(|t| sm.memory.memory_type == t))
                 .filter(|sm| min_trust_score.is_none_or(|min| meets_trust(&sm.memory, min)))
+                .filter(|sm| max_created_at.is_none_or(|t| sm.memory.created_at <= t))
                 .take(limit)
                 .cloned()
                 .collect())
@@ -6150,9 +6342,12 @@ mod tests {
             &self,
             _q: &str,
             _l: usize,
-            _f: Option<PayloadFilter>,
+            f: Option<PayloadFilter>,
         ) -> Result<Vec<ScoredMemory>> {
             self.bm25_calls.set(self.bm25_calls.get() + 1);
+            self.bounds_seen
+                .borrow_mut()
+                .push(f.and_then(|f| f.max_created_at));
             Ok(self.bm25_pool.clone())
         }
         async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
@@ -6925,6 +7120,487 @@ mod tests {
         assert_eq!(returned(filtered), wanted);
     }
 
+    // ─── as_of: search as the store stood at T ────────────────────────────
+
+    /// The `as_of` replay time the tests below search at.
+    const AS_OF: f64 = 1_500_000.0;
+
+    fn injection_svc(
+        mock: MockVectorsWithInjection,
+        graph: MockGraphWithActivation,
+    ) -> MemoryService {
+        MemoryService::new(
+            Box::new(mock),
+            Box::new(MockEmbeddings),
+            Box::new(graph),
+            Box::new(MockHebbian),
+            Box::new(MockConsolidation),
+            None,
+        )
+        .with_ranking(RankingFlags {
+            keyword_leg: KeywordLeg::Both,
+            ..RankingFlags::default()
+        })
+    }
+
+    fn returned_hashes(result: &Value) -> std::collections::HashSet<String> {
+        result["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .filter_map(|r| r["content_hash"].as_str().map(String::from))
+            .collect()
+    }
+
+    /// With `as_of = T`, hybrid returns no memory created after T from any
+    /// candidate pool. Each pool (vector, keyword tag, semantic tag, BM25,
+    /// graph injection) holds one memory created by T and one after it. The
+    /// tag mock applies the bound as Qdrant does; vector and BM25 hits and
+    /// graph neighbours come back unfiltered, so only `admits` drops them.
+    /// The live run proves every late memory reached its pool.
+    #[tokio::test(flavor = "current_thread")]
+    async fn as_of_bounds_every_candidate_pool() {
+        let at = |hash: char, created_at: f64| {
+            let mut sm = make_scored_memory(&hash.to_string().repeat(64), "pool member", 0.5);
+            sm.memory.created_at = created_at;
+            sm
+        };
+        // The bound is inclusive: a memory written at T existed at T.
+        let vector_ok = at('a', AS_OF);
+        let vector_bad = at('2', AS_OF + 1.0);
+        let keyword_ok = at('b', AS_OF - 60.0);
+        let keyword_bad = at('c', AS_OF + 1.0);
+        let semantic_ok = at('d', AS_OF - 60.0);
+        let semantic_bad = at('e', AS_OF + 1.0);
+        let graph_ok = at('f', AS_OF - 60.0);
+        let graph_bad = at('1', AS_OF + 1.0);
+        let bm25_ok = at('3', AS_OF - 60.0);
+        let bm25_bad = at('4', AS_OF + 1.0);
+        let hashes = |sms: &[&ScoredMemory]| -> std::collections::HashSet<String> {
+            sms.iter()
+                .map(|sm| sm.memory.content_hash.clone())
+                .collect()
+        };
+        let wanted = hashes(&[&vector_ok, &keyword_ok, &semantic_ok, &graph_ok, &bm25_ok]);
+        let everything = hashes(&[
+            &vector_ok,
+            &vector_bad,
+            &keyword_ok,
+            &keyword_bad,
+            &semantic_ok,
+            &semantic_bad,
+            &graph_ok,
+            &graph_bad,
+            &bm25_ok,
+            &bm25_bad,
+        ]);
+
+        let mock = MockVectorsWithInjection {
+            search_results: vec![vector_ok.clone(), vector_bad.clone()],
+            injectable_memories: [&graph_ok, &graph_bad]
+                .into_iter()
+                .map(|sm| (sm.memory.content_hash.clone(), sm.memory.clone()))
+                .collect(),
+            // "stability" is a known tag, so the query hits the keyword pool.
+            tag_pools: HashMap::from([
+                (
+                    "stability".into(),
+                    vec![keyword_ok.clone(), keyword_bad.clone()],
+                ),
+                (
+                    "semantic".into(),
+                    vec![semantic_ok.clone(), semantic_bad.clone()],
+                ),
+            ]),
+            similar_tags: vec!["semantic".into()],
+            bm25_pool: vec![bm25_ok.clone(), bm25_bad.clone()],
+            ..Default::default()
+        };
+        let bounds_seen = mock.bounds_seen.clone();
+        let svc = injection_svc(
+            mock,
+            MockGraphWithActivation {
+                activation: [&graph_ok, &graph_bad]
+                    .into_iter()
+                    .map(|sm| (sm.memory.content_hash.clone(), 0.8))
+                    .collect(),
+                ..Default::default()
+            },
+        );
+
+        let live = svc
+            .search_with(search_params("stability notes"), true, None)
+            .await
+            .expect("search succeeds");
+        assert_eq!(returned_hashes(&live), everything);
+        assert_eq!(
+            *bounds_seen.borrow(),
+            [None; 4],
+            "a live search sends no bound"
+        );
+        bounds_seen.borrow_mut().clear();
+
+        let replay = svc
+            .search_with(search_params("stability notes"), true, Some(AS_OF))
+            .await
+            .expect("search succeeds");
+        assert_eq!(returned_hashes(&replay), wanted);
+        // The bound reaches Qdrant on every leg (dense, BM25, keyword tag,
+        // semantic tag): `admits` alone would let late memories fill each
+        // leg's fetch window first.
+        assert_eq!(*bounds_seen.borrow(), [Some(AS_OF); 4]);
+    }
+
+    /// As of T, a superseded memory is hidden once its survivor existed (the
+    /// survivor's `created_at` at or before T), and when its survivor is not
+    /// in the store or its marker names none; it is shown while its survivor
+    /// was still to come. `include_superseded` turns that check off. Hybrid
+    /// and similar agree, and each looks the survivors up in one batch, only
+    /// when a candidate is marked and the check is on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn as_of_hides_a_superseded_memory_once_its_survivor_existed() {
+        let survivor = |hash: char, created_at: f64| {
+            let mut m = make_scored_memory(&hash.to_string().repeat(64), "survivor", 0.0).memory;
+            m.created_at = created_at;
+            m
+        };
+        let early_survivor = survivor('e', AS_OF);
+        let late_survivor = survivor('f', AS_OF + 60.0);
+        let marked = |hash: char, marker: Value| {
+            let mut sm = make_scored_memory(&hash.to_string().repeat(64), "superseded", 0.5);
+            sm.memory.metadata = Some(HashMap::from([("superseded_by".to_string(), marker)]));
+            sm
+        };
+        let superseded_by_t = marked('a', serde_json::json!(early_survivor.content_hash));
+        let superseded_after_t = marked('b', serde_json::json!(late_survivor.content_hash));
+        let survivor_missing = marked('c', serde_json::json!("d".repeat(64)));
+        let legacy_marker = marked('1', serde_json::json!(true));
+        let live = make_scored_memory(&"2".repeat(64), "live", 0.5);
+        let candidates = vec![
+            superseded_by_t.clone(),
+            superseded_after_t.clone(),
+            survivor_missing.clone(),
+            legacy_marker.clone(),
+            live.clone(),
+        ];
+        let hash = |sm: &ScoredMemory| sm.memory.content_hash.clone();
+
+        for mode in [SearchMode::Hybrid, SearchMode::Similar] {
+            let mock = MockVectorsWithInjection {
+                search_results: candidates.clone(),
+                injectable_memories: [&early_survivor, &late_survivor]
+                    .into_iter()
+                    .map(|m| (m.content_hash.clone(), m.clone()))
+                    .collect(),
+                ..Default::default()
+            };
+            let batch_calls = mock.batch_calls.clone();
+            let svc = injection_svc(mock, MockGraphWithActivation::default());
+            let params = SearchParams {
+                mode,
+                ..search_params("superseded")
+            };
+
+            let replay = svc
+                .search_with(params.clone(), true, Some(AS_OF))
+                .await
+                .expect("search succeeds");
+            assert_eq!(
+                returned_hashes(&replay),
+                [hash(&superseded_after_t), hash(&live)].into(),
+                "{mode:?}"
+            );
+            assert_eq!(batch_calls.get(), 1, "{mode:?}: one batched lookup");
+
+            let with_superseded = svc
+                .search_with(
+                    SearchParams {
+                        include_superseded: true,
+                        ..params.clone()
+                    },
+                    true,
+                    Some(AS_OF),
+                )
+                .await
+                .expect("search succeeds");
+            assert_eq!(
+                returned_hashes(&with_superseded),
+                candidates.iter().map(hash).collect(),
+                "{mode:?}"
+            );
+
+            let now = svc
+                .search_with(params, true, None)
+                .await
+                .expect("search succeeds");
+            assert_eq!(returned_hashes(&now), [hash(&live)].into(), "{mode:?}");
+            assert_eq!(
+                batch_calls.get(),
+                1,
+                "{mode:?}: no lookup without as_of or with include_superseded"
+            );
+        }
+    }
+
+    /// The supersession rule reaches graph-injected neighbours, which come
+    /// from `get_batch` with no filter: as of T, a neighbour whose survivor
+    /// came after T is injected and one whose survivor existed by T is not.
+    /// The neighbours' survivors are looked up in one batch of their own.
+    #[tokio::test(flavor = "current_thread")]
+    async fn as_of_applies_the_supersession_rule_to_injected_neighbours() {
+        let survivor = |hash: char, created_at: f64| {
+            let mut m = make_scored_memory(&hash.to_string().repeat(64), "survivor", 0.0).memory;
+            m.created_at = created_at;
+            m
+        };
+        let early_survivor = survivor('e', AS_OF);
+        let late_survivor = survivor('f', AS_OF + 60.0);
+        let neighbour = |hash: char, survivor: &Memory| {
+            let mut m = make_scored_memory(&hash.to_string().repeat(64), "neighbour", 0.0).memory;
+            m.metadata = Some(HashMap::from([(
+                "superseded_by".to_string(),
+                serde_json::json!(survivor.content_hash),
+            )]));
+            m
+        };
+        let shown = neighbour('b', &late_survivor);
+        let hidden = neighbour('c', &early_survivor);
+        let seed = make_scored_memory(&"a".repeat(64), "seed", 0.9);
+
+        let mock = MockVectorsWithInjection {
+            search_results: vec![seed.clone()],
+            injectable_memories: [&shown, &hidden, &early_survivor, &late_survivor]
+                .into_iter()
+                .map(|m| (m.content_hash.clone(), m.clone()))
+                .collect(),
+            ..Default::default()
+        };
+        let batch_calls = mock.batch_calls.clone();
+        let svc = injection_svc(
+            mock,
+            MockGraphWithActivation {
+                activation: [&shown, &hidden]
+                    .into_iter()
+                    .map(|m| (m.content_hash.clone(), 0.8))
+                    .collect(),
+                ..Default::default()
+            },
+        );
+
+        let replay = svc
+            .search_with(search_params("stability notes"), true, Some(AS_OF))
+            .await
+            .expect("search succeeds");
+        assert_eq!(
+            returned_hashes(&replay),
+            [seed.memory.content_hash, shown.content_hash].into()
+        );
+        // The neighbour fetch, then its survivor lookup; the unmarked pools
+        // need none.
+        assert_eq!(batch_calls.get(), 2);
+    }
+
+    /// A survivor lookup that fails on the candidate pools fails the search:
+    /// a replay that guessed at supersession would be wrong without saying
+    /// so. The same failure on graph-injected neighbours only skips the
+    /// injection, as a failed injection fetch always has.
+    #[tokio::test(flavor = "current_thread")]
+    async fn as_of_survivor_lookup_failure_fails_pools_and_skips_injection() {
+        let broken = "d".repeat(64);
+        let marked = |hash: char| {
+            let mut m = make_scored_memory(&hash.to_string().repeat(64), "superseded", 0.5).memory;
+            m.metadata = Some(HashMap::from([(
+                "superseded_by".to_string(),
+                serde_json::json!(broken),
+            )]));
+            m
+        };
+        let seed = make_scored_memory(&"a".repeat(64), "seed", 0.9);
+
+        // On the pools: a marked candidate's lookup fails, and so does the search.
+        let pool_svc = injection_svc(
+            MockVectorsWithInjection {
+                search_results: vec![
+                    seed.clone(),
+                    ScoredMemory {
+                        memory: marked('b'),
+                        score: 0.5,
+                    },
+                ],
+                failing_batch: Some(broken.clone()),
+                ..Default::default()
+            },
+            MockGraphWithActivation::default(),
+        );
+        let failed = pool_svc
+            .search_with(search_params("stability notes"), true, Some(AS_OF))
+            .await;
+        assert!(matches!(failed, Err(AlayaError::Storage(_))), "{failed:?}");
+
+        // On the neighbours: the search answers from its pools alone.
+        let neighbour = marked('c');
+        let inject_svc = injection_svc(
+            MockVectorsWithInjection {
+                search_results: vec![seed.clone()],
+                injectable_memories: HashMap::from([(
+                    neighbour.content_hash.clone(),
+                    neighbour.clone(),
+                )]),
+                failing_batch: Some(broken),
+                ..Default::default()
+            },
+            MockGraphWithActivation {
+                activation: HashMap::from([(neighbour.content_hash.clone(), 0.8)]),
+                ..Default::default()
+            },
+        );
+        let degraded = inject_svc
+            .search_with(search_params("stability notes"), true, Some(AS_OF))
+            .await
+            .expect("an injection failure never fails the search");
+        assert_eq!(
+            returned_hashes(&degraded),
+            [seed.memory.content_hash].into()
+        );
+    }
+
+    /// With `as_of = T`, recency decay runs from T, not the clock: a memory
+    /// replayed at its own creation time scores as a memory created now
+    /// scores live. The tag cache keeps the clock.
+    #[tokio::test(flavor = "current_thread")]
+    async fn as_of_pins_recency_decay_to_t() {
+        let old = ranked_memory();
+        let mut fresh = old.clone();
+        fresh.memory.created_at = RANKING_NOW;
+        let undecayed = score_of(&fresh, RankingFlags::default()).await;
+        assert!(
+            score_of(&old, RankingFlags::default()).await < undecayed,
+            "decay applies live"
+        );
+
+        let svc = ranking_svc(
+            vec![old.clone()],
+            vec![],
+            MockGraphWithActivation::default(),
+            RankingFlags::default(),
+        );
+        let replay = svc
+            .search_with(
+                search_params("ranking switches"),
+                true,
+                Some(old.memory.created_at),
+            )
+            .await
+            .expect("search succeeds");
+        assert_eq!(replay["results"][0]["score"].as_f64(), Some(undecayed));
+        assert_eq!(
+            svc.tag_cache.borrow().as_ref().map(|(ts, _)| *ts),
+            Some(RANKING_NOW),
+            "the tag cache is stamped with the clock"
+        );
+    }
+
+    /// With `as_of = T`, `similar` sends the `created_at` bound to Qdrant with
+    /// its vector search and drops a late memory a backend returned anyway.
+    /// A live `similar` sends no bound.
+    #[tokio::test(flavor = "current_thread")]
+    async fn as_of_bounds_similar_at_qdrant() {
+        let early = make_scored_memory(&"a".repeat(64), "early", 0.9);
+        let mut late = make_scored_memory(&"b".repeat(64), "late", 0.8);
+        late.memory.created_at = AS_OF + 1.0;
+        let mock = MockVectorsWithInjection {
+            search_results: vec![early.clone(), late.clone()],
+            ..Default::default()
+        };
+        let bounds_seen = mock.bounds_seen.clone();
+        let svc = injection_svc(mock, MockGraphWithActivation::default());
+        let params = SearchParams {
+            mode: SearchMode::Similar,
+            ..search_params("similar")
+        };
+
+        let live = svc
+            .search_with(params.clone(), true, None)
+            .await
+            .expect("search succeeds");
+        assert_eq!(
+            returned_hashes(&live),
+            [early.memory.content_hash.clone(), late.memory.content_hash].into()
+        );
+        assert_eq!(*bounds_seen.borrow(), [None]);
+        bounds_seen.borrow_mut().clear();
+
+        let replay = svc
+            .search_with(params, true, Some(AS_OF))
+            .await
+            .expect("search succeeds");
+        assert_eq!(returned_hashes(&replay), [early.memory.content_hash].into());
+        assert_eq!(*bounds_seen.borrow(), [Some(AS_OF)]);
+    }
+
+    /// A response echoes `as_of` when the search carried it and not
+    /// otherwise, in both modes that take it, so a caller can tell a server
+    /// that ignored the field.
+    #[tokio::test(flavor = "current_thread")]
+    async fn as_of_is_echoed_only_when_sent() {
+        let svc = injection_svc(
+            MockVectorsWithInjection {
+                search_results: vec![make_scored_memory(&"a".repeat(64), "hit", 0.9)],
+                ..Default::default()
+            },
+            MockGraphWithActivation::default(),
+        );
+        for mode in [SearchMode::Hybrid, SearchMode::Similar] {
+            let params = SearchParams {
+                mode,
+                ..search_params("echo")
+            };
+            let replay = svc
+                .search_with(params.clone(), true, Some(AS_OF))
+                .await
+                .expect("search succeeds");
+            assert_eq!(replay["as_of"], serde_json::json!(AS_OF), "{mode:?}");
+            let live = svc
+                .search_with(params, true, None)
+                .await
+                .expect("search succeeds");
+            assert!(live.get("as_of").is_none(), "{mode:?}: {live}");
+        }
+    }
+
+    /// `as_of` takes only a read-only `hybrid` or `similar` search, at a time
+    /// not past the clock. The REST handler and `search_with` share this
+    /// check; the service refuses on its own too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn validate_as_of_refuses_writes_other_modes_and_future_times() {
+        let now = 1_700_000_000.0;
+        assert!(validate_as_of(None, SearchMode::Recent, false, now).is_ok());
+        assert!(validate_as_of(Some(now - 60.0), SearchMode::Hybrid, true, now).is_ok());
+        assert!(validate_as_of(Some(now), SearchMode::Similar, true, now).is_ok());
+
+        let refusal = |as_of: f64, mode, read_only| {
+            validate_as_of(Some(as_of), mode, read_only, now).expect_err("refused")
+        };
+        assert!(refusal(now - 60.0, SearchMode::Hybrid, false).contains("read-only"));
+        for mode in [SearchMode::Recent, SearchMode::Tag, SearchMode::Scan] {
+            assert!(refusal(now - 60.0, mode, true).contains("hybrid and similar"));
+        }
+        // Epoch milliseconds read as a time far past the clock.
+        assert!(refusal(now * 1000.0, SearchMode::Hybrid, true).contains("epoch seconds"));
+
+        let svc = injection_svc(
+            MockVectorsWithInjection::default(),
+            MockGraphWithActivation::default(),
+        );
+        let written = svc
+            .search_with(search_params("q"), false, Some(AS_OF))
+            .await;
+        assert!(
+            matches!(written, Err(AlayaError::Validation(_))),
+            "{written:?}"
+        );
+    }
+
     /// A typed hybrid search passes the type to both tag searches, so
     /// wrong-type tag matches cannot fill fetch_size ahead of the right type.
     /// Each pool holds 100 wrong-type matches (fetch_size never exceeds 100)
@@ -7417,7 +8093,7 @@ mod tests {
                 None,
             );
             let res = svc
-                .search_with(search_params("stability"), read_only)
+                .search_with(search_params("stability"), read_only, None)
                 .await
                 .expect("search");
             let results = res["results"].as_array().expect("results");
@@ -7948,6 +8624,7 @@ mod tests {
             _l: usize,
             _mt: Option<&str>,
             _mts: Option<f64>,
+            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -8583,6 +9260,7 @@ mod tests {
             limit: usize,
             _mt: Option<&str>,
             _mts: Option<f64>,
+            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(self.scored(limit))
         }
@@ -9322,6 +10000,7 @@ mod tests {
                 _l: usize,
                 _mt: Option<&str>,
                 _mts: Option<f64>,
+                _mca: Option<f64>,
             ) -> Result<Vec<ScoredMemory>> {
                 unimplemented!()
             }
@@ -10326,6 +11005,7 @@ mod tests {
             limit: usize,
             _mt: Option<&str>,
             _mts: Option<f64>,
+            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(scored_from(&self.0.memories.borrow(), limit))
         }
