@@ -58,12 +58,13 @@ from longmemeval_qa import (
     DEFAULT_READER,
     ClaudeCLI,
     bind_stage,
+    check_labels,
     get_anscheck_prompt,
     judge_label,
     load_json,
     load_jsonl,
     record_calls,
-    retrieval_fingerprint,
+    rows_fingerprint,
     run_parallel,
     score,
 )
@@ -192,7 +193,7 @@ def stage_read(args, cli: ClaudeCLI) -> int:
     config = {
         "model": args.reader,
         "k": max(len(r["retrieved"]) for r in retrieval),
-        "retrieval_sha256": retrieval_fingerprint(retrieval, "retrieved"),
+        "retrieval_sha256": rows_fingerprint(retrieval),
     }
     bind_stage(args.run_dir, "read", **config)
     out = os.path.join(args.run_dir, "hypotheses.jsonl")
@@ -223,7 +224,9 @@ def stage_judge(args, cli: ClaudeCLI) -> int:
     hyps = load_jsonl(os.path.join(args.run_dir, "hypotheses.jsonl"))
     bind_stage(args.run_dir, "judge", model=args.judge)
     out = os.path.join(args.run_dir, "judge_labels.jsonl")
-    done = {r["question_id"] for r in load_jsonl(out, missing_ok=True)}
+    existing = load_jsonl(out, missing_ok=True)
+    check_labels(hyps, existing, out)
+    done = {r["question_id"] for r in existing}
     todo = [h for h in hyps if h["question_id"] not in done]
     print(f"  judge: {len(todo)} to do (judge {args.judge})")
 
@@ -261,6 +264,11 @@ def stage_report(args) -> dict:
         for r in load_jsonl(os.path.join(args.run_dir, "retrieval.jsonl"))
     }
     labels = load_jsonl(os.path.join(args.run_dir, "judge_labels.jsonl"))
+    check_labels(
+        load_jsonl(os.path.join(args.run_dir, "hypotheses.jsonl")),
+        labels,
+        "judge_labels.jsonl",
+    )
     calls_path = os.path.join(args.run_dir, "calls.json")
     calls = load_json(calls_path)
     ids = [r["question_id"] for r in labels]
@@ -270,9 +278,7 @@ def stage_report(args) -> dict:
         )
     if "read" not in calls or "judge" not in calls:
         sys.exit(f"  {calls_path} lacks the read or judge stage")
-    if calls["read"].get("retrieval_sha256") != retrieval_fingerprint(
-        list(by_id.values()), "retrieved"
-    ):
+    if calls["read"].get("retrieval_sha256") != rows_fingerprint(list(by_id.values())):
         sys.exit("  retrieval.jsonl is not the retrieval this run's reader read")
     if {r["autoeval_label"]["model"] for r in labels} != {calls["judge"]["model"]}:
         sys.exit(f"  labels are not all from judge {calls['judge']['model']}")

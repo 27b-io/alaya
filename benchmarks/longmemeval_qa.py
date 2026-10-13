@@ -262,26 +262,59 @@ def paths(run_dir: str) -> dict[str, str]:
     }
 
 
-def retrieval_fingerprint(rows: list[dict], key: str) -> str:
-    """SHA-256 over every question's ranked results: what the reader was given."""
-    ranked = sorted((r["question_id"], r[key]) for r in rows)
-    return hashlib.sha256(json.dumps(ranked).encode()).hexdigest()
+def rows_fingerprint(rows: list[dict]) -> str:
+    """SHA-256 over every row, every field: the ranked results the reader was
+    given and the fields the report scores (type, answer sessions, hit flags)."""
+    canon = sorted(json.dumps(r, sort_keys=True) for r in rows)
+    return hashlib.sha256("\n".join(canon).encode()).hexdigest()
+
+
+def file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
 def bind_stage(run_dir: str, stage: str, **config) -> None:
-    """Refuse to resume a stage under a different config (model, k, retrieval).
+    """Refuse to resume a stage under a different config (model, k, inputs).
 
     A resume skips questions already done, so a changed config would silently
     mix two runs in one file; the report then credits one run with the other's
-    answers.
+    answers. The first run writes the config before any call, so even an
+    interrupted first run is bound.
     """
     p = paths(run_dir)["calls"]
-    prev = load_json(p).get(stage, {})
+    calls = load_json(p)
+    prev = calls.get(stage, {})
     for key, value in config.items():
         if prev and prev.get(key) != value:
             sys.exit(
                 f"  {p} records {stage} {key}={prev.get(key)!r}, not {value!r}; use a new --run-dir"
             )
+    if not prev:
+        calls[stage] = {**config, "calls": 0}
+        with open(p, "w") as f:
+            json.dump(calls, f, indent=2)
+            f.write("\n")
+
+
+def check_labels(hyps: list[dict], labels: list[dict], where: str) -> None:
+    """Every label must carry the hypothesis now in the hypotheses file, so an
+    edited or re-read answer can never keep an old verdict."""
+    by_id = {h["question_id"]: h["hypothesis"] for h in hyps}
+    if len(by_id) != len(hyps):
+        sys.exit(f"  duplicate question ids in the hypotheses for {where}")
+    stale = [
+        r["question_id"]
+        for r in labels
+        if by_id.get(r["question_id"]) != r["hypothesis"]
+    ]
+    if stale:
+        sys.exit(
+            f"  {len(stale)} label(s) in {where} judge a different hypothesis (e.g. {stale[0]}); use a new --run-dir"
+        )
 
 
 def record_calls(run_dir: str, stage: str, cli: ClaudeCLI, **config) -> None:
@@ -309,7 +342,8 @@ def stage_read(args, cli: ClaudeCLI) -> int:
     config = {
         "model": args.reader,
         "k": args.k,
-        "retrieval_sha256": retrieval_fingerprint(retrieval, "ranked_session_ids"),
+        "retrieval_sha256": rows_fingerprint(retrieval),
+        "dataset_sha256": file_sha256(args.data),
     }
     bind_stage(args.run_dir, "read", **config)
     out = paths(args.run_dir)["hyp"]
@@ -338,7 +372,9 @@ def stage_judge(args, cli: ClaudeCLI) -> int:
     hyps = load_jsonl(paths(args.run_dir)["hyp"])
     bind_stage(args.run_dir, "judge", model=args.judge)
     out = paths(args.run_dir)["labels"]
-    done = {r["question_id"] for r in load_jsonl(out, missing_ok=True)}
+    existing = load_jsonl(out, missing_ok=True)
+    check_labels(hyps, existing, out)
+    done = {r["question_id"] for r in existing}
     todo = [h for h in hyps if h["question_id"] not in done]
     print(
         f"  judge: {len(todo)} to do, {len(done)} already in {out} (judge {args.judge})"
@@ -397,6 +433,7 @@ def stage_report(args) -> dict:
     """Score a finished run. Reads only the run's own files, never the dataset."""
     p = paths(args.run_dir)
     labels = load_jsonl(p["labels"])
+    check_labels(load_jsonl(p["hyp"]), labels, p["labels"])
     retrieval = load_jsonl(args.retrieval)
     calls = load_json(p["calls"])
 
@@ -410,9 +447,7 @@ def stage_report(args) -> dict:
     reader, judge = calls.get("read", {}), calls.get("judge", {})
     if not reader or not judge:
         sys.exit(f"  {p['calls']} lacks the read or judge stage")
-    if reader.get("retrieval_sha256") != retrieval_fingerprint(
-        retrieval, "ranked_session_ids"
-    ):
+    if reader.get("retrieval_sha256") != rows_fingerprint(retrieval):
         sys.exit(
             f"  {args.retrieval} is not the retrieval this run's reader read; pass that file"
         )

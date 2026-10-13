@@ -11,7 +11,7 @@
       "calls": 200,
       "cli": "2.1.285 (Claude Code)",
       "k": 10,
-      "retrieval_sha256": "ef06adbb82b7b303b8c196a74d432347ca866b584db8ef5249cc8342a0d89f11"
+      "retrieval_sha256": "a1ca9cb3a6cb56730855b1b1917876e5edbd89fb9ba589d28a0340b01d53d85e"
     },
     "judge": {
       "model": "claude-opus-5-5",
