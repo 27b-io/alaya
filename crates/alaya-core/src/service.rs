@@ -4265,7 +4265,7 @@ mod tests {
                 Box::new(MockConsolidation),
                 None,
             )
-            .search_with(search_params("anything"), false)
+            .search_with(search_params("anything"), false, None)
             .await
             .expect("search succeeds")
         };
