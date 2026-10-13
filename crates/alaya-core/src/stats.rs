@@ -326,6 +326,7 @@ mod tests {
             _l: usize,
             _mt: Option<&str>,
             _mts: Option<f64>,
+            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }

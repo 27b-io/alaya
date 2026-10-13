@@ -906,6 +906,13 @@ fn build_filter(filter: &PayloadFilter) -> Value {
         }));
     }
 
+    if let Some(max_created) = filter.max_created_at {
+        must.push(json!({
+            "key": "created_at",
+            "range": { "lte": max_created }
+        }));
+    }
+
     let mut f = json!({});
     if !must.is_empty() {
         f["must"] = json!(must);
@@ -1806,13 +1813,15 @@ impl VectorStorage for QdrantClient {
         limit: usize,
         memory_type: Option<&str>,
         min_trust_score: Option<f64>,
+        max_created_at: Option<f64>,
     ) -> Result<Vec<ScoredMemory>> {
-        // Qdrant applies memory_type and min_trust_score before `limit`, so
-        // wrong-type or below-trust tag matches cannot fill the page ahead of
-        // the memories the caller asked for.
+        // Qdrant applies memory_type, min_trust_score and max_created_at
+        // before `limit`, so tag matches the caller excluded cannot fill the
+        // page ahead of the memories it asked for.
         let filter = PayloadFilter {
             memory_type: memory_type.map(String::from),
             min_trust_score,
+            max_created_at,
             tags: Some(tags.iter().map(|t| t.to_string()).collect()),
             tags_match_all: match_all,
             ..Default::default()
@@ -2556,6 +2565,20 @@ mod tests {
         assert_eq!(
             build_filter(&f),
             json!({"must": [{"key": "provenance.trust_score", "range": {"gte": 0.5}}]})
+        );
+    }
+
+    /// `created_at` is stored as epoch seconds, so the bound is inclusive:
+    /// a memory written at T itself existed at T.
+    #[test]
+    fn build_filter_max_created_at() {
+        let f = PayloadFilter {
+            max_created_at: Some(1_700_000_000.5),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_filter(&f),
+            json!({"must": [{"key": "created_at", "range": {"lte": 1_700_000_000.5}}]})
         );
     }
 

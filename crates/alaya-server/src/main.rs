@@ -52,7 +52,8 @@ use alaya_core::calendar::utc_date_str;
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{
     JudgeOutcome, KeywordLeg, MemoryService, OutputMode, RankingFlags, Refutation, RefuteStage,
-    RelationParams, SearchParams, StoreParams, parse_user_relation,
+    RelationParams, SearchParams, StoreParams, current_timestamp, parse_user_relation,
+    validate_as_of,
 };
 use alaya_core::vitals::{CountingEmbedding, SelfCheckOutcome, Vitals};
 use alaya_types::graph::{Contradiction, ContradictionQuery, Resolution};
@@ -99,6 +100,8 @@ struct Config {
     rerank_timeout_ms: std::num::NonZeroU64,
     /// Hybrid ranking boosts switched off by `RANK_*` (LAB-7714).
     ranking: RankingFlags,
+    /// The `newer_related` pointer's judge-confidence floor; `None` = off.
+    newer_related: Option<f64>,
     /// Periodic self-check (LAB-4026); `None` when its env vars are unset.
     selfcheck: Option<selfcheck::SelfCheckConfig>,
 }
@@ -166,6 +169,8 @@ impl Config {
                 .parse()
                 .expect("RERANK_TIMEOUT_MS must be a positive integer (ms)"),
             ranking: parse_ranking(|var| std::env::var(var).ok()).unwrap_or_else(|e| panic!("{e}")),
+            newer_related: parse_newer_related(|var| std::env::var(var).ok())
+                .unwrap_or_else(|e| panic!("{e}")),
             selfcheck: selfcheck::parse(
                 env_non_empty("SELFCHECK_QUERY"),
                 env_non_empty("SELFCHECK_EXPECT_HASH"),
@@ -769,6 +774,8 @@ pub(crate) enum CmdInner {
     Search {
         params: SearchParams,
         read_only: bool,
+        /// REST-only replay time (epoch seconds); MCP always sends `None`.
+        as_of: Option<f64>,
         reply: oneshot::Sender<Value>,
     },
     Delete {
@@ -1554,6 +1561,7 @@ async fn service_worker(
             CmdInner::Search {
                 params,
                 read_only,
+                as_of,
                 reply,
             } => {
                 search_backlog_warned = false;
@@ -1572,7 +1580,7 @@ async fn service_worker(
                     clip_for_log(params.memory_type.as_deref().unwrap_or_default()).into_owned();
                 // `queued_ms` is recorded once the search holds the gate, so
                 // its ok, failed and timeout lines all carry the wait.
-                let span = tracing::info_span!(parent: &ps, "search", %mode, read_only,
+                let span = tracing::info_span!(parent: &ps, "search", %mode, read_only, ?as_of,
                     queued_ms = tracing::field::Empty);
                 let svc = svc.clone();
                 let gate = search_gate.clone();
@@ -1594,8 +1602,11 @@ async fn service_worker(
                             return;
                         }
                         let running_since = std::time::Instant::now();
-                        let result = match timeout(deadline, svc.search_with(params, read_only))
-                            .await
+                        let result = match timeout(
+                            deadline,
+                            svc.search_with(params, read_only, as_of),
+                        )
+                        .await
                         {
                             Ok(Ok(r)) => {
                                 let n = result_count(&r);
@@ -2347,6 +2358,34 @@ fn parse_ranking(env: impl Fn(&str) -> Option<String>) -> Result<RankingFlags, S
     })
 }
 
+/// `NEWER_RELATED` (`true` / `false`, unset = on) and
+/// `NEWER_RELATED_MIN_CONFIDENCE` (the floor on the judge's
+/// `verdict_confidence`, `0 < x <= 1`, unset = 0.90). `None` turns the
+/// pointer off. Read raw, like `parse_ranking`: set-but-blank or any other
+/// value refuses boot.
+fn parse_newer_related(env: impl Fn(&str) -> Option<String>) -> Result<Option<f64>, String> {
+    let on = match env("NEWER_RELATED") {
+        None => true,
+        Some(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" => true,
+            "false" => false,
+            _ => return Err(format!("NEWER_RELATED must be true or false, got {s:?}")),
+        },
+    };
+    let min = match env("NEWER_RELATED_MIN_CONFIDENCE") {
+        None => alaya_core::newer_related::DEFAULT_MIN_CONFIDENCE,
+        Some(s) => s
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|x| *x > 0.0 && *x <= 1.0)
+            .ok_or_else(|| {
+                format!("NEWER_RELATED_MIN_CONFIDENCE must be a number in (0, 1], got {s:?}")
+            })?,
+    };
+    Ok(on.then_some(min))
+}
+
 /// Default daily cap for store-path judge calls (LAB-3895).
 const JUDGE_DAILY_CAP_DEFAULT: usize = 1000;
 
@@ -2997,6 +3036,10 @@ fn main() {
             keyword_leg = ?config.ranking.keyword_leg,
             "hybrid ranking switches"
         );
+        tracing::info!(
+            min_confidence = ?config.newer_related,
+            "newer_related pointer (None = off)"
+        );
 
         let judge: Option<JudgeClient> = if let Some(url) = &config.judge_url {
             tracing::info!(
@@ -3079,6 +3122,7 @@ fn main() {
                     svc = svc.with_reranker(Box::new(rerank));
                 }
                 svc = svc.with_ranking(cfg_clone.ranking);
+                svc = svc.with_newer_related(cfg_clone.newer_related);
 
                 let limits = WorkerLimits {
                     judge_daily_cap: cfg_clone.judge_daily_cap,
@@ -3358,29 +3402,42 @@ async fn store(
     .await
 }
 
-/// `POST /search` body: the shared search params plus a REST-only
-/// `read_only` that a caller sets to make its own search a pure read. It can
-/// only narrow: it is OR'd with the principal's policy, so `false` never
-/// lifts a read-only principal into the side-effect writes.
+/// `POST /search` body: the shared search params plus two REST-only fields.
+/// `read_only` makes the caller's own search a pure read. It can only
+/// narrow: it is OR'd with the principal's policy, so `false` never lifts a
+/// read-only principal into the side-effect writes. `as_of` (epoch seconds)
+/// replays a read-only `hybrid` or `similar` search against the store as it
+/// stood then; MCP's `search` does not take it.
 #[derive(Deserialize)]
 struct SearchReq {
     #[serde(flatten)]
     params: SearchParams,
     #[serde(default)]
     read_only: bool,
+    as_of: Option<f64>,
 }
 
 async fn search(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
     axum::Extension(principal): axum::Extension<AuthPrincipal>,
-    Json(SearchReq { params, read_only }): Json<SearchReq>,
+    Json(SearchReq {
+        params,
+        read_only,
+        as_of,
+    }): Json<SearchReq>,
 ) -> (StatusCode, Json<Value>) {
     let read_only = read_only || WritePolicy::read_only_for(principal);
+    // Refused here, before dispatch, so the caller gets a 400 rather than an
+    // op error in a 200 body.
+    if let Err(msg) = validate_as_of(as_of, params.mode, read_only, current_timestamp()) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg})));
+    }
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::Search {
             params,
             read_only,
+            as_of,
             reply: tx,
         },
         rx,
@@ -4279,6 +4336,55 @@ mod tests {
             let err = parse_ranking(|v| (v == var).then(|| value.to_string())).unwrap_err();
             assert!(err.starts_with(var), "{var}={value:?}: {err}");
         }
+    }
+
+    #[test]
+    fn parse_newer_related_defaults_and_validates() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |var: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == var)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(parse_newer_related(env(&[])).unwrap(), Some(0.90));
+        assert_eq!(
+            parse_newer_related(env(&[("NEWER_RELATED_MIN_CONFIDENCE", " 0.95 ")])).unwrap(),
+            Some(0.95)
+        );
+        assert_eq!(
+            parse_newer_related(env(&[("NEWER_RELATED_MIN_CONFIDENCE", "1")])).unwrap(),
+            Some(1.0)
+        );
+        assert_eq!(
+            parse_newer_related(env(&[("NEWER_RELATED", "FALSE")])).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_newer_related(env(&[("NEWER_RELATED", "true")])).unwrap(),
+            Some(0.90)
+        );
+        // A bad threshold refuses boot even with the pointer off.
+        for (var, value) in [
+            ("NEWER_RELATED", ""),
+            ("NEWER_RELATED", "off"),
+            ("NEWER_RELATED_MIN_CONFIDENCE", ""),
+            ("NEWER_RELATED_MIN_CONFIDENCE", "0"),
+            ("NEWER_RELATED_MIN_CONFIDENCE", "-0.5"),
+            ("NEWER_RELATED_MIN_CONFIDENCE", "1.01"),
+            ("NEWER_RELATED_MIN_CONFIDENCE", "90"),
+            ("NEWER_RELATED_MIN_CONFIDENCE", "NaN"),
+            ("NEWER_RELATED_MIN_CONFIDENCE", "high"),
+        ] {
+            let err = parse_newer_related(|v| (v == var).then(|| value.to_string())).unwrap_err();
+            assert!(err.starts_with(var), "{var}={value:?}: {err}");
+        }
+        let off_but_bad = parse_newer_related(env(&[
+            ("NEWER_RELATED", "false"),
+            ("NEWER_RELATED_MIN_CONFIDENCE", "2"),
+        ]));
+        assert!(off_but_bad.is_err());
     }
 
     const DAY1: u64 = 1789733949; // 2026-09-18
@@ -5373,7 +5479,7 @@ mod tests {
         let client =
             QdrantClient::new(format!("http://{refused}"), "memories".into(), None).unwrap();
         let found = client
-            .search_by_tags(&["TAG-MARKER"], false, 10, Some("note"), None)
+            .search_by_tags(&["TAG-MARKER"], false, 10, Some("note"), None, None)
             .await;
         assert!(found.is_err());
 
@@ -5509,6 +5615,7 @@ mod wedge_tests {
             _limit: usize,
             _mt: Option<&str>,
             _mts: Option<f64>,
+            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             unimplemented!()
         }
@@ -5677,7 +5784,8 @@ mod wedge_tests {
             &self,
             _hashes: &[&str],
         ) -> Result<HashMap<String, Vec<ContradictionRef>>> {
-            unimplemented!()
+            // Every search and get_memory reads it for `newer_related`.
+            Ok(HashMap::new())
         }
         async fn get_neighbors(
             &self,
@@ -6100,6 +6208,7 @@ mod wedge_tests {
             _limit: usize,
             _mt: Option<&str>,
             _mts: Option<f64>,
+            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             tokio::time::sleep(SLOW_SEARCH).await;
             Ok(Vec::new())
@@ -6191,6 +6300,7 @@ mod wedge_tests {
         CmdInner::Search {
             params,
             read_only: false,
+            as_of: None,
             reply,
         }
     }
@@ -6537,6 +6647,7 @@ mod wedge_tests {
             let out = ask(&tx, |reply| CmdInner::Search {
                 params,
                 read_only: false,
+                as_of: None,
                 reply,
             })
             .await;
@@ -7413,6 +7524,7 @@ mod wedge_tests {
             rerank_top_n: 0,
             rerank_timeout_ms: std::num::NonZeroU64::MIN,
             ranking: RankingFlags::default(),
+            newer_related: None,
             selfcheck: None,
         };
         // `check_detail` fans out to all four probes.
@@ -7733,6 +7845,7 @@ mod wedge_tests {
                     Some(CmdInner::Search {
                         params,
                         read_only,
+                        as_of: None,
                         reply,
                     }) => {
                         let _ = reply.send(json!({ "results": [] }));
@@ -7758,6 +7871,111 @@ mod wedge_tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(rx.try_recv().is_err(), "a refused call must not dispatch");
+    }
+
+    /// `POST /search` `as_of` reaches the worker only on a read-only `hybrid`
+    /// or `similar` search at a time not past the clock. Each refusal is a 400
+    /// naming the problem, before dispatch: a worker-side validation error
+    /// would reach the caller as a 200.
+    #[tokio::test]
+    async fn search_as_of_refusals_are_400s_before_dispatch() {
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = mpsc::channel::<Cmd>(4);
+        let mut auth = test_auth_state();
+        auth.readonly_api_key = Some("ro-key".into());
+        let app = protected_router(ServiceHandle { tx }, auth);
+        let post = |token: &str, body: Value| {
+            axum::http::Request::post("/search")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        let past = 1_700_000_000.5;
+
+        let refused = [
+            (
+                TEST_KEY,
+                json!({ "query": "q", "as_of": past }),
+                "read-only",
+            ),
+            (
+                TEST_KEY,
+                json!({ "query": "q", "as_of": past, "read_only": false }),
+                "read-only",
+            ),
+            (
+                TEST_KEY,
+                json!({ "query": "q", "mode": "recent", "as_of": past, "read_only": true }),
+                "hybrid and similar",
+            ),
+            (
+                "ro-key",
+                json!({ "query": "q", "mode": "tag", "tags": "a", "as_of": past }),
+                "hybrid and similar",
+            ),
+            (
+                "ro-key",
+                json!({ "query": "q", "mode": "scan", "as_of": past }),
+                "hybrid and similar",
+            ),
+            // Epoch milliseconds.
+            (
+                TEST_KEY,
+                json!({ "query": "q", "as_of": past * 1000.0, "read_only": true }),
+                "epoch seconds",
+            ),
+        ];
+        for (token, body, names) in refused {
+            let resp = app
+                .clone()
+                .oneshot(post(token, body.clone()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let err: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(
+                err["error"].as_str().is_some_and(|e| e.contains(names)),
+                "{body}: {err}"
+            );
+            assert!(rx.try_recv().is_err(), "a refused call must not dispatch");
+        }
+
+        let accepted = [
+            (
+                TEST_KEY,
+                json!({ "query": "q", "as_of": past, "read_only": true }),
+            ),
+            (
+                "ro-key",
+                json!({ "query": "q", "mode": "similar", "as_of": past }),
+            ),
+        ];
+        for (token, body) in accepted {
+            let worker = async {
+                match rx.recv().await.map(|c| c.inner) {
+                    Some(CmdInner::Search {
+                        read_only,
+                        as_of,
+                        reply,
+                        ..
+                    }) => {
+                        let _ = reply.send(json!({ "results": [] }));
+                        (read_only, as_of)
+                    }
+                    _ => panic!("expected a Search command"),
+                }
+            };
+            let (resp, (read_only, as_of)) =
+                tokio::join!(app.clone().oneshot(post(token, body.clone())), worker);
+            assert_eq!(resp.unwrap().status(), StatusCode::OK, "{body}");
+            assert!(read_only, "{body}");
+            assert_eq!(as_of, Some(past), "{body}");
+        }
     }
 
     /// The other half of #63's contract: a worker that IS draining must never

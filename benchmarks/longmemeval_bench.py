@@ -51,7 +51,13 @@ COLLECTION = "bench_memories"
 TAG_COLLECTION = "bench_memories_tags"
 EMBEDDING_DIM = 1024
 
-LME_URL = "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json"
+# Pinned to the revision whose file has SHA-256 d6f21ea9...a3c442, the one the
+# committed QA run read, so a rerun fetches the same bytes.
+LME_REVISION = "98d7416c24c778c2fee6e6f3006e7a073259d48f"
+LME_URL = (
+    "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/"
+    f"{LME_REVISION}/longmemeval_s_cleaned.json"
+)
 LME_CACHE = "/tmp/longmemeval_s_cleaned.json"
 
 
@@ -155,17 +161,19 @@ class QdrantAdmin:
         self.client = httpx.Client(timeout=30)
 
     def reset_collections(self):
-        """Delete and recreate both collections for a clean slate."""
+        """Delete and recreate both collections for a clean slate.
+
+        Same schema the server creates (qdrant.rs ensure_one): the memories
+        collection also carries the BM25 sparse vector, which every store writes.
+        """
         for coll in (COLLECTION, TAG_COLLECTION):
             resp = self.client.delete(f"{self.base}/collections/{coll}")
             if resp.status_code not in (200, 404):
                 resp.raise_for_status()
-            resp = self.client.put(
-                f"{self.base}/collections/{coll}",
-                json={
-                    "vectors": {"size": EMBEDDING_DIM, "distance": "Cosine"},
-                },
-            )
+            body: dict = {"vectors": {"size": EMBEDDING_DIM, "distance": "Cosine"}}
+            if coll == COLLECTION:
+                body["sparse_vectors"] = {"bm25": {"modifier": "idf"}}
+            resp = self.client.put(f"{self.base}/collections/{coll}", json=body)
             if resp.status_code not in (200, 409):
                 resp.raise_for_status()
 
@@ -450,6 +458,10 @@ def run_benchmark(args):
 
             if "error" in metrics:
                 errors += 1
+                print(
+                    f"  ERROR {entry['question_id']}: {metrics['error']}",
+                    file=sys.stderr,
+                )
                 continue
 
             all_metrics.append(metrics)

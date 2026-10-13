@@ -34,6 +34,8 @@ Cross-encoder reranking lifts hit-rate@5 from 0.916 to 0.986 on the live server 
 
 Numbers above are from harness `benchmarks/longmemeval_bench.py` at commit `8b01f85`, run on `2026-05-30`, against the shipped server build. **[Reproduce →](benchmarks/README.md)**
 
+Answered end to end, with a reader model answering from what Ālaya retrieves and a judge model scoring it, LongMemEval-S QA accuracy is **0.930** (n=500, 95% CI [0.904, 0.949]; one run, frontier reader `claude-sonnet-5-5` over the top 10 sessions, judge `claude-opus-5-5`; not comparable with published LongMemEval QA numbers). **[Per-type table →](benchmarks/README.md#qa-accuracy)**
+
 ## Quick Start
 
 ```bash

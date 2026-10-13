@@ -1,0 +1,16 @@
+{
+  "read": {
+    "model": "claude-sonnet-5-5",
+    "calls": 500,
+    "cli": "2.1.285 (Claude Code)",
+    "k": 10,
+    "retrieval_sha256": "5081114f7a82c90d68cbb60fb046afc1f341ebaeaf221f51d12cf72d6d2c7d13",
+    "dataset_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442"
+  },
+  "judge": {
+    "model": "claude-opus-5-5",
+    "calls": 500,
+    "cli": "2.1.285 (Claude Code)",
+    "dataset_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442"
+  }
+}

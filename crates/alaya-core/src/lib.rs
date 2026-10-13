@@ -4,6 +4,7 @@ pub mod encoding_context;
 pub mod hashing;
 pub mod hybrid_search;
 pub mod interference;
+pub mod newer_related;
 pub mod provenance;
 pub mod salience;
 pub mod service;

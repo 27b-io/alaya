@@ -204,8 +204,8 @@ pub fn delete_incoming_system_edges(dst: &str, rel: SystemRelationType) -> Cyphe
 /// Row layout of `get_all_contradictions`, in this order.
 /// `handlers::contradictions::parse_verdict` indexes columns 4..=9 and
 /// `parse_resolution` columns 10..=12 by position, so keep the three in
-/// lock-step. (`get_contradictions_for_hashes` deliberately returns no
-/// verdict or resolution columns.)
+/// lock-step. `get_contradictions_for_hashes` returns the same columns
+/// plus two.
 const CONTRADICTION_COLUMNS: &str = "a.content_hash, b.content_hash, e.confidence, e.created_at, \
      e.verdict, e.verdict_survivor, e.verdict_reason, e.verdict_confidence, \
      e.verdict_model, e.judged_at, \
@@ -442,12 +442,24 @@ pub fn count_judged_or_resolved_contradiction(src: &str, dst: &str) -> CypherQue
     )
 }
 
-/// Fetch CONTRADICTS pairs touching any of the supplied hashes.
+/// Every CONTRADICTS edge touching any of the supplied hashes, each edge
+/// once: `CONTRADICTION_COLUMNS`, then each endpoint's incoming
+/// `SUPERSEDES` count (columns 13 and 14). Anchored on the requested
+/// nodes: the graph carries no property index, so a filter on the edge's
+/// endpoints (`a.content_hash IN $hashes OR b.content_hash IN $hashes`)
+/// reads every CONTRADICTS edge per call, while this reads only the
+/// requested memories' own. `DISTINCT e` drops the second copy of an edge
+/// whose two endpoints were both requested; `startNode` / `endNode` keep
+/// its direction.
 pub fn get_contradictions_for_hashes(hashes: &[&str]) -> CypherQuery {
-    let q = "MATCH (a:Memory)-[e:CONTRADICTS]->(b:Memory) \
-             WHERE a.content_hash IN $hashes OR b.content_hash IN $hashes \
-             RETURN a.content_hash, b.content_hash, e.confidence"
-        .to_string();
+    let q = format!(
+        "MATCH (m:Memory) WHERE m.content_hash IN $hashes \
+         MATCH (m)-[e:CONTRADICTS]-(:Memory) \
+         WITH DISTINCT e \
+         WITH e, startNode(e) AS a, endNode(e) AS b \
+         RETURN {CONTRADICTION_COLUMNS}, \
+         indegree(a, 'SUPERSEDES'), indegree(b, 'SUPERSEDES')"
+    );
     let hash_list: Vec<Value> = hashes.iter().map(|h| json!(h)).collect();
     (q, params(&[("hashes", Value::Array(hash_list))]), true)
 }
@@ -1090,8 +1102,15 @@ mod tests {
     #[test]
     fn get_contradictions_for_hashes_shape() {
         let (q, p, ro) = get_contradictions_for_hashes(&["a", "b"]);
-        assert!(q.contains("CONTRADICTS"));
-        assert!(q.contains("IN $hashes"));
+        // Anchored on the requested nodes, never a filter on edge endpoints.
+        assert!(q.starts_with("MATCH (m:Memory) WHERE m.content_hash IN $hashes"));
+        assert!(!q.contains("a.content_hash IN"));
+        assert!(q.contains("WITH DISTINCT e"));
+        // Row layout the handler indexes: the queue's columns, then the two
+        // SUPERSEDES in-degrees.
+        assert!(q.contains(&format!(
+            "RETURN {CONTRADICTION_COLUMNS}, indegree(a, 'SUPERSEDES'), indegree(b, 'SUPERSEDES')"
+        )));
         assert!(p.contains_key("hashes"));
         let arr = p["hashes"].as_array().unwrap();
         assert_eq!(arr.len(), 2);

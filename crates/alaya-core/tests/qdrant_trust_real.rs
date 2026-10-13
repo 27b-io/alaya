@@ -1,6 +1,7 @@
-//! `min_trust_score` against a real Qdrant: the range filter must read the
-//! key the payload actually stores (top-level `provenance.trust_score`), and
-//! the tag scroll must apply it before its limit.
+//! `min_trust_score` and `as_of`'s `created_at` bound against a real
+//! Qdrant: each range filter must read the key the payload actually stores
+//! (top-level `provenance.trust_score`, `created_at`), and the tag scroll
+//! must apply it before its limit.
 //!
 //! Ignored by default: it needs `QDRANT_TEST_URL`, a disposable Qdrant (the
 //! test makes and drops its own collections). Embeddings are a fixed stub and
@@ -21,8 +22,8 @@ use alaya_backends::{
 use alaya_core::service::{MemoryService, SearchParams};
 use alaya_types::{
     Result,
-    memory::{HealthStatus, Memory},
-    search::{PromptName, SearchMode},
+    memory::{HealthStatus, Memory, ScoredMemory},
+    search::{PayloadFilter, PromptName, SearchMode},
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -135,7 +136,7 @@ async fn min_trust_score_keeps_only_memories_that_meet_it() {
     // points (ids from 'a…', 'b…') fill the page unless the trust filter runs
     // before the limit.
     let tag_page: HashSet<String> = qdrant
-        .search_by_tags(&["pool"], false, 2, None, Some(0.6))
+        .search_by_tags(&["pool"], false, 2, None, Some(0.6), None)
         .await
         .expect("tag search")
         .into_iter()
@@ -173,4 +174,65 @@ async fn min_trust_score_keeps_only_memories_that_meet_it() {
         assert_eq!(unfiltered, everything, "{mode:?} without min_trust_score");
         assert_eq!(filtered, hashes(&high), "{mode:?} with min_trust_score 0.6");
     }
+}
+
+/// `as_of`'s `created_at` bound runs inside Qdrant on the vector and tag
+/// paths, before `limit`. The backends are called directly, because the
+/// service checks the bound again and would hide a filter Qdrant ignored.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs QDRANT_TEST_URL"]
+async fn max_created_at_bounds_vector_and_tag_searches() {
+    let url = std::env::var("QDRANT_TEST_URL")
+        .expect("QDRANT_TEST_URL must point at a disposable Qdrant");
+    let name = format!("as_of_real_{}", std::process::id());
+    drop_collections(&url, &name).await;
+
+    let qdrant = QdrantClient::new(url.clone(), name.clone(), None).unwrap();
+    qdrant
+        .ensure_collection(DIMS)
+        .await
+        .expect("create test collection");
+    const T: f64 = 2000.0;
+    let at = |hash: char, created_at: f64| Memory {
+        created_at,
+        ..memory(hash, 0.8)
+    };
+    // Scroll pages in point-id order, so with `limit` 2 the two late points
+    // (ids from 'a…', 'b…') fill the tag page unless the bound runs first.
+    // The bound is inclusive: 'c' was written at T itself.
+    let late = [at('a', T + 1.0), at('b', T + 500.0)];
+    let early = [at('c', T), at('d', T - 500.0)];
+    for m in late.iter().chain(&early) {
+        qdrant.store(m, StoreMode::Upsert).await.expect("store");
+    }
+    let bound = PayloadFilter {
+        max_created_at: Some(T),
+        ..Default::default()
+    };
+    let hashes = |sms: Vec<ScoredMemory>| -> HashSet<String> {
+        sms.into_iter().map(|sm| sm.memory.content_hash).collect()
+    };
+
+    let tag_page = qdrant
+        .search_by_tags(&["pool"], false, 2, None, None, Some(T))
+        .await
+        .map(hashes);
+    let vector_hits = qdrant
+        .search_by_vector(&[0.6, 0.8], 10, Some(bound))
+        .await
+        .map(hashes);
+    let unbounded = qdrant
+        .search_by_vector(&[0.6, 0.8], 10, None)
+        .await
+        .map(hashes);
+    drop_collections(&url, &name).await;
+
+    let early: HashSet<String> = early.iter().map(|m| m.content_hash.clone()).collect();
+    assert_eq!(tag_page.expect("tag search"), early, "tag scroll");
+    assert_eq!(vector_hits.expect("vector search"), early, "vector search");
+    assert_eq!(
+        unbounded.expect("vector search").len(),
+        4,
+        "every point stored"
+    );
 }
