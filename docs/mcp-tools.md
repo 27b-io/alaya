@@ -99,7 +99,7 @@ The one retrieval tool. Mode selects the algorithm.
 | `recent` | Reverse chronological. Use `cursor` to paginate. |
 | `scan` | Full collection scan, ordered by creation time. Expensive — use only for admin / migration. |
 
-**Returns:** an object whose `results` array holds the memories in rank order, plus paging fields that depend on the mode, plus `mode`:
+**Returns:** an object whose `results` array holds the memories, plus paging fields that depend on the mode, plus `mode`. `hybrid` and `similar` put the best match first, `recent` and `scan` the newest first, and `tag` returns memories in store order:
 
 | Mode | Envelope keys besides `results` and `mode` |
 |:--|:--|

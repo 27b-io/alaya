@@ -272,7 +272,7 @@ curl -X POST http://localhost:3001/search \
 
 Some state cannot be rewound and is read as it is now: graph state (Hebbian weights, and which neighbours spreading activation injects, though each injected neighbour still passes the `as_of` bound and the supersession rule); access counts and access timestamps (the salience and spacing boosts); BM25 term statistics, computed over today's collection; the tag vocabulary that keyword extraction and the semantic tag pool read; tags, type, summary and trust patched since T; hard deletes; supersessions reversed by `/unsupersede`, which leave no marker, so the memory passes the supersession check at every T (the `created_at` bound still applies); and a marker re-pointed to a second survivor, which names only the last one. The corpus size behind hybrid's fusion weight is today's too.
 
-**Response:** an object whose `results` array holds the memories in rank order, with the paging keys of the mode and `mode` itself; a search sent with `as_of` also echoes `"as_of": T`. Per-mode keys and the result fields are listed under [MCP: `search`](./mcp-tools.md#search). A hybrid page looks like this:
+**Response:** an object whose `results` array holds the memories in the order the mode sets, with the paging keys of the mode and `mode` itself; a search sent with `as_of` also echoes `"as_of": T`. Per-mode order, keys and the result fields are listed under [MCP: `search`](./mcp-tools.md#search). A hybrid page looks like this:
 
 ```json
 {
