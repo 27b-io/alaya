@@ -88,24 +88,34 @@ class Chrome:
             "--disable-gpu",
             "about:blank",
         ]
-        # close_fds=False: Python opens every fd non-inheritable, so only 3
-        # and 4, made inheritable above, reach Chrome.
-        self._proc = subprocess.Popen(
-            args,
-            close_fds=False,
-            preexec_fn=wire,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        os.close(to_chrome)
-        os.close(from_chrome)
+        self._proc = None
         self._buf = b""
         self._next_id = 0
         self._loads = 0
-        target = self.call("Target.createTarget", url="about:blank")["targetId"]
-        self._session = self.call(
-            "Target.attachToTarget", targetId=target, flatten=True
-        )["sessionId"]
+        try:
+            # close_fds=False: Python opens every fd non-inheritable, so only
+            # 3 and 4, made inheritable above, reach Chrome.
+            self._proc = subprocess.Popen(
+                args,
+                close_fds=False,
+                preexec_fn=wire,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            os.close(to_chrome)
+            os.close(from_chrome)
+            target = self.call("Target.createTarget", url="about:blank")["targetId"]
+            self._session = self.call(
+                "Target.attachToTarget", targetId=target, flatten=True
+            )["sessionId"]
+        except BaseException:
+            # The caller gets no object to close, so stop Chrome and remove
+            # its profile here.
+            if self._proc:
+                self._proc.kill()
+                self._proc.wait()
+            shutil.rmtree(self._profile, ignore_errors=True)
+            raise
 
     def call(self, method, session=None, **params):
         self._next_id += 1
