@@ -128,10 +128,12 @@ is `user-123`, not `"user-123"`.
 
 ## anthropic-lb module (read-only)
 
-Scope: the console **renders** LB state; budgets, limits, endpoints and
-client identities change through GitOps only. The console has **no write
-route to the LB**, the LB exposes no admin write API, and this module must
-not grow one. Values render with their provenance; limits are
+Scope: the console **renders** LB state; this module changes nothing.
+Endpoints change through GitOps only, and so do the clients in the LB's own
+config; the clients the client store holds change through the client-store
+module below, which writes to the store, never to the LB. The console has
+**no write route to the LB**, the LB exposes no admin write API, and this
+module must not grow one. Values render with their provenance; limits are
 "TOML, GitOps".
 
 - **Fleet** — routing strategy, replicas seen, shared-state (Redis) health,
@@ -168,7 +170,9 @@ manages them through the store's admin API, never through the LB: `lb.rs`
 only ever GETs, and `no_route_sends_anything_but_a_get_to_the_lb` drives
 every route to prove it.
 
-This slice carries the kill switch, at `/lb/clients`:
+Two kinds of write, both at `/lb/clients`.
+
+**The kill switch: restriction ops.**
 
 - **`disable` / `enable`** by name, each with a reason, sent as restriction
   ops. `disable` refuses every key of the name, the TOML keys of an ordinary
@@ -181,51 +185,105 @@ This slice carries the kill switch, at `/lb/clients`:
   1,024 names disabled and more than it found; the form then offers disabled
   names to enable in the same request, those the readers report matching no
   client first.
-- **In effect, per stack.** After a write, `/lb/clients/effect` shows each
-  op on each stack that counts, refreshing until every stack holds it (or two
-  minutes pass). An op is in effect on an instance when the instance reports
-  the set hash of the restrictions part the store serves now, and that part
-  carries the op's record or a newer one of the same state. CF is judged from
-  the store's report of CF's latest poll; every other stack from its
-  instances in the metrics store: every instance listed by `up` must be up
-  and export exactly one restrictions series, on the served set hash. A part
-  that moved between the two store reads around the metrics read confirms
-  nothing, and neither does a partial part. A newer record in the other state
-  reads as superseded, never as in effect. The rule lives in `effect.rs`.
-- **Warnings.** A partial restrictions part, instances raising
-  restrictions-behind, a frozen or unreadable document, an open
-  point-in-time-recovery window, and disabled names the readers report
-  matching nothing ("mistyped?").
 
-Every write re-checks the session's subject against
-`CONSOLE_ALLOWED_SUBJECTS` (otherwise read only at login), after the CSRF
-token and the Origin check. Every attempt that reaches the write handler is
-logged on target `ops_console::write_log` with the subject: a refusal made
-before sending (CSRF, allowlist, malformed input), the request with the
-store's answer, or the upstream failure. A request without the console's own
-Origin is refused earlier, by middleware, before any session is read. An
-answer that is lost, or a 503 from the store's restrictions object, leaves
-the outcome unknown: the console says so, re-reads the store, and exports
-nothing as committed.
+**Document ops: clients, policies and keys.** `create`, `update` (all four
+policy fields: daily budget, utilization limit, models, pinned endpoints),
+`delete` (its keys stay unrevoked, so `restore` can undo it), `add_key`,
+`revoke_key` (by digest, for good) and `restore` (from history, at
+`/lb/clients/history`).
+
+- **Preview, then commit.** Every form posts to `/lb/clients/preview`, which
+  sends the op as a `dry_run` pinned to the document version the page read
+  and shows the store's diff. The commit form at `/lb/clients/commit` carries
+  the same op and the same version, so a resubmitted form gets 409 from the
+  store and never writes twice. After any 409 the console re-reads the store
+  and says what it holds.
+- **The key page.** `add_key`'s commit answers with the key page itself, not a
+  redirect: the key the store minted, shown once, sent `Cache-Control:
+  no-store`. It never goes in the flash cookie, a URL or a log line: the write
+  log keeps only the answer members it knows, and each key's client, id and
+  digest. Reloading it re-sends the commit, which the store refuses with 409.
+  A preview whose answer is not a dry run's is reported as an unknown outcome
+  and logged, never rendered. Rotation with overlap: add a key, move consumers
+  to it, then revoke the old one.
+- **Typed confirmations.** While any instance reports the store behind or
+  edited (`store_behind`, `store_edited`), every document write needs `write
+  anyway` typed: the store was rolled back or edited outside its write path,
+  and a write would publish that content at a newer version. The same holds
+  while that cannot be told: the metrics store does not answer, shows no
+  reader up, or shows a reader that is up but does not export both of those
+  alerts, which a reader always exports, raised or not. A write still goes
+  ahead once the phrase is typed.
+- **The `restore` row check.** The store's dry run names the digest of the
+  history row it would restore, and the commit sends that digest back, so the
+  store refuses the restore, inside the commit's transaction, if the row
+  changed after the preview. The digest is checked against the (version,
+  digest) pairs instances installed in the last 30 days. A version installed
+  with another digest means the row was edited after the fact, and the
+  restore is refused. A version with no install on record needs its version
+  typed. An empty answer from the metrics store is unknown, and the restore is
+  refused. The check runs again at commit. A store whose dry run names no
+  digest cannot bind a restore, so the console offers none.
+- **TOML warnings.** A `delete` or `restore` preview names each client it
+  drops that a stack's TOML still holds: on that stack the name goes back to
+  its TOML policy and keys.
+
+**In effect, per stack.** After a write, `/lb/clients/effect` shows it on
+each stack that counts, refreshing until every stack holds it (or two
+minutes pass). CF is judged from the store's report of CF's latest poll; every
+other stack from its instances in the metrics store, each of which must be
+listed by `up`, be up and export exactly one series of the kind judged. A
+restriction op is in effect on an instance when the instance reports the set
+hash of the restrictions part the store serves now, and that part carries the
+op's record or a newer one of the same state. A document is in effect when the
+instance holds its digest and the store still serves it. What moved between
+the two store reads around the metrics read confirms nothing, and neither does
+a partial restrictions part. A newer record in the other state, or a later
+document, reads as superseded, never as in effect. The rules live in
+`effect.rs`; the stacks card on `/lb/clients` shows both for what the store
+serves now.
+
+**Warnings.** A partial restrictions part, instances raising
+restrictions-behind or reporting the store behind or edited, a frozen or
+unreadable document, a refused recovery, an open point-in-time-recovery
+window, and disabled names the readers report matching nothing ("mistyped?").
+
+Every write route in the console, the Ālaya memory-curation ones included,
+re-checks the session's subject against `CONSOLE_ALLOWED_SUBJECTS` (otherwise
+read only at login), after the CSRF token and the Origin check. Every
+client-store attempt that reaches its handler is logged on target
+`ops_console::write_log` with the subject: a refusal made before sending
+(CSRF, allowlist, malformed input, a missing confirmation), the request with
+the store's answer, or the upstream failure. A request without the console's
+own Origin is refused earlier, by middleware, before any session is read. A
+write is sent, logged and exported as committed in a task of its own, so a
+dropped connection cannot lose its log line or its labels. An answer that is
+lost, or any status but 200 or a 4xx refusal, leaves the outcome unknown: the
+console says so, re-reads the store, and exports nothing as committed.
 
 **What the metrics proxy must serve.** One route per metric, at
 `{METRICS_URL}/m/<metric>/api/v1/query`, each pinning `__name__` (and the
 LB's scrape job) with `extra_label` so a query can only narrow it:
-`up`, `anthropic_client_store_restrictions`, `anthropic_client_store_alert`
-and `anthropic_client_store_unmatched_disabled_name`. A query outside a pin
-comes back empty, which the console reads as "nothing visible", never as
-healthy. Each reader stack's series must carry `stack="<name>"`, the name the
-store gives it (its reader role, `reader:<name>`). A reader series without a
-`stack` label leaves every stack judged from the metrics store unknown, naming
-the instance: dropped, it would let its stack read as in effect without it.
+`up`, `anthropic_client_store_restrictions`, `anthropic_client_store_document`,
+`anthropic_client_store_alert`, `anthropic_client_store_unmatched_disabled_name`
+and `anthropic_client_store_toml_client`. Instant queries only: the 30-day
+window the `restore` check needs is a range selector inside the query. A query
+outside a pin comes back empty, which the console reads as "nothing visible",
+never as healthy. Each reader stack's series must carry `stack="<name>"`, the
+name the store gives it (its reader role, `reader:<name>`); the CF scrape's
+`stack="cloudflare"` is read as the store's `cf`. A reader series the console
+cannot place, with no `stack` or no pod or instance label, or of a stack the
+store does not count, leaves every stack judged from the metrics store
+unknown: dropped, it would let its stack read as in effect without it.
 
 **Committed labels.** On `CONSOLE_METRICS_ADDR` the console serves
 `ops_console_committed_record{name,version}`, one series per restriction
-record it committed (the value is when). An alert can match the versions
-instances install against these over 30 days and fire on one the console
-never wrote. The list is in memory: a commit the scraper never saw, because
-the console restarted within one scrape interval, reads as unmatched, and the
-write log holds it.
+record it committed, and `ops_console_committed_document{version,digest}`, one
+per document (the value is when). An alert can match the versions instances
+install against these over 30 days and fire on one the console never wrote.
+The lists are in memory: a commit the scraper never saw, because the console
+restarted within one scrape interval, reads as unmatched, and the write log
+holds it.
 
 ## selecta module (read-only)
 

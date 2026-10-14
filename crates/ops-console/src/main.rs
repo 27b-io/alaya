@@ -14,6 +14,7 @@
 mod alaya;
 mod committed;
 mod config;
+mod confirm;
 mod effect;
 mod error;
 mod fleet;
@@ -218,7 +219,10 @@ fn routes() -> Vec<(&'static str, axum::routing::MethodRouter<AppState>)> {
         ("/lb/clients", get(routes::clients::pane)),
         ("/lb/clients/disable", get(routes::clients::disable_page)),
         ("/lb/clients/restrict", post(routes::clients::restrict)),
+        ("/lb/clients/preview", post(routes::clients::preview)),
+        ("/lb/clients/commit", post(routes::clients::commit)),
         ("/lb/clients/effect", get(routes::clients::effect)),
+        ("/lb/clients/history", get(routes::clients::history)),
         // selecta module: GET only, by design. The console holds a read-only
         // selecta credential and no POST route to selecta may be added here.
         ("/selecta", get(routes::selecta::pane)),
@@ -3085,236 +3089,8 @@ mod tests {
     mod client_store {
         use super::*;
         use crate::effect::{self, RecordState};
-        use serde_json::{Value, json};
-        use sha2::Digest;
-        use std::collections::BTreeMap;
-        use std::sync::{Arc, Mutex};
-
-        const STORE_TOKEN: &str = "store-writer-token-secret-value-0123456789abc";
-        const T0: u64 = 1_791_698_400_000_000;
-
-        /// Every request a fake saw: (method, path and query, body).
-        type Log = Arc<Mutex<Vec<(String, String, String)>>>;
-
-        /// The store's state as a fake `GET /_clients/admin` answers it.
-        #[derive(Clone)]
-        struct World {
-            records: Vec<(&'static str, RecordState, u64)>,
-            full: bool,
-            /// CF's report: (running, set hash). `None` = no report yet.
-            cf: Option<(bool, String)>,
-            stacks: Vec<&'static str>,
-        }
-
-        impl World {
-            fn new(records: Vec<(&'static str, RecordState, u64)>) -> Self {
-                World {
-                    records,
-                    full: true,
-                    cf: None,
-                    stacks: vec!["cf", "k3s"],
-                }
-            }
-
-            fn set_hash(&self) -> String {
-                effect::set_hash(self.records.iter().copied(), [])
-            }
-
-            /// CF running and holding exactly the served set.
-            fn cf_caught_up(mut self) -> Self {
-                self.cf = Some((true, self.set_hash()));
-                self
-            }
-
-            fn get_body(&self) -> Value {
-                let body = json!({
-                    "full": self.full,
-                    "enabled_ahead": 0,
-                    "records": self.records.iter().map(|(n, s, v)| json!({"name": n, "state": s.as_str(), "version": v})).collect::<Vec<_>>(),
-                    "revoked_digests": [],
-                })
-                .to_string();
-                let report = self.cf.as_ref().map(|(_, h)| json!({"version": 0, "digest": null, "records_version": 0, "set_hash": h, "set_complete": true, "binary": "lb/1", "at": "2026-10-11T06:00:00.000Z"}));
-                json!({
-                    "document": {
-                        "status": "ok", "version": 1_791_698_400_123_u64, "digest": "0".repeat(64),
-                        "clients": [{"name": "acme", "daily_budget": 600_000_000, "utilization_limit": null,
-                                     "models": [], "preferred_endpoints": [],
-                                     "keys": [{"id": "k7f3a2c1", "label": "2026-10", "digest": "a".repeat(64), "created_at": "2026-10-11T06:00:00.000Z"}]}],
-                        "revoked_digests": [], "frozen": [], "recovery_refused": false,
-                        "pitr_window": {"open": false, "usable": false, "restore_to": null, "closes": null},
-                        "cf": {"report": report, "complete": null, "running": self.cf.as_ref().is_some_and(|(r, _)| *r)},
-                        "history": [], "history_versions": []
-                    },
-                    "restrictions": {
-                        "status": "ok",
-                        "records": self.records.iter().map(|(n, s, v)| json!({"name": n, "state": s.as_str(), "version": v, "actor": "ops@example.test", "reason": "test", "at": "2026-10-11T06:00:00.000Z"})).collect::<Vec<_>>(),
-                        "revoked_digests": [],
-                        "records_version": self.records.iter().map(|r| r.2).max().unwrap_or(0),
-                        "integrity": {"matches": self.full, "established": null},
-                        "part": {"status": "ok", "tag": effect::hex(&sha2::Sha256::digest(body.as_bytes())), "body": body, "set_hash": self.set_hash()},
-                        "markers": []
-                    },
-                    "recoveries": [],
-                    "stacks": self.stacks,
-                    "pitr_window": false
-                })
-            }
-        }
-
-        /// A fake store: successive `GET`s are answered from `gets` in order
-        /// (the last one repeats); every `POST` gets `post`, or `post_page`
-        /// when set: a body that is not the store's JSON, as an edge block
-        /// page would be.
-        #[derive(Clone)]
-        struct FakeStore {
-            gets: Arc<Mutex<Vec<Value>>>,
-            post: Arc<Mutex<(StatusCode, Value)>>,
-            post_page: Arc<Mutex<Option<StatusCode>>>,
-            log: Log,
-        }
-
-        impl FakeStore {
-            fn new(world: &World) -> Self {
-                FakeStore {
-                    gets: Arc::new(Mutex::new(vec![world.get_body()])),
-                    post_page: Arc::new(Mutex::new(None)),
-                    post: Arc::new(Mutex::new((
-                        StatusCode::OK,
-                        json!({"status": 200, "results": [], "records_version": 0}),
-                    ))),
-                    log: Log::default(),
-                }
-            }
-
-            fn answer_post(&self, status: StatusCode, body: Value) {
-                *self.post.lock().unwrap() = (status, body);
-            }
-
-            fn requests(&self) -> Vec<(String, String, String)> {
-                self.log.lock().unwrap().clone()
-            }
-
-            fn posts(&self) -> Vec<Value> {
-                self.requests()
-                    .into_iter()
-                    .filter(|(m, _, _)| m == "POST")
-                    .map(|(_, _, b)| serde_json::from_str(&b).unwrap())
-                    .collect()
-            }
-
-            fn router(&self) -> Router {
-                let me = self.clone();
-                Router::new().fallback(move |req: Request| {
-                    let me = me.clone();
-                    async move {
-                        let method = req.method().to_string();
-                        let path = req.uri().to_string();
-                        let auth = req.headers().get(header::AUTHORIZATION).cloned();
-                        let body = axum::body::to_bytes(req.into_body(), 1 << 20)
-                            .await
-                            .unwrap();
-                        me.log.lock().unwrap().push((
-                            method.clone(),
-                            path.clone(),
-                            String::from_utf8_lossy(&body).into(),
-                        ));
-                        if auth.as_ref().and_then(|a| a.to_str().ok())
-                            != Some(&format!("Bearer {STORE_TOKEN}"))
-                        {
-                            return (
-                                StatusCode::UNAUTHORIZED,
-                                axum::Json(json!({"error": "unauthorized"})),
-                            );
-                        }
-                        if path != "/_clients/admin" {
-                            return (
-                                StatusCode::NOT_FOUND,
-                                axum::Json(json!({"error": "not found"})),
-                            );
-                        }
-                        if method == "GET" {
-                            let mut gets = me.gets.lock().unwrap();
-                            let body = if gets.len() > 1 {
-                                gets.remove(0)
-                            } else {
-                                gets[0].clone()
-                            };
-                            return (StatusCode::OK, axum::Json(body));
-                        }
-                        if let Some(status) = *me.post_page.lock().unwrap() {
-                            return (status, axum::Json(Value::Null));
-                        }
-                        let (status, body) = me.post.lock().unwrap().clone();
-                        (status, axum::Json(body))
-                    }
-                })
-            }
-        }
-
-        /// A fake metrics proxy: `/m/<metric>/api/v1/query` answers that
-        /// metric's series; anything else is a missing route.
-        #[derive(Clone, Default)]
-        struct FakeMetrics {
-            series: Arc<Mutex<BTreeMap<&'static str, Vec<Value>>>>,
-            /// Routes that answer 500, as a failed query would.
-            failing: Arc<Mutex<Vec<String>>>,
-            log: Log,
-        }
-
-        impl FakeMetrics {
-            fn set(&self, metric: &'static str, series: Vec<Value>) {
-                self.series.lock().unwrap().insert(metric, series);
-            }
-
-            fn router(&self) -> Router {
-                let me = self.clone();
-                Router::new().fallback(move |req: Request| {
-                    let me = me.clone();
-                    async move {
-                        let path = req.uri().path().to_string();
-                        me.log.lock().unwrap().push((req.method().to_string(), req.uri().to_string(), String::new()));
-                        let metric = path.strip_prefix("/m/").and_then(|p| p.strip_suffix("/api/v1/query"));
-                        let Some(metric) = metric else {
-                            return (StatusCode::BAD_REQUEST, axum::Json(json!({"error": "missing route"})));
-                        };
-                        if me.failing.lock().unwrap().iter().any(|f| f == metric) {
-                            return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": "query failed"})));
-                        }
-                        let series = me.series.lock().unwrap().get(metric).cloned().unwrap_or_default();
-                        (StatusCode::OK, axum::Json(json!({"status": "success", "data": {"resultType": "vector", "result": series}})))
-                    }
-                })
-            }
-        }
-
-        fn series(labels: &[(&str, &str)], value: &str) -> Value {
-            let metric: serde_json::Map<String, Value> = labels
-                .iter()
-                .map(|(k, v)| (k.to_string(), json!(v)))
-                .collect();
-            json!({"metric": metric, "value": [1_791_698_400.0, value]})
-        }
-
-        /// k3s pods, each `(pod, up, [set hashes])`.
-        fn k3s(metrics: &FakeMetrics, pods: &[(&str, &str, &[&str])]) {
-            metrics.set(
-                "up",
-                pods.iter()
-                    .map(|(p, up, _)| series(&[("stack", "k3s"), ("pod", p)], up))
-                    .collect(),
-            );
-            metrics.set(
-                "anthropic_client_store_restrictions",
-                pods.iter()
-                    .flat_map(|(p, _, hashes)| {
-                        hashes.iter().map(move |h| {
-                            series(&[("stack", "k3s"), ("pod", p), ("set_hash", h)], "1")
-                        })
-                    })
-                    .collect(),
-            );
-        }
+        use crate::testkit::{FakeMetrics, FakeStore, Log, STORE_TOKEN, T0, World, k3s, series};
+        use serde_json::json;
 
         async fn store_state(
             store: &FakeStore,
@@ -3997,6 +3773,8 @@ mod tests {
                 let sink = form(&[
                     ("csrf", &csrf),
                     ("action", "disable"),
+                    ("op", "delete"),
+                    ("confirm_signal", "write anyway"),
                     ("name", "acme"),
                     ("reason", "test"),
                     ("expected_version", "1"),
@@ -4304,6 +4082,8 @@ mod tests {
                 html.contains("named no stacks, so nothing can be confirmed"),
                 "{html}"
             );
+            // Its own reason, not filed under an unreadable part.
+            assert!(!html.contains("served part is unreadable"), "{html}");
             assert!(!html.contains(">in effect<"), "{html}");
         }
 
@@ -4360,6 +4140,1174 @@ mod tests {
             let (_, html) =
                 get_page(&state, &session_cookie_header(&state, &sess), "/lb/clients").await;
             assert!(html.contains("module not configured"), "{html}");
+        }
+
+        // ─── Document ops ───────────────────────────────────────────────────
+
+        use crate::testkit::{V0, k3s_documents, quiet_fleet};
+
+        /// A dry run's answer: the store's diff and CF's state.
+        fn dry_run(diff: serde_json::Value) -> serde_json::Value {
+            json!({"status": 200, "dry_run": true, "diff": diff, "cf": {"report": null, "complete": null, "running": true}, "errors": []})
+        }
+
+        /// A commit's answer at `version` with digest `digest`, and its keys.
+        fn committed(version: u64, digest: &str, keys: serde_json::Value) -> serde_json::Value {
+            json!({"status": 200, "version": version, "digest": digest, "diff": [], "keys": keys})
+        }
+
+        /// A key the store minted for `client`, and the key itself.
+        fn minted(client: &str) -> (serde_json::Value, String) {
+            use sha2::Digest;
+            // 32 bytes, base64url, as the store mints them; built here so no
+            // key-shaped literal sits in the source.
+            let key = {
+                use base64::Engine;
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32])
+            };
+            assert_eq!(key.len(), 43);
+            let digest = effect::hex(&sha2::Sha256::digest(key.as_bytes()));
+            let id = format!("k{}", &digest[..7]);
+            (
+                json!({"client": client, "id": id, "key": key, "digest": digest}),
+                key,
+            )
+        }
+
+        const D1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        const D2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+        fn store_alert(metrics: &FakeMetrics, pod: &str, alert: &str) {
+            metrics.set(
+                "anthropic_client_store_alert",
+                vec![series(
+                    &[("stack", "k3s"), ("pod", pod), ("alert", alert)],
+                    "1",
+                )],
+            );
+        }
+
+        fn doc_form(csrf: &str, pairs: &[(&str, &str)]) -> String {
+            let v0 = V0.to_string();
+            let mut all = vec![
+                ("csrf", csrf),
+                ("expected_version", v0.as_str()),
+                ("reason", "test"),
+            ];
+            all.extend_from_slice(pairs);
+            form(&all)
+        }
+
+        #[tokio::test]
+        async fn a_document_op_previews_as_a_dry_run_pinned_to_the_page_version() {
+            let store = FakeStore::new(&World::new(vec![]));
+            store.answer_post(
+                StatusCode::OK,
+                dry_run(json!([{"client": "acme", "change": "policy", "field": "daily_budget", "from": 600_000_000, "to": 700_000_000}])),
+            );
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/preview",
+                doc_form(
+                    &csrf,
+                    &[
+                        ("op", "update"),
+                        ("name", "acme"),
+                        ("daily_budget", "700000000"),
+                        ("utilization_limit", "0.9"),
+                        ("models", "claude-*"),
+                    ],
+                ),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let html = body_string(resp).await;
+            assert_eq!(
+                store.posts(),
+                [json!({"document": {
+                    "expected_version": V0, "actor": "ops@example.test", "reason": "test", "dry_run": true,
+                    "ops": [{"op": "update", "name": "acme", "daily_budget": 700_000_000, "utilization_limit": 0.9,
+                             "models": ["claude-*"], "preferred_endpoints": []}]
+                }})]
+            );
+            assert!(
+                html.contains("acme: daily_budget 600000000 → 700000000"),
+                "{html}"
+            );
+            // The commit form carries the op and the same pinned version.
+            assert!(html.contains("action=\"/lb/clients/commit\""), "{html}");
+            assert!(
+                html.contains(&format!("name=\"expected_version\" value=\"{V0}\"")),
+                "{html}"
+            );
+            assert!(
+                html.contains("name=\"daily_budget\" value=\"700000000\""),
+                "{html}"
+            );
+            // A preview commits nothing.
+            assert!(
+                !state
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .committed
+                    .render()
+                    .contains("ops_console_committed_document{")
+            );
+        }
+
+        #[tokio::test]
+        async fn an_empty_diff_offers_nothing_to_commit() {
+            let store = FakeStore::new(&World::new(vec![]));
+            store.answer_post(StatusCode::OK, dry_run(json!([])));
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/preview",
+                doc_form(&csrf, &[("op", "update"), ("name", "acme")]),
+            )
+            .await;
+            let html = body_string(resp).await;
+            assert!(html.contains("Nothing would change"), "{html}");
+            assert!(!html.contains("action=\"/lb/clients/commit\""), "{html}");
+        }
+
+        /// create, update, delete and revoke_key: each commits as a document
+        /// op, exports its document as committed, and goes on to confirm it.
+        #[tokio::test]
+        async fn document_ops_commit_and_export_the_committed_document() {
+            let revoke = "a".repeat(64);
+            let cases: [(&[(&str, &str)], serde_json::Value); 4] = [
+                (
+                    &[("op", "create"), ("name", "beta"), ("daily_budget", "5")],
+                    json!({"op": "create", "name": "beta", "daily_budget": 5, "utilization_limit": null, "models": [], "preferred_endpoints": []}),
+                ),
+                (
+                    &[
+                        ("op", "update"),
+                        ("name", "acme"),
+                        ("utilization_limit", "1"),
+                    ],
+                    json!({"op": "update", "name": "acme", "daily_budget": null, "utilization_limit": 1.0, "models": [], "preferred_endpoints": []}),
+                ),
+                (
+                    &[("op", "delete"), ("name", "acme")],
+                    json!({"op": "delete", "name": "acme"}),
+                ),
+                (
+                    &[("op", "revoke_key"), ("digest", revoke.as_str())],
+                    json!({"op": "revoke_key", "digest": revoke}),
+                ),
+            ];
+            for (fields, op) in cases {
+                let store = FakeStore::new(&World::new(vec![]));
+                store.answer_post(StatusCode::OK, committed(V0 + 1, D1, json!([])));
+                let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
+                let (cookie, csrf) = cookie_for(&state, "admin-sub");
+                let resp = post_form(
+                    &state,
+                    &cookie,
+                    "/lb/clients/commit",
+                    doc_form(&csrf, fields),
+                )
+                .await;
+                assert_eq!(resp.status(), StatusCode::SEE_OTHER, "{op}");
+                assert!(
+                    location(&resp)
+                        .starts_with(&format!("/lb/clients/effect?doc={}.{D1}&at=", V0 + 1)),
+                    "{}",
+                    location(&resp)
+                );
+                let posted = store.posts();
+                assert_eq!(posted.len(), 1, "{op}");
+                assert_eq!(posted[0]["document"]["ops"], json!([op]));
+                assert_eq!(posted[0]["document"]["dry_run"], json!(false));
+                assert_eq!(posted[0]["document"]["expected_version"], json!(V0));
+                let text = state.store.as_ref().unwrap().committed.render();
+                assert!(
+                    text.contains(&format!(
+                        "ops_console_committed_document{{version=\"{}\",digest=\"{D1}\"}}",
+                        V0 + 1
+                    )),
+                    "{text}"
+                );
+            }
+        }
+
+        /// The minted key is shown once: on the commit's own answer, sent
+        /// `no-store`, with no flash cookie, and never in any log line.
+        #[tokio::test]
+        async fn add_key_shows_the_key_once_never_cached_flashed_or_logged() {
+            let store = FakeStore::new(&World::new(vec![]));
+            let (k, key) = minted("acme");
+            store.answer_post(StatusCode::OK, committed(V0 + 1, D1, json!([k])));
+            let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let buf = testlog::LogBuf::default();
+            let _guard = buf.capture();
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/commit",
+                doc_form(
+                    &csrf,
+                    &[
+                        ("op", "add_key"),
+                        ("name", "acme"),
+                        ("label", "2026-10 rotation"),
+                    ],
+                ),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store"
+            );
+            assert!(
+                resp.headers()
+                    .get_all(header::SET_COOKIE)
+                    .iter()
+                    .all(|c| !c.to_str().unwrap().starts_with(session::FLASH_COOKIE)),
+                "no flash cookie on the key page"
+            );
+            assert!(resp.headers().get(header::LOCATION).is_none());
+            let html = body_string(resp).await;
+            assert!(html.contains(&key), "{html}");
+            assert!(html.contains("1Password"), "{html}");
+            assert!(
+                html.contains(&format!("/lb/clients/effect?doc={}.{D1}", V0 + 1)),
+                "{html}"
+            );
+            assert_eq!(
+                store.posts()[0]["document"]["ops"],
+                json!([{"op": "add_key", "name": "acme", "label": "2026-10 rotation"}])
+            );
+            // Logged, with the key's id and digest, but never the key.
+            let logged = buf.text();
+            assert!(logged.contains("client-store write committed"), "{logged}");
+            assert!(
+                logged.contains(&k["id"].as_str().unwrap().to_string()),
+                "{logged}"
+            );
+            assert!(!logged.contains(&key), "{logged}");
+        }
+
+        /// Reloading the key page re-sends the commit with the version the
+        /// preview pinned: the store answers 409, the console re-reads it,
+        /// and no second key is minted or shown.
+        #[tokio::test]
+        async fn a_resubmitted_key_page_gets_409_and_mints_nothing() {
+            let mut moved = World::new(vec![]);
+            moved.doc = (V0 + 1, D1.into());
+            let store = FakeStore::new(&moved);
+            let (k, key) = minted("acme");
+            store.answer_posts(vec![
+                (StatusCode::OK, committed(V0 + 1, D1, json!([k]))),
+                (
+                    StatusCode::CONFLICT,
+                    json!({"status": 409, "errors": [{"code": "version.stale", "message": format!("the store is at version {}, not {V0}", V0 + 1), "version": V0 + 1}]}),
+                ),
+            ]);
+            let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let body = doc_form(&csrf, &[("op", "add_key"), ("name", "acme"), ("label", "")]);
+            let first = post_form(&state, &cookie, "/lb/clients/commit", body.clone()).await;
+            assert_eq!(first.status(), StatusCode::OK);
+            let gets_before = store
+                .requests()
+                .iter()
+                .filter(|(m, _, _)| m == "GET")
+                .count();
+            let again = post_form(&state, &cookie, "/lb/clients/commit", body).await;
+            assert_eq!(again.status(), StatusCode::SEE_OTHER);
+            assert_eq!(location(&again), "/lb/clients");
+            let flash = flash_of(&state, &again);
+            assert!(flash.msg.contains("version.stale"), "{}", flash.msg);
+            assert!(
+                flash.msg.contains("If the form was sent twice"),
+                "{}",
+                flash.msg
+            );
+            assert!(
+                flash.msg.contains(&format!(
+                    "Re-read the store: it is at document version {}",
+                    V0 + 1
+                )),
+                "{}",
+                flash.msg
+            );
+            assert!(!flash.msg.contains(&key));
+            assert!(!body_string(again).await.contains(&key));
+            // Both carried the pinned version; the re-read happened.
+            assert!(
+                store
+                    .posts()
+                    .iter()
+                    .all(|p| p["document"]["expected_version"] == json!(V0))
+            );
+            assert!(
+                store
+                    .requests()
+                    .iter()
+                    .filter(|(m, _, _)| m == "GET")
+                    .count()
+                    > gets_before
+            );
+        }
+
+        /// An instance reporting the store edited or behind puts a typed
+        /// confirmation in front of every document write, revoke_key
+        /// included; typed, the write goes.
+        #[tokio::test]
+        async fn a_store_alert_needs_a_typed_confirmation_on_document_writes() {
+            let digest = "a".repeat(64);
+            for alert in ["store_edited", "store_behind"] {
+                let store = FakeStore::new(&World::new(vec![]));
+                store.answer_posts(vec![
+                    (
+                        StatusCode::OK,
+                        dry_run(json!([{"change": "digest revoked", "digest": digest}])),
+                    ),
+                    (StatusCode::OK, committed(V0 + 1, D1, json!([]))),
+                ]);
+                let metrics = FakeMetrics::default();
+                store_alert(&metrics, "lb-a", alert);
+                let state = store_state(&store, &metrics, &["admin-sub"]).await;
+                let (cookie, csrf) = cookie_for(&state, "admin-sub");
+                let fields = [("op", "revoke_key"), ("digest", digest.as_str())];
+                let resp = post_form(
+                    &state,
+                    &cookie,
+                    "/lb/clients/preview",
+                    doc_form(&csrf, &fields),
+                )
+                .await;
+                let html = body_string(resp).await;
+                assert!(html.contains(&format!("k3s/lb-a ({alert})")), "{html}");
+                assert!(html.contains("name=\"confirm_signal\""), "{html}");
+                // Not typed: refused before sending, on the write log.
+                let buf = testlog::LogBuf::default();
+                let guard = buf.capture();
+                let resp = post_form(
+                    &state,
+                    &cookie,
+                    "/lb/clients/commit",
+                    doc_form(&csrf, &fields),
+                )
+                .await;
+                drop(guard);
+                assert_eq!(location(&resp), "/lb/clients");
+                assert!(flash_of(&state, &resp).msg.contains("write anyway"));
+                assert_eq!(store.posts().len(), 1, "only the dry run was sent");
+                assert!(
+                    buf.text()
+                        .contains("client-store write refused before sending")
+                );
+                // Typed: sent.
+                let mut typed = fields.to_vec();
+                typed.push(("confirm_signal", "write anyway"));
+                let resp = post_form(
+                    &state,
+                    &cookie,
+                    "/lb/clients/commit",
+                    doc_form(&csrf, &typed),
+                )
+                .await;
+                assert!(
+                    location(&resp).starts_with("/lb/clients/effect?doc="),
+                    "{}",
+                    location(&resp)
+                );
+                assert_eq!(store.posts().len(), 2);
+            }
+        }
+
+        /// A metrics store that cannot answer refuses a `restore`, which needs
+        /// its record of what was installed, and asks for the typed
+        /// confirmation on every other document write: whether an instance
+        /// reports the store edited cannot be told. Typed, the write goes.
+        #[tokio::test]
+        async fn a_dark_metrics_store_refuses_restore_and_asks_to_confirm_the_rest() {
+            let mut world = World::new(vec![]);
+            world.history = vec![(V0, "0".repeat(64)), (V0 - 5, D1.into())];
+            let store = FakeStore::new(&world);
+            store.answer_post(StatusCode::OK, committed(V0 + 1, D1, json!([])));
+            let mut config = test_config();
+            config.lb = Some(config::LbConfig {
+                url: "http://127.0.0.1:1".parse().unwrap(),
+                api_key: LB_KEY.into(),
+                metrics_url: "http://127.0.0.1:1".parse().unwrap(),
+            });
+            config.store = Some(config::StoreConfig {
+                url: fake_upstream(store.router()).await.parse().unwrap(),
+                token: STORE_TOKEN.into(),
+                metrics_addr: "127.0.0.1:0".into(),
+            });
+            let state = AppState::new(config);
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let delete = [("op", "delete"), ("name", "acme")];
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/commit",
+                doc_form(&csrf, &delete),
+            )
+            .await;
+            let msg = flash_of(&state, &resp).msg;
+            assert!(
+                msg.contains("cannot be told") && msg.contains("write anyway"),
+                "{msg}"
+            );
+            assert!(store.posts().is_empty());
+            let mut typed = delete.to_vec();
+            typed.push(("confirm_signal", "write anyway"));
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/commit",
+                doc_form(&csrf, &typed),
+            )
+            .await;
+            assert!(
+                location(&resp).starts_with("/lb/clients/effect?doc="),
+                "{}",
+                location(&resp)
+            );
+            assert_eq!(store.posts().len(), 1);
+            let v = (V0 - 5).to_string();
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/commit",
+                doc_form(
+                    &csrf,
+                    &[
+                        ("op", "restore"),
+                        ("version", &v),
+                        ("expected_digest", D1),
+                        ("confirm_version", &v),
+                        ("confirm_signal", "write anyway"),
+                    ],
+                ),
+            )
+            .await;
+            assert_eq!(location(&resp), "/lb/clients");
+            let msg = flash_of(&state, &resp).msg;
+            assert!(msg.contains("cannot be checked, so it is refused"), "{msg}");
+            assert_eq!(store.posts().len(), 1, "the restore was never sent");
+        }
+
+        /// Every reader exports its alerts raised or not, so one that is up
+        /// and exports none is a broken read: the signal cannot be told, and
+        /// the preview asks for the confirmation.
+        #[tokio::test]
+        async fn a_reader_exporting_no_alerts_leaves_the_signal_unknown() {
+            let store = FakeStore::new(&World::new(vec![]));
+            store.answer_post(
+                StatusCode::OK,
+                dry_run(json!([{"client": "acme", "change": "deleted"}])),
+            );
+            let metrics = quiet_fleet();
+            let mut up = metrics.series.lock().unwrap()["up"].clone();
+            up.push(series(&[("stack", "k3s"), ("pod", "lb-b")], "1"));
+            metrics.set("up", up);
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/preview",
+                doc_form(&csrf, &[("op", "delete"), ("name", "acme")]),
+            )
+            .await;
+            let html = body_string(resp).await;
+            assert!(
+                html.contains("export no store_behind or store_edited series (k3s/lb-b)"),
+                "{html}"
+            );
+            assert!(html.contains("name=\"confirm_signal\""), "{html}");
+            // The pane says so too.
+            let (_, html) = get_page(&state, &cookie, "/lb/clients").await;
+            assert!(
+                html.contains("Store behind or edited alerts unreadable"),
+                "{html}"
+            );
+        }
+
+        /// A preview is rendered only from a dry run's answer. An answer that
+        /// carries a version or keys is a write nobody confirmed: logged,
+        /// and reported as an unknown outcome with no key shown.
+        #[tokio::test]
+        async fn a_preview_answered_as_a_commit_is_an_unknown_outcome() {
+            let (k, key) = minted("acme");
+            // No dry-run mark, or one beside a version and keys: a commit.
+            let mut marked = committed(V0 + 1, D1, json!([k.clone()]));
+            marked["dry_run"] = json!(true);
+            for answer in [committed(V0 + 1, D1, json!([k])), marked] {
+                let store = FakeStore::new(&World::new(vec![]));
+                store.answer_post(StatusCode::OK, answer);
+                let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
+                let (cookie, csrf) = cookie_for(&state, "admin-sub");
+                let buf = testlog::LogBuf::default();
+                let guard = buf.capture();
+                let resp = post_form(
+                    &state,
+                    &cookie,
+                    "/lb/clients/preview",
+                    doc_form(&csrf, &[("op", "add_key"), ("name", "acme")]),
+                )
+                .await;
+                drop(guard);
+                assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+                let msg = flash_of(&state, &resp).msg;
+                assert!(
+                    msg.contains("answered the preview as if it were a commit"),
+                    "{msg}"
+                );
+                assert!(msg.contains("its key was never shown"), "{msg}");
+                assert!(!msg.contains(&key));
+                let logged = buf.text();
+                assert!(logged.contains("client-store write committed"), "{logged}");
+                assert!(!logged.contains(&key), "{logged}");
+            }
+        }
+
+        /// A restore's commit is checked on the digest its preview named, the
+        /// one it sends back for the store to bind the commit to: installed
+        /// with that digest, it goes; installed with another, it is refused;
+        /// with no install on record, its version must be typed; with no
+        /// record at all, or no digest, it is refused.
+        #[tokio::test]
+        async fn restore_is_checked_against_what_instances_installed() {
+            let old = V0 - 5;
+            let pair = |v: u64, d: &str| series(&[("version", &v.to_string()), ("digest", d)], "2");
+            let run = |installed: Vec<serde_json::Value>,
+                       digest: Option<&'static str>,
+                       typed: bool| async move {
+                let store = FakeStore::new(&World::new(vec![]));
+                store.answer_post(StatusCode::OK, committed(V0 + 1, D2, json!([])));
+                let metrics = quiet_fleet();
+                metrics.set_30d("anthropic_client_store_document", installed);
+                let state = store_state(&store, &metrics, &["admin-sub"]).await;
+                let (cookie, csrf) = cookie_for(&state, "admin-sub");
+                let v = old.to_string();
+                let mut fields = vec![("op", "restore"), ("version", v.as_str())];
+                fields.extend(digest.map(|d| ("expected_digest", d)));
+                if typed {
+                    fields.push(("confirm_version", v.as_str()));
+                }
+                let resp = post_form(
+                    &state,
+                    &cookie,
+                    "/lb/clients/commit",
+                    doc_form(&csrf, &fields),
+                )
+                .await;
+                let posts = store.posts();
+                let to = location(&resp).to_string();
+                let msg = if to == "/lb/clients" {
+                    flash_of(&state, &resp).msg
+                } else {
+                    String::new()
+                };
+                (posts, msg)
+            };
+            // Installed with the digest the preview named: sent, bound to it.
+            let (posts, _) = run(
+                vec![pair(old, D1), pair(V0, &"0".repeat(64))],
+                Some(D1),
+                false,
+            )
+            .await;
+            assert_eq!(
+                posts[0]["document"]["ops"],
+                json!([{"op": "restore", "version": old, "expected_digest": D1}])
+            );
+            // Installed with another digest: refused, typed or not.
+            let (posts, msg) = run(vec![pair(old, D2)], Some(D1), true).await;
+            assert!(
+                posts.is_empty() && msg.contains("edited after the fact"),
+                "{msg}"
+            );
+            // No install on record: the version must be typed.
+            let (posts, msg) = run(vec![pair(V0, &"0".repeat(64))], Some(D1), false).await;
+            assert!(
+                posts.is_empty() && msg.contains(&format!("type {old} to confirm")),
+                "{msg}"
+            );
+            let (posts, _) = run(vec![pair(V0, &"0".repeat(64))], Some(D1), true).await;
+            assert_eq!(posts.len(), 1);
+            // An empty record is unknown: refused.
+            let (posts, msg) = run(vec![], Some(D1), true).await;
+            assert!(
+                posts.is_empty() && msg.contains("reads as unknown"),
+                "{msg}"
+            );
+            // A restore naming no row digest did not come from its preview.
+            let (posts, msg) = run(vec![pair(old, D1)], None, true).await;
+            assert!(
+                posts.is_empty() && msg.contains("names no row digest"),
+                "{msg}"
+            );
+        }
+
+        /// The store refuses a restore whose row changed since its preview:
+        /// the console says so and re-reads the store.
+        #[tokio::test]
+        async fn a_restore_whose_row_changed_since_its_preview_is_refused() {
+            let old = V0 - 5;
+            let store = FakeStore::new(&World::new(vec![]));
+            store.answer_post(
+                StatusCode::CONFLICT,
+                json!({"status": 409, "errors": [{"code": "restore.changed", "message": format!("history's version {old} no longer holds the document with digest {D1}"), "digest": D2}]}),
+            );
+            let metrics = quiet_fleet();
+            metrics.set_30d(
+                "anthropic_client_store_document",
+                vec![series(
+                    &[("version", &old.to_string()), ("digest", D1)],
+                    "1",
+                )],
+            );
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let v = old.to_string();
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/commit",
+                doc_form(
+                    &csrf,
+                    &[("op", "restore"), ("version", &v), ("expected_digest", D1)],
+                ),
+            )
+            .await;
+            let msg = flash_of(&state, &resp).msg;
+            assert!(msg.contains("restore.changed"), "{msg}");
+            assert!(
+                msg.contains(&format!(
+                    "Re-read the store: it is at document version {V0}"
+                )),
+                "{msg}"
+            );
+            assert!(
+                !state
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .committed
+                    .render()
+                    .contains("ops_console_committed_document{")
+            );
+        }
+
+        /// The preview checks the row the store's dry run names, carries its
+        /// digest into the commit form, and offers no commit where the check
+        /// refuses or the store named no digest.
+        #[tokio::test]
+        async fn the_restore_preview_checks_the_row_its_dry_run_names() {
+            let old = V0 - 5;
+            let store = FakeStore::new(&World::new(vec![]));
+            let mut named = dry_run(json!([{"client": "acme", "change": "deleted"}]));
+            named["restore_digest"] = json!(D1);
+            store.answer_post(StatusCode::OK, named);
+            let metrics = quiet_fleet();
+            metrics.set_30d(
+                "anthropic_client_store_document",
+                vec![series(
+                    &[("version", &old.to_string()), ("digest", D2)],
+                    "1",
+                )],
+            );
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let v = old.to_string();
+            let preview = || {
+                post_form(
+                    &state,
+                    &cookie,
+                    "/lb/clients/preview",
+                    doc_form(&csrf, &[("op", "restore"), ("version", &v)]),
+                )
+            };
+            // Installed with another digest: refused, no commit form.
+            let html = body_string(preview().await).await;
+            assert!(html.contains("edited after the fact"), "{html}");
+            assert!(!html.contains("action=\"/lb/clients/commit\""), "{html}");
+            // Not on record: the version to type, and the digest carried.
+            metrics.set_30d(
+                "anthropic_client_store_document",
+                vec![series(
+                    &[("version", &V0.to_string()), ("digest", &"0".repeat(64))],
+                    "1",
+                )],
+            );
+            let html = body_string(preview().await).await;
+            assert!(html.contains("name=\"confirm_version\""), "{html}");
+            assert!(
+                html.contains("no instance installed it in the last 30 days"),
+                "{html}"
+            );
+            assert!(
+                html.contains(&format!("name=\"expected_digest\" value=\"{D1}\"")),
+                "{html}"
+            );
+            // The dry run was sent with no digest: it is what names one.
+            assert_eq!(
+                store.posts()[0]["document"]["ops"],
+                json!([{"op": "restore", "version": old}])
+            );
+            // A store whose dry run names no digest: no commit form at all.
+            store.answer_post(
+                StatusCode::OK,
+                dry_run(json!([{"client": "acme", "change": "deleted"}])),
+            );
+            let html = body_string(preview().await).await;
+            assert!(
+                html.contains("cannot be bound to the row it restores"),
+                "{html}"
+            );
+            assert!(!html.contains("action=\"/lb/clients/commit\""), "{html}");
+        }
+
+        /// A preview from a stale page gets 409: the console re-reads the
+        /// store and says what it holds now.
+        #[tokio::test]
+        async fn a_409_on_a_preview_re_reads_the_store() {
+            let mut moved = World::new(vec![]);
+            moved.doc = (V0 + 3, D1.into());
+            let store = FakeStore::new(&moved);
+            store.answer_post(
+                StatusCode::CONFLICT,
+                json!({"status": 409, "dry_run": true, "errors": [{"code": "version.stale", "message": format!("the store is at version {}, not {V0}", V0 + 3), "version": V0 + 3}]}),
+            );
+            let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/preview",
+                doc_form(&csrf, &[("op", "delete"), ("name", "acme")]),
+            )
+            .await;
+            assert_eq!(location(&resp), "/lb/clients");
+            let msg = flash_of(&state, &resp).msg;
+            assert!(
+                msg.contains("The store refused the preview (409): version.stale"),
+                "{msg}"
+            );
+            assert!(
+                msg.contains(&format!(
+                    "Re-read the store: it is at document version {}",
+                    V0 + 3
+                )),
+                "{msg}"
+            );
+            let requests = store.requests();
+            let post_at = requests.iter().position(|(m, _, _)| m == "POST").unwrap();
+            assert!(
+                requests[post_at + 1..].iter().any(|(m, _, _)| m == "GET"),
+                "{requests:?}"
+            );
+        }
+
+        /// A name a delete or a restore drops that a stack's TOML still holds
+        /// goes back to its TOML policy there: the preview says so, naming
+        /// CF by the store's name for it.
+        #[tokio::test]
+        async fn delete_and_restore_previews_warn_on_a_name_still_in_a_stacks_toml() {
+            let old = V0 - 5;
+            let mut world = World::new(vec![]);
+            world.history = vec![(V0, "0".repeat(64)), (old, D1.into())];
+            let metrics = quiet_fleet();
+            metrics.set(
+                "anthropic_client_store_toml_client",
+                vec![
+                    series(
+                        &[("stack", "k3s"), ("pod", "lb-a"), ("client", "acme")],
+                        "1",
+                    ),
+                    series(
+                        &[
+                            ("stack", "cloudflare"),
+                            ("instance", "edge:443"),
+                            ("client", "acme"),
+                        ],
+                        "1",
+                    ),
+                    series(
+                        &[("stack", "k3s"), ("pod", "lb-a"), ("client", "other")],
+                        "1",
+                    ),
+                ],
+            );
+            metrics.set_30d(
+                "anthropic_client_store_document",
+                vec![series(
+                    &[("version", &old.to_string()), ("digest", D1)],
+                    "1",
+                )],
+            );
+            let v = old.to_string();
+            for fields in [
+                vec![("op", "delete"), ("name", "acme")],
+                vec![("op", "restore"), ("version", v.as_str())],
+            ] {
+                let store = FakeStore::new(&world);
+                let mut answer = dry_run(json!([{"client": "acme", "change": "deleted"}]));
+                answer["restore_digest"] = json!(D1);
+                store.answer_post(StatusCode::OK, answer);
+                let state = store_state(&store, &metrics, &["admin-sub"]).await;
+                let (cookie, csrf) = cookie_for(&state, "admin-sub");
+                let resp = post_form(
+                    &state,
+                    &cookie,
+                    "/lb/clients/preview",
+                    doc_form(&csrf, &fields),
+                )
+                .await;
+                let html = body_string(resp).await;
+                assert!(
+                    html.contains("acme is still in the TOML of cf, k3s: on those stacks it goes back to its TOML policy and keys."),
+                    "{html}"
+                );
+                assert!(!html.contains("other is still"), "{html}");
+            }
+        }
+
+        /// No 5xx proves nothing was written: a document write answered with
+        /// one is an unknown outcome, re-read, with nothing exported.
+        #[tokio::test]
+        async fn a_5xx_on_a_document_write_is_an_unknown_outcome() {
+            let store = FakeStore::new(&World::new(vec![]));
+            store.answer_post(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"status": 503, "errors": [{"code": "store.unavailable", "message": "ClientStore or Revocations could not answer"}]}),
+            );
+            let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/commit",
+                doc_form(&csrf, &[("op", "add_key"), ("name", "acme")]),
+            )
+            .await;
+            let msg = flash_of(&state, &resp).msg;
+            assert!(
+                msg.contains("Whether the write applied is unknown"),
+                "{msg}"
+            );
+            assert!(msg.contains("its key was never shown"), "{msg}");
+            assert!(
+                msg.contains(&format!(
+                    "Re-read the store: it is at document version {V0}"
+                )),
+                "{msg}"
+            );
+            assert!(
+                !state
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .committed
+                    .render()
+                    .contains("ops_console_committed_document{")
+            );
+        }
+
+        /// The same for restriction ops: any 5xx, whatever its code.
+        #[tokio::test]
+        async fn any_5xx_on_a_restriction_op_is_an_unknown_outcome() {
+            let store = FakeStore::new(&World::new(vec![]));
+            store.answer_post(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"status": 500, "errors": [{"code": "internal", "message": "boom"}]}),
+            );
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/restrict",
+                form(&[
+                    ("csrf", &csrf),
+                    ("action", "disable"),
+                    ("name", "acme"),
+                    ("reason", "x"),
+                ]),
+            )
+            .await;
+            let msg = flash_of(&state, &resp).msg;
+            assert!(
+                msg.contains("Whether the request applied is unknown"),
+                "{msg}"
+            );
+            assert!(!msg.contains("refused"), "{msg}");
+            assert!(
+                !state
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .committed
+                    .render()
+                    .contains("ops_console_committed_record{")
+            );
+        }
+
+        /// A result that does not answer the op sent in its place confirms
+        /// nothing and exports nothing.
+        #[tokio::test]
+        async fn a_result_naming_another_op_confirms_nothing() {
+            let store = FakeStore::new(&World::new(vec![]));
+            store.answer_post(
+                StatusCode::OK,
+                json!({"status": 200, "results": [{"name": "other", "state": "disabled", "version": T0, "written": true}], "records_version": T0}),
+            );
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/restrict",
+                form(&[
+                    ("csrf", &csrf),
+                    ("action", "disable"),
+                    ("name", "acme"),
+                    ("reason", "x"),
+                ]),
+            )
+            .await;
+            let msg = flash_of(&state, &resp).msg;
+            assert!(msg.contains("could not be read"), "{msg}");
+            assert!(
+                msg.contains("disabled other for an op on disabled acme"),
+                "{msg}"
+            );
+            assert!(
+                !state
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .committed
+                    .render()
+                    .contains("ops_console_committed_record{")
+            );
+        }
+
+        /// A document is in effect on a stack once every instance holds its
+        /// digest; a later write supersedes it.
+        #[tokio::test]
+        async fn the_effect_page_confirms_a_document_by_its_digest() {
+            let mut world = World::new(vec![]).cf_caught_up();
+            world.doc = (V0, D1.into());
+            world.cf_digest = Some(D1.into());
+            let metrics = FakeMetrics::default();
+            let h = world.set_hash();
+            k3s(&metrics, &[("lb-a", "1", &[&h]), ("lb-b", "1", &[&h])]);
+            k3s_documents(&metrics, &[("lb-a", &[D1]), ("lb-b", &[D2])]);
+            let store = FakeStore::new(&world);
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, _) = cookie_for(&state, "admin-sub");
+            let uri = format!(
+                "/lb/clients/effect?doc={V0}.{D1}&at={}",
+                session::now_epoch()
+            );
+            let resp = app(state.clone())
+                .oneshot(
+                    HttpRequest::get(&uri)
+                        .header(header::COOKIE, cookie.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.headers().get(header::REFRESH).unwrap(), "5");
+            let html = body_string(resp).await;
+            assert_eq!(html.matches(">in effect<").count(), 1, "{html}");
+            assert!(html.contains("lb-b holds another document"), "{html}");
+            // Every pod caught up: both stacks in effect.
+            k3s_documents(&metrics, &[("lb-a", &[D1]), ("lb-b", &[D1])]);
+            let (_, html) = get_page(&state, &cookie, &uri).await;
+            assert_eq!(html.matches(">in effect<").count(), 2, "{html}");
+            // The store moved on: superseded, and the page stops refreshing.
+            let mut later = world.clone();
+            later.doc = (V0 + 7, D2.into());
+            store.answer_gets(&[&later]);
+            let resp = app(state.clone())
+                .oneshot(
+                    HttpRequest::get(&uri)
+                        .header(header::COOKIE, cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(resp.headers().get(header::REFRESH).is_none());
+            let html = body_string(resp).await;
+            assert!(
+                html.contains(">superseded<") && !html.contains(">in effect<"),
+                "{html}"
+            );
+        }
+
+        /// The clients page shows each stack's hold on the served document,
+        /// and every document op as a form pinned to the version it read.
+        #[tokio::test]
+        async fn the_clients_page_offers_every_document_op_pinned_to_its_version() {
+            let mut world = World::new(vec![]).cf_caught_up();
+            world.cf_digest = Some("0".repeat(64));
+            let store = FakeStore::new(&world);
+            let metrics = FakeMetrics::default();
+            let h = world.set_hash();
+            k3s(&metrics, &[("lb-a", "1", &[&h])]);
+            k3s_documents(&metrics, &[("lb-a", &["0".repeat(64).as_str()])]);
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, _) = cookie_for(&state, "admin-sub");
+            let (_, html) = get_page(&state, &cookie, "/lb/clients").await;
+            // Restrictions and document, on both stacks.
+            assert_eq!(html.matches(">in effect<").count(), 4, "{html}");
+            for op in ["create", "update", "delete", "add_key", "revoke_key"] {
+                assert!(
+                    html.contains(&format!("name=\"op\" value=\"{op}\"")),
+                    "{op}: {html}"
+                );
+            }
+            assert!(
+                html.contains(&format!("name=\"expected_version\" value=\"{V0}\"")),
+                "{html}"
+            );
+            assert!(html.contains("k7f3a2c1 2026-10"), "{html}");
+            assert!(html.contains("href=\"/lb/clients/history\""), "{html}");
+        }
+
+        #[tokio::test]
+        async fn the_history_view_lists_rows_with_restore_forms() {
+            let mut world = World::new(vec![]);
+            world.history = vec![(V0, "0".repeat(64)), (V0 - 5, D1.into())];
+            world.history_versions = vec![V0 - 9, V0 - 5, V0];
+            let store = FakeStore::new(&world);
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, _) = cookie_for(&state, "admin-sub");
+            let (status, html) = get_page(&state, &cookie, "/lb/clients/history").await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(html.contains(">current<"), "{html}");
+            assert!(html.contains("111111111111…"), "{html}");
+            assert!(
+                html.contains(&format!("name=\"version\" value=\"{}\"", V0 - 5)),
+                "{html}"
+            );
+            assert!(
+                !html.contains(&format!("name=\"version\" value=\"{V0}\"")),
+                "the current version has no restore"
+            );
+            assert!(html.contains("1 older versions in history"), "{html}");
+            assert!(html.contains(&(V0 - 9).to_string()), "{html}");
+            assert!(html.contains("acme: daily_budget 1 → 2"), "{html}");
+
+            // A document whose digest is unreadable still shows its history,
+            // and offers no restore.
+            let mut edited = world.clone();
+            edited.doc = (V0, "not a digest".into());
+            store.answer_gets(&[&edited]);
+            let (_, html) = get_page(&state, &cookie, "/lb/clients/history").await;
+            assert!(html.contains("is unreadable"), "{html}");
+            assert!(html.contains("111111111111…"), "{html}");
+            assert!(!html.contains("name=\"version\""), "{html}");
+        }
+
+        /// A stack the metrics store lists that the store does not count
+        /// leaves every stack judged from the metrics store unknown.
+        #[tokio::test]
+        async fn readers_of_a_stack_the_store_does_not_count_make_metrics_stacks_unknown() {
+            let world = World::new(vec![("acme", RecordState::Disabled, T0)]).cf_caught_up();
+            let store = FakeStore::new(&world);
+            let metrics = FakeMetrics::default();
+            let h = world.set_hash();
+            k3s(&metrics, &[("lb-a", "1", &[&h])]);
+            let mut up = metrics.series.lock().unwrap()["up"].clone();
+            up.push(series(&[("stack", "mem"), ("pod", "lb-m")], "1"));
+            metrics.set("up", up);
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, _) = cookie_for(&state, "admin-sub");
+            let (_, html) = get_page(&state, &cookie, "/lb/clients").await;
+            assert!(
+                html.contains("stacks the store does not count (mem)"),
+                "{html}"
+            );
+            // CF still confirms its restrictions from its report.
+            assert!(html.contains(">in effect<"), "{html}");
+        }
+
+        /// Every write route re-checks the subject, the memory curation ones
+        /// included: a subject removed from the allowlist writes nothing.
+        #[tokio::test]
+        async fn every_write_route_rechecks_the_subject() {
+            let (h1, h2) = ("1".repeat(64), "2".repeat(64));
+            let alaya = Log::default();
+            let store = FakeStore::new(&World::new(vec![]));
+            let mut config = test_config();
+            config.alaya_url = fake_upstream(recorder(&alaya)).await.parse().unwrap();
+            config.lb = Some(config::LbConfig {
+                url: "http://127.0.0.1:1".parse().unwrap(),
+                api_key: LB_KEY.into(),
+                metrics_url: "http://127.0.0.1:1".parse().unwrap(),
+            });
+            config.store = Some(config::StoreConfig {
+                url: fake_upstream(store.router()).await.parse().unwrap(),
+                token: STORE_TOKEN.into(),
+                metrics_addr: "127.0.0.1:0".into(),
+            });
+            let state = AppState::new(config);
+            let mut checked = 0;
+            for (route, _) in routes() {
+                if route == "/auth/logout" {
+                    continue;
+                }
+                let path = route.replace("{hash}", &h1);
+                let (cookie, csrf) = cookie_for(&state, "removed-sub");
+                let pair = format!("{h1}:{h2}");
+                let body = form(&[
+                    ("csrf", &csrf),
+                    ("action", "disable"),
+                    ("op", "delete"),
+                    ("name", "acme"),
+                    ("reason", "x"),
+                    ("expected_version", "1"),
+                    ("old_hash", &h1),
+                    ("new_hash", &h2),
+                    ("hash", &h1),
+                    ("content_hash", &h1),
+                    ("target_hash", &h2),
+                    ("relation_type", "RELATES_TO"),
+                    ("memory_a_hash", &h1),
+                    ("memory_b_hash", &h2),
+                    ("canonical_hash", &h1),
+                    ("duplicate_hashes", &h2),
+                    ("pair", &pair),
+                    ("content", "x"),
+                ]);
+                let resp = post_form(&state, &cookie, &path, body).await;
+                if resp.status() == StatusCode::METHOD_NOT_ALLOWED {
+                    continue;
+                }
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{route}");
+                checked += 1;
+            }
+            // Ten memory-curation writes and three client-store writes.
+            assert!(checked >= 13, "only {checked} write routes were driven");
+            assert!(
+                alaya.lock().unwrap().is_empty(),
+                "{:?}",
+                alaya.lock().unwrap()
+            );
+            assert!(store.requests().is_empty(), "{:?}", store.requests());
         }
     }
 }

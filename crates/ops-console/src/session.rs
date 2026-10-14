@@ -198,10 +198,44 @@ pub fn flash_cookie(jar: PrivateCookieJar, f: &Flash, secure: bool) -> PrivateCo
     jar.add(base_cookie(FLASH_COOKIE, value, secure, 120))
 }
 
-/// Ceiling on a flash message, in characters. The flash rides an encrypted
-/// cookie, and a cookie over the browser's ~4 KiB limit is dropped silently,
-/// taking the message with it.
-const MAX_FLASH_CHARS: usize = 1500;
+/// Ceiling on a flash message as the cookie carries it: the bytes of its
+/// JSON string, escapes included. The flash rides an encrypted cookie, and a
+/// cookie over the browser's ~4 KiB limit is dropped silently, taking the
+/// message with it. A message can quote upstream text, so a ceiling in
+/// characters is not enough: a quote costs two bytes in JSON, a control
+/// character six, a non-ASCII character up to four.
+const MAX_FLASH_BYTES: usize = 1800;
+
+/// `msg` as a flash carries it: control characters become spaces, and a
+/// message whose JSON string would pass `MAX_FLASH_BYTES` is cut there and
+/// marked with '…'.
+fn flash_text(msg: &str) -> String {
+    let cost = |c: char| {
+        if matches!(c, '"' | '\\') {
+            2
+        } else {
+            c.len_utf8()
+        }
+    };
+    let text: String = msg
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if text.chars().map(cost).sum::<usize>() <= MAX_FLASH_BYTES {
+        return text;
+    }
+    let mut out = String::new();
+    let mut size = 0;
+    for c in text.chars() {
+        if size + cost(c) > MAX_FLASH_BYTES - '…'.len_utf8() {
+            break;
+        }
+        size += cost(c);
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
 
 /// POST-redirect-GET with a one-shot banner: set the flash, then 303 to `to`.
 pub fn flash_redirect(
@@ -212,7 +246,7 @@ pub fn flash_redirect(
     to: &str,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let msg = crate::routes::clip(&msg, MAX_FLASH_CHARS);
+    let msg = flash_text(&msg);
     let jar = flash_cookie(
         jar,
         &Flash {
@@ -304,6 +338,49 @@ impl FromRequestParts<AppState> for Session {
 
 #[cfg(test)]
 mod tests {
+    /// The flash survives whatever text it quotes: under the browser's
+    /// cookie limit at its worst, as the real jar encodes it.
+    #[test]
+    fn a_flash_fits_the_cookie_limit_whatever_it_quotes() {
+        use axum::http::header::SET_COOKIE;
+        use axum_extra::extract::cookie::{Key, PrivateCookieJar};
+        let key = Key::from(&[7u8; 64][..]);
+        for (label, msg) in [
+            ("ascii", "a".repeat(10_000)),
+            ("quotes", "\"".repeat(10_000)),
+            ("backslashes", "\\".repeat(10_000)),
+            ("controls", "\u{1}".repeat(10_000)),
+            ("four-byte characters", "🔒".repeat(10_000)),
+        ] {
+            let resp = flash_redirect(PrivateCookieJar::new(key.clone()), true, "error", msg, "/");
+            let header = resp
+                .headers()
+                .get(SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                header.len() <= 4096,
+                "{label}: Set-Cookie is {} bytes",
+                header.len()
+            );
+        }
+        // Short text passes as it is, control characters aside.
+        assert_eq!(flash_text("plain \"quoted\""), "plain \"quoted\"");
+        assert_eq!(flash_text("a\nb\u{7}c"), "a b c");
+        let cut = flash_text(&"a".repeat(MAX_FLASH_BYTES + 1));
+        assert!(
+            cut.ends_with('…') && cut.len() <= MAX_FLASH_BYTES,
+            "{}",
+            cut.len()
+        );
+        assert_eq!(
+            flash_text(&"a".repeat(MAX_FLASH_BYTES)).len(),
+            MAX_FLASH_BYTES
+        );
+    }
+
     use super::*;
 
     #[test]
