@@ -105,10 +105,11 @@ pub async fn read(metrics: &MetricsClient) -> Fleet {
             .map(|s| format!("{} ({})", place(s), s.labels["alert"]))
             .collect::<BTreeSet<_>>()
     });
-    let heard = match (&up, &alerts) {
-        (Ok(up), Ok(alerts)) => heard(up, alerts),
+    let heard = |names: &[&str]| match (&up, &alerts) {
+        (Ok(up), Ok(alerts)) => heard(up, alerts, names),
         (Err(e), _) | (_, Err(e)) => Err(e.clone()),
     };
+    let (heard_behind, heard_store) = (heard(&["restrictions_behind"]), heard(&STORE_ALERTS));
     let docs = docs.map_err(err);
     let stacks = match (&up, sets, &behind) {
         (Ok(up), Ok(sets), Ok(behind)) => instances(up, &sets, docs, behind),
@@ -118,33 +119,43 @@ pub async fn read(metrics: &MetricsClient) -> Fleet {
     };
     Fleet {
         stacks,
-        behind: signal(behind, &heard),
-        store_alerts: signal(store_alerts, &heard),
+        behind: signal(behind, &heard_behind),
+        store_alerts: signal(store_alerts, &heard_store),
         unmatched: unmatched.map_err(err).map(|s| by_label(&s, "name")),
         toml: toml.map_err(err).map(|s| by_label(&s, "client")),
     }
 }
 
-/// Whether the alert read shows every instance's alerts. A reader exports
-/// each of its alerts, raised or not, so an instance that is up and exports
-/// none is a broken read, never a quiet instance; and with no instance up,
+/// Whether the alert read shows every instance's `names` alerts. A reader
+/// exports each of its alerts on every scrape, raised or not, so an instance
+/// that is up and exports none of one is not quiet but unheard: a broken
+/// read, or a reader that does not raise that alert. With no instance up,
 /// there is nothing to hear.
-fn heard(up: &[Series], alerts: &[Series]) -> Result<(), String> {
+fn heard(up: &[Series], alerts: &[Series], names: &[&str]) -> Result<(), String> {
     let live: BTreeSet<String> = up.iter().filter(|s| s.value == 1.0).map(place).collect();
     if live.is_empty() {
         return Err("the metrics store shows no reader that is up".into());
     }
-    let exporting: BTreeSet<String> = alerts.iter().map(place).collect();
+    let mut exporting: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+    for s in alerts {
+        if let Some(name) = s.labels.get("alert") {
+            exporting.entry(place(s)).or_default().insert(name.as_str());
+        }
+    }
     let silent: Vec<&str> = live
         .iter()
-        .filter(|i| !exporting.contains(*i))
+        .filter(|i| {
+            let heard = exporting.get(*i);
+            !names.iter().all(|n| heard.is_some_and(|h| h.contains(n)))
+        })
         .map(String::as_str)
         .collect();
     if silent.is_empty() {
         return Ok(());
     }
     Err(format!(
-        "readers that are up export no alert series ({}), so their alerts cannot be read",
+        "readers that are up export no {} series ({}), so they cannot be read",
+        names.join(" or "),
         clip(&silent.join(", "), 300)
     ))
 }
@@ -406,20 +417,33 @@ mod tests {
             series(&[("stack", "k3s"), ("pod", "lb-b")], 1.0),
             series(&[("stack", "k3s"), ("pod", "lb-down")], 0.0),
         ];
-        let quiet = |pod: &str| {
-            series(
-                &[("stack", "k3s"), ("pod", pod), ("alert", "store_edited")],
-                0.0,
-            )
+        let quiet = |pod: &str, alert: &str| {
+            series(&[("stack", "k3s"), ("pod", pod), ("alert", alert)], 0.0)
         };
-        assert_eq!(heard(&up, &[quiet("lb-a"), quiet("lb-b")]), Ok(()));
-        let err = heard(&up, &[quiet("lb-a")]).unwrap_err();
+        let both = |pod: &str| [quiet(pod, "store_edited"), quiet(pod, "store_behind")];
+        let all: Vec<Series> = both("lb-a").into_iter().chain(both("lb-b")).collect();
+        assert_eq!(heard(&up, &all, &STORE_ALERTS), Ok(()));
+        let err = heard(&up, &both("lb-a"), &STORE_ALERTS).unwrap_err();
         assert!(
             err.contains("k3s/lb-b") && !err.contains("lb-down"),
             "{err}"
         );
-        assert!(heard(&[], &[quiet("lb-a")]).is_err());
-        assert!(heard(&up[2..], &[]).is_err());
+        assert!(heard(&[], &both("lb-a"), &STORE_ALERTS).is_err());
+        assert!(heard(&up[2..], &[], &STORE_ALERTS).is_err());
+        // Heard per alert: a reader exporting restrictions_behind but not
+        // store_edited leaves the store signal unheard, and only it.
+        let partial: Vec<Series> = all
+            .iter()
+            .filter(|s| !(s.labels["pod"] == "lb-b" && s.labels["alert"] == "store_edited"))
+            .cloned()
+            .chain([
+                quiet("lb-a", "restrictions_behind"),
+                quiet("lb-b", "restrictions_behind"),
+            ])
+            .collect();
+        let err = heard(&up, &partial, &STORE_ALERTS).unwrap_err();
+        assert!(err.contains("k3s/lb-b"), "{err}");
+        assert_eq!(heard(&up, &partial, &["restrictions_behind"]), Ok(()));
 
         let none = Ok(BTreeSet::new());
         let some: Result<BTreeSet<String>, String> =

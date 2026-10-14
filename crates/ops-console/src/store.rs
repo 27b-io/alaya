@@ -93,8 +93,14 @@ pub enum DocOp {
     AddKey { name: String, label: String },
     /// Revokes a key for good, by its digest.
     RevokeKey { digest: String },
-    /// Returns the document to a version in history.
-    Restore { version: u64 },
+    /// Returns the document to a version in history. A commit names the
+    /// digest of the row its preview's dry run named, and the store refuses
+    /// the restore if that row changed since; a dry run names none.
+    Restore {
+        version: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expected_digest: Option<String>,
+    },
 }
 
 /// A client's policy. `None` is no budget or no ceiling; an empty list is
@@ -176,20 +182,18 @@ impl StoreClient {
         json_body("client store", req).await
     }
 
-    /// `POST /_clients/admin` with `{"restrictions": ops}`. Returns the store's
-    /// answer whatever its status, because 409, 422 and 503 each carry the
-    /// store's own account of what it refused, which the console shows.
-    pub async fn restrict(&self, ops: &[RestrictionOp]) -> Result<Answer, AppError> {
-        self.post(&json!({ "restrictions": ops })).await
-    }
-
-    /// `POST /_clients/admin` with `{"document": request}`, answered like
-    /// `restrict`. A commit's 200 may carry minted keys: see `loggable`.
+    /// `POST /_clients/admin` with `{"document": request}`: a document op,
+    /// the preview's dry run included.
     pub async fn document(&self, request: &DocRequest<'_>) -> Result<Answer, AppError> {
         self.post(&json!({ "document": request })).await
     }
 
-    async fn post(&self, body: &Value) -> Result<Answer, AppError> {
+    /// `POST /_clients/admin` with a whole request: `{"restrictions": ops}`
+    /// or `{"document": request}`. Returns the store's answer whatever its
+    /// status, because 409, 422 and 503 each carry the store's own account
+    /// of what it refused, which the console shows. A commit's 200 may carry
+    /// minted keys: see `loggable`.
+    pub async fn post(&self, body: &Value) -> Result<Answer, AppError> {
         let req = self
             .http
             .post(self.admin_url())
@@ -424,7 +428,14 @@ mod tests {
             DocOp::RevokeKey {
                 digest: "a".repeat(64),
             },
-            DocOp::Restore { version: 7 },
+            DocOp::Restore {
+                version: 7,
+                expected_digest: None,
+            },
+            DocOp::Restore {
+                version: 7,
+                expected_digest: Some("b".repeat(64)),
+            },
         ];
         let req = DocRequest {
             expected_version: 1_791_700_000_123,
@@ -446,7 +457,8 @@ mod tests {
                     {"op": "delete", "name": "acme"},
                     {"op": "add_key", "name": "acme", "label": "2026-10"},
                     {"op": "revoke_key", "digest": "a".repeat(64)},
-                    {"op": "restore", "version": 7}
+                    {"op": "restore", "version": 7},
+                    {"op": "restore", "version": 7, "expected_digest": "b".repeat(64)}
                 ]
             }})
         );

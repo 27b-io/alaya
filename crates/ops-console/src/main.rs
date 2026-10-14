@@ -4590,6 +4590,7 @@ mod tests {
                     &[
                         ("op", "restore"),
                         ("version", &v),
+                        ("expected_digest", D1),
                         ("confirm_version", &v),
                         ("confirm_signal", "write anyway"),
                     ],
@@ -4626,7 +4627,10 @@ mod tests {
             )
             .await;
             let html = body_string(resp).await;
-            assert!(html.contains("export no alert series (k3s/lb-b)"), "{html}");
+            assert!(
+                html.contains("export no store_behind or store_edited series (k3s/lb-b)"),
+                "{html}"
+            );
             assert!(html.contains("name=\"confirm_signal\""), "{html}");
             // The pane says so too.
             let (_, html) = get_page(&state, &cookie, "/lb/clients").await;
@@ -4674,105 +4678,145 @@ mod tests {
             }
         }
 
-        /// The restore row check: a row instances installed with its digest
-        /// goes; one installed with another digest is refused; one with no
-        /// install on record, or no digest shown, needs its version typed;
-        /// an empty record refuses.
+        /// A restore's commit is checked on the digest its preview named, the
+        /// one it sends back for the store to bind the commit to: installed
+        /// with that digest, it goes; installed with another, it is refused;
+        /// with no install on record, its version must be typed; with no
+        /// record at all, or no digest, it is refused.
         #[tokio::test]
         async fn restore_is_checked_against_what_instances_installed() {
             let old = V0 - 5;
-            let ancient = V0 - 9;
-            let mut world = World::new(vec![]);
-            world.history = vec![(V0, "0".repeat(64)), (old, D1.into())];
-            world.history_versions = vec![ancient, old, V0];
             let pair = |v: u64, d: &str| series(&[("version", &v.to_string()), ("digest", d)], "2");
-            let run = |installed: Vec<serde_json::Value>, version: u64, typed: Option<String>| {
-                let world = world.clone();
-                async move {
-                    let store = FakeStore::new(&world);
-                    store.answer_post(StatusCode::OK, committed(V0 + 1, D2, json!([])));
-                    let metrics = quiet_fleet();
-                    metrics.set_30d("anthropic_client_store_document", installed);
-                    let state = store_state(&store, &metrics, &["admin-sub"]).await;
-                    let (cookie, csrf) = cookie_for(&state, "admin-sub");
-                    let v = version.to_string();
-                    let mut fields = vec![("op", "restore"), ("version", v.as_str())];
-                    let typed = typed.unwrap_or_default();
-                    if !typed.is_empty() {
-                        fields.push(("confirm_version", typed.as_str()));
-                    }
-                    let resp = post_form(
-                        &state,
-                        &cookie,
-                        "/lb/clients/commit",
-                        doc_form(&csrf, &fields),
-                    )
-                    .await;
-                    let sent = store.posts().len() == 1;
-                    let to = location(&resp).to_string();
-                    let msg = if to == "/lb/clients" {
-                        flash_of(&state, &resp).msg
-                    } else {
-                        String::new()
-                    };
-                    (sent, msg)
+            let run = |installed: Vec<serde_json::Value>,
+                       digest: Option<&'static str>,
+                       typed: bool| async move {
+                let store = FakeStore::new(&World::new(vec![]));
+                store.answer_post(StatusCode::OK, committed(V0 + 1, D2, json!([])));
+                let metrics = quiet_fleet();
+                metrics.set_30d("anthropic_client_store_document", installed);
+                let state = store_state(&store, &metrics, &["admin-sub"]).await;
+                let (cookie, csrf) = cookie_for(&state, "admin-sub");
+                let v = old.to_string();
+                let mut fields = vec![("op", "restore"), ("version", v.as_str())];
+                fields.extend(digest.map(|d| ("expected_digest", d)));
+                if typed {
+                    fields.push(("confirm_version", v.as_str()));
                 }
+                let resp = post_form(
+                    &state,
+                    &cookie,
+                    "/lb/clients/commit",
+                    doc_form(&csrf, &fields),
+                )
+                .await;
+                let posts = store.posts();
+                let to = location(&resp).to_string();
+                let msg = if to == "/lb/clients" {
+                    flash_of(&state, &resp).msg
+                } else {
+                    String::new()
+                };
+                (posts, msg)
             };
-            // Installed with its digest: sent, nothing to type.
-            let (sent, _) = run(vec![pair(old, D1), pair(V0, &"0".repeat(64))], old, None).await;
-            assert!(sent);
-            // Installed with another digest: refused, typed or not.
-            let (sent, msg) = run(vec![pair(old, D2)], old, Some(old.to_string())).await;
-            assert!(!sent && msg.contains("edited after the fact"), "{msg}");
-            // No install on record: the version must be typed.
-            let (sent, msg) = run(vec![pair(V0, &"0".repeat(64))], old, None).await;
-            assert!(
-                !sent && msg.contains(&format!("type {old} to confirm")),
-                "{msg}"
-            );
-            let (sent, _) = run(vec![pair(V0, &"0".repeat(64))], old, Some(old.to_string())).await;
-            assert!(sent);
-            // A row older than the ones shown with a digest, and too old
-            // for the record of installs: the same.
-            let (sent, msg) = run(vec![pair(V0, &"0".repeat(64))], ancient, None).await;
-            assert!(
-                !sent
-                    && msg.contains("50 history rows")
-                    && msg.contains(&format!("type {ancient}")),
-                "{msg}"
-            );
-            let (sent, _) = run(
-                vec![pair(V0, &"0".repeat(64))],
-                ancient,
-                Some(ancient.to_string()),
+            // Installed with the digest the preview named: sent, bound to it.
+            let (posts, _) = run(
+                vec![pair(old, D1), pair(V0, &"0".repeat(64))],
+                Some(D1),
+                false,
             )
             .await;
-            assert!(sent);
-            // Such a row whose version IS on record cannot be compared with
-            // it: refused, typed or not.
-            let (sent, msg) =
-                run(vec![pair(ancient, D1)], ancient, Some(ancient.to_string())).await;
+            assert_eq!(
+                posts[0]["document"]["ops"],
+                json!([{"op": "restore", "version": old, "expected_digest": D1}])
+            );
+            // Installed with another digest: refused, typed or not.
+            let (posts, msg) = run(vec![pair(old, D2)], Some(D1), true).await;
             assert!(
-                !sent && msg.contains("cannot be checked against what was installed"),
+                posts.is_empty() && msg.contains("edited after the fact"),
                 "{msg}"
             );
+            // No install on record: the version must be typed.
+            let (posts, msg) = run(vec![pair(V0, &"0".repeat(64))], Some(D1), false).await;
+            assert!(
+                posts.is_empty() && msg.contains(&format!("type {old} to confirm")),
+                "{msg}"
+            );
+            let (posts, _) = run(vec![pair(V0, &"0".repeat(64))], Some(D1), true).await;
+            assert_eq!(posts.len(), 1);
             // An empty record is unknown: refused.
-            let (sent, msg) = run(vec![], old, Some(old.to_string())).await;
-            assert!(!sent && msg.contains("reads as unknown"), "{msg}");
+            let (posts, msg) = run(vec![], Some(D1), true).await;
+            assert!(
+                posts.is_empty() && msg.contains("reads as unknown"),
+                "{msg}"
+            );
+            // A restore naming no row digest did not come from its preview.
+            let (posts, msg) = run(vec![pair(old, D1)], None, true).await;
+            assert!(
+                posts.is_empty() && msg.contains("names no row digest"),
+                "{msg}"
+            );
         }
 
-        /// The preview shows the row check: refused with no commit form, or
-        /// the confirmation it needs.
+        /// The store refuses a restore whose row changed since its preview:
+        /// the console says so and re-reads the store.
         #[tokio::test]
-        async fn the_restore_preview_shows_the_row_check() {
+        async fn a_restore_whose_row_changed_since_its_preview_is_refused() {
             let old = V0 - 5;
-            let mut world = World::new(vec![]);
-            world.history = vec![(V0, "0".repeat(64)), (old, D1.into())];
-            let store = FakeStore::new(&world);
+            let store = FakeStore::new(&World::new(vec![]));
             store.answer_post(
-                StatusCode::OK,
-                dry_run(json!([{"client": "acme", "change": "deleted"}])),
+                StatusCode::CONFLICT,
+                json!({"status": 409, "errors": [{"code": "restore.changed", "message": format!("history's version {old} no longer holds the document with digest {D1}"), "digest": D2}]}),
             );
+            let metrics = quiet_fleet();
+            metrics.set_30d(
+                "anthropic_client_store_document",
+                vec![series(
+                    &[("version", &old.to_string()), ("digest", D1)],
+                    "1",
+                )],
+            );
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let v = old.to_string();
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/commit",
+                doc_form(
+                    &csrf,
+                    &[("op", "restore"), ("version", &v), ("expected_digest", D1)],
+                ),
+            )
+            .await;
+            let msg = flash_of(&state, &resp).msg;
+            assert!(msg.contains("restore.changed"), "{msg}");
+            assert!(
+                msg.contains(&format!(
+                    "Re-read the store: it is at document version {V0}"
+                )),
+                "{msg}"
+            );
+            assert!(
+                !state
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .committed
+                    .render()
+                    .contains("ops_console_committed_document{")
+            );
+        }
+
+        /// The preview checks the row the store's dry run names, carries its
+        /// digest into the commit form, and offers no commit where the check
+        /// refuses or the store named no digest.
+        #[tokio::test]
+        async fn the_restore_preview_checks_the_row_its_dry_run_names() {
+            let old = V0 - 5;
+            let store = FakeStore::new(&World::new(vec![]));
+            let mut named = dry_run(json!([{"client": "acme", "change": "deleted"}]));
+            named["restore_digest"] = json!(D1);
+            store.answer_post(StatusCode::OK, named);
             let metrics = quiet_fleet();
             metrics.set_30d(
                 "anthropic_client_store_document",
@@ -4784,16 +4828,19 @@ mod tests {
             let state = store_state(&store, &metrics, &["admin-sub"]).await;
             let (cookie, csrf) = cookie_for(&state, "admin-sub");
             let v = old.to_string();
-            let resp = post_form(
-                &state,
-                &cookie,
-                "/lb/clients/preview",
-                doc_form(&csrf, &[("op", "restore"), ("version", &v)]),
-            )
-            .await;
-            let html = body_string(resp).await;
+            let preview = || {
+                post_form(
+                    &state,
+                    &cookie,
+                    "/lb/clients/preview",
+                    doc_form(&csrf, &[("op", "restore"), ("version", &v)]),
+                )
+            };
+            // Installed with another digest: refused, no commit form.
+            let html = body_string(preview().await).await;
             assert!(html.contains("edited after the fact"), "{html}");
             assert!(!html.contains("action=\"/lb/clients/commit\""), "{html}");
+            // Not on record: the version to type, and the digest carried.
             metrics.set_30d(
                 "anthropic_client_store_document",
                 vec![series(
@@ -4801,18 +4848,72 @@ mod tests {
                     "1",
                 )],
             );
-            let resp = post_form(
-                &state,
-                &cookie,
-                "/lb/clients/preview",
-                doc_form(&csrf, &[("op", "restore"), ("version", &v)]),
-            )
-            .await;
-            let html = body_string(resp).await;
+            let html = body_string(preview().await).await;
             assert!(html.contains("name=\"confirm_version\""), "{html}");
             assert!(
                 html.contains("no instance installed it in the last 30 days"),
                 "{html}"
+            );
+            assert!(
+                html.contains(&format!("name=\"expected_digest\" value=\"{D1}\"")),
+                "{html}"
+            );
+            // The dry run was sent with no digest: it is what names one.
+            assert_eq!(
+                store.posts()[0]["document"]["ops"],
+                json!([{"op": "restore", "version": old}])
+            );
+            // A store whose dry run names no digest: no commit form at all.
+            store.answer_post(
+                StatusCode::OK,
+                dry_run(json!([{"client": "acme", "change": "deleted"}])),
+            );
+            let html = body_string(preview().await).await;
+            assert!(
+                html.contains("cannot be bound to the row it restores"),
+                "{html}"
+            );
+            assert!(!html.contains("action=\"/lb/clients/commit\""), "{html}");
+        }
+
+        /// A preview from a stale page gets 409: the console re-reads the
+        /// store and says what it holds now.
+        #[tokio::test]
+        async fn a_409_on_a_preview_re_reads_the_store() {
+            let mut moved = World::new(vec![]);
+            moved.doc = (V0 + 3, D1.into());
+            let store = FakeStore::new(&moved);
+            store.answer_post(
+                StatusCode::CONFLICT,
+                json!({"status": 409, "dry_run": true, "errors": [{"code": "version.stale", "message": format!("the store is at version {}, not {V0}", V0 + 3), "version": V0 + 3}]}),
+            );
+            let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/preview",
+                doc_form(&csrf, &[("op", "delete"), ("name", "acme")]),
+            )
+            .await;
+            assert_eq!(location(&resp), "/lb/clients");
+            let msg = flash_of(&state, &resp).msg;
+            assert!(
+                msg.contains("The store refused the preview (409): version.stale"),
+                "{msg}"
+            );
+            assert!(
+                msg.contains(&format!(
+                    "Re-read the store: it is at document version {}",
+                    V0 + 3
+                )),
+                "{msg}"
+            );
+            let requests = store.requests();
+            let post_at = requests.iter().position(|(m, _, _)| m == "POST").unwrap();
+            assert!(
+                requests[post_at + 1..].iter().any(|(m, _, _)| m == "GET"),
+                "{requests:?}"
             );
         }
 
@@ -4859,10 +4960,9 @@ mod tests {
                 vec![("op", "restore"), ("version", v.as_str())],
             ] {
                 let store = FakeStore::new(&world);
-                store.answer_post(
-                    StatusCode::OK,
-                    dry_run(json!([{"client": "acme", "change": "deleted"}])),
-                );
+                let mut answer = dry_run(json!([{"client": "acme", "change": "deleted"}]));
+                answer["restore_digest"] = json!(D1);
+                store.answer_post(StatusCode::OK, answer);
                 let state = store_state(&store, &metrics, &["admin-sub"]).await;
                 let (cookie, csrf) = cookie_for(&state, "admin-sub");
                 let resp = post_form(

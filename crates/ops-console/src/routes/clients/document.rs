@@ -32,17 +32,17 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    actor_of, clean_reason, effect_href, guard, not_configured, outcome_unknown, page_html,
-    refused_locally, write_log,
+    Outcome, actor_of, clean_reason, effect_href, guard, not_configured, outcome, page_html,
+    refused_locally, refused_text, send_recorded, store_of, write_log,
 };
 use crate::confirm::{self, Needed, RowCheck};
-use crate::effect::{Doc, is_hex64, is_name};
+use crate::effect::{self, Doc, is_hex64, is_name};
 use crate::error::AppError;
 use crate::fleet;
-use crate::routes::{clip, fmt_epoch, unavailable};
+use crate::routes::{clip, fmt_epoch, short_digest, unavailable};
 use crate::session::{Session, flash_redirect, take_flash};
 use crate::state::{AppState, StoreModule};
-use crate::store::{Commit, DocOp, DocRequest, Policy, commit_of, refusal_lines};
+use crate::store::{Commit, DocOp, DocRequest, Policy, commit_of};
 use crate::ui::*;
 
 /// The write log's kind for document ops.
@@ -75,6 +75,9 @@ pub struct DocForm {
     digest: String,
     #[serde(default)]
     version: String,
+    /// A restore's commit: the digest of the row its preview's dry run named.
+    #[serde(default)]
+    expected_digest: String,
     #[serde(default)]
     daily_budget: String,
     #[serde(default)]
@@ -147,6 +150,11 @@ fn parse(f: &DocForm) -> Result<(DocOp, u64, String), String> {
                 .ok()
                 .filter(|v| *v >= 1)
                 .ok_or("restore names a version in history.")?,
+            expected_digest: match f.expected_digest.trim() {
+                "" => None,
+                d if is_hex64(d) => Some(d.to_string()),
+                _ => return Err("A restore's row digest is 64 hex characters.".into()),
+            },
         },
         _ => return Err("Unknown document op.".into()),
     };
@@ -226,8 +234,13 @@ fn op_fields(op: &DocOp) -> Vec<(&'static str, String)> {
         DocOp::RevokeKey { digest } => {
             vec![("op", "revoke_key".into()), ("digest", digest.clone())]
         }
-        DocOp::Restore { version } => {
-            vec![("op", "restore".into()), ("version", version.to_string())]
+        DocOp::Restore {
+            version,
+            expected_digest,
+        } => {
+            let mut f = vec![("op", "restore".into()), ("version", version.to_string())];
+            f.extend(expected_digest.clone().map(|d| ("expected_digest", d)));
+            f
         }
     }
 }
@@ -238,8 +251,8 @@ fn op_title(op: &DocOp) -> String {
         DocOp::Update { name, .. } => format!("update {name}'s policy"),
         DocOp::Delete { name } => format!("delete {name}"),
         DocOp::AddKey { name, .. } => format!("add a key to {name}"),
-        DocOp::RevokeKey { digest } => format!("revoke key {}…", &digest[..12]),
-        DocOp::Restore { version } => format!("restore version {version}"),
+        DocOp::RevokeKey { digest } => format!("revoke key {}", short_digest(digest)),
+        DocOp::Restore { version, .. } => format!("restore version {version}"),
     }
 }
 
@@ -251,7 +264,6 @@ fn fmt_ms(v: u64) -> String {
 /// One line per change in a store diff, bounded.
 fn diff_lines(diff: &[Value]) -> Vec<String> {
     let s = |c: &Value, k: &str| c.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-    let short = |d: String| format!("{}…", clip(&d, 12).trim_end_matches('…'));
     let mut lines: Vec<String> = diff
         .iter()
         .take(MAX_DIFF_LINES)
@@ -268,7 +280,7 @@ fn diff_lines(diff: &[Value]) -> Vec<String> {
                 ),
                 "key added" => format!("{client}: key added {} ({})", s(c, "id"), s(c, "label")),
                 "key removed" => format!("{client}: key removed {}", s(c, "id")),
-                "digest revoked" => format!("digest revoked {}", short(s(c, "digest"))),
+                "digest revoked" => format!("digest revoked {}", short_digest(&s(c, "digest"))),
                 _ => c.to_string(),
             };
             clip(&line, 300)
@@ -305,12 +317,20 @@ struct Gate {
 
 async fn gate(m: &StoreModule, op: &DocOp) -> Gate {
     let restore = match op {
-        DocOp::Restore { version } => Some(*version),
+        DocOp::Restore {
+            version,
+            expected_digest,
+        } => Some((*version, expected_digest.clone())),
         _ => None,
     };
     let (fleet, check) = tokio::join!(fleet::read(&m.metrics), async {
-        match restore {
-            Some(v) => Some(restore_check(m, v).await),
+        match &restore {
+            Some((version, Some(digest))) => Some(restore_check(m, *version, digest).await),
+            Some((_, None)) => Some(Err(
+                "it names no row digest; a restore is sent only from its preview, which names the \
+                 row it restores"
+                    .to_string(),
+            )),
             None => None,
         }
     });
@@ -318,10 +338,11 @@ async fn gate(m: &StoreModule, op: &DocOp) -> Gate {
     let mut notes = Vec::new();
     let mut refused = None;
     needed.extend(confirm::for_signals(&fleet.store_alerts));
-    if let (Some(version), Some(check)) = (restore, check) {
+    if let (Some((version, _)), Some(check)) = (restore, check) {
         match check {
             Ok(RowCheck::Checked) => notes.push(format!(
-                "Version {version} checks out: instances installed it with its history row's digest."
+                "Version {version} checks out: instances installed it with the digest of the row \
+                 this restores."
             )),
             Ok(RowCheck::Unchecked(why)) => needed.push(Needed::Unchecked { version, why }),
             Ok(RowCheck::Refused(why)) => refused = Some(format!("The restore is refused: {why}.")),
@@ -340,13 +361,15 @@ async fn gate(m: &StoreModule, op: &DocOp) -> Gate {
     }
 }
 
-/// The `restore` row check, on a fresh read of the store's history and of
-/// the pairs instances installed.
-async fn restore_check(m: &StoreModule, version: u64) -> Result<RowCheck, String> {
-    let (store, installed) = tokio::join!(m.client.read(), fleet::installed(&m.metrics));
-    let store = store.map_err(|e| format!("the store could not be read ({})", e.detail()))?;
-    let installed = installed.map_err(|e| format!("the metrics store could not be read ({e})"))?;
-    confirm::row_check(version, &confirm::history_row(&store, version)?, &installed)
+/// The `restore` row check: the digest of the row the store restores,
+/// against the pairs instances installed. The digest is the one the store's
+/// own dry run named, and the commit sends it back, so the store refuses the
+/// restore if that row changes after this check.
+async fn restore_check(m: &StoreModule, version: u64, digest: &str) -> Result<RowCheck, String> {
+    let installed = fleet::installed(&m.metrics)
+        .await
+        .map_err(|e| format!("the metrics store could not be read ({e})"))?;
+    confirm::row_check(version, digest, &installed)
 }
 
 /// A name the write drops that is still in a stack's TOML goes back to its
@@ -392,11 +415,7 @@ pub async fn preview(
     jar: PrivateCookieJar,
     axum::Form(form): axum::Form<DocForm>,
 ) -> Result<Response, AppError> {
-    let Some(m) = state.store.as_ref() else {
-        return Err(AppError::NotFound(
-            "the client-store module is not configured".into(),
-        ));
-    };
+    let m = store_of(&state)?;
     guard(&state, &session, &form.csrf, DOCUMENT)?;
     let secure = state.secure_cookies();
     let back = |jar, msg: String| flash_redirect(jar, secure, "error", msg, "/lb/clients");
@@ -416,44 +435,67 @@ pub async fn preview(
         dry_run: true,
         ops: &ops,
     };
-    let answer = match m.client.document(&request).await {
-        Ok(a) => a,
-        Err(e) => return Ok(back(jar, format!("The preview failed: {}.", e.detail()))),
-    };
-    let op = &ops[0];
-    if answer.status != StatusCode::OK {
-        let what = if answer.status.is_client_error() {
-            "The store refused the preview"
-        } else {
-            "The preview failed"
-        };
-        let mut msg = format!(
-            "{what} ({}): {}.",
-            answer.status.as_u16(),
-            refusal_lines(&answer.body).join("; ")
-        );
-        if answer.status == StatusCode::CONFLICT {
-            msg.push_str(&doc_now(m).await);
-        }
-        return Ok(back(jar, msg));
-    }
+    let answer = m.client.document(&request).await;
     // A preview is shown only for an answer that is a dry run's. One that
     // carries a version or keys is a commit: the store wrote something the
     // operator never confirmed, so it is logged and reported like any write
     // whose outcome is unknown.
-    let dry = answer.body.get("dry_run").and_then(Value::as_bool) == Some(true);
-    if !dry || answer.body.get("version").is_some() || answer.body.get("keys").is_some() {
+    let commit_like = |body: &Value| {
+        body.get("dry_run").and_then(Value::as_bool) != Some(true)
+            || body.get("version").is_some()
+            || body.get("keys").is_some()
+    };
+    if let Ok(a) = &answer
+        && a.status == StatusCode::OK
+        && commit_like(&a.body)
+    {
         write_log(
             &session.sub,
             DOCUMENT,
             &json!({ "document": request }),
-            Ok(&answer),
+            Ok(a),
         );
         let why = "the store answered the preview as if it were a commit";
-        return Ok(back(jar, unknown(m, op, why).await));
+        return Ok(back(jar, unknown(m, &ops[0], why).await));
     }
-    let gate = gate(m, op).await;
-    let content = preview_view(op, expected, &reason, &answer.body, &gate, &session.csrf);
+    let body = match outcome(answer) {
+        Outcome::Committed(body) => body,
+        Outcome::Unknown(why) => return Ok(back(jar, format!("The preview failed: {why}."))),
+        Outcome::Refused { status, body } => {
+            let mut msg = refused_text("The store refused the preview", status, &body);
+            if status == StatusCode::CONFLICT {
+                msg.push_str(&doc_now(m).await);
+            }
+            return Ok(back(jar, msg));
+        }
+    };
+    // A restore commits only the row its preview showed: the digest the
+    // store's dry run names for that row rides the commit form, and the
+    // store refuses the commit if the row changed since.
+    let op = match &ops[0] {
+        DocOp::Restore { version, .. } => DocOp::Restore {
+            version: *version,
+            expected_digest: body
+                .get("restore_digest")
+                .and_then(Value::as_str)
+                .filter(|d| is_hex64(d))
+                .map(str::to_string),
+        },
+        op => op.clone(),
+    };
+    let mut gate = gate(m, &op).await;
+    if let DocOp::Restore {
+        expected_digest: None,
+        ..
+    } = op
+    {
+        gate.refused = Some(
+            "The restore cannot be bound to the row it restores: the store's dry run named no \
+             digest for that row, so it cannot refuse the row if it changes before the commit."
+                .into(),
+        );
+    }
+    let content = preview_view(&op, expected, &reason, &body, &gate, &session.csrf);
     Ok((jar, Html(page_html(&session, None, content))).into_response())
 }
 
@@ -562,11 +604,7 @@ pub async fn commit(
     jar: PrivateCookieJar,
     axum::Form(form): axum::Form<DocForm>,
 ) -> Result<Response, AppError> {
-    let Some(m) = state.store.as_ref() else {
-        return Err(AppError::NotFound(
-            "the client-store module is not configured".into(),
-        ));
-    };
+    let m = store_of(&state)?;
     guard(&state, &session, &form.csrf, DOCUMENT)?;
     let secure = state.secure_cookies();
     let back = |jar, msg: String| flash_redirect(jar, secure, "error", msg, "/lb/clients");
@@ -593,72 +631,50 @@ pub async fn commit(
     }
     let actor = actor_of(&session);
     let ops = [op];
-    // Sent and recorded in a task of its own: a write the store commits must
-    // reach the write log and the committed labels even when the operator's
-    // connection drops and this handler is dropped with it. The answer comes
-    // back here, minted keys included, and nowhere else.
-    let answer = {
-        let (m, sub, ops) = (m.clone(), session.sub.clone(), ops.clone());
-        tokio::spawn(async move {
-            let request = DocRequest {
-                expected_version: expected,
-                actor: &actor,
-                reason: &reason,
-                dry_run: false,
-                ops: &ops,
-            };
-            let answer = m.client.document(&request).await;
-            write_log(
-                &sub,
-                DOCUMENT,
-                &json!({ "document": request }),
-                answer.as_ref(),
-            );
-            let committed = answer.as_ref().ok().filter(|a| a.status == StatusCode::OK);
-            if let Some(Ok(c)) = committed.map(|a| commit_of(&a.body, &ops)) {
+    let request = DocRequest {
+        expected_version: expected,
+        actor: &actor,
+        reason: &reason,
+        dry_run: false,
+        ops: &ops,
+    };
+    // Exported as committed where it is sent. When the store follows a
+    // commit with a catch-up commit of its own (`merged_after_commit`), the
+    // answer carries the catch-up's version and digest, which readers
+    // converge on. The first is not exported: an instance that installed it
+    // in between raises the unmatched-install alert, which is the safe side.
+    let export = {
+        let ops = ops.clone();
+        move |m: &StoreModule, body: &Value| {
+            if let Ok(c) = commit_of(body, &ops) {
                 m.committed.document(c.version, &c.digest);
             }
-            answer
-        })
-        .await
-        .unwrap_or_else(|e| Err(AppError::Upstream(format!("the write's task failed ({e})"))))
+        }
     };
+    let body = json!({ "document": request });
+    let answer = send_recorded(m, &session.sub, DOCUMENT, body, export).await;
     let op = &ops[0];
-    let answer = match answer {
-        Ok(a) if !outcome_unknown(&a) => a,
-        Ok(a) => {
-            let why = format!(
-                "the store answered {}: {}",
-                a.status.as_u16(),
-                refusal_lines(&a.body).join("; ")
-            );
-            return Ok(back(jar, unknown(m, op, &why).await));
-        }
-        Err(e) => {
-            let why = format!("the store's answer was lost ({})", e.detail());
-            return Ok(back(jar, unknown(m, op, &why).await));
+    let body = match outcome(answer) {
+        Outcome::Committed(body) => body,
+        Outcome::Unknown(why) => return Ok(back(jar, unknown(m, op, &why).await)),
+        Outcome::Refused { status, body } => {
+            let mut msg = refused_text("The store refused the write", status, &body);
+            if status == StatusCode::CONFLICT {
+                // The page the form came from was stale, or the row a restore
+                // previewed has changed: say what the store holds now.
+                if matches!(op, DocOp::AddKey { .. }) {
+                    msg.push_str(
+                        " If the form was sent twice, the first send may have minted a key that \
+                         was never shown: compare the client's keys with the ones you hold, and \
+                         revoke any other.",
+                    );
+                }
+                msg.push_str(&doc_now(m).await);
+            }
+            return Ok(back(jar, msg));
         }
     };
-    if answer.status != StatusCode::OK {
-        let mut msg = format!(
-            "The store refused the write ({}): {}.",
-            answer.status.as_u16(),
-            refusal_lines(&answer.body).join("; ")
-        );
-        if answer.status == StatusCode::CONFLICT {
-            // The page the form came from was stale: say what the store holds.
-            if matches!(op, DocOp::AddKey { .. }) {
-                msg.push_str(
-                    " If the form was sent twice, the first send may have minted a key that was \
-                     never shown: compare the client's keys with the ones you hold, and revoke \
-                     any other.",
-                );
-            }
-            msg.push_str(&doc_now(m).await);
-        }
-        return Ok(back(jar, msg));
-    }
-    let c = match commit_of(&answer.body, &ops) {
+    let c = match commit_of(&body, &ops) {
         Ok(c) => c,
         Err(e) => {
             let mut msg = format!(
@@ -672,11 +688,6 @@ pub async fn commit(
             return Ok(back(jar, msg));
         }
     };
-    // Exported as committed where it was sent. When the store follows a
-    // commit with a catch-up commit of its own (`merged_after_commit`), the
-    // answer carries the catch-up's version and digest, which readers
-    // converge on. The first is not exported: an instance that installed it
-    // in between raises the unmatched-install alert, which is the safe side.
     let doc = Doc {
         version: c.version,
         digest: c.digest.clone(),
@@ -833,11 +844,7 @@ fn op_summary(op: &Value) -> String {
         .get("name")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .or_else(|| {
-            op.get("digest")
-                .and_then(Value::as_str)
-                .map(|d| format!("{}…", clip(d, 12).trim_end_matches('…')))
-        })
+        .or_else(|| op.get("digest").and_then(Value::as_str).map(short_digest))
         .or_else(|| {
             op.get("version")
                 .and_then(Value::as_u64)
@@ -857,7 +864,22 @@ fn history_view(store: &Value, csrf: &str) -> impl IntoView + use<> {
         }
         .into_any();
     };
-    let current = doc.get("version").and_then(Value::as_u64).unwrap_or(0);
+    // The version every restore form pins. Unreadable, or a store at no
+    // addressable version: the rows still show, and no form is offered.
+    let current = match effect::served_doc(store) {
+        Ok(Some(d)) => Some(d.version),
+        Ok(None) => None,
+        Err(e) => {
+            let why = format!(
+                "The store's document is unreadable ({}), so nothing can be restored.",
+                clip(&e, 160)
+            );
+            return view! {
+                <p class="text-sm"><span class=badge(BadgeKind::Destructive)>"unavailable"</span>" "{why}</p>
+            }
+            .into_any();
+        }
+    };
     let rows: Vec<Value> = doc
         .get("history")
         .and_then(Value::as_array)
@@ -886,7 +908,7 @@ fn history_view(store: &Value, csrf: &str) -> impl IntoView + use<> {
                 .map(|v| (fmt_ms(v), v.to_string()))
                 .unwrap_or_else(|| ("unreadable".into(), String::new()));
             let digest = s("digest", 64);
-            let short = format!("{}…", clip(&digest, 12).trim_end_matches('…'));
+            let short = short_digest(&digest);
             let who = format!("{} ({})", s("actor", 64), s("role", 16));
             let all_ops: Vec<String> = r
                 .get("ops")
@@ -903,10 +925,10 @@ fn history_view(store: &Value, csrf: &str) -> impl IntoView + use<> {
                 .into_iter()
                 .map(|l| view! { <li>{l}</li> })
                 .collect_view();
-            let action = match version {
-                Some(v) if v == current => view! { <span class=badge(BadgeKind::Success)>"current"</span> }.into_any(),
-                Some(v) => restore_form(csrf, current, v).into_any(),
-                None => view! { <span class="text-xs">"—"</span> }.into_any(),
+            let action = match (version, current) {
+                (Some(v), Some(c)) if v == c => view! { <span class=badge(BadgeKind::Success)>"current"</span> }.into_any(),
+                (Some(v), Some(c)) => restore_form(csrf, c, v).into_any(),
+                _ => view! { <span class="text-xs">"—"</span> }.into_any(),
             };
             let (at, reason) = (s("at", 40), s("reason", 200));
             view! {
@@ -930,23 +952,27 @@ fn history_view(store: &Value, csrf: &str) -> impl IntoView + use<> {
             .map(|v| v.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        let form = restore_by_version_form(csrf, current);
+        let form = current.map(|c| restore_by_version_form(csrf, c));
         view! {
             <details class="mt-6">
                 <summary class="text-sm cursor-pointer">{summary}</summary>
-                <p class="text-xs text-muted-foreground my-2">"The store shows a digest only for its 50 newest rows, so a restore of an older version cannot be checked against what instances installed: its preview asks you to type the version."</p>
+                <p class="text-xs text-muted-foreground my-2">"Rows past the 50 newest are listed by version only. A restore of one is checked like any other: its preview names the row's digest, and it is refused if instances installed that version with another digest."</p>
                 <p class="text-xs font-mono break-all mb-3">{list}</p>
                 {form}
             </details>
         }
     });
-    let title = format!("Document history (current version {current})");
+    let title = match current {
+        Some(c) => format!("Document history (current version {c})"),
+        None => "Document history (no document at an addressable version: nothing can be restored)"
+            .to_string(),
+    };
     view! {
         <Card>
             <CardHeader>
                 <CardTitle>{title}</CardTitle>
                 <CardDescription>
-                    "Every document the store committed, newest first, with what each changed. Restoring one previews the change first, and is refused if instances installed that version with another digest: its row was edited after the fact. Restore never brings back a revoked key. "
+                    "Every document the store committed, newest first, with what each changed. Restoring one previews the change first and commits only the row the preview showed. It is refused if instances installed that version with another digest, since the row was edited after the fact, and needs its version typed if no instance installed it in the last 30 days. Restore never brings back a revoked key. "
                     <a class="underline underline-offset-4" href="/lb/clients">"Back to LB clients"</a>
                 </CardDescription>
             </CardHeader>
@@ -1024,14 +1050,26 @@ pub(super) fn clients_card(store: &Value, csrf: &str) -> impl IntoView + use<> {
                 .into_any(),
         );
     };
-    let version = doc.get("version").and_then(Value::as_u64).unwrap_or(0);
-    if version == 0 {
-        return clients_shell(
-            "Clients".into(),
-            view! { <p class="text-sm">"The store holds no document at a version a write can address, so it takes no document op but the recovery ops: an import, or a point-in-time recovery."</p> }
-                .into_any(),
-        );
-    }
+    let version = match effect::served_doc(store) {
+        Ok(Some(d)) => d.version,
+        Ok(None) => {
+            return clients_shell(
+                "Clients".into(),
+                view! { <p class="text-sm">"The store holds no document at a version a write can address, so it takes no document op but the recovery ops: an import, or a point-in-time recovery."</p> }
+                    .into_any(),
+            );
+        }
+        Err(e) => {
+            let why = format!(
+                "The store's document is unreadable ({}), so document ops are unavailable. Restriction ops still work.",
+                clip(&e, 160)
+            );
+            return clients_shell(
+                "Clients".into(),
+                view! { <p class="text-sm">{why}</p> }.into_any(),
+            );
+        }
+    };
     let clients: Vec<Value> = doc
         .get("clients")
         .and_then(Value::as_array)
@@ -1246,7 +1284,7 @@ fn revoke_form(csrf: &str, version: u64, digest: &str) -> impl IntoView + use<> 
         <form method="post" action="/lb/clients/preview" class="flex items-center gap-1">
             {pinned(csrf, version, "revoke_key")}
             <input type="hidden" name="digest" value=digest />
-            <input class=INPUT_CLASS name="reason" required maxlength="200" placeholder="reason" />
+            {reason_input()}
             <button type="submit" class=btn_sm(Btn::Destructive)>"Revoke…"</button>
         </form>
     }
@@ -1300,6 +1338,7 @@ mod tests {
                 "label" => f.label = v,
                 "digest" => f.digest = v,
                 "version" => f.version = v,
+                "expected_digest" => f.expected_digest = v,
                 "daily_budget" => f.daily_budget = v,
                 "utilization_limit" => f.utilization_limit = v,
                 "models" => f.models = v,
@@ -1343,7 +1382,14 @@ mod tests {
             DocOp::RevokeKey {
                 digest: "a".repeat(64),
             },
-            DocOp::Restore { version: 9 },
+            DocOp::Restore {
+                version: 9,
+                expected_digest: None,
+            },
+            DocOp::Restore {
+                version: 9,
+                expected_digest: Some("c".repeat(64)),
+            },
         ];
         for op in ops {
             let mut pairs: Vec<(&str, String)> = op_fields(&op);
@@ -1394,6 +1440,14 @@ mod tests {
         assert!(with(&[("op", "delete"), ("name", "Bad Name")]).is_err());
         assert!(with(&[("op", "revoke_key"), ("digest", "abc")]).is_err());
         assert!(with(&[("op", "restore"), ("version", "0")]).is_err());
+        assert!(
+            with(&[
+                ("op", "restore"),
+                ("version", "9"),
+                ("expected_digest", "abc")
+            ])
+            .is_err()
+        );
         assert!(with(&[("op", "pitr")]).is_err());
         // No pinned version, or no reason: refused.
         assert!(ok(&[("op", "delete"), ("name", "acme"), ("reason", "x")]).is_err());

@@ -9,10 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::Value;
-
-use crate::effect::is_hex64;
-use crate::routes::clip;
+use crate::routes::{clip, short_digest};
 
 /// What the operator types to write while instances report the store
 /// behind or edited, or while that cannot be told.
@@ -87,38 +84,6 @@ pub fn missing<'a>(needed: &'a [Needed], typed: impl Fn(&str) -> &'a str) -> Opt
         .find(|n| typed(n.field()).trim() != n.phrase())
 }
 
-/// What a `GET` shows of the newest history row holding a version: the row
-/// a `restore` of that version reads.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Row {
-    Digest(String),
-    /// Shown, with no readable digest: only an edit leaves one.
-    Unreadable,
-    /// Not among the rows the store shows with a digest, its newest 50.
-    NotShown,
-}
-
-pub fn history_row(store: &Value, version: u64) -> Result<Row, String> {
-    let rows = store
-        .get("document")
-        .filter(|d| d.get("status").and_then(Value::as_str) == Some("ok"))
-        .ok_or("the document side of the store did not answer")?
-        .get("history")
-        .and_then(Value::as_array)
-        .ok_or("the store's history is unreadable")?;
-    let Some(row) = rows
-        .iter()
-        .find(|r| r.get("version").and_then(Value::as_u64) == Some(version))
-    else {
-        return Ok(Row::NotShown);
-    };
-    Ok(row
-        .get("digest")
-        .and_then(Value::as_str)
-        .filter(|d| is_hex64(d))
-        .map_or(Row::Unreadable, |d| Row::Digest(d.to_string())))
-}
-
 /// The `restore` row check's verdict on one history row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RowCheck {
@@ -127,20 +92,19 @@ pub enum RowCheck {
     /// No install of this version is on record: a typed confirmation, never
     /// a refusal.
     Unchecked(String),
-    /// The row cannot pass: this version was installed with another digest,
-    /// or was installed but its row cannot be compared.
+    /// This version was installed with another digest: the row was edited
+    /// after the fact.
     Refused(String),
 }
 
-/// Check a history row against every (version, digest) pair instances
-/// installed in the last 30 days. A row too old for that record needs a
-/// typed confirmation. A row whose version is on record must match it, so
-/// one the console cannot compare is refused. An empty record is unknown,
-/// never "no install": the metrics proxy answers a query outside its pin
-/// with an empty result, so the console refuses on it.
+/// Check the digest of the history row a `restore` would restore against
+/// every (version, digest) pair instances installed in the last 30 days. A
+/// row too old for that record needs a typed confirmation. An empty record
+/// is unknown, never "no install": the metrics proxy answers a query outside
+/// its pin with an empty result, so the console refuses on it.
 pub fn row_check(
     version: u64,
-    row: &Row,
+    digest: &str,
     installed: &BTreeMap<u64, BTreeSet<String>>,
 ) -> Result<RowCheck, String> {
     if installed.is_empty() {
@@ -150,30 +114,14 @@ pub fn row_check(
                 .into(),
         );
     }
-    let short = |d: &str| d.chars().take(12).collect::<String>();
-    Ok(match (row, installed.get(&version)) {
-        (Row::Unreadable, _) => RowCheck::Refused(
-            "its history row carries no readable digest, which only an edit leaves".into(),
-        ),
-        (Row::NotShown, Some(_)) => RowCheck::Refused(format!(
-            "version {version} was installed in the last 30 days, but the store shows a digest \
-             only for its 50 newest history rows, so this row cannot be checked against what was \
-             installed: restore a newer version, or recover to it with point-in-time recovery"
-        )),
-        (Row::NotShown, None) => RowCheck::Unchecked(
-            "it is older than the 30-day record of installs, and than the 50 history rows the \
-             store shows a digest for"
-                .into(),
-        ),
-        (Row::Digest(_), None) => {
-            RowCheck::Unchecked("no instance installed it in the last 30 days".into())
-        }
-        (Row::Digest(digest), Some(seen)) => match seen.iter().find(|d| *d != digest) {
+    Ok(match installed.get(&version) {
+        None => RowCheck::Unchecked("no instance installed it in the last 30 days".into()),
+        Some(seen) => match seen.iter().find(|d| *d != digest) {
             Some(other) => RowCheck::Refused(format!(
-                "version {version} was installed with digest {}…, but its history row now holds \
-                 {}…: the row was edited after the fact",
-                short(other),
-                short(digest)
+                "version {version} was installed with digest {}, but its history row now holds \
+                 {}: the row was edited after the fact",
+                short_digest(other),
+                short_digest(digest)
             )),
             None => RowCheck::Checked,
         },
@@ -183,7 +131,6 @@ pub fn row_check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     fn installed(pairs: &[(u64, &str)]) -> BTreeMap<u64, BTreeSet<String>> {
         let mut m: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
@@ -196,57 +143,24 @@ mod tests {
     #[test]
     fn the_row_check_follows_what_instances_installed() {
         let (d, e) = ("d".repeat(64), "e".repeat(64));
-        let (shown_d, shown_e) = (Row::Digest(d.clone()), Row::Digest(e.clone()));
         let seen = installed(&[(9, &d), (10, &e)]);
-        assert_eq!(row_check(9, &shown_d, &seen), Ok(RowCheck::Checked));
+        assert_eq!(row_check(9, &d, &seen), Ok(RowCheck::Checked));
         // Installed with another digest: edited after the fact.
-        let RowCheck::Refused(why) = row_check(10, &shown_d, &seen).unwrap() else {
+        let RowCheck::Refused(why) = row_check(10, &d, &seen).unwrap() else {
             panic!("an edited row must be refused");
         };
         assert!(why.contains("edited after the fact"), "{why}");
-        assert_eq!(row_check(10, &shown_e, &seen), Ok(RowCheck::Checked));
+        assert_eq!(row_check(10, &e, &seen), Ok(RowCheck::Checked));
         // Installed with its digest and another one too: still refused.
         let both = installed(&[(9, &d), (9, &e)]);
-        assert!(matches!(
-            row_check(9, &shown_d, &both),
-            Ok(RowCheck::Refused(_))
-        ));
+        assert!(matches!(row_check(9, &d, &both), Ok(RowCheck::Refused(_))));
         // No install on record: a typed confirmation.
         assert!(matches!(
-            row_check(3, &shown_d, &seen),
+            row_check(3, &d, &seen),
             Ok(RowCheck::Unchecked(_))
         ));
-        assert!(matches!(
-            row_check(3, &Row::NotShown, &seen),
-            Ok(RowCheck::Unchecked(_))
-        ));
-        // On record, but the row cannot be compared: refused, never typed
-        // through.
-        let RowCheck::Refused(why) = row_check(9, &Row::NotShown, &seen).unwrap() else {
-            panic!("a row on record that cannot be compared must be refused");
-        };
-        assert!(why.contains("50 newest"), "{why}");
-        assert!(matches!(
-            row_check(3, &Row::Unreadable, &seen),
-            Ok(RowCheck::Refused(_))
-        ));
-        // No install on record at all is unknown, whatever the row.
-        assert!(row_check(9, &shown_d, &BTreeMap::new()).is_err());
-        assert!(row_check(9, &Row::NotShown, &BTreeMap::new()).is_err());
-    }
-
-    #[test]
-    fn history_row_reads_the_newest_row_holding_the_version() {
-        let (d, e) = ("d".repeat(64), "e".repeat(64));
-        let get = json!({"document": {"status": "ok", "history": [
-            {"version": 9, "digest": d}, {"version": 9, "digest": e}, {"version": 8, "digest": "short"}
-        ]}});
-        assert_eq!(history_row(&get, 9), Ok(Row::Digest(d)));
-        assert_eq!(history_row(&get, 8), Ok(Row::Unreadable));
-        assert_eq!(history_row(&get, 7), Ok(Row::NotShown));
-        // A document side that did not answer is no answer, never "not shown".
-        assert!(history_row(&json!({"document": {"status": "unavailable"}}), 9).is_err());
-        assert!(history_row(&json!({"document": {"status": "ok"}}), 9).is_err());
+        // No install on record at all is unknown.
+        assert!(row_check(9, &d, &BTreeMap::new()).is_err());
     }
 
     #[test]

@@ -105,6 +105,12 @@ pub fn short_hash(hash: &str) -> String {
     hash.chars().take(12).collect()
 }
 
+/// A digest as a page or a message names it: its first 12 characters,
+/// marked as cut.
+pub fn short_digest(digest: &str) -> String {
+    format!("{}…", short_hash(digest))
+}
+
 /// `s` clipped to `max` chars, with `'…'` appended when anything was cut.
 ///
 /// Marked, because an unmarked cut renders as a complete-looking wrong value.

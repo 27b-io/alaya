@@ -465,16 +465,15 @@ fn stacks_card(
         .iter()
         .map(|(stack, sight)| {
             let restrictions = match part {
-                Ok(p) => effect::steady(effect::holds(p, sight), r.tag_stable),
+                Ok(p) => effect::steady(effect::holds(p, sight), r.tag_stable, effect::MOVED),
                 Err(e) => Verdict::Unknown(format!("the served part is unreadable: {e}")),
             };
             let held_doc = match doc {
-                Ok(Some(d)) => match effect::holds_doc(&d.digest, sight) {
-                    Verdict::InEffect if !r.doc_stable => {
-                        Verdict::Unknown(effect::DOC_MOVED.into())
-                    }
-                    v => v,
-                },
+                Ok(Some(d)) => effect::steady(
+                    effect::holds_doc(&d.digest, sight),
+                    r.doc_stable,
+                    effect::DOC_MOVED,
+                ),
                 Ok(None) => Verdict::Unknown("the store holds no document".into()),
                 Err(e) => Verdict::Unknown(e.clone()),
             };
@@ -856,11 +855,7 @@ pub async fn restrict(
     jar: PrivateCookieJar,
     axum_extra::extract::Form(form): axum_extra::extract::Form<RestrictForm>,
 ) -> Result<Response, AppError> {
-    let Some(m) = state.store.as_ref() else {
-        return Err(AppError::NotFound(
-            "the client-store module is not configured".into(),
-        ));
-    };
+    let m = store_of(&state)?;
     guard(&state, &session, &form.csrf, RESTRICTIONS)?;
     let secure = state.secure_cookies();
     let ops = match restriction_ops(&form, &actor_of(&session)) {
@@ -871,32 +866,89 @@ pub async fn restrict(
             return Ok(flash_redirect(jar, secure, "error", msg, "/lb/clients"));
         }
     };
-    // Sent and recorded in a task of its own: a write the store commits must
-    // reach the write log and the committed labels even when the operator's
-    // connection drops and this handler is dropped with it.
-    let answer = {
-        let (m, sub, ops) = (m.clone(), session.sub.clone(), ops.clone());
-        tokio::spawn(async move {
-            let answer = m.client.restrict(&ops).await;
-            write_log(
-                &sub,
-                RESTRICTIONS,
-                &json!({ "restrictions": ops }),
-                answer.as_ref(),
-            );
-            let committed = answer.as_ref().ok().filter(|a| a.status == StatusCode::OK);
-            if let Some(Ok(done)) = committed.map(|a| written_ops(&a.body, &ops)) {
-                for op in &done {
-                    m.committed.record(&op.name, op.version);
-                }
+    let export = {
+        let ops = ops.clone();
+        move |m: &StoreModule, body: &Value| {
+            for op in written_ops(body, &ops).unwrap_or_default() {
+                m.committed.record(&op.name, op.version);
             }
-            answer
-        })
-        .await
-        .unwrap_or_else(|e| Err(AppError::Upstream(format!("the write's task failed ({e})"))))
+        }
     };
+    let body = json!({ "restrictions": ops });
+    let answer = send_recorded(m, &session.sub, RESTRICTIONS, body, export).await;
     let (kind, msg, to) = restrict_outcome(m, &ops, answer).await;
     Ok(flash_redirect(jar, secure, kind, msg, &to))
+}
+
+/// The client-store module, or a 404 for a route of a module not configured.
+fn store_of(state: &AppState) -> Result<&StoreModule, AppError> {
+    state
+        .store
+        .as_ref()
+        .ok_or_else(|| AppError::NotFound("the client-store module is not configured".into()))
+}
+
+/// Send a write and record it, in a task of its own: a write the store
+/// commits must reach the write log and the committed labels even when the
+/// operator's connection drops and the handler is dropped with it. `export`
+/// runs on a 200's body and exports what it can read as committed. The
+/// answer, minted keys included, comes back to the handler and nowhere else.
+async fn send_recorded(
+    m: &StoreModule,
+    sub: &str,
+    kind: &'static str,
+    body: Value,
+    export: impl FnOnce(&StoreModule, &Value) + Send + 'static,
+) -> Result<Answer, AppError> {
+    let (m, sub) = (m.clone(), sub.to_string());
+    tokio::spawn(async move {
+        let answer = m.client.post(&body).await;
+        write_log(&sub, kind, &body, answer.as_ref());
+        if let Ok(a) = &answer
+            && a.status == StatusCode::OK
+        {
+            export(&m, &a.body);
+        }
+        answer
+    })
+    .await
+    .unwrap_or_else(|e| Err(AppError::Upstream(format!("the write's task failed ({e})"))))
+}
+
+/// How a write's answer reads, for every kind of write.
+enum Outcome {
+    /// Whether it applied is unknown: the answer was lost, or is one that no
+    /// refusal or commit gives (`outcome_unknown`). Why, in words.
+    Unknown(String),
+    /// A 4xx: the store refused, and wrote nothing.
+    Refused { status: StatusCode, body: Value },
+    /// A 200.
+    Committed(Value),
+}
+
+fn outcome(answer: Result<Answer, AppError>) -> Outcome {
+    match answer {
+        Err(e) => Outcome::Unknown(format!("the store's answer was lost ({})", e.detail())),
+        Ok(a) if outcome_unknown(&a) => Outcome::Unknown(format!(
+            "the store answered {}: {}",
+            a.status.as_u16(),
+            refusal_lines(&a.body).join("; ")
+        )),
+        Ok(a) if a.status == StatusCode::OK => Outcome::Committed(a.body),
+        Ok(a) => Outcome::Refused {
+            status: a.status,
+            body: a.body,
+        },
+    }
+}
+
+/// A refusal in words: what was refused, its status and the store's errors.
+fn refused_text(what: &str, status: StatusCode, body: &Value) -> String {
+    format!(
+        "{what} ({}): {}.",
+        status.as_u16(),
+        refusal_lines(body).join("; ")
+    )
 }
 
 /// The write log's kind for restriction ops.
@@ -960,62 +1012,48 @@ async fn restrict_outcome(
     answer: Result<Answer, AppError>,
 ) -> (&'static str, String, String) {
     let back = "/lb/clients".to_string();
-    let answer = match answer {
-        Ok(a) => a,
-        Err(e) => {
-            let why = format!("the store's answer was lost ({})", e.detail());
-            return ("error", unknown_outcome(m, ops, &why).await, back);
+    match outcome(answer) {
+        Outcome::Unknown(why) => ("error", unknown_outcome(m, ops, &why).await, back),
+        Outcome::Committed(body) => {
+            let done = match written_ops(&body, ops) {
+                Ok(done) => done,
+                Err(e) => {
+                    // Committed, but which records it wrote, at which versions,
+                    // is unreadable: nothing can be confirmed or exported.
+                    let mut msg = format!(
+                        "The store committed the request, but its answer could not be read \
+                         ({e}), so nothing is confirmed or exported as committed."
+                    );
+                    msg.push_str(&now_holds(m, ops).await);
+                    return ("error", msg, back);
+                }
+            };
+            let summary = done
+                .iter()
+                .map(|op| format!("{} {}", op.state.as_str(), op.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let msg = if summary.is_empty() {
+                "Nothing changed: every name was already in that state.".to_string()
+            } else {
+                format!("Committed: {summary}. Confirming on every stack…")
+            };
+            ("ok", msg, effect_href(&done, None))
         }
-    };
-    if outcome_unknown(&answer) {
-        let why = format!(
-            "the store answered {}: {}",
-            answer.status.as_u16(),
-            refusal_lines(&answer.body).join("; ")
-        );
-        return ("error", unknown_outcome(m, ops, &why).await, back);
-    }
-    if answer.status == StatusCode::OK {
-        let done = match written_ops(&answer.body, ops) {
-            Ok(done) => done,
-            Err(e) => {
-                // Committed, but which records it wrote, at which versions, is
-                // unreadable: nothing can be confirmed or exported as committed.
-                let mut msg = format!(
-                    "The store committed the request, but its answer could not be read ({e}), \
-                     so nothing is confirmed or exported as committed."
-                );
+        Outcome::Refused { status, body } => {
+            let mut msg = refused_text("The store refused the request", status, &body);
+            if status == StatusCode::CONFLICT {
+                // A 409 means the console's picture was stale: read the store
+                // again before reporting, and say what it holds now.
                 msg.push_str(&now_holds(m, ops).await);
-                return ("error", msg, back);
             }
-        };
-        let summary = done
-            .iter()
-            .map(|op| format!("{} {}", op.state.as_str(), op.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        if summary.is_empty() {
-            let msg = "Nothing changed: every name was already in that state.".to_string();
-            return ("ok", msg, effect_href(&done, None));
+            let to = match ops.last() {
+                Some(last) if has_code(&body, "disabled.cap") => back_to(last.name()),
+                _ => back,
+            };
+            ("error", msg, to)
         }
-        let msg = format!("Committed: {summary}. Confirming on every stack…");
-        return ("ok", msg, effect_href(&done, None));
     }
-    let mut msg = format!(
-        "The store refused the request ({}): {}.",
-        answer.status.as_u16(),
-        refusal_lines(&answer.body).join("; ")
-    );
-    if answer.status == StatusCode::CONFLICT {
-        // A 409 means the console's picture was stale: read the store again
-        // before reporting, and say what it holds now.
-        msg.push_str(&now_holds(m, ops).await);
-    }
-    let to = match ops.last() {
-        Some(last) if has_code(&answer.body, "disabled.cap") => back_to(last.name()),
-        _ => back,
-    };
-    ("error", msg, to)
 }
 
 /// A request that may or may not have applied: its answer was lost, or the
@@ -1224,9 +1262,9 @@ pub async fn effect(
         .collect();
     if let Some(d) = &wanted.doc {
         let title = format!(
-            "document version {} — digest {}…",
+            "document version {} — digest {}",
             d.version,
-            &d.digest[..12]
+            crate::routes::short_digest(&d.digest)
         );
         let j = match (effect::served_doc(&reading.store), &no_stacks) {
             (Err(e), _) => Err(format!(
