@@ -4,6 +4,7 @@ pub mod clients;
 pub mod health;
 pub mod home;
 pub mod lb;
+pub mod prefs;
 pub mod selecta;
 
 use leptos::prelude::*;

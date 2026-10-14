@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 
 use super::{
     Outcome, actor_of, clean_reason, effect_href, guard, not_configured, outcome, page_html,
-    refused_locally, refused_text, send_recorded, store_of, write_log,
+    refused_locally, refused_text, result_page_html, send_recorded, store_of, write_log,
 };
 use crate::confirm::{self, Needed, RowCheck};
 use crate::effect::{self, Doc, is_hex64, is_name};
@@ -496,7 +496,7 @@ pub async fn preview(
         );
     }
     let content = preview_view(&op, expected, &reason, &body, &gate, &session.csrf);
-    Ok((jar, Html(page_html(&session, None, content))).into_response())
+    Ok((jar, Html(result_page_html(&session, content))).into_response())
 }
 
 fn preview_view(
@@ -813,7 +813,7 @@ fn key_page(session: &Session, c: &Commit, effect: &str) -> Response {
             </CardContent>
         </Card>
     };
-    let mut resp = Html(page_html(session, None, content)).into_response();
+    let mut resp = Html(result_page_html(session, content)).into_response();
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     resp

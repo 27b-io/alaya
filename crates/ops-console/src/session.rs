@@ -6,6 +6,9 @@
 //! - `console_login`   — transient OIDC flow state (state/nonce/PKCE), 10 min.
 //! - `console_flash`   — one-shot result banner after a POST-redirect-GET.
 //!
+//! A fourth, `console_theme`, carries the operator's colour theme with the
+//! same attributes; it outlives the session on purpose (`theme.rs`).
+//!
 //! Session fixation: the callback always mints a brand-new session cookie
 //! (fresh CSRF included) and deletes the flow cookie — nothing minted before
 //! authentication survives it.
@@ -18,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 use crate::state::AppState;
+use crate::theme::{self, Theme};
 
 pub const SESSION_COOKIE: &str = "console_session";
 pub const LOGIN_COOKIE: &str = "console_login";
@@ -93,6 +97,10 @@ pub struct Session {
     /// No serde default: a cookie without it (pre-idle-timeout format) is
     /// simply invalid and forces a re-login.
     pub last_seen: i64,
+    /// Not part of the session cookie: the extractor fills it from the theme
+    /// cookie on every request, so every page renders in the operator's theme.
+    #[serde(skip)]
+    pub theme: Theme,
 }
 
 impl Session {
@@ -130,7 +138,7 @@ pub struct Flash {
     pub msg: String,
 }
 
-fn base_cookie(
+pub(crate) fn base_cookie(
     name: &'static str,
     value: String,
     secure: bool,
@@ -293,6 +301,7 @@ pub fn new_session(sub: String, email: Option<String>, name: Option<String>) -> 
         csrf: random_token(),
         exp: now_epoch() + SESSION_TTL_SECS,
         last_seen: now_epoch(),
+        theme: Theme::System,
     }
 }
 
@@ -329,7 +338,10 @@ impl FromRequestParts<AppState> for Session {
             .map_err(|_| AppError::LoginRedirect)?;
         // Logged-out sids are rejected identically to missing sessions.
         match read_session(&jar).filter(|s| !state.is_revoked(&s.sid)) {
-            Some(s) => Ok(s),
+            Some(s) => Ok(Session {
+                theme: theme::read(&jar),
+                ..s
+            }),
             None if parts.method == axum::http::Method::GET => Err(AppError::LoginRedirect),
             None => Err(AppError::Forbidden("no session".into())),
         }
