@@ -36,18 +36,24 @@ THEMES = ["light", "dark"]
 # Contact-sheet panels: (width, theme, scale).
 SHEET = [(390, "light", 1), (390, "dark", 1), (1280, "light", 0.5), (1280, "dark", 0.5)]
 
-# Elements wider than the viewport that no scroll box contains: the cause of
-# a page that scrolls sideways.
+# The innermost elements whose box or content reaches past the viewport with
+# no scroll box around them: the cause of a page that scrolls sideways. An
+# element's content counts too, since a long unbroken word overflows its box
+# without widening it.
 MEASURE = """(() => {
   const de = document.documentElement, cw = de.clientWidth;
+  const scrolls = el => ['auto', 'scroll', 'hidden', 'clip'].includes(getComputedStyle(el).overflowX);
   const boxed = el => {
-    for (let p = el.parentElement; p; p = p.parentElement) {
-      if (['auto', 'scroll', 'hidden', 'clip'].includes(getComputedStyle(p).overflowX)) return true;
-    }
+    for (let p = el.parentElement; p; p = p.parentElement) if (scrolls(p)) return true;
     return false;
   };
+  const extent = el => {
+    const r = el.getBoundingClientRect();
+    return scrolls(el) ? r.right : Math.max(r.right, r.left + el.scrollWidth);
+  };
+  const over = el => extent(el) > cw + 0.5 && !boxed(el);
   const wide = [...document.body.querySelectorAll('*')]
-    .filter(el => el.getBoundingClientRect().right > cw + 0.5 && !boxed(el))
+    .filter(el => over(el) && ![...el.children].some(over))
     .slice(0, 5)
     .map(el => el.tagName.toLowerCase() + ' ' + (el.getAttribute('class') || '').slice(0, 80));
   return JSON.stringify({scrollWidth: de.scrollWidth, clientWidth: cw, wide});

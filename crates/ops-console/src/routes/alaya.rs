@@ -783,7 +783,7 @@ pub async fn detail(
     let content = view! {
         <div class="space-y-6">
             <div class="flex items-center gap-3 flex-wrap">
-                <h1 class="font-mono text-sm">{hash_title}</h1>
+                <h1 class="font-mono text-sm break-all">{hash_title}</h1>
                 <span class=badge(BadgeKind::Secondary)>{mtype.clone()}</span>
                 {superseded.then(|| view! { <span class=badge(BadgeKind::Warning)>"superseded"</span> })}
             </div>
@@ -791,11 +791,11 @@ pub async fn detail(
             <Card>
                 <CardHeader><CardTitle>"Content"</CardTitle></CardHeader>
                 <CardContent>
-                    <pre class="whitespace-pre-wrap text-sm font-sans">{content_text}</pre>
+                    <pre class="whitespace-pre-wrap wrap-anywhere text-sm font-sans">{content_text}</pre>
                     {(!summary.is_empty()).then(|| view! {
                         <div class="mt-4 border-t pt-4">
                             <div class="text-xs font-medium text-muted-foreground mb-1">"Summary"</div>
-                            <p class="text-sm">{summary_text}</p>
+                            <p class="text-sm wrap-anywhere">{summary_text}</p>
                         </div>
                     })}
                 </CardContent>
@@ -1798,7 +1798,11 @@ fn edge_facts(p: &Value) -> impl IntoView + use<> {
                 })}
             </div>
             {(!reason.is_empty()).then(|| {
-                let class = if failed { "text-sm text-destructive" } else { "text-sm" };
+                let class = if failed {
+                    "text-sm wrap-anywhere text-destructive"
+                } else {
+                    "text-sm wrap-anywhere"
+                };
                 view! { <p class=class>{reason}</p> }
             })}
             <dl class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
@@ -1917,7 +1921,7 @@ fn queue_card(p: &Value, csrf: &str, view: &QueueView, back: &str) -> impl IntoV
                     <HashLink hash=hash />
                     {sup.then(|| view! { <span class=badge(BadgeKind::Warning)>"superseded"</span> })}
                 </div>
-                <p class="text-sm">{text}</p>
+                <p class="text-sm wrap-anywhere">{text}</p>
             </div>
         }
     };
@@ -2124,10 +2128,10 @@ fn memory_column(label: &'static str, hash: String, res: Result<Value, AppError>
                             {validate_hash(&by).is_ok().then(|| view! { <HashLink hash=by.clone() /> })}
                         })}
                     </div>
-                    <pre class="whitespace-pre-wrap text-sm font-sans">{content}</pre>
+                    <pre class="whitespace-pre-wrap wrap-anywhere text-sm font-sans">{content}</pre>
                     <div class="border-t pt-4">
                         <div class="text-xs font-medium text-muted-foreground mb-1">"Summary"</div>
-                        <p class="text-sm">{or_dash(summary)}</p>
+                        <p class="text-sm wrap-anywhere">{or_dash(summary)}</p>
                     </div>
                     <div class="flex flex-wrap gap-1">
                         {tags.into_iter().map(|t| view! { <span class=badge(BadgeKind::Muted)>{t}</span> }).collect_view()}

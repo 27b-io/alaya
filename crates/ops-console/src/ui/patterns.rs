@@ -69,13 +69,9 @@ pub fn unavailable(what: &str, detail: &str) -> impl IntoView + use<> {
 /// Where a list or a section has nothing in it: said in words, in a dashed
 /// frame, so an empty section never looks broken or still loading.
 #[component]
-pub fn EmptyState(
-    #[prop(optional, into)] title: Option<String>,
-    children: Children,
-) -> impl IntoView {
+pub fn EmptyState(children: Children) -> impl IntoView {
     view! {
         <div class="flex flex-col items-center gap-2 rounded-lg border border-dashed px-4 py-8 text-center text-sm text-muted-foreground wrap-break-word">
-            {title.map(|t| view! { <p class="font-medium text-foreground">{t}</p> })}
             {children()}
         </div>
     }
@@ -211,14 +207,10 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_state_carries_an_optional_title() {
-        let titled = html(view! { <EmptyState title="No alerts">"All quiet."</EmptyState> });
-        assert!(
-            titled.contains(">No alerts</p>All quiet.</div>"),
-            "{titled}"
-        );
-        let bare = html(view! { <EmptyState>"Nothing is waiting on you."</EmptyState> });
-        assert!(!bare.contains("<p"), "{bare}");
+    fn an_empty_state_says_so_in_a_dashed_frame() {
+        let out = html(view! { <EmptyState>"Nothing is waiting on you."</EmptyState> });
+        assert!(out.contains("border-dashed"), "{out}");
+        assert!(out.contains(">Nothing is waiting on you.</div>"), "{out}");
     }
 
     /// A stat is a `dt`/`dd` pair inside the grid's `dl`, so the label still

@@ -5512,4 +5512,6 @@ mod tests {
             assert!(store.requests().is_empty(), "{:?}", store.requests());
         }
     }
+
+    mod snapshot;
 }
