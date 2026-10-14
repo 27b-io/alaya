@@ -774,9 +774,26 @@ fn clean_reason(raw: &str) -> Result<String, String> {
 
 /// One line per write attempt, refusals and upstream failures included, with
 /// the user's subject. Request and answer are re-serialised and clipped.
+/// The store answers 503 `store.unavailable` to any failure of its
+/// restrictions object's call, a connection dropped after the commit
+/// included, so whether such a request applied is unknown. The write log and
+/// the page both read it through here, so they can never disagree.
+fn outcome_unknown(a: &Answer) -> bool {
+    a.status == StatusCode::SERVICE_UNAVAILABLE && has_code(&a.body, "store.unavailable")
+}
+
 fn write_log(session: &Session, kind: &str, request: &Value, outcome: Result<&Answer, &AppError>) {
     let request = clip(&request.to_string(), MAX_LOGGED_CHARS);
     match outcome {
+        Ok(a) if outcome_unknown(a) => tracing::warn!(
+            target: "ops_console::write_log",
+            sub = ?session.sub,
+            kind,
+            request = %request,
+            status = a.status.as_u16(),
+            answer = %clip(&a.body.to_string(), MAX_LOGGED_CHARS),
+            "client-store write outcome unknown"
+        ),
         Ok(a) if a.status.is_success() => tracing::info!(
             target: "ops_console::write_log",
             sub = ?session.sub,
@@ -801,7 +818,7 @@ fn write_log(session: &Session, kind: &str, request: &Value, outcome: Result<&An
             kind,
             request = %request,
             error = %e.detail(),
-            "client-store write failed upstream"
+            "client-store write outcome unknown"
         ),
     }
 }
@@ -923,11 +940,7 @@ pub async fn restrict(
             return Ok(flash_redirect(jar, secure, "error", msg, "/lb/clients"));
         }
     };
-    // The store answers 503 to any failure of the restrictions object's call,
-    // a connection dropped after its commit included: that is a lost answer too.
-    if answer.status == StatusCode::SERVICE_UNAVAILABLE
-        && has_code(&answer.body, "store.unavailable")
-    {
+    if outcome_unknown(&answer) {
         let why = format!(
             "the store answered 503: {}",
             refusal_lines(&answer.body).join("; ")

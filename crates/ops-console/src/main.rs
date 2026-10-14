@@ -4114,6 +4114,8 @@ mod tests {
             );
             let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
             let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let buf = testlog::LogBuf::default();
+            let _guard = buf.capture();
             let resp = post_form(
                 &state,
                 &cookie,
@@ -4127,6 +4129,10 @@ mod tests {
                 ]),
             )
             .await;
+            // The write log agrees with the page: unknown, never refused.
+            let line = buf.record("client-store write outcome unknown");
+            assert!(line.contains("store.unavailable"), "{line}");
+            assert!(!buf.text().contains("client-store write refused"));
             let flash = flash_of(&state, &resp);
             assert!(
                 flash
