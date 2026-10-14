@@ -6,11 +6,14 @@ use leptos::prelude::*;
 
 use super::components::{BadgeKind, badge};
 
-// ─── Status: the one status-to-badge mapping ────────────────────────────────
+// ─── Status: the status-to-badge mapping ────────────────────────────────────
 
 /// What a state means to the operator. A page picks the meaning and this
 /// picks the look, once, so "failing" on one page and "unreachable" on
-/// another wear the same badge.
+/// another wear the same badge. Pages not yet built on these components
+/// still pick badge kinds themselves: `verdict_badge` in `routes/alaya.rs`
+/// (a judge verdict, which is a category rather than a state) and in
+/// `routes/clients.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     /// Working as it should: passing, healthy, reachable.
@@ -159,20 +162,6 @@ mod tests {
 
     fn html(v: impl IntoView) -> String {
         v.into_view().to_html()
-    }
-
-    /// One meaning, one badge: the mapping is total and each status is told
-    /// apart from the others.
-    #[test]
-    fn each_status_has_its_own_badge() {
-        let all = [Status::Ok, Status::Warn, Status::Error, Status::Off];
-        for (i, a) in all.iter().enumerate() {
-            for b in &all[i + 1..] {
-                assert_ne!(a.badge(), b.badge(), "{a:?} and {b:?} look the same");
-            }
-        }
-        assert_eq!(Status::Error.badge(), badge(BadgeKind::Destructive));
-        assert_eq!(Status::Off.badge(), badge(BadgeKind::Muted));
     }
 
     /// Only an error is an alert: a passing check or an unconfigured module

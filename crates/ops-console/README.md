@@ -392,15 +392,17 @@ not hand-write layout or recurring markup.
   registry now lives at [rust-ui/leptos-ui](https://github.com/rust-ui/leptos-ui)
   (`app_crates/registry/src/ui/*.rs`, theme tokens in `style/tailwind.css`);
   [rust-ui/ui](https://github.com/rust-ui/ui) has moved to Dioxus.
-- `ui/patterns.rs`: the console's own components. `Status` is the one
-  mapping from what a state means (ok, warn, error, off) to its badge;
+- `ui/patterns.rs`: the console's own components. `Status` maps what a
+  state means (ok, warn, error, off) to its badge; the pages not yet built
+  on these components still map their own (`verdict_badge` in
+  `routes/alaya.rs` and `routes/clients.rs`);
   `Notice` is a status badge plus a sentence (an `Error` notice is an alert),
   and `unavailable()` is the notice for a dark section; `EmptyState`,
   `NotConfigured`, `Stat`/`StatGrid`, `PageHeader`, `Link` (the one link
   style) and `HashLink`.
 - `ui/shell.rs`: the document and the page shell. Every handler passes the
-  `Nav` entry its page belongs under to `page()` (or `result_page()`, below);
-  the shell marks that entry `aria-current="page"`. From `lg` the navigation is a sidebar grouped by
+  `Nav` entry its page belongs under to `page()`; the shell marks that entry
+  `aria-current="page"`. From `lg` the navigation is a sidebar grouped by
   module; below it, a `<details>` menu in the top bar. The top bar holds the
   theme switch and logout once at every width.
 
@@ -431,6 +433,5 @@ top bar saves the operator's choice in the encrypted `console_theme`
 cookie (`src/theme.rs`); the page renders it as `class="dark"` or
 `class="light"` on `<html>`, and with no choice saved the OS setting
 (`prefers-color-scheme`) decides. No JavaScript is involved. The switch
-returns to the page it was used on, so a page rendered as the answer to a
-POST (a preview, a result, a shown-once key) uses `ui::result_page`, which
-leaves the switch out: its URL is POST-only, and a GET of it is a 405.
+returns to the page's navigation entry, which the form carries as `back`: a
+short GET page, so a switch used on a POST's answer page lands on a page too.

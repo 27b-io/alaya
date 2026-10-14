@@ -132,14 +132,21 @@ class Chrome:
     def page(self, method, **params):
         return self.call(method, session=self._session, **params)
 
-    def shoot(self, url, width, height, mobile):
-        """Load `url` at this viewport; return (PNG bytes, measurement)."""
+    def shoot(self, url, width, height, mobile, scheme):
+        """Load `url` at this viewport, with the OS colour scheme `scheme`;
+        return (PNG bytes, measurement)."""
         self.page(
             "Emulation.setDeviceMetricsOverride",
             width=width,
             height=height,
             deviceScaleFactor=1,
             mobile=mobile,
+        )
+        # A page with no saved theme (the error page) follows the OS, and
+        # headless Chrome's OS is light: a dark shot must say dark.
+        self.page(
+            "Emulation.setEmulatedMedia",
+            features=[{"name": "prefers-color-scheme", "value": scheme}],
         )
         # A query unique to this load, so the document it waits for is never
         # the one already open: the same page is loaded once per width.
@@ -240,7 +247,7 @@ def main():
             for theme in THEMES:
                 for width, height, mobile in VIEWPORTS:
                     png, m = chrome.shoot(
-                        f"{origin}/{stem}.{theme}.html", width, height, mobile
+                        f"{origin}/{stem}.{theme}.html", width, height, mobile, theme
                     )
                     (pngs / f"{stem}.{theme}.{width}.png").write_bytes(png)
                     if m["scrollWidth"] > m["clientWidth"]:
@@ -263,7 +270,7 @@ def main():
         sheet_width = int(sum(w * s for w, _, s in SHEET)) + 16 * (len(SHEET) + 1)
         for stem in stems:
             png, _ = chrome.shoot(
-                f"{origin}/sheets/{stem}.html", sheet_width, 800, False
+                f"{origin}/sheets/{stem}.html", sheet_width, 800, False, "light"
             )
             (sheets / f"{stem}.png").write_bytes(png)
     finally:

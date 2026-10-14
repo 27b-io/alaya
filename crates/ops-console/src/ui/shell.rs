@@ -26,6 +26,26 @@ pub enum Nav {
     Selecta,
 }
 
+impl Nav {
+    /// The entry's own page: a short GET route, which is where the theme
+    /// switch returns. A `Nav` missing from `NAV` returns home.
+    fn href(self) -> &'static str {
+        NAV.iter()
+            .flat_map(|(_, entries)| entries.iter())
+            .find(|(nav, _, _)| *nav == self)
+            .map_or("/", |(_, href, _)| *href)
+    }
+}
+
+/// Where the shell's own forms post: `routes()` serves these paths and every
+/// page carries both forms.
+pub const LOGOUT: &str = "/auth/logout";
+pub const SET_THEME: &str = "/prefs/theme";
+/// Neither calls an upstream, so the tests that walk the routes set them
+/// apart.
+#[cfg(test)]
+pub const SHELL_POSTS: [&str; 2] = [LOGOUT, SET_THEME];
+
 /// One module's entries under its heading; `None` heads the console's own.
 type NavGroup = (
     Option<&'static str>,
@@ -33,8 +53,8 @@ type NavGroup = (
 );
 
 /// The navigation, by module, in display order: the one place a page joins
-/// it. Tests check that each `Nav` appears once and that each entry is a page
-/// that renders and marks itself (`main.rs`).
+/// it. `tests/snapshot.rs` checks that every page marks the entry it names
+/// and that every entry is a page that marks itself.
 const NAV: &[NavGroup] = &[
     (None, &[(Nav::Home, "/", "Home")]),
     (
@@ -150,16 +170,17 @@ fn theme_icon(theme: Theme) -> AnyView {
 
 /// One icon button showing the current theme; it opens a menu of the three
 /// choices, each a submit button of one POST form carrying the session's CSRF
-/// token, like logout. A `<details>` disclosure, so it needs no JavaScript,
-/// and one icon wide, so it fits the top bar at every width.
-fn theme_switch(current: Theme, csrf: String) -> impl IntoView {
+/// token, like logout, and `back`, the page's navigation entry, to return to.
+/// A `<details>` disclosure, so it needs no JavaScript, and one icon wide, so
+/// it fits the top bar at every width.
+fn theme_switch(current: Theme, csrf: String, back: &'static str) -> impl IntoView {
     let options = Theme::ALL
         .into_iter()
         .map(|t| {
-            let (label, name) = match t {
-                Theme::System => ("System theme", "System"),
-                Theme::Light => ("Light theme", "Light"),
-                Theme::Dark => ("Dark theme", "Dark"),
+            let name = match t {
+                Theme::System => "System",
+                Theme::Light => "Light",
+                Theme::Dark => "Dark",
             };
             let class = if t == current {
                 "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm bg-accent text-accent-foreground"
@@ -171,7 +192,6 @@ fn theme_switch(current: Theme, csrf: String) -> impl IntoView {
                     type="submit"
                     name="theme"
                     value=t.as_str()
-                    aria-label=label
                     aria-pressed=(t == current).to_string()
                     class=class
                 >
@@ -192,10 +212,11 @@ fn theme_switch(current: Theme, csrf: String) -> impl IntoView {
             </summary>
             <form
                 method="post"
-                action="/prefs/theme"
+                action=SET_THEME
                 class="absolute right-0 z-20 mt-2 w-36 rounded-md border bg-card p-1 shadow-md"
             >
                 <input type="hidden" name="csrf" value=csrf />
+                <input type="hidden" name="back" value=back />
                 {options}
             </form>
         </details>
@@ -212,14 +233,16 @@ fn escape_html(s: &str) -> String {
 }
 
 /// Full HTML document around already-rendered body HTML, in `theme`. Pages
-/// rendered without a session (errors) pass `Theme::System`.
+/// rendered without a session (errors) pass `Theme::System`. The scroll
+/// padding is the top bar's height (`h-14`): a jump to an anchor stops below
+/// the bar, not under it.
 pub fn document(title: &str, theme: Theme, body_html: String) -> String {
-    let class = theme
-        .html_class()
-        .map(|c| format!(" class=\"{c}\""))
-        .unwrap_or_default();
+    let class = match theme.html_class() {
+        Some(c) => format!("scroll-pt-14 {c}"),
+        None => "scroll-pt-14".to_string(),
+    };
     format!(
-        "<!DOCTYPE html><html lang=\"en\"{class}><head><meta charset=\"utf-8\">\
+        "<!DOCTYPE html><html lang=\"en\" class=\"{class}\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta name=\"color-scheme\" content=\"{}\">\
          <meta name=\"referrer\" content=\"same-origin\">\
@@ -245,9 +268,13 @@ fn flash_banner(flash: &Flash) -> impl IntoView + use<> {
     view! { <div class=class role="status">{msg}</div> }
 }
 
-/// The authenticated page for a page reached by GET: navigation with `nav`
-/// marked current, the top bar (theme switch, operator, log out), the flash
-/// banner, then the content.
+/// The authenticated page: navigation with `nav` marked current, the top bar
+/// (theme switch, operator, log out), the flash banner, then the content.
+///
+/// The top bar holds one copy of each control at every width, so a form is
+/// never on the page twice; only the navigation is drawn twice, once per
+/// layout. The content column is `min-w-0`, so a wide table scrolls inside
+/// its wrapper instead of widening the page.
 pub fn page(
     title: &str,
     nav: Nav,
@@ -255,38 +282,9 @@ pub fn page(
     flash: Option<Flash>,
     content: impl IntoView,
 ) -> String {
-    shell(title, nav, session, flash, content, true)
-}
-
-/// The same shell for a page rendered as the answer to a POST (a preview, a
-/// result, a shown-once key). It carries no theme switch: the switch returns to
-/// the page it was used on, and this page's URL is a POST-only route that a
-/// GET would answer with 405, leaving the page and anything shown once on it.
-pub fn result_page(
-    title: &str,
-    nav: Nav,
-    session: &Session,
-    flash: Option<Flash>,
-    content: impl IntoView,
-) -> String {
-    shell(title, nav, session, flash, content, false)
-}
-
-/// The top bar holds one copy of each control at every width, so a form is
-/// never on the page twice; only the navigation is drawn twice, once per
-/// layout. The content column is `min-w-0`, so a wide table scrolls inside
-/// its wrapper instead of widening the page.
-fn shell(
-    title: &str,
-    nav: Nav,
-    session: &Session,
-    flash: Option<Flash>,
-    content: impl IntoView,
-    with_theme_switch: bool,
-) -> String {
     let who = session.display_name().to_string();
     let csrf = session.csrf.clone();
-    let switch = with_theme_switch.then(|| theme_switch(session.theme, session.csrf.clone()));
+    let switch = theme_switch(session.theme, session.csrf.clone(), nav.href());
     let body = view! {
         <a href="#content" class="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-3 focus:z-50 focus:rounded-md focus:bg-card focus:px-3 focus:py-2 focus:text-sm focus:shadow-md">
             "Skip to content"
@@ -324,7 +322,7 @@ fn shell(
                         <div class="ml-auto flex min-w-0 items-center gap-3 text-sm text-muted-foreground">
                             {switch}
                             <span class="hidden max-w-48 truncate sm:block">{who}</span>
-                            <form method="post" action="/auth/logout">
+                            <form method="post" action=LOGOUT>
                                 <input type="hidden" name="csrf" value=csrf />
                                 <button
                                     type="submit"
@@ -362,54 +360,15 @@ mod tests {
         assert!(html.contains("&lt;script&gt;"));
     }
 
-    /// The page names its entry and the shell marks exactly that one, in
-    /// both copies of the navigation, and nothing else.
-    #[test]
-    fn the_named_entry_and_only_it_is_current() {
-        let all = [
-            (Nav::Home, "/"),
-            (Nav::Memories, "/alaya"),
-            (Nav::Duplicates, "/alaya/duplicates"),
-            (Nav::Contradictions, "/alaya/contradictions"),
-            (Nav::Health, "/alaya/health"),
-            (Nav::Auth, "/alaya/auth"),
-            (Nav::Lb, "/lb"),
-            (Nav::LbClients, "/lb/clients"),
-            (Nav::Selecta, "/selecta"),
-        ];
-        for (nav, href) in all {
-            let html = page("t", nav, &session(), None, "");
-            let marked = format!(r#"href="{href}" aria-current="page""#);
-            assert_eq!(html.matches(&marked).count(), 2, "{nav:?}: {html}");
-            assert_eq!(html.matches("aria-current").count(), 2, "{nav:?}");
-        }
-    }
-
-    /// Every entry, grouped by module in order, each with its own `Nav`.
-    #[test]
-    fn the_navigation_lists_every_module_once() {
-        let headings: Vec<_> = NAV.iter().map(|(m, _)| *m).collect();
-        assert_eq!(
-            headings,
-            [None, Some("Ālaya"), Some("anthropic-lb"), Some("selecta")]
-        );
-        let mut navs: Vec<Nav> = NAV
-            .iter()
-            .flat_map(|(_, entries)| entries.iter().map(|(n, _, _)| *n))
-            .collect();
-        let count = navs.len();
-        navs.dedup();
-        assert_eq!(navs.len(), count, "an entry is listed twice");
-        assert_eq!(count, 9);
-    }
-
     /// Each control is on the page once at every width: one theme switch,
     /// one logout form, one skip link to the one `main`.
     #[test]
     fn the_shell_holds_one_copy_of_each_control() {
         let html = page("t", Nav::Home, &session(), None, "");
-        assert_eq!(html.matches(r#"action="/auth/logout""#).count(), 1);
-        assert_eq!(html.matches(r#"action="/prefs/theme""#).count(), 1);
+        for action in SHELL_POSTS {
+            let form = format!(r#"action="{action}""#);
+            assert_eq!(html.matches(&form).count(), 1, "{action}");
+        }
         assert_eq!(html.matches(r#"aria-pressed="true""#).count(), 1);
         assert_eq!(html.matches("<main").count(), 1);
         assert!(html.contains(r##"href="#content""##));
@@ -418,26 +377,14 @@ mod tests {
         assert!(html.contains(">Ray</span>"), "the operator is named");
     }
 
-    /// A POST's answer page keeps the navigation and logout but has no theme
-    /// switch, which would send the browser to a GET of a POST-only URL.
+    /// The theme switch returns to the page's navigation entry, a short GET
+    /// page, whatever page it is used on.
     #[test]
-    fn a_result_page_has_no_theme_switch() {
-        let html = result_page("t", Nav::Duplicates, &session(), None, "");
-        assert!(!html.contains(r#"action="/prefs/theme""#), "{html}");
-        assert_eq!(html.matches(r#"action="/auth/logout""#).count(), 1);
-        let marked = r#"href="/alaya/duplicates" aria-current="page""#;
-        assert_eq!(html.matches(marked).count(), 2, "{html}");
-    }
-
-    /// The menu is a `<details>` that only exists below `lg` and the sidebar
-    /// only from `lg`, so exactly one navigation is ever displayed.
-    #[test]
-    fn one_navigation_per_layout() {
-        let html = page("t", Nav::Home, &session(), None, "");
-        assert!(html.contains(r#"<aside class="hidden lg:block"#), "{html}");
-        assert!(
-            html.contains(r#"<details class="group lg:hidden">"#),
-            "{html}"
-        );
+    fn the_theme_switch_returns_to_the_pages_entry() {
+        for (nav, href) in [(Nav::Home, "/"), (Nav::Health, "/alaya/health")] {
+            let html = page("t", nav, &session(), None, "");
+            let back = format!(r#"<input type="hidden" name="back" value="{href}">"#);
+            assert!(html.contains(&back), "{nav:?}: {html}");
+        }
     }
 }

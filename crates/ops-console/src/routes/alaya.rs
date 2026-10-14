@@ -1570,7 +1570,7 @@ pub async fn merge_submit(
         };
         return Ok((
             jar,
-            Html(result_page(
+            Html(page(
                 "Merge preview — ops console",
                 Nav::Duplicates,
                 &session,

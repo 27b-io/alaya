@@ -48,11 +48,7 @@ impl Theme {
     /// The class on `<html>`. None for `System`: the stylesheet then follows
     /// `prefers-color-scheme`.
     pub fn html_class(self) -> Option<&'static str> {
-        match self {
-            Theme::System => None,
-            Theme::Light => Some("light"),
-            Theme::Dark => Some("dark"),
-        }
+        (self != Theme::System).then_some(self.as_str())
     }
 
     /// The `<meta name="color-scheme">` value. Every link in the console is a

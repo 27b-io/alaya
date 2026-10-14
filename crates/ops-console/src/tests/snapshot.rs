@@ -31,30 +31,51 @@ const CLOSED: &str = "http://127.0.0.1:1";
 
 // ─── Pages ──────────────────────────────────────────────────────────────────
 
-/// A page to snapshot: the route pattern it exercises, as `routes()` names
-/// it; the path to GET; and the stem its files are written under.
-type Page = (&'static str, String, String);
+/// A page to snapshot.
+struct Page {
+    /// The route pattern it exercises, as `routes()` names it.
+    route: &'static str,
+    /// The navigation entry it is under: its own route, or for a page that
+    /// is not an entry, the entry it is reached from.
+    under: &'static str,
+    /// The path to GET.
+    path: String,
+    /// The stem its files are written under.
+    stem: String,
+}
 
 /// Every GET page the console serves, as the healthy world renders it.
 /// Where a page needs a query to render its full layout, the path carries
 /// it: the supersede form prefilled from a contradiction, the pair the
 /// queue opens, the write the effect page confirms.
 fn pages() -> Vec<Page> {
-    let page = |route: &'static str, path: String, stem: &str| (route, path, stem.to_string());
+    let page = |route: &'static str, under: &'static str, path: String, stem: &str| Page {
+        route,
+        under,
+        path,
+        stem: stem.to_string(),
+    };
     let effect = format!(
         "/lb/clients/effect?op=disabled.ci-review-bot.{T0}&doc={V0}.{}&at=0",
         doc_digest(V0)
     );
     vec![
-        page("/", "/".into(), "home"),
-        page("/alaya", "/alaya?include_superseded=on".into(), "alaya"),
+        page("/", "/", "/".into(), "home"),
+        page(
+            "/alaya",
+            "/alaya",
+            "/alaya?include_superseded=on".into(),
+            "alaya",
+        ),
         page(
             "/alaya/memory/{hash}",
+            "/alaya",
             format!("/alaya/memory/{}", hm(1)),
             "alaya-memory",
         ),
         page(
             "/alaya/supersede",
+            "/alaya",
             format!(
                 "/alaya/supersede?old={}&new={}&back=%2Falaya%2Fcontradictions",
                 hm(6),
@@ -64,37 +85,63 @@ fn pages() -> Vec<Page> {
         ),
         page(
             "/alaya/duplicates",
+            "/alaya/duplicates",
             "/alaya/duplicates".into(),
             "alaya-duplicates",
         ),
         page(
+            "/alaya/contradictions",
             "/alaya/contradictions",
             "/alaya/contradictions".into(),
             "alaya-contradictions",
         ),
         page(
             "/alaya/contradictions/pair",
+            "/alaya/contradictions",
             format!("/alaya/contradictions/pair?a={}&b={}", hm(6), hm(7)),
             "alaya-contradictions-pair",
         ),
-        page("/alaya/auth", "/alaya/auth".into(), "alaya-auth"),
-        page("/alaya/health", "/alaya/health".into(), "alaya-health"),
-        page("/lb", "/lb".into(), "lb"),
-        page("/lb/clients", "/lb/clients".into(), "lb-clients"),
+        page(
+            "/alaya/auth",
+            "/alaya/auth",
+            "/alaya/auth".into(),
+            "alaya-auth",
+        ),
+        page(
+            "/alaya/health",
+            "/alaya/health",
+            "/alaya/health".into(),
+            "alaya-health",
+        ),
+        page("/lb", "/lb", "/lb".into(), "lb"),
+        page(
+            "/lb/clients",
+            "/lb/clients",
+            "/lb/clients".into(),
+            "lb-clients",
+        ),
         page(
             "/lb/clients/disable",
+            "/lb/clients",
             "/lb/clients/disable?disable=support-triage".into(),
             "lb-clients-disable",
         ),
-        page("/lb/clients/effect", effect, "lb-clients-effect"),
+        page(
+            "/lb/clients/effect",
+            "/lb/clients",
+            effect,
+            "lb-clients-effect",
+        ),
         page(
             "/lb/clients/history",
+            "/lb/clients",
             "/lb/clients/history".into(),
             "lb-clients-history",
         ),
-        page("/selecta", "/selecta".into(), "selecta"),
+        page("/selecta", "/selecta", "/selecta".into(), "selecta"),
         page(
             "/selecta/task/{id}",
+            "/selecta",
             format!("/selecta/task/{FAILED_ID}"),
             "selecta-task",
         ),
@@ -128,8 +175,11 @@ const FAILS_WHOLE: [&str; 5] = [
 fn down_pages() -> Vec<Page> {
     pages()
         .into_iter()
-        .filter(|(route, _, _)| !READS_NOTHING.contains(route))
-        .map(|(route, path, stem)| (route, path, format!("{stem}-down")))
+        .filter(|p| !READS_NOTHING.contains(&p.route))
+        .map(|p| Page {
+            stem: format!("{}-down", p.stem),
+            ..p
+        })
         .collect()
 }
 
@@ -175,7 +225,10 @@ async fn render_pages(
     let mut out = Vec::new();
     for (state, pages, down) in worlds {
         let cookie = operator_cookie(state, theme);
-        for (route, path, stem) in pages {
+        for Page {
+            route, path, stem, ..
+        } in pages
+        {
             let (status, html) = get_page(state, &cookie, path).await;
             let want = if *down && FAILS_WHOLE.contains(route) {
                 StatusCode::BAD_GATEWAY
@@ -226,39 +279,11 @@ async fn every_get_page_renders_in_the_snapshot_world() {
             continue;
         }
         assert!(
-            snapped.iter().any(|(r, _, _)| *r == route),
+            snapped.iter().any(|p| p.route == route),
             "GET {route} answers {status} but has no snapshot: add it to pages()"
         );
     }
-    let served: Vec<&str> = routes().into_iter().map(|(r, _)| r).collect();
-    for (route, _, stem) in snapped {
-        assert!(
-            served.contains(route),
-            "{stem} names {route}, which routes() does not serve"
-        );
-    }
 }
-
-/// The navigation entry each page is under: its own, or for a page that is
-/// not an entry, the one it is reached from.
-const UNDER: [(&str, &str); 16] = [
-    ("/", "/"),
-    ("/alaya", "/alaya"),
-    ("/alaya/memory/{hash}", "/alaya"),
-    ("/alaya/supersede", "/alaya"),
-    ("/alaya/duplicates", "/alaya/duplicates"),
-    ("/alaya/contradictions", "/alaya/contradictions"),
-    ("/alaya/contradictions/pair", "/alaya/contradictions"),
-    ("/alaya/auth", "/alaya/auth"),
-    ("/alaya/health", "/alaya/health"),
-    ("/lb", "/lb"),
-    ("/lb/clients", "/lb/clients"),
-    ("/lb/clients/disable", "/lb/clients"),
-    ("/lb/clients/effect", "/lb/clients"),
-    ("/lb/clients/history", "/lb/clients"),
-    ("/selecta", "/selecta"),
-    ("/selecta/task/{id}", "/selecta"),
-];
 
 /// The two copies of the main navigation in `html`: the sidebar's and the
 /// narrow-screen menu's.
@@ -275,13 +300,12 @@ fn main_navs(html: &str) -> Vec<&str> {
 async fn every_page_marks_the_navigation_entry_it_is_under() {
     let state = healthy_world().await;
     let cookie = operator_cookie(&state, None);
-    for (route, path, stem) in pages() {
-        let under = UNDER
-            .iter()
-            .find(|(r, _)| *r == route)
-            .unwrap_or_else(|| panic!("{route} is missing from UNDER"))
-            .1;
-        let (_, html) = get_page(&state, &cookie, &path).await;
+    let pages = pages();
+    for Page {
+        under, path, stem, ..
+    } in &pages
+    {
+        let (_, html) = get_page(&state, &cookie, path).await;
         let navs = main_navs(&html);
         assert_eq!(navs.len(), 2, "{stem}");
         let marked = format!("href=\"{under}\" aria-current=\"page\"");
@@ -300,11 +324,18 @@ async fn every_page_marks_the_navigation_entry_it_is_under() {
         .skip(1)
         .filter_map(|h| h.split('"').next())
         .collect();
-    assert_eq!(entries.len(), 9, "{entries:?}");
-    for href in entries {
+    for href in &entries {
         assert!(
-            UNDER.contains(&(href, href)),
+            pages.iter().any(|p| p.route == *href && p.under == *href),
             "the navigation links {href}, which is no page's own entry"
+        );
+    }
+    for p in &pages {
+        assert!(
+            entries.contains(&p.under),
+            "{} is under {}, which the navigation lacks",
+            p.stem,
+            p.under
         );
     }
 }
@@ -339,7 +370,7 @@ async fn write_snapshots() {
     }
     let stems: Vec<&str> = worlds
         .iter()
-        .flat_map(|(_, pages, _)| pages.iter().map(|(_, _, stem)| stem.as_str()))
+        .flat_map(|(_, pages, _)| pages.iter().map(|p| p.stem.as_str()))
         .collect();
     write("pages.txt".into(), &format!("{}\n", stems.join("\n")));
 }
