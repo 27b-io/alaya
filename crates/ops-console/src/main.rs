@@ -3163,11 +3163,14 @@ mod tests {
         }
 
         /// A fake store: successive `GET`s are answered from `gets` in order
-        /// (the last one repeats); every `POST` gets `post`.
+        /// (the last one repeats); every `POST` gets `post`, or `post_page`
+        /// when set: a body that is not the store's JSON, as an edge block
+        /// page would be.
         #[derive(Clone)]
         struct FakeStore {
             gets: Arc<Mutex<Vec<Value>>>,
             post: Arc<Mutex<(StatusCode, Value)>>,
+            post_page: Arc<Mutex<Option<StatusCode>>>,
             log: Log,
         }
 
@@ -3175,6 +3178,7 @@ mod tests {
             fn new(world: &World) -> Self {
                 FakeStore {
                     gets: Arc::new(Mutex::new(vec![world.get_body()])),
+                    post_page: Arc::new(Mutex::new(None)),
                     post: Arc::new(Mutex::new((
                         StatusCode::OK,
                         json!({"status": 200, "results": [], "records_version": 0}),
@@ -3237,6 +3241,9 @@ mod tests {
                                 gets[0].clone()
                             };
                             return (StatusCode::OK, axum::Json(body));
+                        }
+                        if let Some(status) = *me.post_page.lock().unwrap() {
+                            return (status, axum::Json(Value::Null));
                         }
                         let (status, body) = me.post.lock().unwrap().clone();
                         (status, axum::Json(body))
@@ -3643,6 +3650,45 @@ mod tests {
                 "{}",
                 flash.msg
             );
+        }
+
+        /// An answer that never arrives intact leaves the outcome unknown:
+        /// the console says so, re-reads the store, and exports nothing as
+        /// committed.
+        #[tokio::test]
+        async fn a_lost_answer_is_reported_as_unknown_after_a_re_read() {
+            let store = FakeStore::new(&World::new(vec![("acme", RecordState::Disabled, T0)]));
+            *store.post_page.lock().unwrap() = Some(StatusCode::FORBIDDEN);
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/restrict",
+                form(&[
+                    ("csrf", &csrf),
+                    ("action", "disable"),
+                    ("name", "acme"),
+                    ("reason", "leak"),
+                ]),
+            )
+            .await;
+            let flash = flash_of(&state, &resp);
+            assert_eq!(flash.kind, "error");
+            assert!(
+                flash.msg.contains("whether the request applied is unknown"),
+                "{}",
+                flash.msg
+            );
+            assert!(
+                flash.msg.contains(&format!("acme is disabled at {T0}")),
+                "{}",
+                flash.msg
+            );
+            let methods: Vec<String> = store.requests().into_iter().map(|(m, _, _)| m).collect();
+            assert_eq!(methods, ["POST", "GET"]);
+            let text = state.store.as_ref().unwrap().committed.render();
+            assert!(!text.contains("ops_console_committed_record{"), "{text}");
         }
 
         #[tokio::test]

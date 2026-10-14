@@ -891,7 +891,22 @@ pub async fn restrict(
     write_log(&session, "restrictions", &request, answer.as_ref());
     let answer = match answer {
         Ok(a) => a,
-        Err(e) => return refuse(jar, format!("Nothing was sent through: {}", e.detail())),
+        Err(e) => {
+            // The request may have reached the store before its answer was
+            // lost (a timeout after the commit), so whether it applied is
+            // unknown: say so, and read the store to show what it holds now.
+            // Nothing is exported as committed, since the console cannot
+            // prove it wrote the record; an unmatched-install alert on its
+            // own write is the safe side of that doubt, and the write log
+            // holds the attempt.
+            let mut msg = format!(
+                "The store's answer was lost ({}), so whether the request applied is unknown. \
+                 Check the restrictions before sending it again.",
+                e.detail()
+            );
+            msg.push_str(&now_holds(m, &ops).await);
+            return refuse(jar, msg);
+        }
     };
     if answer.status == StatusCode::OK {
         let done = written_ops(&answer.body);

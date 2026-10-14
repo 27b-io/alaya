@@ -195,10 +195,18 @@ impl StoreConfig {
                          ASCII characters with no space"
                     ));
                 }
+                // Parsed here, not first at bind time, so a typo refuses
+                // startup with the variable named, like every other value.
+                let metrics_addr = metrics_addr.unwrap_or_else(|| "0.0.0.0:9102".to_string());
+                if metrics_addr.parse::<std::net::SocketAddr>().is_err() {
+                    return Err(format!(
+                        "CONSOLE_METRICS_ADDR must be an ip:port listen address (got {metrics_addr:?})"
+                    ));
+                }
                 Ok(Some(StoreConfig {
                     url,
                     token: t,
-                    metrics_addr: metrics_addr.unwrap_or_else(|| "0.0.0.0:9102".to_string()),
+                    metrics_addr,
                 }))
             }
             (u, _) => Err(format!(
@@ -864,5 +872,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(addr.metrics_addr, "127.0.0.1:9999");
+        // A listen address that cannot bind refuses startup with its name,
+        // not a panic after the main listener is up.
+        let err = refused(StoreConfig::from_parts(u(), t(), Some("9102".into()), true));
+        assert!(err.starts_with("CONSOLE_METRICS_ADDR"), "{err}");
     }
 }
