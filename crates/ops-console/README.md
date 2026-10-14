@@ -211,17 +211,19 @@ policy fields: daily budget, utilization limit, models, pinned endpoints),
   anyway` typed: the store was rolled back or edited outside its write path,
   and a write would publish that content at a newer version. The same holds
   while that cannot be told: the metrics store does not answer, shows no
-  reader up, or shows a reader that is up but exports no alert series, which
-  a reader always exports, raised or not. A write still goes ahead once the
-  phrase is typed.
-- **The `restore` row check.** The target row's digest is checked against
-  the (version, digest) pairs instances installed in the last 30 days. A
-  version installed with another digest means the row was edited after the
-  fact, and the restore is refused. A version with no install on record needs
-  its version typed. A version on record whose row the store shows no digest
-  for (it shows them for its 50 newest rows) cannot be compared, and is
-  refused. An empty answer from the metrics store is unknown, and the restore
-  is refused. Both checks run again at commit.
+  reader up, or shows a reader that is up but does not export both of those
+  alerts, which a reader always exports, raised or not. A write still goes
+  ahead once the phrase is typed.
+- **The `restore` row check.** The store's dry run names the digest of the
+  history row it would restore, and the commit sends that digest back, so the
+  store refuses the restore, inside the commit's transaction, if the row
+  changed after the preview. The digest is checked against the (version,
+  digest) pairs instances installed in the last 30 days. A version installed
+  with another digest means the row was edited after the fact, and the
+  restore is refused. A version with no install on record needs its version
+  typed. An empty answer from the metrics store is unknown, and the restore is
+  refused. The check runs again at commit. A store whose dry run names no
+  digest cannot bind a restore, so the console offers none.
 - **TOML warnings.** A `delete` or `restore` preview names each client it
   drops that a stack's TOML still holds: on that stack the name goes back to
   its TOML policy and keys.
