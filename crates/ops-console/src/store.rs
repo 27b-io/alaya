@@ -431,7 +431,10 @@ mod tests {
 
     /// A key and its digest as the store mints them.
     fn minted(client: &str) -> Value {
-        let key = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_abcde";
+        let key = {
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32])
+        };
         let digest = crate::effect::hex(&sha2::Sha256::digest(key.as_bytes()));
         json!({"client": client, "id": format!("k{}", &digest[..7]), "key": key, "digest": digest})
     }
