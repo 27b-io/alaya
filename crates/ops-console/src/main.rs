@@ -4641,31 +4641,37 @@ mod tests {
         /// and reported as an unknown outcome with no key shown.
         #[tokio::test]
         async fn a_preview_answered_as_a_commit_is_an_unknown_outcome() {
-            let store = FakeStore::new(&World::new(vec![]));
             let (k, key) = minted("acme");
-            store.answer_post(StatusCode::OK, committed(V0 + 1, D1, json!([k])));
-            let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
-            let (cookie, csrf) = cookie_for(&state, "admin-sub");
-            let buf = testlog::LogBuf::default();
-            let _guard = buf.capture();
-            let resp = post_form(
-                &state,
-                &cookie,
-                "/lb/clients/preview",
-                doc_form(&csrf, &[("op", "add_key"), ("name", "acme")]),
-            )
-            .await;
-            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-            let msg = flash_of(&state, &resp).msg;
-            assert!(
-                msg.contains("answered the preview as if it were a commit"),
-                "{msg}"
-            );
-            assert!(msg.contains("its key was never shown"), "{msg}");
-            assert!(!msg.contains(&key));
-            let logged = buf.text();
-            assert!(logged.contains("client-store write committed"), "{logged}");
-            assert!(!logged.contains(&key), "{logged}");
+            // No dry-run mark, or one beside a version and keys: a commit.
+            let mut marked = committed(V0 + 1, D1, json!([k.clone()]));
+            marked["dry_run"] = json!(true);
+            for answer in [committed(V0 + 1, D1, json!([k])), marked] {
+                let store = FakeStore::new(&World::new(vec![]));
+                store.answer_post(StatusCode::OK, answer);
+                let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
+                let (cookie, csrf) = cookie_for(&state, "admin-sub");
+                let buf = testlog::LogBuf::default();
+                let guard = buf.capture();
+                let resp = post_form(
+                    &state,
+                    &cookie,
+                    "/lb/clients/preview",
+                    doc_form(&csrf, &[("op", "add_key"), ("name", "acme")]),
+                )
+                .await;
+                drop(guard);
+                assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+                let msg = flash_of(&state, &resp).msg;
+                assert!(
+                    msg.contains("answered the preview as if it were a commit"),
+                    "{msg}"
+                );
+                assert!(msg.contains("its key was never shown"), "{msg}");
+                assert!(!msg.contains(&key));
+                let logged = buf.text();
+                assert!(logged.contains("client-store write committed"), "{logged}");
+                assert!(!logged.contains(&key), "{logged}");
+            }
         }
 
         /// The restore row check: a row instances installed with its digest

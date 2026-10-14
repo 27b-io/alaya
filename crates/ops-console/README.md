@@ -200,21 +200,28 @@ policy fields: daily budget, utilization limit, models, pinned endpoints),
   and says what it holds.
 - **The key page.** `add_key`'s commit answers with the key page itself, not a
   redirect: the key the store minted, shown once, sent `Cache-Control:
-  no-store`. It never goes in the flash cookie, a URL or a log line (the write
-  log keeps each key's client, id and digest). Reloading it re-sends the
-  commit, which the store refuses with 409. Rotation with overlap: add a key,
-  move consumers to it, then revoke the old one.
+  no-store`. It never goes in the flash cookie, a URL or a log line: the write
+  log keeps only the answer members it knows, and each key's client, id and
+  digest. Reloading it re-sends the commit, which the store refuses with 409.
+  A preview whose answer is not a dry run's is reported as an unknown outcome
+  and logged, never rendered. Rotation with overlap: add a key, move consumers
+  to it, then revoke the old one.
 - **Typed confirmations.** While any instance reports the store behind or
   edited (`store_behind`, `store_edited`), every document write needs `write
   anyway` typed: the store was rolled back or edited outside its write path,
-  and a write would publish that content at a newer version.
+  and a write would publish that content at a newer version. The same holds
+  while that cannot be told: the metrics store does not answer, shows no
+  reader up, or shows a reader that is up but exports no alert series, which
+  a reader always exports, raised or not. A write still goes ahead once the
+  phrase is typed.
 - **The `restore` row check.** The target row's digest is checked against
   the (version, digest) pairs instances installed in the last 30 days. A
   version installed with another digest means the row was edited after the
-  fact, and the restore is refused. A version with no install on record, or a
-  row older than the 50 the store shows with a digest, needs its version
-  typed. An empty answer from the metrics store is unknown, and the restore is
-  refused. Both checks run again at commit.
+  fact, and the restore is refused. A version with no install on record needs
+  its version typed. A version on record whose row the store shows no digest
+  for (it shows them for its 50 newest rows) cannot be compared, and is
+  refused. An empty answer from the metrics store is unknown, and the restore
+  is refused. Both checks run again at commit.
 - **TOML warnings.** A `delete` or `restore` preview names each client it
   drops that a stack's TOML still holds: on that stack the name goes back to
   its TOML policy and keys.
@@ -246,9 +253,11 @@ client-store attempt that reaches its handler is logged on target
 `ops_console::write_log` with the subject: a refusal made before sending
 (CSRF, allowlist, malformed input, a missing confirmation), the request with
 the store's answer, or the upstream failure. A request without the console's
-own Origin is refused earlier, by middleware, before any session is read. An
-answer that is lost, or any 5xx, leaves the outcome unknown: the console says
-so, re-reads the store, and exports nothing as committed.
+own Origin is refused earlier, by middleware, before any session is read. A
+write is sent, logged and exported as committed in a task of its own, so a
+dropped connection cannot lose its log line or its labels. An answer that is
+lost, or any status but 200 or a 4xx refusal, leaves the outcome unknown: the
+console says so, re-reads the store, and exports nothing as committed.
 
 **What the metrics proxy must serve.** One route per metric, at
 `{METRICS_URL}/m/<metric>/api/v1/query`, each pinning `__name__` (and the
