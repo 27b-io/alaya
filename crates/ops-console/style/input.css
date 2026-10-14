@@ -1,15 +1,39 @@
 /*
  * Tailwind v4 source for ops-console. Theme tokens vendored from the Rust/UI
- * registry (github.com/rust-ui/ui, style/tailwind.css) — trimmed to the
- * tokens this console's vendored components actually use. Font stack is the
- * system stack: the console is tailnet-only and loads no external assets.
+ * Leptos registry (github.com/rust-ui/leptos-ui, style/tailwind.css), light
+ * and dark, trimmed to the tokens this console's vendored components
+ * actually use. Font stack is the system stack: the console is tailnet-only
+ * and loads no external assets.
  *
  * Regenerate static/console.css with scripts/build-css.sh.
  */
 @import "tailwindcss";
 @source "../src";
 
+/*
+ * Dark mode without JavaScript (the CSP allows none). The server puts the
+ * operator's saved choice on <html> as `dark` or `light` (theme.rs); with no
+ * choice saved, the OS setting decides. So `dark` matches an explicit dark
+ * choice, or a dark OS setting the operator has not overridden with `light`.
+ */
+@custom-variant dark {
+  &:where(.dark, .dark *) {
+    @slot;
+  }
+  @media (prefers-color-scheme: dark) {
+    &:where(:not(.light, .light *)) {
+      @slot;
+    }
+  }
+}
+
+/*
+ * `-light` / `-dark` name each status colour's role in the light theme: the
+ * tint behind a badge and the ink on it. The dark theme keeps the roles and
+ * swaps the values (a dark tint, a light ink), as upstream does.
+ */
 :root {
+  color-scheme: light;
   --radius: 0.625rem;
   --font-sans: ui-sans-serif, system-ui, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -38,6 +62,35 @@
   --warning-dark: oklch(0.35 0.16 55);
   --info-light: oklch(0.95 0.08 250);
   --info-dark: oklch(0.35 0.18 250);
+
+  @variant dark {
+    color-scheme: dark;
+    --background: oklch(0.18 0 0);
+    --foreground: oklch(0.985 0 0);
+    --card: oklch(0.205 0 0);
+    --card-foreground: oklch(0.985 0 0);
+    --primary: oklch(0.922 0 0);
+    --primary-foreground: oklch(0.205 0 0);
+    --secondary: oklch(0.269 0 0);
+    --secondary-foreground: oklch(0.985 0 0);
+    --muted: oklch(0.269 0 0);
+    --muted-foreground: oklch(0.708 0 0);
+    --accent: oklch(0.371 0 0);
+    --accent-foreground: oklch(0.985 0 0);
+    --destructive: oklch(0.704 0.191 22.216);
+    --destructive-foreground: oklch(0.985 0 0);
+    --destructive-light: oklch(0.25 0.08 22.216);
+    --destructive-dark: oklch(0.85 0.191 22.216);
+    --border: oklch(1 0 0 / 10%);
+    --input: oklch(1 0 0 / 15%);
+    --ring: oklch(0.556 0 0);
+    --success-light: oklch(0.25 0.08 145);
+    --success-dark: oklch(0.75 0.16 145);
+    --warning-light: oklch(0.25 0.08 55);
+    --warning-dark: oklch(0.75 0.16 55);
+    --info-light: oklch(0.25 0.08 250);
+    --info-dark: oklch(0.75 0.18 250);
+  }
 }
 
 @theme inline {

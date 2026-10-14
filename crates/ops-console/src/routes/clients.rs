@@ -329,6 +329,11 @@ fn page_html(session: &Session, flash: Option<Flash>, content: impl IntoView) ->
     page(TITLE, session, flash, content)
 }
 
+/// `page_html` for a page rendered as the answer to a POST (`ui::result_page`).
+fn result_page_html(session: &Session, content: impl IntoView) -> String {
+    result_page(TITLE, session, None, content)
+}
+
 fn verdict_badge(v: &Verdict) -> (String, &'static str, String) {
     match v {
         Verdict::InEffect => (badge(BadgeKind::Success), "in effect", String::new()),
