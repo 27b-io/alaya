@@ -2982,15 +2982,26 @@ impl MemoryService {
 
         // Insert-only: a store of the same text that lands after the read
         // above is never overwritten. Its memory is then the correction,
-        // checked as if it had been there all along.
+        // checked as if it had been there all along. A delete that races the
+        // insert leaves nothing of it, and nothing else is written yet.
         let stored = match existing {
             Some(_) => None,
             None => match self
                 .store_memory_mode(refutation.correction(), false, true)
-                .await?
+                .await
             {
-                Some(stored) => Some(stored),
-                None => {
+                Err(AlayaError::DeletedWhileStoring(_)) => {
+                    return Ok(RefuteStage::Refused(correction_refusal(
+                        "correction_deleted",
+                        content_hash,
+                        &correction_hash,
+                        "The correction was deleted while it was being stored; nothing was \
+                         written. Retry the refute",
+                    )));
+                }
+                Err(e) => return Err(e),
+                Ok(Some(stored)) => Some(stored),
+                Ok(None) => {
                     let Some(m) = self.vectors.get_by_hash(&correction_hash).await? else {
                         return Ok(RefuteStage::Refused(
                             self.correction_unreadable(content_hash, &correction_hash)
@@ -3050,13 +3061,12 @@ impl MemoryService {
                  meanwhile; nothing was written. Retry the refute",
             )
         };
-        Ok(serde_json::json!({
-            "success": false,
-            "status": status,
-            "content_hash": content_hash,
-            "correction_hash": correction_hash,
-            "error": error,
-        }))
+        Ok(correction_refusal(
+            status,
+            content_hash,
+            correction_hash,
+            error,
+        ))
     }
 
     /// Refute's second phase: supersede or link, on a stored correction.
@@ -4542,6 +4552,22 @@ fn superseded_refusal(content_hash: &str, marker: &Value, error: &str) -> Value 
         "status": "superseded",
         "content_hash": content_hash,
         "superseded_by": marker,
+        "error": error,
+    })
+}
+
+/// A refute whose correction could not be stored or read: nothing written.
+fn correction_refusal(
+    status: &str,
+    content_hash: &str,
+    correction_hash: &str,
+    error: &str,
+) -> Value {
+    serde_json::json!({
+        "success": false,
+        "status": status,
+        "content_hash": content_hash,
+        "correction_hash": correction_hash,
         "error": error,
     })
 }
@@ -11904,6 +11930,9 @@ mod tests {
         /// The next store finds a point with this hash, which is deleted
         /// before anything reads it back.
         point_deleted_after_insert: RefCell<Option<String>>,
+        /// The next store's point is deleted around its write: the store
+        /// fails as `DeletedWhileStoring` and leaves nothing.
+        store_raced_by_delete: Cell<bool>,
         /// A graph sweep's mark per node (LAB-9265).
         sweep_marks: RefCell<HashMap<String, String>>,
         /// A store's point write that lands just before the sweep's mark,
@@ -12077,6 +12106,9 @@ mod tests {
         /// A plain upsert; the store contract's carry-over is pinned against
         /// Qdrant in alaya-backends.
         async fn store(&self, m: &Memory, mode: StoreMode) -> Result<(bool, String)> {
+            if self.0.store_raced_by_delete.take() {
+                return Err(AlayaError::DeletedWhileStoring(m.content_hash.clone()));
+            }
             let mut mems = self.0.memories.borrow_mut();
             if let Some(first) = self.0.store_lands_first.borrow_mut().take() {
                 mems.push(first);
@@ -13946,6 +13978,42 @@ mod tests {
             assert_eq!(out["success"], false, "{out}");
             assert_eq!(out["status"], want);
             assert_eq!(out["correction_hash"], fix);
+            assert!(ledger.contradicts.borrow().is_empty(), "nothing linked");
+        }
+    }
+
+    /// A delete that races the correction's own insert is the typed
+    /// `correction_deleted` refusal, never the store's error: nothing of the
+    /// correction survives and nothing else is written, so a retry is safe.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refute_whose_correction_store_races_a_delete_is_correction_deleted() {
+        for supersede in [true, false] {
+            let a = h('a');
+            let fix = generate_content_hash("the port is 3001");
+            let ledger = Ledger::with(&[&a]);
+            ledger.store_raced_by_delete.set(true);
+            let svc = ledger.service();
+            let out = svc
+                .memory_refute(&a, refutation("the port is 3001", supersede))
+                .await
+                .unwrap();
+            assert_eq!(out["success"], false, "{out}");
+            assert_eq!(out["status"], "correction_deleted");
+            assert_eq!(out["content_hash"], a);
+            assert_eq!(out["correction_hash"], fix);
+            assert!(
+                out["error"].as_str().unwrap().contains("Retry the refute"),
+                "{out}"
+            );
+            assert!(
+                !ledger
+                    .memories
+                    .borrow()
+                    .iter()
+                    .any(|m| m.content_hash == fix),
+                "nothing stored"
+            );
+            assert_eq!(ledger.marker(&a), None);
             assert!(ledger.contradicts.borrow().is_empty(), "nothing linked");
         }
     }

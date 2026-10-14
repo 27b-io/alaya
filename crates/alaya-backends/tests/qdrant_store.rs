@@ -490,7 +490,7 @@ async fn store_fails_closed_when_retrieve_has_no_result() {
 
 /// The same rule on the read-back: a malformed answer is a storage error, not
 /// "the point is gone" — reading it as absent would report a landed store as
-/// deleted (`Conflict`).
+/// deleted (`DeletedWhileStoring`).
 #[tokio::test]
 async fn store_fails_closed_when_readback_has_no_result() {
     let (server, fake) = fake_with(Some(existing_payload())).await;
@@ -1439,7 +1439,7 @@ async fn writer_that_loses_every_race_gives_up_after_eight_conditional_attempts(
 
 /// A delete landing between a writer's read and its conditional write: the
 /// write is rejected and the point stays deleted. A store says so
-/// (`Conflict` — nothing of it survived); a patch or generated summary of a
+/// (`DeletedWhileStoring` — nothing of it survived); a patch or generated summary of a
 /// memory that no longer exists is `NotFound`; a supersession skips it (a
 /// deleted memory needs no marker, and the rest of a batch has committed, so
 /// its caller must go on to write the graph edges); an access count on
@@ -1457,7 +1457,10 @@ async fn delete_inside_a_writers_window_is_never_undone() {
 
         let result = run(&client_for(&server), writer).await;
         match writer {
-            Writer::Store => assert!(matches!(result, Err(AlayaError::Conflict(_))), "{result:?}"),
+            Writer::Store => assert!(
+                matches!(result, Err(AlayaError::DeletedWhileStoring(_))),
+                "{result:?}"
+            ),
             Writer::Patch | Writer::GeneratedSummary => {
                 assert!(
                     matches!(result, Err(AlayaError::NotFound(_))),

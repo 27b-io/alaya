@@ -6575,6 +6575,197 @@ mod wedge_tests {
         .await;
     }
 
+    /// VectorStorage whose every store is raced by a delete, as when the
+    /// point goes before or after the store's conditional write. The store
+    /// path's neighbour search finds nothing; nothing else is called.
+    struct RacedStoreVectors;
+
+    #[async_trait(?Send)]
+    impl VectorStorage for RacedStoreVectors {
+        async fn reverse_supersession(
+            &self,
+            _h: &str,
+            _e: &serde_json::Value,
+            _r: &alaya_backends::ReversalRecord,
+        ) -> Result<alaya_backends::ReversalOutcome> {
+            unimplemented!()
+        }
+        async fn store(&self, memory: &Memory, _mode: StoreMode) -> Result<(bool, String)> {
+            Err(alaya_types::AlayaError::DeletedWhileStoring(format!(
+                "memory {} was deleted while it was being stored",
+                memory.content_hash
+            )))
+        }
+        async fn get_by_hash(&self, _content_hash: &str) -> Result<Option<Memory>> {
+            unimplemented!()
+        }
+        async fn set_generated_summary(
+            &self,
+            _content_hash: &str,
+            _summary: &str,
+            _summary_embedding: Option<Vec<f32>>,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn get_batch(&self, _hashes: &[&str]) -> Result<Vec<Memory>> {
+            unimplemented!()
+        }
+        async fn delete(&self, _content_hash: &str) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn update_metadata(
+            &self,
+            _content_hash: &str,
+            _updates: MetadataUpdate,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+        async fn patch_memory(
+            &self,
+            _content_hash: &str,
+            _patch: &PatchMemoryRequest,
+        ) -> Result<Memory> {
+            unimplemented!()
+        }
+        async fn search_by_vector(
+            &self,
+            _embedding: &[f32],
+            _limit: usize,
+            _filters: Option<PayloadFilter>,
+        ) -> Result<Vec<ScoredMemory>> {
+            Ok(Vec::new())
+        }
+        async fn search_by_tags(
+            &self,
+            _tags: &[&str],
+            _match_all: bool,
+            _limit: usize,
+            _mt: Option<&str>,
+            _mts: Option<f64>,
+            _mca: Option<f64>,
+        ) -> Result<Vec<ScoredMemory>> {
+            unimplemented!()
+        }
+        async fn search_similar_tags(
+            &self,
+            _tag_embedding: &[f32],
+            _limit: usize,
+        ) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_all(&self, _limit: usize, _offset: Option<&str>) -> Result<ScrollResult> {
+            unimplemented!()
+        }
+        async fn get_recent(
+            &self,
+            _limit: usize,
+            _start_from: Option<f64>,
+            _memory_type: Option<&str>,
+        ) -> Result<Vec<Memory>> {
+            unimplemented!()
+        }
+        async fn count(&self) -> Result<usize> {
+            unimplemented!()
+        }
+        async fn get_all_tags(&self) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+        async fn increment_access_count(&self, _content_hash: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn health(&self) -> Result<HealthStatus> {
+            unimplemented!()
+        }
+    }
+
+    /// A store raced by a delete tells its caller so, on REST `POST /store`
+    /// and on MCP `store_memory` alike: `success: false` with the store
+    /// race's own message, never the edge-delete refusal's advice.
+    #[tokio::test]
+    async fn store_raced_by_a_delete_says_so_on_rest_and_mcp() {
+        use tower::ServiceExt;
+
+        let want = alaya_types::AlayaError::DeletedWhileStoring(String::new()).safe_message();
+        let svc = MemoryService::new(
+            Box::new(RacedStoreVectors),
+            Box::new(StubEmbeddings),
+            Box::new(StubGraph { panic_stats: false }),
+            Box::new(StubHebbian),
+            Box::new(StubConsolidation),
+            None,
+        );
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::channel::<Cmd>(8);
+                tokio::task::spawn_local(service_worker(
+                    rx,
+                    svc,
+                    Arc::new(AtomicU64::new(0)),
+                    WorkerLimits::default(),
+                ));
+                let app = protected_router(ServiceHandle { tx }, test_auth_state());
+                let post = |uri: &str, body: Value| {
+                    axum::http::Request::post(uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::ACCEPT, "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap()
+                };
+                let read = async |resp: axum::response::Response| -> Value {
+                    assert_eq!(resp.status(), StatusCode::OK);
+                    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                        .await
+                        .unwrap();
+                    serde_json::from_slice(&bytes).unwrap()
+                };
+
+                let rest = read(
+                    app.clone()
+                        .oneshot(post("/store", json!({"content": "the port is 3001"})))
+                        .await
+                        .unwrap(),
+                )
+                .await;
+                let mcp = read(
+                    app.clone()
+                        .oneshot(post(
+                            "/mcp",
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "store_memory",
+                                    "arguments": {"content": "the port is 3001"},
+                                },
+                            }),
+                        ))
+                        .await
+                        .unwrap(),
+                )
+                .await;
+                let text = mcp["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("no tool result: {mcp}"));
+                let mcp: Value = serde_json::from_str(text).unwrap();
+
+                for (surface, reply) in [("REST", rest), ("MCP", mcp)] {
+                    assert_eq!(reply["success"], false, "{surface}: {reply}");
+                    assert_eq!(reply["error"], want, "{surface}: {reply}");
+                    assert!(
+                        !reply.to_string().contains("Edge"),
+                        "{surface} carries the edge-delete text: {reply}"
+                    );
+                }
+            })
+            .await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn store_is_not_held_behind_a_running_slow_search() {
         store_is_not_held_behind(1).await;
