@@ -69,7 +69,11 @@ impl IntoResponse for AppError {
         .to_html();
         (
             status,
-            Html(crate::ui::document("Error — ops console", body)),
+            Html(crate::ui::document(
+                "Error — ops console",
+                crate::theme::Theme::System,
+                body,
+            )),
         )
             .into_response()
     }

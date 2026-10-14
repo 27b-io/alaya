@@ -30,6 +30,7 @@ mod store;
 mod testkit;
 #[cfg(test)]
 mod testlog;
+mod theme;
 mod ui;
 
 use axum::Router;
@@ -166,6 +167,7 @@ fn routes() -> Vec<(&'static str, axum::routing::MethodRouter<AppState>)> {
         ("/auth/login", get(routes::auth::login)),
         ("/auth/callback", get(routes::auth::callback)),
         ("/auth/logout", post(routes::auth::logout)),
+        ("/prefs/theme", post(routes::prefs::set_theme)),
         ("/", get(routes::home::home)),
         ("/alaya", get(routes::alaya::browse)),
         ("/alaya/memory/{hash}", get(routes::alaya::detail)),
@@ -432,6 +434,146 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        // Both ways into the dark theme ship in the stylesheet: an explicit
+        // choice, and the OS setting when no choice overrides it. Missing
+        // means static/console.css was not regenerated (scripts/build-css.sh).
+        let css = body_string(resp).await;
+        assert!(css.contains(":root:where(.dark,.dark *){color-scheme:dark;"));
+        assert!(css.contains(
+            "@media (prefers-color-scheme:dark){:root:where(:not(.light,.light *)){color-scheme:dark;"
+        ));
+    }
+
+    /// Every page renders in the saved theme: a class on `<html>` for an
+    /// explicit choice and none without one, so the OS decides. The switch in
+    /// the header marks the current choice.
+    #[tokio::test]
+    async fn every_page_renders_in_the_saved_theme() {
+        let state = test_state();
+        let sess = session::new_session("admin-sub".into(), None, None);
+        let session_cookie = session_cookie_header(&state, &sess);
+        for (saved, html_tag, scheme, current) in [
+            (None, "<html lang=\"en\">", "light dark", "System"),
+            (
+                Some("dark"),
+                "<html lang=\"en\" class=\"dark\">",
+                "dark",
+                "Dark",
+            ),
+            (
+                Some("light"),
+                "<html lang=\"en\" class=\"light\">",
+                "light",
+                "Light",
+            ),
+            // An unknown value is no choice at all, never a failed page.
+            (
+                Some("solarized"),
+                "<html lang=\"en\">",
+                "light dark",
+                "System",
+            ),
+        ] {
+            let cookie = match saved {
+                Some(v) => format!(
+                    "{session_cookie}; {}",
+                    encrypted_cookie_header(&state, theme::THEME_COOKIE, v.into())
+                ),
+                None => session_cookie.clone(),
+            };
+            let (status, html) = get_page(&state, &cookie, "/").await;
+            assert_eq!(status, StatusCode::OK, "{saved:?}");
+            assert!(
+                html.starts_with(&format!("<!DOCTYPE html>{html_tag}")),
+                "{saved:?}: {html}"
+            );
+            assert!(
+                html.contains(&format!(
+                    "<meta name=\"color-scheme\" content=\"{scheme}\">"
+                )),
+                "{saved:?}"
+            );
+            assert!(html.contains("action=\"/prefs/theme\""), "{saved:?}");
+            assert_eq!(html.matches("aria-pressed=\"true\"").count(), 1);
+            assert!(
+                html.contains(&format!(
+                    "aria-label=\"{current} theme\" aria-pressed=\"true\""
+                )),
+                "{saved:?}: {html}"
+            );
+        }
+    }
+
+    /// The switch saves the choice in a cookie that the next page reads
+    /// back, returns to the page it was on, and `system` forgets the choice.
+    #[tokio::test]
+    async fn the_theme_switch_saves_the_choice_and_returns_to_the_page() {
+        let state = test_state();
+        let sess = session::new_session("admin-sub".into(), None, None);
+        let cookie = session_cookie_header(&state, &sess);
+        let switch = |cookie: String, theme: &'static str| {
+            app(state.clone()).oneshot(
+                HttpRequest::post("/prefs/theme")
+                    .header(header::ORIGIN, "https://console.test")
+                    .header(header::REFERER, "https://console.test/alaya?q=x")
+                    .header(header::COOKIE, cookie)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("csrf={}&theme={theme}", sess.csrf)))
+                    .unwrap(),
+            )
+        };
+        let theme_cookie = |resp: &Response| {
+            resp.headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .find(|v| v.starts_with("console_theme="))
+                .map(str::to_string)
+        };
+
+        let resp = switch(cookie.clone(), "dark").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&resp), "/alaya?q=x");
+        let saved = theme_cookie(&resp).expect("a theme cookie");
+        for attr in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/"] {
+            assert!(saved.contains(attr), "{saved}");
+        }
+        // Sent back the way a browser would, it is what the page reads.
+        let with_theme = format!("{cookie}; {}", saved.split(';').next().unwrap());
+        let (_, html) = get_page(&state, &with_theme, "/").await;
+        assert!(html.contains("<html lang=\"en\" class=\"dark\">"), "{html}");
+
+        let resp = switch(with_theme, "system").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let cleared = theme_cookie(&resp).expect("a removal cookie");
+        assert!(cleared.contains("Max-Age=0"), "{cleared}");
+    }
+
+    #[tokio::test]
+    async fn the_theme_switch_refuses_a_bad_token_or_an_unknown_theme() {
+        let state = test_state();
+        let sess = session::new_session("admin-sub".into(), None, None);
+        let cookie = session_cookie_header(&state, &sess);
+        let sets_theme = |resp: &Response| {
+            resp.headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .any(|v| v.starts_with("console_theme="))
+        };
+        let resp = post_form(
+            &state,
+            &cookie,
+            "/prefs/theme",
+            "csrf=wrong&theme=dark".into(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(!sets_theme(&resp));
+        let body = format!("csrf={}&theme=solarized", sess.csrf);
+        let resp = post_form(&state, &cookie, "/prefs/theme", body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(!sets_theme(&resp));
     }
 
     #[tokio::test]
@@ -1226,6 +1368,33 @@ mod tests {
         let mut config = test_config();
         config.alaya_url = fake_upstream(upstream).await.parse().unwrap();
         render(AppState::new(config), "/alaya/health").await
+    }
+
+    /// The `action` of every form on a page other than the page shell's own
+    /// (logout and the theme switch, neither of which calls an upstream). A
+    /// form with no `action` posts back to the page, and is listed as "".
+    fn content_form_actions(html: &str) -> Vec<String> {
+        html.split("<form")
+            .skip(1)
+            .map(|rest| {
+                let tag = rest.split('>').next().unwrap_or("");
+                tag.split("action=\"")
+                    .nth(1)
+                    .and_then(|a| a.split('"').next())
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .filter(|a| a != "/auth/logout" && a != "/prefs/theme")
+            .collect()
+    }
+
+    #[test]
+    fn content_form_actions_lists_only_the_pages_own_forms() {
+        let html = "<form method=\"post\" action=\"/prefs/theme\"></form>\
+                    <form method=\"post\" action=\"/alaya/supersede\"></form>\
+                    <form method=\"post\" action=\"/auth/logout\"></form>\
+                    <form method=\"get\"></form>";
+        assert_eq!(content_form_actions(html), ["/alaya/supersede", ""]);
     }
 
     async fn render(state: AppState, path: &str) -> (StatusCode, String) {
@@ -2793,10 +2962,10 @@ mod tests {
         // Download health: alerts and signals.
         assert!(html.contains("slskd unreachable: connection refused"));
         assert!(html.contains("queue_count"));
-        // AC3: the logout form is the only form; no approve/enqueue button.
-        assert_eq!(html.matches("<form").count(), 1, "{html}");
+        // AC3: no approve/enqueue path. The shell's forms are the only
+        // forms, and with no JavaScript a button outside a form does nothing.
+        assert_eq!(content_form_actions(&html), Vec::<String>::new(), "{html}");
         assert!(html.contains("action=\"/auth/logout\""));
-        assert_eq!(html.matches("<button").count(), 1, "{html}");
         assert!(!html.contains(SELECTA_KEY));
     }
 
@@ -2957,7 +3126,7 @@ mod tests {
         let (status, html) = render(state.clone(), &format!("/selecta/task/{FAILED_ID}")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("full trace line two"), "{html}");
-        assert_eq!(html.matches("<form").count(), 1);
+        assert_eq!(content_form_actions(&html), Vec::<String>::new());
         // A task selecta does not know: the tool error, named — not a blank.
         let (status, html) = render(state, &format!("/selecta/task/{GATED_ID}")).await;
         assert_eq!(status, StatusCode::OK);
@@ -3791,14 +3960,16 @@ mod tests {
                     ("memory_b_hash", &h2),
                     ("pair", &pair),
                     ("back", "/"),
+                    ("theme", "dark"),
                 ]);
                 let before = seen();
                 let post = post_form(&state, &cookie, &path, sink).await;
                 if post.status() == StatusCode::METHOD_NOT_ALLOWED {
                     continue;
                 }
-                // Logout ends a session and calls nothing.
-                if route != "/auth/logout" {
+                // Logout ends a session, and the theme switch sets a
+                // cookie: neither calls anything.
+                if route != "/auth/logout" && route != "/prefs/theme" {
                     assert!(
                         seen() > before,
                         "{route} takes a POST that reached no upstream: extend the form"
@@ -5292,6 +5463,7 @@ mod tests {
                     ("duplicate_hashes", &h2),
                     ("pair", &pair),
                     ("content", "x"),
+                    ("theme", "dark"),
                 ]);
                 let resp = post_form(&state, &cookie, &path, body).await;
                 if resp.status() == StatusCode::METHOD_NOT_ALLOWED {
@@ -5300,8 +5472,9 @@ mod tests {
                 assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{route}");
                 checked += 1;
             }
-            // Ten memory-curation writes and three client-store writes.
-            assert!(checked >= 13, "only {checked} write routes were driven");
+            // Ten memory-curation writes, three client-store writes and the
+            // theme switch.
+            assert!(checked >= 14, "only {checked} write routes were driven");
             assert!(
                 alaya.lock().unwrap().is_empty(),
                 "{:?}",

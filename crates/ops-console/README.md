@@ -378,9 +378,23 @@ scripts/build-css.sh                # regenerate static/console.css (Tailwind v4
 `static/console.css` is generated from `style/input.css` and **checked in**
 so builds never need node/tailwind. Regenerate it whenever a Tailwind class
 is added/changed in `src/**` (the pre-commit `end-of-file-fixer` will touch
-it; that's fine).
+it; that's fine). Nothing else catches a stale file: Tailwind emits only the
+classes it finds in `src/`, so a class added without a rebuild ships with no
+rule and its element renders unstyled, silently.
 
-UI components are copy-paste vendored from the [Rust/UI registry]
-(https://github.com/rust-ui/ui) (`app_crates/registry/src/ui/*.rs`), class
+UI components are copy-paste vendored from the Rust/UI registry, class
 strings verbatim, `variants!`/`clx!` macros expanded to plain Leptos
-components — see `src/ui.rs`.
+components — see `src/ui.rs`. The Leptos registry now lives at
+[rust-ui/leptos-ui](https://github.com/rust-ui/leptos-ui)
+(`app_crates/registry/src/ui/*.rs`, theme tokens in `style/tailwind.css`);
+[rust-ui/ui](https://github.com/rust-ui/ui) has moved to Dioxus.
+
+**Theme.** Every colour is a CSS variable in `style/input.css`, defined once
+for light and once under `@variant dark`; components use the token classes
+(`bg-card`, `text-muted-foreground`, …), never a palette colour, so a new
+component is dark-mode-ready by construction. A new token needs a value in
+both blocks and a `--color-*` line in `@theme inline`. The theme switch in the
+page header saves the operator's choice in the encrypted `console_theme`
+cookie (`src/theme.rs`); the page renders it as `class="dark"` or
+`class="light"` on `<html>`, and with no choice saved the OS setting
+(`prefers-color-scheme`) decides. No JavaScript is involved.

@@ -1,7 +1,8 @@
 //! Vendored Rust/UI components + page shell.
 //!
-//! Components are copy-paste vendored from the Rust/UI registry
-//! (github.com/rust-ui/ui, `app_crates/registry/src/ui/*.rs`) per the
+//! Components are copy-paste vendored from the Rust/UI Leptos registry
+//! (then github.com/rust-ui/ui, now github.com/rust-ui/leptos-ui;
+//! `app_crates/registry/src/ui/*.rs`) per the
 //! registry's shadcn-style model: the class strings are kept verbatim; the
 //! `variants!`/`clx!` macros are expanded to plain functions so the console
 //! doesn't take `leptos_ui`/`tw_merge` dependencies for an SSR-only app.
@@ -13,6 +14,7 @@
 use leptos::prelude::*;
 
 use crate::session::{Flash, Session};
+use crate::theme::Theme;
 
 // ─── Buttons (vendored: ui/button.rs) ───────────────────────────────────────
 
@@ -30,7 +32,7 @@ pub fn btn(v: Btn) -> String {
     let variant = match v {
         Btn::Default => "bg-primary text-primary-foreground shadow-xs hover:bg-primary/90",
         Btn::Destructive => {
-            "bg-destructive text-white shadow-xs hover:bg-destructive/90 focus-visible:ring-destructive/20"
+            "bg-destructive text-white shadow-xs hover:bg-destructive/90 focus-visible:ring-destructive/20 dark:focus-visible:ring-destructive/40 dark:bg-destructive/60"
         }
         Btn::Outline => {
             "border bg-background shadow-xs hover:bg-accent hover:text-accent-foreground"
@@ -63,7 +65,7 @@ pub fn badge(kind: BadgeKind) -> String {
         BadgeKind::Secondary => "border-transparent bg-secondary text-secondary-foreground",
         BadgeKind::Muted => "border-transparent bg-muted text-muted-foreground",
         BadgeKind::Destructive => {
-            "border-transparent shadow bg-destructive text-destructive-foreground"
+            "border-transparent shadow bg-destructive text-destructive-foreground dark:bg-destructive/60"
         }
         BadgeKind::Success => "border-transparent bg-success-light text-success-dark",
         BadgeKind::Warning => "border-transparent bg-warning-light text-warning-dark",
@@ -178,18 +180,115 @@ fn escape_html(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Full HTML document around already-rendered body HTML.
-pub fn document(title: &str, body_html: String) -> String {
+/// Full HTML document around already-rendered body HTML, in `theme`. Pages
+/// rendered without a session (errors) pass `Theme::System`.
+pub fn document(title: &str, theme: Theme, body_html: String) -> String {
+    let class = theme
+        .html_class()
+        .map(|c| format!(" class=\"{c}\""))
+        .unwrap_or_default();
     format!(
-        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+        "<!DOCTYPE html><html lang=\"en\"{class}><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <meta name=\"color-scheme\" content=\"{}\">\
          <meta name=\"referrer\" content=\"same-origin\">\
          <title>{}</title>\
          <link rel=\"stylesheet\" href=\"/static/console.css\"></head>\
          <body class=\"bg-background text-foreground font-sans antialiased\">{}</body></html>",
+        theme.color_scheme(),
         escape_html(title),
         body_html
     )
+}
+
+// ─── Theme switch ───────────────────────────────────────────────────────────
+
+/// Lucide icons (ISC), inline: the CSP loads nothing but the stylesheet.
+fn theme_icon(theme: Theme) -> AnyView {
+    match theme {
+        Theme::System => view! {
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect width="20" height="14" x="2" y="3" rx="2" />
+                <line x1="8" x2="16" y1="21" y2="21" />
+                <line x1="12" x2="12" y1="17" y2="21" />
+            </svg>
+        }
+        .into_any(),
+        Theme::Light => view! {
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="4" />
+                <path d="M12 2v2" />
+                <path d="M12 20v2" />
+                <path d="m4.93 4.93 1.41 1.41" />
+                <path d="m17.66 17.66 1.41 1.41" />
+                <path d="M2 12h2" />
+                <path d="M20 12h2" />
+                <path d="m6.34 17.66-1.41 1.41" />
+                <path d="m19.07 4.93-1.41 1.41" />
+            </svg>
+        }
+        .into_any(),
+        Theme::Dark => view! {
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
+            </svg>
+        }
+        .into_any(),
+    }
+}
+
+/// One icon button showing the current theme; it opens a menu of the three
+/// choices, each a submit button of one POST form carrying the session's CSRF
+/// token, like logout. A `<details>` disclosure, so it needs no JavaScript,
+/// and one icon wide, so the header row keeps its width.
+fn theme_switch(current: Theme, csrf: String) -> impl IntoView {
+    let options = Theme::ALL
+        .into_iter()
+        .map(|t| {
+            let (label, name) = match t {
+                Theme::System => ("System theme", "System"),
+                Theme::Light => ("Light theme", "Light"),
+                Theme::Dark => ("Dark theme", "Dark"),
+            };
+            let class = if t == current {
+                "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm bg-accent text-accent-foreground"
+            } else {
+                "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm text-foreground hover:bg-accent hover:cursor-pointer"
+            };
+            view! {
+                <button
+                    type="submit"
+                    name="theme"
+                    value=t.as_str()
+                    aria-label=label
+                    aria-pressed=(t == current).to_string()
+                    class=class
+                >
+                    {theme_icon(t)}
+                    {name}
+                </button>
+            }
+        })
+        .collect_view();
+    view! {
+        <details class="relative">
+            <summary
+                title="Theme"
+                aria-label="Theme"
+                class="flex h-8 w-8 list-none items-center justify-center rounded-md hover:bg-accent hover:text-foreground hover:cursor-pointer [&::-webkit-details-marker]:hidden"
+            >
+                {theme_icon(current)}
+            </summary>
+            <form
+                method="post"
+                action="/prefs/theme"
+                class="absolute right-0 z-20 mt-2 w-36 rounded-md border bg-card p-1 shadow-md"
+            >
+                <input type="hidden" name="csrf" value=csrf />
+                {options}
+            </form>
+        </details>
+    }
 }
 
 fn flash_banner(flash: &Flash) -> impl IntoView + use<> {
@@ -216,6 +315,7 @@ pub fn page(
 ) -> String {
     let who = session.display_name().to_string();
     let csrf = session.csrf.clone();
+    let switch = theme_switch(session.theme, session.csrf.clone());
     let body = view! {
         <div class="min-h-screen">
             <header class="border-b bg-card">
@@ -232,6 +332,7 @@ pub fn page(
                         <a class="hover:text-foreground" href="/selecta">"selecta"</a>
                     </nav>
                     <div class="ml-auto flex items-center gap-3 text-sm text-muted-foreground">
+                        {switch}
                         <span>{who}</span>
                         <form method="post" action="/auth/logout">
                             <input type="hidden" name="csrf" value=csrf />
@@ -249,7 +350,7 @@ pub fn page(
         </div>
     }
     .to_html();
-    document(title, body)
+    document(title, session.theme, body)
 }
 
 #[cfg(test)]
@@ -258,7 +359,7 @@ mod tests {
 
     #[test]
     fn document_escapes_title() {
-        let html = document("<script>alert(1)</script>", String::new());
+        let html = document("<script>alert(1)</script>", Theme::System, String::new());
         assert!(!html.contains("<script>alert(1)</script>"));
         assert!(html.contains("&lt;script&gt;"));
     }
