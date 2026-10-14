@@ -199,9 +199,14 @@ This slice carries the kill switch, at `/lb/clients`:
 
 Every write re-checks the session's subject against
 `CONSOLE_ALLOWED_SUBJECTS` (otherwise read only at login), after the CSRF
-token and the Origin check. Every attempt, refusals and upstream failures
-included, is logged on target `ops_console::write_log` with the subject, the
-request and the store's answer.
+token and the Origin check. Every attempt that reaches the write handler is
+logged on target `ops_console::write_log` with the subject: a refusal made
+before sending (CSRF, allowlist, malformed input), the request with the
+store's answer, or the upstream failure. A request without the console's own
+Origin is refused earlier, by middleware, before any session is read. An
+answer that is lost, or a 503 from the store's restrictions object, leaves
+the outcome unknown: the console says so, re-reads the store, and exports
+nothing as committed.
 
 **What the metrics proxy must serve.** One route per metric, at
 `{METRICS_URL}/m/<metric>/api/v1/query`, each pinning `__name__` (and the
@@ -210,8 +215,9 @@ LB's scrape job) with `extra_label` so a query can only narrow it:
 and `anthropic_client_store_unmatched_disabled_name`. A query outside a pin
 comes back empty, which the console reads as "nothing visible", never as
 healthy. Each reader stack's series must carry `stack="<name>"`, the name the
-store gives it (its reader role, `reader:<name>`); series without a `stack`
-label belong to no stack.
+store gives it (its reader role, `reader:<name>`). A reader series without a
+`stack` label leaves every stack judged from the metrics store unknown, naming
+the instance: dropped, it would let its stack read as in effect without it.
 
 **Committed labels.** On `CONSOLE_METRICS_ADDR` the console serves
 `ops_console_committed_record{name,version}`, one series per restriction

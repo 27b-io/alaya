@@ -4,12 +4,14 @@
 //!
 //! Every query goes through its own pinned route (`MetricsClient::instant`),
 //! one metric each, and instances are grouped by the `stack` label the
-//! scraper puts on them, which names the stack as the store does. A series
-//! with no `stack` label belongs to no stack and is left out.
+//! scraper puts on them, which names the stack as the store does. Every
+//! series the `up` route returns is a reader, so a reader series with no
+//! `stack` label leaves every stack judged here unknown: dropped, it would let
+//! its stack read as in effect without it.
 //!
-//! Anything in the cluster can write the metrics store today, so nothing here
-//! may stop a restriction op: these values feed the display and the
-//! in-effect judgement, which only ever withholds a confirmation.
+//! Metrics values are untrusted input, so nothing here may stop or delay a
+//! restriction op: they feed the display and the in-effect judgement, which
+//! only ever withholds a confirmation.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -65,7 +67,7 @@ pub async fn read(metrics: &MetricsClient) -> Fleet {
             .collect::<BTreeSet<_>>()
     });
     let stacks = match (up, sets, &behind) {
-        (Ok(up), Ok(sets), Ok(behind)) => Ok(instances(&up, &sets, behind)),
+        (Ok(up), Ok(sets), Ok(behind)) => instances(&up, &sets, behind),
         (Err(e), _, _) | (_, Err(e), _) => Err(err(e)),
         (_, _, Err(e)) => Err(e.clone()),
     };
@@ -90,11 +92,24 @@ pub async fn read(metrics: &MetricsClient) -> Fleet {
 /// Instances per stack. The list comes from `up`, one entry per scraped
 /// instance: an instance whose gauge lingers after its scrape went away is
 /// not listed. Its restrictions series are counted raw, every series kept.
+/// A reader series with no `stack` label is an error naming its instance.
 fn instances(
     up: &[Series],
     sets: &[Series],
     behind: &BTreeSet<String>,
-) -> BTreeMap<String, Vec<Instance>> {
+) -> Result<BTreeMap<String, Vec<Instance>>, String> {
+    let unlabeled: BTreeSet<&str> = up
+        .iter()
+        .chain(sets)
+        .filter(|s| stack_of(s).is_none())
+        .map(|s| instance_of(s).unwrap_or("a series with no pod or instance label"))
+        .collect();
+    if !unlabeled.is_empty() {
+        return Err(format!(
+            "reader series without a stack label ({}), so their stack cannot be told",
+            unlabeled.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
     let mut by_stack: BTreeMap<String, BTreeMap<String, Instance>> = BTreeMap::new();
     for s in up {
         let (Some(stack), Some(id)) = (stack_of(s), instance_of(s)) else {
@@ -122,10 +137,10 @@ fn instances(
                 .push(s.labels.get("set_hash").cloned().unwrap_or_default());
         }
     }
-    by_stack
+    Ok(by_stack
         .into_iter()
         .map(|(stack, m)| (stack, m.into_values().collect()))
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -148,8 +163,6 @@ mod tests {
             series(&[("stack", "k3s"), ("pod", "lb-a")], 1.0),
             series(&[("stack", "k3s"), ("pod", "lb-b")], 0.0),
             series(&[("stack", "cloudflare"), ("instance", "edge:443")], 1.0),
-            // No stack label: belongs to no stack the store names.
-            series(&[("pod", "lb-old")], 1.0),
         ];
         let sets = vec![
             series(
@@ -167,7 +180,7 @@ mod tests {
             ),
         ];
         let behind: BTreeSet<String> = ["k3s/lb-b".to_string()].into();
-        let m = instances(&up, &sets, &behind);
+        let m = instances(&up, &sets, &behind).unwrap();
         let k3s = &m["k3s"];
         assert_eq!(k3s.len(), 2);
         let a = k3s.iter().find(|i| i.id == "lb-a").unwrap();
@@ -176,6 +189,29 @@ mod tests {
         let b = k3s.iter().find(|i| i.id == "lb-b").unwrap();
         assert!(!b.up && b.behind && b.set_hashes.is_empty());
         assert_eq!(m["cloudflare"][0].id, "edge:443");
-        assert!(!m.contains_key(""));
+    }
+
+    /// A reader the console cannot place in a stack must not drop out of
+    /// one: it would let that stack read as in effect without it.
+    #[test]
+    fn a_reader_without_a_stack_label_makes_the_stacks_unknown() {
+        let up = vec![
+            series(&[("stack", "k3s"), ("pod", "lb-a")], 1.0),
+            series(&[("pod", "lb-b")], 1.0),
+        ];
+        let sets = vec![series(
+            &[("stack", "k3s"), ("pod", "lb-a"), ("set_hash", "h1")],
+            1.0,
+        )];
+        let err = instances(&up, &sets, &BTreeSet::new()).unwrap_err();
+        assert!(err.contains("lb-b"), "{err}");
+        // An unlabeled restrictions series counts the same.
+        let up = vec![series(&[("stack", "k3s"), ("pod", "lb-a")], 1.0)];
+        let sets = vec![series(&[("pod", "lb-c"), ("set_hash", "h1")], 1.0)];
+        assert!(
+            instances(&up, &sets, &BTreeSet::new())
+                .unwrap_err()
+                .contains("lb-c")
+        );
     }
 }

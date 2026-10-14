@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordState {
     Disabled,
     Enabled,
@@ -60,9 +60,6 @@ pub struct Op {
 /// The restrictions part the store serves to polls now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServedPart {
-    /// Changes whenever the served bytes change; the console re-reads it after
-    /// reading the metrics store, and confirms nothing if it moved.
-    pub tag: String,
     /// The set hash an instance reports once it holds exactly this part's
     /// records and digests. Checked here against the body it summarises.
     pub set_hash: String,
@@ -148,7 +145,7 @@ pub fn parse_part(part: Option<&Value>) -> Result<ServedPart, String> {
             .map(str::to_string)
             .ok_or_else(|| format!("the part's {k} is missing or malformed"))
     };
-    let (tag, served_hash) = (field("tag")?, field("set_hash")?);
+    let served_hash = field("set_hash")?;
     let body: PartBody = part
         .get("body")
         .and_then(Value::as_str)
@@ -179,7 +176,6 @@ pub fn parse_part(part: Option<&Value>) -> Result<ServedPart, String> {
         return Err("the part's set hash does not match its body".into());
     }
     Ok(ServedPart {
-        tag,
         set_hash: served_hash,
         full: body.full,
         records,
@@ -204,7 +200,7 @@ pub struct Report {
 }
 
 /// One instance as the metrics store shows it.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Instance {
     /// The pod, or the scrape instance where there is no pod.
     pub id: String,
@@ -467,7 +463,7 @@ mod tests {
         bad["body"] = json!("{not json");
         assert!(parse_part(Some(&bad)).is_err());
         let mut bad = served(true, &[], &[]);
-        bad["tag"] = json!("short");
+        bad["set_hash"] = json!("short");
         assert!(parse_part(Some(&bad)).is_err());
         // A record the console cannot place in the set text.
         let mut bad = served(true, &[], &[]);

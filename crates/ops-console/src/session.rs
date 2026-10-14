@@ -198,6 +198,32 @@ pub fn flash_cookie(jar: PrivateCookieJar, f: &Flash, secure: bool) -> PrivateCo
     jar.add(base_cookie(FLASH_COOKIE, value, secure, 120))
 }
 
+/// Ceiling on a flash message, in characters. The flash rides an encrypted
+/// cookie, and a cookie over the browser's ~4 KiB limit is dropped silently,
+/// taking the message with it.
+const MAX_FLASH_CHARS: usize = 1500;
+
+/// POST-redirect-GET with a one-shot banner: set the flash, then 303 to `to`.
+pub fn flash_redirect(
+    jar: PrivateCookieJar,
+    secure: bool,
+    kind: &str,
+    msg: String,
+    to: &str,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let msg = crate::routes::clip(&msg, MAX_FLASH_CHARS);
+    let jar = flash_cookie(
+        jar,
+        &Flash {
+            kind: kind.into(),
+            msg,
+        },
+        secure,
+    );
+    (jar, axum::response::Redirect::to(to)).into_response()
+}
+
 pub fn read_login(jar: &PrivateCookieJar) -> Option<LoginState> {
     let c = jar.get(LOGIN_COOKIE)?;
     let s: LoginState = serde_json::from_str(c.value()).ok()?;

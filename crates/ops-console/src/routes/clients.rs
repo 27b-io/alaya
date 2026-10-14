@@ -8,15 +8,15 @@
 //! After a write the console shows, per stack, whether it is in effect, and
 //! refreshes until it is or until it has said why not (`effect.rs`).
 //!
-//! No metrics-store value can stop a restriction op. The handlers that send
-//! one never read the metrics store first: anything in the cluster can write
-//! it, and a kill switch that a forged sample could hold up would not be one.
+//! No metrics-store value can stop or delay a restriction op. Metrics values
+//! are untrusted input, so the handlers that send one never read the metrics
+//! store first.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use axum::extract::{RawQuery, State};
 use axum::http::{HeaderValue, StatusCode, header};
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum_extra::extract::cookie::PrivateCookieJar;
 use leptos::either::Either;
 use leptos::prelude::*;
@@ -28,7 +28,7 @@ use crate::effect::{self, Carried, Op, RecordState, Report, ServedPart, Sight, V
 use crate::error::AppError;
 use crate::fleet::{self, Fleet};
 use crate::routes::{clip, fmt_epoch, unavailable};
-use crate::session::{Flash, Session, flash_cookie, take_flash};
+use crate::session::{Flash, Session, flash_redirect, take_flash};
 use crate::state::{AppState, StoreModule};
 use crate::store::{Answer, RestrictionOp, has_code, refusal_lines};
 use crate::ui::*;
@@ -46,6 +46,9 @@ const MAX_REASON_CHARS: usize = 200;
 /// A request carries at most this many ops.
 const MAX_OPS: usize = 100;
 
+/// Why nothing is confirmed when the store's answer names no stack that counts.
+const NO_STACKS: &str = "the store's answer named no stacks, so nothing can be confirmed";
+
 /// How long the effect page keeps refreshing: readers poll every 5 s and the
 /// metrics store scrapes every 30 s, so a write is normally confirmed within
 /// a minute. After this the page stays put and says what is not in effect.
@@ -55,10 +58,6 @@ const REFRESH_EVERY: &str = "5";
 /// Ceiling on a write-log field built from a request or an answer. The
 /// answer is upstream text bounded only by the body cap.
 const MAX_LOGGED_CHARS: usize = 16 * 1024;
-
-fn module(state: &AppState) -> Option<&StoreModule> {
-    state.store.as_ref()
-}
 
 // ─── One judgement-grade read ───────────────────────────────────────────────
 
@@ -221,7 +220,7 @@ pub async fn pane(
     RawQuery(raw): RawQuery,
 ) -> Result<(PrivateCookieJar, Html<String>), AppError> {
     let (jar, flash) = take_flash(jar);
-    let Some(m) = module(&state) else {
+    let Some(m) = state.store.as_ref() else {
         return Ok((jar, Html(page_html(&session, flash, not_configured()))));
     };
     // `?disable=<name>` prefills the disable form (a client row's button, or
@@ -249,7 +248,7 @@ pub async fn disable_page(
     RawQuery(raw): RawQuery,
 ) -> Result<(PrivateCookieJar, Html<String>), AppError> {
     let (jar, flash) = take_flash(jar);
-    if module(&state).is_none() {
+    if state.store.as_ref().is_none() {
         return Ok((jar, Html(page_html(&session, flash, not_configured()))));
     }
     let prefill = prefill_of(raw.as_deref());
@@ -278,6 +277,13 @@ fn kill_switch_card(csrf: &str, prefill: &str) -> impl IntoView + use<> {
             <CardContent>{form}</CardContent>
         </Card>
     }
+}
+
+fn capitalise(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
 }
 
 fn page_html(session: &Session, flash: Option<Flash>, content: impl IntoView) -> String {
@@ -330,6 +336,17 @@ fn warnings(r: &Reading, part: &Result<ServedPart, String>) -> impl IntoView + u
         )),
         Ok(_) => {}
         Err(e) => items.push((warning.clone(), format!("Restrictions-behind alerts unreadable (metrics store: {e})."))),
+    }
+    // A failed read of the readers' unmatched names hides the only flag on a
+    // mistyped disable, which still reads as in effect: say it is missing.
+    if let Err(e) = &r.fleet.unmatched {
+        items.push((
+            warning.clone(),
+            format!("Unmatched disabled names unreadable (metrics store: {e}): a mistyped disable is not flagged."),
+        ));
+    }
+    if stacks_of(&r.store).is_empty() {
+        items.push((destructive.clone(), format!("{}.", capitalise(NO_STACKS))));
     }
     let doc = r.store.get("document");
     if doc.and_then(|d| d.get("status")).and_then(Value::as_str) != Some("ok") {
@@ -693,14 +710,29 @@ fn clients_card(store: &Value) -> impl IntoView + use<> {
 /// would keep writing for the rest of its session. The Origin check has
 /// already run, as middleware, before any handler.
 pub fn guard_write(state: &AppState, session: &Session, csrf: &str) -> Result<(), AppError> {
-    session.verify_csrf(csrf)?;
+    if let Err(e) = session.verify_csrf(csrf) {
+        refused_locally(session, "CSRF token mismatch");
+        return Err(e);
+    }
     if !state.config.subject_allowed(&session.sub) {
-        tracing::warn!(sub = ?session.sub, "client-store write refused: subject no longer allowlisted");
+        refused_locally(session, "subject no longer allowlisted");
         return Err(AppError::Forbidden(
             "this subject is no longer allowed to write".into(),
         ));
     }
     Ok(())
+}
+
+/// A write refused before anything was sent to the store, logged with the
+/// subject on the write log like every other attempt.
+fn refused_locally(session: &Session, why: &str) {
+    tracing::warn!(
+        target: "ops_console::write_log",
+        sub = ?session.sub,
+        kind = "restrictions",
+        why = %clip(why, 300),
+        "client-store write refused before sending"
+    );
 }
 
 /// The actor the store records on each op: the session's email when the IdP
@@ -774,26 +806,6 @@ fn write_log(session: &Session, kind: &str, request: &Value, outcome: Result<&An
     }
 }
 
-fn redirect_with(
-    jar: PrivateCookieJar,
-    secure: bool,
-    kind: &str,
-    msg: String,
-    to: &str,
-) -> Response {
-    // The flash rides an encrypted cookie with a ~4 KiB ceiling.
-    let msg = clip(&msg, 1500);
-    let jar = flash_cookie(
-        jar,
-        &Flash {
-            kind: kind.into(),
-            msg,
-        },
-        secure,
-    );
-    (jar, Redirect::to(to)).into_response()
-}
-
 #[derive(Deserialize)]
 pub struct RestrictForm {
     #[serde(default)]
@@ -825,15 +837,17 @@ pub async fn restrict(
     jar: PrivateCookieJar,
     axum_extra::extract::Form(form): axum_extra::extract::Form<RestrictForm>,
 ) -> Result<Response, AppError> {
-    let Some(m) = module(&state) else {
+    let Some(m) = state.store.as_ref() else {
         return Err(AppError::NotFound(
             "the client-store module is not configured".into(),
         ));
     };
     guard_write(&state, &session, &form.csrf)?;
     let secure = state.secure_cookies();
+    // A refusal made here, before anything is sent, is an attempt too.
     let refuse = |jar: PrivateCookieJar, msg: String| -> Result<Response, AppError> {
-        Ok(redirect_with(jar, secure, "error", msg, "/lb/clients"))
+        refused_locally(&session, &msg);
+        Ok(flash_redirect(jar, secure, "error", msg, "/lb/clients"))
     };
 
     let name = form.name.trim().to_string();
@@ -855,7 +869,10 @@ pub async fn restrict(
             .and_then(|(n, v)| Some((n, v.parse::<u64>().ok()?)))
             .filter(|(n, _)| is_name(n));
         let Some((n, v)) = parsed else {
-            return Err(AppError::BadRequest("malformed name to enable".into()));
+            return refuse(
+                jar,
+                "A name to enable in the same request is malformed.".into(),
+            );
         };
         ops.push(RestrictionOp::Enable {
             name: n.to_string(),
@@ -864,24 +881,29 @@ pub async fn restrict(
             reason: reason.clone(),
         });
     }
-    ops.push(match form.action.as_str() {
+    let last = match form.action.as_str() {
         "disable" => RestrictionOp::Disable {
             name: name.clone(),
             actor: actor.clone(),
             reason: reason.clone(),
         },
-        "enable" => RestrictionOp::Enable {
-            name: name.clone(),
-            expected_version: form
-                .expected_version
-                .trim()
-                .parse()
-                .map_err(|_| AppError::BadRequest("enable needs the version it read".into()))?,
-            actor: actor.clone(),
-            reason: reason.clone(),
+        "enable" => match form.expected_version.trim().parse() {
+            Ok(v) => RestrictionOp::Enable {
+                name: name.clone(),
+                expected_version: v,
+                actor: actor.clone(),
+                reason: reason.clone(),
+            },
+            Err(_) => {
+                return refuse(
+                    jar,
+                    "enable needs the version of the record it read.".into(),
+                );
+            }
         },
-        _ => return Err(AppError::BadRequest("action is disable or enable".into())),
-    });
+        _ => return refuse(jar, "The action is disable or enable.".into()),
+    };
+    ops.push(last);
     if ops.len() > MAX_OPS {
         return refuse(jar, format!("A request carries at most {MAX_OPS} ops."));
     }
@@ -892,24 +914,41 @@ pub async fn restrict(
     let answer = match answer {
         Ok(a) => a,
         Err(e) => {
-            // The request may have reached the store before its answer was
-            // lost (a timeout after the commit), so whether it applied is
-            // unknown: say so, and read the store to show what it holds now.
-            // Nothing is exported as committed, since the console cannot
-            // prove it wrote the record; an unmatched-install alert on its
-            // own write is the safe side of that doubt, and the write log
-            // holds the attempt.
-            let mut msg = format!(
-                "The store's answer was lost ({}), so whether the request applied is unknown. \
-                 Check the restrictions before sending it again.",
-                e.detail()
-            );
-            msg.push_str(&now_holds(m, &ops).await);
-            return refuse(jar, msg);
+            let msg = unknown_outcome(
+                m,
+                &ops,
+                &format!("the store's answer was lost ({})", e.detail()),
+            )
+            .await;
+            return Ok(flash_redirect(jar, secure, "error", msg, "/lb/clients"));
         }
     };
+    // The store answers 503 to any failure of the restrictions object's call,
+    // a connection dropped after its commit included: that is a lost answer too.
+    if answer.status == StatusCode::SERVICE_UNAVAILABLE
+        && has_code(&answer.body, "store.unavailable")
+    {
+        let why = format!(
+            "the store answered 503: {}",
+            refusal_lines(&answer.body).join("; ")
+        );
+        let msg = unknown_outcome(m, &ops, &why).await;
+        return Ok(flash_redirect(jar, secure, "error", msg, "/lb/clients"));
+    }
     if answer.status == StatusCode::OK {
-        let done = written_ops(&answer.body);
+        let done = match written_ops(&answer.body, ops.len()) {
+            Ok(done) => done,
+            Err(e) => {
+                // Committed, but which records it wrote, at which versions, is
+                // unreadable: nothing can be confirmed or exported as committed.
+                let mut msg = format!(
+                    "The store committed the request, but its answer could not be read ({e}), \
+                     so nothing is confirmed or exported as committed."
+                );
+                msg.push_str(&now_holds(m, &ops).await);
+                return Ok(flash_redirect(jar, secure, "error", msg, "/lb/clients"));
+            }
+        };
         for op in &done {
             m.committed.record(&op.name, op.version);
         }
@@ -923,7 +962,7 @@ pub async fn restrict(
         } else {
             format!("Committed: {summary}. Confirming on every stack…")
         };
-        return Ok(redirect_with(jar, secure, "ok", msg, &effect_href(&done)));
+        return Ok(flash_redirect(jar, secure, "ok", msg, &effect_href(&done)));
     }
     let mut msg = format!(
         "The store refused the request ({}): {}.",
@@ -940,7 +979,22 @@ pub async fn restrict(
     } else {
         "/lb/clients".to_string()
     };
-    Ok(redirect_with(jar, secure, "error", msg, &to))
+    Ok(flash_redirect(jar, secure, "error", msg, &to))
+}
+
+/// A request that may or may not have applied: its answer was lost, or the
+/// store's call to its restrictions object failed, possibly after the commit.
+/// Say so and read the store to show what it holds now. Nothing is exported
+/// as committed, since the console cannot prove it wrote the record; an
+/// unmatched-install alert on its own write is the safe side of that doubt,
+/// and the write log holds the attempt.
+async fn unknown_outcome(m: &StoreModule, ops: &[RestrictionOp], why: &str) -> String {
+    let mut msg = format!(
+        "Whether the request applied is unknown: {why}. Check the restrictions before \
+         sending it again."
+    );
+    msg.push_str(&now_holds(m, ops).await);
+    msg
 }
 
 /// After a 409: what the store holds now for each name the request named.
@@ -969,24 +1023,35 @@ async fn now_holds(m: &StoreModule, ops: &[RestrictionOp]) -> String {
     format!(" Re-read the store: {}.", now.join("; "))
 }
 
-/// The ops a 200 actually wrote. An `enable` of a name already enabled
-/// writes nothing and returns the existing record: there is nothing new to
-/// confirm or to export as committed.
-fn written_ops(answer: &Value) -> Vec<Op> {
-    answer
+/// The ops a 200 actually wrote, read strictly: one readable result per op
+/// sent, in order. An `enable` of a name already enabled writes nothing and
+/// returns the existing record, so there is nothing new to confirm or to
+/// export as committed. An answer that cannot be read in full is an error,
+/// never "nothing changed".
+fn written_ops(answer: &Value, sent: usize) -> Result<Vec<Op>, String> {
+    let results = answer
         .get("results")
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|r| r.get("written").and_then(Value::as_bool) == Some(true))
-        .filter_map(|r| {
+        .ok_or("no results")?;
+    if results.len() != sent {
+        return Err(format!("{} results for {sent} ops", results.len()));
+    }
+    let mut done = Vec::new();
+    for r in results {
+        let op = (|| {
             Some(Op {
                 name: r.get("name")?.as_str().filter(|n| is_name(n))?.to_string(),
                 state: RecordState::parse(r.get("state")?.as_str()?)?,
                 version: r.get("version")?.as_u64()?,
             })
-        })
-        .collect()
+        })();
+        match (op, r.get("written").and_then(Value::as_bool)) {
+            (Some(op), Some(true)) => done.push(op),
+            (Some(_), Some(false)) => {}
+            _ => return Err("a result is malformed".into()),
+        }
+    }
+    Ok(done)
 }
 
 // ─── After a write: in effect per stack ─────────────────────────────────────
@@ -1043,7 +1108,7 @@ pub async fn effect(
     RawQuery(raw): RawQuery,
 ) -> Result<Response, AppError> {
     let (jar, flash) = take_flash(jar);
-    let Some(m) = module(&state) else {
+    let Some(m) = state.store.as_ref() else {
         return Ok((jar, Html(page_html(&session, flash, not_configured()))).into_response());
     };
     let (ops, at) = parse_effect_query(raw.as_deref())?;
@@ -1064,10 +1129,13 @@ pub async fn effect(
     let judged: Vec<(Op, Result<effect::Judged, String>)> = ops
         .into_iter()
         .map(|op| {
-            let j = part
-                .as_ref()
-                .map(|p| effect::judge_op(&op, p, &sights, reading.tag_stable))
-                .map_err(Clone::clone);
+            // An answer that names no stack would judge each op on an empty
+            // table and read as settled: it is unreadable instead.
+            let j = match &part {
+                Err(e) => Err(e.clone()),
+                Ok(_) if sights.is_empty() => Err(NO_STACKS.to_string()),
+                Ok(p) => Ok(effect::judge_op(&op, p, &sights, reading.tag_stable)),
+            };
             (op, j)
         })
         .collect();
@@ -1079,7 +1147,10 @@ pub async fn effect(
         }
         Err(_) => true,
     });
-    let refresh = settling && crate::session::now_epoch() - at < REFRESH_FOR_SECS;
+    // `at` comes from the URL: a time in the future, or one so far back that
+    // the subtraction would overflow, never keeps a page refreshing.
+    let now = crate::session::now_epoch();
+    let refresh = settling && at <= now && now.saturating_sub(at) < REFRESH_FOR_SECS;
     let content = view! {
         <div class="space-y-6">
             {warnings(&reading, &part)}

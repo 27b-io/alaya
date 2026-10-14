@@ -4,7 +4,7 @@
 //! results follow POST-redirect-GET with a flash banner.
 
 use axum::extract::{Path, Query, RawQuery, State};
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum_extra::extract::cookie::PrivateCookieJar;
 use leptos::either::Either;
 use leptos::prelude::*;
@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use crate::alaya::Unsupersede;
 use crate::error::AppError;
 use crate::routes::{clip, fmt_epoch, short_hash, validate_hash, vf, vs};
-use crate::session::{Flash, Session, flash_cookie, take_flash};
+use crate::session::{Flash, Session, flash_redirect, take_flash};
 use crate::state::AppState;
 use crate::ui::*;
 
@@ -47,24 +47,6 @@ fn is_superseded(v: &Value) -> bool {
     v.get("metadata")
         .and_then(|m| m.get("superseded_by"))
         .is_some()
-}
-
-fn flash_redirect(
-    jar: PrivateCookieJar,
-    secure: bool,
-    kind: &str,
-    msg: String,
-    to: &str,
-) -> Response {
-    let jar = flash_cookie(
-        jar,
-        &Flash {
-            kind: kind.into(),
-            msg,
-        },
-        secure,
-    );
-    (jar, Redirect::to(to)).into_response()
 }
 
 fn memory_href(hash: &str) -> String {

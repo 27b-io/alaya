@@ -25,8 +25,8 @@ pub struct LbModule {
 }
 
 /// Client-store module, present only when configured — see `StoreConfig`.
-/// It carries its own handle on the metrics store, which its config requires,
-/// so no handler has to reach into the LB module and assume it is there.
+/// It carries a handle on the metrics store, which its config requires, so no
+/// handler has to reach into the LB module and assume it is there.
 #[derive(Clone)]
 pub struct StoreModule {
     pub client: StoreClient,
@@ -85,13 +85,15 @@ impl AppState {
             .selecta
             .as_ref()
             .map(|c| SelectaClient::new(c.url.clone(), c.api_key.clone()));
+        // The store module reads the same metrics store as the LB module,
+        // through the same client: its config requires that module.
         let store = config
             .store
             .as_ref()
-            .zip(config.lb.as_ref())
+            .zip(lb.as_ref())
             .map(|(s, l)| StoreModule {
                 client: StoreClient::new(s.url.clone(), s.token.clone()),
-                metrics: MetricsClient::new(l.metrics_url.clone()),
+                metrics: l.metrics.clone(),
                 committed: Arc::new(Committed::default()),
             });
         let oidc = Arc::new(OidcRp::new(

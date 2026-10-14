@@ -106,11 +106,10 @@ impl StoreClient {
         let (status, text) = text_body("client store", req).await?;
         match serde_json::from_str::<Value>(&text) {
             Ok(body) if body.is_object() => Ok(Answer { status, body }),
-            // The edge blocks the admin path from every IP but one, and its
-            // block page is HTML: say what most likely happened, without
-            // echoing a body that is not the store's.
+            // Every answer the store writes is a JSON object; anything else
+            // is not the store's, and only its status is worth showing.
             _ => Err(AppError::Upstream(format!(
-                "client store {status}: the answer was not the store's JSON (blocked at the edge?)"
+                "client store {status}: the answer was not the store's JSON"
             ))),
         }
     }
