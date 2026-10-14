@@ -228,6 +228,7 @@ pub fn page(
                         <a class="hover:text-foreground" href="/alaya/health">"Judge health"</a>
                         <a class="hover:text-foreground" href="/alaya/auth">"Auth state"</a>
                         <a class="hover:text-foreground" href="/lb">"anthropic-lb"</a>
+                        <a class="hover:text-foreground" href="/lb/clients">"LB clients"</a>
                         <a class="hover:text-foreground" href="/selecta">"selecta"</a>
                     </nav>
                     <div class="ml-auto flex items-center gap-3 text-sm text-muted-foreground">

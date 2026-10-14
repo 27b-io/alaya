@@ -90,6 +90,33 @@ pub fn live_budgets(stats: &Value) -> (BTreeMap<String, (f64, f64)>, bool) {
     (local, fleet_true)
 }
 
+/// One series of an instant vector: its labels and its sample value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Series {
+    pub labels: BTreeMap<String, String>,
+    pub value: f64,
+}
+
+/// An instant vector's series. A series whose value is not a number is
+/// dropped rather than read as zero.
+fn parse_vector(body: &Value) -> Vec<Series> {
+    body.pointer("/data/result")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            let labels = s
+                .get("metric")?
+                .as_object()?
+                .iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect();
+            let value = s.pointer("/value/1")?.as_str()?.parse::<f64>().ok()?;
+            Some(Series { labels, value })
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct MetricsClient {
     base: url::Url,
@@ -154,6 +181,24 @@ impl MetricsClient {
             base,
             http: http::client(Duration::from_secs(20)),
         }
+    }
+
+    /// One instant query through the route the metrics proxy pins to
+    /// `metric`: `{base}/m/{metric}/api/v1/query`. The proxy adds the pin to
+    /// every selector, so `query` can only narrow what the route lets through,
+    /// and a query outside the pin comes back empty, not refused. An empty
+    /// result is returned as an empty list: whether that means "none" or
+    /// "unknown" is the caller's call.
+    pub async fn instant(&self, metric: &str, query: &str) -> Result<Vec<Series>, AppError> {
+        let req = self
+            .http
+            .get(join(&self.base, &format!("/m/{metric}/api/v1/query")))
+            .query(&[("query", query)]);
+        let body = json_body("metrics", req).await?;
+        if body.get("status").and_then(Value::as_str) != Some("success") {
+            return Err(AppError::Upstream("metrics: query did not succeed".into()));
+        }
+        Ok(parse_vector(&body))
     }
 
     pub async fn daily_burn(&self) -> Result<DailyBurn, AppError> {
@@ -256,6 +301,22 @@ mod tests {
         // Nothing budgeted anywhere is not a degraded state.
         let (m, fleet) = live_budgets(&json!({"client_budgets": null}));
         assert!(fleet && m.is_empty());
+    }
+
+    #[test]
+    fn parse_vector_reads_labels_and_values_and_drops_garbage() {
+        let body = json!({"status": "success", "data": {"resultType": "vector", "result": [
+            {"metric": {"__name__": "up", "stack": "k3s", "pod": "lb-a"}, "value": [1789826976.5, "1"]},
+            {"metric": {"stack": "k3s", "pod": "lb-b"}, "value": [1789826976.5, "0"]},
+            {"metric": {"pod": "lb-c"}, "value": [1789826976.5, "NaN?"]},
+            {"metric": {"pod": "lb-d"}}
+        ]}});
+        let v = parse_vector(&body);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].labels["pod"], "lb-a");
+        assert_eq!(v[0].value, 1.0);
+        assert_eq!(v[1].value, 0.0);
+        assert!(parse_vector(&json!({"status": "success", "data": {"result": []}})).is_empty());
     }
 
     #[test]
