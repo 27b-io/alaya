@@ -459,7 +459,10 @@ async fn restore_racing_a_delete_does_not_resurrect() {
 
     assert_eq!(b, json!(true));
     let err = a.expect_err("A must not report a store that the delete removed");
-    assert!(matches!(err, AlayaError::Conflict(_)), "got {err:?}");
+    assert!(
+        matches!(err, AlayaError::DeletedWhileStoring(_)),
+        "got {err:?}"
+    );
     assert!(
         coll.payload(&hash).await.is_none(),
         "the deleted point stayed deleted"

@@ -51,9 +51,17 @@ pub enum AlayaError {
 
     /// Refused because the write would destroy audit state: today, deleting
     /// a `CONTRADICTS` edge that carries a judge verdict or an operator
-    /// resolution (LAB-3885 AC-6). The safe message names the way out.
+    /// resolution (LAB-3885 AC-6). The safe message names the way out. A
+    /// store raced by a delete is `DeletedWhileStoring`, never this.
     #[error("conflict: {0}")]
     Conflict(String),
+
+    /// A store raced by a delete: the point was deleted before or after the
+    /// store's conditional write, so nothing of the store survives. Never
+    /// retried in-process: a retry could resurrect a memory deleted after
+    /// the write landed. The caller decides whether to store it again.
+    #[error("deleted while storing: {0}")]
+    DeletedWhileStoring(String),
 }
 
 impl AlayaError {
@@ -73,6 +81,7 @@ impl AlayaError {
             Self::Unavailable { .. } => -32009,
             Self::Serialization(_) => -32600,
             Self::Conflict(_) => -32010,
+            Self::DeletedWhileStoring(_) => -32011,
         }
     }
 
@@ -94,6 +103,9 @@ impl AlayaError {
             Self::Serialization(_) => "Invalid request format",
             Self::Conflict(_) => {
                 "Edge carries a verdict, a resolution or a refute's reason; resolve it (keep_both / supersede) instead of deleting"
+            }
+            Self::DeletedWhileStoring(_) => {
+                "Memory was deleted while it was being stored; nothing of this store was kept. Store it again to recreate it"
             }
         }
     }

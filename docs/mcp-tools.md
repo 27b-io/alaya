@@ -51,6 +51,8 @@ Embed text and persist it. Returns the new memory's `content_hash` and its neare
 
 When `dedup_threshold` skipped the write: `{ "success": true, "duplicate": true, "existing_hash": "<64-hex>", "similarity": 0.97, "content_hash": "<64-hex>", "message": "Duplicate detected, storage skipped" }`. Nothing is stored and no neighbours are returned.
 
+When the memory is deleted while the store runs, before or after its write lands: `{ "success": false, "error": "Memory was deleted while it was being stored; nothing of this store was kept. Store it again to recreate it" }`. Nothing of the store survives, and the server never retries it, since a retry could bring back a memory deleted after the write had landed. Store it again if you still want it.
+
 **Example:**
 
 ```json
@@ -350,7 +352,7 @@ Any other argument, `metadata` included, is a `-32602` error.
 | `correction_superseded` | The correction's content is stored already as a superseded memory, and a store would keep it hidden. Unsupersede it, or word the correction differently. |
 | `correction_exists` | The correction's content is stored already as a live memory, and `field` names the first field you sent that it does not have. Refute without that field, or update that memory first. |
 | `correction_unreadable` | A point holds the correction's content but its payload does not parse. Repair or delete that point, or word the correction differently. |
-| `correction_deleted` | Another caller stored the correction's content and deleted it while this call ran. Retry the refute. |
+| `correction_deleted` | The correction's content was deleted while this call ran: another caller stored and deleted it, or it was deleted while this call stored it. Retry the refute. |
 
 If the correction is stored but the second step fails, or its outcome could not be read back ("unknown outcome" in the error; a supersede that was sent but not confirmed is read back first and reported as `superseded` when it landed with your reason, else `conflict`), the result is `{ success: false, status: "partial", correction_hash, failed_step: "supersede" | "contradicts_edge", error, existing, stored? }`; a link that found a graph node missing counts as a failed `contradicts_edge`. The correction **is stored**: retry the same refute, which reuses it. A failed `supersede` can also be finished with [`memory_supersede`](#memory_supersede); a failed `contradicts_edge` only by the retry, since only a refute's own link stores the reason ([`relation`](#relation) `create` would leave the edge without it). A timeout error also leaves the correction possibly stored; retrying the refute is safe.
 

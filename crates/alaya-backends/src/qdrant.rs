@@ -1423,7 +1423,7 @@ impl VectorStorage for QdrantClient {
             // Deleted after our write or before it: either way nothing of
             // this store survives, and retrying could resurrect a memory
             // deleted after our write had landed. Say so.
-            Some(Update::Deleted) => Err(AlayaError::Conflict(format!(
+            Some(Update::Deleted) => Err(AlayaError::DeletedWhileStoring(format!(
                 "memory {hash} was deleted while it was being stored; store it again to keep it"
             ))),
             Some(Update::Unconfirmed(why)) => {

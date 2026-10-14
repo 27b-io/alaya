@@ -119,7 +119,7 @@ pub trait VectorStorage {
     /// the trait docs), so a write that landed in between is never rolled
     /// back and a deleted record is never brought back from that copy. A
     /// delete that lands while the store is in flight is reported as
-    /// `AlayaError::Conflict`: nothing of the store survives it.
+    /// `AlayaError::DeletedWhileStoring`: nothing of the store survives it.
     async fn store(&self, memory: &Memory, mode: StoreMode) -> Result<(bool, String)>;
     async fn get_by_hash(&self, content_hash: &str) -> Result<Option<Memory>>;
     async fn get_batch(&self, hashes: &[&str]) -> Result<Vec<Memory>>;
