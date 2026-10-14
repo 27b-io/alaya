@@ -505,7 +505,13 @@ pub async fn browse(
 
     Ok((
         jar,
-        Html(page("Memories — ops console", &session, flash, content)),
+        Html(page(
+            "Memories — ops console",
+            Nav::Memories,
+            &session,
+            flash,
+            content,
+        )),
     ))
 }
 
@@ -913,7 +919,13 @@ pub async fn detail(
 
     Ok((
         jar,
-        Html(page("Memory — ops console", &session, flash, content)),
+        Html(page(
+            "Memory — ops console",
+            Nav::Memories,
+            &session,
+            flash,
+            content,
+        )),
     ))
 }
 
@@ -1030,7 +1042,13 @@ pub async fn supersede_form(
 
     Ok((
         jar,
-        Html(page("Supersede — ops console", &session, flash, content)),
+        Html(page(
+            "Supersede — ops console",
+            Nav::Memories,
+            &session,
+            flash,
+            content,
+        )),
     ))
 }
 
@@ -1448,7 +1466,13 @@ pub async fn duplicates(
 
     Ok((
         jar,
-        Html(page("Duplicates — ops console", &session, flash, content)),
+        Html(page(
+            "Duplicates — ops console",
+            Nav::Duplicates,
+            &session,
+            flash,
+            content,
+        )),
     ))
 }
 
@@ -1546,7 +1570,13 @@ pub async fn merge_submit(
         };
         return Ok((
             jar,
-            Html(page("Merge preview — ops console", &session, None, content)),
+            Html(page(
+                "Merge preview — ops console",
+                Nav::Duplicates,
+                &session,
+                None,
+                content,
+            )),
         )
             .into_response());
     }
@@ -2029,6 +2059,7 @@ pub async fn contradictions(
         jar,
         Html(page(
             "Contradictions — ops console",
+            Nav::Contradictions,
             &session,
             flash,
             content,
@@ -2183,6 +2214,7 @@ pub async fn pair_page(
         jar,
         Html(page(
             "Contradiction pair — ops console",
+            Nav::Contradictions,
             &session,
             flash,
             content,
@@ -2528,7 +2560,13 @@ pub async fn auth_view(
 
     Ok((
         jar,
-        Html(page("Auth state — ops console", &session, flash, content)),
+        Html(page(
+            "Auth state — ops console",
+            Nav::Auth,
+            &session,
+            flash,
+            content,
+        )),
     ))
 }
 

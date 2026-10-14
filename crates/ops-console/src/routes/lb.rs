@@ -23,7 +23,7 @@ use serde_json::Value;
 
 use crate::error::AppError;
 use crate::lb::{DailyBurn, fmt_tokens, live_budgets};
-use crate::routes::{fmt_epoch, unavailable, vf, vs};
+use crate::routes::{fmt_epoch, vf, vs};
 use crate::session::{Session, take_flash};
 use crate::state::AppState;
 use crate::ui::*;
@@ -48,7 +48,7 @@ pub async fn pane(
                 </CardHeader>
             </Card>
         };
-        return Ok((jar, Html(page(TITLE, &session, flash, content))));
+        return Ok((jar, Html(page(TITLE, Nav::Lb, &session, flash, content))));
     };
 
     // Sections are independent: a dark metrics store must not hide live
@@ -62,7 +62,7 @@ pub async fn pane(
             {accounts_card(&stats)}
         </div>
     };
-    Ok((jar, Html(page(TITLE, &session, flash, content))))
+    Ok((jar, Html(page(TITLE, Nav::Lb, &session, flash, content))))
 }
 
 // ─── Rendering helpers ──────────────────────────────────────────────────────
@@ -91,7 +91,7 @@ fn fmt_day(midnight: i64) -> String {
 
 fn fleet_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
     let body = match stats {
-        Err(e) => Either::Left(unavailable("anthropic-lb /_stats", e)),
+        Err(e) => Either::Left(unavailable("anthropic-lb /_stats", e.detail())),
         Ok(s) => {
             let strategy = vs(s, "strategy");
             let cluster = s.get("cluster");
@@ -234,7 +234,7 @@ fn budgets_card(
     let live_note = stats
         .as_ref()
         .err()
-        .map(|e| unavailable("live budgets (anthropic-lb /_stats)", e));
+        .map(|e| view! { <div class="mb-4">{unavailable("live budgets (anthropic-lb /_stats)", e.detail())}</div> });
     let mirror_note = (!fleet_true).then(|| {
         view! {
             <p class="text-sm mb-4">
@@ -246,7 +246,7 @@ fn budgets_card(
     let history_note = burn
         .as_ref()
         .err()
-        .map(|e| unavailable("7-day history (metrics store)", e));
+        .map(|e| view! { <div class="mb-4">{unavailable("7-day history (metrics store)", e.detail())}</div> });
 
     view! {
         <Card>
@@ -303,7 +303,7 @@ fn status_of(e: &Value) -> (String, String) {
 // Utilisation is the signal that exists. Don't re-add the column.
 fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
     let body = match stats {
-        Err(e) => Either::Left(unavailable("accounts (anthropic-lb /_stats)", e)),
+        Err(e) => Either::Left(unavailable("accounts (anthropic-lb /_stats)", e.detail())),
         Ok(s) => {
             let mut endpoints: Vec<&Value> = s
                 .get("endpoints")

@@ -39,7 +39,7 @@ use crate::confirm::{self, Needed, RowCheck};
 use crate::effect::{self, Doc, is_hex64, is_name};
 use crate::error::AppError;
 use crate::fleet;
-use crate::routes::{clip, fmt_epoch, short_digest, unavailable};
+use crate::routes::{clip, fmt_epoch, short_digest};
 use crate::session::{Session, flash_redirect, take_flash};
 use crate::state::{AppState, StoreModule};
 use crate::store::{Commit, DocOp, DocRequest, Policy, commit_of};
@@ -831,7 +831,7 @@ pub async fn history(
         return Ok((jar, Html(page_html(&session, flash, not_configured()))));
     };
     let content = match m.client.read().await {
-        Err(e) => unavailable("client store", &e).into_any(),
+        Err(e) => unavailable("client store", e.detail()).into_any(),
         Ok(store) => history_view(&store, &session.csrf).into_any(),
     };
     Ok((jar, Html(page_html(&session, flash, content))))

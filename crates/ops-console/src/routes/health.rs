@@ -3,9 +3,10 @@
 //! GET only, plain tables, no JS. Renders alaya-server's `GET /stats`: the
 //! answering pod's self-check and failure counters (LAB-4026), the
 //! contradiction judge's verdict mix, stored failures, backlog, daily-cap
-//! usage, the novelty of each day's writes and the corpus by edge type. A section whose source is down shows
-//! an "unavailable" banner, never zeros, so an outage cannot pass for an
-//! empty corpus; a failing self-check is a banner too.
+//! usage, the novelty of each day's writes and the corpus by edge type. A
+//! section whose source is down shows an "unavailable" notice, never zeros,
+//! so an outage cannot pass for an empty corpus; a failing self-check is an
+//! alert too.
 
 use axum::extract::State;
 use axum::response::Html;
@@ -20,7 +21,7 @@ use crate::session::{Session, take_flash};
 use crate::state::AppState;
 use crate::ui::*;
 
-const TITLE: &str = "Ālaya health — ops console";
+const TITLE: &str = "Judge health — ops console";
 
 /// Verdict rows in display order: `(key in by_verdict, label, the
 /// contradictions page's `verdict` filter)`. A stored failure and a pair
@@ -62,29 +63,33 @@ pub async fn pane(
     jar: PrivateCookieJar,
 ) -> Result<(PrivateCookieJar, Html<String>), AppError> {
     let (jar, flash) = take_flash(jar);
-    let content = match state.alaya.stats().await {
-        Err(e) => Either::Left(view! {
-            <Card>
-                <CardHeader>
-                    <CardTitle>"Ālaya health"</CardTitle>
-                </CardHeader>
-                <CardContent>{unavailable("alaya-server GET /stats", e.detail())}</CardContent>
-            </Card>
-        }),
+    let body = match state.alaya.stats().await {
+        Err(e) => Either::Left(unavailable("alaya-server GET /stats", e.detail())),
         Ok(s) => Either::Right(view! {
-            <div class="space-y-6">
-                {pod_card(&s)}
-                {summary_card(&s)}
-                {verdicts_card(&s)}
-                {failures_card(&s)}
-                {per_day_card(&s)}
-                {novelty_card(&s)}
-                {degenerate_card(&s)}
-                {corpus_card(&s)}
-            </div>
+            {errors(&s)}
+            {summary(&s)}
+            {pod_card(&s)}
+            {verdicts_card(&s)}
+            {failures_card(&s)}
+            {per_day_card(&s)}
+            {novelty_card(&s)}
+            {degenerate_card(&s)}
+            {corpus_card(&s)}
         }),
     };
-    Ok((jar, Html(page(TITLE, &session, flash, content))))
+    let content = view! {
+        <div class="space-y-6">
+            <PageHeader
+                title="Judge health"
+                description="alaya-server's own figures: the contradiction judge's verdicts, failures, backlog and daily cap, the novelty of each day's writes, the corpus by edge type, and the answering pod's self-check."
+            />
+            {body}
+        </div>
+    };
+    Ok((
+        jar,
+        Html(page(TITLE, Nav::Health, &session, flash, content)),
+    ))
 }
 
 // ─── Rendering helpers ──────────────────────────────────────────────────────
@@ -97,27 +102,33 @@ fn count(v: Option<&Value>) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
-fn unavailable(what: &str, detail: &str) -> impl IntoView + use<> {
-    banner(format!("{what}: {detail}"))
-}
-
-fn banner(msg: String) -> impl IntoView + use<> {
-    view! {
-        <p class="text-sm" role="alert">
-            <span class=badge(BadgeKind::Destructive)>"unavailable"</span>
-            " "{msg}
-        </p>
-    }
-}
-
-/// `section` when the server sent it, else the banner. The server nulls a
-/// section whose source failed and says why in `errors`.
+/// `section` when the server sent it, else `None` and the card says it is
+/// unavailable. The server nulls a section whose source failed and says why
+/// in `errors`.
 fn section<'a>(s: &'a Value, key: &str) -> Option<&'a Value> {
     s.get(key).filter(|v| v.is_object())
 }
 
-fn link(href: String, text: String) -> impl IntoView + use<> {
-    view! { <a class="text-primary underline-offset-4 hover:underline" href=href>{text}</a> }
+/// The server's own account of each section it could not read, one notice
+/// each, above everything else on the page.
+fn errors(s: &Value) -> impl IntoView + use<> {
+    let errors: Vec<String> = s
+        .get("errors")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    (!errors.is_empty()).then(|| {
+        let notices = errors
+            .into_iter()
+            .map(|e| view! { <Notice status=Status::Error label="unavailable">{e}</Notice> })
+            .collect_view();
+        view! { <div class="space-y-2">{notices}</div> }
+    })
 }
 
 // ─── Pod: self-check and failure counters (LAB-4026) ─────────────────────────
@@ -148,16 +159,14 @@ fn pod_card(s: &Value) -> impl IntoView + use<> {
     let streak = count(sc.and_then(|c| c.get("consecutive_failures")));
     let state = match (enabled, last) {
         (Some(false), _) => Either::Left(view! {
-            <p class="text-sm">
-                <span class=badge(BadgeKind::Muted)>"disabled"</span>
-                " SELFCHECK_QUERY and SELFCHECK_EXPECT_HASH are unset on this pod."
-            </p>
+            <Notice status=Status::Off label="disabled">
+                "SELFCHECK_QUERY and SELFCHECK_EXPECT_HASH are unset on this pod."
+            </Notice>
         }),
         (_, None) => Either::Left(view! {
-            <p class="text-sm">
-                <span class=badge(BadgeKind::Muted)>"not run yet"</span>
-                " The first check runs at startup."
-            </p>
+            <Notice status=Status::Off label="not run yet">
+                "The first check runs at startup."
+            </Notice>
         }),
         (_, Some(l)) if l.get("ok").and_then(Value::as_bool) == Some(true) => {
             let msg = format!(
@@ -166,10 +175,7 @@ fn pod_card(s: &Value) -> impl IntoView + use<> {
                 vs(l, "rerank"),
             );
             Either::Right(Either::Left(view! {
-                <p class="text-sm">
-                    <span class=badge(BadgeKind::Success)>"passing"</span>
-                    " "{msg}
-                </p>
+                <Notice status=Status::Ok label="passing">{msg}</Notice>
             }))
         }
         (_, Some(l)) => {
@@ -181,10 +187,7 @@ fn pod_card(s: &Value) -> impl IntoView + use<> {
                 fmt_epoch(l["at"].as_f64().unwrap_or(0.0)),
             );
             Either::Right(Either::Right(view! {
-                <p class="text-sm" role="alert">
-                    <span class=badge(BadgeKind::Destructive)>"failing"</span>
-                    " "{msg}
-                </p>
+                <Notice status=Status::Error label="failing">{msg}</Notice>
             }))
         }
     };
@@ -234,57 +237,32 @@ fn pod_card(s: &Value) -> impl IntoView + use<> {
     })
 }
 
-// ─── Summary: errors, vector total, judge daily cap ──────────────────────────
+// ─── Summary: vector total, judge daily cap ─────────────────────────────────
 
-fn summary_card(s: &Value) -> impl IntoView + use<> {
-    let errors: Vec<String> = s
-        .get("errors")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+fn summary(s: &Value) -> impl IntoView + use<> {
     let cap = s.get("judge_daily_cap");
     let cap_value = match cap.and_then(|c| c.get("cap")) {
         Some(Value::Null) => "no judge configured".to_string(),
         v => count(v),
     };
     let admitted = count(cap.and_then(|c| c.get("admitted_today")));
-    let day = cap.map(|c| vs(c, "utc_day")).unwrap_or_default();
+    let day = cap
+        .map(|c| vs(c, "utc_day"))
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| "—".into());
     let memories = count(section(s, "memories").and_then(|m| m.get("total")));
     view! {
-        <Card>
-            <CardHeader>
-                <CardTitle>"Ālaya health"</CardTitle>
-            </CardHeader>
-            <CardContent>
-                <div class="space-y-2 mb-4">{errors.into_iter().map(banner).collect_view()}</div>
-                <dl class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
-                    <div>
-                        <dt class="text-muted-foreground text-xs">"Memories (vector store)"</dt>
-                        <dd>{memories}</dd>
-                    </div>
-                    <div>
-                        <dt class="text-muted-foreground text-xs">"Judge daily cap"</dt>
-                        <dd>{cap_value}</dd>
-                    </div>
-                    <div>
-                        <dt class="text-muted-foreground text-xs">"Admitted today"</dt>
-                        <dd>{admitted}</dd>
-                    </div>
-                    <div>
-                        <dt class="text-muted-foreground text-xs">"UTC day"</dt>
-                        <dd>{day}</dd>
-                    </div>
-                </dl>
-                <p class="text-xs text-muted-foreground mt-3">
-                    "The daily cap bounds store-path judge calls per alaya-server process; with several replicas this is the one that answered. Operator backfill is not counted."
-                </p>
-            </CardContent>
-        </Card>
+        <div class="space-y-2">
+            <StatGrid>
+                <Stat label="Memories (vector store)">{memories}</Stat>
+                <Stat label="Judge daily cap">{cap_value}</Stat>
+                <Stat label="Admitted today">{admitted}</Stat>
+                <Stat label="UTC day">{day}</Stat>
+            </StatGrid>
+            <p class="text-xs text-muted-foreground">
+                "The daily cap bounds store-path judge calls per alaya-server process; with several replicas this is the one that answered. Operator backfill is not counted."
+            </p>
+        </div>
     }
 }
 
@@ -304,12 +282,13 @@ fn verdicts_card(s: &Value) -> impl IntoView + use<> {
                     // A dash is a missing count: nothing to link to.
                     let cell = |n: String, resolved: bool| match n.as_str() {
                         "—" => Either::Right(n),
-                        _ if resolved => Either::Left(link(
-                            format!("/alaya/contradictions?verdict={filter}&resolved=1"),
-                            n,
-                        )),
+                        _ if resolved => {
+                            let href = format!("/alaya/contradictions?verdict={filter}&resolved=1");
+                            Either::Left(view! { <Link href=href>{n}</Link> })
+                        }
                         _ => {
-                            Either::Left(link(format!("/alaya/contradictions?verdict={filter}"), n))
+                            let href = format!("/alaya/contradictions?verdict={filter}");
+                            Either::Left(view! { <Link href=href>{n}</Link> })
                         }
                     };
                     let (label, open, resolved) = (

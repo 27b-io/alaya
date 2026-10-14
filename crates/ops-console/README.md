@@ -373,6 +373,7 @@ deployed manifest.
 cargo run -p ops-console            # needs the env above
 cargo test -p ops-console           # session/CSRF/origin/XSS/no-secret tests
 scripts/build-css.sh                # regenerate static/console.css (Tailwind v4 CLI)
+scripts/snapshot.sh                 # screenshot every page: 390/768/1280px, light and dark
 ```
 
 `static/console.css` is generated from `style/input.css` and **checked in**
@@ -382,19 +383,47 @@ it; that's fine). Nothing else catches a stale file: Tailwind emits only the
 classes it finds in `src/`, so a class added without a rebuild ships with no
 rule and its element renders unstyled, silently.
 
-UI components are copy-paste vendored from the Rust/UI registry, class
-strings verbatim, `variants!`/`clx!` macros expanded to plain Leptos
-components — see `src/ui.rs`. The Leptos registry now lives at
-[rust-ui/leptos-ui](https://github.com/rust-ui/leptos-ui)
-(`app_crates/registry/src/ui/*.rs`, theme tokens in `style/tailwind.css`);
-[rust-ui/ui](https://github.com/rust-ui/ui) has moved to Dioxus.
+**Presentation framework (`src/ui/`).** Pages compose components; they do
+not hand-write layout or recurring markup.
+
+- `ui/components.rs`: the atoms (button, badge, card, table, form classes),
+  copy-paste vendored from the Rust/UI registry, class strings verbatim,
+  `variants!`/`clx!` macros expanded to plain Leptos components. The Leptos
+  registry now lives at [rust-ui/leptos-ui](https://github.com/rust-ui/leptos-ui)
+  (`app_crates/registry/src/ui/*.rs`, theme tokens in `style/tailwind.css`);
+  [rust-ui/ui](https://github.com/rust-ui/ui) has moved to Dioxus.
+- `ui/patterns.rs`: the console's own components. `Status` is the one
+  mapping from what a state means (ok, warn, error, off) to its badge;
+  `Notice` is a status badge plus a sentence (an `Error` notice is an alert),
+  and `unavailable()` is the notice for a dark section; `EmptyState`,
+  `NotConfigured`, `Stat`/`StatGrid`, `PageHeader`, `Link` (the one link
+  style) and `HashLink`.
+- `ui/shell.rs`: the document and the page shell. Every handler passes the
+  `Nav` entry its page belongs under to `page()`; the shell marks that entry
+  `aria-current="page"`. From `lg` the navigation is a sidebar grouped by
+  module; below it, a `<details>` menu in the top bar. The top bar holds the
+  theme switch and logout once at every width.
+
+The CSP forbids scripts and inline style, so nothing may emit a script, a
+style element or a style attribute, and colour comes only from the theme
+tokens, never a Tailwind palette class (`text-white`, `bg-gray-100`): a test
+in `src/ui/mod.rs` holds every production source file under `src/` to that.
+
+**Snapshots.** `scripts/snapshot.sh` renders every GET page against the test
+suite's fake upstreams (an ignored test, `tests::snapshot::write_snapshots`),
+both healthy and with every upstream down, then screenshots each with
+headless Chrome at 390, 768 and 1280px, light and dark, into
+`target/snapshots/` at the workspace root, with one contact sheet per page.
+It fails if any page scrolls sideways; a table may, inside its own scroll
+box. A UI change attaches the sheets to its review. Needs python3 and Chrome
+(`CHROME=/path/to/chrome` if it is not on `PATH`).
 
 **Theme.** Every colour is a CSS variable in `style/input.css`, defined once
 for light and once under `@variant dark`; components use the token classes
 (`bg-card`, `text-muted-foreground`, …), never a palette colour, so a new
 component is dark-mode-ready by construction. A new token needs a value in
 both blocks and a `--color-*` line in `@theme inline`. The theme switch in the
-page header saves the operator's choice in the encrypted `console_theme`
+top bar saves the operator's choice in the encrypted `console_theme`
 cookie (`src/theme.rs`); the page renders it as `class="dark"` or
 `class="light"` on `<html>`, and with no choice saved the OS setting
 (`prefers-color-scheme`) decides. No JavaScript is involved.
