@@ -300,10 +300,13 @@ pub fn commit_of(answer: &Value, ops: &[DocOp]) -> Result<Commit, String> {
             _ => None,
         })
         .collect();
-    let keys = answer
-        .get("keys")
-        .and_then(Value::as_array)
-        .ok_or("no keys list")?;
+    // A request with no add_key has no key to lose, so an answer may leave
+    // the list out; one that asked for a key must carry it.
+    let keys = match answer.get("keys") {
+        Some(Value::Array(keys)) => keys.as_slice(),
+        None if wanted.is_empty() => &[],
+        _ => return Err("no keys list".into()),
+    };
     if keys.len() != wanted.len() {
         return Err(format!(
             "{} keys for {} add_key ops",
@@ -500,6 +503,29 @@ mod tests {
         );
         // No version or digest: unreadable.
         assert!(commit_of(&json!({"keys": []}), &[]).is_err());
+        // No keys list: fine with no key asked for, never with one.
+        let plain = json!({"status": 200, "version": 9, "digest": "b".repeat(64)});
+        assert!(
+            commit_of(
+                &plain,
+                &[DocOp::Delete {
+                    name: "acme".into()
+                }]
+            )
+            .is_ok()
+        );
+        assert!(commit_of(&plain, &ops).is_err());
+        let mut odd = plain.clone();
+        odd["keys"] = json!({"acme": "x"});
+        assert!(
+            commit_of(
+                &odd,
+                &[DocOp::Delete {
+                    name: "acme".into()
+                }]
+            )
+            .is_err()
+        );
     }
 
     #[test]
