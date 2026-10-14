@@ -16,6 +16,12 @@
 //! Versions are compared only between two records of one name, which is how
 //! the console tells that a later op superseded this one.
 //!
+//! A document write is in effect on an instance once the instance holds the
+//! write's digest: the hash of the exact bytes the store committed, which
+//! carry the version. The store must still serve that digest, read from the
+//! same `GET`: a later write supersedes it, and readers never install a
+//! document the store no longer serves.
+//!
 //! "In effect" means no new admission, so every doubt reads as not in
 //! effect, or as unknown when the console cannot see a stack at all.
 
@@ -190,6 +196,10 @@ pub const PARTIAL: &str = "the restrictions part is partial: the store lost rows
 pub const MOVED: &str = "the served part changed, or could not be re-read, while the console was \
     reading; re-checking";
 
+/// The same, for the store's document.
+pub const DOC_MOVED: &str = "the store's document changed, or could not be re-read, while the \
+    console was reading; re-checking";
+
 /// CF's state, from the store's record of CF's latest poll.
 #[derive(Clone, Debug)]
 pub struct Report {
@@ -197,6 +207,8 @@ pub struct Report {
     pub running: bool,
     /// The hash of the restrictions set CF holds.
     pub set_hash: Option<String>,
+    /// The digest of the document CF holds.
+    pub digest: Option<String>,
 }
 
 /// One instance as the metrics store shows it.
@@ -212,6 +224,10 @@ pub struct Instance {
     pub set_hashes: Vec<String>,
     /// Its restrictions-behind alert: it holds a restriction the store lost.
     pub behind: bool,
+    /// The `digest` label of every document series it exports now, counted
+    /// raw like `set_hashes`; an error when that read failed, which leaves
+    /// every document judgement unknown and touches no restriction one.
+    pub doc_digests: Result<Vec<String>, String>,
 }
 
 /// What the console can see of one stack.
@@ -377,6 +393,138 @@ pub fn aged_out(op: &Op, now_micros: u64) -> bool {
     op.state == RecordState::Enabled && now_micros.saturating_sub(op.version) > PRUNE_AFTER_MICROS
 }
 
+// ─── Documents ──────────────────────────────────────────────────────────────
+
+/// A document as a version and the digest of its exact bytes: a write's own
+/// result, or what the store serves now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Doc {
+    pub version: u64,
+    pub digest: String,
+}
+
+/// The document the store holds, from a `GET`. `Ok(None)` is a store at
+/// version 0, which holds none.
+pub fn served_doc(store: &Value) -> Result<Option<Doc>, String> {
+    let doc = store
+        .get("document")
+        .filter(|d| d.get("status").and_then(Value::as_str) == Some("ok"))
+        .ok_or("the document side of the store did not answer")?;
+    let version = doc
+        .get("version")
+        .and_then(Value::as_u64)
+        .ok_or("the store's document version is unreadable")?;
+    if version == 0 {
+        return Ok(None);
+    }
+    let digest = doc
+        .get("digest")
+        .and_then(Value::as_str)
+        .filter(|d| is_hex64(d))
+        .ok_or("the store's document digest is unreadable")?;
+    Ok(Some(Doc {
+        version,
+        digest: digest.to_string(),
+    }))
+}
+
+/// Whether the store still serves a write's document: the content half.
+pub fn doc_carried(served: Option<&Doc>, write: &Doc) -> Carried {
+    match served {
+        Some(s) if s == write => Carried::Yes,
+        Some(s) if s.version > write.version => Carried::Superseded(s.version),
+        Some(s) => Carried::No(format!(
+            "the store serves version {} with another digest: rolled back or edited since",
+            s.version
+        )),
+        None => Carried::No("the store holds no document".into()),
+    }
+}
+
+/// Whether a stack holds the document with this digest: the instance half.
+/// An instance's restrictions play no part.
+pub fn holds_doc(digest: &str, sight: &Sight) -> Verdict {
+    use Verdict::*;
+    match sight {
+        Sight::Report(None) => Unknown(
+            "the document side of the store did not answer, so CF's report could not be read"
+                .into(),
+        ),
+        Sight::Report(Some(r)) if !r.running => NotInEffect(
+            "CF has not reported in the last 15 s: asleep, restarting or cut off from the store"
+                .into(),
+        ),
+        Sight::Report(Some(r)) => match &r.digest {
+            Some(d) if d == digest => InEffect,
+            Some(_) => NotInEffect("CF holds another document".into()),
+            None => NotInEffect("CF reports no document".into()),
+        },
+        Sight::Instances(Err(e)) => Unknown(format!("the metrics store could not be read: {e}")),
+        Sight::Instances(Ok(list)) if list.is_empty() => {
+            Unknown("no instance of this stack is visible in the metrics store".into())
+        }
+        Sight::Instances(Ok(list)) => {
+            if let Some(e) = list.iter().find_map(|i| i.doc_digests.as_ref().err()) {
+                return Unknown(format!("the document series could not be read: {e}"));
+            }
+            let faults: Vec<String> = list.iter().filter_map(|i| doc_fault(i, digest)).collect();
+            if faults.is_empty() {
+                InEffect
+            } else {
+                NotInEffect(faults.join("; "))
+            }
+        }
+    }
+}
+
+fn doc_fault(i: &Instance, digest: &str) -> Option<String> {
+    if !i.up {
+        return Some(format!(
+            "{} is not scraped (up is 0): draining, restarting or unreachable",
+            i.id
+        ));
+    }
+    match i.doc_digests.as_deref().unwrap_or_default() {
+        [] => Some(format!("{} exports no document gauge", i.id)),
+        [d] if d == digest => None,
+        [_] => Some(format!("{} holds another document", i.id)),
+        many => Some(format!(
+            "{} exports {} document series, so its current document is unknown",
+            i.id,
+            many.len()
+        )),
+    }
+}
+
+/// A document write's judgement on every stack that counts. `stable` is
+/// whether the store's document stayed put across the two `GET`s around the
+/// metrics read.
+pub fn judge_doc(
+    write: &Doc,
+    served: Option<&Doc>,
+    sights: &[(String, Sight)],
+    stable: bool,
+) -> Judged {
+    let carried = doc_carried(served, write);
+    let stacks = sights
+        .iter()
+        .map(|(stack, sight)| {
+            let v = match &carried {
+                Carried::Yes => match holds_doc(&write.digest, sight) {
+                    Verdict::InEffect if !stable => Verdict::Unknown(DOC_MOVED.into()),
+                    v => v,
+                },
+                Carried::Superseded(v) => {
+                    Verdict::NotInEffect(format!("superseded by version {v}"))
+                }
+                Carried::No(why) => Verdict::NotInEffect(why.clone()),
+            };
+            (stack.clone(), v)
+        })
+        .collect();
+    Judged { carried, stacks }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,6 +676,7 @@ mod tests {
         Sight::Report(Some(Report {
             running: true,
             set_hash: Some(set_hash.into()),
+            digest: None,
         }))
     }
 
@@ -537,6 +686,7 @@ mod tests {
             up,
             set_hashes: hashes.iter().map(|h| h.to_string()).collect(),
             behind: false,
+            doc_digests: Ok(vec![]),
         }
     }
 
@@ -551,11 +701,13 @@ mod tests {
         let stale = Sight::Report(Some(Report {
             running: false,
             set_hash: Some(p.set_hash.clone()),
+            digest: None,
         }));
         assert!(matches!(holds(&p, &stale), Verdict::NotInEffect(_)));
         let none = Sight::Report(Some(Report {
             running: true,
             set_hash: None,
+            digest: None,
         }));
         assert!(matches!(holds(&p, &none), Verdict::NotInEffect(_)));
         assert!(matches!(
@@ -696,6 +848,121 @@ mod tests {
         assert!(!aged_out(&op("a", Enabled, T0 + 1), now));
         // A disable is never pruned while it is the name's latest record.
         assert!(!aged_out(&op("a", Disabled, T0), now));
+    }
+
+    fn doc(version: u64, digest: &str) -> Doc {
+        Doc {
+            version,
+            digest: digest.into(),
+        }
+    }
+
+    fn doc_pod(id: &str, up: bool, digests: &[&str]) -> Instance {
+        Instance {
+            doc_digests: Ok(digests.iter().map(|d| d.to_string()).collect()),
+            ..pod(id, up, &[])
+        }
+    }
+
+    fn cf_holding(digest: Option<&str>, running: bool) -> Sight {
+        Sight::Report(Some(Report {
+            running,
+            set_hash: None,
+            digest: digest.map(str::to_string),
+        }))
+    }
+
+    #[test]
+    fn served_doc_reads_the_document_side_of_a_get() {
+        let d = "d".repeat(64);
+        let get = json!({"document": {"status": "ok", "version": 9, "digest": d}});
+        assert_eq!(served_doc(&get).unwrap(), Some(doc(9, &d)));
+        let empty = json!({"document": {"status": "ok", "version": 0, "digest": null}});
+        assert_eq!(served_doc(&empty).unwrap(), None);
+        assert!(served_doc(&json!({"document": {"status": "unavailable"}})).is_err());
+        assert!(
+            served_doc(&json!({"document": {"status": "ok", "version": 9, "digest": "x"}}))
+                .is_err()
+        );
+    }
+
+    /// The write's digest, and only it: CF from its report, every other
+    /// stack from each listed instance's one document series.
+    #[test]
+    fn a_document_is_in_effect_where_every_instance_holds_its_digest() {
+        let (d, other) = ("d".repeat(64), "e".repeat(64));
+        assert_eq!(
+            holds_doc(&d, &cf_holding(Some(&d), true)),
+            Verdict::InEffect
+        );
+        assert!(matches!(
+            holds_doc(&d, &cf_holding(Some(&other), true)),
+            Verdict::NotInEffect(_)
+        ));
+        assert!(matches!(
+            holds_doc(&d, &cf_holding(Some(&d), false)),
+            Verdict::NotInEffect(_)
+        ));
+        assert!(matches!(
+            holds_doc(&d, &cf_holding(None, true)),
+            Verdict::NotInEffect(_)
+        ));
+        assert!(matches!(
+            holds_doc(&d, &Sight::Report(None)),
+            Verdict::Unknown(_)
+        ));
+
+        let k3s = |list: Vec<Instance>| holds_doc(&d, &Sight::Instances(Ok(list)));
+        assert_eq!(
+            k3s(vec![doc_pod("a", true, &[&d]), doc_pod("b", true, &[&d])]),
+            Verdict::InEffect
+        );
+        for (list, why) in [
+            (
+                vec![doc_pod("a", true, &[&d]), doc_pod("b", false, &[&d])],
+                "b is not scraped",
+            ),
+            (vec![doc_pod("a", true, &[])], "no document gauge"),
+            (vec![doc_pod("a", true, &[&other])], "another document"),
+            (vec![doc_pod("a", true, &[&d, &other])], "2 document series"),
+        ] {
+            let v = k3s(list);
+            assert!(
+                matches!(&v, Verdict::NotInEffect(r) if r.contains(why)),
+                "{v:?}"
+            );
+        }
+        assert!(matches!(k3s(vec![]), Verdict::Unknown(_)));
+        // A failed document read leaves the stack unknown, never in effect.
+        let mut lost = doc_pod("a", true, &[&d]);
+        lost.doc_digests = Err("timeout".into());
+        assert!(matches!(k3s(vec![lost]), Verdict::Unknown(_)));
+        // Restrictions-behind is about restrictions: no bearing here.
+        let mut behind = doc_pod("a", true, &[&d]);
+        behind.behind = true;
+        assert_eq!(k3s(vec![behind]), Verdict::InEffect);
+    }
+
+    #[test]
+    fn a_later_write_supersedes_a_document_and_a_rollback_unserves_it() {
+        let (d, e) = ("d".repeat(64), "e".repeat(64));
+        let write = doc(9, &d);
+        let readers = vec![("cf".to_string(), cf_holding(Some(&d), true))];
+        let j = judge_doc(&write, Some(&doc(9, &d)), &readers, true);
+        assert_eq!(j.carried, Carried::Yes);
+        assert_eq!(j.stacks[0].1, Verdict::InEffect);
+        // The store moved on: history, not in effect, however the readers lag.
+        let j = judge_doc(&write, Some(&doc(12, &e)), &readers, true);
+        assert_eq!(j.carried, Carried::Superseded(12));
+        assert!(matches!(&j.stacks[0].1, Verdict::NotInEffect(r) if r.contains("superseded")));
+        // Rolled back, or the same version with other bytes: never served.
+        for served in [Some(doc(8, &e)), Some(doc(9, &e)), None] {
+            let j = judge_doc(&write, served.as_ref(), &readers, true);
+            assert!(matches!(j.carried, Carried::No(_)), "{served:?}");
+        }
+        // The document moved between the two reads: withheld, not denied.
+        let j = judge_doc(&write, Some(&doc(9, &d)), &readers, false);
+        assert_eq!(j.stacks[0].1, Verdict::Unknown(DOC_MOVED.into()));
     }
 
     #[test]

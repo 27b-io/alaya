@@ -1,36 +1,54 @@
 //! What the metrics store says about the LB instances that read the client
-//! store: who is up, which restrictions set each holds, which hold a
-//! restriction the store lost, and which disabled names match nothing.
+//! store: who is up, which restrictions set and which document each holds,
+//! which hold a restriction the store lost, which report the store behind or
+//! edited, which disabled names match nothing, and which ordinary clients
+//! are still in a stack's TOML.
 //!
 //! Every query goes through its own pinned route (`MetricsClient::instant`),
 //! one metric each, and instances are grouped by the `stack` label the
 //! scraper puts on them, which names the stack as the store does. Every
-//! series the `up` route returns is a reader, so a reader series with no
-//! `stack` label leaves every stack judged here unknown: dropped, it would let
-//! its stack read as in effect without it.
+//! series the `up` route returns is a reader, so a reader series the console
+//! cannot place, with no `stack` label or no pod or instance label, leaves
+//! every stack judged here unknown: dropped, it would let its stack read as
+//! in effect without it.
 //!
 //! Metrics values are untrusted input, so nothing here may stop or delay a
 //! restriction op: they feed the display and the in-effect judgement, which
-//! only ever withholds a confirmation.
+//! only ever withholds a confirmation, and the warnings on document writes,
+//! which only ever ask for a typed confirmation or refuse a `restore`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::effect::Instance;
+use crate::effect::{Instance, is_hex64};
 use crate::lb::{MetricsClient, Series};
 
 const UP: &str = "up";
 const RESTRICTIONS: &str = "anthropic_client_store_restrictions";
+const DOCUMENT: &str = "anthropic_client_store_document";
 const ALERT: &str = "anthropic_client_store_alert";
 const UNMATCHED: &str = "anthropic_client_store_unmatched_disabled_name";
+const TOML_CLIENT: &str = "anthropic_client_store_toml_client";
+
+/// The alerts a reader raises when the store's document is behind what it
+/// holds, or differs from it at its own version: the store was rolled back,
+/// wiped or edited outside its write path. A document write on top would
+/// publish that content at a newer version, which every reader installs.
+const STORE_ALERTS: [&str; 2] = ["store_behind", "store_edited"];
 
 pub struct Fleet {
     /// stack → its instances, as the metrics store lists them.
     pub stacks: Result<BTreeMap<String, Vec<Instance>>, String>,
     /// Instances raising restrictions-behind, as `stack/instance`.
     pub behind: Result<BTreeSet<String>, String>,
+    /// Instances reporting the store behind or edited, as
+    /// `stack/instance (alert)`. Placed or not: a signal is never dropped.
+    pub store_alerts: Result<BTreeSet<String>, String>,
     /// Disabled names some instance reports matching no client it serves →
     /// the stacks reporting them. Each instance reports at most 5.
     pub unmatched: Result<BTreeMap<String, BTreeSet<String>>, String>,
+    /// Ordinary clients still in some instance's TOML → the stacks whose
+    /// instances report them.
+    pub toml: Result<BTreeMap<String, BTreeSet<String>>, String>,
 }
 
 /// The instance a series belongs to: its pod, or its scrape instance.
@@ -41,73 +59,111 @@ fn instance_of(s: &Series) -> Option<&str> {
         .map(String::as_str)
 }
 
+/// The stack a series belongs to, by the store's name for it. The CF scrape
+/// labels its series `stack="cloudflare"`, and the store calls that stack
+/// `cf`.
 fn stack_of(s: &Series) -> Option<&str> {
-    s.labels
-        .get("stack")
-        .map(String::as_str)
-        .filter(|v| !v.is_empty())
+    match s.labels.get("stack").map(String::as_str) {
+        Some("cloudflare") => Some("cf"),
+        Some(v) if !v.is_empty() => Some(v),
+        _ => None,
+    }
+}
+
+/// `stack/instance` for a series, with a placeholder for what is missing,
+/// for the lists of signals that name instances.
+fn place(s: &Series) -> String {
+    format!(
+        "{}/{}",
+        stack_of(s).unwrap_or("(no stack)"),
+        instance_of(s).unwrap_or("(no instance)")
+    )
 }
 
 pub async fn read(metrics: &MetricsClient) -> Fleet {
-    let (up, sets, behind, unmatched) = tokio::join!(
+    let (up, sets, docs, alerts, unmatched, toml) = tokio::join!(
         metrics.instant(UP, UP),
         metrics.instant(RESTRICTIONS, RESTRICTIONS),
-        metrics.instant(
-            ALERT,
-            r#"anthropic_client_store_alert{alert="restrictions_behind"}"#
-        ),
+        metrics.instant(DOCUMENT, DOCUMENT),
+        metrics.instant(ALERT, ALERT),
         metrics.instant(UNMATCHED, UNMATCHED),
+        metrics.instant(TOML_CLIENT, TOML_CLIENT),
     );
     let err = |e: crate::error::AppError| e.detail().to_string();
-    let behind = behind.map_err(err).map(|series| {
-        series
-            .iter()
-            .filter(|s| s.value == 1.0)
-            .filter_map(|s| Some(format!("{}/{}", stack_of(s)?, instance_of(s)?)))
+    let alerts = alerts.map_err(err);
+    let behind = alerts.as_ref().map_err(Clone::clone).map(|a| {
+        raised(a, &["restrictions_behind"])
+            .map(place)
             .collect::<BTreeSet<_>>()
     });
+    let store_alerts = alerts.as_ref().map_err(Clone::clone).map(|a| {
+        raised(a, &STORE_ALERTS)
+            .map(|s| format!("{} ({})", place(s), s.labels["alert"]))
+            .collect::<BTreeSet<_>>()
+    });
+    let docs = docs.map_err(err);
     let stacks = match (up, sets, &behind) {
-        (Ok(up), Ok(sets), Ok(behind)) => instances(&up, &sets, behind),
+        (Ok(up), Ok(sets), Ok(behind)) => instances(&up, &sets, docs, behind),
         (Err(e), _, _) | (_, Err(e), _) => Err(err(e)),
         (_, _, Err(e)) => Err(e.clone()),
     };
-    let unmatched = unmatched.map_err(err).map(|series| {
-        let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for s in &series {
-            if let (Some(name), Some(stack)) = (s.labels.get("name"), stack_of(s)) {
-                out.entry(name.clone())
-                    .or_default()
-                    .insert(stack.to_string());
-            }
-        }
-        out
-    });
     Fleet {
         stacks,
         behind,
-        unmatched,
+        store_alerts,
+        unmatched: unmatched.map_err(err).map(|s| by_label(&s, "name")),
+        toml: toml.map_err(err).map(|s| by_label(&s, "client")),
     }
+}
+
+/// The alert series raised now with one of `names`.
+fn raised<'a>(alerts: &'a [Series], names: &'a [&str]) -> impl Iterator<Item = &'a Series> {
+    alerts.iter().filter(|s| {
+        s.value == 1.0
+            && s.labels
+                .get("alert")
+                .is_some_and(|a| names.contains(&a.as_str()))
+    })
+}
+
+/// `label` value → the stacks of the series carrying it. A series the
+/// console cannot place in a stack is listed under its instance, so a
+/// warning built on this never loses it.
+fn by_label(series: &[Series], label: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for s in series {
+        if let Some(value) = s.labels.get(label) {
+            let stack = stack_of(s).map(str::to_string).unwrap_or_else(|| place(s));
+            out.entry(value.clone()).or_default().insert(stack);
+        }
+    }
+    out
 }
 
 /// Instances per stack. The list comes from `up`, one entry per scraped
 /// instance: an instance whose gauge lingers after its scrape went away is
-/// not listed. Its restrictions series are counted raw, every series kept.
-/// A reader series with no `stack` label is an error naming its instance.
+/// not listed. Its restrictions and document series are counted raw, every
+/// series kept. A reader series the console cannot place is an error naming
+/// it. `docs` failing leaves each instance's documents unknown and nothing
+/// else.
 fn instances(
     up: &[Series],
     sets: &[Series],
+    docs: Result<Vec<Series>, String>,
     behind: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, Vec<Instance>>, String> {
-    let unlabeled: BTreeSet<&str> = up
+    let docs_ok = docs.as_deref().unwrap_or_default();
+    let unplaced: BTreeSet<String> = up
         .iter()
         .chain(sets)
-        .filter(|s| stack_of(s).is_none())
-        .map(|s| instance_of(s).unwrap_or("a series with no pod or instance label"))
+        .chain(docs_ok)
+        .filter(|s| stack_of(s).is_none() || instance_of(s).is_none())
+        .map(place)
         .collect();
-    if !unlabeled.is_empty() {
+    if !unplaced.is_empty() {
         return Err(format!(
-            "reader series without a stack label ({}), so their stack cannot be told",
-            unlabeled.into_iter().collect::<Vec<_>>().join(", ")
+            "reader series the console cannot place in a stack ({}), so their stack cannot be told",
+            unplaced.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
     let mut by_stack: BTreeMap<String, BTreeMap<String, Instance>> = BTreeMap::new();
@@ -124,6 +180,7 @@ fn instances(
                 up: true,
                 set_hashes: Vec::new(),
                 behind: behind.contains(&format!("{stack}/{id}")),
+                doc_digests: docs.as_ref().map(|_| Vec::new()).map_err(Clone::clone),
             });
         // Two scrapes of one instance: it is up only if both are.
         inst.up &= s.value == 1.0;
@@ -137,10 +194,46 @@ fn instances(
                 .push(s.labels.get("set_hash").cloned().unwrap_or_default());
         }
     }
+    for s in docs_ok {
+        let (Some(stack), Some(id)) = (stack_of(s), instance_of(s)) else {
+            continue;
+        };
+        if let Some(Ok(digests)) = by_stack
+            .get_mut(stack)
+            .and_then(|m| m.get_mut(id))
+            .map(|i| i.doc_digests.as_mut())
+        {
+            digests.push(s.labels.get("digest").cloned().unwrap_or_default());
+        }
+    }
     Ok(by_stack
         .into_iter()
         .map(|(stack, m)| (stack, m.into_values().collect()))
         .collect())
+}
+
+/// Every (version, digest) pair an instance installed in the last 30 days,
+/// for the `restore` row check: version → the digests it was installed
+/// with. The route answers instant queries only, so the window is a range
+/// selector inside the query. An empty answer is returned empty: the caller
+/// reads it as unknown, since a query outside the route's pin is empty too.
+pub async fn installed(metrics: &MetricsClient) -> Result<BTreeMap<u64, BTreeSet<String>>, String> {
+    let series = metrics
+        .instant(
+            DOCUMENT,
+            &format!("count by (version, digest) (last_over_time({DOCUMENT}[30d]))"),
+        )
+        .await
+        .map_err(|e| e.detail().to_string())?;
+    let mut out: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
+    for s in &series {
+        let version = s.labels.get("version").and_then(|v| v.parse::<u64>().ok());
+        let digest = s.labels.get("digest").filter(|d| is_hex64(d));
+        if let (Some(v), Some(d)) = (version, digest) {
+            out.entry(v).or_default().insert(d.clone());
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -179,22 +272,50 @@ mod tests {
                 1.0,
             ),
         ];
+        let docs = vec![series(
+            &[
+                ("stack", "k3s"),
+                ("pod", "lb-a"),
+                ("version", "9"),
+                ("digest", "d1"),
+            ],
+            1.0,
+        )];
         let behind: BTreeSet<String> = ["k3s/lb-b".to_string()].into();
-        let m = instances(&up, &sets, &behind).unwrap();
+        let m = instances(&up, &sets, Ok(docs), &behind).unwrap();
         let k3s = &m["k3s"];
         assert_eq!(k3s.len(), 2);
         let a = k3s.iter().find(|i| i.id == "lb-a").unwrap();
         assert!(a.up && !a.behind);
         assert_eq!(a.set_hashes, ["h1", "h0"]);
+        assert_eq!(a.doc_digests.as_deref().unwrap(), ["d1"]);
         let b = k3s.iter().find(|i| i.id == "lb-b").unwrap();
         assert!(!b.up && b.behind && b.set_hashes.is_empty());
-        assert_eq!(m["cloudflare"][0].id, "edge:443");
+        assert!(b.doc_digests.as_ref().unwrap().is_empty());
+        // The CF scrape's label is mapped to the store's name for CF.
+        assert_eq!(m["cf"][0].id, "edge:443");
+        assert!(!m.contains_key("cloudflare"));
+    }
+
+    /// A failed document read leaves documents unknown on every instance
+    /// and costs the restrictions judgement nothing.
+    #[test]
+    fn a_failed_document_read_touches_only_documents() {
+        let up = vec![series(&[("stack", "k3s"), ("pod", "lb-a")], 1.0)];
+        let sets = vec![series(
+            &[("stack", "k3s"), ("pod", "lb-a"), ("set_hash", "h1")],
+            1.0,
+        )];
+        let m = instances(&up, &sets, Err("missing route".into()), &BTreeSet::new()).unwrap();
+        let a = &m["k3s"][0];
+        assert_eq!(a.set_hashes, ["h1"]);
+        assert_eq!(a.doc_digests.as_ref().unwrap_err(), "missing route");
     }
 
     /// A reader the console cannot place in a stack must not drop out of
     /// one: it would let that stack read as in effect without it.
     #[test]
-    fn a_reader_without_a_stack_label_makes_the_stacks_unknown() {
+    fn a_reader_the_console_cannot_place_makes_the_stacks_unknown() {
         let up = vec![
             series(&[("stack", "k3s"), ("pod", "lb-a")], 1.0),
             series(&[("pod", "lb-b")], 1.0),
@@ -203,15 +324,58 @@ mod tests {
             &[("stack", "k3s"), ("pod", "lb-a"), ("set_hash", "h1")],
             1.0,
         )];
-        let err = instances(&up, &sets, &BTreeSet::new()).unwrap_err();
+        let err = instances(&up, &sets, Ok(vec![]), &BTreeSet::new()).unwrap_err();
         assert!(err.contains("lb-b"), "{err}");
         // An unlabeled restrictions series counts the same.
         let up = vec![series(&[("stack", "k3s"), ("pod", "lb-a")], 1.0)];
         let sets = vec![series(&[("pod", "lb-c"), ("set_hash", "h1")], 1.0)];
         assert!(
-            instances(&up, &sets, &BTreeSet::new())
+            instances(&up, &sets, Ok(vec![]), &BTreeSet::new())
                 .unwrap_err()
                 .contains("lb-c")
+        );
+        // So does a series with a stack but no pod or instance label, and a
+        // document series.
+        let up = vec![
+            series(&[("stack", "k3s"), ("pod", "lb-a")], 1.0),
+            series(&[("stack", "k3s")], 1.0),
+        ];
+        let err = instances(&up, &[], Ok(vec![]), &BTreeSet::new()).unwrap_err();
+        assert!(err.contains("k3s/(no instance)"), "{err}");
+        let up = vec![series(&[("stack", "k3s"), ("pod", "lb-a")], 1.0)];
+        let docs = vec![series(&[("pod", "lb-d"), ("digest", "d1")], 1.0)];
+        assert!(
+            instances(&up, &[], Ok(docs), &BTreeSet::new())
+                .unwrap_err()
+                .contains("lb-d")
+        );
+    }
+
+    #[test]
+    fn labels_group_by_stack_and_an_unplaced_series_keeps_its_instance() {
+        let toml = vec![
+            series(
+                &[("stack", "k3s"), ("pod", "lb-a"), ("client", "acme")],
+                1.0,
+            ),
+            series(
+                &[
+                    ("stack", "cloudflare"),
+                    ("instance", "edge:443"),
+                    ("client", "acme"),
+                ],
+                1.0,
+            ),
+            series(&[("pod", "lb-x"), ("client", "beta")], 1.0),
+        ];
+        let m = by_label(&toml, "client");
+        assert_eq!(
+            m["acme"].iter().map(String::as_str).collect::<Vec<_>>(),
+            ["cf", "k3s"]
+        );
+        assert_eq!(
+            m["beta"].iter().map(String::as_str).collect::<Vec<_>>(),
+            ["(no stack)/lb-x"]
         );
     }
 }

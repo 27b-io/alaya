@@ -9,9 +9,26 @@ pub mod selecta;
 use leptos::prelude::*;
 
 use crate::error::AppError;
+use crate::session::Session;
+use crate::state::AppState;
 use crate::ui::{BadgeKind, badge};
 
 const MAX_NEXT_BYTES: usize = 512;
+
+/// Every write route passes here before anything else: the session's CSRF
+/// token, then the subject allowlist as configured now. The allowlist is
+/// otherwise read only at login, so without this a subject removed from it
+/// would keep writing for the rest of its session. The Origin check has
+/// already run, as middleware, before any handler.
+pub fn guard_write(state: &AppState, session: &Session, csrf: &str) -> Result<(), AppError> {
+    session.verify_csrf(csrf)?;
+    if !state.config.subject_allowed(&session.sub) {
+        return Err(AppError::Forbidden(
+            "this subject is no longer allowed to write".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Validate a post-login redirect target: same-site absolute path only —
 /// no scheme, no authority, no protocol-relative `//`.

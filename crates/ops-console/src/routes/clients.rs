@@ -1,7 +1,9 @@
 //! Client-store module — managing the LB's clients through the client
-//! store's admin API. This slice carries the kill switch: `disable` and
-//! `enable`, which deny or re-admit every key of a name on every LB instance
-//! within a poll, whatever state the store's document is in.
+//! store's admin API. Two kinds of write:
+//! - the kill switch, here: `disable` and `enable`, restriction ops that deny
+//!   or re-admit every key of a name on every LB instance within a poll,
+//!   whatever state the store's document is in;
+//! - document ops, in `document`: clients, their policies and their keys.
 //!
 //! Writes follow the console's pattern: CSRF token and Origin check, then
 //! the subject allowlist re-checked on every write, then POST-redirect-GET.
@@ -11,6 +13,10 @@
 //! No metrics-store value can stop or delay a restriction op. Metrics values
 //! are untrusted input, so the handlers that send one never read the metrics
 //! store first.
+
+mod document;
+
+pub use document::{commit, history, preview};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -24,13 +30,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Digest;
 
-use crate::effect::{self, Carried, Op, RecordState, Report, ServedPart, Sight, Verdict, is_name};
+use crate::effect::{
+    self, Carried, Doc, Op, RecordState, Report, ServedPart, Sight, Verdict, is_name,
+};
 use crate::error::AppError;
 use crate::fleet::{self, Fleet};
 use crate::routes::{clip, fmt_epoch, unavailable};
 use crate::session::{Flash, Session, flash_redirect, take_flash};
 use crate::state::{AppState, StoreModule};
-use crate::store::{Answer, RestrictionOp, has_code, refusal_lines};
+use crate::store::{Answer, RestrictionOp, has_code, loggable, refusal_lines};
 use crate::ui::*;
 
 const TITLE: &str = "LB clients — ops console";
@@ -63,31 +71,40 @@ const MAX_LOGGED_CHARS: usize = 16 * 1024;
 
 /// The store and the fleet read for one judgement: `GET`, the metrics read,
 /// then `GET` again. CF and k3s are judged against the first `GET`, and a
-/// confirmation is shown only if the served part's tag did not move by the
-/// second, so instances are never compared with a part the store had already
-/// replaced.
+/// confirmation is shown only if what is judged did not move by the second:
+/// the served part's tag for a restriction op, the document's digest for a
+/// document write. Instances are never compared with something the store had
+/// already replaced.
 struct Reading {
     store: Value,
     fleet: Fleet,
     tag_stable: bool,
+    doc_stable: bool,
 }
 
 fn part_tag(v: &Value) -> Option<&str> {
     v.pointer("/restrictions/part/tag").and_then(Value::as_str)
 }
 
+fn doc_digest(v: &Value) -> Option<&str> {
+    v.get("document")
+        .filter(|d| d.get("status").and_then(Value::as_str) == Some("ok"))
+        .and_then(|d| d.get("digest"))
+        .and_then(Value::as_str)
+}
+
 async fn read_all(m: &StoreModule) -> Result<Reading, AppError> {
     let store = m.client.read().await?;
     let fleet = fleet::read(&m.metrics).await;
     let again = m.client.read().await;
-    let tag_stable = matches!(
-        (part_tag(&store), again.as_ref().ok().and_then(part_tag)),
-        (Some(a), Some(b)) if a == b
-    );
+    let again = again.as_ref().ok();
+    let same = |f: fn(&Value) -> Option<&str>| matches!((f(&store), again.and_then(f)), (Some(a), Some(b)) if a == b);
+    let (tag_stable, doc_stable) = (same(part_tag), same(doc_digest));
     Ok(Reading {
         store,
         fleet,
         tag_stable,
+        doc_stable,
     })
 }
 
@@ -113,31 +130,53 @@ fn cf_report(store: &Value) -> Option<Report> {
         return None;
     }
     let cf = doc.get("cf")?;
-    Some(Report {
-        running: cf.get("running").and_then(Value::as_bool) == Some(true),
-        set_hash: cf
-            .pointer("/report/set_hash")
+    let hex = |p: &str| {
+        cf.pointer(p)
             .and_then(Value::as_str)
             .filter(|h| effect::is_hex64(h))
-            .map(str::to_string),
+            .map(str::to_string)
+    };
+    Some(Report {
+        running: cf.get("running").and_then(Value::as_bool) == Some(true),
+        set_hash: hex("/report/set_hash"),
+        digest: hex("/report/digest"),
     })
 }
 
+/// How each stack that counts is seen. A stack the metrics store lists but
+/// the store does not count is a reader the console cannot account for, so
+/// every stack judged from the metrics store reads unknown while it is there.
 fn sights(store: &Value, fleet: &Fleet) -> Vec<(String, Sight)> {
-    stacks_of(store)
-        .into_iter()
+    let named = stacks_of(store);
+    let instances = fleet.stacks.as_ref().map_err(Clone::clone).and_then(|m| {
+        let extra: Vec<&str> = m
+            .keys()
+            .filter(|s| !named.contains(s))
+            .map(String::as_str)
+            .collect();
+        if extra.is_empty() {
+            Ok(m)
+        } else {
+            Err(format!(
+                "the metrics store lists readers of stacks the store does not count ({}), so their \
+                 instances cannot be accounted for",
+                extra.join(", ")
+            ))
+        }
+    });
+    named
+        .iter()
         .map(|stack| {
             let sight = if stack == "cf" {
                 Sight::Report(cf_report(store))
             } else {
                 Sight::Instances(
-                    fleet
-                        .stacks
+                    instances
                         .clone()
-                        .map(|m| m.get(&stack).cloned().unwrap_or_default()),
+                        .map(|m| m.get(stack).cloned().unwrap_or_default()),
                 )
             };
-            (stack, sight)
+            (stack.clone(), sight)
         })
         .collect()
 }
@@ -300,15 +339,16 @@ fn verdict_badge(v: &Verdict) -> (String, &'static str, String) {
 
 fn store_view(r: &Reading, csrf: &str, prefill: &str) -> impl IntoView + use<> {
     let part = served_part(&r.store);
+    let doc = effect::served_doc(&r.store);
     let sights = sights(&r.store, &r.fleet);
     let rows = table_records(&r.store);
     let unmatched = r.fleet.unmatched.clone().unwrap_or_default();
     view! {
         <div class="space-y-6">
             {warnings(r, &part)}
-            {stacks_card(&part, &sights, r.tag_stable)}
+            {stacks_card(&part, &doc, &sights, r)}
             {restrictions_card(&rows, &part, &unmatched, csrf, prefill)}
-            {clients_card(&r.store)}
+            {document::clients_card(&r.store, csrf)}
         </div>
     }
 }
@@ -383,6 +423,24 @@ fn warnings(r: &Reading, part: &Result<ServedPart, String>) -> impl IntoView + u
     if r.store.get("pitr_window").and_then(Value::as_bool) == Some(true) {
         items.push((warning.clone(), "A point-in-time recovery window is open: the store takes no document write but pitr. Restriction ops still work.".into()));
     }
+    if doc
+        .and_then(|d| d.get("recovery_refused"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        items.push((destructive.clone(), "A recovery was refused: the store serves no document to readers until an import or another recovery commits. Restriction ops still work.".into()));
+    }
+    match &r.fleet.store_alerts {
+        Ok(who) if !who.is_empty() => items.push((
+            destructive.clone(),
+            format!(
+                "Instances report the store behind or edited: {}. Every document write needs a typed confirmation while they do. Restriction ops still work.",
+                who.iter().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        )),
+        Ok(_) => {}
+        Err(e) => items.push((warning.clone(), format!("Store behind or edited alerts unreadable (metrics store: {e})."))),
+    }
     let list = items
         .into_iter()
         .map(|(class, text)| view! { <p class="text-sm"><span class=class>"warning"</span>" "{text}</p> })
@@ -392,23 +450,40 @@ fn warnings(r: &Reading, part: &Result<ServedPart, String>) -> impl IntoView + u
 
 fn stacks_card(
     part: &Result<ServedPart, String>,
+    doc: &Result<Option<Doc>, String>,
     sights: &[(String, Sight)],
-    tag_stable: bool,
+    r: &Reading,
 ) -> impl IntoView + use<> {
+    let cell = |v: &Verdict| {
+        let (class, label, why) = verdict_badge(v);
+        view! {
+            <TableCell><span class=class>{label}</span></TableCell>
+            <TableCell><span class="text-xs">{why}</span></TableCell>
+        }
+    };
     let rows = sights
         .iter()
         .map(|(stack, sight)| {
-            let v = match part {
-                Ok(p) => effect::steady(effect::holds(p, sight), tag_stable),
+            let restrictions = match part {
+                Ok(p) => effect::steady(effect::holds(p, sight), r.tag_stable),
                 Err(e) => Verdict::Unknown(format!("the served part is unreadable: {e}")),
             };
-            let (class, label, why) = verdict_badge(&v);
+            let held_doc = match doc {
+                Ok(Some(d)) => match effect::holds_doc(&d.digest, sight) {
+                    Verdict::InEffect if !r.doc_stable => {
+                        Verdict::Unknown(effect::DOC_MOVED.into())
+                    }
+                    v => v,
+                },
+                Ok(None) => Verdict::Unknown("the store holds no document".into()),
+                Err(e) => Verdict::Unknown(e.clone()),
+            };
             let stack = stack.clone();
             view! {
                 <TableRow>
                     <TableCell><span class="font-mono text-xs">{stack}</span></TableCell>
-                    <TableCell><span class=class>{label}</span></TableCell>
-                    <TableCell><span class="text-xs">{why}</span></TableCell>
+                    {cell(&restrictions)}
+                    {cell(&held_doc)}
                 </TableRow>
             }
         })
@@ -418,7 +493,7 @@ fn stacks_card(
             <CardHeader>
                 <CardTitle>"Stacks"</CardTitle>
                 <CardDescription>
-                    "Whether each stack holds the restrictions the store serves now: CF from its report to the store, every other stack from its instances' set hash in the metrics store. In effect only when every instance reports exactly the served set."
+                    "Whether each stack holds the restrictions and the document the store serves now: CF from its report to the store, every other stack from its instances in the metrics store. Restrictions are in effect only when every instance reports exactly the served set hash, and the document only when every instance reports exactly the served digest."
                 </CardDescription>
             </CardHeader>
             <CardContent>
@@ -426,6 +501,8 @@ fn stacks_card(
                     <TableHeader><TableRow>
                         <TableHead>"Stack"</TableHead>
                         <TableHead>"Served restrictions"</TableHead>
+                        <TableHead>"Why"</TableHead>
+                        <TableHead>"Served document"</TableHead>
                         <TableHead>"Why"</TableHead>
                     </TableRow></TableHeader>
                     <TableBody>{rows}</TableBody>
@@ -635,101 +712,22 @@ fn enable_unrecorded_form(csrf: &str) -> impl IntoView + use<> {
     }
 }
 
-/// The document's clients, read-only here, each with a shortcut to the
-/// disable form.
-fn clients_card(store: &Value) -> impl IntoView + use<> {
-    let doc = store.get("document");
-    let version = doc
-        .and_then(|d| d.get("version"))
-        .and_then(Value::as_u64)
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "—".into());
-    let clients: Vec<Value> = doc
-        .and_then(|d| d.get("clients"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let rows = clients
-        .iter()
-        .map(|c| {
-            let name = c.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-            let budget = c
-                .get("daily_budget")
-                .and_then(Value::as_u64)
-                .map(|b| crate::lb::fmt_tokens(b as f64))
-                .unwrap_or_else(|| "—".into());
-            let keys: Vec<String> = c
-                .get("keys")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .map(|k| {
-                    let id = k.get("id").and_then(Value::as_str).unwrap_or("?");
-                    let label = k.get("label").and_then(Value::as_str).unwrap_or("");
-                    format!("{id} {label}").trim().to_string()
-                })
-                .collect();
-            let keys = if keys.is_empty() { "—".to_string() } else { keys.join(", ") };
-            let href = format!("/lb/clients/disable?disable={}", url::form_urlencoded::byte_serialize(name.as_bytes()).collect::<String>());
-            view! {
-                <TableRow>
-                    <TableCell><span class="font-mono text-xs">{name}</span></TableCell>
-                    <TableCell><span class="tabular-nums">{budget}</span></TableCell>
-                    <TableCell><span class="text-xs font-mono">{keys}</span></TableCell>
-                    <TableCell><a class="text-xs underline underline-offset-4" href=href>"disable…"</a></TableCell>
-                </TableRow>
-            }
-        })
-        .collect_view();
-    view! {
-        <Card>
-            <CardHeader>
-                <CardTitle>{format!("Clients (document version {version})")}</CardTitle>
-                <CardDescription>"The store's document: the clients it grants, with their keys (ids and labels only)."</CardDescription>
-            </CardHeader>
-            <CardContent>
-                <TableWrapper><Table>
-                    <TableHeader><TableRow>
-                        <TableHead>"Client"</TableHead>
-                        <TableHead>"Daily budget"</TableHead>
-                        <TableHead>"Keys"</TableHead>
-                        <TableHead>""</TableHead>
-                    </TableRow></TableHeader>
-                    <TableBody>{rows}</TableBody>
-                </Table></TableWrapper>
-            </CardContent>
-        </Card>
-    }
-}
-
 // ─── Writes ─────────────────────────────────────────────────────────────────
 
-/// Every store write passes here before anything else: the session's CSRF
-/// token, then the subject allowlist as configured now. The allowlist is
-/// otherwise read only at login, so without this a subject removed from it
-/// would keep writing for the rest of its session. The Origin check has
-/// already run, as middleware, before any handler.
-pub fn guard_write(state: &AppState, session: &Session, csrf: &str) -> Result<(), AppError> {
-    if let Err(e) = session.verify_csrf(csrf) {
-        refused_locally(session, "CSRF token mismatch");
-        return Err(e);
-    }
-    if !state.config.subject_allowed(&session.sub) {
-        refused_locally(session, "subject no longer allowlisted");
-        return Err(AppError::Forbidden(
-            "this subject is no longer allowed to write".into(),
-        ));
-    }
-    Ok(())
+/// `routes::guard_write` for a client-store write, which puts its refusal
+/// on the write log like every other attempt.
+fn guard(state: &AppState, session: &Session, csrf: &str, kind: &str) -> Result<(), AppError> {
+    crate::routes::guard_write(state, session, csrf)
+        .inspect_err(|e| refused_locally(session, kind, e.detail()))
 }
 
 /// A write refused before anything was sent to the store, logged with the
 /// subject on the write log like every other attempt.
-fn refused_locally(session: &Session, why: &str) {
+fn refused_locally(session: &Session, kind: &str, why: &str) {
     tracing::warn!(
         target: "ops_console::write_log",
         sub = ?session.sub,
-        kind = "restrictions",
+        kind,
         why = %clip(why, 300),
         "client-store write refused before sending"
     );
@@ -772,18 +770,21 @@ fn clean_reason(raw: &str) -> Result<String, String> {
     Ok(r)
 }
 
-/// One line per write attempt, refusals and upstream failures included, with
-/// the user's subject. Request and answer are re-serialised and clipped.
-/// The store answers 503 `store.unavailable` to any failure of its
-/// restrictions object's call, a connection dropped after the commit
-/// included, so whether such a request applied is unknown. The write log and
-/// the page both read it through here, so they can never disagree.
+/// Whether a request may or may not have applied. The store answers 503
+/// `store.unavailable` to any failure of an object's call, a connection
+/// dropped after the commit included, and no 5xx proves that nothing was
+/// written. The write log and the page both read it through here, so they
+/// can never disagree.
 fn outcome_unknown(a: &Answer) -> bool {
-    a.status == StatusCode::SERVICE_UNAVAILABLE && has_code(&a.body, "store.unavailable")
+    a.status.is_server_error()
 }
 
+/// One line per write attempt, refusals and upstream failures included, with
+/// the user's subject. Request and answer are re-serialised and clipped, and
+/// the answer passes through `loggable`, so no minted key is ever logged.
 fn write_log(session: &Session, kind: &str, request: &Value, outcome: Result<&Answer, &AppError>) {
     let request = clip(&request.to_string(), MAX_LOGGED_CHARS);
+    let answer = |a: &Answer| clip(&loggable(&a.body).to_string(), MAX_LOGGED_CHARS);
     match outcome {
         Ok(a) if outcome_unknown(a) => tracing::warn!(
             target: "ops_console::write_log",
@@ -791,7 +792,7 @@ fn write_log(session: &Session, kind: &str, request: &Value, outcome: Result<&An
             kind,
             request = %request,
             status = a.status.as_u16(),
-            answer = %clip(&a.body.to_string(), MAX_LOGGED_CHARS),
+            answer = %answer(a),
             "client-store write outcome unknown"
         ),
         Ok(a) if a.status.is_success() => tracing::info!(
@@ -800,7 +801,7 @@ fn write_log(session: &Session, kind: &str, request: &Value, outcome: Result<&An
             kind,
             request = %request,
             status = a.status.as_u16(),
-            answer = %clip(&a.body.to_string(), MAX_LOGGED_CHARS),
+            answer = %answer(a),
             "client-store write committed"
         ),
         Ok(a) => tracing::warn!(
@@ -809,7 +810,7 @@ fn write_log(session: &Session, kind: &str, request: &Value, outcome: Result<&An
             kind,
             request = %request,
             status = a.status.as_u16(),
-            answer = %clip(&a.body.to_string(), MAX_LOGGED_CHARS),
+            answer = %answer(a),
             "client-store write refused"
         ),
         Err(e) => tracing::warn!(
@@ -859,26 +860,34 @@ pub async fn restrict(
             "the client-store module is not configured".into(),
         ));
     };
-    guard_write(&state, &session, &form.csrf)?;
+    guard(&state, &session, &form.csrf, RESTRICTIONS)?;
     let secure = state.secure_cookies();
-    // A refusal made here, before anything is sent, is an attempt too.
-    let refuse = |jar: PrivateCookieJar, msg: String| -> Result<Response, AppError> {
-        refused_locally(&session, &msg);
-        Ok(flash_redirect(jar, secure, "error", msg, "/lb/clients"))
+    let ops = match restriction_ops(&form, &actor_of(&session)) {
+        Ok(ops) => ops,
+        Err(msg) => {
+            // A refusal made here, before anything is sent, is an attempt too.
+            refused_locally(&session, RESTRICTIONS, &msg);
+            return Ok(flash_redirect(jar, secure, "error", msg, "/lb/clients"));
+        }
     };
+    let request = json!({ "restrictions": ops });
+    let answer = m.client.restrict(&ops).await;
+    write_log(&session, RESTRICTIONS, &request, answer.as_ref());
+    let (kind, msg, to) = restrict_outcome(m, &ops, answer).await;
+    Ok(flash_redirect(jar, secure, kind, msg, &to))
+}
 
+/// The write log's kind for restriction ops.
+const RESTRICTIONS: &str = "restrictions";
+
+/// The ops a restrict form asks for: the enables chosen when the disabled
+/// set is full, then the form's own `disable` or `enable`, last.
+fn restriction_ops(form: &RestrictForm, actor: &str) -> Result<Vec<RestrictionOp>, String> {
     let name = form.name.trim().to_string();
     if !is_name(&name) {
-        return refuse(
-            jar,
-            "A name is [a-z0-9] then [a-z0-9_-], at most 63 characters.".into(),
-        );
+        return Err("A name is [a-z0-9] then [a-z0-9_-], at most 63 characters.".into());
     }
-    let reason = match clean_reason(&form.reason) {
-        Ok(r) => r,
-        Err(e) => return refuse(jar, e),
-    };
-    let actor = actor_of(&session);
+    let reason = clean_reason(&form.reason)?;
     let mut ops: Vec<RestrictionOp> = Vec::new();
     for pick in &form.also_enable {
         let parsed = pick
@@ -886,70 +895,66 @@ pub async fn restrict(
             .and_then(|(n, v)| Some((n, v.parse::<u64>().ok()?)))
             .filter(|(n, _)| is_name(n));
         let Some((n, v)) = parsed else {
-            return refuse(
-                jar,
-                "A name to enable in the same request is malformed.".into(),
-            );
+            return Err("A name to enable in the same request is malformed.".into());
         };
         ops.push(RestrictionOp::Enable {
             name: n.to_string(),
             expected_version: v,
-            actor: actor.clone(),
+            actor: actor.to_string(),
             reason: reason.clone(),
         });
     }
-    let last = match form.action.as_str() {
+    ops.push(match form.action.as_str() {
         "disable" => RestrictionOp::Disable {
-            name: name.clone(),
-            actor: actor.clone(),
-            reason: reason.clone(),
+            name,
+            actor: actor.to_string(),
+            reason,
         },
-        "enable" => match form.expected_version.trim().parse() {
-            Ok(v) => RestrictionOp::Enable {
-                name: name.clone(),
-                expected_version: v,
-                actor: actor.clone(),
-                reason: reason.clone(),
-            },
-            Err(_) => {
-                return refuse(
-                    jar,
-                    "enable needs the version of the record it read.".into(),
-                );
-            }
+        "enable" => RestrictionOp::Enable {
+            name,
+            expected_version: form
+                .expected_version
+                .trim()
+                .parse()
+                .map_err(|_| "enable needs the version of the record it read.")?,
+            actor: actor.to_string(),
+            reason,
         },
-        _ => return refuse(jar, "The action is disable or enable.".into()),
-    };
-    ops.push(last);
+        _ => return Err("The action is disable or enable.".into()),
+    });
     if ops.len() > MAX_OPS {
-        return refuse(jar, format!("A request carries at most {MAX_OPS} ops."));
+        return Err(format!("A request carries at most {MAX_OPS} ops."));
     }
+    Ok(ops)
+}
 
-    let request = json!({ "restrictions": ops });
-    let answer = m.client.restrict(&ops).await;
-    write_log(&session, "restrictions", &request, answer.as_ref());
+/// What the page says after a restrict request, and where it goes: the
+/// effect page after a commit, the form again after a full-set refusal, the
+/// clients page otherwise. Only a commit whose answer reads in full exports
+/// committed labels.
+async fn restrict_outcome(
+    m: &StoreModule,
+    ops: &[RestrictionOp],
+    answer: Result<Answer, AppError>,
+) -> (&'static str, String, String) {
+    let back = "/lb/clients".to_string();
     let answer = match answer {
         Ok(a) => a,
         Err(e) => {
-            let msg = unknown_outcome(
-                m,
-                &ops,
-                &format!("the store's answer was lost ({})", e.detail()),
-            )
-            .await;
-            return Ok(flash_redirect(jar, secure, "error", msg, "/lb/clients"));
+            let why = format!("the store's answer was lost ({})", e.detail());
+            return ("error", unknown_outcome(m, ops, &why).await, back);
         }
     };
     if outcome_unknown(&answer) {
         let why = format!(
-            "the store answered 503: {}",
+            "the store answered {}: {}",
+            answer.status.as_u16(),
             refusal_lines(&answer.body).join("; ")
         );
-        let msg = unknown_outcome(m, &ops, &why).await;
-        return Ok(flash_redirect(jar, secure, "error", msg, "/lb/clients"));
+        return ("error", unknown_outcome(m, ops, &why).await, back);
     }
     if answer.status == StatusCode::OK {
-        let done = match written_ops(&answer.body, ops.len()) {
+        let done = match written_ops(&answer.body, ops) {
             Ok(done) => done,
             Err(e) => {
                 // Committed, but which records it wrote, at which versions, is
@@ -958,8 +963,8 @@ pub async fn restrict(
                     "The store committed the request, but its answer could not be read ({e}), \
                      so nothing is confirmed or exported as committed."
                 );
-                msg.push_str(&now_holds(m, &ops).await);
-                return Ok(flash_redirect(jar, secure, "error", msg, "/lb/clients"));
+                msg.push_str(&now_holds(m, ops).await);
+                return ("error", msg, back);
             }
         };
         for op in &done {
@@ -970,12 +975,12 @@ pub async fn restrict(
             .map(|op| format!("{} {}", op.state.as_str(), op.name))
             .collect::<Vec<_>>()
             .join(", ");
-        let msg = if summary.is_empty() {
-            "Nothing changed: every name was already in that state.".to_string()
-        } else {
-            format!("Committed: {summary}. Confirming on every stack…")
-        };
-        return Ok(flash_redirect(jar, secure, "ok", msg, &effect_href(&done)));
+        if summary.is_empty() {
+            let msg = "Nothing changed: every name was already in that state.".to_string();
+            return ("ok", msg, effect_href(&done, None));
+        }
+        let msg = format!("Committed: {summary}. Confirming on every stack…");
+        return ("ok", msg, effect_href(&done, None));
     }
     let mut msg = format!(
         "The store refused the request ({}): {}.",
@@ -985,14 +990,13 @@ pub async fn restrict(
     if answer.status == StatusCode::CONFLICT {
         // A 409 means the console's picture was stale: read the store again
         // before reporting, and say what it holds now.
-        msg.push_str(&now_holds(m, &ops).await);
+        msg.push_str(&now_holds(m, ops).await);
     }
-    let to = if has_code(&answer.body, "disabled.cap") {
-        back_to(&name)
-    } else {
-        "/lb/clients".to_string()
+    let to = match ops.last() {
+        Some(last) if has_code(&answer.body, "disabled.cap") => back_to(last.name()),
+        _ => back,
     };
-    Ok(flash_redirect(jar, secure, "error", msg, &to))
+    ("error", msg, to)
 }
 
 /// A request that may or may not have applied: its answer was lost, or the
@@ -1037,20 +1041,20 @@ async fn now_holds(m: &StoreModule, ops: &[RestrictionOp]) -> String {
 }
 
 /// The ops a 200 actually wrote, read strictly: one readable result per op
-/// sent, in order. An `enable` of a name already enabled writes nothing and
-/// returns the existing record, so there is nothing new to confirm or to
-/// export as committed. An answer that cannot be read in full is an error,
-/// never "nothing changed".
-fn written_ops(answer: &Value, sent: usize) -> Result<Vec<Op>, String> {
+/// sent, in order, each naming the name and state of the op it answers. An
+/// `enable` of a name already enabled writes nothing and returns the existing
+/// record, so there is nothing new to confirm or to export as committed. An
+/// answer that cannot be read in full is an error, never "nothing changed".
+fn written_ops(answer: &Value, sent: &[RestrictionOp]) -> Result<Vec<Op>, String> {
     let results = answer
         .get("results")
         .and_then(Value::as_array)
         .ok_or("no results")?;
-    if results.len() != sent {
-        return Err(format!("{} results for {sent} ops", results.len()));
+    if results.len() != sent.len() {
+        return Err(format!("{} results for {} ops", results.len(), sent.len()));
     }
     let mut done = Vec::new();
-    for r in results {
+    for (r, asked) in results.iter().zip(sent) {
         let op = (|| {
             Some(Op {
                 name: r.get("name")?.as_str().filter(|n| is_name(n))?.to_string(),
@@ -1058,10 +1062,23 @@ fn written_ops(answer: &Value, sent: usize) -> Result<Vec<Op>, String> {
                 version: r.get("version")?.as_u64()?,
             })
         })();
-        match (op, r.get("written").and_then(Value::as_bool)) {
-            (Some(op), Some(true)) => done.push(op),
-            (Some(_), Some(false)) => {}
-            _ => return Err("a result is malformed".into()),
+        let op = match op {
+            Some(op) if op.name == asked.name() && op.state == asked.state() => op,
+            Some(op) => {
+                return Err(format!(
+                    "a result names {} {} for an op on {} {}",
+                    op.state.as_str(),
+                    op.name,
+                    asked.state().as_str(),
+                    asked.name()
+                ));
+            }
+            None => return Err("a result is malformed".into()),
+        };
+        match r.get("written").and_then(Value::as_bool) {
+            Some(true) => done.push(op),
+            Some(false) => {}
+            None => return Err("a result is malformed".into()),
         }
     }
     Ok(done)
@@ -1069,10 +1086,10 @@ fn written_ops(answer: &Value, sent: usize) -> Result<Vec<Op>, String> {
 
 // ─── After a write: in effect per stack ─────────────────────────────────────
 
-/// `/lb/clients/effect?op=<state>.<name>.<version>…&at=<epoch s>`. The ops
-/// ride the URL, taken from the write's own result, so the page needs no
-/// state of its own and survives a console restart.
-fn effect_href(ops: &[Op]) -> String {
+/// `/lb/clients/effect?op=<state>.<name>.<version>…&doc=<version>.<digest>&at=<epoch s>`.
+/// What to confirm rides the URL, taken from the write's own result, so the
+/// page needs no state of its own and survives a console restart.
+fn effect_href(ops: &[Op], doc: Option<&Doc>) -> String {
     let mut qs = url::form_urlencoded::Serializer::new(String::new());
     for op in ops {
         qs.append_pair(
@@ -1080,13 +1097,26 @@ fn effect_href(ops: &[Op]) -> String {
             &format!("{}.{}.{}", op.state.as_str(), op.name, op.version),
         );
     }
+    if let Some(d) = doc {
+        qs.append_pair("doc", &format!("{}.{}", d.version, d.digest));
+    }
     qs.append_pair("at", &crate::session::now_epoch().to_string());
     format!("/lb/clients/effect?{}", qs.finish())
 }
 
-fn parse_effect_query(raw: Option<&str>) -> Result<(Vec<Op>, i64), AppError> {
-    let mut ops = Vec::new();
-    let mut at = 0;
+/// What the effect page confirms, read from its URL.
+struct Wanted {
+    ops: Vec<Op>,
+    doc: Option<Doc>,
+    at: i64,
+}
+
+fn parse_effect_query(raw: Option<&str>) -> Result<Wanted, AppError> {
+    let mut wanted = Wanted {
+        ops: Vec::new(),
+        doc: None,
+        at: 0,
+    };
     for (k, v) in url::form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
         match &*k {
             "op" => {
@@ -1102,17 +1132,34 @@ fn parse_effect_query(raw: Option<&str>) -> Result<(Vec<Op>, i64), AppError> {
                     })
                 })()
                 .ok_or_else(|| AppError::BadRequest("malformed op".into()))?;
-                ops.push(op);
+                wanted.ops.push(op);
             }
-            "at" => at = v.parse().unwrap_or(0),
+            "doc" => {
+                let doc = v
+                    .split_once('.')
+                    .and_then(|(version, digest)| {
+                        Some(Doc {
+                            version: version.parse().ok()?,
+                            digest: digest.to_string(),
+                        })
+                    })
+                    .filter(|d| effect::is_hex64(&d.digest))
+                    .ok_or_else(|| AppError::BadRequest("malformed document".into()))?;
+                wanted.doc = Some(doc);
+            }
+            "at" => wanted.at = v.parse().unwrap_or(0),
             _ => {}
         }
     }
-    if ops.len() > MAX_OPS {
+    if wanted.ops.len() > MAX_OPS {
         return Err(AppError::BadRequest(format!("at most {MAX_OPS} ops")));
     }
-    Ok((ops, at))
+    Ok(wanted)
 }
+
+/// One thing the effect page confirms: its title, and its judgement or the
+/// sentence saying why none could be made.
+type Block = (String, Result<effect::Judged, String>);
 
 pub async fn effect(
     State(state): State<AppState>,
@@ -1124,12 +1171,8 @@ pub async fn effect(
     let Some(m) = state.store.as_ref() else {
         return Ok((jar, Html(page_html(&session, flash, not_configured()))).into_response());
     };
-    let (ops, at) = parse_effect_query(raw.as_deref())?;
+    let wanted = parse_effect_query(raw.as_deref())?;
     let now_micros = (crate::session::now_epoch().max(0) as u64) * 1_000_000;
-    let ops: Vec<Op> = ops
-        .into_iter()
-        .filter(|op| !effect::aged_out(op, now_micros))
-        .collect();
     let reading = match read_all(m).await {
         Ok(r) => r,
         Err(e) => {
@@ -1139,21 +1182,49 @@ pub async fn effect(
     };
     let part = served_part(&reading.store);
     let sights = sights(&reading.store, &reading.fleet);
-    let judged: Vec<(Op, Result<effect::Judged, String>)> = ops
-        .into_iter()
+    // An answer that names no stack would judge everything on an empty
+    // table and read as settled: nothing is confirmed instead.
+    let no_stacks = sights
+        .is_empty()
+        .then(|| format!("{}.", capitalise(NO_STACKS)));
+    let mut blocks: Vec<Block> = wanted
+        .ops
+        .iter()
+        .filter(|op| !effect::aged_out(op, now_micros))
         .map(|op| {
-            // An answer that names no stack would judge each op on an empty
-            // table and read as settled: it is unreadable instead.
-            let j = match &part {
-                Err(e) => Err(e.clone()),
-                Ok(_) if sights.is_empty() => Err(NO_STACKS.to_string()),
-                Ok(p) => Ok(effect::judge_op(&op, p, &sights, reading.tag_stable)),
+            let title = format!("{} {} — version {}", op.state.as_str(), op.name, op.version);
+            let j = match (&part, &no_stacks) {
+                (Err(e), _) => Err(format!(
+                    "The served part is unreadable, so nothing is confirmed: {e}"
+                )),
+                (_, Some(why)) => Err(why.clone()),
+                (Ok(p), None) => Ok(effect::judge_op(op, p, &sights, reading.tag_stable)),
             };
-            (op, j)
+            (title, j)
         })
         .collect();
-    // Keep polling while some op can still become in effect on its own.
-    let settling = judged.iter().any(|(_, j)| match j {
+    if let Some(d) = &wanted.doc {
+        let title = format!(
+            "document version {} — digest {}…",
+            d.version,
+            &d.digest[..12]
+        );
+        let j = match (effect::served_doc(&reading.store), &no_stacks) {
+            (Err(e), _) => Err(format!(
+                "The store's document is unreadable, so nothing is confirmed: {e}"
+            )),
+            (_, Some(why)) => Err(why.clone()),
+            (Ok(served), None) => Ok(effect::judge_doc(
+                d,
+                served.as_ref(),
+                &sights,
+                reading.doc_stable,
+            )),
+        };
+        blocks.push((title, j));
+    }
+    // Keep polling while something can still become in effect on its own.
+    let settling = blocks.iter().any(|(_, j)| match j {
         Ok(j) => {
             !matches!(j.carried, Carried::Superseded(_))
                 && j.stacks.iter().any(|(_, v)| *v != Verdict::InEffect)
@@ -1163,11 +1234,12 @@ pub async fn effect(
     // `at` comes from the URL: a time in the future, or one so far back that
     // the subtraction would overflow, never keeps a page refreshing.
     let now = crate::session::now_epoch();
+    let at = wanted.at;
     let refresh = settling && at <= now && now.saturating_sub(at) < REFRESH_FOR_SECS;
     let content = view! {
         <div class="space-y-6">
             {warnings(&reading, &part)}
-            {effect_card(&judged, refresh)}
+            {effect_card(&blocks, refresh)}
         </div>
     };
     let html = Html(page_html(&session, flash, content));
@@ -1179,19 +1251,16 @@ pub async fn effect(
     Ok(resp)
 }
 
-fn effect_card(
-    judged: &[(Op, Result<effect::Judged, String>)],
-    refresh: bool,
-) -> impl IntoView + use<> {
-    let blocks = judged
+fn effect_card(blocks: &[Block], refresh: bool) -> impl IntoView + use<> {
+    let blocks_view = blocks
         .iter()
-        .map(|(op, j)| {
-            let title = format!("{} {} — version {}", op.state.as_str(), op.name, op.version);
+        .map(|(title, j)| {
+            let title = title.clone();
             let body = match j {
-                Err(e) => Either::Left(view! { <p class="text-sm">"The served part is unreadable, so nothing is confirmed: "{e.clone()}</p> }),
+                Err(e) => Either::Left(view! { <p class="text-sm">{e.clone()}</p> }),
                 Ok(j) => {
                     let head = match &j.carried {
-                        Carried::Superseded(v) => Some(format!("Superseded: a newer record of {} in the other state, at {v}, replaced this op. It is history, not in effect.", op.name)),
+                        Carried::Superseded(v) => Some(format!("Superseded: a newer write, at {v}, replaced this one. It is history, not in effect.")),
                         _ => None,
                     };
                     let rows = j
@@ -1233,9 +1302,9 @@ fn effect_card(
     let note = if refresh {
         "Refreshing every 5 s until every stack is in effect (readers poll every 5 s; the metrics store trails by up to a minute)."
     } else {
-        "Not refreshing: every op is settled, or two minutes have passed. Reload to check again."
+        "Not refreshing: everything is settled, or two minutes have passed. Reload to check again."
     };
-    let empty = judged.is_empty().then(|| {
+    let empty = blocks.is_empty().then(|| {
         view! { <p class="text-sm">"Nothing to confirm: the request wrote no record (already in that state, or older than the store keeps)."</p> }
     });
     view! {
@@ -1246,7 +1315,7 @@ fn effect_card(
             </CardHeader>
             <CardContent>
                 {empty}
-                {blocks}
+                {blocks_view}
                 <p class="text-sm"><a class="underline underline-offset-4" href="/lb/clients">"Back to LB clients"</a></p>
             </CardContent>
         </Card>

@@ -14,6 +14,7 @@
 mod alaya;
 mod committed;
 mod config;
+mod confirm;
 mod effect;
 mod error;
 mod fleet;
@@ -218,7 +219,10 @@ fn routes() -> Vec<(&'static str, axum::routing::MethodRouter<AppState>)> {
         ("/lb/clients", get(routes::clients::pane)),
         ("/lb/clients/disable", get(routes::clients::disable_page)),
         ("/lb/clients/restrict", post(routes::clients::restrict)),
+        ("/lb/clients/preview", post(routes::clients::preview)),
+        ("/lb/clients/commit", post(routes::clients::commit)),
         ("/lb/clients/effect", get(routes::clients::effect)),
+        ("/lb/clients/history", get(routes::clients::history)),
         // selecta module: GET only, by design. The console holds a read-only
         // selecta credential and no POST route to selecta may be added here.
         ("/selecta", get(routes::selecta::pane)),
@@ -3997,6 +4001,7 @@ mod tests {
                 let sink = form(&[
                     ("csrf", &csrf),
                     ("action", "disable"),
+                    ("op", "delete"),
                     ("name", "acme"),
                     ("reason", "test"),
                     ("expected_version", "1"),

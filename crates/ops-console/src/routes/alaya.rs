@@ -932,7 +932,7 @@ pub async fn delete_memory(
     jar: PrivateCookieJar,
     axum::Form(form): axum::Form<CsrfOnly>,
 ) -> Result<Response, AppError> {
-    session.verify_csrf(&form.csrf)?;
+    crate::routes::guard_write(&state, &session, &form.csrf)?;
     validate_hash(&hash)?;
     state.alaya.delete(&hash).await?;
     tracing::info!(sub = ?session.sub, hash = %hash, "memory deleted");
@@ -1052,7 +1052,7 @@ pub async fn supersede_submit(
     jar: PrivateCookieJar,
     axum::Form(form): axum::Form<SupersedeForm>,
 ) -> Result<Response, AppError> {
-    session.verify_csrf(&form.csrf)?;
+    crate::routes::guard_write(&state, &session, &form.csrf)?;
     validate_hash(&form.old_hash)?;
     validate_hash(&form.new_hash)?;
     if form.reason.trim().is_empty() {
@@ -1098,7 +1098,7 @@ pub async fn unsupersede_submit(
     jar: PrivateCookieJar,
     axum::Form(form): axum::Form<UnsupersedeForm>,
 ) -> Result<Response, AppError> {
-    session.verify_csrf(&form.csrf)?;
+    crate::routes::guard_write(&state, &session, &form.csrf)?;
     validate_hash(&hash)?;
     let secure = state.secure_cookies();
     let reason = form.reason.trim();
@@ -1166,7 +1166,7 @@ pub async fn correct_and_supersede(
     jar: PrivateCookieJar,
     axum::Form(form): axum::Form<CorrectForm>,
 ) -> Result<Response, AppError> {
-    session.verify_csrf(&form.csrf)?;
+    crate::routes::guard_write(&state, &session, &form.csrf)?;
     validate_hash(&hash)?;
     if form.content.trim().is_empty() || form.reason.trim().is_empty() {
         return Err(AppError::BadRequest(
@@ -1294,7 +1294,7 @@ async fn relation_action(
     form: RelationForm,
     action: &str,
 ) -> Result<Response, AppError> {
-    session.verify_csrf(&form.csrf)?;
+    crate::routes::guard_write(&state, &session, &form.csrf)?;
     validate_hash(&form.content_hash)?;
     validate_hash(&form.target_hash)?;
     if !["RELATES_TO", "PRECEDES", "CONTRADICTS"].contains(&form.relation_type.as_str()) {
@@ -1470,7 +1470,7 @@ pub async fn merge_submit(
     jar: PrivateCookieJar,
     axum_extra::extract::Form(mut form): axum_extra::extract::Form<MergeForm>,
 ) -> Result<Response, AppError> {
-    session.verify_csrf(&form.csrf)?;
+    crate::routes::guard_write(&state, &session, &form.csrf)?;
     validate_hash(&form.canonical_hash)?;
     // The form's checkbox state doesn't re-sync when the operator moves the
     // canonical radio (no JS by design) — the chosen canonical may arrive
@@ -2209,7 +2209,7 @@ pub async fn keep_both_submit(
     jar: PrivateCookieJar,
     axum::Form(form): axum::Form<ResolutionForm>,
 ) -> Result<Response, AppError> {
-    session.verify_csrf(&form.csrf)?;
+    crate::routes::guard_write(&state, &session, &form.csrf)?;
     validate_hash(&form.memory_a_hash)?;
     validate_hash(&form.memory_b_hash)?;
     state
@@ -2247,7 +2247,7 @@ pub async fn reopen_submit(
     jar: PrivateCookieJar,
     axum::Form(form): axum::Form<ResolutionForm>,
 ) -> Result<Response, AppError> {
-    session.verify_csrf(&form.csrf)?;
+    crate::routes::guard_write(&state, &session, &form.csrf)?;
     validate_hash(&form.memory_a_hash)?;
     validate_hash(&form.memory_b_hash)?;
     let (a, b) = (&form.memory_a_hash, &form.memory_b_hash);
@@ -2368,7 +2368,7 @@ pub async fn keep_both_bulk(
     jar: PrivateCookieJar,
     axum_extra::extract::Form(form): axum_extra::extract::Form<BulkKeepBothForm>,
 ) -> Result<Response, AppError> {
-    session.verify_csrf(&form.csrf)?;
+    crate::routes::guard_write(&state, &session, &form.csrf)?;
     if form.pair.is_empty() {
         return Err(AppError::BadRequest("select at least one pair".into()));
     }
