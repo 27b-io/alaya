@@ -399,8 +399,8 @@ not hand-write layout or recurring markup.
   `NotConfigured`, `Stat`/`StatGrid`, `PageHeader`, `Link` (the one link
   style) and `HashLink`.
 - `ui/shell.rs`: the document and the page shell. Every handler passes the
-  `Nav` entry its page belongs under to `page()`; the shell marks that entry
-  `aria-current="page"`. From `lg` the navigation is a sidebar grouped by
+  `Nav` entry its page belongs under to `page()` (or `result_page()`, below);
+  the shell marks that entry `aria-current="page"`. From `lg` the navigation is a sidebar grouped by
   module; below it, a `<details>` menu in the top bar. The top bar holds the
   theme switch and logout once at every width.
 
@@ -426,4 +426,7 @@ both blocks and a `--color-*` line in `@theme inline`. The theme switch in the
 top bar saves the operator's choice in the encrypted `console_theme`
 cookie (`src/theme.rs`); the page renders it as `class="dark"` or
 `class="light"` on `<html>`, and with no choice saved the OS setting
-(`prefers-color-scheme`) decides. No JavaScript is involved.
+(`prefers-color-scheme`) decides. No JavaScript is involved. The switch
+returns to the page it was used on, so a page rendered as the answer to a
+POST (a preview, a result, a shown-once key) uses `ui::result_page`, which
+leaves the switch out: its URL is POST-only, and a GET of it is a 405.

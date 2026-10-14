@@ -1370,6 +1370,30 @@ mod tests {
         render(AppState::new(config), "/alaya/health").await
     }
 
+    /// The merge preview is the answer to a POST, so its URL is POST-only: a
+    /// theme switch on it would 303 back to a GET of that URL and land on a
+    /// 405. It renders through `ui::result_page`, without the switch, while
+    /// the GET page it came from keeps it.
+    #[tokio::test]
+    async fn the_merge_preview_carries_no_theme_switch() {
+        let (h1, h2) = ("1".repeat(64), "2".repeat(64));
+        let superseded = serde_json::json!({ "superseded": [h2.clone()] });
+        let upstream = Router::new().route(
+            "/duplicates/merge",
+            post(move || std::future::ready(axum::Json(superseded.clone()))),
+        );
+        let (state, cookie, csrf) = triage_app(upstream).await;
+        let body =
+            format!("csrf={csrf}&canonical_hash={h1}&duplicate_hashes={h2}&reason=dup&dry_run=1");
+        let resp = post_form(&state, &cookie, "/alaya/duplicates/merge", body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = body_string(resp).await;
+        assert!(html.contains("Commit merge"), "{html}");
+        assert!(!html.contains("action=\"/prefs/theme\""), "{html}");
+        let (_, html) = get_page(&state, &cookie, "/").await;
+        assert!(html.contains("action=\"/prefs/theme\""), "{html}");
+    }
+
     /// The `action` of every form on a page other than the page shell's own
     /// (logout and the theme switch, neither of which calls an upstream). A
     /// form with no `action` posts back to the page, and is listed as "".
@@ -4396,6 +4420,8 @@ mod tests {
             .await;
             assert_eq!(resp.status(), StatusCode::OK);
             let html = body_string(resp).await;
+            // A POST answer: no theme switch (`ui::result_page`).
+            assert!(!html.contains("action=\"/prefs/theme\""), "{html}");
             assert_eq!(
                 store.posts(),
                 [json!({"document": {
@@ -4551,6 +4577,9 @@ mod tests {
             let html = body_string(resp).await;
             assert!(html.contains(&key), "{html}");
             assert!(html.contains("1Password"), "{html}");
+            // No theme switch: it would GET this POST-only URL back (a 405)
+            // and the key, shown once, would be gone (`ui::result_page`).
+            assert!(!html.contains("action=\"/prefs/theme\""), "{html}");
             assert!(
                 html.contains(&format!("/lb/clients/effect?doc={}.{D1}", V0 + 1)),
                 "{html}"

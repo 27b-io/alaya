@@ -245,13 +245,9 @@ fn flash_banner(flash: &Flash) -> impl IntoView + use<> {
     view! { <div class=class role="status">{msg}</div> }
 }
 
-/// The authenticated page: navigation with `nav` marked current, the top bar
-/// (theme switch, operator, log out), the flash banner, then the content.
-///
-/// The top bar holds one copy of each control at every width, so a form is
-/// never on the page twice; only the navigation is drawn twice, once per
-/// layout. The content column is `min-w-0`, so a wide table scrolls inside
-/// its wrapper instead of widening the page.
+/// The authenticated page for a page reached by GET: navigation with `nav`
+/// marked current, the top bar (theme switch, operator, log out), the flash
+/// banner, then the content.
 pub fn page(
     title: &str,
     nav: Nav,
@@ -259,9 +255,38 @@ pub fn page(
     flash: Option<Flash>,
     content: impl IntoView,
 ) -> String {
+    shell(title, nav, session, flash, content, true)
+}
+
+/// The same shell for a page rendered as the answer to a POST (a preview, a
+/// result, a shown-once key). It carries no theme switch: the switch returns to
+/// the page it was used on, and this page's URL is a POST-only route that a
+/// GET would answer with 405, leaving the page and anything shown once on it.
+pub fn result_page(
+    title: &str,
+    nav: Nav,
+    session: &Session,
+    flash: Option<Flash>,
+    content: impl IntoView,
+) -> String {
+    shell(title, nav, session, flash, content, false)
+}
+
+/// The top bar holds one copy of each control at every width, so a form is
+/// never on the page twice; only the navigation is drawn twice, once per
+/// layout. The content column is `min-w-0`, so a wide table scrolls inside
+/// its wrapper instead of widening the page.
+fn shell(
+    title: &str,
+    nav: Nav,
+    session: &Session,
+    flash: Option<Flash>,
+    content: impl IntoView,
+    with_theme_switch: bool,
+) -> String {
     let who = session.display_name().to_string();
     let csrf = session.csrf.clone();
-    let switch = theme_switch(session.theme, session.csrf.clone());
+    let switch = with_theme_switch.then(|| theme_switch(session.theme, session.csrf.clone()));
     let body = view! {
         <a href="#content" class="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-3 focus:z-50 focus:rounded-md focus:bg-card focus:px-3 focus:py-2 focus:text-sm focus:shadow-md">
             "Skip to content"
@@ -391,6 +416,17 @@ mod tests {
         assert!(html.contains(r#"<main id="content""#));
         assert_eq!(html.matches(r#"<nav aria-label="Main""#).count(), 2);
         assert!(html.contains(">Ray</span>"), "the operator is named");
+    }
+
+    /// A POST's answer page keeps the navigation and logout but has no theme
+    /// switch, which would send the browser to a GET of a POST-only URL.
+    #[test]
+    fn a_result_page_has_no_theme_switch() {
+        let html = result_page("t", Nav::Duplicates, &session(), None, "");
+        assert!(!html.contains(r#"action="/prefs/theme""#), "{html}");
+        assert_eq!(html.matches(r#"action="/auth/logout""#).count(), 1);
+        let marked = r#"href="/alaya/duplicates" aria-current="page""#;
+        assert_eq!(html.matches(marked).count(), 2, "{html}");
     }
 
     /// The menu is a `<details>` that only exists below `lg` and the sidebar
