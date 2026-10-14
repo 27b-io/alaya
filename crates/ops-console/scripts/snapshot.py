@@ -101,6 +101,7 @@ class Chrome:
         os.close(from_chrome)
         self._buf = b""
         self._next_id = 0
+        self._loads = 0
         target = self.call("Target.createTarget", url="about:blank")["targetId"]
         self._session = self.call(
             "Target.attachToTarget", targetId=target, flatten=True
@@ -140,9 +141,12 @@ class Chrome:
             deviceScaleFactor=1,
             mobile=mobile,
         )
+        # A query unique to this load, so the document it waits for is never
+        # the one already open: the same page is loaded once per width.
+        self._loads += 1
+        url = f"{url}?load={self._loads}"
         self.page("Page.navigate", url=url)
-        # Until the new document has loaded, stylesheet included: right after
-        # the navigate call the old document can still answer `complete`.
+        # Until the new document has loaded, stylesheet included.
         loaded = (
             f"location.href === {json.dumps(url)} && document.readyState === 'complete'"
         )
@@ -175,9 +179,16 @@ class Chrome:
     def close(self):
         try:
             self.call("Browser.close")
-        except RuntimeError:
-            pass
-        self._proc.wait(timeout=10)
+        except RuntimeError as e:
+            # Chrome may exit before it answers; anything else is news.
+            if "closed the DevTools pipe" not in str(e):
+                print(f"Browser.close: {e}", file=sys.stderr)
+        try:
+            self._proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            print("Chrome did not exit within 10s; killing it", file=sys.stderr)
+            self._proc.kill()
+            self._proc.wait()
         shutil.rmtree(self._profile, ignore_errors=True)
 
 
@@ -212,7 +223,12 @@ def main():
     if len(sys.argv) != 2:
         sys.exit(f"usage: {sys.argv[0]} DIR")
     root = Path(sys.argv[1]).resolve()
-    stems = (root / "pages.txt").read_text().split()
+    try:
+        stems = (root / "pages.txt").read_text().split()
+    except OSError as e:
+        sys.exit(
+            f"cannot read the page list: {e}. Run scripts/snapshot.sh, which writes it."
+        )
     pngs, sheets = root / "png", root / "sheets"
     pngs.mkdir(exist_ok=True)
     sheets.mkdir(exist_ok=True)

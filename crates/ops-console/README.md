@@ -406,8 +406,12 @@ not hand-write layout or recurring markup.
 
 The CSP forbids scripts and inline style, so nothing may emit a script, a
 style element or a style attribute, and colour comes only from the theme
-tokens, never a Tailwind palette class (`text-white`, `bg-gray-100`): a test
-in `src/ui/mod.rs` holds every production source file under `src/` to that.
+tokens, never a Tailwind palette class (`text-white`, `bg-gray-100`). Tests
+in `src/ui/mod.rs` hold the production code to the first, and every file
+under `src/` (tests included: Tailwind reads them all) and the checked-in
+stylesheet to the second. Tailwind reads `src/` and nothing else
+(`source(none)` in `style/input.css`), so prose like this paragraph never
+reaches the stylesheet.
 
 **Snapshots.** `scripts/snapshot.sh` renders every GET page against the test
 suite's fake upstreams (an ignored test, `tests::snapshot::write_snapshots`),

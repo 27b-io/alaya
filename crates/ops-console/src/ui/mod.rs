@@ -15,7 +15,9 @@
 //! The CSP admits the console's one stylesheet and nothing else: no script,
 //! no style element and no inline style attribute. Colour comes only from
 //! the theme tokens in `style/input.css`, never from Tailwind's palette, so
-//! it follows the theme. A test below holds the whole of `src/` to all of it.
+//! it follows the theme. Tests below hold the production code to the first,
+//! and every file under `src/` (tests too: Tailwind reads them) and the
+//! shipped stylesheet to the second.
 
 mod components;
 mod patterns;
@@ -86,10 +88,10 @@ mod tests {
         "indigo", "violet", "purple", "fuchsia", "pink", "rose",
     ];
 
-    /// `class` uses a palette colour: `text-white`, `bg-gray-100`,
-    /// `hover:ring-red-500/50`. Variants, an important mark, a negative and
-    /// an opacity are stripped first; theme tokens (`text-foreground`,
-    /// `bg-destructive/60`) are not palette colours.
+    /// `class` is a colour utility naming white, black or a palette hue
+    /// and shade, as the test below spells out. Variants, an important mark,
+    /// a negative and an opacity are stripped first; theme tokens
+    /// (`text-foreground`, `bg-destructive/60`) are not palette colours.
     fn is_palette_class(class: &str) -> bool {
         let utility = class.rsplit(':').next().unwrap_or(class);
         let utility = utility.trim_start_matches(['!', '-']);
@@ -116,15 +118,17 @@ mod tests {
 
     #[test]
     fn palette_classes_are_told_from_theme_tokens() {
+        // Spelt in halves: whole, they would be palette classes in `src/`,
+        // which Tailwind would compile into the stylesheet.
         for bad in [
-            "text-white",
-            "bg-gray-100",
-            "hover:ring-red-500/50",
-            "dark:bg-zinc-950",
-            "!text-black",
-            "border-t-slate-200",
-            "fill-sky-400",
-            "decoration-white/40",
+            concat!("text-", "white"),
+            concat!("bg-", "gray-100"),
+            concat!("hover:ring-", "red-500/50"),
+            concat!("dark:bg-", "zinc-950"),
+            concat!("!text-", "black"),
+            concat!("border-t-", "slate-200"),
+            concat!("fill-", "sky-400"),
+            concat!("decoration-", "white/40"),
         ] {
             assert!(is_palette_class(bad), "{bad}");
         }
@@ -147,10 +151,9 @@ mod tests {
         }
     }
 
-    /// The production code of every source file under `src/`: a file's
-    /// trailing `mod tests` is cut off, and test-only files are skipped.
-    /// Tests may hold hostile markup, to prove it comes out escaped.
-    fn production_sources() -> Vec<(std::path::PathBuf, String)> {
+    /// Every Rust source file under `src/` as (path within `src/`, text):
+    /// all that Tailwind reads (`@source "../src"`), tests included.
+    fn sources() -> Vec<(std::path::PathBuf, String)> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut dirs = vec![root.clone()];
         let mut out = Vec::new();
@@ -158,32 +161,36 @@ mod tests {
             for entry in std::fs::read_dir(&dir).unwrap() {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
-                    // `src/tests/` holds modules of main.rs's own tests.
-                    if path != root.join("tests") {
-                        dirs.push(path);
-                    }
-                    continue;
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    out.push((path.strip_prefix(&root).unwrap().to_path_buf(), text));
                 }
-                let name = path.file_name().unwrap().to_string_lossy().into_owned();
-                if !name.ends_with(".rs") || name == "testkit.rs" || name == "testlog.rs" {
-                    continue;
-                }
-                let src = std::fs::read_to_string(&path).unwrap();
-                let cut = src.find("\n#[cfg(test)]\nmod tests").unwrap_or(src.len());
-                out.push((path, src[..cut].to_string()));
             }
         }
         assert!(out.len() > 20, "found only {} source files", out.len());
         out
     }
 
-    /// The CSP forbids scripts and inline style, and colour is the theme's
-    /// alone: nothing in `src/` may put a script or style element, an inline
-    /// style (attribute or `style:` directive) or a Tailwind palette colour
-    /// on a page. A palette class even in a comment would be compiled into
-    /// the stylesheet, so comments count too.
+    /// The part of a source file that runs outside the tests: a file's
+    /// trailing `mod tests` is cut off, and test-only files (`tests/`,
+    /// `testkit.rs`, `testlog.rs`) are none of it. Tests may hold hostile
+    /// markup, to prove it comes out escaped.
+    fn production<'a>(path: &std::path::Path, text: &'a str) -> &'a str {
+        let test_only = path.starts_with("tests")
+            || path == std::path::Path::new("testkit.rs")
+            || path == std::path::Path::new("testlog.rs");
+        if test_only {
+            return "";
+        }
+        &text[..text.find("\n#[cfg(test)]\nmod tests").unwrap_or(text.len())]
+    }
+
+    /// The CSP forbids scripts and inline style: no code that renders a page
+    /// may hold a script or style element or an inline style, attribute or
+    /// `style:` directive.
     #[test]
-    fn src_has_no_script_inline_style_or_palette_colour() {
+    fn production_code_has_no_script_or_inline_style() {
         let forbidden = [
             concat!("<scr", "ipt"),
             concat!("<sty", "le"),
@@ -191,22 +198,50 @@ mod tests {
             concat!("sty", "le:"),
         ];
         let mut found = Vec::new();
-        for (path, src) in production_sources() {
-            for (n, line) in src.lines().enumerate() {
-                let at = format!("{}:{}", path.display(), n + 1);
-                for f in forbidden {
-                    if line.contains(f) {
-                        found.push(format!("{at}: {f}"));
-                    }
-                }
-                let classes = line.split(|c: char| {
-                    c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ',' | ';' | '{' | '}')
-                });
-                for class in classes.filter(|c| is_palette_class(c)) {
-                    found.push(format!("{at}: {class}"));
+        for (path, text) in sources() {
+            for (n, line) in production(&path, &text).lines().enumerate() {
+                for f in forbidden.iter().filter(|f| line.contains(**f)) {
+                    found.push(format!("src/{}:{}: {f}", path.display(), n + 1));
                 }
             }
         }
         assert!(found.is_empty(), "{}", found.join("\n"));
+    }
+
+    /// Colour is the theme's alone. Tailwind compiles a palette class from
+    /// anywhere it reads, a comment or a test included, so no file under
+    /// `src/` may hold one.
+    #[test]
+    fn src_holds_no_palette_colour() {
+        let mut found = Vec::new();
+        for (path, text) in sources() {
+            for (n, line) in text.lines().enumerate() {
+                let classes = line.split(|c: char| {
+                    c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ',' | ';' | '{' | '}')
+                });
+                for class in classes.filter(|c| is_palette_class(c)) {
+                    found.push(format!("src/{}:{}: {class}", path.display(), n + 1));
+                }
+            }
+        }
+        assert!(found.is_empty(), "{}", found.join("\n"));
+    }
+
+    /// What ships: the checked-in stylesheet defines no palette colour. This
+    /// catches one compiled from wherever Tailwind read it; the source test
+    /// above names the file.
+    #[test]
+    fn the_stylesheet_defines_no_palette_colour() {
+        let css = include_str!("../../static/console.css");
+        let leaked: Vec<&str> = HUES
+            .iter()
+            .copied()
+            .chain(["white", "black"])
+            .filter(|hue| css.contains(&format!("--color-{hue}")))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "static/console.css defines palette colours {leaked:?}: a palette class under src/"
+        );
     }
 }
