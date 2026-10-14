@@ -241,20 +241,40 @@ pub fn refusal_lines(answer: &Value) -> Vec<String> {
     lines
 }
 
-/// The answer as the write log may hold it: each minted key reduced to its
-/// client, id and digest. A key is in a commit's `keys` and nowhere else.
+/// The members of a store answer the write log keeps. Anything else is left
+/// out, so a member the store might add later can never carry key material
+/// into a log line.
+const LOGGED: [&str; 11] = [
+    "status",
+    "errors",
+    "error",
+    "dry_run",
+    "version",
+    "digest",
+    "diff",
+    "merged_after_commit",
+    "results",
+    "records_version",
+    "message",
+];
+
+/// The answer as the write log may hold it: the members in `LOGGED`, and
+/// each minted key reduced to its client, id and digest.
 pub fn loggable(answer: &Value) -> Value {
-    let mut out = answer.clone();
-    if let Some(keys) = out.get_mut("keys").and_then(Value::as_array_mut) {
-        for k in keys.iter_mut() {
-            *k = json!({
-                "client": k.get("client"),
-                "id": k.get("id"),
-                "digest": k.get("digest"),
-            });
+    let mut out = serde_json::Map::new();
+    for k in LOGGED {
+        if let Some(v) = answer.get(k) {
+            out.insert(k.to_string(), v.clone());
         }
     }
-    out
+    if let Some(keys) = answer.get("keys").and_then(Value::as_array) {
+        let keys = keys
+            .iter()
+            .map(|k| json!({"client": k.get("client"), "id": k.get("id"), "digest": k.get("digest")}))
+            .collect();
+        out.insert("keys".to_string(), Value::Array(keys));
+    }
+    Value::Object(out)
 }
 
 /// Read a commit's 200 strictly. Every key must be one the request asked
@@ -492,6 +512,11 @@ mod tests {
         // An answer with no keys passes through unchanged.
         let refusal = json!({"status": 409, "errors": [{"code": "version.stale", "message": "x"}]});
         assert_eq!(loggable(&refusal), refusal);
+        // A member the console does not know is left out, whatever it holds.
+        let odd = json!({"status": 200, "version": 9, "secret": key, "keys": {"key": key}});
+        let logged = loggable(&odd).to_string();
+        assert!(!logged.contains(&key), "{logged}");
+        assert!(logged.contains("\"version\":9"), "{logged}");
     }
 
     #[test]

@@ -50,6 +50,12 @@ const DOCUMENT: &str = "document";
 /// Most changes one diff renders; the rest are counted.
 const MAX_DIFF_LINES: usize = 100;
 
+/// Most ops a history row names, and most keys a client row lists; the rest
+/// are counted. A valid document holds at most two keys per client, but the
+/// page renders whatever the store sends.
+const MAX_OPS_SHOWN: usize = 20;
+const MAX_KEYS_SHOWN: usize = 8;
+
 /// The fields of every document form. Each form fills those its op reads;
 /// the commit form carries them back exactly as the preview parsed them.
 #[derive(Deserialize, Default)]
@@ -311,11 +317,6 @@ async fn gate(m: &StoreModule, op: &DocOp) -> Gate {
     let mut notes = Vec::new();
     let mut refused = None;
     needed.extend(confirm::for_signals(&fleet.store_alerts));
-    if let Err(e) = &fleet.store_alerts {
-        notes.push(format!(
-            "Whether any instance reports the store behind or edited is unknown (metrics store: {e})."
-        ));
-    }
     if let (Some(version), Some(check)) = (restore, check) {
         match check {
             Ok(RowCheck::Checked) => notes.push(format!(
@@ -344,11 +345,7 @@ async fn restore_check(m: &StoreModule, version: u64) -> Result<RowCheck, String
     let (store, installed) = tokio::join!(m.client.read(), fleet::installed(&m.metrics));
     let store = store.map_err(|e| format!("the store could not be read ({})", e.detail()))?;
     let installed = installed.map_err(|e| format!("the metrics store could not be read ({e})"))?;
-    confirm::row_check(
-        version,
-        confirm::row_digest(&store, version).as_deref(),
-        &installed,
-    )
+    confirm::row_check(version, &confirm::history_row(&store, version)?, &installed)
 }
 
 /// A name the write drops that is still in a stack's TOML goes back to its
@@ -373,7 +370,10 @@ fn toml_notes(
         Ok(t) => dropped
             .into_iter()
             .filter_map(|n| {
-                let stacks = t.get(n)?.iter().cloned().collect::<Vec<_>>().join(", ");
+                let stacks = clip(
+                    &t.get(n)?.iter().cloned().collect::<Vec<_>>().join(", "),
+                    300,
+                );
                 Some(format!(
                     "{n} is still in the TOML of {stacks}: on those stacks it goes back to its \
                      TOML policy and keys."
@@ -415,19 +415,16 @@ pub async fn preview(
         dry_run: true,
         ops: &ops,
     };
-    // A dry run writes nothing, whatever happens to it.
     let answer = match m.client.document(&request).await {
         Ok(a) => a,
-        Err(e) => {
-            let msg = format!("The preview failed: {}. Nothing was written.", e.detail());
-            return Ok(back(jar, msg));
-        }
+        Err(e) => return Ok(back(jar, format!("The preview failed: {}.", e.detail()))),
     };
+    let op = &ops[0];
     if answer.status != StatusCode::OK {
         let what = if answer.status.is_client_error() {
             "The store refused the preview"
         } else {
-            "The preview failed, and wrote nothing"
+            "The preview failed"
         };
         let mut msg = format!(
             "{what} ({}): {}.",
@@ -439,7 +436,21 @@ pub async fn preview(
         }
         return Ok(back(jar, msg));
     }
-    let op = &ops[0];
+    // A preview is shown only for an answer that is a dry run's. One that
+    // carries a version or keys is a commit: the store wrote something the
+    // operator never confirmed, so it is logged and reported like any write
+    // whose outcome is unknown.
+    let dry = answer.body.get("dry_run").and_then(Value::as_bool) == Some(true);
+    if !dry || answer.body.get("version").is_some() || answer.body.get("keys").is_some() {
+        write_log(
+            &session.sub,
+            DOCUMENT,
+            &json!({ "document": request }),
+            Ok(&answer),
+        );
+        let why = "the store answered the preview as if it were a commit";
+        return Ok(back(jar, unknown(m, op, why).await));
+    }
     let gate = gate(m, op).await;
     let content = preview_view(op, expected, &reason, &answer.body, &gate, &session.csrf);
     Ok((jar, Html(page_html(&session, None, content))).into_response())
@@ -581,20 +592,36 @@ pub async fn commit(
     }
     let actor = actor_of(&session);
     let ops = [op];
-    let request = DocRequest {
-        expected_version: expected,
-        actor: &actor,
-        reason: &reason,
-        dry_run: false,
-        ops: &ops,
+    // Sent and recorded in a task of its own: a write the store commits must
+    // reach the write log and the committed labels even when the operator's
+    // connection drops and this handler is dropped with it. The answer comes
+    // back here, minted keys included, and nowhere else.
+    let answer = {
+        let (m, sub, ops) = (m.clone(), session.sub.clone(), ops.clone());
+        tokio::spawn(async move {
+            let request = DocRequest {
+                expected_version: expected,
+                actor: &actor,
+                reason: &reason,
+                dry_run: false,
+                ops: &ops,
+            };
+            let answer = m.client.document(&request).await;
+            write_log(
+                &sub,
+                DOCUMENT,
+                &json!({ "document": request }),
+                answer.as_ref(),
+            );
+            let committed = answer.as_ref().ok().filter(|a| a.status == StatusCode::OK);
+            if let Some(Ok(c)) = committed.map(|a| commit_of(&a.body, &ops)) {
+                m.committed.document(c.version, &c.digest);
+            }
+            answer
+        })
+        .await
+        .unwrap_or_else(|e| Err(AppError::Upstream(format!("the write's task failed ({e})"))))
     };
-    let answer = m.client.document(&request).await;
-    write_log(
-        &session,
-        DOCUMENT,
-        &json!({ "document": request }),
-        answer.as_ref(),
-    );
     let op = &ops[0];
     let answer = match answer {
         Ok(a) if !outcome_unknown(&a) => a,
@@ -619,6 +646,13 @@ pub async fn commit(
         );
         if answer.status == StatusCode::CONFLICT {
             // The page the form came from was stale: say what the store holds.
+            if matches!(op, DocOp::AddKey { .. }) {
+                msg.push_str(
+                    " If the form was sent twice, the first send may have minted a key that was \
+                     never shown: compare the client's keys with the ones you hold, and revoke \
+                     any other.",
+                );
+            }
             msg.push_str(&doc_now(m).await);
         }
         return Ok(back(jar, msg));
@@ -637,12 +671,11 @@ pub async fn commit(
             return Ok(back(jar, msg));
         }
     };
-    // When the store follows a commit with a catch-up commit of its own
-    // (`merged_after_commit`), the answer carries the catch-up's version and
-    // digest, which readers converge on. The first is not exported: an
-    // instance that installed it in between raises the unmatched-install
-    // alert, which is the safe side.
-    m.committed.document(c.version, &c.digest);
+    // Exported as committed where it was sent. When the store follows a
+    // commit with a catch-up commit of its own (`merged_after_commit`), the
+    // answer carries the catch-up's version and digest, which readers
+    // converge on. The first is not exported: an instance that installed it
+    // in between raises the unmatched-install alert, which is the safe side.
     let doc = Doc {
         version: c.version,
         digest: c.digest.clone(),
@@ -844,22 +877,27 @@ fn history_view(store: &Value, csrf: &str) -> impl IntoView + use<> {
     let table = rows
         .iter()
         .map(|r| {
-            let s = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+            // A row is the store's text, and an edit can put anything in it:
+            // every field is clipped, and the ops are counted past a few.
+            let s = |k: &str, max: usize| clip(r.get(k).and_then(Value::as_str).unwrap_or(""), max);
             let version = r.get("version").and_then(Value::as_u64);
             let (when, exact) = version
                 .map(|v| (fmt_ms(v), v.to_string()))
                 .unwrap_or_else(|| ("unreadable".into(), String::new()));
-            let digest = s("digest");
+            let digest = s("digest", 64);
             let short = format!("{}…", clip(&digest, 12).trim_end_matches('…'));
-            let who = format!("{} ({})", s("actor"), s("role"));
-            let ops = r
+            let who = format!("{} ({})", s("actor", 64), s("role", 16));
+            let all_ops: Vec<String> = r
                 .get("ops")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
                 .map(op_summary)
-                .collect::<Vec<_>>()
-                .join(", ");
+                .collect();
+            let mut ops = all_ops.iter().take(MAX_OPS_SHOWN).cloned().collect::<Vec<_>>().join(", ");
+            if all_ops.len() > MAX_OPS_SHOWN {
+                ops.push_str(&format!(", and {} more", all_ops.len() - MAX_OPS_SHOWN));
+            }
             let changes = diff_lines(r.get("diff").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default())
                 .into_iter()
                 .map(|l| view! { <li>{l}</li> })
@@ -869,7 +907,7 @@ fn history_view(store: &Value, csrf: &str) -> impl IntoView + use<> {
                 Some(v) => restore_form(csrf, current, v).into_any(),
                 None => view! { <span class="text-xs">"—"</span> }.into_any(),
             };
-            let (at, reason) = (s("at"), s("reason"));
+            let (at, reason) = (s("at", 40), s("reason", 200));
             view! {
                 <TableRow>
                     <TableCell><span class="tabular-nums whitespace-nowrap" title=exact>{when}</span></TableCell>
@@ -1074,10 +1112,10 @@ fn client_row(c: &Value, csrf: &str, version: u64) -> impl IntoView + use<> {
     let util = Some(field_text(c.get("utilization_limit")))
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| "—".into());
-    let models = Some(list_text(c.get("models"), ", "))
+    let models = Some(clip(&list_text(c.get("models"), ", "), 300))
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| "all".into());
-    let pins = Some(list_text(c.get("preferred_endpoints"), ", "))
+    let pins = Some(clip(&list_text(c.get("preferred_endpoints"), ", "), 300))
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| "—".into());
     let keys: Vec<Value> = c
@@ -1085,12 +1123,22 @@ fn client_row(c: &Value, csrf: &str, version: u64) -> impl IntoView + use<> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let more_keys = (keys.len() > MAX_KEYS_SHOWN).then(|| {
+        let more = format!("and {} more", keys.len() - MAX_KEYS_SHOWN);
+        view! { <li class="text-xs">{more}</li> }
+    });
     let key_list = keys
         .iter()
+        .take(MAX_KEYS_SHOWN)
         .map(|k| {
-            let s = |f: &str| k.get(f).and_then(Value::as_str).unwrap_or("").to_string();
-            let text = format!("{} {} ({})", s("id"), s("label"), s("created_at"));
-            let digest = s("digest");
+            let s = |f: &str, max: usize| clip(k.get(f).and_then(Value::as_str).unwrap_or(""), max);
+            let text = format!(
+                "{} {} ({})",
+                s("id", 16),
+                s("label", 64),
+                s("created_at", 40)
+            );
+            let digest = s("digest", 64);
             let form = revoke_form(csrf, version, &digest);
             view! {
                 <li class="flex items-center gap-2 mb-1">
@@ -1112,7 +1160,7 @@ fn client_row(c: &Value, csrf: &str, version: u64) -> impl IntoView + use<> {
             <TableCell><span class="tabular-nums">{util}</span></TableCell>
             <TableCell><span class="text-xs font-mono">{models}</span></TableCell>
             <TableCell><span class="text-xs font-mono">{pins}</span></TableCell>
-            <TableCell><ul>{key_list}</ul></TableCell>
+            <TableCell><ul>{key_list}{more_keys}</ul></TableCell>
             <TableCell>
                 {manage}
                 <a class="text-xs underline underline-offset-4" href=disable>"disable…"</a>

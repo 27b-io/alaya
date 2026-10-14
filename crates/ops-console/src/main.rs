@@ -3774,6 +3774,7 @@ mod tests {
                     ("csrf", &csrf),
                     ("action", "disable"),
                     ("op", "delete"),
+                    ("confirm_signal", "write anyway"),
                     ("name", "acme"),
                     ("reason", "test"),
                     ("expected_version", "1"),
@@ -4143,7 +4144,7 @@ mod tests {
 
         // ─── Document ops ───────────────────────────────────────────────────
 
-        use crate::testkit::{V0, k3s_documents};
+        use crate::testkit::{V0, k3s_documents, quiet_fleet};
 
         /// A dry run's answer: the store's diff and CF's state.
         fn dry_run(diff: serde_json::Value) -> serde_json::Value {
@@ -4306,7 +4307,7 @@ mod tests {
             for (fields, op) in cases {
                 let store = FakeStore::new(&World::new(vec![]));
                 store.answer_post(StatusCode::OK, committed(V0 + 1, D1, json!([])));
-                let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+                let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
                 let (cookie, csrf) = cookie_for(&state, "admin-sub");
                 let resp = post_form(
                     &state,
@@ -4345,7 +4346,7 @@ mod tests {
             let store = FakeStore::new(&World::new(vec![]));
             let (k, key) = minted("acme");
             store.answer_post(StatusCode::OK, committed(V0 + 1, D1, json!([k])));
-            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
             let (cookie, csrf) = cookie_for(&state, "admin-sub");
             let buf = testlog::LogBuf::default();
             let _guard = buf.capture();
@@ -4413,7 +4414,7 @@ mod tests {
                     json!({"status": 409, "errors": [{"code": "version.stale", "message": format!("the store is at version {}, not {V0}", V0 + 1), "version": V0 + 1}]}),
                 ),
             ]);
-            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
             let (cookie, csrf) = cookie_for(&state, "admin-sub");
             let body = doc_form(&csrf, &[("op", "add_key"), ("name", "acme"), ("label", "")]);
             let first = post_form(&state, &cookie, "/lb/clients/commit", body.clone()).await;
@@ -4428,6 +4429,11 @@ mod tests {
             assert_eq!(location(&again), "/lb/clients");
             let flash = flash_of(&state, &again);
             assert!(flash.msg.contains("version.stale"), "{}", flash.msg);
+            assert!(
+                flash.msg.contains("If the form was sent twice"),
+                "{}",
+                flash.msg
+            );
             assert!(
                 flash.msg.contains(&format!(
                     "Re-read the store: it is at document version {}",
@@ -4522,10 +4528,12 @@ mod tests {
             }
         }
 
-        /// A metrics store that cannot answer holds up no document write but
-        /// a `restore`, which needs its record of what was installed.
+        /// A metrics store that cannot answer refuses a `restore`, which needs
+        /// its record of what was installed, and asks for the typed
+        /// confirmation on every other document write: whether an instance
+        /// reports the store edited cannot be told. Typed, the write goes.
         #[tokio::test]
-        async fn a_dark_metrics_store_refuses_only_restore() {
+        async fn a_dark_metrics_store_refuses_restore_and_asks_to_confirm_the_rest() {
             let mut world = World::new(vec![]);
             world.history = vec![(V0, "0".repeat(64)), (V0 - 5, D1.into())];
             let store = FakeStore::new(&world);
@@ -4543,11 +4551,27 @@ mod tests {
             });
             let state = AppState::new(config);
             let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let delete = [("op", "delete"), ("name", "acme")];
             let resp = post_form(
                 &state,
                 &cookie,
                 "/lb/clients/commit",
-                doc_form(&csrf, &[("op", "delete"), ("name", "acme")]),
+                doc_form(&csrf, &delete),
+            )
+            .await;
+            let msg = flash_of(&state, &resp).msg;
+            assert!(
+                msg.contains("cannot be told") && msg.contains("write anyway"),
+                "{msg}"
+            );
+            assert!(store.posts().is_empty());
+            let mut typed = delete.to_vec();
+            typed.push(("confirm_signal", "write anyway"));
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/commit",
+                doc_form(&csrf, &typed),
             )
             .await;
             assert!(
@@ -4563,7 +4587,12 @@ mod tests {
                 "/lb/clients/commit",
                 doc_form(
                     &csrf,
-                    &[("op", "restore"), ("version", &v), ("confirm_version", &v)],
+                    &[
+                        ("op", "restore"),
+                        ("version", &v),
+                        ("confirm_version", &v),
+                        ("confirm_signal", "write anyway"),
+                    ],
                 ),
             )
             .await;
@@ -4571,6 +4600,72 @@ mod tests {
             let msg = flash_of(&state, &resp).msg;
             assert!(msg.contains("cannot be checked, so it is refused"), "{msg}");
             assert_eq!(store.posts().len(), 1, "the restore was never sent");
+        }
+
+        /// Every reader exports its alerts raised or not, so one that is up
+        /// and exports none is a broken read: the signal cannot be told, and
+        /// the preview asks for the confirmation.
+        #[tokio::test]
+        async fn a_reader_exporting_no_alerts_leaves_the_signal_unknown() {
+            let store = FakeStore::new(&World::new(vec![]));
+            store.answer_post(
+                StatusCode::OK,
+                dry_run(json!([{"client": "acme", "change": "deleted"}])),
+            );
+            let metrics = quiet_fleet();
+            let mut up = metrics.series.lock().unwrap()["up"].clone();
+            up.push(series(&[("stack", "k3s"), ("pod", "lb-b")], "1"));
+            metrics.set("up", up);
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/preview",
+                doc_form(&csrf, &[("op", "delete"), ("name", "acme")]),
+            )
+            .await;
+            let html = body_string(resp).await;
+            assert!(html.contains("export no alert series (k3s/lb-b)"), "{html}");
+            assert!(html.contains("name=\"confirm_signal\""), "{html}");
+            // The pane says so too.
+            let (_, html) = get_page(&state, &cookie, "/lb/clients").await;
+            assert!(
+                html.contains("Store behind or edited alerts unreadable"),
+                "{html}"
+            );
+        }
+
+        /// A preview is rendered only from a dry run's answer. An answer that
+        /// carries a version or keys is a write nobody confirmed: logged,
+        /// and reported as an unknown outcome with no key shown.
+        #[tokio::test]
+        async fn a_preview_answered_as_a_commit_is_an_unknown_outcome() {
+            let store = FakeStore::new(&World::new(vec![]));
+            let (k, key) = minted("acme");
+            store.answer_post(StatusCode::OK, committed(V0 + 1, D1, json!([k])));
+            let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let buf = testlog::LogBuf::default();
+            let _guard = buf.capture();
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/preview",
+                doc_form(&csrf, &[("op", "add_key"), ("name", "acme")]),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            let msg = flash_of(&state, &resp).msg;
+            assert!(
+                msg.contains("answered the preview as if it were a commit"),
+                "{msg}"
+            );
+            assert!(msg.contains("its key was never shown"), "{msg}");
+            assert!(!msg.contains(&key));
+            let logged = buf.text();
+            assert!(logged.contains("client-store write committed"), "{logged}");
+            assert!(!logged.contains(&key), "{logged}");
         }
 
         /// The restore row check: a row instances installed with its digest
@@ -4590,7 +4685,7 @@ mod tests {
                 async move {
                     let store = FakeStore::new(&world);
                     store.answer_post(StatusCode::OK, committed(V0 + 1, D2, json!([])));
-                    let metrics = FakeMetrics::default();
+                    let metrics = quiet_fleet();
                     metrics.set_30d("anthropic_client_store_document", installed);
                     let state = store_state(&store, &metrics, &["admin-sub"]).await;
                     let (cookie, csrf) = cookie_for(&state, "admin-sub");
@@ -4631,9 +4726,15 @@ mod tests {
             );
             let (sent, _) = run(vec![pair(V0, &"0".repeat(64))], old, Some(old.to_string())).await;
             assert!(sent);
-            // A row older than the ones shown with a digest: the same.
+            // A row older than the ones shown with a digest, and too old
+            // for the record of installs: the same.
             let (sent, msg) = run(vec![pair(V0, &"0".repeat(64))], ancient, None).await;
-            assert!(!sent && msg.contains("50 newest"), "{msg}");
+            assert!(
+                !sent
+                    && msg.contains("50 history rows")
+                    && msg.contains(&format!("type {ancient}")),
+                "{msg}"
+            );
             let (sent, _) = run(
                 vec![pair(V0, &"0".repeat(64))],
                 ancient,
@@ -4641,6 +4742,14 @@ mod tests {
             )
             .await;
             assert!(sent);
+            // Such a row whose version IS on record cannot be compared with
+            // it: refused, typed or not.
+            let (sent, msg) =
+                run(vec![pair(ancient, D1)], ancient, Some(ancient.to_string())).await;
+            assert!(
+                !sent && msg.contains("cannot be checked against what was installed"),
+                "{msg}"
+            );
             // An empty record is unknown: refused.
             let (sent, msg) = run(vec![], old, Some(old.to_string())).await;
             assert!(!sent && msg.contains("reads as unknown"), "{msg}");
@@ -4658,7 +4767,7 @@ mod tests {
                 StatusCode::OK,
                 dry_run(json!([{"client": "acme", "change": "deleted"}])),
             );
-            let metrics = FakeMetrics::default();
+            let metrics = quiet_fleet();
             metrics.set_30d(
                 "anthropic_client_store_document",
                 vec![series(
@@ -4709,7 +4818,7 @@ mod tests {
             let old = V0 - 5;
             let mut world = World::new(vec![]);
             world.history = vec![(V0, "0".repeat(64)), (old, D1.into())];
-            let metrics = FakeMetrics::default();
+            let metrics = quiet_fleet();
             metrics.set(
                 "anthropic_client_store_toml_client",
                 vec![
@@ -4775,7 +4884,7 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 json!({"status": 503, "errors": [{"code": "store.unavailable", "message": "ClientStore or Revocations could not answer"}]}),
             );
-            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
             let (cookie, csrf) = cookie_for(&state, "admin-sub");
             let resp = post_form(
                 &state,

@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::effect::{Instance, is_hex64};
 use crate::lb::{MetricsClient, Series};
+use crate::routes::clip;
 
 const UP: &str = "up";
 const RESTRICTIONS: &str = "anthropic_client_store_restrictions";
@@ -38,10 +39,13 @@ const STORE_ALERTS: [&str; 2] = ["store_behind", "store_edited"];
 pub struct Fleet {
     /// stack → its instances, as the metrics store lists them.
     pub stacks: Result<BTreeMap<String, Vec<Instance>>, String>,
-    /// Instances raising restrictions-behind, as `stack/instance`.
+    /// Instances raising restrictions-behind, as `stack/instance`, read as
+    /// `store_alerts` is.
     pub behind: Result<BTreeSet<String>, String>,
     /// Instances reporting the store behind or edited, as
     /// `stack/instance (alert)`. Placed or not: a signal is never dropped.
+    /// An error when none is raised but not every instance that is up could
+    /// be heard (`heard`), so "none" is never read from a broken read.
     pub store_alerts: Result<BTreeSet<String>, String>,
     /// Disabled names some instance reports matching no client it serves →
     /// the stacks reporting them. Each instance reports at most 5.
@@ -90,7 +94,7 @@ pub async fn read(metrics: &MetricsClient) -> Fleet {
         metrics.instant(TOML_CLIENT, TOML_CLIENT),
     );
     let err = |e: crate::error::AppError| e.detail().to_string();
-    let alerts = alerts.map_err(err);
+    let (up, alerts) = (up.map_err(err), alerts.map_err(err));
     let behind = alerts.as_ref().map_err(Clone::clone).map(|a| {
         raised(a, &["restrictions_behind"])
             .map(place)
@@ -101,18 +105,59 @@ pub async fn read(metrics: &MetricsClient) -> Fleet {
             .map(|s| format!("{} ({})", place(s), s.labels["alert"]))
             .collect::<BTreeSet<_>>()
     });
+    let heard = match (&up, &alerts) {
+        (Ok(up), Ok(alerts)) => heard(up, alerts),
+        (Err(e), _) | (_, Err(e)) => Err(e.clone()),
+    };
     let docs = docs.map_err(err);
-    let stacks = match (up, sets, &behind) {
-        (Ok(up), Ok(sets), Ok(behind)) => instances(&up, &sets, docs, behind),
-        (Err(e), _, _) | (_, Err(e), _) => Err(err(e)),
+    let stacks = match (&up, sets, &behind) {
+        (Ok(up), Ok(sets), Ok(behind)) => instances(up, &sets, docs, behind),
+        (Err(e), _, _) => Err(e.clone()),
+        (_, Err(e), _) => Err(err(e)),
         (_, _, Err(e)) => Err(e.clone()),
     };
     Fleet {
         stacks,
-        behind,
-        store_alerts,
+        behind: signal(behind, &heard),
+        store_alerts: signal(store_alerts, &heard),
         unmatched: unmatched.map_err(err).map(|s| by_label(&s, "name")),
         toml: toml.map_err(err).map(|s| by_label(&s, "client")),
+    }
+}
+
+/// Whether the alert read shows every instance's alerts. A reader exports
+/// each of its alerts, raised or not, so an instance that is up and exports
+/// none is a broken read, never a quiet instance; and with no instance up,
+/// there is nothing to hear.
+fn heard(up: &[Series], alerts: &[Series]) -> Result<(), String> {
+    let live: BTreeSet<String> = up.iter().filter(|s| s.value == 1.0).map(place).collect();
+    if live.is_empty() {
+        return Err("the metrics store shows no reader that is up".into());
+    }
+    let exporting: BTreeSet<String> = alerts.iter().map(place).collect();
+    let silent: Vec<&str> = live
+        .iter()
+        .filter(|i| !exporting.contains(*i))
+        .map(String::as_str)
+        .collect();
+    if silent.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "readers that are up export no alert series ({}), so their alerts cannot be read",
+        clip(&silent.join(", "), 300)
+    ))
+}
+
+/// A signal as the console may rely on it: an alert raised anywhere always
+/// stands, and "none raised" stands only where every instance was heard.
+fn signal(
+    raised: Result<BTreeSet<String>, String>,
+    heard: &Result<(), String>,
+) -> Result<BTreeSet<String>, String> {
+    match raised {
+        Ok(r) if r.is_empty() => heard.clone().map(|()| r),
+        other => other,
     }
 }
 
@@ -349,6 +394,40 @@ mod tests {
                 .unwrap_err()
                 .contains("lb-d")
         );
+    }
+
+    /// Every reader exports all its alerts, so "none raised" is believed
+    /// only when every instance that is up was heard; a raised alert stands
+    /// whatever else is silent.
+    #[test]
+    fn a_silent_reader_leaves_the_signals_unknown_but_never_hides_a_raised_one() {
+        let up = vec![
+            series(&[("stack", "k3s"), ("pod", "lb-a")], 1.0),
+            series(&[("stack", "k3s"), ("pod", "lb-b")], 1.0),
+            series(&[("stack", "k3s"), ("pod", "lb-down")], 0.0),
+        ];
+        let quiet = |pod: &str| {
+            series(
+                &[("stack", "k3s"), ("pod", pod), ("alert", "store_edited")],
+                0.0,
+            )
+        };
+        assert_eq!(heard(&up, &[quiet("lb-a"), quiet("lb-b")]), Ok(()));
+        let err = heard(&up, &[quiet("lb-a")]).unwrap_err();
+        assert!(
+            err.contains("k3s/lb-b") && !err.contains("lb-down"),
+            "{err}"
+        );
+        assert!(heard(&[], &[quiet("lb-a")]).is_err());
+        assert!(heard(&up[2..], &[]).is_err());
+
+        let none = Ok(BTreeSet::new());
+        let some: Result<BTreeSet<String>, String> =
+            Ok(["k3s/lb-a (store_edited)".to_string()].into());
+        assert_eq!(signal(none.clone(), &Ok(())), Ok(BTreeSet::new()));
+        assert!(signal(none, &Err("silent".into())).is_err());
+        assert_eq!(signal(some.clone(), &Err("silent".into())), some);
+        assert!(signal(Err("down".into()), &Ok(())).is_err());
     }
 
     #[test]

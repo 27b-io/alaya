@@ -316,35 +316,58 @@ pub fn holds(part: &ServedPart, sight: &Sight) -> Verdict {
             if faults.is_empty() {
                 InEffect
             } else {
-                NotInEffect(faults.join("; "))
+                NotInEffect(joined(faults))
             }
         }
     }
 }
 
 fn instance_fault(i: &Instance, set_hash: &str) -> Option<String> {
+    let id = clip_id(&i.id);
     if !i.up {
         return Some(format!(
             "{} is not scraped (up is 0): draining, restarting or unreachable",
-            i.id
+            id
         ));
     }
     if i.behind {
         return Some(format!(
             "{} holds a restriction the store lost (restrictions behind): confirmed only after a reseed",
-            i.id
+            id
         ));
     }
     match i.set_hashes.as_slice() {
-        [] => Some(format!("{} exports no client-store gauge", i.id)),
+        [] => Some(format!("{} exports no client-store gauge", id)),
         [h] if h == set_hash => None,
-        [_] => Some(format!("{} holds a different set", i.id)),
+        [_] => Some(format!("{} holds a different set", id)),
         many => Some(format!(
             "{} exports {} restrictions series, so its current set is unknown",
-            i.id,
+            id,
             many.len()
         )),
     }
+}
+
+/// Instance ids are metric labels, untrusted and unbounded, so each is
+/// clipped where a verdict names it.
+fn clip_id(id: &str) -> String {
+    crate::routes::clip(id, 80)
+}
+
+/// A verdict's faults, at most `MAX_FAULTS` of them named and the rest
+/// counted, so a forged flood of instances cannot flood the page.
+fn joined(faults: Vec<String>) -> String {
+    const MAX_FAULTS: usize = 8;
+    let more = faults.len().saturating_sub(MAX_FAULTS);
+    let mut out = faults
+        .into_iter()
+        .take(MAX_FAULTS)
+        .collect::<Vec<_>>()
+        .join("; ");
+    if more > 0 {
+        out.push_str(&format!("; and {more} more"));
+    }
+    out
 }
 
 /// Withhold "in effect" when the served part moved between the two `GET`s
@@ -471,26 +494,27 @@ pub fn holds_doc(digest: &str, sight: &Sight) -> Verdict {
             if faults.is_empty() {
                 InEffect
             } else {
-                NotInEffect(faults.join("; "))
+                NotInEffect(joined(faults))
             }
         }
     }
 }
 
 fn doc_fault(i: &Instance, digest: &str) -> Option<String> {
+    let id = clip_id(&i.id);
     if !i.up {
         return Some(format!(
             "{} is not scraped (up is 0): draining, restarting or unreachable",
-            i.id
+            id
         ));
     }
     match i.doc_digests.as_deref().unwrap_or_default() {
-        [] => Some(format!("{} exports no document gauge", i.id)),
+        [] => Some(format!("{} exports no document gauge", id)),
         [d] if d == digest => None,
-        [_] => Some(format!("{} holds another document", i.id)),
+        [_] => Some(format!("{} holds another document", id)),
         many => Some(format!(
             "{} exports {} document series, so its current document is unknown",
-            i.id,
+            id,
             many.len()
         )),
     }

@@ -396,12 +396,26 @@ pub(crate) fn series(labels: &[(&str, &str)], value: &str) -> Value {
     json!({"metric": metric, "value": [1_791_698_400.0, value]})
 }
 
-/// k3s pods, each `(pod, up, [set hashes])`.
+/// The alerts every reader exports, raised or not; all quiet here.
+const QUIET_ALERTS: [&str; 3] = ["restrictions_behind", "store_behind", "store_edited"];
+
+/// k3s pods, each `(pod, up, [set hashes])`, each exporting its alerts, all
+/// quiet, as a healthy reader does.
 pub(crate) fn k3s(metrics: &FakeMetrics, pods: &[(&str, &str, &[&str])]) {
     metrics.set(
         "up",
         pods.iter()
             .map(|(p, up, _)| series(&[("stack", "k3s"), ("pod", p)], up))
+            .collect(),
+    );
+    metrics.set(
+        "anthropic_client_store_alert",
+        pods.iter()
+            .flat_map(|(p, _, _)| {
+                QUIET_ALERTS
+                    .iter()
+                    .map(move |a| series(&[("stack", "k3s"), ("pod", p), ("alert", a)], "0"))
+            })
             .collect(),
     );
     metrics.set(
@@ -436,4 +450,13 @@ pub(crate) fn k3s_documents(metrics: &FakeMetrics, pods: &[(&str, &[&str])]) {
             })
             .collect(),
     );
+}
+
+/// A metrics store showing one healthy reader with nothing to report: what
+/// a document write meets when no instance reports the store behind or
+/// edited.
+pub(crate) fn quiet_fleet() -> FakeMetrics {
+    let metrics = FakeMetrics::default();
+    k3s(&metrics, &[("lb-a", "1", &[])]);
+    metrics
 }

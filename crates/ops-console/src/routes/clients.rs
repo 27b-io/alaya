@@ -533,7 +533,7 @@ fn restrictions_card(
                 None => (badge(BadgeKind::Muted), "unreadable"),
             };
             let flag = unmatched.get(&r.name).filter(|_| r.state == Some(RecordState::Disabled)).map(|stacks| {
-                let text = format!("matches no client on {} — mistyped?", stacks.iter().cloned().collect::<Vec<_>>().join(", "));
+                let text = format!("matches no client on {} — mistyped?", clip(&stacks.iter().cloned().collect::<Vec<_>>().join(", "), 200));
                 view! { <span class=badge(BadgeKind::Warning)>{text}</span> }
             });
             let (version_text, version_title) = match r.version {
@@ -783,13 +783,13 @@ fn outcome_unknown(a: &Answer) -> bool {
 /// One line per write attempt, refusals and upstream failures included, with
 /// the user's subject. Request and answer are re-serialised and clipped, and
 /// the answer passes through `loggable`, so no minted key is ever logged.
-fn write_log(session: &Session, kind: &str, request: &Value, outcome: Result<&Answer, &AppError>) {
+fn write_log(sub: &str, kind: &str, request: &Value, outcome: Result<&Answer, &AppError>) {
     let request = clip(&request.to_string(), MAX_LOGGED_CHARS);
     let answer = |a: &Answer| clip(&loggable(&a.body).to_string(), MAX_LOGGED_CHARS);
     match outcome {
         Ok(a) if outcome_unknown(a) => tracing::warn!(
             target: "ops_console::write_log",
-            sub = ?session.sub,
+            sub = ?sub,
             kind,
             request = %request,
             status = a.status.as_u16(),
@@ -798,7 +798,7 @@ fn write_log(session: &Session, kind: &str, request: &Value, outcome: Result<&An
         ),
         Ok(a) if a.status.is_success() => tracing::info!(
             target: "ops_console::write_log",
-            sub = ?session.sub,
+            sub = ?sub,
             kind,
             request = %request,
             status = a.status.as_u16(),
@@ -807,7 +807,7 @@ fn write_log(session: &Session, kind: &str, request: &Value, outcome: Result<&An
         ),
         Ok(a) => tracing::warn!(
             target: "ops_console::write_log",
-            sub = ?session.sub,
+            sub = ?sub,
             kind,
             request = %request,
             status = a.status.as_u16(),
@@ -816,7 +816,7 @@ fn write_log(session: &Session, kind: &str, request: &Value, outcome: Result<&An
         ),
         Err(e) => tracing::warn!(
             target: "ops_console::write_log",
-            sub = ?session.sub,
+            sub = ?sub,
             kind,
             request = %request,
             error = %e.detail(),
@@ -871,9 +871,30 @@ pub async fn restrict(
             return Ok(flash_redirect(jar, secure, "error", msg, "/lb/clients"));
         }
     };
-    let request = json!({ "restrictions": ops });
-    let answer = m.client.restrict(&ops).await;
-    write_log(&session, RESTRICTIONS, &request, answer.as_ref());
+    // Sent and recorded in a task of its own: a write the store commits must
+    // reach the write log and the committed labels even when the operator's
+    // connection drops and this handler is dropped with it.
+    let answer = {
+        let (m, sub, ops) = (m.clone(), session.sub.clone(), ops.clone());
+        tokio::spawn(async move {
+            let answer = m.client.restrict(&ops).await;
+            write_log(
+                &sub,
+                RESTRICTIONS,
+                &json!({ "restrictions": ops }),
+                answer.as_ref(),
+            );
+            let committed = answer.as_ref().ok().filter(|a| a.status == StatusCode::OK);
+            if let Some(Ok(done)) = committed.map(|a| written_ops(&a.body, &ops)) {
+                for op in &done {
+                    m.committed.record(&op.name, op.version);
+                }
+            }
+            answer
+        })
+        .await
+        .unwrap_or_else(|e| Err(AppError::Upstream(format!("the write's task failed ({e})"))))
+    };
     let (kind, msg, to) = restrict_outcome(m, &ops, answer).await;
     Ok(flash_redirect(jar, secure, kind, msg, &to))
 }
@@ -931,8 +952,8 @@ fn restriction_ops(form: &RestrictForm, actor: &str) -> Result<Vec<RestrictionOp
 
 /// What the page says after a restrict request, and where it goes: the
 /// effect page after a commit, the form again after a full-set refusal, the
-/// clients page otherwise. Only a commit whose answer reads in full exports
-/// committed labels.
+/// clients page otherwise. The committed labels are exported where the
+/// request is sent, and only for a commit whose answer reads in full.
 async fn restrict_outcome(
     m: &StoreModule,
     ops: &[RestrictionOp],
@@ -968,9 +989,6 @@ async fn restrict_outcome(
                 return ("error", msg, back);
             }
         };
-        for op in &done {
-            m.committed.record(&op.name, op.version);
-        }
         let summary = done
             .iter()
             .map(|op| format!("{} {}", op.state.as_str(), op.name))
