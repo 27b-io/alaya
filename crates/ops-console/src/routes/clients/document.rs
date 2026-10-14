@@ -297,7 +297,16 @@ struct Gate {
 }
 
 async fn gate(m: &StoreModule, op: &DocOp) -> Gate {
-    let fleet = fleet::read(&m.metrics).await;
+    let restore = match op {
+        DocOp::Restore { version } => Some(*version),
+        _ => None,
+    };
+    let (fleet, check) = tokio::join!(fleet::read(&m.metrics), async {
+        match restore {
+            Some(v) => Some(restore_check(m, v).await),
+            None => None,
+        }
+    });
     let mut needed = Vec::new();
     let mut notes = Vec::new();
     let mut refused = None;
@@ -307,15 +316,12 @@ async fn gate(m: &StoreModule, op: &DocOp) -> Gate {
             "Whether any instance reports the store behind or edited is unknown (metrics store: {e})."
         ));
     }
-    if let DocOp::Restore { version } = op {
-        match restore_check(m, *version).await {
+    if let (Some(version), Some(check)) = (restore, check) {
+        match check {
             Ok(RowCheck::Checked) => notes.push(format!(
                 "Version {version} checks out: instances installed it with its history row's digest."
             )),
-            Ok(RowCheck::Unchecked(why)) => needed.push(Needed::Unchecked {
-                version: *version,
-                why,
-            }),
+            Ok(RowCheck::Unchecked(why)) => needed.push(Needed::Unchecked { version, why }),
             Ok(RowCheck::Refused(why)) => refused = Some(format!("The restore is refused: {why}.")),
             Err(why) => {
                 refused = Some(format!(
@@ -418,8 +424,13 @@ pub async fn preview(
         }
     };
     if answer.status != StatusCode::OK {
+        let what = if answer.status.is_client_error() {
+            "The store refused the preview"
+        } else {
+            "The preview failed, and wrote nothing"
+        };
         let mut msg = format!(
-            "The store refused the preview ({}): {}.",
+            "{what} ({}): {}.",
             answer.status.as_u16(),
             refusal_lines(&answer.body).join("; ")
         );

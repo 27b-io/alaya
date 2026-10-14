@@ -770,13 +770,14 @@ fn clean_reason(raw: &str) -> Result<String, String> {
     Ok(r)
 }
 
-/// Whether a request may or may not have applied. The store answers 503
-/// `store.unavailable` to any failure of an object's call, a connection
-/// dropped after the commit included, and no 5xx proves that nothing was
-/// written. The write log and the page both read it through here, so they
-/// can never disagree.
+/// Whether a request may or may not have applied: anything but a 200 or a
+/// 4xx refusal. The store answers 503 `store.unavailable` to any failure of
+/// an object's call, a connection dropped after the commit included, and no
+/// 5xx proves that nothing was written; nor does a status the store never
+/// sends for these requests. The write log and the page both read it through
+/// here, so they can never disagree.
 fn outcome_unknown(a: &Answer) -> bool {
-    a.status.is_server_error()
+    !(a.status == StatusCode::OK || a.status.is_client_error())
 }
 
 /// One line per write attempt, refusals and upstream failures included, with
