@@ -6,8 +6,12 @@
  * and loads no external assets.
  *
  * Regenerate static/console.css with scripts/build-css.sh.
+ *
+ * Classes come from src/ alone. Tailwind otherwise also scans the directory
+ * it runs in: the README's prose and the previous static/console.css, whose
+ * own variables kept every class it ever held alive.
  */
-@import "tailwindcss";
+@import "tailwindcss" source(none);
 @source "../src";
 
 /*

@@ -21,7 +21,7 @@ use leptos::prelude::*;
 
 use crate::error::AppError;
 use crate::lb::fmt_tokens;
-use crate::routes::{fmt_epoch, unavailable};
+use crate::routes::fmt_epoch;
 use crate::selecta::{
     DOWNLOAD_HEALTH, GET_TASK, Gauges, HealthSnapshot, LIST_TASKS, Liveness, STATES, TORN_SENTINEL,
     TaskRow, github_pr, valid_task_id,
@@ -55,7 +55,10 @@ pub async fn pane(
 ) -> Result<(PrivateCookieJar, Html<String>), AppError> {
     let (jar, flash) = take_flash(jar);
     let Some(selecta) = state.selecta.as_ref() else {
-        return Ok((jar, Html(page(TITLE, &session, flash, not_configured()))));
+        return Ok((
+            jar,
+            Html(page(TITLE, Nav::Selecta, &session, flash, not_configured())),
+        ));
     };
 
     // Independent sources: any one dark leaves the others up.
@@ -76,7 +79,10 @@ pub async fn pane(
             {health_card(&health)}
         </div>
     };
-    Ok((jar, Html(page(TITLE, &session, flash, content))))
+    Ok((
+        jar,
+        Html(page(TITLE, Nav::Selecta, &session, flash, content)),
+    ))
 }
 
 pub async fn task(
@@ -90,10 +96,13 @@ pub async fn task(
     }
     let (jar, flash) = take_flash(jar);
     let Some(selecta) = state.selecta.as_ref() else {
-        return Ok((jar, Html(page(TITLE, &session, flash, not_configured()))));
+        return Ok((
+            jar,
+            Html(page(TITLE, Nav::Selecta, &session, flash, not_configured())),
+        ));
     };
     let body = match selecta.get_task(&id).await {
-        Err(e) => Either::Left(unavailable("task detail", &e)),
+        Err(e) => Either::Left(unavailable("task detail", e.detail())),
         Ok(t) => {
             let pr = pr_cell(t.pr_url.as_deref(), t.state == "awaiting_approval");
             let audit = t.audit.unwrap_or_else(|| "—".into());
@@ -124,7 +133,10 @@ pub async fn task(
             <CardContent>{body}</CardContent>
         </Card>
     };
-    Ok((jar, Html(page(TITLE, &session, flash, content))))
+    Ok((
+        jar,
+        Html(page(TITLE, Nav::Selecta, &session, flash, content)),
+    ))
 }
 
 // ─── Rendering helpers ──────────────────────────────────────────────────────
@@ -199,7 +211,7 @@ fn runner_card(
     gauges: &Result<Gauges, AppError>,
 ) -> impl IntoView + use<> {
     let heartbeat = match live {
-        Err(e) => Either::Left(unavailable("heartbeat", e)),
+        Err(e) => Either::Left(unavailable("heartbeat", e.detail())),
         Ok(l) => {
             let seq = l.seq.map(|s| format!("seq {s}")).unwrap_or_default();
             let (class, text) = if l.advancing {
@@ -220,7 +232,7 @@ fn runner_card(
     };
 
     let body = match gauges {
-        Err(e) => Either::Left(unavailable("lease and budget", e)),
+        Err(e) => Either::Left(unavailable("lease and budget", e.detail())),
         Ok(g) => {
             let (lease_class, lease_text) = if g.lease_remaining_s > 0.0 {
                 (
@@ -348,7 +360,7 @@ fn approvals_card(
     gauges: &Result<Gauges, AppError>,
 ) -> impl IntoView + use<> {
     let body = match awaiting {
-        Err(e) => Either::Left(unavailable(LIST_TASKS, e)),
+        Err(e) => Either::Left(unavailable(LIST_TASKS, e.detail())),
         Ok(rows) if rows.is_empty() => Either::Right(Either::Left(view! {
             <p class="text-sm text-muted-foreground">"Nothing is waiting on you."</p>
         })),
@@ -423,7 +435,7 @@ fn failures_card(
     gauges: &Result<Gauges, AppError>,
 ) -> impl IntoView + use<> {
     let body = match failed {
-        Err(e) => Either::Left(unavailable(LIST_TASKS, e)),
+        Err(e) => Either::Left(unavailable(LIST_TASKS, e.detail())),
         Ok(rows) if rows.is_empty() => Either::Right(Either::Left(view! {
             <p class="text-sm text-muted-foreground">"No failed tasks."</p>
         })),
@@ -480,7 +492,7 @@ fn failures_card(
 
 fn states_card(gauges: &Result<Gauges, AppError>) -> impl IntoView + use<> {
     let body = match gauges {
-        Err(e) => Either::Left(unavailable("task counts", e)),
+        Err(e) => Either::Left(unavailable("task counts", e.detail())),
         Ok(g) => {
             // A state this console does not know gets a tile too, under an
             // error: hidden, it would read as 0.
@@ -544,7 +556,7 @@ fn states_card(gauges: &Result<Gauges, AppError>) -> impl IntoView + use<> {
 
 fn health_card(health: &Result<HealthSnapshot, AppError>) -> impl IntoView + use<> {
     let body = match health {
-        Err(e) => Either::Left(unavailable(DOWNLOAD_HEALTH, e)),
+        Err(e) => Either::Left(unavailable(DOWNLOAD_HEALTH, e.detail())),
         Ok(h) => {
             let alerts = if h.alerts.is_empty() {
                 Either::Left(

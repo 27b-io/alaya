@@ -33,13 +33,13 @@ use serde_json::{Value, json};
 
 use super::{
     Outcome, actor_of, clean_reason, effect_href, guard, not_configured, outcome, page_html,
-    refused_locally, refused_text, result_page_html, send_recorded, store_of, write_log,
+    refused_locally, refused_text, send_recorded, store_of, write_log,
 };
 use crate::confirm::{self, Needed, RowCheck};
 use crate::effect::{self, Doc, is_hex64, is_name};
 use crate::error::AppError;
 use crate::fleet;
-use crate::routes::{clip, fmt_epoch, short_digest, unavailable};
+use crate::routes::{clip, fmt_epoch, short_digest};
 use crate::session::{Session, flash_redirect, take_flash};
 use crate::state::{AppState, StoreModule};
 use crate::store::{Commit, DocOp, DocRequest, Policy, commit_of};
@@ -496,7 +496,7 @@ pub async fn preview(
         );
     }
     let content = preview_view(&op, expected, &reason, &body, &gate, &session.csrf);
-    Ok((jar, Html(result_page_html(&session, content))).into_response())
+    Ok((jar, Html(page_html(&session, None, content))).into_response())
 }
 
 fn preview_view(
@@ -813,7 +813,7 @@ fn key_page(session: &Session, c: &Commit, effect: &str) -> Response {
             </CardContent>
         </Card>
     };
-    let mut resp = Html(result_page_html(session, content)).into_response();
+    let mut resp = Html(page_html(session, None, content)).into_response();
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     resp
@@ -831,7 +831,7 @@ pub async fn history(
         return Ok((jar, Html(page_html(&session, flash, not_configured()))));
     };
     let content = match m.client.read().await {
-        Err(e) => unavailable("client store", &e).into_any(),
+        Err(e) => unavailable("client store", e.detail()).into_any(),
         Ok(store) => history_view(&store, &session.csrf).into_any(),
     };
     Ok((jar, Html(page_html(&session, flash, content))))

@@ -59,23 +59,22 @@ pub async fn home(
         ),
         None => ("unreachable".to_string(), "—".into()),
     };
-    let status_badge = match status.as_str() {
-        "healthy" => badge(BadgeKind::Success),
-        "degraded" => badge(BadgeKind::Warning),
-        _ => badge(BadgeKind::Destructive),
+    let alaya_status = match status.as_str() {
+        "healthy" => Status::Ok,
+        "degraded" => Status::Warn,
+        _ => Status::Error,
+    };
+    let alaya_card = view! {
+        <Notice status=alaya_status label=status>{format!("{memories} memories")}</Notice>
+        {open("/alaya")}
     };
 
     let lb_card = match &lb_stats {
         None => Either::Left(view! {
-            <div class="text-sm">
-                <span class=badge(BadgeKind::Muted)>"not configured"</span>
-                <p class="text-muted-foreground mt-2">
-                    "Set LB_URL, LB_API_KEY and METRICS_URL on the console to enable."
-                </p>
-            </div>
+            <NotConfigured>"Set LB_URL, LB_API_KEY and METRICS_URL on the console to enable."</NotConfigured>
         }),
         Some(probe) => {
-            let (class, label, summary) = match probe {
+            let (status, label, summary) = match probe {
                 Ok(s) => {
                     let accounts = s
                         .get("endpoints")
@@ -83,45 +82,31 @@ pub async fn home(
                         .map_or(0, Vec::len);
                     let budgeted = live_budgets(s).0.len();
                     (
-                        badge(BadgeKind::Success),
+                        Status::Ok,
                         "reachable",
                         format!("{accounts} accounts · {budgeted} budgeted clients"),
                     )
                 }
-                Err(e) => (
-                    badge(BadgeKind::Destructive),
-                    "unreachable",
-                    e.detail().to_string(),
-                ),
+                Err(e) => (Status::Error, "unreachable", e.detail().to_string()),
             };
             Either::Right(view! {
-                <div class="flex items-center gap-3 text-sm mb-4">
-                    <span class=class>{label}</span>
-                    <span class="text-muted-foreground">{summary}</span>
-                </div>
-                <a href="/lb" class=btn(Btn::Default)>"Open module"</a>
+                <Notice status=status label=label>{summary}</Notice>
+                {open("/lb")}
             })
         }
     };
 
     let selecta_card = match &selecta_awaiting {
         None => Either::Left(view! {
-            <div class="text-sm">
-                <span class=badge(BadgeKind::Muted)>"not configured"</span>
-                <p class="text-muted-foreground mt-2">
-                    "Set SELECTA_URL and SELECTA_API_KEY on the console to enable."
-                </p>
-            </div>
+            <NotConfigured>"Set SELECTA_URL and SELECTA_API_KEY on the console to enable."</NotConfigured>
         }),
         Some(probe) => {
-            let (class, label, summary) = match probe {
+            let (status, label, summary) = match probe {
                 Ok(rows) => {
                     let no_pr = rows.iter().filter(|r| r.approval_pr().is_none()).count();
-                    let class = if no_pr > 0 {
-                        badge(BadgeKind::Destructive)
-                    } else {
-                        badge(BadgeKind::Success)
-                    };
+                    // A task with no PR cannot be approved: worth a look,
+                    // though selecta itself is answering.
+                    let status = if no_pr > 0 { Status::Warn } else { Status::Ok };
                     // A full probe means the list was cut, not that it is exact.
                     let full = rows.len() >= routes::selecta::AWAITING_SHOWN as usize;
                     let mut summary = format!(
@@ -132,63 +117,68 @@ pub async fn home(
                     if no_pr > 0 {
                         summary.push_str(&format!(" · {no_pr} with no PR"));
                     }
-                    (class, "reachable", summary)
+                    (status, "reachable", summary)
                 }
                 // "error", not "unreachable": a 401 or a tool error arrives
                 // over a healthy network. The detail names the kind.
-                Err(e) => (
-                    badge(BadgeKind::Destructive),
-                    "error",
-                    e.detail().to_string(),
-                ),
+                Err(e) => (Status::Error, "error", e.detail().to_string()),
             };
             Either::Right(view! {
-                <div class="flex items-center gap-3 text-sm mb-4">
-                    <span class=class>{label}</span>
-                    <span class="text-muted-foreground">{summary}</span>
-                </div>
-                <a href="/selecta" class=btn(Btn::Default)>"Open module"</a>
+                <Notice status=status label=label>{summary}</Notice>
+                {open("/selecta")}
             })
         }
     };
 
     let content = view! {
-        <div class="grid gap-6 sm:grid-cols-2">
-            <Card>
-                <CardHeader>
-                    <CardTitle>"Ālaya — memory curation"</CardTitle>
-                    <CardDescription>
-                        "Browse, search and curate the memory corpus: supersede, delete, merge duplicates, relations, contradictions."
-                    </CardDescription>
-                </CardHeader>
-                <CardContent>
-                    <div class="flex items-center gap-3 text-sm mb-4">
-                        <span class=status_badge>{status}</span>
-                        <span class="text-muted-foreground">{memories}" memories"</span>
-                    </div>
-                    <a href="/alaya" class=btn(Btn::Default)>"Open module"</a>
-                </CardContent>
-            </Card>
-            <Card>
-                <CardHeader>
-                    <CardTitle>"anthropic-lb — monitoring"</CardTitle>
-                    <CardDescription>
-                        "Read-only budget burn and account utilisation for the load balancer. Limits are TOML, GitOps."
-                    </CardDescription>
-                </CardHeader>
-                <CardContent>{lb_card}</CardContent>
-            </Card>
-            <Card>
-                <CardHeader>
-                    <CardTitle>"selecta — what it is doing"</CardTitle>
-                    <CardDescription>
-                        "Read-only: failures and why, tasks waiting on your approval, and whether selecta is parked, fenced or stalled. Approvals happen on GitHub."
-                    </CardDescription>
-                </CardHeader>
-                <CardContent>{selecta_card}</CardContent>
-            </Card>
+        <div class="space-y-6">
+            <PageHeader
+                title="Overview"
+                description="Each module this console runs, and whether its upstream is answering."
+            />
+            <div class="grid gap-6 md:grid-cols-2 xl:grid-cols-3">
+                <Card>
+                    <CardHeader>
+                        <CardTitle>"Ālaya — memory curation"</CardTitle>
+                        <CardDescription>
+                            "Browse, search and curate the memory corpus: supersede, delete, merge duplicates, relations, contradictions."
+                        </CardDescription>
+                    </CardHeader>
+                    <CardContent>{alaya_card}</CardContent>
+                </Card>
+                <Card>
+                    <CardHeader>
+                        <CardTitle>"anthropic-lb — monitoring"</CardTitle>
+                        <CardDescription>
+                            "Read-only budget burn and account utilisation for the load balancer. Limits are TOML, GitOps."
+                        </CardDescription>
+                    </CardHeader>
+                    <CardContent>{lb_card}</CardContent>
+                </Card>
+                <Card>
+                    <CardHeader>
+                        <CardTitle>"selecta — what it is doing"</CardTitle>
+                        <CardDescription>
+                            "Read-only: failures and why, tasks waiting on your approval, and whether selecta is parked, fenced or stalled. Approvals happen on GitHub."
+                        </CardDescription>
+                    </CardHeader>
+                    <CardContent>{selecta_card}</CardContent>
+                </Card>
+            </div>
         </div>
     };
 
-    Ok((jar, Html(page("ops console", &session, flash, content))))
+    Ok((
+        jar,
+        Html(page("ops console", Nav::Home, &session, flash, content)),
+    ))
+}
+
+/// A module card's way into its module.
+fn open(href: &'static str) -> impl IntoView {
+    view! {
+        <a href=href class=format!("mt-4 {}", btn_sm(Btn::Outline))>
+            "Open module"
+        </a>
+    }
 }

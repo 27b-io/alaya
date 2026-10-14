@@ -35,7 +35,7 @@ use crate::effect::{
 };
 use crate::error::AppError;
 use crate::fleet::{self, Fleet};
-use crate::routes::{clip, fmt_epoch, unavailable};
+use crate::routes::{clip, fmt_epoch};
 use crate::session::{Flash, Session, flash_redirect, take_flash};
 use crate::state::{AppState, StoreModule};
 use crate::store::{Answer, RestrictionOp, has_code, loggable, refusal_lines};
@@ -269,7 +269,7 @@ pub async fn pane(
         // The store could not be read, but a disable needs no read: the form
         // stays, so a degraded store never hides the kill switch.
         Err(e) => Either::Left(view! {
-            {unavailable("client store", &e)}
+            <div class="mb-4">{unavailable("client store", e.detail())}</div>
             {kill_switch_card(&session.csrf, &prefill)}
         }),
         Ok(r) => Either::Right(store_view(&r, &session.csrf, &prefill)),
@@ -326,12 +326,7 @@ fn capitalise(s: &str) -> String {
 }
 
 fn page_html(session: &Session, flash: Option<Flash>, content: impl IntoView) -> String {
-    page(TITLE, session, flash, content)
-}
-
-/// `page_html` for a page rendered as the answer to a POST (`ui::result_page`).
-fn result_page_html(session: &Session, content: impl IntoView) -> String {
-    result_page(TITLE, session, None, content)
+    page(TITLE, Nav::LbClients, session, flash, content)
 }
 
 fn verdict_badge(v: &Verdict) -> (String, &'static str, String) {
@@ -1238,7 +1233,7 @@ pub async fn effect(
     let reading = match read_all(m).await {
         Ok(r) => r,
         Err(e) => {
-            let content = unavailable("client store", &e);
+            let content = unavailable("client store", e.detail());
             return Ok((jar, Html(page_html(&session, flash, content))).into_response());
         }
     };

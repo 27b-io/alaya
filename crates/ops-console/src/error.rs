@@ -6,6 +6,7 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use leptos::prelude::*;
 
 use crate::routes::clip;
+use crate::ui::Link;
 
 /// Ceiling on an upstream's JSON `error` field on a page. Needed because the
 /// field is upstream text bounded only by the body cap, and it renders on an
@@ -63,7 +64,7 @@ impl IntoResponse for AppError {
             <div class="mx-auto max-w-lg py-24 px-6 font-sans">
                 <h1 class="text-lg font-semibold">{title}</h1>
                 <p class="text-muted-foreground text-sm mt-2">{detail}</p>
-                <p class="mt-6"><a class="text-primary underline underline-offset-4" href="/">"Back to console"</a></p>
+                <p class="mt-6"><Link href="/">"Back to console"</Link></p>
             </div>
         }
         .to_html();

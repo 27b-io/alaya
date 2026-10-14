@@ -272,6 +272,8 @@ pub fn read_login(jar: &PrivateCookieJar) -> Option<LoginState> {
     (s.exp > now_epoch()).then_some(s)
 }
 
+/// The session cookie's session. Its `theme` is `System`: only the `Session`
+/// extractor fills it, from the theme cookie.
 pub fn read_session(jar: &PrivateCookieJar) -> Option<Session> {
     let c = jar.get(SESSION_COOKIE)?;
     let s: Session = serde_json::from_str(c.value()).ok()?;
@@ -292,6 +294,8 @@ pub fn take_flash(jar: PrivateCookieJar) -> (PrivateCookieJar, Option<Flash>) {
     }
 }
 
+/// A fresh session. Its `theme` is `System`: only the `Session` extractor
+/// fills it, from the theme cookie.
 pub fn new_session(sub: String, email: Option<String>, name: Option<String>) -> Session {
     Session {
         sid: random_token(),

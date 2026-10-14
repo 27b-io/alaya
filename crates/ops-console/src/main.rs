@@ -166,8 +166,8 @@ fn routes() -> Vec<(&'static str, axum::routing::MethodRouter<AppState>)> {
         ("/static/console.css", get(console_css)),
         ("/auth/login", get(routes::auth::login)),
         ("/auth/callback", get(routes::auth::callback)),
-        ("/auth/logout", post(routes::auth::logout)),
-        ("/prefs/theme", post(routes::prefs::set_theme)),
+        (ui::LOGOUT, post(routes::auth::logout)),
+        (ui::SET_THEME, post(routes::prefs::set_theme)),
         ("/", get(routes::home::home)),
         ("/alaya", get(routes::alaya::browse)),
         ("/alaya/memory/{hash}", get(routes::alaya::detail)),
@@ -446,32 +446,37 @@ mod tests {
 
     /// Every page renders in the saved theme: a class on `<html>` for an
     /// explicit choice and none without one, so the OS decides. The switch in
-    /// the header marks the current choice.
+    /// the top bar marks the current choice.
     #[tokio::test]
     async fn every_page_renders_in_the_saved_theme() {
         let state = test_state();
         let sess = session::new_session("admin-sub".into(), None, None);
         let session_cookie = session_cookie_header(&state, &sess);
         for (saved, html_tag, scheme, current) in [
-            (None, "<html lang=\"en\">", "light dark", "System"),
+            (
+                None,
+                "<html lang=\"en\" class=\"scroll-pt-14\">",
+                "light dark",
+                "system",
+            ),
             (
                 Some("dark"),
-                "<html lang=\"en\" class=\"dark\">",
+                "<html lang=\"en\" class=\"scroll-pt-14 dark\">",
                 "dark",
-                "Dark",
+                "dark",
             ),
             (
                 Some("light"),
-                "<html lang=\"en\" class=\"light\">",
+                "<html lang=\"en\" class=\"scroll-pt-14 light\">",
                 "light",
-                "Light",
+                "light",
             ),
             // An unknown value is no choice at all, never a failed page.
             (
                 Some("solarized"),
-                "<html lang=\"en\">",
+                "<html lang=\"en\" class=\"scroll-pt-14\">",
                 "light dark",
-                "System",
+                "system",
             ),
         ] {
             let cookie = match saved {
@@ -493,34 +498,31 @@ mod tests {
                 )),
                 "{saved:?}"
             );
-            assert!(html.contains("action=\"/prefs/theme\""), "{saved:?}");
+            assert!(
+                html.contains(&format!("action=\"{}\"", ui::SET_THEME)),
+                "{saved:?}"
+            );
             assert_eq!(html.matches("aria-pressed=\"true\"").count(), 1);
             assert!(
-                html.contains(&format!(
-                    "aria-label=\"{current} theme\" aria-pressed=\"true\""
-                )),
+                html.contains(&format!("value=\"{current}\" aria-pressed=\"true\"")),
                 "{saved:?}: {html}"
             );
         }
     }
 
     /// The switch saves the choice in a cookie that the next page reads
-    /// back, returns to the page it was on, and `system` forgets the choice.
+    /// back, returns to the page's navigation entry it carries as `back`
+    /// (held to `return_to`, so never off-site), and `system` forgets the
+    /// choice.
     #[tokio::test]
     async fn the_theme_switch_saves_the_choice_and_returns_to_the_page() {
         let state = test_state();
         let sess = session::new_session("admin-sub".into(), None, None);
         let cookie = session_cookie_header(&state, &sess);
-        let switch = |cookie: String, theme: &'static str| {
-            app(state.clone()).oneshot(
-                HttpRequest::post("/prefs/theme")
-                    .header(header::ORIGIN, "https://console.test")
-                    .header(header::REFERER, "https://console.test/alaya?q=x")
-                    .header(header::COOKIE, cookie)
-                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from(format!("csrf={}&theme={theme}", sess.csrf)))
-                    .unwrap(),
-            )
+        let switch = |cookie: String, theme: &'static str, back: &'static str| {
+            let form = format!("csrf={}&theme={theme}&back={back}", sess.csrf);
+            let state = state.clone();
+            async move { post_form(&state, &cookie, ui::SET_THEME, form).await }
         };
         let theme_cookie = |resp: &Response| {
             resp.headers()
@@ -531,9 +533,9 @@ mod tests {
                 .map(str::to_string)
         };
 
-        let resp = switch(cookie.clone(), "dark").await.unwrap();
+        let resp = switch(cookie.clone(), "dark", "/alaya/health").await;
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-        assert_eq!(location(&resp), "/alaya?q=x");
+        assert_eq!(location(&resp), "/alaya/health");
         let saved = theme_cookie(&resp).expect("a theme cookie");
         for attr in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/"] {
             assert!(saved.contains(attr), "{saved}");
@@ -541,12 +543,22 @@ mod tests {
         // Sent back the way a browser would, it is what the page reads.
         let with_theme = format!("{cookie}; {}", saved.split(';').next().unwrap());
         let (_, html) = get_page(&state, &with_theme, "/").await;
-        assert!(html.contains("<html lang=\"en\" class=\"dark\">"), "{html}");
+        assert!(
+            html.contains("<html lang=\"en\" class=\"scroll-pt-14 dark\">"),
+            "{html}"
+        );
 
-        let resp = switch(with_theme, "system").await.unwrap();
+        let resp = switch(with_theme, "system", "").await;
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&resp), "/", "no `back`: home");
         let cleared = theme_cookie(&resp).expect("a removal cookie");
         assert!(cleared.contains("Max-Age=0"), "{cleared}");
+
+        // A crafted `back` cannot leave the console.
+        for off_site in ["//evil.com", "https://evil.com/x", "/%5Cevil.com"] {
+            let resp = switch(cookie.clone(), "dark", off_site).await;
+            assert_eq!(location(&resp), "/", "{off_site}");
+        }
     }
 
     #[tokio::test]
@@ -564,14 +576,14 @@ mod tests {
         let resp = post_form(
             &state,
             &cookie,
-            "/prefs/theme",
+            ui::SET_THEME,
             "csrf=wrong&theme=dark".into(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert!(!sets_theme(&resp));
         let body = format!("csrf={}&theme=solarized", sess.csrf);
-        let resp = post_form(&state, &cookie, "/prefs/theme", body).await;
+        let resp = post_form(&state, &cookie, ui::SET_THEME, body).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(!sets_theme(&resp));
     }
@@ -1370,30 +1382,6 @@ mod tests {
         render(AppState::new(config), "/alaya/health").await
     }
 
-    /// The merge preview is the answer to a POST, so its URL is POST-only: a
-    /// theme switch on it would 303 back to a GET of that URL and land on a
-    /// 405. It renders through `ui::result_page`, without the switch, while
-    /// the GET page it came from keeps it.
-    #[tokio::test]
-    async fn the_merge_preview_carries_no_theme_switch() {
-        let (h1, h2) = ("1".repeat(64), "2".repeat(64));
-        let superseded = serde_json::json!({ "superseded": [h2.clone()] });
-        let upstream = Router::new().route(
-            "/duplicates/merge",
-            post(move || std::future::ready(axum::Json(superseded.clone()))),
-        );
-        let (state, cookie, csrf) = triage_app(upstream).await;
-        let body =
-            format!("csrf={csrf}&canonical_hash={h1}&duplicate_hashes={h2}&reason=dup&dry_run=1");
-        let resp = post_form(&state, &cookie, "/alaya/duplicates/merge", body).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let html = body_string(resp).await;
-        assert!(html.contains("Commit merge"), "{html}");
-        assert!(!html.contains("action=\"/prefs/theme\""), "{html}");
-        let (_, html) = get_page(&state, &cookie, "/").await;
-        assert!(html.contains("action=\"/prefs/theme\""), "{html}");
-    }
-
     /// The `action` of every form on a page other than the page shell's own
     /// (logout and the theme switch, neither of which calls an upstream). A
     /// form with no `action` posts back to the page, and is listed as "".
@@ -1408,7 +1396,7 @@ mod tests {
                     .unwrap_or("")
                     .to_string()
             })
-            .filter(|a| a != "/auth/logout" && a != "/prefs/theme")
+            .filter(|a| !ui::SHELL_POSTS.contains(&a.as_str()))
             .collect()
     }
 
@@ -3993,7 +3981,7 @@ mod tests {
                 }
                 // Logout ends a session, and the theme switch sets a
                 // cookie: neither calls anything.
-                if route != "/auth/logout" && route != "/prefs/theme" {
+                if !ui::SHELL_POSTS.contains(&route) {
                     assert!(
                         seen() > before,
                         "{route} takes a POST that reached no upstream: extend the form"
@@ -4420,8 +4408,6 @@ mod tests {
             .await;
             assert_eq!(resp.status(), StatusCode::OK);
             let html = body_string(resp).await;
-            // A POST answer: no theme switch (`ui::result_page`).
-            assert!(!html.contains("action=\"/prefs/theme\""), "{html}");
             assert_eq!(
                 store.posts(),
                 [json!({"document": {
@@ -4577,9 +4563,6 @@ mod tests {
             let html = body_string(resp).await;
             assert!(html.contains(&key), "{html}");
             assert!(html.contains("1Password"), "{html}");
-            // No theme switch: it would GET this POST-only URL back (a 405)
-            // and the key, shown once, would be gone (`ui::result_page`).
-            assert!(!html.contains("action=\"/prefs/theme\""), "{html}");
             assert!(
                 html.contains(&format!("/lb/clients/effect?doc={}.{D1}", V0 + 1)),
                 "{html}"
@@ -5467,7 +5450,7 @@ mod tests {
             let state = AppState::new(config);
             let mut checked = 0;
             for (route, _) in routes() {
-                if route == "/auth/logout" {
+                if route == ui::LOGOUT {
                     continue;
                 }
                 let path = route.replace("{hash}", &h1);
@@ -5512,4 +5495,6 @@ mod tests {
             assert!(store.requests().is_empty(), "{:?}", store.requests());
         }
     }
+
+    mod snapshot;
 }
