@@ -397,4 +397,7 @@ both blocks and a `--color-*` line in `@theme inline`. The theme switch in the
 page header saves the operator's choice in the encrypted `console_theme`
 cookie (`src/theme.rs`); the page renders it as `class="dark"` or
 `class="light"` on `<html>`, and with no choice saved the OS setting
-(`prefers-color-scheme`) decides. No JavaScript is involved.
+(`prefers-color-scheme`) decides. No JavaScript is involved. The switch
+returns to the page it was used on, so a page rendered as the answer to a
+POST (a preview, a result, a shown-once key) uses `ui::result_page`, which
+leaves the switch out: its URL is POST-only, and a GET of it is a 405.

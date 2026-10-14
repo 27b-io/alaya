@@ -1546,7 +1546,12 @@ pub async fn merge_submit(
         };
         return Ok((
             jar,
-            Html(page("Merge preview — ops console", &session, None, content)),
+            Html(result_page(
+                "Merge preview — ops console",
+                &session,
+                None,
+                content,
+            )),
         )
             .into_response());
     }

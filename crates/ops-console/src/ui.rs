@@ -304,18 +304,41 @@ fn flash_banner(flash: &Flash) -> impl IntoView + use<> {
     view! { <div class=class role="status">{msg}</div> }
 }
 
-/// Authenticated page shell: top nav (module bar — Ālaya plus the
-/// anthropic-lb and selecta read-only panes), flash banner, then the page
-/// content.
+/// Authenticated page shell for a page reached by GET: top nav (module bar —
+/// Ālaya plus the anthropic-lb and selecta read-only panes), the theme switch,
+/// flash banner, then the page content.
 pub fn page(
     title: &str,
     session: &Session,
     flash: Option<Flash>,
     content: impl IntoView,
 ) -> String {
+    shell(title, session, flash, content, true)
+}
+
+/// The same shell for a page rendered as the answer to a POST (a preview, a
+/// result, a shown-once key). It carries no theme switch: the switch returns to
+/// the page it was used on, and this page's URL is a POST-only route that a
+/// GET would answer with 405, leaving the page and anything shown once on it.
+pub fn result_page(
+    title: &str,
+    session: &Session,
+    flash: Option<Flash>,
+    content: impl IntoView,
+) -> String {
+    shell(title, session, flash, content, false)
+}
+
+fn shell(
+    title: &str,
+    session: &Session,
+    flash: Option<Flash>,
+    content: impl IntoView,
+    with_theme_switch: bool,
+) -> String {
     let who = session.display_name().to_string();
     let csrf = session.csrf.clone();
-    let switch = theme_switch(session.theme, session.csrf.clone());
+    let switch = with_theme_switch.then(|| theme_switch(session.theme, session.csrf.clone()));
     let body = view! {
         <div class="min-h-screen">
             <header class="border-b bg-card">
