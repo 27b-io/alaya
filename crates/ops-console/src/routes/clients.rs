@@ -435,7 +435,7 @@ fn warnings(r: &Reading, part: &Result<ServedPart, String>) -> impl IntoView + u
             destructive.clone(),
             format!(
                 "Instances report the store behind or edited: {}. Every document write needs a typed confirmation while they do. Restriction ops still work.",
-                who.iter().cloned().collect::<Vec<_>>().join(", ")
+                clip(&who.iter().cloned().collect::<Vec<_>>().join(", "), 600)
             ),
         )),
         Ok(_) => {}

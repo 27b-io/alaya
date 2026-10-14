@@ -626,6 +626,11 @@ pub async fn commit(
             return Ok(back(jar, msg));
         }
     };
+    // When the store follows a commit with a catch-up commit of its own
+    // (`merged_after_commit`), the answer carries the catch-up's version and
+    // digest, which readers converge on. The first is not exported: an
+    // instance that installed it in between raises the unmatched-install
+    // alert, which is the safe side.
     m.committed.document(c.version, &c.digest);
     let doc = Doc {
         version: c.version,
@@ -973,7 +978,7 @@ pub(super) fn clients_card(store: &Value, csrf: &str) -> impl IntoView + use<> {
     if version == 0 {
         return clients_shell(
             "Clients".into(),
-            view! { <p class="text-sm">"The store holds no document. Its first document is an import, which is a recovery op."</p> }
+            view! { <p class="text-sm">"The store holds no document at a version a write can address, so it takes no document op but the recovery ops: an import, or a point-in-time recovery."</p> }
                 .into_any(),
         );
     }

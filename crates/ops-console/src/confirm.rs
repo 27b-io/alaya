@@ -50,7 +50,7 @@ impl Needed {
                 "Instances report the store behind or edited: {}. The store was rolled back, wiped \
                  or edited outside its write path. A write now publishes its current content at a \
                  newer version, which every reader installs.",
-                who.join(", ")
+                crate::routes::clip(&who.join(", "), 600)
             ),
             Needed::Unchecked { version, why } => {
                 format!("Version {version} cannot be checked: {why}.")
