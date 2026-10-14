@@ -5210,6 +5210,16 @@ mod tests {
             assert!(html.contains("1 older versions in history"), "{html}");
             assert!(html.contains(&(V0 - 9).to_string()), "{html}");
             assert!(html.contains("acme: daily_budget 1 → 2"), "{html}");
+
+            // A document whose digest is unreadable still shows its history,
+            // and offers no restore.
+            let mut edited = world.clone();
+            edited.doc = (V0, "not a digest".into());
+            store.answer_gets(&[&edited]);
+            let (_, html) = get_page(&state, &cookie, "/lb/clients/history").await;
+            assert!(html.contains("is unreadable"), "{html}");
+            assert!(html.contains("111111111111…"), "{html}");
+            assert!(!html.contains("name=\"version\""), "{html}");
         }
 
         /// A stack the metrics store lists that the store does not count

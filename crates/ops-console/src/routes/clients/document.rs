@@ -866,20 +866,20 @@ fn history_view(store: &Value, csrf: &str) -> impl IntoView + use<> {
     };
     // The version every restore form pins. Unreadable, or a store at no
     // addressable version: the rows still show, and no form is offered.
-    let current = match effect::served_doc(store) {
-        Ok(Some(d)) => Some(d.version),
-        Ok(None) => None,
-        Err(e) => {
-            let why = format!(
+    let (current, unreadable) = match effect::served_doc(store) {
+        Ok(Some(d)) => (Some(d.version), None),
+        Ok(None) => (None, None),
+        Err(e) => (
+            None,
+            Some(format!(
                 "The store's document is unreadable ({}), so nothing can be restored.",
                 clip(&e, 160)
-            );
-            return view! {
-                <p class="text-sm"><span class=badge(BadgeKind::Destructive)>"unavailable"</span>" "{why}</p>
-            }
-            .into_any();
-        }
+            )),
+        ),
     };
+    let unreadable = unreadable.map(|why| {
+        view! { <p class="text-sm mb-3"><span class=badge(BadgeKind::Destructive)>"unreadable"</span>" "{why}</p> }
+    });
     let rows: Vec<Value> = doc
         .get("history")
         .and_then(Value::as_array)
@@ -964,8 +964,7 @@ fn history_view(store: &Value, csrf: &str) -> impl IntoView + use<> {
     });
     let title = match current {
         Some(c) => format!("Document history (current version {c})"),
-        None => "Document history (no document at an addressable version: nothing can be restored)"
-            .to_string(),
+        None => "Document history (nothing can be restored now)".to_string(),
     };
     view! {
         <Card>
@@ -977,6 +976,7 @@ fn history_view(store: &Value, csrf: &str) -> impl IntoView + use<> {
                 </CardDescription>
             </CardHeader>
             <CardContent>
+                {unreadable}
                 <TableWrapper><Table>
                     <TableHeader><TableRow>
                         <TableHead>"Version (UTC)"</TableHead>
