@@ -45,9 +45,11 @@ CSP (`default-src 'none'`).
 | `ALAYA_API_KEY` | Static bearer (full write) — server-side only. |
 | `CONSOLE_LISTEN_ADDR` | Optional, default `0.0.0.0:3002`. |
 | `SELECTA_URL` / `SELECTA_API_KEY` | selecta module — **both or neither**, same rules as the LB group. `SELECTA_URL` = selecta's HTTP base URL; its host:port is sent as the `Host` header, and selecta answers 421 to any Host outside its `allowed_hosts`, so use exactly the name selecta allow-lists. `SELECTA_API_KEY` = a selecta **read-only** token, sent server-side as `Authorization: Bearer` to `/readonly/mcp`. |
-| `LB_URL` / `LB_API_KEY` / `METRICS_URL` | anthropic-lb module — **all three or none**. None: the module is disabled and the home card says so. A partial set refuses startup. `LB_URL` = the LB's base URL; `LB_API_KEY` = an LB **operator** client key, sent server-side as `x-api-key` (the LB rejects `Authorization: Bearer` on `/_stats`); `METRICS_URL` = a Prometheus-compatible query API for the 7-day history — the console only ever calls `/api/v1/query_range` on it, so point it at a route that exposes nothing else. |
+| `LB_URL` / `LB_API_KEY` / `METRICS_URL` | anthropic-lb module — **all three or none**. None: the module is disabled and the home card says so. A partial set refuses startup. `LB_URL` = the LB's base URL; `LB_API_KEY` = an LB **operator** client key, sent server-side as `x-api-key` (the LB rejects `Authorization: Bearer` on `/_stats`); `METRICS_URL` = a Prometheus-compatible query API for the 7-day history — the console calls `/api/v1/query_range` on it, plus the client-store module's per-metric routes when that module is on, so point it at a proxy that exposes nothing else. |
+| `CLIENT_STORE_URL` / `CLIENT_STORE_TOKEN` | Client-store module — **both or neither**, and it needs the anthropic-lb module too. `CLIENT_STORE_URL` = the client store's origin, with no path (the console calls `{url}/_clients/admin`, nothing else); `CLIENT_STORE_TOKEN` = the store's **writer** token, at least 32 printable ASCII characters, sent server-side as `Authorization: Bearer`. |
+| `CONSOLE_METRICS_ADDR` | Optional, default `0.0.0.0:9102`, an `ip:port` literal (no hostname, so loading the config needs no lookup), used only with the client-store module: the listener that serves `/metrics` (the committed-version labels) to the scraper. Keep it off any ingress that reaches the browser. |
 
-Every upstream URL (`ALAYA_URL`, `LB_URL`, `METRICS_URL`, `SELECTA_URL`) must be https, or plain http to a cluster-local host (`*.svc`, `*.svc.cluster.local`, `*.internal`, a single-label name, or a loopback/private IP literal), and must carry no query string or fragment. Anything else refuses startup — `METRICS_URL` included, keyless or not: off-cluster plaintext leaves the budget history both readable and rewritable in flight. `CONSOLE_OIDC_ISSUER` is stricter still: https only, no cluster-local exemption, and no userinfo (it is printed verbatim in the startup config log).
+Every upstream URL (`ALAYA_URL`, `LB_URL`, `METRICS_URL`, `SELECTA_URL`, `CLIENT_STORE_URL`) must be https, or plain http to a cluster-local host (`*.svc`, `*.svc.cluster.local`, `*.internal`, a single-label name, or a loopback/private IP literal), and must carry no query string or fragment. Anything else refuses startup — `METRICS_URL` included, keyless or not: off-cluster plaintext leaves the budget history both readable and rewritable in flight. `CONSOLE_OIDC_ISSUER` is stricter still: https only, no cluster-local exemption, and no userinfo (it is printed verbatim in the startup config log).
 
 Logs are JSON, one object per line on stdout, so structured fields (`sub`,
 `op`, `issuer`, `cause`, ...) are queryable as `fields.<name>` rather than
@@ -156,6 +158,74 @@ not grow one. Values render with their provenance; limits are
 Each card degrades on its own: a dark metrics store leaves live headroom
 up, an LB outage leaves the burn history up. Every upstream client in the
 console refuses redirects (no credential ever rides a 3xx off-host).
+
+## Client-store module (LB client management)
+
+The LB's ordinary clients live in a client store that every LB instance
+polls: a document that grants (clients, keys, policies) and a set of
+restrictions that deny (disabled names, revoked key digests). The console
+manages them through the store's admin API, never through the LB: `lb.rs`
+only ever GETs, and `no_route_sends_anything_but_a_get_to_the_lb` drives
+every route to prove it.
+
+This slice carries the kill switch, at `/lb/clients`:
+
+- **`disable` / `enable`** by name, each with a reason, sent as restriction
+  ops. `disable` refuses every key of the name, the TOML keys of an ordinary
+  client included; `enable` carries the version of the record it read, so a
+  newer `disable` gets 409 instead of being undone. Nothing read from the
+  metrics store is consulted before either is sent. `/lb/clients/disable`
+  loads the form without reading anything, for when the store or the metrics
+  store is slow.
+- **A full disabled set.** The store refuses a request that leaves more than
+  1,024 names disabled and more than it found; the form then offers disabled
+  names to enable in the same request, those the readers report matching no
+  client first.
+- **In effect, per stack.** After a write, `/lb/clients/effect` shows each
+  op on each stack that counts, refreshing until every stack holds it (or two
+  minutes pass). An op is in effect on an instance when the instance reports
+  the set hash of the restrictions part the store serves now, and that part
+  carries the op's record or a newer one of the same state. CF is judged from
+  the store's report of CF's latest poll; every other stack from its
+  instances in the metrics store: every instance listed by `up` must be up
+  and export exactly one restrictions series, on the served set hash. A part
+  that moved between the two store reads around the metrics read confirms
+  nothing, and neither does a partial part. A newer record in the other state
+  reads as superseded, never as in effect. The rule lives in `effect.rs`.
+- **Warnings.** A partial restrictions part, instances raising
+  restrictions-behind, a frozen or unreadable document, an open
+  point-in-time-recovery window, and disabled names the readers report
+  matching nothing ("mistyped?").
+
+Every write re-checks the session's subject against
+`CONSOLE_ALLOWED_SUBJECTS` (otherwise read only at login), after the CSRF
+token and the Origin check. Every attempt that reaches the write handler is
+logged on target `ops_console::write_log` with the subject: a refusal made
+before sending (CSRF, allowlist, malformed input), the request with the
+store's answer, or the upstream failure. A request without the console's own
+Origin is refused earlier, by middleware, before any session is read. An
+answer that is lost, or a 503 from the store's restrictions object, leaves
+the outcome unknown: the console says so, re-reads the store, and exports
+nothing as committed.
+
+**What the metrics proxy must serve.** One route per metric, at
+`{METRICS_URL}/m/<metric>/api/v1/query`, each pinning `__name__` (and the
+LB's scrape job) with `extra_label` so a query can only narrow it:
+`up`, `anthropic_client_store_restrictions`, `anthropic_client_store_alert`
+and `anthropic_client_store_unmatched_disabled_name`. A query outside a pin
+comes back empty, which the console reads as "nothing visible", never as
+healthy. Each reader stack's series must carry `stack="<name>"`, the name the
+store gives it (its reader role, `reader:<name>`). A reader series without a
+`stack` label leaves every stack judged from the metrics store unknown, naming
+the instance: dropped, it would let its stack read as in effect without it.
+
+**Committed labels.** On `CONSOLE_METRICS_ADDR` the console serves
+`ops_console_committed_record{name,version}`, one series per restriction
+record it committed (the value is when). An alert can match the versions
+instances install against these over 30 days and fire on one the console
+never wrote. The list is in memory: a commit the scraper never saw, because
+the console restarted within one scrape interval, reads as unmatched, and the
+write log holds it.
 
 ## selecta module (read-only)
 

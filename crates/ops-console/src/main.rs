@@ -12,8 +12,11 @@
 //! on the OIDC callback, pinned `redirect_uri`, fail-closed configuration.
 
 mod alaya;
+mod committed;
 mod config;
+mod effect;
 mod error;
+mod fleet;
 mod http;
 mod lb;
 mod oidc;
@@ -21,6 +24,7 @@ mod routes;
 mod selecta;
 mod session;
 mod state;
+mod store;
 #[cfg(test)]
 mod testkit;
 #[cfg(test)]
@@ -129,68 +133,105 @@ async fn security_headers(req: Request, next: Next) -> Response {
     resp
 }
 
-fn app(state: AppState) -> Router {
+/// The committed-version labels (`committed.rs`) on a listener of their own,
+/// for the metrics scraper. The console's main port serves nothing without a
+/// session beyond the health check, the stylesheet and login, and this keeps
+/// it that way.
+fn metrics_app(committed: std::sync::Arc<committed::Committed>) -> Router {
+    Router::new().route(
+        "/metrics",
+        get(move || async move {
+            (
+                [(
+                    header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )],
+                committed.render(),
+            )
+        }),
+    )
+}
+
+/// Every route the console serves, in one list: `app()` builds its router
+/// from it, and the write-path test walks it, so no route can be added that
+/// the test does not drive.
+fn routes() -> Vec<(&'static str, axum::routing::MethodRouter<AppState>)> {
     // Session enforcement lives in the `Session` extractor: every handler
     // below except healthz/css/login/callback requires it, so an unlisted
     // future route without the extractor serves nothing sensitive by itself.
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/static/console.css", get(console_css))
-        .route("/auth/login", get(routes::auth::login))
-        .route("/auth/callback", get(routes::auth::callback))
-        .route("/auth/logout", post(routes::auth::logout))
-        .route("/", get(routes::home::home))
-        .route("/alaya", get(routes::alaya::browse))
-        .route("/alaya/memory/{hash}", get(routes::alaya::detail))
-        .route(
+    vec![
+        ("/healthz", get(healthz)),
+        ("/static/console.css", get(console_css)),
+        ("/auth/login", get(routes::auth::login)),
+        ("/auth/callback", get(routes::auth::callback)),
+        ("/auth/logout", post(routes::auth::logout)),
+        ("/", get(routes::home::home)),
+        ("/alaya", get(routes::alaya::browse)),
+        ("/alaya/memory/{hash}", get(routes::alaya::detail)),
+        (
             "/alaya/memory/{hash}/delete",
             post(routes::alaya::delete_memory),
-        )
-        .route(
+        ),
+        (
             "/alaya/memory/{hash}/correct",
             post(routes::alaya::correct_and_supersede),
-        )
-        .route(
+        ),
+        (
             "/alaya/memory/{hash}/unsupersede",
             post(routes::alaya::unsupersede_submit),
-        )
-        .route(
+        ),
+        (
             "/alaya/supersede",
             get(routes::alaya::supersede_form).post(routes::alaya::supersede_submit),
-        )
-        .route(
+        ),
+        (
             "/alaya/relation/create",
             post(routes::alaya::relation_create),
-        )
-        .route(
+        ),
+        (
             "/alaya/relation/delete",
             post(routes::alaya::relation_delete),
-        )
-        .route("/alaya/duplicates", get(routes::alaya::duplicates))
-        .route("/alaya/duplicates/merge", post(routes::alaya::merge_submit))
-        .route("/alaya/contradictions", get(routes::alaya::contradictions))
-        .route("/alaya/contradictions/pair", get(routes::alaya::pair_page))
-        .route(
+        ),
+        ("/alaya/duplicates", get(routes::alaya::duplicates)),
+        ("/alaya/duplicates/merge", post(routes::alaya::merge_submit)),
+        ("/alaya/contradictions", get(routes::alaya::contradictions)),
+        ("/alaya/contradictions/pair", get(routes::alaya::pair_page)),
+        (
             "/alaya/contradictions/keep-both",
             post(routes::alaya::keep_both_submit),
-        )
-        .route(
+        ),
+        (
             "/alaya/contradictions/keep-both/bulk",
             post(routes::alaya::keep_both_bulk),
-        )
-        .route(
+        ),
+        (
             "/alaya/contradictions/reopen",
             post(routes::alaya::reopen_submit),
-        )
-        .route("/alaya/auth", get(routes::alaya::auth_view))
-        .route("/alaya/health", get(routes::health::pane))
+        ),
+        ("/alaya/auth", get(routes::alaya::auth_view)),
+        ("/alaya/health", get(routes::health::pane)),
         // anthropic-lb module: GET only, by design. No POST route to the LB
         // exists and none may be added here.
-        .route("/lb", get(routes::lb::pane))
+        ("/lb", get(routes::lb::pane)),
+        // Client-store module: the LB's clients are managed through the
+        // client store's admin API, never through the LB.
+        ("/lb/clients", get(routes::clients::pane)),
+        ("/lb/clients/disable", get(routes::clients::disable_page)),
+        ("/lb/clients/restrict", post(routes::clients::restrict)),
+        ("/lb/clients/effect", get(routes::clients::effect)),
         // selecta module: GET only, by design. The console holds a read-only
         // selecta credential and no POST route to selecta may be added here.
-        .route("/selecta", get(routes::selecta::pane))
-        .route("/selecta/task/{id}", get(routes::selecta::task))
+        ("/selecta", get(routes::selecta::pane)),
+        ("/selecta/task/{id}", get(routes::selecta::task)),
+    ]
+}
+
+fn app(state: AppState) -> Router {
+    routes()
+        .into_iter()
+        .fold(Router::new(), |router, (path, method)| {
+            router.route(path, method)
+        })
         .layer(middleware::from_fn_with_state(state.clone(), origin_check))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -250,11 +291,25 @@ async fn main() {
     tracing::info!(?config, "ops-console starting");
 
     let listen = config.listen_addr.clone();
+    let metrics_listen = config.store.as_ref().map(|s| s.metrics_addr.clone());
     let state = AppState::new(config);
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .expect("failed to bind");
     tracing::info!("ops-console listening on {listen}");
+    if let (Some(addr), Some(store)) = (metrics_listen, state.store.as_ref()) {
+        let metrics = tokio::net::TcpListener::bind(&addr)
+            .await
+            .expect("failed to bind the metrics listener");
+        tracing::info!("ops-console metrics listening on {addr}");
+        let router = metrics_app(store.committed.clone());
+        // Ends with the process: the main server's shutdown returns from main.
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(metrics, router).await {
+                tracing::error!(error = %e, "metrics listener stopped");
+            }
+        });
+    }
 
     axum::serve(listener, app(state))
         .with_graceful_shutdown(shutdown_signal())
@@ -297,6 +352,7 @@ mod tests {
             alaya_api_key: "alaya-bearer-secret-value".into(),
             lb: None,
             selecta: None,
+            store: None,
         }
     }
 
@@ -547,10 +603,11 @@ mod tests {
     }
 
     /// Each section degrades on its own: with both upstreams dark the page
-    /// still renders, names each unavailable source, keeps the provenance
-    /// text, and carries no form that could POST to the LB.
+    /// still renders, names each unavailable source and keeps the provenance
+    /// text. That the console has no write path to the LB is pinned by
+    /// `no_route_sends_anything_but_a_get_to_the_lb`, over every route.
     #[tokio::test]
-    async fn lb_pane_degrades_per_section_and_has_no_write_path() {
+    async fn lb_pane_degrades_per_section() {
         let state = test_state_with_lb();
         let sess = session::new_session("admin-sub".into(), None, None);
         let cookie_header = session_cookie_header(&state, &sess);
@@ -569,9 +626,6 @@ mod tests {
         assert!(html.contains("anthropic-lb: connection failed"), "{html}");
         assert!(html.contains("metrics: connection failed"), "{html}");
         assert!(html.contains("TOML, GitOps"));
-        // The only form on any authenticated page is the logout form.
-        assert_eq!(html.matches("<form").count(), 1);
-        assert!(html.contains("action=\"/auth/logout\""));
     }
 
     #[tokio::test]
@@ -3024,5 +3078,1288 @@ mod tests {
             ),
             "{home}"
         );
+    }
+
+    // ─── Client-store module ────────────────────────────────────────────────
+
+    mod client_store {
+        use super::*;
+        use crate::effect::{self, RecordState};
+        use serde_json::{Value, json};
+        use sha2::Digest;
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+
+        const STORE_TOKEN: &str = "store-writer-token-secret-value-0123456789abc";
+        const T0: u64 = 1_791_698_400_000_000;
+
+        /// Every request a fake saw: (method, path and query, body).
+        type Log = Arc<Mutex<Vec<(String, String, String)>>>;
+
+        /// The store's state as a fake `GET /_clients/admin` answers it.
+        #[derive(Clone)]
+        struct World {
+            records: Vec<(&'static str, RecordState, u64)>,
+            full: bool,
+            /// CF's report: (running, set hash). `None` = no report yet.
+            cf: Option<(bool, String)>,
+            stacks: Vec<&'static str>,
+        }
+
+        impl World {
+            fn new(records: Vec<(&'static str, RecordState, u64)>) -> Self {
+                World {
+                    records,
+                    full: true,
+                    cf: None,
+                    stacks: vec!["cf", "k3s"],
+                }
+            }
+
+            fn set_hash(&self) -> String {
+                effect::set_hash(self.records.iter().copied(), [])
+            }
+
+            /// CF running and holding exactly the served set.
+            fn cf_caught_up(mut self) -> Self {
+                self.cf = Some((true, self.set_hash()));
+                self
+            }
+
+            fn get_body(&self) -> Value {
+                let body = json!({
+                    "full": self.full,
+                    "enabled_ahead": 0,
+                    "records": self.records.iter().map(|(n, s, v)| json!({"name": n, "state": s.as_str(), "version": v})).collect::<Vec<_>>(),
+                    "revoked_digests": [],
+                })
+                .to_string();
+                let report = self.cf.as_ref().map(|(_, h)| json!({"version": 0, "digest": null, "records_version": 0, "set_hash": h, "set_complete": true, "binary": "lb/1", "at": "2026-10-11T06:00:00.000Z"}));
+                json!({
+                    "document": {
+                        "status": "ok", "version": 1_791_698_400_123_u64, "digest": "0".repeat(64),
+                        "clients": [{"name": "acme", "daily_budget": 600_000_000, "utilization_limit": null,
+                                     "models": [], "preferred_endpoints": [],
+                                     "keys": [{"id": "k7f3a2c1", "label": "2026-10", "digest": "a".repeat(64), "created_at": "2026-10-11T06:00:00.000Z"}]}],
+                        "revoked_digests": [], "frozen": [], "recovery_refused": false,
+                        "pitr_window": {"open": false, "usable": false, "restore_to": null, "closes": null},
+                        "cf": {"report": report, "complete": null, "running": self.cf.as_ref().is_some_and(|(r, _)| *r)},
+                        "history": [], "history_versions": []
+                    },
+                    "restrictions": {
+                        "status": "ok",
+                        "records": self.records.iter().map(|(n, s, v)| json!({"name": n, "state": s.as_str(), "version": v, "actor": "ops@example.test", "reason": "test", "at": "2026-10-11T06:00:00.000Z"})).collect::<Vec<_>>(),
+                        "revoked_digests": [],
+                        "records_version": self.records.iter().map(|r| r.2).max().unwrap_or(0),
+                        "integrity": {"matches": self.full, "established": null},
+                        "part": {"status": "ok", "tag": effect::hex(&sha2::Sha256::digest(body.as_bytes())), "body": body, "set_hash": self.set_hash()},
+                        "markers": []
+                    },
+                    "recoveries": [],
+                    "stacks": self.stacks,
+                    "pitr_window": false
+                })
+            }
+        }
+
+        /// A fake store: successive `GET`s are answered from `gets` in order
+        /// (the last one repeats); every `POST` gets `post`, or `post_page`
+        /// when set: a body that is not the store's JSON, as an edge block
+        /// page would be.
+        #[derive(Clone)]
+        struct FakeStore {
+            gets: Arc<Mutex<Vec<Value>>>,
+            post: Arc<Mutex<(StatusCode, Value)>>,
+            post_page: Arc<Mutex<Option<StatusCode>>>,
+            log: Log,
+        }
+
+        impl FakeStore {
+            fn new(world: &World) -> Self {
+                FakeStore {
+                    gets: Arc::new(Mutex::new(vec![world.get_body()])),
+                    post_page: Arc::new(Mutex::new(None)),
+                    post: Arc::new(Mutex::new((
+                        StatusCode::OK,
+                        json!({"status": 200, "results": [], "records_version": 0}),
+                    ))),
+                    log: Log::default(),
+                }
+            }
+
+            fn answer_post(&self, status: StatusCode, body: Value) {
+                *self.post.lock().unwrap() = (status, body);
+            }
+
+            fn requests(&self) -> Vec<(String, String, String)> {
+                self.log.lock().unwrap().clone()
+            }
+
+            fn posts(&self) -> Vec<Value> {
+                self.requests()
+                    .into_iter()
+                    .filter(|(m, _, _)| m == "POST")
+                    .map(|(_, _, b)| serde_json::from_str(&b).unwrap())
+                    .collect()
+            }
+
+            fn router(&self) -> Router {
+                let me = self.clone();
+                Router::new().fallback(move |req: Request| {
+                    let me = me.clone();
+                    async move {
+                        let method = req.method().to_string();
+                        let path = req.uri().to_string();
+                        let auth = req.headers().get(header::AUTHORIZATION).cloned();
+                        let body = axum::body::to_bytes(req.into_body(), 1 << 20)
+                            .await
+                            .unwrap();
+                        me.log.lock().unwrap().push((
+                            method.clone(),
+                            path.clone(),
+                            String::from_utf8_lossy(&body).into(),
+                        ));
+                        if auth.as_ref().and_then(|a| a.to_str().ok())
+                            != Some(&format!("Bearer {STORE_TOKEN}"))
+                        {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                axum::Json(json!({"error": "unauthorized"})),
+                            );
+                        }
+                        if path != "/_clients/admin" {
+                            return (
+                                StatusCode::NOT_FOUND,
+                                axum::Json(json!({"error": "not found"})),
+                            );
+                        }
+                        if method == "GET" {
+                            let mut gets = me.gets.lock().unwrap();
+                            let body = if gets.len() > 1 {
+                                gets.remove(0)
+                            } else {
+                                gets[0].clone()
+                            };
+                            return (StatusCode::OK, axum::Json(body));
+                        }
+                        if let Some(status) = *me.post_page.lock().unwrap() {
+                            return (status, axum::Json(Value::Null));
+                        }
+                        let (status, body) = me.post.lock().unwrap().clone();
+                        (status, axum::Json(body))
+                    }
+                })
+            }
+        }
+
+        /// A fake metrics proxy: `/m/<metric>/api/v1/query` answers that
+        /// metric's series; anything else is a missing route.
+        #[derive(Clone, Default)]
+        struct FakeMetrics {
+            series: Arc<Mutex<BTreeMap<&'static str, Vec<Value>>>>,
+            /// Routes that answer 500, as a failed query would.
+            failing: Arc<Mutex<Vec<String>>>,
+            log: Log,
+        }
+
+        impl FakeMetrics {
+            fn set(&self, metric: &'static str, series: Vec<Value>) {
+                self.series.lock().unwrap().insert(metric, series);
+            }
+
+            fn router(&self) -> Router {
+                let me = self.clone();
+                Router::new().fallback(move |req: Request| {
+                    let me = me.clone();
+                    async move {
+                        let path = req.uri().path().to_string();
+                        me.log.lock().unwrap().push((req.method().to_string(), req.uri().to_string(), String::new()));
+                        let metric = path.strip_prefix("/m/").and_then(|p| p.strip_suffix("/api/v1/query"));
+                        let Some(metric) = metric else {
+                            return (StatusCode::BAD_REQUEST, axum::Json(json!({"error": "missing route"})));
+                        };
+                        if me.failing.lock().unwrap().iter().any(|f| f == metric) {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": "query failed"})));
+                        }
+                        let series = me.series.lock().unwrap().get(metric).cloned().unwrap_or_default();
+                        (StatusCode::OK, axum::Json(json!({"status": "success", "data": {"resultType": "vector", "result": series}})))
+                    }
+                })
+            }
+        }
+
+        fn series(labels: &[(&str, &str)], value: &str) -> Value {
+            let metric: serde_json::Map<String, Value> = labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), json!(v)))
+                .collect();
+            json!({"metric": metric, "value": [1_791_698_400.0, value]})
+        }
+
+        /// k3s pods, each `(pod, up, [set hashes])`.
+        fn k3s(metrics: &FakeMetrics, pods: &[(&str, &str, &[&str])]) {
+            metrics.set(
+                "up",
+                pods.iter()
+                    .map(|(p, up, _)| series(&[("stack", "k3s"), ("pod", p)], up))
+                    .collect(),
+            );
+            metrics.set(
+                "anthropic_client_store_restrictions",
+                pods.iter()
+                    .flat_map(|(p, _, hashes)| {
+                        hashes.iter().map(move |h| {
+                            series(&[("stack", "k3s"), ("pod", p), ("set_hash", h)], "1")
+                        })
+                    })
+                    .collect(),
+            );
+        }
+
+        async fn store_state(
+            store: &FakeStore,
+            metrics: &FakeMetrics,
+            subjects: &[&str],
+        ) -> AppState {
+            let mut config = test_config();
+            config.allowed_subjects = subjects.iter().map(|s| s.to_string()).collect();
+            config.lb = Some(config::LbConfig {
+                url: "http://127.0.0.1:1".parse().unwrap(),
+                api_key: LB_KEY.into(),
+                metrics_url: fake_upstream(metrics.router()).await.parse().unwrap(),
+            });
+            config.store = Some(config::StoreConfig {
+                url: fake_upstream(store.router()).await.parse().unwrap(),
+                token: STORE_TOKEN.into(),
+                metrics_addr: "127.0.0.1:0".into(),
+            });
+            AppState::new(config)
+        }
+
+        fn cookie_for(state: &AppState, sub: &str) -> (String, String) {
+            let mut sess = session::new_session(sub.into(), Some("ops@example.test".into()), None);
+            sess.last_seen = session::now_epoch();
+            (session_cookie_header(state, &sess), sess.csrf)
+        }
+
+        fn form(pairs: &[(&str, &str)]) -> String {
+            let mut s = url::form_urlencoded::Serializer::new(String::new());
+            for (k, v) in pairs {
+                s.append_pair(k, v);
+            }
+            s.finish()
+        }
+
+        #[tokio::test]
+        async fn the_page_judges_each_stack_on_the_served_set() {
+            let world = World::new(vec![("acme", RecordState::Disabled, T0)]).cf_caught_up();
+            let store = FakeStore::new(&world);
+            let metrics = FakeMetrics::default();
+            let h = world.set_hash();
+            k3s(&metrics, &[("lb-a", "1", &[&h]), ("lb-b", "1", &[&h])]);
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, _) = cookie_for(&state, "admin-sub");
+            let (status, html) = get_page(&state, &cookie, "/lb/clients").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(html.matches(">in effect<").count(), 2, "{html}");
+            assert!(html.contains("acme"), "{html}");
+            assert!(!html.contains(STORE_TOKEN));
+            // The bearer reached the store, and only GETs did.
+            assert!(
+                store
+                    .requests()
+                    .iter()
+                    .all(|(m, p, _)| m == "GET" && p == "/_clients/admin")
+            );
+        }
+
+        #[tokio::test]
+        async fn k3s_reads_not_in_effect_with_up_at_zero_or_a_missing_gauge() {
+            let world = World::new(vec![("acme", RecordState::Disabled, T0)]).cf_caught_up();
+            let h = world.set_hash();
+            for pods in [
+                vec![
+                    ("lb-a", "1", vec![h.as_str()]),
+                    ("lb-b", "0", vec![h.as_str()]),
+                ],
+                vec![("lb-a", "1", vec![h.as_str()]), ("lb-b", "1", vec![])],
+            ] {
+                let store = FakeStore::new(&world);
+                let metrics = FakeMetrics::default();
+                let pods: Vec<(&str, &str, &[&str])> = pods
+                    .iter()
+                    .map(|(p, u, hs)| (*p, *u, hs.as_slice()))
+                    .collect();
+                k3s(&metrics, &pods);
+                let state = store_state(&store, &metrics, &["admin-sub"]).await;
+                let (cookie, _) = cookie_for(&state, "admin-sub");
+                let (_, html) = get_page(&state, &cookie, "/lb/clients").await;
+                assert_eq!(html.matches(">in effect<").count(), 1, "{html}");
+                assert!(html.contains(">not in effect<"), "{html}");
+                assert!(
+                    html.contains("lb-b is not scraped (up is 0)")
+                        || html.contains("lb-b exports no client-store gauge"),
+                    "{html}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn the_partial_part_and_restrictions_behind_are_shown() {
+            let mut world = World::new(vec![("acme", RecordState::Disabled, T0)]).cf_caught_up();
+            world.full = false;
+            let store = FakeStore::new(&world);
+            let metrics = FakeMetrics::default();
+            let h = world.set_hash();
+            k3s(&metrics, &[("lb-a", "1", &[&h])]);
+            metrics.set(
+                "anthropic_client_store_alert",
+                vec![series(
+                    &[
+                        ("stack", "k3s"),
+                        ("pod", "lb-a"),
+                        ("alert", "restrictions_behind"),
+                    ],
+                    "1",
+                )],
+            );
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, _) = cookie_for(&state, "admin-sub");
+            let (_, html) = get_page(&state, &cookie, "/lb/clients").await;
+            assert!(html.contains("the restrictions part is partial"), "{html}");
+            assert!(html.contains("Restrictions behind on k3s/lb-a"), "{html}");
+            // Equal hashes or not, a partial part confirms nothing.
+            assert!(!html.contains(">in effect<"), "{html}");
+        }
+
+        #[tokio::test]
+        async fn a_mistyped_disable_is_flagged_from_the_readers_unmatched_names() {
+            let world = World::new(vec![
+                ("acmee", RecordState::Disabled, T0),
+                ("acme", RecordState::Disabled, T0),
+            ]);
+            let store = FakeStore::new(&world);
+            let metrics = FakeMetrics::default();
+            metrics.set(
+                "anthropic_client_store_unmatched_disabled_name",
+                vec![series(
+                    &[("stack", "k3s"), ("pod", "lb-a"), ("name", "acmee")],
+                    "1",
+                )],
+            );
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, _) = cookie_for(&state, "admin-sub");
+            let (_, html) = get_page(&state, &cookie, "/lb/clients").await;
+            assert_eq!(
+                html.matches("matches no client on k3s — mistyped?").count(),
+                1,
+                "{html}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_full_disabled_set_offers_names_to_enable_matching_nothing_first() {
+            let names: Vec<&'static str> = (0..1024)
+                .map(|i| &*Box::leak(format!("n{i:04}").into_boxed_str()))
+                .collect();
+            let world = World::new(
+                names
+                    .iter()
+                    .map(|n| (*n, RecordState::Disabled, T0))
+                    .collect(),
+            );
+            let store = FakeStore::new(&world);
+            let metrics = FakeMetrics::default();
+            metrics.set(
+                "anthropic_client_store_unmatched_disabled_name",
+                vec![series(
+                    &[("stack", "k3s"), ("pod", "lb-a"), ("name", "n0999")],
+                    "1",
+                )],
+            );
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, _) = cookie_for(&state, "admin-sub");
+            let (_, html) = get_page(&state, &cookie, "/lb/clients").await;
+            assert!(html.contains("disabled set full"), "{html}");
+            let first = html.find("name=\"also_enable\"").unwrap();
+            assert!(
+                html[first..].starts_with(&format!("name=\"also_enable\" value=\"n0999:{T0}\"")),
+                "{}",
+                &html[first..first + 80]
+            );
+        }
+
+        #[tokio::test]
+        async fn disable_is_sent_as_a_restriction_op_and_confirmed_per_stack() {
+            let world = World::new(vec![]);
+            let store = FakeStore::new(&world);
+            store.answer_post(
+                StatusCode::OK,
+                json!({"status": 200, "results": [{"name": "acme", "state": "disabled", "version": T0, "written": true}], "records_version": T0}),
+            );
+            let metrics = FakeMetrics::default();
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/restrict",
+                form(&[
+                    ("csrf", &csrf),
+                    ("action", "disable"),
+                    ("name", "acme"),
+                    ("reason", "leaked\nkey  "),
+                ]),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            assert!(
+                location(&resp)
+                    .starts_with(&format!("/lb/clients/effect?op=disabled.acme.{T0}&at=")),
+                "{}",
+                location(&resp)
+            );
+            assert_eq!(
+                store.posts(),
+                [
+                    json!({"restrictions": [{"op": "disable", "name": "acme", "actor": "ops@example.test", "reason": "leaked key"}]})
+                ]
+            );
+            // No metrics value was consulted to send it.
+            assert!(metrics.log.lock().unwrap().is_empty());
+            // The written record is exported as committed.
+            let text = state.store.as_ref().unwrap().committed.render();
+            assert!(
+                text.contains(&format!(
+                    "ops_console_committed_record{{name=\"acme\",version=\"{T0}\"}}"
+                )),
+                "{text}"
+            );
+        }
+
+        /// A dark or forged metrics store cannot stop the kill switch: the
+        /// handler never reads it before sending.
+        #[tokio::test]
+        async fn no_metrics_signal_can_stop_a_restriction_op() {
+            let world = World::new(vec![("acme", RecordState::Disabled, T0)]);
+            let store = FakeStore::new(&world);
+            store.answer_post(
+                StatusCode::OK,
+                json!({"status": 200, "results": [{"name": "acme", "state": "enabled", "version": T0 + 1, "written": true}], "records_version": T0 + 1}),
+            );
+            let mut config = test_config();
+            config.lb = Some(config::LbConfig {
+                url: "http://127.0.0.1:1".parse().unwrap(),
+                api_key: LB_KEY.into(),
+                // Closed port: every metrics read fails.
+                metrics_url: "http://127.0.0.1:1".parse().unwrap(),
+            });
+            config.store = Some(config::StoreConfig {
+                url: fake_upstream(store.router()).await.parse().unwrap(),
+                token: STORE_TOKEN.into(),
+                metrics_addr: "127.0.0.1:0".into(),
+            });
+            let state = AppState::new(config);
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/restrict",
+                form(&[
+                    ("csrf", &csrf),
+                    ("action", "enable"),
+                    ("name", "acme"),
+                    ("expected_version", &T0.to_string()),
+                    ("reason", "false alarm"),
+                ]),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            assert!(
+                location(&resp).starts_with("/lb/clients/effect?op=enabled.acme."),
+                "{}",
+                location(&resp)
+            );
+            // `enable` carries the version of the record it read.
+            assert_eq!(
+                store.posts()[0]["restrictions"][0]["expected_version"],
+                json!(T0)
+            );
+        }
+
+        #[tokio::test]
+        async fn a_full_set_is_handled_by_enabling_chosen_names_in_the_same_request() {
+            let store = FakeStore::new(&World::new(vec![]));
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let pick = format!("spare:{T0}");
+            post_form(
+                &state,
+                &cookie,
+                "/lb/clients/restrict",
+                form(&[
+                    ("csrf", &csrf),
+                    ("action", "disable"),
+                    ("name", "acme"),
+                    ("reason", "leak"),
+                    ("also_enable", &pick),
+                ]),
+            )
+            .await;
+            let ops = &store.posts()[0]["restrictions"];
+            assert_eq!(
+                ops[0],
+                json!({"op": "enable", "name": "spare", "expected_version": T0, "actor": "ops@example.test", "reason": "leak"})
+            );
+            assert_eq!(ops[1]["op"], "disable");
+            assert_eq!(ops.as_array().unwrap().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_409_re_reads_the_store_before_reporting() {
+            let world = World::new(vec![("acme", RecordState::Disabled, T0 + 99)]);
+            let store = FakeStore::new(&world);
+            store.answer_post(
+                StatusCode::CONFLICT,
+                json!({"status": 409, "errors": [{"code": "enable.stale", "message": "acme changed since it was read", "name": "acme", "version": T0 + 99}]}),
+            );
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/restrict",
+                form(&[
+                    ("csrf", &csrf),
+                    ("action", "enable"),
+                    ("name", "acme"),
+                    ("expected_version", &T0.to_string()),
+                    ("reason", "ok now"),
+                ]),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            let methods: Vec<String> = store.requests().into_iter().map(|(m, _, _)| m).collect();
+            assert_eq!(
+                methods,
+                ["POST", "GET"],
+                "a 409 is followed by a fresh read"
+            );
+            let flash = flash_of(&state, &resp);
+            assert_eq!(flash.kind, "error");
+            assert!(flash.msg.contains("enable.stale"), "{}", flash.msg);
+            assert!(
+                flash
+                    .msg
+                    .contains(&format!("acme is disabled at {}", T0 + 99)),
+                "{}",
+                flash.msg
+            );
+        }
+
+        /// An answer that never arrives intact leaves the outcome unknown:
+        /// the console says so, re-reads the store, and exports nothing as
+        /// committed.
+        #[tokio::test]
+        async fn a_lost_answer_is_reported_as_unknown_after_a_re_read() {
+            let store = FakeStore::new(&World::new(vec![("acme", RecordState::Disabled, T0)]));
+            *store.post_page.lock().unwrap() = Some(StatusCode::FORBIDDEN);
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/restrict",
+                form(&[
+                    ("csrf", &csrf),
+                    ("action", "disable"),
+                    ("name", "acme"),
+                    ("reason", "leak"),
+                ]),
+            )
+            .await;
+            let flash = flash_of(&state, &resp);
+            assert_eq!(flash.kind, "error");
+            assert!(
+                flash.msg.contains("Whether the request applied is unknown"),
+                "{}",
+                flash.msg
+            );
+            assert!(
+                flash.msg.contains(&format!("acme is disabled at {T0}")),
+                "{}",
+                flash.msg
+            );
+            let methods: Vec<String> = store.requests().into_iter().map(|(m, _, _)| m).collect();
+            assert_eq!(methods, ["POST", "GET"]);
+            let text = state.store.as_ref().unwrap().committed.render();
+            assert!(!text.contains("ops_console_committed_record{"), "{text}");
+        }
+
+        #[tokio::test]
+        async fn a_refusal_names_the_stores_errors_and_a_full_set_returns_to_the_form() {
+            let store = FakeStore::new(&World::new(vec![]));
+            store.answer_post(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                json!({"status": 422, "errors": [{"code": "disabled.cap", "message": "enable at least 1 name more in the same request"}]}),
+            );
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/restrict",
+                form(&[
+                    ("csrf", &csrf),
+                    ("action", "disable"),
+                    ("name", "acme"),
+                    ("reason", "leak"),
+                ]),
+            )
+            .await;
+            assert_eq!(location(&resp), "/lb/clients?disable=acme#disable");
+            assert!(
+                flash_of(&state, &resp)
+                    .msg
+                    .contains("disabled.cap: enable at least 1 name more")
+            );
+        }
+
+        /// CSRF and Origin, and the allowlist read again on every write: a
+        /// subject removed since login cannot write, and nothing is sent.
+        #[tokio::test]
+        async fn writes_need_csrf_origin_and_a_subject_still_allowlisted() {
+            let store = FakeStore::new(&World::new(vec![]));
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let body = |csrf: &str| {
+                form(&[
+                    ("csrf", csrf),
+                    ("action", "disable"),
+                    ("name", "acme"),
+                    ("reason", "x"),
+                ])
+            };
+            let resp = post_form(&state, &cookie, "/lb/clients/restrict", body("wrong")).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            let resp = app(state.clone())
+                .oneshot(
+                    HttpRequest::post("/lb/clients/restrict")
+                        .header(header::ORIGIN, "https://evil.test")
+                        .header(header::COOKIE, cookie.clone())
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::from(body(&csrf)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            let (removed, removed_csrf) = cookie_for(&state, "removed-sub");
+            let resp = post_form(
+                &state,
+                &removed,
+                "/lb/clients/restrict",
+                body(&removed_csrf),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            assert!(store.requests().is_empty(), "nothing reaches the store");
+        }
+
+        #[tokio::test]
+        async fn every_write_attempt_is_logged_with_the_subject() {
+            let store = FakeStore::new(&World::new(vec![]));
+            store.answer_post(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                json!({"status": 422, "errors": [{"code": "name.privileged", "message": "a privileged name"}]}),
+            );
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let buf = testlog::LogBuf::default();
+            let _guard = buf.capture();
+            post_form(
+                &state,
+                &cookie,
+                "/lb/clients/restrict",
+                form(&[
+                    ("csrf", &csrf),
+                    ("action", "disable"),
+                    ("name", "operator"),
+                    ("reason", "test"),
+                ]),
+            )
+            .await;
+            let line = buf.record("client-store write refused");
+            assert!(line.contains("sub=\"admin-sub\""), "{line}");
+            assert!(
+                line.contains("name.privileged") && line.contains("operator"),
+                "{line}"
+            );
+            assert!(!line.contains(STORE_TOKEN), "{line}");
+        }
+
+        #[tokio::test]
+        async fn the_effect_page_refreshes_until_every_stack_holds_the_op() {
+            let world = World::new(vec![("acme", RecordState::Disabled, T0)]);
+            let behind = World::new(vec![]);
+            // CF and k3s still on the old set: refresh.
+            let mut lagging = world.clone();
+            lagging.cf = Some((true, behind.set_hash()));
+            let store = FakeStore::new(&lagging);
+            let metrics = FakeMetrics::default();
+            let old = behind.set_hash();
+            k3s(&metrics, &[("lb-a", "1", &[&old])]);
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, _) = cookie_for(&state, "admin-sub");
+            let uri = format!(
+                "/lb/clients/effect?op=disabled.acme.{T0}&at={}",
+                session::now_epoch()
+            );
+            let resp = app(state.clone())
+                .oneshot(
+                    HttpRequest::get(&uri)
+                        .header(header::COOKIE, cookie.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.headers().get(header::REFRESH).unwrap(), "5");
+            let html = body_string(resp).await;
+            assert_eq!(html.matches(">not in effect<").count(), 2, "{html}");
+
+            // Both caught up: in effect everywhere, and the refresh stops.
+            let caught = world.clone().cf_caught_up();
+            let store = FakeStore::new(&caught);
+            let metrics = FakeMetrics::default();
+            let h = caught.set_hash();
+            k3s(&metrics, &[("lb-a", "1", &[&h])]);
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, _) = cookie_for(&state, "admin-sub");
+            let resp = app(state.clone())
+                .oneshot(
+                    HttpRequest::get(&uri)
+                        .header(header::COOKIE, cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(resp.headers().get(header::REFRESH).is_none());
+            assert_eq!(body_string(resp).await.matches(">in effect<").count(), 2);
+        }
+
+        /// The tag moved between the two reads around the metrics read: the
+        /// instances were compared with a part the store had replaced.
+        #[tokio::test]
+        async fn a_part_that_moves_during_the_read_confirms_nothing() {
+            let world = World::new(vec![("acme", RecordState::Disabled, T0)]).cf_caught_up();
+            let moved = World::new(vec![
+                ("acme", RecordState::Disabled, T0),
+                ("beta", RecordState::Disabled, T0 + 5),
+            ])
+            .cf_caught_up();
+            let store = FakeStore::new(&world);
+            *store.gets.lock().unwrap() = vec![world.get_body(), moved.get_body()];
+            let metrics = FakeMetrics::default();
+            let h = world.set_hash();
+            k3s(&metrics, &[("lb-a", "1", &[&h])]);
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, _) = cookie_for(&state, "admin-sub");
+            let (_, html) = get_page(
+                &state,
+                &cookie,
+                &format!("/lb/clients/effect?op=disabled.acme.{T0}&at=0"),
+            )
+            .await;
+            assert!(!html.contains(">in effect<"), "{html}");
+            assert!(html.contains(effect::MOVED), "{html}");
+        }
+
+        #[tokio::test]
+        async fn a_superseded_op_reads_as_superseded_and_stops_refreshing() {
+            let world = World::new(vec![("acme", RecordState::Enabled, T0 + 50)]).cf_caught_up();
+            let store = FakeStore::new(&world);
+            let metrics = FakeMetrics::default();
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, _) = cookie_for(&state, "admin-sub");
+            let uri = format!(
+                "/lb/clients/effect?op=disabled.acme.{T0}&at={}",
+                session::now_epoch()
+            );
+            let resp = app(state.clone())
+                .oneshot(
+                    HttpRequest::get(&uri)
+                        .header(header::COOKIE, cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(resp.headers().get(header::REFRESH).is_none());
+            let html = body_string(resp).await;
+            assert!(html.contains(">superseded<"), "{html}");
+            assert!(!html.contains(">in effect<"), "{html}");
+        }
+
+        #[tokio::test]
+        async fn the_metrics_listener_serves_only_the_committed_labels() {
+            let committed = std::sync::Arc::new(committed::Committed::default());
+            committed.record("acme", T0);
+            let resp = metrics_app(committed)
+                .oneshot(HttpRequest::get("/metrics").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(
+                body_string(resp)
+                    .await
+                    .contains(&format!("version=\"{T0}\""))
+            );
+        }
+
+        /// A fake upstream that records every request and answers `{}`.
+        fn recorder(log: &Log) -> Router {
+            let log = log.clone();
+            Router::new().fallback(move |req: Request| {
+                let log = log.clone();
+                async move {
+                    log.lock().unwrap().push((
+                        req.method().to_string(),
+                        req.uri().path().to_string(),
+                        String::new(),
+                    ));
+                    axum::Json(json!({}))
+                }
+            })
+        }
+
+        /// The console has no write path to the LB, whatever route someone
+        /// adds: every route in `routes()` is driven with a GET, and with a
+        /// POST carrying every field any form reads, and every route that
+        /// takes a POST must reach an upstream with it. The LB sees nothing
+        /// but GETs. Writes for LB clients go to the client store instead,
+        /// and only ever to its one admin path.
+        #[tokio::test]
+        async fn no_route_sends_anything_but_a_get_to_the_lb() {
+            let (lb, alaya, selecta) = (Log::default(), Log::default(), Log::default());
+            let store = FakeStore::new(&World::new(vec![("acme", RecordState::Disabled, T0)]));
+            store.answer_post(
+                StatusCode::OK,
+                json!({"status": 200, "results": [{"name": "acme", "state": "disabled", "version": T0, "written": true}], "records_version": T0}),
+            );
+            let metrics = FakeMetrics::default();
+            let mut config = test_config();
+            // A closed port: login's discovery fails at once, off the network.
+            config.oidc_issuer = "https://127.0.0.1:1".into();
+            config.alaya_url = fake_upstream(recorder(&alaya)).await.parse().unwrap();
+            config.lb = Some(config::LbConfig {
+                url: fake_upstream(recorder(&lb)).await.parse().unwrap(),
+                api_key: LB_KEY.into(),
+                metrics_url: fake_upstream(metrics.router()).await.parse().unwrap(),
+            });
+            config.selecta = Some(config::SelectaConfig {
+                url: fake_upstream(recorder(&selecta)).await.parse().unwrap(),
+                api_key: SELECTA_KEY.into(),
+            });
+            config.store = Some(config::StoreConfig {
+                url: fake_upstream(store.router()).await.parse().unwrap(),
+                token: STORE_TOKEN.into(),
+                metrics_addr: "127.0.0.1:0".into(),
+            });
+            let state = AppState::new(config);
+            let (h1, h2) = ("1".repeat(64), "2".repeat(64));
+            let seen = || {
+                lb.lock().unwrap().len()
+                    + alaya.lock().unwrap().len()
+                    + selecta.lock().unwrap().len()
+                    + store.requests().len()
+            };
+            for (route, _) in routes() {
+                let path = route.replace("{hash}", &h1).replace("{id}", "task-1");
+                // A fresh session each time: the logout route revokes its own.
+                let (cookie, _) = cookie_for(&state, "admin-sub");
+                let get = app(state.clone())
+                    .oneshot(
+                        HttpRequest::get(&path)
+                            .header(header::COOKIE, cookie)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                // The router's own 404 has no body; a handler's 404 renders a page.
+                let routed =
+                    get.status() != StatusCode::NOT_FOUND || !body_string(get).await.is_empty();
+                assert!(routed, "{route} did not route");
+                let (cookie, csrf) = cookie_for(&state, "admin-sub");
+                let pair = format!("{h1}:{h2}");
+                let sink = form(&[
+                    ("csrf", &csrf),
+                    ("action", "disable"),
+                    ("name", "acme"),
+                    ("reason", "test"),
+                    ("expected_version", "1"),
+                    ("old_hash", &h1),
+                    ("new_hash", &h2),
+                    ("hash", &h1),
+                    ("canonical_hash", &h1),
+                    ("duplicate_hashes", &h2),
+                    ("content", "x"),
+                    ("content_hash", &h1),
+                    ("target_hash", &h2),
+                    ("relation_type", "RELATES_TO"),
+                    ("memory_a_hash", &h1),
+                    ("memory_b_hash", &h2),
+                    ("pair", &pair),
+                    ("back", "/"),
+                ]);
+                let before = seen();
+                let post = post_form(&state, &cookie, &path, sink).await;
+                if post.status() == StatusCode::METHOD_NOT_ALLOWED {
+                    continue;
+                }
+                // Logout ends a session and calls nothing.
+                if route != "/auth/logout" {
+                    assert!(
+                        seen() > before,
+                        "{route} takes a POST that reached no upstream: extend the form"
+                    );
+                }
+            }
+            let lb = lb.lock().unwrap();
+            assert!(
+                !lb.is_empty(),
+                "no route reached the LB, so this proved nothing"
+            );
+            assert!(lb.iter().all(|(m, _, _)| m == "GET"), "{lb:?}");
+            let to_store = store.requests();
+            assert!(
+                to_store.iter().any(|(m, _, _)| m == "POST"),
+                "the store write path was never driven"
+            );
+            assert!(
+                to_store.iter().all(|(_, p, _)| p == "/_clients/admin"),
+                "{to_store:?}"
+            );
+        }
+
+        /// The kill switch never waits on a read: the disable page reads
+        /// nothing, and the main page keeps its form when the store is dark.
+        #[tokio::test]
+        async fn the_disable_form_never_waits_on_a_read() {
+            let store = FakeStore::new(&World::new(vec![]));
+            let metrics = FakeMetrics::default();
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, _) = cookie_for(&state, "admin-sub");
+            let (status, html) =
+                get_page(&state, &cookie, "/lb/clients/disable?disable=acme").await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(html.contains("action=\"/lb/clients/restrict\""), "{html}");
+            assert!(html.contains("value=\"acme\""), "{html}");
+            assert!(store.requests().is_empty() && metrics.log.lock().unwrap().is_empty());
+
+            let mut config = test_config();
+            config.lb = Some(config::LbConfig {
+                url: "http://127.0.0.1:1".parse().unwrap(),
+                api_key: LB_KEY.into(),
+                metrics_url: "http://127.0.0.1:1".parse().unwrap(),
+            });
+            config.store = Some(config::StoreConfig {
+                url: "http://127.0.0.1:1".parse().unwrap(),
+                token: STORE_TOKEN.into(),
+                metrics_addr: "127.0.0.1:0".into(),
+            });
+            let dark = AppState::new(config);
+            let (cookie, _) = cookie_for(&dark, "admin-sub");
+            let (status, html) = get_page(&dark, &cookie, "/lb/clients").await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(html.contains("client store: connection failed"), "{html}");
+            assert!(html.contains("action=\"/lb/clients/restrict\""), "{html}");
+        }
+
+        /// A reader the scraper left without a `stack` label must not drop
+        /// out of its stack: the stack reads unknown and names it, even while
+        /// every labelled pod holds the served set.
+        #[tokio::test]
+        async fn an_unlabelled_reader_makes_its_stack_unknown_not_in_effect() {
+            let world = World::new(vec![("acme", RecordState::Disabled, T0)]).cf_caught_up();
+            let store = FakeStore::new(&world);
+            let metrics = FakeMetrics::default();
+            let h = world.set_hash();
+            k3s(&metrics, &[("lb-a", "1", &[&h])]);
+            let mut up = metrics.series.lock().unwrap()["up"].clone();
+            up.push(series(&[("pod", "lb-b")], "1"));
+            metrics.set("up", up);
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, _) = cookie_for(&state, "admin-sub");
+            let (_, html) = get_page(&state, &cookie, "/lb/clients").await;
+            // CF still confirms from its report; k3s cannot be judged.
+            assert_eq!(html.matches(">in effect<").count(), 1, "{html}");
+            assert!(
+                html.contains(">unknown<") && html.contains("lb-b"),
+                "{html}"
+            );
+        }
+
+        /// The store answers 503 to any failure of its restrictions object's
+        /// call, a connection dropped after the commit included: that outcome
+        /// is unknown, never "refused".
+        #[tokio::test]
+        async fn a_503_from_the_restrictions_object_is_an_unknown_outcome() {
+            let store = FakeStore::new(&World::new(vec![("acme", RecordState::Enabled, T0)]));
+            store.answer_post(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"status": 503, "errors": [{"code": "store.unavailable", "message": "Revocations could not answer"}]}),
+            );
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let buf = testlog::LogBuf::default();
+            let _guard = buf.capture();
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/restrict",
+                form(&[
+                    ("csrf", &csrf),
+                    ("action", "enable"),
+                    ("name", "acme"),
+                    ("expected_version", "1"),
+                    ("reason", "ok"),
+                ]),
+            )
+            .await;
+            // The write log agrees with the page: unknown, never refused.
+            let line = buf.record("client-store write outcome unknown");
+            assert!(line.contains("store.unavailable"), "{line}");
+            assert!(!buf.text().contains("client-store write refused"));
+            let flash = flash_of(&state, &resp);
+            assert!(
+                flash
+                    .msg
+                    .starts_with("Whether the request applied is unknown"),
+                "{}",
+                flash.msg
+            );
+            assert!(!flash.msg.contains("refused"), "{}", flash.msg);
+            let methods: Vec<String> = store.requests().into_iter().map(|(m, _, _)| m).collect();
+            assert_eq!(methods, ["POST", "GET"]);
+            assert!(
+                !state
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .committed
+                    .render()
+                    .contains("ops_console_committed_record{")
+            );
+        }
+
+        /// A 200 whose results cannot be read in full is not "nothing
+        /// changed": the console says it cannot confirm, and exports nothing.
+        #[tokio::test]
+        async fn an_unreadable_commit_answer_confirms_nothing() {
+            let store = FakeStore::new(&World::new(vec![]));
+            store.answer_post(
+                StatusCode::OK,
+                json!({"status": 200, "results": [], "records_version": 0}),
+            );
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/restrict",
+                form(&[
+                    ("csrf", &csrf),
+                    ("action", "disable"),
+                    ("name", "acme"),
+                    ("reason", "leak"),
+                ]),
+            )
+            .await;
+            assert_eq!(location(&resp), "/lb/clients");
+            let flash = flash_of(&state, &resp);
+            assert!(
+                flash
+                    .msg
+                    .contains("could not be read (0 results for 1 ops)"),
+                "{}",
+                flash.msg
+            );
+        }
+
+        /// A no-op enable writes nothing: no op to confirm, nothing exported.
+        #[tokio::test]
+        async fn a_no_op_enable_tracks_nothing_and_exports_nothing() {
+            let store = FakeStore::new(&World::new(vec![("acme", RecordState::Enabled, T0)]));
+            store.answer_post(
+                StatusCode::OK,
+                json!({"status": 200, "results": [{"name": "acme", "state": "enabled", "version": T0, "written": false}], "records_version": 0}),
+            );
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/restrict",
+                form(&[
+                    ("csrf", &csrf),
+                    ("action", "enable"),
+                    ("name", "acme"),
+                    ("expected_version", "0"),
+                    ("reason", "ok"),
+                ]),
+            )
+            .await;
+            assert!(
+                location(&resp).starts_with("/lb/clients/effect?at="),
+                "{}",
+                location(&resp)
+            );
+            assert!(!location(&resp).contains("op="));
+            assert!(
+                !state
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .committed
+                    .render()
+                    .contains("ops_console_committed_record{")
+            );
+        }
+
+        /// An enable past the store's prune window can never be confirmed:
+        /// it ages out of the view instead of reading as failing.
+        #[tokio::test]
+        async fn an_enable_older_than_the_prune_window_ages_out_of_the_view() {
+            let store = FakeStore::new(&World::new(vec![]).cf_caught_up());
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, _) = cookie_for(&state, "admin-sub");
+            let old = (session::now_epoch() as u64 - 32 * 86_400) * 1_000_000;
+            let uri = format!(
+                "/lb/clients/effect?op=enabled.acme.{old}&at={}",
+                session::now_epoch()
+            );
+            let resp = app(state.clone())
+                .oneshot(
+                    HttpRequest::get(&uri)
+                        .header(header::COOKIE, cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(resp.headers().get(header::REFRESH).is_none());
+            assert!(body_string(resp).await.contains("Nothing to confirm"));
+        }
+
+        /// `at` rides the URL: a future one, or one that would overflow the
+        /// subtraction, never keeps a page refreshing.
+        #[tokio::test]
+        async fn the_refresh_window_is_bounded_whatever_the_url_says() {
+            let store = FakeStore::new(&World::new(vec![]));
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, _) = cookie_for(&state, "admin-sub");
+            let future = session::now_epoch() + 86_400;
+            for at in [future.to_string(), i64::MIN.to_string()] {
+                let uri = format!("/lb/clients/effect?op=disabled.zzz.1&at={at}");
+                let resp = app(state.clone())
+                    .oneshot(
+                        HttpRequest::get(&uri)
+                            .header(header::COOKIE, cookie.clone())
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{at}");
+                assert!(resp.headers().get(header::REFRESH).is_none(), "{at}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_failed_unmatched_names_read_and_a_store_naming_no_stacks_are_warned() {
+            let mut world = World::new(vec![("acme", RecordState::Disabled, T0)]);
+            world.stacks = vec![];
+            let store = FakeStore::new(&world);
+            let metrics = FakeMetrics::default();
+            metrics
+                .failing
+                .lock()
+                .unwrap()
+                .push("anthropic_client_store_unmatched_disabled_name".into());
+            let state = store_state(&store, &metrics, &["admin-sub"]).await;
+            let (cookie, _) = cookie_for(&state, "admin-sub");
+            let (_, html) = get_page(&state, &cookie, "/lb/clients").await;
+            assert!(html.contains("a mistyped disable is not flagged"), "{html}");
+            assert!(html.contains("named no stacks"), "{html}");
+            let (_, html) = get_page(
+                &state,
+                &cookie,
+                &format!("/lb/clients/effect?op=disabled.acme.{T0}&at=0"),
+            )
+            .await;
+            assert!(
+                html.contains("named no stacks, so nothing can be confirmed"),
+                "{html}"
+            );
+            assert!(!html.contains(">in effect<"), "{html}");
+        }
+
+        #[tokio::test]
+        async fn a_refusal_before_sending_is_on_the_write_log_too() {
+            let store = FakeStore::new(&World::new(vec![]));
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let buf = testlog::LogBuf::default();
+            let _guard = buf.capture();
+            post_form(
+                &state,
+                &cookie,
+                "/lb/clients/restrict",
+                form(&[
+                    ("csrf", &csrf),
+                    ("action", "disable"),
+                    ("name", "Bad Name"),
+                    ("reason", "x"),
+                ]),
+            )
+            .await;
+            post_form(
+                &state,
+                &cookie,
+                "/lb/clients/restrict",
+                form(&[
+                    ("csrf", "wrong"),
+                    ("action", "disable"),
+                    ("name", "acme"),
+                    ("reason", "x"),
+                ]),
+            )
+            .await;
+            let logged = buf.text();
+            assert_eq!(
+                logged
+                    .matches("client-store write refused before sending")
+                    .count(),
+                2,
+                "{logged}"
+            );
+            assert!(
+                logged.contains("CSRF token mismatch") && logged.contains("sub=\"admin-sub\""),
+                "{logged}"
+            );
+            assert!(store.requests().is_empty());
+        }
+
+        #[tokio::test]
+        async fn the_module_reports_itself_unconfigured() {
+            let state = test_state_with_lb();
+            let sess = session::new_session("admin-sub".into(), None, None);
+            let (_, html) =
+                get_page(&state, &session_cookie_header(&state, &sess), "/lb/clients").await;
+            assert!(html.contains("module not configured"), "{html}");
+        }
     }
 }

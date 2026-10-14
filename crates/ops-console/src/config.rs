@@ -36,6 +36,8 @@ pub struct Config {
     pub lb: Option<LbConfig>,
     /// selecta read-only pane; `None` = module disabled.
     pub selecta: Option<SelectaConfig>,
+    /// Client-store module (LB client management); `None` = module disabled.
+    pub store: Option<StoreConfig>,
 }
 
 /// anthropic-lb read-only module. Optional as a GROUP: a
@@ -130,6 +132,95 @@ impl SelectaConfig {
     }
 }
 
+/// Client-store module: managing the LB's clients through the client
+/// store's admin API. Optional as a GROUP, for the same deploy-ordering
+/// reason as `LbConfig`: both set → enabled, neither → the page reads "not
+/// configured", one alone refuses startup.
+///
+/// It also needs the anthropic-lb module. The console confirms every write
+/// per instance from the metrics store, so a module that could write but
+/// never read that state would show every write as unconfirmed, forever.
+pub struct StoreConfig {
+    /// The store's origin. Every request goes to `{url}/_clients/admin`, the
+    /// only path the writer token opens, so the URL may carry no path.
+    pub url: url::Url,
+    /// The store's writer token, sent server-side as `Authorization: Bearer`.
+    /// Never reaches the browser and is never logged.
+    pub token: String,
+    /// Where the console serves its committed-version labels to the metrics
+    /// scraper: a listener of its own, so the labels never share the port
+    /// that serves the session-gated pages.
+    pub metrics_addr: String,
+}
+
+/// The shortest writer token the console accepts. The store's README mints
+/// 43 characters; anything under 32 is a placeholder, not a credential, and
+/// refusing it at boot beats a 401 on the first write.
+const MIN_STORE_TOKEN_CHARS: usize = 32;
+
+impl StoreConfig {
+    pub fn from_parts(
+        url: Option<String>,
+        token: Option<String>,
+        metrics_addr: Option<String>,
+        lb_configured: bool,
+    ) -> Result<Option<Self>, String> {
+        match (url, token) {
+            (None, None) => Ok(None),
+            (Some(u), Some(t)) => {
+                if !lb_configured {
+                    return Err("the client-store module needs the anthropic-lb module too \
+                        (LB_URL, LB_API_KEY, METRICS_URL): every write is confirmed from the \
+                        metrics store"
+                        .into());
+                }
+                let url = parse_upstream("CLIENT_STORE_URL", &u)?;
+                // reqwest turns URL userinfo into a Basic Authorization header,
+                // which would collide with the bearer the store reads.
+                reject_userinfo("CLIENT_STORE_URL", &url)?;
+                if url.path() != "/" {
+                    return Err(
+                        "CLIENT_STORE_URL must be an origin with no path: the console \
+                        appends /_clients/admin itself"
+                            .into(),
+                    );
+                }
+                // The store reads `Bearer <token>` with the token as printable
+                // ASCII and no space; anything else is a 401 at the first write.
+                if t.chars().count() < MIN_STORE_TOKEN_CHARS
+                    || !t.bytes().all(|b| b.is_ascii_graphic())
+                {
+                    return Err(format!(
+                        "CLIENT_STORE_TOKEN must be at least {MIN_STORE_TOKEN_CHARS} printable \
+                         ASCII characters with no space"
+                    ));
+                }
+                // Parsed here, not first at bind time, so a typo refuses
+                // startup with the variable named, like every other value.
+                let metrics_addr = metrics_addr.unwrap_or_else(|| "0.0.0.0:9102".to_string());
+                if metrics_addr.parse::<std::net::SocketAddr>().is_err() {
+                    return Err(format!(
+                        "CONSOLE_METRICS_ADDR must be an ip:port listen address (got {metrics_addr:?})"
+                    ));
+                }
+                Ok(Some(StoreConfig {
+                    url,
+                    token: t,
+                    metrics_addr,
+                }))
+            }
+            (u, _) => Err(format!(
+                "client-store module is half-configured — set both CLIENT_STORE_URL and CLIENT_STORE_TOKEN or neither (missing: {})",
+                if u.is_none() {
+                    "CLIENT_STORE_URL"
+                } else {
+                    "CLIENT_STORE_TOKEN"
+                }
+            )),
+        }
+    }
+}
+
 // Never derive Debug for Config — it holds credentials. Upstream URLs render
 // as origin only: userinfo and query strings can carry more.
 impl fmt::Debug for Config {
@@ -149,6 +240,10 @@ impl fmt::Debug for Config {
             .field(
                 "selecta_url",
                 &self.selecta.as_ref().map(|s| origin_of(&s.url)),
+            )
+            .field(
+                "client_store_url",
+                &self.store.as_ref().map(|s| origin_of(&s.url)),
             )
             .finish_non_exhaustive()
     }
@@ -416,6 +511,12 @@ impl Config {
         // `format!("{}{path}", base.as_str()…)`, so the same gate applies.
         let alaya_url = parse_upstream("ALAYA_URL", &required("ALAYA_URL")?)?;
 
+        let lb = LbConfig::from_parts(
+            optional("LB_URL"),
+            optional("LB_API_KEY"),
+            optional("METRICS_URL"),
+        )?;
+
         Ok(Config {
             listen_addr: std::env::var("CONSOLE_LISTEN_ADDR")
                 .unwrap_or_else(|_| "0.0.0.0:3002".to_string()),
@@ -427,15 +528,17 @@ impl Config {
             session_secret,
             alaya_url,
             alaya_api_key: required("ALAYA_API_KEY")?,
-            lb: LbConfig::from_parts(
-                optional("LB_URL"),
-                optional("LB_API_KEY"),
-                optional("METRICS_URL"),
-            )?,
             selecta: SelectaConfig::from_parts(
                 optional("SELECTA_URL"),
                 optional("SELECTA_API_KEY"),
             )?,
+            store: StoreConfig::from_parts(
+                optional("CLIENT_STORE_URL"),
+                optional("CLIENT_STORE_TOKEN"),
+                optional("CONSOLE_METRICS_ADDR"),
+                lb.is_some(),
+            )?,
+            lb,
         })
     }
 }
@@ -619,12 +722,19 @@ mod tests {
                 url: "http://selecta.test:8080".parse().unwrap(),
                 api_key: "SELECTA_KEY_VALUE".into(),
             }),
+            store: Some(StoreConfig {
+                url: "https://store.test".parse().unwrap(),
+                token: "STORE_TOKEN_VALUE".into(),
+                metrics_addr: "0.0.0.0:9102".into(),
+            }),
         };
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("SECRET_VALUE"));
         assert!(!dbg.contains("BEARER_VALUE"));
         assert!(!dbg.contains("LB_KEY_VALUE"));
         assert!(!dbg.contains("SELECTA_KEY_VALUE"), "{dbg}");
+        assert!(!dbg.contains("STORE_TOKEN_VALUE"), "{dbg}");
+        assert!(dbg.contains("store.test"), "{dbg}");
         assert!(dbg.contains("selecta.test:8080"), "{dbg}");
         assert!(!dbg.contains("URL_USERINFO_VALUE"), "{dbg}");
         assert!(!dbg.contains("URL_QUERY_VALUE"), "{dbg}");
@@ -704,5 +814,67 @@ mod tests {
         );
         assert!(SelectaConfig::from_parts(Some("http://selecta:8080?x=1".into()), k()).is_err());
         assert!(SelectaConfig::from_parts(Some("not a url".into()), k()).is_err());
+    }
+
+    #[test]
+    fn store_config_is_all_or_nothing_and_needs_the_lb_module() {
+        let u = || Some("https://store.test".to_string());
+        let t = || Some("t".repeat(43));
+        // `.err()`: StoreConfig has no Debug impl — it holds the writer token.
+        let refused = |r: Result<Option<StoreConfig>, String>| r.err().expect("must refuse");
+        assert!(
+            StoreConfig::from_parts(None, None, None, false)
+                .unwrap()
+                .is_none()
+        );
+        let on = StoreConfig::from_parts(u(), t(), None, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(on.metrics_addr, "0.0.0.0:9102");
+        let err = refused(StoreConfig::from_parts(u(), None, None, true));
+        assert!(err.ends_with("(missing: CLIENT_STORE_TOKEN)"), "{err}");
+        let err = refused(StoreConfig::from_parts(None, t(), None, true));
+        assert!(err.ends_with("(missing: CLIENT_STORE_URL)"), "{err}");
+        // A store module with no metrics store could write but never confirm.
+        let err = refused(StoreConfig::from_parts(u(), t(), None, false));
+        assert!(err.contains("needs the anthropic-lb module"), "{err}");
+        // The console appends the admin path itself, and the store answers
+        // only that exact path.
+        let err = refused(StoreConfig::from_parts(
+            Some("https://store.test/_clients/admin".into()),
+            t(),
+            None,
+            true,
+        ));
+        assert!(err.contains("no path"), "{err}");
+        // Userinfo would become a Basic header beside the bearer; the refusal
+        // never echoes the credential.
+        let err = refused(StoreConfig::from_parts(
+            Some("https://ops:hunter2@store.test".into()),
+            t(),
+            None,
+            true,
+        ));
+        assert!(
+            err.contains("userinfo") && !err.contains("hunter2"),
+            "{err}"
+        );
+        // Plaintext only in-cluster, as for every other upstream.
+        assert!(
+            StoreConfig::from_parts(Some("http://store.example.com".into()), t(), None, true)
+                .is_err()
+        );
+        // A placeholder or a token the store's header grammar refuses.
+        assert!(StoreConfig::from_parts(u(), Some("short".into()), None, true).is_err());
+        let spaced = Some(format!("{} {}", "t".repeat(20), "t".repeat(20)));
+        assert!(StoreConfig::from_parts(u(), spaced, None, true).is_err());
+        let addr = StoreConfig::from_parts(u(), t(), Some("127.0.0.1:9999".into()), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(addr.metrics_addr, "127.0.0.1:9999");
+        // A listen address that cannot bind refuses startup with its name,
+        // not a panic after the main listener is up.
+        let err = refused(StoreConfig::from_parts(u(), t(), Some("9102".into()), true));
+        assert!(err.starts_with("CONSOLE_METRICS_ADDR"), "{err}");
     }
 }

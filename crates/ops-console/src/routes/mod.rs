@@ -1,5 +1,6 @@
 pub mod alaya;
 pub mod auth;
+pub mod clients;
 pub mod health;
 pub mod home;
 pub mod lb;

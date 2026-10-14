@@ -8,10 +8,12 @@ use axum_extra::extract::cookie::Key;
 use sha2::Digest;
 
 use crate::alaya::AlayaClient;
+use crate::committed::Committed;
 use crate::config::Config;
 use crate::lb::{LbClient, MetricsClient};
 use crate::oidc::OidcRp;
 use crate::selecta::SelectaClient;
+use crate::store::StoreClient;
 
 /// anthropic-lb monitoring module upstreams, present only when the module
 /// is configured — see `LbConfig`. One value, not two `Option`s: the
@@ -22,11 +24,23 @@ pub struct LbModule {
     pub metrics: MetricsClient,
 }
 
+/// Client-store module, present only when configured — see `StoreConfig`.
+/// It carries a handle on the metrics store, which its config requires, so no
+/// handler has to reach into the LB module and assume it is there.
+#[derive(Clone)]
+pub struct StoreModule {
+    pub client: StoreClient,
+    pub metrics: MetricsClient,
+    pub committed: Arc<Committed>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub alaya: AlayaClient,
     pub lb: Option<LbModule>,
+    /// Client-store module; `None` = module not configured.
+    pub store: Option<StoreModule>,
     /// selecta read-only pane; `None` = module not configured.
     pub selecta: Option<SelectaClient>,
     pub oidc: Arc<OidcRp>,
@@ -71,6 +85,17 @@ impl AppState {
             .selecta
             .as_ref()
             .map(|c| SelectaClient::new(c.url.clone(), c.api_key.clone()));
+        // The store module reads the same metrics store as the LB module,
+        // through the same client: its config requires that module.
+        let store = config
+            .store
+            .as_ref()
+            .zip(lb.as_ref())
+            .map(|(s, l)| StoreModule {
+                client: StoreClient::new(s.url.clone(), s.token.clone()),
+                metrics: l.metrics.clone(),
+                committed: Arc::new(Committed::default()),
+            });
         let oidc = Arc::new(OidcRp::new(
             config.oidc_issuer.clone(),
             config.oidc_client_id.clone(),
@@ -81,6 +106,7 @@ impl AppState {
             config,
             alaya,
             lb,
+            store,
             selecta,
             oidc,
             key,
