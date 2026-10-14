@@ -558,8 +558,17 @@ fn window_holds(missing: usize, valid: usize) -> bool {
     missing > GRAPH_SWEEP_HOLD_FLOOR || (missing > 0 && missing == valid)
 }
 
-/// A held graph sweep: nothing on the held page was written.
+/// Why a graph sweep held: its window, or the call's deletion allowance.
+#[derive(Clone, Copy)]
+enum SweepHold {
+    Window,
+    CallCap,
+}
+
+/// A held graph sweep: nothing on the held page was written. `valid` and
+/// `missing` are always the window's own counts, whatever held it.
 fn sweep_held(
+    reason: SweepHold,
     held_after: &str,
     scanned: usize,
     swept: usize,
@@ -567,18 +576,26 @@ fn sweep_held(
     valid: usize,
     missing: usize,
 ) -> Value {
-    tracing::warn!(
-        missing,
-        valid,
-        swept,
-        "graph sweep held: too many nodes without a point"
-    );
+    let (reason, error) = match reason {
+        SweepHold::Window => (
+            "window",
+            "Too many graph nodes in this window have no Qdrant point, or none has \
+             one; nothing on the held page was written. Check QDRANT_COLLECTION, then \
+             remove confirmed strays with POST /delete",
+        ),
+        SweepHold::CallCap => (
+            "call_cap",
+            "This call has used its graph node deletion allowance; nothing on the \
+             held page was written. Confirm QDRANT_COLLECTION, then resume from \
+             held_after",
+        ),
+    };
+    tracing::warn!(reason, missing, valid, swept, "graph sweep held");
     serde_json::json!({
         "success": false,
         "status": "held",
-        "error": "Graph nodes without a Qdrant point exceed what one call removes, or \
-                  close the graph; nothing on the held page was written. Check \
-                  QDRANT_COLLECTION, then remove confirmed strays with POST /delete",
+        "reason": reason,
+        "error": error,
         "scanned": scanned,
         "swept": swept,
         "skipped": skipped,
@@ -2730,7 +2747,8 @@ impl MemoryService {
     /// gone nodes would take it past that holds before any write on it, so
     /// misses spread a few per window cannot add up within one call. Each
     /// resumed call has the same allowance again; a `held` answer is where
-    /// to stop and check the collection. Sparse absence of up to the floor
+    /// to stop and check the collection, and a `call_cap` hold resumes from
+    /// `held_after` once it is confirmed. Sparse absence of up to the floor
     /// per call looks exactly like real strays, so do not sweep after a
     /// restore until the collection is reconciled. A caller who hand-crafts
     /// `after` is outside the window bound; such a caller can call
@@ -2738,7 +2756,7 @@ impl MemoryService {
     /// than the floor within one window, or, when a page starts among them,
     /// the last few in the graph with nothing live after them) are left for
     /// `delete_memory`, whose graph removal is best-effort. A held call answers `status: held`, `success: false`,
-    /// with the window's counts. Otherwise it returns `{scanned, swept,
+    /// a `reason` (`window` or `call_cap`) and the window's counts. Otherwise it returns `{scanned, swept,
     /// skipped, next_after}`; pass `next_after` back until it is `null`.
     #[tracing::instrument(skip_all, fields(limit))]
     pub async fn sweep_gone_memory_nodes(
@@ -2772,31 +2790,29 @@ impl MemoryService {
                 break;
             };
             let (window_valid, window_missing) = self.missing_points(&window).await?;
-            if window_holds(window_missing.len(), window_valid) {
-                return Ok(sweep_held(
+            let held = |reason| {
+                sweep_held(
+                    reason,
                     &after,
                     scanned,
                     swept,
                     skipped,
                     window_valid,
                     window_missing.len(),
-                ));
+                )
+            };
+            if window_holds(window_missing.len(), window_valid) {
+                return Ok(held(SweepHold::Window));
             }
             // Hash order: the page is the window's prefix up to `last`.
             let missing: Vec<&str> = window_missing
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|h| *h <= last.as_str())
                 .collect();
             // The per-call allowance, counted on candidates before any write.
             if candidates + missing.len() > GRAPH_SWEEP_HOLD_FLOOR {
-                return Ok(sweep_held(
-                    &after,
-                    scanned,
-                    swept,
-                    skipped,
-                    window_valid,
-                    missing.len(),
-                ));
+                return Ok(held(SweepHold::CallCap));
             }
             candidates += missing.len();
             let page_valid = page
@@ -14557,6 +14573,7 @@ mod tests {
         let out = svc.sweep_gone_memory_nodes("", 100, "run-1").await.unwrap();
         assert_eq!(out["success"], false, "{out}");
         assert_eq!(out["status"], "held");
+        assert_eq!(out["reason"], "window");
         assert_eq!(out["window_missing"], 4);
         assert_eq!(out["window_valid"], 10);
         assert_eq!(out["swept"], 0);
@@ -14618,9 +14635,49 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(out["status"], "held", "limit={limit}: {out}");
+            assert_eq!(out["reason"], "call_cap", "limit={limit}: {out}");
             assert_eq!(out["swept"], 3, "limit={limit}: {out}");
             assert_eq!(ledger.nodes.borrow().len(), 4997);
         }
+    }
+
+    /// A cap hold reports the window's own counts, not the held page's, and
+    /// says it was the cap: a one-node page holding on its single gone node
+    /// still shows the window's three. Resuming from `held_after` gets the
+    /// next call's allowance and sweeps on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn graph_sweep_cap_hold_reports_its_window_and_resumes_from_held_after() {
+        let hashes: Vec<String> = (0..1000u32).map(|i| format!("{i:064x}")).collect();
+        let (mut live, mut gone) = (Vec::new(), Vec::new());
+        for (i, x) in hashes.iter().enumerate() {
+            if i % 500 < 3 {
+                gone.push(x.as_str())
+            } else {
+                live.push(x.as_str())
+            }
+        }
+        let ledger = sweep_ledger(&live, &gone);
+        let svc = ledger.service();
+
+        let out = svc.sweep_gone_memory_nodes("", 501, "run-1").await.unwrap();
+        assert_eq!(out["status"], "held", "{out}");
+        assert_eq!(out["reason"], "call_cap");
+        assert_eq!(out["swept"], 3);
+        assert_eq!(out["held_after"], hashes[499]);
+        assert_eq!(out["window_valid"], 500);
+        assert_eq!(
+            out["window_missing"], 3,
+            "the window's count, not the page's 1"
+        );
+
+        let resumed = svc
+            .sweep_gone_memory_nodes(out["held_after"].as_str().unwrap(), 5000, "run-2")
+            .await
+            .unwrap();
+        assert_eq!(resumed["success"], true, "{resumed}");
+        assert_eq!(resumed["swept"], 3);
+        assert_eq!(resumed["next_after"], Value::Null);
+        assert_eq!(ledger.nodes.borrow().len(), 994);
     }
 
     /// Against an empty or wrong collection, no `limit` or `after` gets a
