@@ -8,13 +8,14 @@
 //! from minting a second key.
 //!
 //! What the metrics store may decide here, and nothing more: an instance
-//! reporting the store behind or edited puts a typed confirmation in front of
-//! every document write, and a `restore` is refused unless the target row
-//! checks out against the (version, digest) pairs instances installed in the
-//! last 30 days, or the operator types its version where it cannot be
-//! checked. A metrics store that cannot answer refuses a `restore` and holds
-//! up nothing else. Both checks run again at commit: a preview is never
-//! trusted to still be true.
+//! reporting the store behind or edited, or a signal that cannot be told,
+//! puts a typed confirmation in front of every document write; and a
+//! `restore` goes only if its row checks out against the (version, digest)
+//! pairs instances installed in the last 30 days, or is too old for that
+//! record and the operator types its version. A metrics store that cannot
+//! answer refuses a `restore`, and asks for the typed confirmation on every
+//! other document write, which then goes. Both checks run again at commit: a
+//! preview is never trusted to still be true.
 //!
 //! A minted key exists only in the commit's answer. It is rendered once, on a
 //! page sent `Cache-Control: no-store`, and never logged, never put in the
