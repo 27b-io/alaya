@@ -226,8 +226,17 @@ def fetch_memories(url: str, key: str, hashes: list[str]) -> dict[str, str]:
             f"{url.rstrip('/')}/memories/{h}",
             headers={"authorization": f"Bearer {key}"},
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            env_ = json.loads(resp.read())
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                env_ = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if (
+                e.code != 404
+            ):  # a deleted memory is a 404; anything else is a broken run
+                sys.exit(f"fetching memory {h}: HTTP {e.code}")
+            env_ = {}
+        except (OSError, ValueError) as e:
+            sys.exit(f"fetching memory {h}: {type(e).__name__}: {e}")
         mem = env_.get("memory") if env_.get("found") else None
         if mem and mem.get("content"):
             out[h] = mem["content"]
