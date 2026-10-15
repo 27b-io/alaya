@@ -11,8 +11,12 @@
 //! Every chart is one `role="img"` element whose `aria-label` states its
 //! numbers, each mark carries a native `<title>` tooltip, and the numbers
 //! are printed beside the marks too, in a readout, a legend or axis ticks.
+//! Where a summary cannot hold every figure, in the daily bars and the
+//! sparkline, a visually hidden table outside the image gives them all: a
+//! tooltip needs a pointer, and a table a screen reader can step through.
 //! A value that is missing (`None`), not finite or negative is "no data",
-//! drawn as such and never as a zero; a zero is drawn as a zero.
+//! drawn as such and never as a zero; a zero is drawn as a zero. So is a
+//! total or a share that overflows `f64`.
 //!
 //! No page draws a chart yet; the pages adopt them in their own changes.
 //! Until then only the tests and the snapshot gallery use this module, and
@@ -60,6 +64,11 @@ impl Colour {
     ];
     /// What is not a series of its own, such as "other" or "none".
     pub const OTHER: Colour = Colour("fill-muted-foreground");
+    /// A meter past its warning threshold: a fixed status colour, the same
+    /// in both themes.
+    pub const WARN: Colour = Colour("fill-chart-warn");
+    /// A meter past its critical threshold.
+    pub const CRIT: Colour = Colour("fill-chart-crit");
 }
 
 /// One named value: a segment of a `StackedBar`, a row of an `HBarList`.
@@ -96,6 +105,11 @@ impl Series {
             colour,
         }
     }
+
+    /// The value at slot `i`, known or not; past the end there is no data.
+    fn at(&self, i: usize) -> Option<f64> {
+        known(self.values.get(i).copied().flatten())
+    }
 }
 
 // ─── Values, scales and labels ──────────────────────────────────────────────
@@ -107,7 +121,11 @@ fn known(v: Option<f64>) -> Option<f64> {
 }
 
 /// A count with thousands separators, `18,342`: the charts' default format.
+/// A count above zero but under one prints `<1`, never a fictitious `0`.
 pub fn fmt_count(v: f64) -> String {
+    if v > 0.0 && v < 1.0 {
+        return "<1".to_string();
+    }
     let rounded = format!("{v:.0}");
     let (sign, digits) = match rounded.strip_prefix('-') {
         Some(d) => ("-", d),
@@ -124,22 +142,31 @@ pub fn fmt_count(v: f64) -> String {
 }
 
 /// An axis tick, compact (`750`, `1.5K`, `2.25M`) to fit beside the plot,
-/// and exact for the round values a `Scale` picks.
-fn fmt_tick(v: f64) -> String {
-    let (n, unit) = [(1e9, "B"), (1e6, "M"), (1e3, "K")]
+/// with as many decimals as its axis `step` needs in the tick's unit, so no
+/// two ticks print alike.
+fn fmt_tick(v: f64, step: f64) -> String {
+    let (base, unit) = [(1e9, "B"), (1e6, "M"), (1e3, "K")]
         .into_iter()
         .find(|(base, _)| v >= *base)
-        .map_or((v, ""), |(base, unit)| (v / base, unit));
-    let fixed = format!("{n:.2}");
-    let trimmed = fixed.trim_end_matches('0').trim_end_matches('.');
+        .unwrap_or((1.0, ""));
+    // A step of 1, 2 or 5 times 10^-k needs k decimals.
+    let decimals = (-(step / base).log10().floor()).clamp(0.0, 15.0) as usize;
+    let fixed = format!("{:.*}", decimals, v / base);
+    let trimmed = match fixed.contains('.') {
+        true => fixed.trim_end_matches('0').trim_end_matches('.'),
+        false => fixed.as_str(),
+    };
     format!("{trimmed}{unit}")
 }
 
-/// A share as a whole percentage, where a share above zero never rounds
-/// down to a fictitious `0%`.
+/// A share as a whole percentage that never rounds to a fictitious end: a
+/// share above zero never prints `0%`, and one short of the whole never
+/// `100%`.
 fn fmt_share(share: f64) -> String {
     if share > 0.0 && share < 0.005 {
         "<1%".to_string()
+    } else if (0.995..1.0).contains(&share) {
+        ">99%".to_string()
     } else {
         format!("{:.0}%", share * 100.0)
     }
@@ -195,6 +222,11 @@ fn scale(max: f64, whole: bool) -> Scale {
     // Shaved before the ceiling, so float noise never adds an empty step.
     let intervals = (max / step * (1.0 - 1e-12)).ceil().max(1.0) as u32;
     Scale { step, intervals }
+}
+
+/// A value as printed: its figure, or "no data".
+fn figure(v: Option<f64>, fmt: fn(f64) -> String) -> String {
+    known(v).map_or_else(|| "no data".to_string(), fmt)
 }
 
 /// What a chart with nothing to draw shows instead: said in words, so a
@@ -283,7 +315,9 @@ pub fn Meter(
     });
     let share = used
         .zip(known(limit).filter(|l| *l > 0.0))
-        .map(|(u, l)| u / l);
+        .map(|(u, l)| u / l)
+        // A share past f64's range is no share either.
+        .filter(|s| s.is_finite());
     let Some(share) = share else {
         let text = figures.map_or_else(|| "no data".to_string(), |f| format!("{f} · no data"));
         let summary = format!("{label}: {text}");
@@ -297,9 +331,9 @@ pub fn Meter(
 
     let percent = fmt_share(share);
     let (fill, state) = match level(share, warn, crit) {
-        Level::Ok => ("fill-chart-1", ""),
-        Level::Warn => ("fill-chart-warn", ", warning"),
-        Level::Crit => ("fill-chart-crit", ", critical"),
+        Level::Ok => (Colour::SERIES[0], ""),
+        Level::Warn => (Colour::WARN, ", warning"),
+        Level::Crit => (Colour::CRIT, ", critical"),
     };
     let summary = match &figures {
         Some(f) => format!("{label}: {f}, {percent}{state}"),
@@ -308,13 +342,14 @@ pub fn Meter(
     let tip = summary.clone();
     let filled = (share > 0.0).then(|| {
         let width = pct(share.min(1.0));
-        view! { <rect width=width height="100%" rx="4" class=fill /> }
+        view! { <rect width=width height="100%" rx="4" class=fill.0 /> }
     });
     let ticks = [warn, crit]
         .into_iter()
         .filter(|t| *t > 0.0 && *t < 1.0)
         .map(|t| {
-            let (x1, x2) = (pct(t), pct(t));
+            let x1 = pct(t);
+            let x2 = x1.clone();
             view! { <line x1=x1 x2=x2 y1="0" y2="100%" stroke-width="1" class="stroke-muted-foreground" /> }
         })
         .collect_view();
@@ -338,10 +373,14 @@ pub fn Meter(
 // ─── StackedBar ─────────────────────────────────────────────────────────────
 
 /// Each part above zero as (part, start, width), both shares of the whole;
-/// `None` while any part is unknown, since the whole is then unknown too.
+/// `None` while any part is unknown, since the whole is then unknown too,
+/// and when the parts sum past `f64`'s range.
 fn shares(values: &[Option<f64>]) -> Option<Vec<(usize, f64, f64)>> {
     let values: Vec<f64> = values.iter().map(|v| known(*v)).collect::<Option<_>>()?;
     let total: f64 = values.iter().sum();
+    if !total.is_finite() {
+        return None;
+    }
     let mut start = 0.0;
     Some(
         values
@@ -466,16 +505,17 @@ enum Column {
 /// is its value's share of the axis; each segment above the lowest gives its
 /// bottom 2px to the gap, so the stack's top stays exact, and a segment too
 /// short to show past its gap is left out of the drawing (not the tooltip).
+/// A stack that sums past `f64`'s range has no known total either.
 fn columns(n: usize, series: &[Series], top: f64) -> Vec<Column> {
     (0..n)
         .map(|i| {
-            let values: Option<Vec<f64>> = series
-                .iter()
-                .map(|s| known(s.values.get(i).copied().flatten()))
-                .collect();
+            let values: Option<Vec<f64>> = series.iter().map(|s| s.at(i)).collect();
             let Some(values) = values else {
                 return Column::NoData;
             };
+            if !values.iter().sum::<f64>().is_finite() {
+                return Column::NoData;
+            }
             let mut base = BASELINE;
             let mut stack = Vec::new();
             for (j, v) in values.into_iter().enumerate() {
@@ -535,8 +575,9 @@ pub fn BarSeries(
         .map(|i| {
             series
                 .iter()
-                .map(|s| known(s.values.get(i).copied().flatten()))
-                .sum()
+                .map(|s| s.at(i))
+                .sum::<Option<f64>>()
+                .filter(|t| t.is_finite())
         })
         .collect();
     if series.is_empty() || totals.iter().all(Option::is_none) {
@@ -550,12 +591,18 @@ pub fn BarSeries(
     let max = totals.iter().flatten().copied().fold(0.0, f64::max);
     let axis = scale(max, whole);
     let (top, intervals) = (axis.top(), axis.intervals);
+    if !top.is_finite() {
+        return no_data(&label);
+    }
 
     // On the pixel grid, so each 1px hairline stays one pixel.
     let tick_y = |i: u32| (PLOT_TOP + PLOT_H * (1.0 - f64::from(i) / f64::from(intervals))).round();
     let tick_labels = (0..=intervals)
         .map(|i| {
-            let (y, text) = (format!("{:.1}", tick_y(i)), fmt_tick(axis.step * f64::from(i)));
+            let (y, text) = (
+                format!("{:.1}", tick_y(i)),
+                fmt_tick(axis.step * f64::from(i), axis.step),
+            );
             view! {
                 <text x="34" y=y text-anchor="end" dominant-baseline="middle" class="fill-muted-foreground text-[11px] tabular-nums">
                     {text}
@@ -565,23 +612,20 @@ pub fn BarSeries(
         .collect_view();
     let gridlines = (1..=intervals)
         .map(|i| {
-            let (y1, y2) = (
-                format!("{:.1}", tick_y(i) + 0.5),
-                format!("{:.1}", tick_y(i) + 0.5),
-            );
+            let y1 = format!("{:.1}", tick_y(i) + 0.5);
+            let y2 = y1.clone();
             view! { <line x1="0" x2="100%" y1=y1 y2=y2 stroke-width="1" class="stroke-border" /> }
         })
         .collect_view();
 
     let slot = 1.0 / n as f64;
-    let figure = |v: Option<f64>| known(v).map_or_else(|| "no data".to_string(), fmt);
     let bars = columns(n, &series, top)
         .into_iter()
         .enumerate()
         .map(|(i, column)| {
             let figures = series
                 .iter()
-                .map(|s| format!("{} {}", s.label, figure(s.values.get(i).copied().flatten())))
+                .map(|s| format!("{} {}", s.label, figure(s.at(i), fmt)))
                 .collect::<Vec<_>>()
                 .join(", ");
             let slot_tip = match totals[i] {
@@ -605,12 +649,8 @@ pub fn BarSeries(
                             .enumerate()
                             .map(|(k, (j, y, h))| {
                                 let s = &series[j];
-                                let tip = format!(
-                                    "{}: {} {}",
-                                    x[i],
-                                    s.label,
-                                    figure(s.values.get(i).copied().flatten())
-                                );
+                                let tip =
+                                    format!("{}: {} {}", x[i], s.label, figure(s.at(i), fmt));
                                 segment(y, h, s.colour, k == last, tip)
                             })
                             .collect_view(),
@@ -676,19 +716,64 @@ pub fn BarSeries(
                 .collect(),
         )
     });
+    // Every figure, slot by slot, for a screen reader: outside the image,
+    // whose children it does not read. `sr-only` goes on a wrapper, never
+    // on the table: a table is never narrower than its content, so on the
+    // table itself it would widen the page.
+    let stacked = series.len() > 1;
+    let heads = series
+        .iter()
+        .map(|s| {
+            let name = s.label.clone();
+            view! { <th scope="col">{name}</th> }
+        })
+        .collect_view();
+    let rows = (0..n)
+        .map(|i| {
+            let slot = x[i].clone();
+            let cells = series
+                .iter()
+                .map(|s| {
+                    let f = figure(s.at(i), fmt);
+                    view! { <td>{f}</td> }
+                })
+                .collect_view();
+            let total = stacked.then(|| {
+                let t = figure(totals[i], fmt);
+                view! { <td>{t}</td> }
+            });
+            view! { <tr><th scope="row">{slot}</th>{cells}{total}</tr> }
+        })
+        .collect_view();
+    let caption = label.clone();
 
     view! {
-        <div role="img" aria-label=summary class="space-y-2 font-normal">
-            <div class="flex">
-                <svg class="h-36 w-10 shrink-0">{tick_labels}</svg>
-                <svg class="h-36 min-w-0 flex-1">
-                    {gridlines}
-                    <line x1="0" x2="100%" y1=baseline_y.clone() y2=baseline_y stroke-width="1" class="stroke-muted-foreground/50" />
-                    {bars}
-                    {x_labels}
-                </svg>
+        <div class="space-y-2 font-normal">
+            <div role="img" aria-label=summary class="space-y-2">
+                <div class="flex">
+                    <svg class="h-36 w-10 shrink-0">{tick_labels}</svg>
+                    <svg class="h-36 min-w-0 flex-1">
+                        {gridlines}
+                        <line x1="0" x2="100%" y1=baseline_y.clone() y2=baseline_y stroke-width="1" class="stroke-muted-foreground/50" />
+                        {bars}
+                        {x_labels}
+                    </svg>
+                </div>
+                {key}
             </div>
-            {key}
+            <div class="sr-only">
+                <table>
+                    <caption>{caption}</caption>
+                    <thead>
+                        <tr>
+                            <td></td>
+                            {heads}
+                            {stacked.then(|| view! { <th scope="col">"total"</th> })}
+                        </tr>
+                    </thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
         </div>
     }
     .into_any()
@@ -758,7 +843,6 @@ pub fn Sparkline(
             .cloned()
             .unwrap_or_else(|| format!("point {}", i + 1))
     };
-    let figure = |v: Option<f64>| known(v).map_or_else(|| "no data".to_string(), fmt);
     let found = runs.iter().flatten().map(|(_, v)| *v);
     let max = found.clone().fold(0.0, f64::max);
     let min = found.fold(f64::INFINITY, f64::min);
@@ -791,8 +875,9 @@ pub fn Sparkline(
             let (cx, cy) = (pct(spark_x(i, n)), format!("{:.2}", spark_y(v, top)));
             let tip = format!("{}: {}", point(i), fmt(v));
             if accent {
+                let class = format!("{} stroke-card", Colour::SERIES[0].0);
                 Either::Left(view! {
-                    <circle cx=cx cy=cy r="4" stroke-width="2" class="fill-chart-1 stroke-card"><title>{tip}</title></circle>
+                    <circle cx=cx cy=cy r="4" stroke-width="2" class=class><title>{tip}</title></circle>
                 })
             } else {
                 Either::Right(view! {
@@ -807,7 +892,7 @@ pub fn Sparkline(
             let half = if n <= 1 { 0.5 } else { 0.5 / (n - 1) as f64 };
             let from = (spark_x(i, n) - half).max(0.0);
             let to = (spark_x(i, n) + half).min(1.0);
-            let tip = format!("{}: {}", point(i), figure(values[i]));
+            let tip = format!("{}: {}", point(i), figure(values[i], fmt));
             view! {
                 <rect x=pct(from) width=pct(to - from) height="100%" class="fill-transparent">
                     <title>{tip}</title>
@@ -822,7 +907,7 @@ pub fn Sparkline(
     }
     summary.push_str(&format!(
         "; latest {}; highest {}; lowest {}",
-        figure(values.last().copied().flatten()),
+        figure(values.last().copied().flatten(), fmt),
         fmt(max),
         fmt(min)
     ));
@@ -830,18 +915,34 @@ pub fn Sparkline(
     if missing > 0 {
         summary.push_str(&format!("; no data for {missing}"));
     }
+    // Every point's figure, for a screen reader: outside the image.
+    let rows = (0..n)
+        .map(|i| {
+            let (at, value) = (point(i), figure(values[i], fmt));
+            view! { <tr><th scope="row">{at}</th><td>{value}</td></tr> }
+        })
+        .collect_view();
+    let caption = label.clone();
     let view_box = format!("0 0 100 {SPARK_H}");
     view! {
-        <div role="img" aria-label=summary class="mt-2">
-            <svg class="h-8 w-full overflow-visible">
-                {slices}
-                // Stretched across, never up: the viewBox's height is the
-                // SVG's, and the stroke ignores the stretch.
-                <svg width="100%" height="100%" viewBox=view_box preserveAspectRatio="none" pointer-events="none" class="overflow-visible">
-                    {lines}
+        <div class="mt-2">
+            <div role="img" aria-label=summary>
+                <svg class="h-8 w-full overflow-visible">
+                    {slices}
+                    // Stretched across, never up: the viewBox's height is the
+                    // SVG's, and the stroke ignores the stretch.
+                    <svg width="100%" height="100%" viewBox=view_box preserveAspectRatio="none" pointer-events="none" class="overflow-visible">
+                        {lines}
+                    </svg>
+                    {dots}
                 </svg>
-                {dots}
-            </svg>
+            </div>
+            <div class="sr-only">
+                <table>
+                    <caption>{caption}</caption>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
         </div>
     }
     .into_any()
@@ -868,21 +969,21 @@ pub fn HBarList(
         .iter()
         .filter_map(|r| known(r.value))
         .fold(0.0, f64::max);
-    let figure = |v: Option<f64>| known(v).map_or_else(|| "no data".to_string(), fmt);
     let summary = format!(
         "{label}: {}",
         rows.iter()
-            .map(|r| format!("{} {}", r.label, figure(r.value)))
+            .map(|r| format!("{} {}", r.label, figure(r.value, fmt)))
             .collect::<Vec<_>>()
             .join(", ")
     );
     let items = rows
         .into_iter()
         .map(|r| {
-            let value = figure(r.value);
+            let value = figure(r.value, fmt);
             let tip = format!("{}: {value}", r.label);
+            // A value above zero means the largest is too.
             let bar = known(r.value)
-                .filter(|v| *v > 0.0 && top > 0.0)
+                .filter(|v| *v > 0.0)
                 .map(|v| {
                     // Rounded at the value's end, square at the baseline.
                     let (whole, half) = (pct(v / top), pct(v / top / 2.0));
@@ -965,6 +1066,10 @@ mod tests {
     fn figures_are_written_in_full_and_ticks_compactly() {
         for (v, want) in [
             (0.0, "0"),
+            // Above zero is never printed as nothing.
+            (0.3, "<1"),
+            (0.5, "<1"),
+            (1.0, "1"),
             (999.0, "999"),
             (1000.0, "1,000"),
             (18342.0, "18,342"),
@@ -973,19 +1078,66 @@ mod tests {
         ] {
             assert_eq!(fmt_count(v), want, "{v}");
         }
-        for (v, want) in [
-            (0.0, "0"),
-            (0.25, "0.25"),
-            (150.0, "150"),
-            (1500.0, "1.5K"),
-            (2.25e6, "2.25M"),
-            (1e9, "1B"),
+        for (v, step, want) in [
+            (0.0, 50.0, "0"),
+            (150.0, 50.0, "150"),
+            (1000.0, 200.0, "1K"),
+            (1200.0, 200.0, "1.2K"),
+            (1500.0, 500.0, "1.5K"),
+            (4e5, 2e5, "400K"),
+            (1.2e6, 2e5, "1.2M"),
+            (2.5e7, 5e6, "25M"),
+            (1e9, 2e8, "1B"),
+            (0.25, 0.05, "0.25"),
+            (0.0015, 0.0005, "0.0015"),
         ] {
-            assert_eq!(fmt_tick(v), want, "{v}");
+            assert_eq!(fmt_tick(v, step), want, "{v} by {step}");
         }
-        // A sliver of a whole is never printed as nothing.
-        for (v, want) in [(0.0, "0%"), (0.004, "<1%"), (0.5, "50%"), (1.3, "130%")] {
+        // A share is never printed as nothing, nor as all of the whole when
+        // it falls short.
+        for (v, want) in [
+            (0.0, "0%"),
+            (0.004, "<1%"),
+            (0.5, "50%"),
+            (0.994, "99%"),
+            (0.995, ">99%"),
+            (0.999, ">99%"),
+            (1.0, "100%"),
+            (1.3, "130%"),
+        ] {
             assert_eq!(fmt_share(v), want, "{v}");
+        }
+    }
+
+    /// Each tick of an axis prints differently from its neighbours, whatever
+    /// the scale: a fractional step gets the decimals it needs.
+    #[test]
+    fn no_two_ticks_print_alike() {
+        let ticks = |max: f64, whole: bool| {
+            let axis = scale(max, whole);
+            (0..=axis.intervals)
+                .map(|i| fmt_tick(axis.step * f64::from(i), axis.step))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ticks(0.002, false),
+            ["0", "0.0005", "0.001", "0.0015", "0.002"]
+        );
+        assert_eq!(ticks(0.02, false), ["0", "0.005", "0.01", "0.015", "0.02"]);
+        let mut max = 3e-4;
+        while max < 5e9 {
+            for whole in [false, max >= 1.0] {
+                let printed = ticks(max, whole);
+                let mut distinct = printed.clone();
+                distinct.sort();
+                distinct.dedup();
+                assert_eq!(
+                    distinct.len(),
+                    printed.len(),
+                    "{max} ({whole}): {printed:?}"
+                );
+            }
+            max *= 1.37;
         }
     }
 
@@ -1133,6 +1285,21 @@ mod tests {
         assert!(over.contains("260 / 200, 130%, critical"), "{over}");
     }
 
+    /// One short of the limit is a warning, so it never prints "100%", the
+    /// share that critical prints at the limit.
+    #[test]
+    fn a_meter_one_short_of_its_limit_never_reads_full() {
+        let out = html(
+            view! { <Meter label="budget" used=Some(999.0) limit=Some(1000.0) fmt=fmt_count /> },
+        );
+        assert!(
+            out.contains(r#"<span class="ml-auto">&gt;99%</span>"#),
+            "{out}"
+        );
+        assert!(out.contains("999 / 1,000, &gt;99%, warning"), "{out}");
+        assert!(!out.contains(">100%<") && !out.contains(", 100%"), "{out}");
+    }
+
     /// Without a format the meter is a share already, such as utilisation,
     /// and prints the share alone; thresholds may be set per meter.
     #[test]
@@ -1187,6 +1354,36 @@ mod tests {
             out.contains(r#"aria-label="cap: 4 / — · no data""#),
             "{out}"
         );
+    }
+
+    /// Finite inputs whose sum or ratio overflows `f64` give no total or
+    /// share: no data, never a blank bar under an infinite total.
+    #[test]
+    fn totals_and_shares_past_f64_are_no_data() {
+        assert_eq!(shares(&[Some(1e308), Some(1e308)]), None);
+        let s = series(&[&[Some(1e308), Some(1.0)], &[Some(1e308), Some(1.0)]]);
+        assert_eq!(columns(2, &s, 2.0)[0], Column::NoData);
+        assert!(matches!(&columns(2, &s, 2.0)[1], Column::Bar(stack) if stack.len() == 2));
+
+        let parts = vec![
+            Part::new("a", Some(1e308), Colour::SERIES[0]),
+            Part::new("b", Some(1e308), Colour::SERIES[1]),
+        ];
+        let out = html(view! { <StackedBar label="Mix" parts=parts /> });
+        assert!(out.contains("the whole is unknown"), "{out}");
+        assert!(!out.contains("<svg x="), "{out}");
+        assert!(!out.contains("inf"), "{out}");
+
+        let out =
+            html(view! { <BarSeries label="Days" x=vec!["10-01".into()] series=s.clone() /> });
+        assert!(!out.contains("inf"), "{out}");
+        // An axis topped past f64's range: nothing can be drawn on it.
+        let huge = series(&[&[Some(1.7e308)]]);
+        let out = html(view! { <BarSeries label="Days" x=vec!["10-01".into()] series=huge /> });
+        assert!(out.contains(r#"aria-label="Days: no data""#), "{out}");
+
+        let out = html(view! { <Meter label="cap" used=Some(1e308) limit=Some(1e-300) /> });
+        assert!(out.contains(">no data</p>"), "{out}");
     }
 
     // ─── StackedBar ─────────────────────────────────────────────────────────
@@ -1305,6 +1502,70 @@ mod tests {
         );
         assert!(
             out.contains(r#"aria-label="Judged, 10-01 to 10-03: s0, s1; highest 90 on 10-01; no data on 1 of 3""#),
+            "{out}"
+        );
+    }
+
+    /// Every figure is in a table outside the image, where a screen reader
+    /// can step through the days; the image itself is the summary.
+    #[test]
+    fn bar_series_figures_are_a_table_outside_the_image() {
+        let s = series(&[
+            &[Some(30.0), Some(10.0), None],
+            &[Some(60.0), Some(0.0), Some(5.0)],
+        ]);
+        // Without the markers SSR puts between dynamic siblings.
+        let out =
+            html(view! { <BarSeries label="Judged" x=days(3) series=s /> }).replace("<!>", "");
+        assert!(
+            out.contains(r#"</div><div class="sr-only"><table><caption>Judged</caption>"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                r#"<th scope="col">s0</th><th scope="col">s1</th><th scope="col">total</th>"#
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"<tr><th scope="row">10-01</th><td>30</td><td>60</td><td>90</td></tr>"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                r#"<tr><th scope="row">10-03</th><td>no data</td><td>5</td><td>no data</td></tr>"#
+            ),
+            "{out}"
+        );
+        assert_eq!(
+            out.matches("<tr>").count(),
+            4,
+            "a header row and one per day: {out}"
+        );
+
+        let single = series(&[&[Some(3.0)]]);
+        let out = html(view! { <BarSeries label="Admitted" x=days(1) series=single /> });
+        assert!(
+            !out.contains(">total</th>"),
+            "one series has no total column: {out}"
+        );
+    }
+
+    #[test]
+    fn sparkline_figures_are_a_table_outside_the_image() {
+        let values = vec![Some(2.0), None, Some(1_500.0)];
+        let out =
+            html(view! { <Sparkline label="Burn" values=values x=days(3) /> }).replace("<!>", "");
+        assert!(
+            out.contains(r#"</div><div class="sr-only"><table><caption>Burn</caption>"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"<tr><th scope="row">10-02</th><td>no data</td></tr>"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"<tr><th scope="row">10-03</th><td>1,500</td></tr>"#),
             "{out}"
         );
     }

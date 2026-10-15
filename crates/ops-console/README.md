@@ -406,13 +406,11 @@ not hand-write layout or recurring markup.
   mix), `BarSeries` (bars per day, optionally stacked), `Sparkline` (a trend
   under a `Stat`'s value) and `HBarList` (a ranking). A chart is one
   `role="img"` element with an `aria-label` that states its numbers, each
-  mark has a `<title>` tooltip, and the numbers are printed beside the
-  marks. A missing, NaN or negative value is "no data", never a zero. A
-  mark's colour is named by its job: `Colour::SERIES` for a series'
-  identity (slots in display order, never by rank), `Colour::RAMP` for an
-  ordered scale, `Colour::OTHER` for the rest. The values are the
-  `--chart-*` tokens in `style/input.css`, which records how they were
-  checked for colour-blind separation and contrast in both themes.
+  mark has a `<title>` tooltip, and the numbers are also text: beside the
+  marks, or, for the daily bars and the sparkline, in a visually hidden
+  table. A missing, NaN or negative value is "no data", never a zero.
+  Colours are `Colour` constants named by their job; `style/input.css`
+  holds their values and how they were checked.
 - `ui/shell.rs`: the document and the page shell. Every handler passes the
   `Nav` entry its page belongs under to `page()`; the shell marks that entry
   `aria-current="page"`. From `lg` the navigation is a sidebar grouped by

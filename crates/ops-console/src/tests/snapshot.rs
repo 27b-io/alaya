@@ -509,12 +509,10 @@ fn chart_gallery() -> impl IntoView {
             .map(|(label, v)| Part::new(*label, *v, Colour::SERIES[0]))
             .collect::<Vec<_>>()
     };
-    let mut failures = ranked(
-        &FAILURES
-            .iter()
-            .map(|(reason, count)| (*reason, n(*count)))
-            .collect::<Vec<_>>(),
-    );
+    let mut failures: Vec<Part> = FAILURES
+        .iter()
+        .map(|(reason, count)| Part::new(*reason, n(*count), Colour::SERIES[0]))
+        .collect();
     failures.push(Part::new("other", n(5), Colour::OTHER));
 
     let budgets = BUDGETS
