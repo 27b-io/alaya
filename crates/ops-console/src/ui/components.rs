@@ -5,9 +5,11 @@
 //! expanded to plain functions so the console doesn't take
 //! `leptos_ui`/`tw_merge` dependencies for an SSR-only app.
 //!
-//! Two deliberate departures, each marked where it is made: the destructive
-//! button's ink is a theme token instead of a palette white, and the table
-//! wrapper has a height cap so its sticky header can stick.
+//! Four deliberate departures, each marked where it is made: the
+//! destructive button's ink is a theme token instead of a palette white, the
+//! table wrapper has a height cap so its sticky header can stick, a table
+//! column can be marked secondary, to hide on a phone, and a text input in a
+//! table row keeps a minimum width.
 
 use leptos::prelude::*;
 
@@ -55,7 +57,6 @@ pub enum BadgeKind {
     Destructive,
     Success,
     Warning,
-    Info,
 }
 
 pub fn badge(kind: BadgeKind) -> String {
@@ -67,7 +68,6 @@ pub fn badge(kind: BadgeKind) -> String {
         }
         BadgeKind::Success => "border-transparent bg-success-light text-success-dark",
         BadgeKind::Warning => "border-transparent bg-warning-light text-warning-dark",
-        BadgeKind::Info => "border-transparent bg-info-light text-info-dark",
     };
     format!("{BADGE_BASE} {variant}")
 }
@@ -134,18 +134,32 @@ pub fn TableRow(children: Children) -> impl IntoView {
     view! { <tr class="border-b transition-colors hover:bg-muted/50">{children()}</tr> }
 }
 
-#[component]
-pub fn TableHead(children: Children) -> impl IntoView {
-    view! {
-        <th class="h-10 px-2 text-left align-middle font-medium text-muted-foreground">
-            {children()}
-        </th>
+/// A column's priority, a departure from upstream: a `secondary` column
+/// shows from `md` up and is hidden on a phone, so a wide table keeps the
+/// columns that say what a row is and how it stands. Mark its head and every
+/// one of its cells, or the columns slip.
+const SECONDARY: &str = "hidden md:table-cell";
+
+fn column(base: &str, secondary: bool) -> String {
+    if secondary {
+        format!("{base} {SECONDARY}")
+    } else {
+        base.to_string()
     }
 }
 
 #[component]
-pub fn TableCell(children: Children) -> impl IntoView {
-    view! { <td class="p-3 align-middle">{children()}</td> }
+pub fn TableHead(#[prop(optional)] secondary: bool, children: Children) -> impl IntoView {
+    let class = column(
+        "h-10 px-2 text-left align-middle font-medium text-muted-foreground",
+        secondary,
+    );
+    view! { <th class=class>{children()}</th> }
+}
+
+#[component]
+pub fn TableCell(#[prop(optional)] secondary: bool, children: Children) -> impl IntoView {
+    view! { <td class=column("p-3 align-middle", secondary)>{children()}</td> }
 }
 
 // ─── Form atoms (vendored: ui/input.rs, ui/label.rs, ui/textarea.rs,
@@ -153,9 +167,49 @@ pub fn TableCell(children: Children) -> impl IntoView {
 
 pub const INPUT_CLASS: &str = "border-input flex h-9 w-full min-w-0 rounded-md border bg-transparent px-3 py-1 text-base shadow-xs transition-[color,box-shadow] outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px] md:text-sm";
 
+/// A text input inside a table row, a departure from upstream: wide enough
+/// to type into, where the row's other columns would squeeze it to nothing.
+pub fn row_input() -> String {
+    INPUT_CLASS.replace("min-w-0", "min-w-32")
+}
+
 pub const LABEL_CLASS: &str =
     "flex items-center gap-2 text-sm leading-none font-medium select-none";
 
 pub const TEXTAREA_CLASS: &str = "border-input placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-ring/50 flex min-h-16 w-full rounded-md border bg-transparent px-3 py-2 text-base shadow-xs transition-[color,box-shadow] outline-none focus-visible:ring-[3px] md:text-sm";
 
 pub const SELECT_CLASS: &str = "border-input flex h-9 w-fit items-center justify-between gap-2 rounded-md border bg-transparent px-3 py-2 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px]";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A secondary column hides below `md` in its head and its cells alike,
+    /// and a primary one never does.
+    #[test]
+    fn a_secondary_column_hides_on_a_phone() {
+        let html = view! {
+            <TableRow>
+                <TableHead>"Name"</TableHead>
+                <TableHead secondary=true>"Actor"</TableHead>
+            </TableRow>
+            <TableRow>
+                <TableCell>"acme"</TableCell>
+                <TableCell secondary=true>"ops"</TableCell>
+            </TableRow>
+        }
+        .to_html();
+        assert_eq!(html.matches(SECONDARY).count(), 2, "{html}");
+        assert!(
+            html.contains(&format!("{SECONDARY}\">Actor</th>")),
+            "{html}"
+        );
+        assert!(html.contains(&format!("{SECONDARY}\">ops</td>")), "{html}");
+        assert!(html.contains("align-middle\">acme</td>"), "{html}");
+    }
+
+    #[test]
+    fn a_row_input_keeps_a_minimum_width() {
+        assert!(row_input().contains(" min-w-32 "));
+    }
+}

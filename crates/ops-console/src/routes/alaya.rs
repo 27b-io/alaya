@@ -316,15 +316,6 @@ fn pager(view: &BrowseView, res: &Value, shown: usize) -> Pager {
     }
 }
 
-fn notice(label: &'static str, msg: String) -> impl IntoView + use<> {
-    view! {
-        <p class="text-sm" role="alert">
-            <span class=badge(BadgeKind::Warning)>{label}</span>
-            " "{msg}
-        </p>
-    }
-}
-
 fn result_row(m: &Value) -> impl IntoView + use<> {
     let hash = vs(m, "content_hash");
     let mtype = vs(m, "memory_type");
@@ -344,21 +335,21 @@ fn result_row(m: &Value) -> impl IntoView + use<> {
     view! {
         <TableRow>
             <TableCell><HashLink hash=hash /></TableCell>
-            <TableCell><span class=badge(BadgeKind::Secondary)>{mtype}</span></TableCell>
+            <TableCell secondary=true><span class=badge(BadgeKind::Secondary)>{mtype}</span></TableCell>
             <TableCell>
-                <span class="text-sm">{text}</span>
+                <span class="text-sm wrap-anywhere">{text}</span>
                 {superseded.then(|| view! {
-                    <span class=format!("ml-2 {}", badge(BadgeKind::Warning))>"superseded"</span>
+                    " "<StatusBadge status=Status::Warn label="superseded" />
                 })}
             </TableCell>
-            <TableCell>
+            <TableCell secondary=true>
                 <div class="flex flex-wrap gap-1">
                     {tags.into_iter().map(|t| view! {
                         <span class=badge(BadgeKind::Muted)>{t}</span>
                     }).collect_view()}
                 </div>
             </TableCell>
-            <TableCell><span class="text-xs text-muted-foreground whitespace-nowrap">{created}</span></TableCell>
+            <TableCell secondary=true><span class="text-xs text-muted-foreground whitespace-nowrap">{created}</span></TableCell>
         </TableRow>
     }
 }
@@ -389,7 +380,7 @@ fn browse_form(view: &BrowseView) -> impl IntoView + use<> {
         <form method="get" action="/alaya" class="flex flex-wrap items-end gap-3">
             <input type="hidden" name="mode" value=view.mode.as_str() />
             {applies.query.then(|| view! {
-                <div class="flex flex-col gap-1.5 grow min-w-56">
+                <div class="flex w-full flex-col gap-1.5 grow sm:w-auto sm:min-w-56">
                     <label class=LABEL_CLASS for="q">"Query"</label>
                     <input class=INPUT_CLASS id="q" name="q" value=q placeholder="semantic query" />
                 </div>
@@ -407,7 +398,7 @@ fn browse_form(view: &BrowseView) -> impl IntoView + use<> {
                 </div>
             })}
             {applies.tags.then(|| view! {
-                <div class="flex flex-col gap-1.5 grow min-w-56">
+                <div class="flex w-full flex-col gap-1.5 grow sm:w-auto sm:min-w-56">
                     <label class=LABEL_CLASS for="tags">"Tags (csv)"</label>
                     <input class=INPUT_CLASS id="tags" name="tags" value=tags />
                 </div>
@@ -431,14 +422,12 @@ pub async fn browse(
     let (jar, flash) = take_flash(jar);
 
     let ignored = (!view.ignored.is_empty()).then(|| {
-        notice(
-            "not applied",
-            format!(
-                "{} mode does not apply: {}. The server ignores these, so the results below are not filtered by them.",
-                view.mode.as_str(),
-                view.ignored.join(", "),
-            ),
-        )
+        let msg = format!(
+            "{} mode does not apply: {}. The server ignores these, so the results below are not filtered by them.",
+            view.mode.as_str(),
+            view.ignored.join(", "),
+        );
+        view! { <Notice status=Status::Warn label="not applied">{msg}</Notice> }
     });
 
     let (results, pager) = match view.missing_input() {
@@ -471,11 +460,11 @@ pub async fn browse(
 
     let content = view! {
         <div class="space-y-6">
+            <PageHeader
+                title="Memories"
+                description="Search or browse the corpus. Each mode offers only the filters the server applies in it."
+            />
             <Card>
-                <CardHeader>
-                    <CardTitle>"Memories"</CardTitle>
-                    <CardDescription>"Search or browse the corpus. Each mode offers only the filters the server applies in it."</CardDescription>
-                </CardHeader>
                 <CardContent>{form}</CardContent>
             </Card>
 
@@ -486,16 +475,16 @@ pub async fn browse(
                     <TableHeader>
                         <TableRow>
                             <TableHead>"Hash"</TableHead>
-                            <TableHead>"Type"</TableHead>
+                            <TableHead secondary=true>"Type"</TableHead>
                             <TableHead>"Content"</TableHead>
-                            <TableHead>"Tags"</TableHead>
-                            <TableHead>"Created"</TableHead>
+                            <TableHead secondary=true>"Tags"</TableHead>
+                            <TableHead secondary=true>"Created"</TableHead>
                         </TableRow>
                     </TableHeader>
                     <TableBody>{rows}</TableBody>
                 </Table>
             </TableWrapper>
-            <div class="flex gap-3">
+            <div class="flex flex-wrap gap-3">
                 {first.map(|h| view! { <a class=btn_sm(Btn::Outline) href=h>"↑ First page"</a> })}
                 {prev.map(|h| view! { <a class=btn_sm(Btn::Outline) href=h>"← Prev"</a> })}
                 {next.map(|h| view! { <a class=btn_sm(Btn::Outline) href=h>"Next →"</a> })}
@@ -575,17 +564,19 @@ async fn supersession_chain(alaya: &crate::alaya::AlayaClient, mem: &Value) -> V
 fn relations_view(hash: &str, relations: Result<Vec<Value>, AppError>, csrf: &str) -> AnyView {
     let relations = match relations {
         Err(e) => {
+            let msg = format!("Could not load relations: {}", e.detail());
             return view! {
-                <p class="text-sm mb-4" role="alert">
-                    <span class=badge(BadgeKind::Destructive)>"unavailable"</span>
-                    " "{format!("Could not load relations: {}", e.detail())}
-                </p>
+                <div class="mb-4">
+                    <Notice status=Status::Error label="unavailable">{msg}</Notice>
+                </div>
             }
             .into_any();
         }
         Ok(r) if r.is_empty() => {
             return view! {
-                <p class="text-sm text-muted-foreground mb-4">"No relations."</p>
+                <div class="mb-4">
+                    <EmptyState>"No relations."</EmptyState>
+                </div>
             }
             .into_any();
         }
@@ -619,7 +610,7 @@ fn relations_view(hash: &str, relations: Result<Vec<Value>, AppError>, csrf: &st
                         <TableHeader>
                             <TableRow>
                                 <TableHead>"Linked memory"</TableHead>
-                                <TableHead>"Created"</TableHead>
+                                <TableHead secondary=true>"Created"</TableHead>
                                 <TableHead>""</TableHead>
                             </TableRow>
                         </TableHeader>
@@ -656,9 +647,9 @@ fn relation_row(hash: &str, e: &Value, csrf: &str, incoming: bool) -> impl IntoV
     view! {
         <TableRow>
             <TableCell><HashLink hash=other /></TableCell>
-            <TableCell><span class="text-xs text-muted-foreground">{created}</span></TableCell>
+            <TableCell secondary=true><span class="text-xs text-muted-foreground">{created}</span></TableCell>
             <TableCell>
-                <div class="flex gap-2">
+                <div class="flex flex-wrap gap-2">
                     {review}
                     <form method="post" action="/alaya/relation/delete">
                         <input type="hidden" name="csrf" value=csrf />
@@ -773,7 +764,7 @@ pub async fn detail(
     let correct_action = format!("/alaya/memory/{hash}/correct");
     let delete_action = format!("/alaya/memory/{hash}/delete");
     let back_href = memory_href(&hash);
-    let hash_title = hash.clone();
+    let hash_header = hash.clone();
     let hash_hidden = hash.clone();
     let content_for_edit = content_text.clone();
     let summary_text = summary.clone();
@@ -782,11 +773,10 @@ pub async fn detail(
         (csrf.clone(), csrf.clone(), csrf.clone(), csrf.clone());
     let content = view! {
         <div class="space-y-6">
-            <div class="flex items-center gap-3 flex-wrap">
-                <h1 class="font-mono text-sm break-all">{hash_title}</h1>
+            <PageHeader title="Memory" description=hash_header>
                 <span class=badge(BadgeKind::Secondary)>{mtype.clone()}</span>
-                {superseded.then(|| view! { <span class=badge(BadgeKind::Warning)>"superseded"</span> })}
-            </div>
+                {superseded.then(|| view! { <StatusBadge status=Status::Warn label="superseded" /> })}
+            </PageHeader>
 
             <Card>
                 <CardHeader><CardTitle>"Content"</CardTitle></CardHeader>
@@ -804,13 +794,15 @@ pub async fn detail(
             <Card>
                 <CardHeader><CardTitle>"Stats & metadata"</CardTitle></CardHeader>
                 <CardContent>
-                    <dl class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm mb-4">
-                        <div><dt class="text-muted-foreground text-xs">"Created"</dt><dd>{created}</dd></div>
-                        <div><dt class="text-muted-foreground text-xs">"Updated"</dt><dd>{updated}</dd></div>
-                        <div><dt class="text-muted-foreground text-xs">"Salience"</dt><dd>{salience}</dd></div>
-                        <div><dt class="text-muted-foreground text-xs">"Accesses"</dt><dd>{access_count}</dd></div>
-                        <div><dt class="text-muted-foreground text-xs">"Trust"</dt><dd>{trust}</dd></div>
-                    </dl>
+                    <div class="mb-4">
+                        <StatGrid>
+                            <Stat label="Created">{created}</Stat>
+                            <Stat label="Updated">{updated}</Stat>
+                            <Stat label="Salience">{salience}</Stat>
+                            <Stat label="Accesses">{access_count}</Stat>
+                            <Stat label="Trust">{trust}</Stat>
+                        </StatGrid>
+                    </div>
                     <div class="flex flex-wrap gap-1 mb-4">
                         {tags.into_iter().map(|t| view! { <span class=badge(BadgeKind::Muted)>{t}</span> }).collect_view()}
                     </div>
@@ -825,23 +817,26 @@ pub async fn detail(
                         <CardDescription>"This memory was superseded — the audit trail is preserved; nothing is dropped."</CardDescription>
                     </CardHeader>
                     <CardContent>
-                        <dl class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm mb-4">
-                            <div><dt class="text-muted-foreground text-xs">"Superseded by"</dt><dd>{superseded_by}</dd></div>
-                            <div><dt class="text-muted-foreground text-xs">"Reason"</dt><dd>{supersession_reason}</dd></div>
-                        </dl>
+                        <div class="mb-4">
+                            <StatGrid>
+                                <Stat label="Superseded by">{superseded_by}</Stat>
+                            </StatGrid>
+                        </div>
+                        <p class="text-sm wrap-anywhere mb-4">
+                            <span class="text-muted-foreground">"Reason: "</span>
+                            {supersession_reason}
+                        </p>
                         <ol class="space-y-2 text-sm mb-6">
                             {chain.into_iter().map(|hop| {
                                 let action = hop.superseded.then(|| {
                                     let href = unsupersede_href(&hop.hash);
-                                    view! {
-                                        <a class="text-xs text-primary underline-offset-4 hover:underline" href=href>"Un-supersede…"</a>
-                                    }
+                                    view! { <span class="text-xs"><Link href=href>"Un-supersede…"</Link></span> }
                                 });
                                 view! {
-                                    <li class="flex gap-2 items-baseline">
+                                    <li class="flex flex-wrap gap-x-2 items-baseline">
                                         <span class="text-muted-foreground">"↳"</span>
                                         <HashLink hash=hop.hash />
-                                        <span class="text-muted-foreground">{hop.label}</span>
+                                        <span class="text-muted-foreground wrap-anywhere">{hop.label}</span>
                                         {action}
                                     </li>
                                 }
@@ -849,7 +844,7 @@ pub async fn detail(
                         </ol>
                         <form method="post" action=unsupersede_action id="unsupersede" class="flex flex-wrap items-end gap-3">
                             <input type="hidden" name="csrf" value=csrf_unsupersede />
-                            <div class="flex flex-col gap-1.5 grow min-w-72">
+                            <div class="flex w-full flex-col gap-1.5 grow sm:w-auto sm:min-w-72">
                                 <label class=LABEL_CLASS for="unsupersede_reason">"Reason to un-supersede (audit trail)"</label>
                                 <input class=INPUT_CLASS id="unsupersede_reason" name="reason" maxlength="2000" placeholder="why this supersession was wrong" required />
                             </div>
@@ -867,7 +862,7 @@ pub async fn detail(
                         <input type="hidden" name="csrf" value=csrf_rel />
                         <input type="hidden" name="content_hash" value=hash_hidden />
                         <input type="hidden" name="back" value=back_href />
-                        <div class="flex flex-col gap-1.5 grow min-w-72">
+                        <div class="flex w-full flex-col gap-1.5 grow sm:w-auto sm:min-w-72">
                             <label class=LABEL_CLASS for="target_hash">"Target hash"</label>
                             <input class=INPUT_CLASS id="target_hash" name="target_hash" placeholder="64-char content hash" required />
                         </div>
@@ -906,7 +901,7 @@ pub async fn detail(
 
                     <details>
                         <summary class="cursor-pointer text-sm font-medium text-destructive">"Delete permanently…"</summary>
-                        <form method="post" action=delete_action class="mt-4 flex items-center gap-3">
+                        <form method="post" action=delete_action class="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center">
                             <input type="hidden" name="csrf" value=csrf_delete />
                             <span class="text-sm text-muted-foreground">"This removes the memory and its audit trail. Prefer supersede."</span>
                             <button type="submit" class=btn(Btn::Destructive)>"Delete memory"</button>
@@ -1000,20 +995,19 @@ pub async fn supersede_form(
                 <div class="rounded-md border p-4">
                     <div class="text-xs font-medium text-muted-foreground mb-1">{title}</div>
                     <HashLink hash=h />
-                    <p class="text-sm mt-2">{text}</p>
+                    <p class="text-sm mt-2 wrap-anywhere">{text}</p>
                 </div>
             }
         })
     };
 
     let content = view! {
+        <div class="space-y-6">
+        <PageHeader
+            title="Supersede a memory"
+            description="The old memory stays retrievable with a full audit trail (superseded_by, reason). Nothing is silently dropped."
+        />
         <Card>
-            <CardHeader>
-                <CardTitle>"Supersede a memory"</CardTitle>
-                <CardDescription>
-                    "The old memory stays retrievable with a full audit trail (superseded_by, reason). Nothing is silently dropped."
-                </CardDescription>
-            </CardHeader>
             <CardContent>
                 <div class="grid gap-4 sm:grid-cols-2 mb-6">
                     {preview_card("Old (will be superseded)", old_preview)}
@@ -1038,6 +1032,7 @@ pub async fn supersede_form(
                 </form>
             </CardContent>
         </Card>
+        </div>
     };
 
     Ok((
@@ -1392,7 +1387,7 @@ pub async fn duplicates(
                     // was actually chosen, so the whole group always merges.
                     let h_hidden = h.clone();
                     view! {
-                        <li class="flex items-center gap-3 text-sm">
+                        <li class="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
                             <label class="flex items-center gap-1 text-xs text-muted-foreground">
                                 <input type="radio" name="canonical_hash" value=h_radio checked=is_canonical />
                                 "canonical"
@@ -1418,7 +1413,7 @@ pub async fn duplicates(
                             <input type="hidden" name="csrf" value=csrf.clone() />
                             <ul class="space-y-2">{members}</ul>
                             <div class="flex flex-wrap items-end gap-3">
-                                <div class="flex flex-col gap-1.5 grow min-w-56">
+                                <div class="flex w-full flex-col gap-1.5 grow sm:w-auto sm:min-w-56">
                                     <label class=LABEL_CLASS>"Reason"</label>
                                     <input class=INPUT_CLASS name="reason" value="Merged by ops-console deduplication" />
                                 </div>
@@ -1442,15 +1437,13 @@ pub async fn duplicates(
     );
     let content = view! {
         <div class="space-y-6">
+            <PageHeader
+                title="Duplicates"
+                description="Merging supersedes each duplicate in favour of the canonical memory — audit trail preserved. Dry-run first."
+            />
             <Card>
-                <CardHeader>
-                    <CardTitle>"Duplicates"</CardTitle>
-                    <CardDescription>
-                        "Merging supersedes each duplicate in favour of the canonical memory — audit trail preserved. Dry-run first."
-                    </CardDescription>
-                </CardHeader>
                 <CardContent>
-                    <form method="get" action="/alaya/duplicates" class="flex items-end gap-3">
+                    <form method="get" action="/alaya/duplicates" class="flex flex-wrap items-end gap-3">
                         <div class="flex flex-col gap-1.5">
                             <label class=LABEL_CLASS for="threshold">"Similarity threshold"</label>
                             <input class=INPUT_CLASS id="threshold" name="threshold" value=threshold.to_string() />
@@ -1538,11 +1531,9 @@ pub async fn merge_submit(
         let canonical_hidden = form.canonical_hash.clone();
         let reason_hidden = form.reason.clone();
         let content = view! {
+            <div class="space-y-6">
+            <PageHeader title="Merge preview (dry run)" description="No changes were made. Review, then commit." />
             <Card>
-                <CardHeader>
-                    <CardTitle>"Merge preview (dry run)"</CardTitle>
-                    <CardDescription>"No changes were made. Review, then commit."</CardDescription>
-                </CardHeader>
                 <CardContent>
                     <p class="text-sm mb-2">
                         "Canonical: "
@@ -1555,7 +1546,7 @@ pub async fn merge_submit(
                             view! { <li><HashLink hash=h /></li> }
                         }).collect_view()}
                     </ul>
-                    <form method="post" action="/alaya/duplicates/merge" class="flex items-center gap-3">
+                    <form method="post" action="/alaya/duplicates/merge" class="flex flex-wrap items-center gap-3">
                         <input type="hidden" name="csrf" value=csrf />
                         <input type="hidden" name="canonical_hash" value=canonical_hidden />
                         {dup_field.into_iter().map(|h| view! {
@@ -1567,6 +1558,7 @@ pub async fn merge_submit(
                     </form>
                 </CardContent>
             </Card>
+            </div>
         };
         return Ok((
             jar,
@@ -1762,10 +1754,17 @@ fn edge_facts(p: &Value) -> impl IntoView + use<> {
     let b = vs(p, "memory_b_hash");
     let state = judge_state(p);
     let failed = matches!(state, JudgeState::Failed);
-    let (badge_class, badge_text) = match state {
-        JudgeState::Judged(v) => (badge(verdict_badge(&v)), v),
-        JudgeState::Failed => (badge(BadgeKind::Destructive), "judge error".into()),
-        JudgeState::Never => (badge(BadgeKind::Muted), "not yet judged".into()),
+    let verdict = match state {
+        JudgeState::Judged(v) => {
+            let class = badge(verdict_badge(&v));
+            Either::Left(view! { <span class=class>{v}</span> })
+        }
+        JudgeState::Failed => {
+            Either::Right(view! { <StatusBadge status=Status::Error label="judge error" /> })
+        }
+        JudgeState::Never => {
+            Either::Right(view! { <StatusBadge status=Status::Off label="not yet judged" /> })
+        }
     };
     let reason = vs(p, "verdict_reason");
     let survivor = vs(p, "survivor");
@@ -1784,17 +1783,14 @@ fn edge_facts(p: &Value) -> impl IntoView + use<> {
     let resolved = !resolution.is_empty() || p.get("resolved_at").is_some_and(|x| !x.is_null());
     let resolved_at = fmt_epoch(vf(p, "resolved_at"));
     let resolved_via = or_dash(vs(p, "resolved_via"));
-    let fact = |label: &'static str, value: String| {
-        view! {
-            <div><dt class="text-muted-foreground text-xs">{label}</dt><dd>{value}</dd></div>
-        }
-    };
+    let fact =
+        |label: &'static str, value: String| view! { <Stat label=label text=true>{value}</Stat> };
     view! {
         <div class="space-y-3">
             <div class="flex flex-wrap items-center gap-2">
-                <span class=badge_class>{badge_text}</span>
+                {verdict}
                 {resolved.then(|| view! {
-                    <span class=badge(BadgeKind::Info)>{format!("resolved: {}", or_dash(resolution.clone()))}</span>
+                    <StatusBadge status=Status::Ok label=format!("resolved: {}", or_dash(resolution.clone())) />
                 })}
             </div>
             {(!reason.is_empty()).then(|| {
@@ -1805,21 +1801,17 @@ fn edge_facts(p: &Value) -> impl IntoView + use<> {
                 };
                 view! { <p class=class>{reason}</p> }
             })}
-            <dl class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
+            <StatGrid>
                 {fact("Judge confidence", judge_conf)}
                 {fact("Detector confidence", detector_conf)}
-                <div>
-                    <dt class="text-muted-foreground text-xs">"Recommended survivor"</dt>
-                    <dd class="flex items-center gap-2">
-                        {match survivor_side {
-                            Some(side) => Either::Left(view! {
-                                <span>{side}</span>
-                                <HashLink hash=survivor />
-                            }),
-                            None => Either::Right("—"),
-                        }}
-                    </dd>
-                </div>
+                <Stat label="Recommended survivor" text=true>
+                    {match survivor_side {
+                        Some(side) => Either::Left(view! {
+                            {side}" "<HashLink hash=survivor />
+                        }),
+                        None => Either::Right("—"),
+                    }}
+                </Stat>
                 {fact("Judge model", model)}
                 {fact("Judged at", judged_at)}
                 {fact("Detected at", detected_at)}
@@ -1827,7 +1819,7 @@ fn edge_facts(p: &Value) -> impl IntoView + use<> {
                     {fact("Resolved at", resolved_at)}
                     {fact("Resolved via", resolved_via)}
                 })}
-            </dl>
+            </StatGrid>
         </div>
     }
 }
@@ -1916,10 +1908,10 @@ fn queue_card(p: &Value, csrf: &str, view: &QueueView, back: &str) -> impl IntoV
     let side = |hash: String, text: String, sup: bool, label: &'static str| {
         view! {
             <div class="rounded-md border p-4">
-                <div class="flex items-center gap-2 mb-2">
+                <div class="flex flex-wrap items-center gap-2 mb-2">
                     <span class="text-xs font-medium text-muted-foreground">{label}</span>
                     <HashLink hash=hash />
-                    {sup.then(|| view! { <span class=badge(BadgeKind::Warning)>"superseded"</span> })}
+                    {sup.then(|| view! { <StatusBadge status=Status::Warn label="superseded" /> })}
                 </div>
                 <p class="text-sm wrap-anywhere">{text}</p>
             </div>
@@ -1946,16 +1938,14 @@ fn queue_card(p: &Value, csrf: &str, view: &QueueView, back: &str) -> impl IntoV
     view! {
         <Card>
             <CardHeader>
-                <div class="flex w-full items-center gap-3">
+                <div class="flex w-full flex-wrap items-center gap-3">
                     {selectable.then(|| view! {
                         // `form=` ties the box to the page's one bulk form
                         // without nesting forms — no JS needed.
                         <input type="checkbox" form="bulk" name="pair" value=pair_value aria-label="select for bulk keep both" />
                     })}
                     <CardTitle>"Contradiction"</CardTitle>
-                    <a class="ml-auto text-sm text-primary underline-offset-4 hover:underline" href=review>
-                        "Review in full →"
-                    </a>
+                    <span class="ml-auto text-sm"><Link href=review>"Review in full →"</Link></span>
                 </div>
             </CardHeader>
             <CardContent>
@@ -2023,13 +2013,11 @@ pub async fn contradictions(
     let resolved = view.resolved;
     let content = view! {
         <div class="space-y-6">
+            <PageHeader
+                title="Contradictions"
+                description="Verdicts are advisory: the judge recommends a survivor, you decide. Keep both when both memories are true or the pair is detector noise — nothing is superseded and Reopen undoes it. Otherwise choose which memory survives — the loser is superseded with a reason, never dropped."
+            />
             <Card>
-                <CardHeader>
-                    <CardTitle>"Contradictions"</CardTitle>
-                    <CardDescription>
-                        "Verdicts are advisory: the judge recommends a survivor, you decide. Keep both when both memories are true or the pair is detector noise — nothing is superseded and Reopen undoes it. Otherwise choose which memory survives — the loser is superseded with a reason, never dropped."
-                    </CardDescription>
-                </CardHeader>
                 <CardContent>
                     <form method="get" action=QUEUE_PATH class="flex flex-wrap items-center gap-4">
                         {verdict_boxes}
@@ -2044,7 +2032,7 @@ pub async fn contradictions(
                 </CardContent>
             </Card>
             {any_selectable.then(|| view! {
-                <form id="bulk" method="post" action="/alaya/contradictions/keep-both/bulk" class="flex items-center gap-3">
+                <form id="bulk" method="post" action="/alaya/contradictions/keep-both/bulk" class="flex flex-wrap items-center gap-3">
                     <input type="hidden" name="csrf" value=csrf.clone() />
                     <input type="hidden" name="back" value=back.clone() />
                     <button type="submit" class=btn_sm(Btn::Secondary)>"Keep both for selected"</button>
@@ -2052,7 +2040,7 @@ pub async fn contradictions(
                 </form>
             })}
             {cards}
-            <div class="flex gap-3">
+            <div class="flex flex-wrap gap-3">
                 {prev_href.map(|h| view! { <a class=btn_sm(Btn::Outline) href=h>"← Prev"</a> })}
                 {next_href.map(|h| view! { <a class=btn_sm(Btn::Outline) href=h>"Next →"</a> })}
             </div>
@@ -2085,7 +2073,7 @@ fn memory_column(label: &'static str, hash: String, res: Result<Value, AppError>
     let header = {
         let hash = hash.clone();
         view! {
-            <div class="flex items-center gap-2 mb-2">
+            <div class="flex flex-wrap items-center gap-2 mb-2">
                 <span class="text-xs font-medium text-muted-foreground">{label}</span>
                 <HashLink hash=hash />
             </div>
@@ -2096,11 +2084,10 @@ fn memory_column(label: &'static str, hash: String, res: Result<Value, AppError>
             .cloned()
             .ok_or_else(|| AppError::NotFound("memory not found".into()))
     }) {
-        Err(e) => Either::Left(view! {
-            <p class="text-sm text-destructive" role="alert">
-                {format!("Could not load this memory: {}", e.detail())}
-            </p>
-        }),
+        Err(e) => {
+            let msg = format!("Could not load this memory: {}", e.detail());
+            Either::Left(view! { <Notice status=Status::Error label="unavailable">{msg}</Notice> })
+        }
         Ok(m) => {
             let content = vs(&m, "content");
             let summary = vs(&m, "summary");
@@ -2124,7 +2111,7 @@ fn memory_column(label: &'static str, hash: String, res: Result<Value, AppError>
                     <div class="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                         <span>{format!("created {created}")}</span>
                         {superseded_by.map(|by| view! {
-                            <span class=badge(BadgeKind::Warning)>"superseded"</span>
+                            <StatusBadge status=Status::Warn label="superseded" />
                             {validate_hash(&by).is_ok().then(|| view! { <HashLink hash=by.clone() /> })}
                         })}
                     </div>
@@ -2184,16 +2171,27 @@ pub async fn pair_page(
     // the verdict — so Keep both stays offered and the server is the judge
     // of whether the edge exists.
     let fallback_edge = json!({ "memory_a_hash": q.a, "memory_b_hash": q.b });
+    let missing = |status: Status, label: &'static str, msg: String| {
+        Either::Right(view! { <Notice status=status label=label>{msg}</Notice> })
+    };
     let (edge_view, action_edge) = match edge {
         Ok(Some(p)) => (Either::Left(edge_facts(&p)), p),
         Ok(None) => (
-            Either::Right(format!(
-                "This pair is not on the queue page it was opened from (offset {offset}, same filters): it was settled, or the queue moved, so its verdict and resolution are unknown here. The memories below are live; to reopen a keep-both, find the pair in the queue with resolved pairs included."
-            )),
+            missing(
+                Status::Off,
+                "not on this page",
+                format!(
+                    "This pair is not on the queue page it was opened from (offset {offset}, same filters): it was settled, or the queue moved, so its verdict and resolution are unknown here. The memories below are live; to reopen a keep-both, find the pair in the queue with resolved pairs included."
+                ),
+            ),
             fallback_edge,
         ),
         Err(e) => (
-            Either::Right(format!("Could not load the verdict: {}", e.detail())),
+            missing(
+                Status::Error,
+                "unavailable",
+                format!("Could not load the verdict: {}", e.detail()),
+            ),
             fallback_edge,
         ),
     };
@@ -2202,9 +2200,13 @@ pub async fn pair_page(
     let col_b = memory_column("B", q.b.clone(), mem_b);
     let content = view! {
         <div class="space-y-6">
-            <a class="text-sm text-primary underline-offset-4 hover:underline" href=back_link>"← Back to the queue"</a>
+            <PageHeader
+                title="Contradiction pair"
+                description="Both memories in full, with the judge's verdict on the pair."
+            >
+                <Link href=back_link>"← Back to the queue"</Link>
+            </PageHeader>
             <Card>
-                <CardHeader><CardTitle>"Contradiction pair"</CardTitle></CardHeader>
                 <CardContent>
                     <div class="mb-4 text-sm">{edge_view}</div>
                     {actions}
@@ -2498,16 +2500,16 @@ pub async fn auth_view(
                     <TableCell><span class="font-mono text-xs">{name}</span></TableCell>
                     <TableCell>
                         {if mutating {
-                            Either::Left(view! { <span class=badge(BadgeKind::Warning)>"mutating"</span> })
+                            view! { <StatusBadge status=Status::Warn label="mutating" /> }
                         } else {
-                            Either::Right(view! { <span class=badge(BadgeKind::Muted)>"read / additive"</span> })
+                            view! { <StatusBadge status=Status::Off label="read / additive" /> }
                         }}
                     </TableCell>
                     <TableCell>
                         {if oidc_ok {
-                            Either::Left(view! { <span class=badge(BadgeKind::Success)>"allowed"</span> })
+                            view! { <StatusBadge status=Status::Ok label="allowed" /> }
                         } else {
-                            Either::Right(view! { <span class=badge(BadgeKind::Destructive)>"denied"</span> })
+                            view! { <StatusBadge status=Status::Error label="denied" /> }
                         }}
                     </TableCell>
                 </TableRow>
@@ -2517,30 +2519,29 @@ pub async fn auth_view(
 
     let content = view! {
         <div class="space-y-6">
-            <Card>
-                <CardHeader>
-                    <CardTitle>"Ālaya auth state (read-only)"</CardTitle>
-                    <CardDescription>
-                        "Live from alaya-server. OIDC principals are read / additive by design (store only, no mutation); changing this is a product decision (LAB-1084), not a console feature."
-                    </CardDescription>
-                </CardHeader>
-                <CardContent>
-                    <dl class="grid grid-cols-1 sm:grid-cols-3 gap-4 text-sm">
-                        <div>
-                            <dt class="text-muted-foreground text-xs">"Static bearer"</dt>
-                            <dd>{if static_configured { "configured" } else { "NOT configured" }}</dd>
-                        </div>
-                        <div>
-                            <dt class="text-muted-foreground text-xs">"OIDC"</dt>
-                            <dd>{if oidc_enabled { "enabled" } else { "disabled" }}</dd>
-                        </div>
-                        <div>
-                            <dt class="text-muted-foreground text-xs">"Issuer / audience"</dt>
-                            <dd class="break-all">{issuer}" / "{audience}</dd>
-                        </div>
-                    </dl>
-                </CardContent>
-            </Card>
+            <PageHeader
+                title="Ālaya auth state"
+                description="Read-only, live from alaya-server. OIDC principals are read / additive by design (store only, no mutation); changing this is a product decision (LAB-1084), not a console feature."
+            />
+            <StatGrid>
+                <Stat label="Static bearer">
+                    {if static_configured {
+                        view! { <StatusBadge status=Status::Ok label="configured" /> }
+                    } else {
+                        view! { <StatusBadge status=Status::Error label="NOT configured" /> }
+                    }}
+                </Stat>
+                <Stat label="OIDC">
+                    {if oidc_enabled {
+                        view! { <StatusBadge status=Status::Ok label="enabled" /> }
+                    } else {
+                        view! { <StatusBadge status=Status::Off label="disabled" /> }
+                    }}
+                </Stat>
+                <Stat label="Issuer / audience" text=true>
+                    <span class="break-all">{issuer}" / "{audience}</span>
+                </Stat>
+            </StatGrid>
             <Card>
                 <CardHeader>
                     <CardTitle>"OIDC principal × operation matrix"</CardTitle>
@@ -2627,6 +2628,12 @@ mod tests {
         queue_card(p, "tok", &QueueView::default(), QUEUE_PATH).to_html()
     }
 
+    /// The value of the `Stat` labelled `label`, exactly.
+    fn stat<'a>(html: &'a str, label: &str) -> Option<&'a str> {
+        let rest = html.split_once(&format!(">{label}</dt><dd"))?.1;
+        rest.split_once('>')?.1.split_once("</dd>").map(|(v, _)| v)
+    }
+
     /// A `null` marker is still a supersession: the server keys on presence.
     #[test]
     fn is_superseded_keys_on_marker_presence_like_the_server() {
@@ -2675,8 +2682,8 @@ mod tests {
             "judged_at": 1788265700.0,
         })));
         assert!(html.contains(">supersession<"));
-        assert!(html.contains("Judge confidence</dt><dd>0.87"), "{html}");
-        assert!(html.contains("Detector confidence</dt><dd>0.61"));
+        assert_eq!(stat(&html, "Judge confidence"), Some("0.87"), "{html}");
+        assert_eq!(stat(&html, "Detector confidence"), Some("0.61"));
         assert!(html.contains("judge-model-x"));
         assert!(html.contains("2026-09-01 12:28"), "judged_at");
         assert!(html.contains("2026-09-01 12:26"), "created_at");
@@ -2710,8 +2717,8 @@ mod tests {
         let html = card(&pair(json!({})));
         assert!(html.contains("not yet judged"));
         assert!(!html.contains("judge error"));
-        assert!(html.contains("Judge confidence</dt><dd>—"), "{html}");
-        assert!(html.contains("Judged at</dt><dd>—"));
+        assert_eq!(stat(&html, "Judge confidence"), Some("—"), "{html}");
+        assert_eq!(stat(&html, "Judged at"), Some("—"));
     }
 
     #[test]
@@ -2723,11 +2730,12 @@ mod tests {
             "resolved_via": "operator:console",
         })));
         assert!(html.contains("resolved: keep_both"));
-        assert!(
-            html.contains("Resolved at</dt><dd>2026-09-01 12:30"),
+        assert_eq!(
+            stat(&html, "Resolved at"),
+            Some("2026-09-01 12:30"),
             "{html}"
         );
-        assert!(html.contains("Resolved via</dt><dd>operator:console"));
+        assert_eq!(stat(&html, "Resolved via"), Some("operator:console"));
         assert!(html.contains("action=\"/alaya/contradictions/reopen\""));
         assert!(!html.contains("form=\"bulk\""));
         assert!(!html.contains("/alaya/contradictions/keep-both\""));

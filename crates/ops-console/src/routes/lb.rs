@@ -39,14 +39,12 @@ pub async fn pane(
 
     let Some(lb) = state.lb.as_ref() else {
         let content = view! {
-            <Card>
-                <CardHeader>
-                    <CardTitle>"anthropic-lb — module not configured"</CardTitle>
-                    <CardDescription>
-                        "Set LB_URL, LB_API_KEY and METRICS_URL on the console deployment (all three, or none) to enable read-only LB monitoring."
-                    </CardDescription>
-                </CardHeader>
-            </Card>
+            <div class="space-y-6">
+                {header()}
+                <NotConfigured>
+                    "Set LB_URL, LB_API_KEY and METRICS_URL on the console deployment (all three, or none) to enable read-only LB monitoring."
+                </NotConfigured>
+            </div>
         };
         return Ok((jar, Html(page(TITLE, Nav::Lb, &session, flash, content))));
     };
@@ -57,12 +55,22 @@ pub async fn pane(
 
     let content = view! {
         <div class="space-y-6">
+            {header()}
             {fleet_card(&stats)}
             {budgets_card(&stats, &burn)}
             {accounts_card(&stats)}
         </div>
     };
     Ok((jar, Html(page(TITLE, Nav::Lb, &session, flash, content))))
+}
+
+fn header() -> impl IntoView {
+    view! {
+        <PageHeader
+            title="anthropic-lb"
+            description="Read-only monitoring of the load balancer: fleet state, per-client budget burn and upstream account utilisation. Limits are TOML, GitOps."
+        />
+    }
 }
 
 // ─── Rendering helpers ──────────────────────────────────────────────────────
@@ -96,13 +104,13 @@ fn fleet_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
             let strategy = vs(s, "strategy");
             let cluster = s.get("cluster");
             let replicas = int_or_dash(cluster.and_then(|c| c.get("replicas_seen")));
-            let (redis_class, redis_text) = match cluster
+            let (redis, redis_text) = match cluster
                 .and_then(|c| c.get("redis_connected"))
                 .and_then(Value::as_bool)
             {
-                Some(true) => (badge(BadgeKind::Success), "connected"),
-                Some(false) => (badge(BadgeKind::Destructive), "disconnected"),
-                None => (badge(BadgeKind::Muted), "no cluster info"),
+                Some(true) => (Status::Ok, "connected"),
+                Some(false) => (Status::Error, "disconnected"),
+                None => (Status::Off, "no cluster info"),
             };
             // serde_json maps iterate in key order — no sort needed.
             let transport = cluster
@@ -118,29 +126,21 @@ fn fleet_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                 .unwrap_or_else(|| "—".into());
 
             Either::Right(view! {
-                <dl class="grid grid-cols-2 sm:grid-cols-3 gap-4 text-sm">
-                    <div>
-                        <dt class="text-muted-foreground text-xs">"Strategy"</dt>
-                        <dd>{strategy}</dd>
-                    </div>
+                <StatGrid>
+                    <Stat label="Strategy" text=true>{strategy}</Stat>
                     // `replicas_seen` counts heartbeating instances in the shared
                     // coordination store, which more than one deployment writes to —
                     // it is not this Deployment's replica count, and reading it as
                     // one sends people hunting a phantom pod (LAB-4554).
-                    <div>
-                        <dt class="text-muted-foreground text-xs">"Heartbeating instances (shared store)"</dt>
-                        <dd>{replicas}</dd>
-                    </div>
-                    <div>
-                        <dt class="text-muted-foreground text-xs">"Shared state (Redis)"</dt>
-                        <dd><span class=redis_class>{redis_text}</span></dd>
-                    </div>
+                    <Stat label="Heartbeating instances (shared store)">{replicas}</Stat>
+                    <Stat label="Shared state (Redis)">
+                        <StatusBadge status=redis label=redis_text />
+                    </Stat>
                     // No pooled-headroom tile: see the note above accounts_card (LAB-4554).
-                    <div class="col-span-2 sm:col-span-3">
-                        <dt class="text-muted-foreground text-xs">"Upstream transport errors (fleet, cumulative)"</dt>
-                        <dd>{transport}</dd>
-                    </div>
-                </dl>
+                    <Stat label="Upstream transport errors (fleet, cumulative)" text=true>
+                        {transport}
+                    </Stat>
+                </StatGrid>
             })
         }
     };
@@ -185,7 +185,7 @@ fn budgets_card(
         .iter()
         .map(|d| {
             let label = fmt_day(*d);
-            view! { <TableHead>{label}</TableHead> }
+            view! { <TableHead secondary=true>{label}</TableHead> }
         })
         .collect_view();
 
@@ -196,9 +196,9 @@ fn budgets_card(
                 Some(&(used, limit)) => {
                     let pct = ratio_pct((limit > 0.0).then(|| used / limit));
                     Either::Left(view! {
-                        <div class="flex items-center gap-2 whitespace-nowrap">
+                        <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
                             <progress class="h-2 w-24" value=format!("{used:.0}") max=format!("{limit:.0}")></progress>
-                            <span class="tabular-nums" title=format!("{used:.0} / {limit:.0} tokens")>
+                            <span class="tabular-nums whitespace-nowrap" title=format!("{used:.0} / {limit:.0} tokens")>
                                 {fmt_tokens(used)}" / "{fmt_tokens(limit)}" ("{pct}")"
                             </span>
                         </div>
@@ -217,7 +217,11 @@ fn budgets_card(
                         Some(x) => (fmt_tokens(x), format!("{x:.0}")),
                         None => ("—".to_string(), String::new()),
                     };
-                    view! { <TableCell><span class="tabular-nums" title=exact>{label}</span></TableCell> }
+                    view! {
+                        <TableCell secondary=true>
+                            <span class="tabular-nums" title=exact>{label}</span>
+                        </TableCell>
+                    }
                 })
                 .collect_view();
             let name = c.clone();
@@ -237,10 +241,11 @@ fn budgets_card(
         .map(|e| view! { <div class="mb-4">{unavailable("live budgets (anthropic-lb /_stats)", e.detail())}</div> });
     let mirror_note = (!fleet_true).then(|| {
         view! {
-            <p class="text-sm mb-4">
-                <span class=badge(BadgeKind::Warning)>"replica-local"</span>
-                " Live numbers come from one replica's mirror (fleet aggregate unavailable): they reset on pod restart and undercount the fleet."
-            </p>
+            <div class="mb-4">
+                <Notice status=Status::Warn label="replica-local">
+                    "Live numbers come from one replica's mirror (fleet aggregate unavailable): they reset on pod restart and undercount the fleet."
+                </Notice>
+            </div>
         }
     });
     let history_note = burn
@@ -277,23 +282,20 @@ fn budgets_card(
 
 // ─── Upstream accounts: utilisation ─────────────────────────────────────────
 
-fn status_of(e: &Value) -> (String, String) {
+fn status_of(e: &Value) -> (Status, String) {
     if let Some(secs) = e.get("hard_limited_remaining_secs").and_then(Value::as_u64) {
-        return (
-            badge(BadgeKind::Destructive),
-            format!("hard-limited {secs}s"),
-        );
+        return (Status::Error, format!("hard-limited {secs}s"));
     }
     let (s5, s7) = (vs(e, "status_5h"), vs(e, "status_7d"));
     // Neither window reported: say so, never a fictitious "allowed".
     if s5.is_empty() && s7.is_empty() {
-        return (badge(BadgeKind::Muted), "unknown".into());
+        return (Status::Off, "unknown".into());
     }
     let throttled = |s: &str| !s.is_empty() && s != "allowed";
     if throttled(&s5) || throttled(&s7) {
-        return (badge(BadgeKind::Warning), format!("{s5} / {s7}"));
+        return (Status::Warn, format!("{s5} / {s7}"));
     }
-    (badge(BadgeKind::Success), "allowed".into())
+    (Status::Ok, "allowed".into())
 }
 
 // Deliberately no request-headroom column, and none of the `headroom_requests`
@@ -325,13 +327,11 @@ fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                         .get("passthrough")
                         .and_then(Value::as_bool)
                         .unwrap_or(false)
-                        .then(
-                            || view! { <span class=badge(BadgeKind::Muted)>"passthrough"</span> },
-                        );
+                        .then(|| view! { <StatusBadge status=Status::Off label="passthrough" /> });
                     let priority = int_or_dash(e.get("priority"));
                     let u5 = ratio_pct(e.get("utilization_5h").and_then(Value::as_f64));
                     let u7 = ratio_pct(e.get("utilization_7d").and_then(Value::as_f64));
-                    let (status_class, status_text) = status_of(e);
+                    let (status, status_text) = status_of(e);
                     let reset_5h = e
                         .get("reset_5h")
                         .and_then(Value::as_f64)
@@ -340,17 +340,17 @@ fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                     view! {
                         <TableRow>
                             <TableCell>
-                                <div class="flex items-center gap-2">
-                                    <span class="font-mono text-xs">{name}</span>
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <span class="font-mono text-xs wrap-break-word">{name}</span>
                                     {passthrough}
                                 </div>
                             </TableCell>
-                            <TableCell>{protocol}</TableCell>
-                            <TableCell>{priority}</TableCell>
+                            <TableCell secondary=true>{protocol}</TableCell>
+                            <TableCell secondary=true>{priority}</TableCell>
                             <TableCell><span class="tabular-nums">{u5}</span></TableCell>
                             <TableCell><span class="tabular-nums">{u7}</span></TableCell>
-                            <TableCell><span class=status_class>{status_text}</span></TableCell>
-                            <TableCell><span class="whitespace-nowrap">{reset_5h}</span></TableCell>
+                            <TableCell><StatusBadge status=status label=status_text /></TableCell>
+                            <TableCell secondary=true><span class="whitespace-nowrap">{reset_5h}</span></TableCell>
                         </TableRow>
                     }
                 })
@@ -360,12 +360,12 @@ fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                     <TableHeader>
                         <TableRow>
                             <TableHead>"Account"</TableHead>
-                            <TableHead>"Protocol"</TableHead>
-                            <TableHead>"Priority"</TableHead>
+                            <TableHead secondary=true>"Protocol"</TableHead>
+                            <TableHead secondary=true>"Priority"</TableHead>
                             <TableHead>"5h util"</TableHead>
                             <TableHead>"7d util"</TableHead>
                             <TableHead>"Status"</TableHead>
-                            <TableHead>"5h reset (UTC)"</TableHead>
+                            <TableHead secondary=true>"5h reset (UTC)"</TableHead>
                         </TableRow>
                     </TableHeader>
                     <TableBody>{rows}</TableBody>
@@ -378,7 +378,7 @@ fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
             <CardHeader>
                 <CardTitle>"Upstream accounts"</CardTitle>
                 <CardDescription>
-                    "Per account: Anthropic 5-hour / 7-day window utilisation, routing status and 5h reset, hottest first. Endpoints and priorities are TOML, GitOps."
+                    "Per account: Anthropic 5-hour / 7-day window utilisation and routing status, hottest first. Endpoints and priorities are TOML, GitOps."
                 </CardDescription>
             </CardHeader>
             <CardContent>{body}</CardContent>

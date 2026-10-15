@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 
 use super::{
     Outcome, actor_of, clean_reason, effect_href, guard, not_configured, outcome, page_html,
-    refused_locally, refused_text, send_recorded, store_of, write_log,
+    refused_locally, refused_text, send_recorded, store_of, sub_header, write_log,
 };
 use crate::confirm::{self, Needed, RowCheck};
 use crate::effect::{self, Doc, is_hex64, is_name};
@@ -510,7 +510,7 @@ fn preview_view(
     let diff = diff_of(answer);
     let lines = diff_lines(diff)
         .into_iter()
-        .map(|l| view! { <li class="font-mono text-xs">{l}</li> })
+        .map(|l| view! { <li class="font-mono text-xs break-all">{l}</li> })
         .collect_view();
     let cf = if answer.pointer("/cf/running").and_then(Value::as_bool) == Some(true) {
         "CF has reported in the last 15 s."
@@ -521,14 +521,17 @@ fn preview_view(
     notes.extend(toml_notes(diff, &gate.toml));
     let notes = notes
         .into_iter()
-        .map(|n| view! { <p class="text-sm"><span class=badge(BadgeKind::Warning)>"warning"</span>" "{n}</p> })
+        .map(|n| view! { <Notice status=Status::Warn label="warning">{n}</Notice> })
         .collect_view();
     let action = match (&gate.refused, diff.is_empty()) {
-        (Some(why), _) => view! {
-            <p class="text-sm"><span class=badge(BadgeKind::Destructive)>"refused"</span>" "{why.clone()}</p>
+        (Some(why), _) => {
+            let why = why.clone();
+            view! { <Notice status=Status::Error label="refused">{why}</Notice> }.into_any()
+        }
+        (None, true) => view! {
+            <EmptyState>"Nothing would change, so there is nothing to commit."</EmptyState>
         }
         .into_any(),
-        (None, true) => view! { <p class="text-sm">"Nothing would change, so there is nothing to commit."</p> }.into_any(),
         (None, false) => commit_form(op, expected, reason, &gate.needed, csrf).into_any(),
     };
     let title = format!("Preview: {}", op_title(op));
@@ -536,21 +539,19 @@ fn preview_view(
         "Nothing is written yet. The commit is pinned to document version {expected}: if the store moves on first, it answers 409 and writes nothing, so a resubmitted form never writes twice."
     );
     view! {
-        <Card>
-            <CardHeader>
-                <CardTitle>{title}</CardTitle>
-                <CardDescription>{pinned}</CardDescription>
-            </CardHeader>
-            <CardContent>
-                <div class="space-y-4">
-                    <ul class="space-y-1">{lines}</ul>
-                    <p class="text-xs text-muted-foreground">{cf}</p>
-                    <div class="space-y-2">{notes}</div>
-                    {action}
-                    <p class="text-sm"><a class="underline underline-offset-4" href="/lb/clients">"Back to LB clients"</a></p>
-                </div>
-            </CardContent>
-        </Card>
+        <div class="space-y-6">
+            {sub_header(title, pinned)}
+            <Card>
+                <CardContent>
+                    <div class="space-y-4">
+                        <ul class="space-y-1">{lines}</ul>
+                        <p class="text-xs text-muted-foreground">{cf}</p>
+                        <div class="space-y-2">{notes}</div>
+                        {action}
+                    </div>
+                </CardContent>
+            </Card>
+        </div>
     }
 }
 
@@ -572,7 +573,7 @@ fn commit_form(
             let label = format!("Type {phrase} to confirm.");
             view! {
                 <div class="space-y-1">
-                    <p class="text-sm"><span class=badge(BadgeKind::Destructive)>"confirm"</span>" "{warning}</p>
+                    <Notice status=Status::Error label="confirm">{warning}</Notice>
                     <label class="text-xs text-muted-foreground" for=field>{label}</label>
                     <input class=INPUT_CLASS id=field name=field required autocomplete="off" />
                 </div>
@@ -781,7 +782,7 @@ fn key_page(session: &Session, c: &Commit, effect: &str) -> Response {
                     <TableCell><span class="font-mono text-xs">{client}</span></TableCell>
                     <TableCell><span class="font-mono text-xs">{id}</span></TableCell>
                     <TableCell><code class="font-mono text-sm break-all select-all">{key}</code></TableCell>
-                    <TableCell><span class="font-mono text-xs break-all">{digest}</span></TableCell>
+                    <TableCell secondary=true><span class="font-mono text-xs break-all">{digest}</span></TableCell>
                 </TableRow>
             }
         })
@@ -789,29 +790,29 @@ fn key_page(session: &Session, c: &Commit, effect: &str) -> Response {
     let committed = format!("Committed document version {}.", c.version);
     let effect = effect.to_string();
     let content = view! {
-        <Card>
-            <CardHeader>
-                <CardTitle>"New key — shown once"</CardTitle>
-                <CardDescription>
-                    "Store it in 1Password now. The console keeps no copy: this page is not cached, and reloading it re-sends the write, which the store refuses because the document has moved on."
-                </CardDescription>
-            </CardHeader>
-            <CardContent>
-                <div class="space-y-4">
-                    <TableWrapper><Table>
-                        <TableHeader><TableRow>
-                            <TableHead>"Client"</TableHead>
-                            <TableHead>"Key id"</TableHead>
-                            <TableHead>"Key"</TableHead>
-                            <TableHead>"Digest"</TableHead>
-                        </TableRow></TableHeader>
-                        <TableBody>{rows}</TableBody>
-                    </Table></TableWrapper>
-                    <p class="text-sm">{committed}" Rotation with overlap: once every consumer reads the new key, revoke the old one from the client's row."</p>
-                    <p class="text-sm"><a class="underline underline-offset-4" href=effect>"Confirm the new document is in effect"</a></p>
-                </div>
-            </CardContent>
-        </Card>
+        <div class="space-y-6">
+            {sub_header(
+                "New key — shown once".into(),
+                "Store it in 1Password now. The console keeps no copy: this page is not cached, and reloading it re-sends the write, which the store refuses because the document has moved on.".into(),
+            )}
+            <Card>
+                <CardContent>
+                    <div class="space-y-4">
+                        <TableWrapper><Table>
+                            <TableHeader><TableRow>
+                                <TableHead>"Client"</TableHead>
+                                <TableHead>"Key id"</TableHead>
+                                <TableHead>"Key"</TableHead>
+                                <TableHead secondary=true>"Digest"</TableHead>
+                            </TableRow></TableHeader>
+                            <TableBody>{rows}</TableBody>
+                        </Table></TableWrapper>
+                        <p class="text-sm">{committed}" Rotation with overlap: once every consumer reads the new key, revoke the old one from the client's row."</p>
+                        <p class="text-sm"><Link href=effect>"Confirm the new document is in effect"</Link></p>
+                    </div>
+                </CardContent>
+            </Card>
+        </div>
     };
     let mut resp = Html(page_html(session, None, content)).into_response();
     resp.headers_mut()
@@ -831,7 +832,13 @@ pub async fn history(
         return Ok((jar, Html(page_html(&session, flash, not_configured()))));
     };
     let content = match m.client.read().await {
-        Err(e) => unavailable("client store", e.detail()).into_any(),
+        Err(e) => view! {
+            <div class="space-y-6">
+                {sub_header("Document history".into(), HISTORY.into())}
+                {unavailable("client store", e.detail())}
+            </div>
+        }
+        .into_any(),
         Ok(store) => history_view(&store, &session.csrf).into_any(),
     };
     Ok((jar, Html(page_html(&session, flash, content))))
@@ -854,13 +861,19 @@ fn op_summary(op: &Value) -> String {
     clip(format!("{kind} {target}").trim(), 120)
 }
 
+/// What the history page is for.
+const HISTORY: &str = "Every document the store committed, newest first, with what each changed. Restoring one previews the change first and commits only the row the preview showed. It is refused if instances installed that version with another digest, since the row was edited after the fact, and needs its version typed if no instance installed it in the last 30 days. Restore never brings back a revoked key.";
+
 fn history_view(store: &Value, csrf: &str) -> impl IntoView + use<> {
     let Some(doc) = store
         .get("document")
         .filter(|d| d.get("status").and_then(Value::as_str) == Some("ok"))
     else {
         return view! {
-            <p class="text-sm"><span class=badge(BadgeKind::Destructive)>"unavailable"</span>" The document side of the store did not answer, so its history cannot be read."</p>
+            <div class="space-y-6">
+                {sub_header("Document history".into(), HISTORY.into())}
+                {unavailable("document history", "the document side of the store did not answer")}
+            </div>
         }
         .into_any();
     };
@@ -878,7 +891,11 @@ fn history_view(store: &Value, csrf: &str) -> impl IntoView + use<> {
         ),
     };
     let unreadable = unreadable.map(|why| {
-        view! { <p class="text-sm mb-3"><span class=badge(BadgeKind::Destructive)>"unreadable"</span>" "{why}</p> }
+        view! {
+            <div class="mb-3">
+                <Notice status=Status::Error label="unreadable">{why}</Notice>
+            </div>
+        }
     });
     let rows: Vec<Value> = doc
         .get("history")
@@ -923,10 +940,10 @@ fn history_view(store: &Value, csrf: &str) -> impl IntoView + use<> {
             }
             let changes = diff_lines(r.get("diff").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default())
                 .into_iter()
-                .map(|l| view! { <li>{l}</li> })
+                .map(|l| view! { <li class="wrap-break-word">{l}</li> })
                 .collect_view();
             let action = match (version, current) {
-                (Some(v), Some(c)) if v == c => view! { <span class=badge(BadgeKind::Success)>"current"</span> }.into_any(),
+                (Some(v), Some(c)) if v == c => view! { <StatusBadge status=Status::Ok label="current" /> }.into_any(),
                 (Some(v), Some(c)) => restore_form(csrf, c, v).into_any(),
                 _ => view! { <span class="text-xs">"—"</span> }.into_any(),
             };
@@ -934,11 +951,11 @@ fn history_view(store: &Value, csrf: &str) -> impl IntoView + use<> {
             view! {
                 <TableRow>
                     <TableCell><span class="tabular-nums whitespace-nowrap" title=exact>{when}</span></TableCell>
-                    <TableCell><span class="font-mono text-xs" title=digest>{short}</span></TableCell>
-                    <TableCell><span class="text-xs whitespace-nowrap">{at}</span></TableCell>
-                    <TableCell><span class="text-xs">{who}</span></TableCell>
-                    <TableCell><span class="text-xs">{reason}</span></TableCell>
-                    <TableCell><span class="text-xs font-mono">{ops}</span></TableCell>
+                    <TableCell secondary=true><span class="font-mono text-xs" title=digest>{short}</span></TableCell>
+                    <TableCell secondary=true><span class="text-xs whitespace-nowrap">{at}</span></TableCell>
+                    <TableCell secondary=true><span class="text-xs wrap-break-word">{who}</span></TableCell>
+                    <TableCell secondary=true><span class="text-xs wrap-break-word">{reason}</span></TableCell>
+                    <TableCell secondary=true><span class="text-xs font-mono wrap-break-word">{ops}</span></TableCell>
                     <TableCell><ul class="text-xs font-mono">{changes}</ul></TableCell>
                     <TableCell>{action}</TableCell>
                 </TableRow>
@@ -967,32 +984,28 @@ fn history_view(store: &Value, csrf: &str) -> impl IntoView + use<> {
         None => "Document history (nothing can be restored now)".to_string(),
     };
     view! {
-        <Card>
-            <CardHeader>
-                <CardTitle>{title}</CardTitle>
-                <CardDescription>
-                    "Every document the store committed, newest first, with what each changed. Restoring one previews the change first and commits only the row the preview showed. It is refused if instances installed that version with another digest, since the row was edited after the fact, and needs its version typed if no instance installed it in the last 30 days. Restore never brings back a revoked key. "
-                    <a class="underline underline-offset-4" href="/lb/clients">"Back to LB clients"</a>
-                </CardDescription>
-            </CardHeader>
-            <CardContent>
-                {unreadable}
-                <TableWrapper><Table>
-                    <TableHeader><TableRow>
-                        <TableHead>"Version (UTC)"</TableHead>
-                        <TableHead>"Digest"</TableHead>
-                        <TableHead>"At"</TableHead>
-                        <TableHead>"By"</TableHead>
-                        <TableHead>"Reason"</TableHead>
-                        <TableHead>"Ops"</TableHead>
-                        <TableHead>"Changes"</TableHead>
-                        <TableHead>""</TableHead>
-                    </TableRow></TableHeader>
-                    <TableBody>{table}</TableBody>
-                </Table></TableWrapper>
-                {older_view}
-            </CardContent>
-        </Card>
+        <div class="space-y-6">
+            {sub_header(title, HISTORY.into())}
+            <Card>
+                <CardContent>
+                    {unreadable}
+                    <TableWrapper><Table>
+                        <TableHeader><TableRow>
+                            <TableHead>"Version (UTC)"</TableHead>
+                            <TableHead secondary=true>"Digest"</TableHead>
+                            <TableHead secondary=true>"At"</TableHead>
+                            <TableHead secondary=true>"By"</TableHead>
+                            <TableHead secondary=true>"Reason"</TableHead>
+                            <TableHead secondary=true>"Ops"</TableHead>
+                            <TableHead>"Changes"</TableHead>
+                            <TableHead>""</TableHead>
+                        </TableRow></TableHeader>
+                        <TableBody>{table}</TableBody>
+                    </Table></TableWrapper>
+                    {older_view}
+                </CardContent>
+            </Card>
+        </div>
     }
     .into_any()
 }
@@ -1008,8 +1021,10 @@ fn pinned(csrf: &str, expected: u64, op: &'static str) -> impl IntoView + use<> 
     }
 }
 
-fn reason_input() -> impl IntoView {
-    view! { <input class=INPUT_CLASS name="reason" required maxlength="200" placeholder="reason" /> }
+/// The reason every document op carries, in `class`: `INPUT_CLASS` in a
+/// form of its own, `row_input()` in a table row.
+fn reason_input(class: String) -> impl IntoView {
+    view! { <input class=class name="reason" required maxlength="200" placeholder="reason" /> }
 }
 
 fn restore_form(csrf: &str, current: u64, version: u64) -> impl IntoView + use<> {
@@ -1018,7 +1033,7 @@ fn restore_form(csrf: &str, current: u64, version: u64) -> impl IntoView + use<>
         <form method="post" action="/lb/clients/preview" class="flex items-center gap-2">
             {pinned(csrf, current, "restore")}
             <input type="hidden" name="version" value=version />
-            {reason_input()}
+            {reason_input(row_input())}
             <button type="submit" class=btn_sm(Btn::Outline)>"Restore…"</button>
         </form>
     }
@@ -1026,10 +1041,10 @@ fn restore_form(csrf: &str, current: u64, version: u64) -> impl IntoView + use<>
 
 fn restore_by_version_form(csrf: &str, current: u64) -> impl IntoView + use<> {
     view! {
-        <form method="post" action="/lb/clients/preview" class="flex items-end gap-3">
+        <form method="post" action="/lb/clients/preview" class="flex flex-col gap-3 sm:flex-row sm:items-end">
             {pinned(csrf, current, "restore")}
             <input class=INPUT_CLASS name="version" required inputmode="numeric" placeholder="version" />
-            {reason_input()}
+            {reason_input(INPUT_CLASS.into())}
             <button type="submit" class=btn(Btn::Outline)>"Restore…"</button>
         </form>
     }
@@ -1046,8 +1061,11 @@ pub(super) fn clients_card(store: &Value, csrf: &str) -> impl IntoView + use<> {
     else {
         return clients_shell(
             "Clients".into(),
-            view! { <p class="text-sm">"The document side of the store did not answer, so document ops are unavailable. Restriction ops still work."</p> }
-                .into_any(),
+            unavailable(
+                "document ops",
+                "the document side of the store did not answer. Restriction ops still work.",
+            )
+            .into_any(),
         );
     };
     let version = match effect::served_doc(store) {
@@ -1055,18 +1073,22 @@ pub(super) fn clients_card(store: &Value, csrf: &str) -> impl IntoView + use<> {
         Ok(None) => {
             return clients_shell(
                 "Clients".into(),
-                view! { <p class="text-sm">"The store holds no document at a version a write can address, so it takes no document op but the recovery ops: an import, or a point-in-time recovery."</p> }
-                    .into_any(),
+                view! {
+                    <Notice status=Status::Warn label="no document">
+                        "The store holds no document at a version a write can address, so it takes no document op but the recovery ops: an import, or a point-in-time recovery."
+                    </Notice>
+                }
+                .into_any(),
             );
         }
         Err(e) => {
             let why = format!(
-                "The store's document is unreadable ({}), so document ops are unavailable. Restriction ops still work.",
+                "the store's document is unreadable ({}). Restriction ops still work.",
                 clip(&e, 160)
             );
             return clients_shell(
                 "Clients".into(),
-                view! { <p class="text-sm">{why}</p> }.into_any(),
+                unavailable("document ops", &why).into_any(),
             );
         }
     };
@@ -1086,9 +1108,9 @@ pub(super) fn clients_card(store: &Value, csrf: &str) -> impl IntoView + use<> {
             <TableHeader><TableRow>
                 <TableHead>"Client"</TableHead>
                 <TableHead>"Daily budget"</TableHead>
-                <TableHead>"Utilization"</TableHead>
-                <TableHead>"Models"</TableHead>
-                <TableHead>"Pins"</TableHead>
+                <TableHead secondary=true>"Utilization"</TableHead>
+                <TableHead secondary=true>"Models"</TableHead>
+                <TableHead secondary=true>"Pins"</TableHead>
                 <TableHead>"Keys"</TableHead>
                 <TableHead>""</TableHead>
             </TableRow></TableHeader>
@@ -1108,7 +1130,7 @@ fn clients_shell(title: String, body: AnyView) -> AnyView {
                 <CardTitle>{title}</CardTitle>
                 <CardDescription>
                     "The clients the store's document grants, with their policies and keys (ids, labels and digests: the store keeps no key). Every change previews the store's diff first, pinned to the version this page read. "
-                    <a class="underline underline-offset-4" href="/lb/clients/history">"History and restore"</a>
+                    <Link href="/lb/clients/history">"History and restore"</Link>
                 </CardDescription>
             </CardHeader>
             <CardContent>{body}</CardContent>
@@ -1180,8 +1202,8 @@ fn client_row(c: &Value, csrf: &str, version: u64) -> impl IntoView + use<> {
             let digest = s("digest", 64);
             let form = revoke_form(csrf, version, &digest);
             view! {
-                <li class="flex items-center gap-2 mb-1">
-                    <span class="font-mono text-xs" title=digest>{text}</span>
+                <li class="flex flex-wrap items-center gap-2 mb-1">
+                    <span class="font-mono text-xs wrap-break-word" title=digest>{text}</span>
                     {form}
                 </li>
             }
@@ -1194,15 +1216,15 @@ fn client_row(c: &Value, csrf: &str, version: u64) -> impl IntoView + use<> {
     );
     view! {
         <TableRow>
-            <TableCell><span class="font-mono text-xs">{name}</span></TableCell>
+            <TableCell><span class="font-mono text-xs wrap-break-word">{name}</span></TableCell>
             <TableCell><span class="tabular-nums" title=budget_exact>{budget}</span></TableCell>
-            <TableCell><span class="tabular-nums">{util}</span></TableCell>
-            <TableCell><span class="text-xs font-mono">{models}</span></TableCell>
-            <TableCell><span class="text-xs font-mono">{pins}</span></TableCell>
+            <TableCell secondary=true><span class="tabular-nums">{util}</span></TableCell>
+            <TableCell secondary=true><span class="text-xs font-mono wrap-break-word">{models}</span></TableCell>
+            <TableCell secondary=true><span class="text-xs font-mono wrap-break-word">{pins}</span></TableCell>
             <TableCell><ul>{key_list}{more_keys}</ul></TableCell>
             <TableCell>
                 {manage}
-                <a class="text-xs underline underline-offset-4" href=disable>"disable…"</a>
+                <span class="text-xs"><Link href=disable>"disable…"</Link></span>
             </TableCell>
         </TableRow>
     }
@@ -1227,11 +1249,11 @@ fn manage_forms(
     } else {
         let name = name.to_string();
         view! {
-            <form method="post" action="/lb/clients/preview" class="flex items-end gap-2">
+            <form method="post" action="/lb/clients/preview" class="flex flex-col gap-2">
                 {pinned(csrf, version, "add_key")}
                 <input type="hidden" name="name" value=name />
                 <input class=INPUT_CLASS name="label" maxlength="64" placeholder="key label, e.g. 2026-10 rotation" />
-                {reason_input()}
+                {reason_input(INPUT_CLASS.into())}
                 <button type="submit" class=btn_sm(Btn::Outline)>"Add key…"</button>
             </form>
         }
@@ -1241,19 +1263,19 @@ fn manage_forms(
     view! {
         <details class="mb-1">
             <summary class="text-xs cursor-pointer underline underline-offset-4">"manage…"</summary>
-            <div class="space-y-3 mt-2 min-w-96">
+            <div class="space-y-3 mt-2 min-w-64 sm:min-w-96">
                 <form method="post" action="/lb/clients/preview" class="space-y-2">
                     {pinned(csrf, version, "update")}
                     <input type="hidden" name="name" value=n1 />
                     {policy}
-                    {reason_input()}
+                    {reason_input(INPUT_CLASS.into())}
                     <button type="submit" class=btn_sm(Btn::Outline)>"Update policy…"</button>
                 </form>
                 {add_key}
-                <form method="post" action="/lb/clients/preview" class="flex items-end gap-2">
+                <form method="post" action="/lb/clients/preview" class="flex flex-col gap-2">
                     {pinned(csrf, version, "delete")}
                     <input type="hidden" name="name" value=n2 />
-                    {reason_input()}
+                    {reason_input(INPUT_CLASS.into())}
                     <button type="submit" class=btn_sm(Btn::Destructive)>"Delete…"</button>
                 </form>
             </div>
@@ -1269,7 +1291,7 @@ fn policy_inputs(budget: &str, util: &str, models: &str, pins: &str) -> impl Int
         pins.to_string(),
     );
     view! {
-        <div class="grid grid-cols-2 gap-2">
+        <div class="grid gap-2 sm:grid-cols-2">
             <input class=INPUT_CLASS name="daily_budget" value=budget inputmode="numeric" placeholder="daily budget (tokens; empty = none)" />
             <input class=INPUT_CLASS name="utilization_limit" value=util inputmode="decimal" placeholder="utilization limit (0–1; empty = none)" />
             <input class=INPUT_CLASS name="models" value=models placeholder="models, comma-separated (empty = all)" />
@@ -1284,7 +1306,7 @@ fn revoke_form(csrf: &str, version: u64, digest: &str) -> impl IntoView + use<> 
         <form method="post" action="/lb/clients/preview" class="flex items-center gap-1">
             {pinned(csrf, version, "revoke_key")}
             <input type="hidden" name="digest" value=digest />
-            {reason_input()}
+            {reason_input(row_input())}
             <button type="submit" class=btn_sm(Btn::Destructive)>"Revoke…"</button>
         </form>
     }
@@ -1299,7 +1321,7 @@ fn create_form(csrf: &str, version: u64) -> impl IntoView + use<> {
                 {pinned(csrf, version, "create")}
                 <input class=INPUT_CLASS name="name" required maxlength="63" placeholder="client name" />
                 {policy}
-                {reason_input()}
+                {reason_input(INPUT_CLASS.into())}
                 <button type="submit" class=btn(Btn::Default)>"Create…"</button>
             </form>
         </details>
@@ -1313,10 +1335,10 @@ fn revoke_by_digest_form(csrf: &str, version: u64) -> impl IntoView + use<> {
         <details class="mt-3">
             <summary class="text-sm cursor-pointer">"Revoke a key by digest"</summary>
             <p class="text-xs text-muted-foreground my-2">"For a key the document no longer holds, such as one a delete left unrevoked: revoked here, no restore can bring it back. The store takes only a digest from the document or its history."</p>
-            <form method="post" action="/lb/clients/preview" class="flex items-end gap-3">
+            <form method="post" action="/lb/clients/preview" class="flex flex-col gap-3 sm:flex-row sm:items-end">
                 {pinned(csrf, version, "revoke_key")}
                 <input class=INPUT_CLASS name="digest" required maxlength="64" placeholder="key digest (64 hex)" />
-                {reason_input()}
+                {reason_input(INPUT_CLASS.into())}
                 <button type="submit" class=btn(Btn::Destructive)>"Revoke…"</button>
             </form>
         </details>

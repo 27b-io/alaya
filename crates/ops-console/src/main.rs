@@ -554,11 +554,10 @@ mod tests {
         let cleared = theme_cookie(&resp).expect("a removal cookie");
         assert!(cleared.contains("Max-Age=0"), "{cleared}");
 
-        // A crafted `back` cannot leave the console.
-        for off_site in ["//evil.com", "https://evil.com/x", "/%5Cevil.com"] {
-            let resp = switch(cookie.clone(), "dark", off_site).await;
-            assert_eq!(location(&resp), "/", "{off_site}");
-        }
+        // A crafted `back` cannot leave the console: `safe_next`'s own tests
+        // hold the rest of its table.
+        let resp = switch(cookie.clone(), "dark", "//evil.com").await;
+        assert_eq!(location(&resp), "/");
     }
 
     #[tokio::test]
@@ -3320,6 +3319,12 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(html.matches(">in effect<").count(), 2, "{html}");
             assert!(html.contains("acme"), "{html}");
+            // Whether a disable is served is how it stands: a phone shows it.
+            assert!(
+                html.contains("align-middle\"><span class=\"text-xs\">served</span>"),
+                "{html}"
+            );
+            assert!(!html.contains("md:table-cell\">Served</th>"), "{html}");
             assert!(!html.contains(STORE_TOKEN));
             // The bearer reached the store, and only GETs did.
             assert!(
@@ -4322,7 +4327,11 @@ mod tests {
             let sess = session::new_session("admin-sub".into(), None, None);
             let (_, html) =
                 get_page(&state, &session_cookie_header(&state, &sess), "/lb/clients").await;
-            assert!(html.contains("module not configured"), "{html}");
+            assert!(html.contains(">not configured</span>"), "{html}");
+            assert!(
+                html.contains("Set CLIENT_STORE_URL and CLIENT_STORE_TOKEN"),
+                "{html}"
+            );
         }
 
         // ─── Document ops ───────────────────────────────────────────────────

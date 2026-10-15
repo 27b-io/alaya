@@ -387,19 +387,19 @@ rule and its element renders unstyled, silently.
 not hand-write layout or recurring markup.
 
 - `ui/components.rs`: the atoms (button, badge, card, table, form classes),
-  copy-paste vendored from the Rust/UI registry, class strings verbatim,
+  copy-paste vendored from the Rust/UI registry, class strings verbatim
+  except the departures marked in `components.rs`,
   `variants!`/`clx!` macros expanded to plain Leptos components. The Leptos
   registry now lives at [rust-ui/leptos-ui](https://github.com/rust-ui/leptos-ui)
   (`app_crates/registry/src/ui/*.rs`, theme tokens in `style/tailwind.css`);
   [rust-ui/ui](https://github.com/rust-ui/ui) has moved to Dioxus.
 - `ui/patterns.rs`: the console's own components. `Status` maps what a
-  state means (ok, warn, error, off) to its badge; the pages not yet built
-  on these components still map their own (`verdict_badge` in
-  `routes/alaya.rs` and `routes/clients.rs`);
+  state means to its badge;
   `Notice` is a status badge plus a sentence (an `Error` notice is an alert),
   and `unavailable()` is the notice for a dark section; `EmptyState`,
-  `NotConfigured`, `Stat`/`StatGrid`, `PageHeader`, `Link` (the one link
-  style) and `HashLink`.
+  `NotConfigured`, `Stat`/`StatGrid`, `PageHeader` (each page has exactly
+  one), `Link` (the one link style; `external` sends no Referer) and
+  `HashLink`.
 - `ui/charts.rs`: key values as server-rendered SVG, which the CSP allows
   where a chart library's script would not: `Meter` (used against a limit,
   with warning and critical thresholds), `StackedBar` (a part-to-whole
@@ -416,6 +416,10 @@ not hand-write layout or recurring markup.
   `aria-current="page"`. From `lg` the navigation is a sidebar grouped by
   module; below it, a `<details>` menu in the top bar. The top bar holds the
   theme switch and logout once at every width.
+
+A wide table keeps the columns that say what a row is and how it stands; the
+rest are `secondary` on `TableHead` and `TableCell` and show from `md` up. A
+form stacks its fields below `sm` and lines them up from there.
 
 The CSP forbids scripts and inline style, so nothing may emit a script, a
 style element or a style attribute, and colour comes only from the theme
