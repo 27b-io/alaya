@@ -169,7 +169,7 @@ services:
       # JUDGE_PROVIDER: ${JUDGE_PROVIDER:-}
       # JUDGE_URL: ${JUDGE_URL:-}
       # JUDGE_API_KEY: ${JUDGE_API_KEY:-}
-      # JUDGE_MODEL: ${JUDGE_MODEL:-claude-sonnet-5}
+      # JUDGE_MODEL: ${JUDGE_MODEL:-claude-sonnet-5-5}
       # OAuth Resource Server (delegated auth via OIDC) — empty disables.
       # See README.md → OAuth section.
       # OIDC_ISSUER: ${OIDC_ISSUER:-}
