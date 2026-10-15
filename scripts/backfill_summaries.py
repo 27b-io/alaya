@@ -44,16 +44,23 @@ QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "memories_arctic1024")
 SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "claude-haiku-4-5-20251001")
 SUMMARY_MODEL_COMPLEX = os.environ.get("SUMMARY_MODEL_COMPLEX", "claude-sonnet-4-6")
 COMPLEXITY_THRESHOLD = int(os.environ.get("COMPLEXITY_THRESHOLD", "200"))  # chars
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-l-v2.0")
+EMBEDDING_MODEL = os.environ.get(
+    "EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-l-v2.0"
+)
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "5"))
 THROTTLE_DELAY = float(os.environ.get("THROTTLE_DELAY", "0.2"))
-PROGRESS_FILE = Path(os.environ.get("PROGRESS_FILE", "backfill_summaries_progress.json"))
+PROGRESS_FILE = Path(
+    os.environ.get("PROGRESS_FILE", "backfill_summaries_progress.json")
+)
 
 SYSTEM_PROMPT = (
     "Summarize the following in one concise sentence of approximately 50 tokens. "
     "Return only the summary, no preamble."
 )
 MAX_CONTENT_CHARS = 4000
+# Same cap as the server (max_output_tokens in crates/alaya-backends/src/summary.rs):
+# a reply cut off at max_tokens is still stored, and 100 cut off one summary in six.
+MAX_OUTPUT_TOKENS = 500
 
 # Retryable exception types (network errors + mid-response resets)
 RETRYABLE = (
@@ -126,11 +133,13 @@ async def scroll_all_qdrant(client: httpx.AsyncClient) -> list[dict]:
             content = payload.get("content")
             content_hash = payload.get("content_hash")
             if content and content_hash:
-                memories.append({
-                    "content": content,
-                    "content_hash": content_hash,
-                    "summary": payload.get("summary"),
-                })
+                memories.append(
+                    {
+                        "content": content,
+                        "content_hash": content_hash,
+                        "summary": payload.get("summary"),
+                    }
+                )
 
         next_offset = data.get("result", {}).get("next_page_offset")
         if next_offset is None:
@@ -175,13 +184,15 @@ async def _scroll_request(client: httpx.AsyncClient, body: dict) -> httpx.Respon
 async def generate_summary(client: httpx.AsyncClient, content: str) -> str | None:
     """Call anthropic-lb to generate a summary. Promotes to Sonnet for complex content."""
     truncated = content[:MAX_CONTENT_CHARS]
-    model = SUMMARY_MODEL_COMPLEX if len(content) > COMPLEXITY_THRESHOLD else SUMMARY_MODEL
+    model = (
+        SUMMARY_MODEL_COMPLEX if len(content) > COMPLEXITY_THRESHOLD else SUMMARY_MODEL
+    )
 
     resp = await client.post(
         f"{SUMMARY_URL}/v1/messages",
         json={
             "model": model,
-            "max_tokens": 100,
+            "max_tokens": MAX_OUTPUT_TOKENS,
             "system": SYSTEM_PROMPT,
             "messages": [{"role": "user", "content": truncated}],
         },
@@ -213,7 +224,9 @@ async def generate_summary(client: httpx.AsyncClient, content: str) -> str | Non
     stop=stop_after_attempt(3),
     reraise=True,
 )
-async def generate_embedding(client: httpx.AsyncClient, text: str) -> list[float] | None:
+async def generate_embedding(
+    client: httpx.AsyncClient, text: str
+) -> list[float] | None:
     """Generate embedding via TEI (OpenAI-compatible endpoint)."""
     resp = await client.post(
         f"{EMBEDDING_URL}/v1/embeddings",
@@ -364,7 +377,9 @@ async def main():
     if not args.embeddings_only:
         print(f"  summary:     {SUMMARY_URL}")
         print(f"  model:       {SUMMARY_MODEL} (< {COMPLEXITY_THRESHOLD} chars)")
-        print(f"  model:       {SUMMARY_MODEL_COMPLEX} (>= {COMPLEXITY_THRESHOLD} chars)")
+        print(
+            f"  model:       {SUMMARY_MODEL_COMPLEX} (>= {COMPLEXITY_THRESHOLD} chars)"
+        )
     print(f"  embedding:   {EMBEDDING_URL}")
     print(f"  concurrency: {CONCURRENCY}")
     print(f"  throttle:    {THROTTLE_DELAY}s")
@@ -404,7 +419,9 @@ async def main():
             queue.put_nowait(m)
 
         workers = [
-            asyncio.create_task(worker(queue, client, completed, stats, args.embeddings_only))
+            asyncio.create_task(
+                worker(queue, client, completed, stats, args.embeddings_only)
+            )
             for _ in range(CONCURRENCY)
         ]
 

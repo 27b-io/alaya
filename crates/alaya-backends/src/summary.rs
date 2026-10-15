@@ -11,14 +11,16 @@ use crate::{Provider, SummaryProvider};
 const SYSTEM_PROMPT: &str = "Summarize the following in one concise sentence of approximately 50 tokens. \
      Return only the summary, no preamble.";
 
-/// Output budget per wire. The Anthropic wire keeps the 100 it sent before
-/// the provider switch (LAB-6877 AC-7). A reasoning model on the OpenAI wire
-/// spends `max_completion_tokens` on hidden reasoning first, and 100 can
-/// leave no room for the summary (`finish_reason: "length"`, no content).
-/// The cap is an upper bound, not a spend: a ~50-token summary costs the same.
+/// Output budget per wire. A cut-off completion is still stored as the
+/// summary, so the cap must clear the longest one-sentence summary: at 100
+/// on the Anthropic wire, Haiku 4.5 hit `max_tokens` on 15-18% of a 300-memory
+/// sample; at 500 every one of those finished, the longest at 195 tokens.
+/// A reasoning model on the OpenAI wire spends `max_completion_tokens` on
+/// hidden reasoning first, and needs more (`finish_reason: "length"`, no
+/// content). The cap is an upper bound, not a spend.
 const fn max_output_tokens(provider: Provider) -> u32 {
     match provider {
-        Provider::Anthropic => 100,
+        Provider::Anthropic => 500,
         Provider::OpenAi => 1024,
     }
 }
@@ -97,11 +99,11 @@ mod tests {
         assert!(!msg.contains("abc"), "error echoed the key: {msg}");
     }
 
-    /// LAB-6877 AC-7: the default wire's summary budget is what it was before
-    /// the provider switch; only the openai wire gets reasoning headroom.
+    /// The Anthropic wire clears the longest measured summary; the openai
+    /// wire adds headroom for hidden reasoning.
     #[test]
-    fn budget_is_raised_on_the_openai_wire_only() {
-        assert_eq!(max_output_tokens(Provider::Anthropic), 100);
+    fn budget_per_wire() {
+        assert_eq!(max_output_tokens(Provider::Anthropic), 500);
         assert_eq!(max_output_tokens(Provider::OpenAi), 1024);
     }
 
