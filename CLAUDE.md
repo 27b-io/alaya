@@ -160,7 +160,7 @@ SUMMARY_URL=                             # optional — API origin; client appen
                                          #   (https://api.anthropic.com); plain http only for a cluster-local proxy (http://anthropic-lb:8082).
                                          #   Boot is refused when a key would go over http to any other host (applies to JUDGE_URL too)
 SUMMARY_API_KEY=
-SUMMARY_MODEL=claude-haiku-4-5-20251001
+SUMMARY_MODEL=claude-haiku-5-5
 JUDGE_PROVIDER=                          # falls back to SUMMARY_PROVIDER; same prompt, schema and validation on either wire
 JUDGE_URL=                               # contradiction judge; URL and key fall back to their SUMMARY_* twin
 JUDGE_API_KEY=                           #   (so SUMMARY_URL alone enables the judge). Both unset = judge disabled.

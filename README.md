@@ -162,7 +162,7 @@ Copy `.env.example` to `.env`. All settings have sensible defaults for local dev
 | `SUMMARY_PROVIDER` | `anthropic` | Wire protocol for `SUMMARY_URL`: `anthropic` (Messages API, `x-api-key`) or `openai` (any OpenAI-compatible endpoint, e.g. a LiteLLM proxy or vLLM: `/v1/chat/completions`, `Authorization: Bearer`). Any other value refuses boot |
 | `SUMMARY_URL` | — | API origin, e.g. `https://api.anthropic.com` or an in-cluster proxy such as `http://anthropic-lb:8082` (optional). The client appends `/v1/messages` (`anthropic`) or `/v1/chat/completions` (`openai`) — do not include the path. With a key set, plain `http://` to any host that is not cluster-local is refused at boot |
 | `SUMMARY_API_KEY` | — | Required if `SUMMARY_URL` is set |
-| `SUMMARY_MODEL` | `claude-haiku-4-5-20251001` | Summary model |
+| `SUMMARY_MODEL` | `claude-haiku-5-5` | Summary model |
 | `JUDGE_PROVIDER` | `SUMMARY_PROVIDER` | Wire protocol for `JUDGE_URL`, same values as `SUMMARY_PROVIDER`. Prompt, verdict schema and validation are the same on both; the schema goes out as `output_config` (`anthropic`) or `response_format` json_schema, strict (`openai`) |
 | `JUDGE_URL` | `SUMMARY_URL` | Contradiction judge API origin, same format as `SUMMARY_URL` (optional). Falls back to `SUMMARY_URL`; unset both to disable the judge |
 | `JUDGE_API_KEY` | `SUMMARY_API_KEY` | Falls back to `SUMMARY_API_KEY` |

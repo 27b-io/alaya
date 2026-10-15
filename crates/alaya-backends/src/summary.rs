@@ -11,22 +11,17 @@ use crate::{Provider, SummaryProvider};
 const SYSTEM_PROMPT: &str = "Summarize the following in one concise sentence of approximately 50 tokens. \
      Return only the summary, no preamble.";
 
-/// Output budget per wire. The Anthropic wire keeps the 100 it sent before
-/// the provider switch (LAB-6877 AC-7). A reasoning model on the OpenAI wire
-/// spends `max_completion_tokens` on hidden reasoning first, and 100 can
-/// leave no room for the summary (`finish_reason: "length"`, no content).
-/// The cap is an upper bound, not a spend: a ~50-token summary costs the same.
-const fn max_output_tokens(provider: Provider) -> u32 {
-    match provider {
-        Provider::Anthropic => 100,
-        Provider::OpenAi => 1024,
-    }
-}
+/// Output budget, both wires. A model that reasons first spends the budget on
+/// that before the summary: an OpenAI-wire reasoning model ends with
+/// `finish_reason: "length"` and no content, and `claude-haiku-5-5`, which
+/// thinks by default, returned no text for about 4 in 5 memories at 100
+/// (`scripts/summary_eval.py`). At 1024 none came back empty; the largest
+/// reply, thinking included, used 894. The cap is an upper bound, not a spend.
+const MAX_OUTPUT_TOKENS: u32 = 1024;
 
 pub struct SummaryClient {
     transport: MessagesTransport,
     model: String,
-    max_tokens: u32,
 }
 
 impl SummaryClient {
@@ -47,7 +42,6 @@ impl SummaryClient {
                 DEFAULT_REQUEST_TIMEOUT,
             )?,
             model,
-            max_tokens: max_output_tokens(provider),
         })
     }
 }
@@ -60,7 +54,7 @@ impl SummaryProvider for SummaryClient {
             model: &self.model,
             system: SYSTEM_PROMPT,
             user: truncate_chars(content),
-            max_tokens: self.max_tokens,
+            max_tokens: MAX_OUTPUT_TOKENS,
             schema: None,
         };
 
@@ -97,12 +91,42 @@ mod tests {
         assert!(!msg.contains("abc"), "error echoed the key: {msg}");
     }
 
-    /// LAB-6877 AC-7: the default wire's summary budget is what it was before
-    /// the provider switch; only the openai wire gets reasoning headroom.
-    #[test]
-    fn budget_is_raised_on_the_openai_wire_only() {
-        assert_eq!(max_output_tokens(Provider::Anthropic), 100);
-        assert_eq!(max_output_tokens(Provider::OpenAi), 1024);
+    /// The anthropic wire sends the shared budget and no `thinking` field, so
+    /// a model that thinks by default keeps doing so within the budget.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn anthropic_wire_sends_the_budget_and_no_thinking_field() {
+        use serde_json::json;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_json(json!({
+                "model": "test-model",
+                "max_tokens": 1024,
+                "system": SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": "the memory"}],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "content": [
+                    {"type": "thinking", "thinking": "…", "signature": "s"},
+                    {"type": "text", "text": " A summary. "},
+                ],
+                "stop_reason": "end_turn",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = SummaryClient::new(
+            Provider::Anthropic,
+            server.uri(),
+            "test-model".into(),
+            Some("test-key".into()),
+        )
+        .unwrap();
+        assert_eq!(client.summarize("the memory").await.unwrap(), "A summary.");
     }
 
     /// LAB-6877 AC-5: the openai wire carries the same prompt as system and

@@ -149,7 +149,7 @@ impl Config {
                 .eq_ignore_ascii_case("true"),
             summary_url: env_non_empty("SUMMARY_URL"),
             summary_api_key: env_non_empty("SUMMARY_API_KEY"),
-            summary_model: env_or("SUMMARY_MODEL", "claude-haiku-4-5-20251001"),
+            summary_model: env_or("SUMMARY_MODEL", "claude-haiku-5-5"),
             summary_provider,
             judge_provider,
             judge_url: env_non_empty("JUDGE_URL").or_else(|| env_non_empty("SUMMARY_URL")),
