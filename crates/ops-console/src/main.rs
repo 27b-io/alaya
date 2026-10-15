@@ -3335,6 +3335,13 @@ mod tests {
             home.contains("100+ awaiting your approval · 1 with no PR"),
             "{home}"
         );
+        // The chart breaks down only the rows the probe returned.
+        assert!(
+            home.contains(
+                r#"aria-label="The newest 100 tasks awaiting approval, by whether they have a PR: "#
+            ),
+            "{home}"
+        );
         let (_, pane) = render(state, "/selecta").await;
         assert!(
             pane.contains("1 gated task(s) have no usable approval PR"),

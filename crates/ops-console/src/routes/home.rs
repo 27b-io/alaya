@@ -114,12 +114,12 @@ pub async fn home(
             let (status, label, summary) = match probe {
                 Ok(rows) => {
                     let no_pr = rows.iter().filter(|r| r.approval_pr().is_none()).count();
-                    awaiting = Some((rows.len(), no_pr));
                     // A task with no PR cannot be approved: worth a look,
                     // though selecta itself is answering.
                     let status = if no_pr > 0 { Status::Warn } else { Status::Ok };
                     // A full probe means the list was cut, not that it is exact.
                     let full = rows.len() >= routes::selecta::AWAITING_SHOWN as usize;
+                    awaiting = Some((rows.len(), no_pr, full));
                     let mut summary = format!(
                         "{}{} awaiting your approval",
                         rows.len(),
@@ -134,14 +134,24 @@ pub async fn home(
                 // over a healthy network. The detail names the kind.
                 Err(e) => (Status::Error, "error", e.detail().to_string()),
             };
-            let mix = awaiting.map(|(n, no_pr)| {
+            let mix = awaiting.map(|(n, no_pr, full)| {
                 let parts = vec![
-                    Part::new("with an approval PR", Some((n - no_pr) as f64), Colour::SERIES[0]),
+                    Part::new(
+                        "with an approval PR",
+                        Some((n - no_pr) as f64),
+                        Colour::SERIES[0],
+                    ),
                     Part::new("no PR", Some(no_pr as f64), Colour::SERIES[1]),
                 ];
+                // A cut list breaks down only the rows returned, newest first.
+                let label = if full {
+                    format!("The newest {n} tasks awaiting approval, by whether they have a PR")
+                } else {
+                    "Tasks awaiting approval, by whether they have a PR".to_string()
+                };
                 view! {
                     <div class="mt-4">
-                        <StackedBar label="Tasks awaiting approval, by whether they have a PR" parts=parts />
+                        <StackedBar label=label parts=parts />
                     </div>
                 }
             });
