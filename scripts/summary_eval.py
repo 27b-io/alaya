@@ -9,8 +9,9 @@ Every memory the contradiction golden fixture names
 (``crates/alaya-core/tests/fixtures/contradiction_golden.json``) is fetched from a
 live Ālaya and summarised by each arm with the server's summary request: the
 system prompt is read from ``crates/alaya-backends/src/summary.rs``, the content
-is cut to 4000 characters and the timeout is 30 s, as in ``anthropic.rs``. Arms A
-and B send exactly the body ``anthropic_body`` builds today.
+is cut to 4000 characters and the timeout is 30 s, as in ``anthropic.rs``. The
+arms vary only the model, ``max_tokens`` and ``thinking`` of the body
+``anthropic_body`` builds.
 
     A  claude-haiku-4-5-20251001  max_tokens 500   (baseline)
     B  claude-haiku-5-5           max_tokens 500
@@ -423,21 +424,6 @@ def main() -> None:
             f"{r['mean_out']:>9.1f}{r['max_out']:>6}{r['p50']:>8.2f}{r['p95']:>8.2f}{r['mean_chars']:>7.0f}  "
             f"{'base' if arm == BASELINE else ('YES' if passes else 'no'):<5} {r['by_reason'] or '-'}"
         )
-
-    winner = next(
-        (arm for arm in ("B", "D", "C") if arm in rows and rows[arm]["pass"]), None
-    )
-    decision = {
-        "B": "B passes: switch the model, no request change",
-        "D": "D passes: raise the Anthropic-wire summary budget to 1024 and switch",
-        "C": "only C passes: needs a model-capability design, do not ship",
-        None: "nothing passes: keep the current model",
-    }[winner]
-    skipped = [arm for arm in ARMS if arm not in rows]
-    print(
-        f"\ndecision: {decision}"
-        + (f" (arms not run: {', '.join(skipped)})" if skipped else "")
-    )
 
     print("\n== failing summaries, first 5 per candidate arm")
     for arm in [a for a in ("B", "C", "D") if a in results]:
