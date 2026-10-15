@@ -127,7 +127,7 @@ fn fleet_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
 
             Either::Right(view! {
                 <StatGrid>
-                    <Stat label="Strategy">{strategy}</Stat>
+                    <Stat label="Strategy" text=true>{strategy}</Stat>
                     // `replicas_seen` counts heartbeating instances in the shared
                     // coordination store, which more than one deployment writes to —
                     // it is not this Deployment's replica count, and reading it as
@@ -137,7 +137,9 @@ fn fleet_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                         <StatusBadge status=redis label=redis_text />
                     </Stat>
                     // No pooled-headroom tile: see the note above accounts_card (LAB-4554).
-                    <Stat label="Upstream transport errors (fleet, cumulative)">{transport}</Stat>
+                    <Stat label="Upstream transport errors (fleet, cumulative)" text=true>
+                        {transport}
+                    </Stat>
                 </StatGrid>
             })
         }
@@ -339,7 +341,7 @@ fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                         <TableRow>
                             <TableCell>
                                 <div class="flex flex-wrap items-center gap-2">
-                                    <span class="font-mono text-xs break-all">{name}</span>
+                                    <span class="font-mono text-xs wrap-break-word">{name}</span>
                                     {passthrough}
                                 </div>
                             </TableCell>

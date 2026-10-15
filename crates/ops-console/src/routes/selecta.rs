@@ -117,10 +117,10 @@ pub async fn task(
             let result_path = t.result_path.unwrap_or_else(|| "—".into());
             Either::Right(view! {
                 <StatGrid>
-                    <Stat label="Verb"><span class="font-mono text-sm">{t.verb}</span></Stat>
+                    <Stat label="Verb" text=true><span class="font-mono">{t.verb}</span></Stat>
                     <Stat label="State">{t.state}</Stat>
                     <Stat label="Tier">{t.tier}</Stat>
-                    <Stat label="Approval PR"><span class="text-sm">{pr}</span></Stat>
+                    <Stat label="Approval PR" text=true>{pr}</Stat>
                 </StatGrid>
                 <h3 class="text-sm font-medium mt-6 mb-2">"Result path"</h3>
                 <p class="font-mono text-xs break-all">{result_path}</p>
@@ -291,7 +291,7 @@ fn runner_card(
                     };
                     view! {
                         <TableRow>
-                            <TableCell><span class="font-mono text-xs break-all">{name}</span></TableCell>
+                            <TableCell><span class="font-mono text-xs wrap-break-word">{name}</span></TableCell>
                             <TableCell>{cell}</TableCell>
                         </TableRow>
                     }
@@ -378,7 +378,7 @@ fn approvals_card(
                     let link = task_link(&r.task_id);
                     view! {
                         <TableRow>
-                            <TableCell><span class="font-mono text-xs break-all">{verb}</span></TableCell>
+                            <TableCell><span class="font-mono text-xs wrap-break-word">{verb}</span></TableCell>
                             <TableCell secondary=true>{tier}</TableCell>
                             <TableCell secondary=true><span class="whitespace-nowrap">{when}</span></TableCell>
                             <TableCell>{pr}</TableCell>
@@ -441,7 +441,7 @@ fn failures_card(
                     let link = task_link(&r.task_id);
                     view! {
                         <TableRow>
-                            <TableCell><span class="font-mono text-xs break-all">{verb}</span></TableCell>
+                            <TableCell><span class="font-mono text-xs wrap-break-word">{verb}</span></TableCell>
                             <TableCell secondary=true><span class="whitespace-nowrap">{when}</span></TableCell>
                             <TableCell><span class="text-xs wrap-break-word">{audit}</span></TableCell>
                             <TableCell>{link}</TableCell>

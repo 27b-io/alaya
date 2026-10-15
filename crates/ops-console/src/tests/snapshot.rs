@@ -216,8 +216,8 @@ fn operator_cookie(state: &AppState, theme: Option<&str>) -> String {
 
 /// GET every page of `worlds` as the operator, in `theme` when one is given,
 /// and hold each to what every snapshot must be: the status its world
-/// answers, nothing the CSP blocks, every module configured, and in the
-/// healthy world no dark section. Returns (stem, HTML) in page order.
+/// answers, nothing the CSP blocks, every module configured, one page
+/// heading (a `PageHeader`), and in the healthy world no dark section. Returns (stem, HTML) in page order.
 async fn render_pages(
     worlds: &[(AppState, Vec<Page>, bool)],
     theme: Option<&str>,
@@ -239,6 +239,9 @@ async fn render_pages(
             assert!(!html.contains("<script"), "{stem}: a script the CSP blocks");
             assert!(!html.contains(" style="), "{stem}: a style the CSP blocks");
             assert!(!html.contains("not configured"), "{stem}: {html}");
+            if status == StatusCode::OK {
+                assert_eq!(html.matches("<h1").count(), 1, "{stem}: one page heading");
+            }
             if !*down {
                 for dark in DARK {
                     assert!(

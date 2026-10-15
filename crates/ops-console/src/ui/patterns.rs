@@ -10,10 +10,9 @@ use super::components::{BadgeKind, badge};
 
 /// What a state means to the operator. A page picks the meaning and this
 /// picks the look, once, so "failing" on one page and "unreachable" on
-/// another wear the same badge. Pages not yet built on these components
-/// still pick badge kinds themselves: `verdict_badge` in `routes/alaya.rs`
-/// (a judge verdict, which is a category rather than a state) and in
-/// `routes/clients.rs`.
+/// another wear the same badge. A badge that names a category rather than a
+/// state picks its own kind: for example a judge verdict (`verdict_badge` in
+/// `routes/alaya.rs`), a memory's type or its tags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     /// Working as it should: passing, healthy, reachable.
@@ -101,13 +100,24 @@ pub fn StatGrid(children: Children) -> impl IntoView {
 }
 
 /// One key value under its label. The value is the children, so it can be a
-/// number, a word or a link.
+/// number, a word or a link. A `text` value is words rather than a figure (a
+/// reason, a URL, a list): set at body size, so it wraps without crowding
+/// the grid.
 #[component]
-pub fn Stat(#[prop(into)] label: String, children: Children) -> impl IntoView {
+pub fn Stat(
+    #[prop(into)] label: String,
+    #[prop(optional)] text: bool,
+    children: Children,
+) -> impl IntoView {
+    let value = if text {
+        "mt-1 text-sm wrap-break-word"
+    } else {
+        "mt-1 text-xl font-semibold tabular-nums wrap-break-word"
+    };
     view! {
         <div class="min-w-0 rounded-lg border bg-card p-4">
             <dt class="text-xs text-muted-foreground wrap-break-word">{label}</dt>
-            <dd class="mt-1 text-xl font-semibold tabular-nums wrap-break-word">{children()}</dd>
+            <dd class=value>{children()}</dd>
         </div>
     }
 }
@@ -126,7 +136,7 @@ pub fn PageHeader(
         <div class="flex flex-wrap items-end justify-between gap-x-6 gap-y-3">
             <div class="min-w-0 max-w-3xl space-y-1">
                 <h1 class="text-2xl font-semibold tracking-tight wrap-break-word">{title}</h1>
-                {description.map(|d| view! { <p class="text-sm text-muted-foreground">{d}</p> })}
+                {description.map(|d| view! { <p class="text-sm text-muted-foreground wrap-break-word">{d}</p> })}
             </div>
             {children.map(|c| view! { <div class="flex flex-wrap items-center gap-2">{c()}</div> })}
         </div>
@@ -224,6 +234,11 @@ mod tests {
         assert!(out.contains(">41</dd></div>"), "{out}");
         assert_eq!(out.matches("<dt").count(), 2, "{out}");
         assert_eq!(out.matches("<dd").count(), 2, "{out}");
+        let text = html(view! { <Stat label="Reason" text=true>"stale"</Stat> });
+        assert!(
+            text.contains(r#"<dd class="mt-1 text-sm wrap-break-word">stale</dd>"#),
+            "{text}"
+        );
     }
 
     #[test]
@@ -262,5 +277,15 @@ mod tests {
             "{out}"
         );
         assert!(out.contains(">abababababab</a>"), "{out}");
+    }
+
+    /// A link off the console sends no Referer; one within it is untouched.
+    #[test]
+    fn an_external_link_sends_no_referer() {
+        let out =
+            html(view! { <Link href="https://github.com/x/y/pull/1" external=true>"PR #1"</Link> });
+        assert!(out.contains(r#"rel="noreferrer""#), "{out}");
+        let own = html(view! { <Link href="/alaya">"Memories"</Link> });
+        assert!(!own.contains("rel="), "{own}");
     }
 }

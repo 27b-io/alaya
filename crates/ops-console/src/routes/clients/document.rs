@@ -940,7 +940,7 @@ fn history_view(store: &Value, csrf: &str) -> impl IntoView + use<> {
             }
             let changes = diff_lines(r.get("diff").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default())
                 .into_iter()
-                .map(|l| view! { <li class="break-all">{l}</li> })
+                .map(|l| view! { <li class="wrap-break-word">{l}</li> })
                 .collect_view();
             let action = match (version, current) {
                 (Some(v), Some(c)) if v == c => view! { <StatusBadge status=Status::Ok label="current" /> }.into_any(),
@@ -955,7 +955,7 @@ fn history_view(store: &Value, csrf: &str) -> impl IntoView + use<> {
                     <TableCell secondary=true><span class="text-xs whitespace-nowrap">{at}</span></TableCell>
                     <TableCell secondary=true><span class="text-xs wrap-break-word">{who}</span></TableCell>
                     <TableCell secondary=true><span class="text-xs wrap-break-word">{reason}</span></TableCell>
-                    <TableCell secondary=true><span class="text-xs font-mono break-all">{ops}</span></TableCell>
+                    <TableCell secondary=true><span class="text-xs font-mono wrap-break-word">{ops}</span></TableCell>
                     <TableCell><ul class="text-xs font-mono">{changes}</ul></TableCell>
                     <TableCell>{action}</TableCell>
                 </TableRow>
@@ -1219,7 +1219,7 @@ fn client_row(c: &Value, csrf: &str, version: u64) -> impl IntoView + use<> {
     );
     view! {
         <TableRow>
-            <TableCell><span class="font-mono text-xs break-all">{name}</span></TableCell>
+            <TableCell><span class="font-mono text-xs wrap-break-word">{name}</span></TableCell>
             <TableCell><span class="tabular-nums" title=budget_exact>{budget}</span></TableCell>
             <TableCell secondary=true><span class="tabular-nums">{util}</span></TableCell>
             <TableCell secondary=true><span class="text-xs font-mono wrap-break-word">{models}</span></TableCell>

@@ -393,13 +393,16 @@ not hand-write layout or recurring markup.
   (`app_crates/registry/src/ui/*.rs`, theme tokens in `style/tailwind.css`);
   [rust-ui/ui](https://github.com/rust-ui/ui) has moved to Dioxus.
 - `ui/patterns.rs`: the console's own components. `Status` maps what a
-  state means (ok, warn, error, off) to its badge; the pages not yet built
-  on these components still map their own (`verdict_badge` in
-  `routes/alaya.rs` and `routes/clients.rs`);
+  state means to its badge;
   `Notice` is a status badge plus a sentence (an `Error` notice is an alert),
   and `unavailable()` is the notice for a dark section; `EmptyState`,
-  `NotConfigured`, `Stat`/`StatGrid`, `PageHeader`, `Link` (the one link
-  style) and `HashLink`.
+  `NotConfigured`, `Stat`/`StatGrid`, `PageHeader` (each page has exactly
+  one), `Link` (the one link style; `external` sends no Referer) and
+  `HashLink`.
+
+A wide table keeps the columns that say what a row is and how it stands; the
+rest are `secondary` on `TableHead` and `TableCell` and show from `md` up. A
+form stacks its fields below `sm` and lines them up from there.
 - `ui/shell.rs`: the document and the page shell. Every handler passes the
   `Nav` entry its page belongs under to `page()`; the shell marks that entry
   `aria-current="page"`. From `lg` the navigation is a sidebar grouped by

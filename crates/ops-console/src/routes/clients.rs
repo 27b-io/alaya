@@ -570,7 +570,7 @@ fn restrictions_card(
                 <TableRow>
                     <TableCell>
                         <div class="flex flex-wrap items-center gap-1">
-                            <span class="font-mono text-xs break-all">{name}</span>
+                            <span class="font-mono text-xs wrap-break-word">{name}</span>
                             {flag}
                         </div>
                     </TableCell>

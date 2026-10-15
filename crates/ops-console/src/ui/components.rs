@@ -57,7 +57,6 @@ pub enum BadgeKind {
     Destructive,
     Success,
     Warning,
-    Info,
 }
 
 pub fn badge(kind: BadgeKind) -> String {
@@ -69,7 +68,6 @@ pub fn badge(kind: BadgeKind) -> String {
         }
         BadgeKind::Success => "border-transparent bg-success-light text-success-dark",
         BadgeKind::Warning => "border-transparent bg-warning-light text-warning-dark",
-        BadgeKind::Info => "border-transparent bg-info-light text-info-dark",
     };
     format!("{BADGE_BASE} {variant}")
 }
@@ -181,3 +179,39 @@ pub const LABEL_CLASS: &str =
 pub const TEXTAREA_CLASS: &str = "border-input placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-ring/50 flex min-h-16 w-full rounded-md border bg-transparent px-3 py-2 text-base shadow-xs transition-[color,box-shadow] outline-none focus-visible:ring-[3px] md:text-sm";
 
 pub const SELECT_CLASS: &str = "border-input flex h-9 w-fit items-center justify-between gap-2 rounded-md border bg-transparent px-3 py-2 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px]";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A secondary column hides below `md` in its head and its cells alike,
+    /// and a primary one never does.
+    #[test]
+    fn a_secondary_column_hides_on_a_phone() {
+        let html = view! {
+            <TableRow>
+                <TableHead>"Name"</TableHead>
+                <TableHead secondary=true>"Actor"</TableHead>
+            </TableRow>
+            <TableRow>
+                <TableCell>"acme"</TableCell>
+                <TableCell secondary=true>"ops"</TableCell>
+            </TableRow>
+        }
+        .to_html();
+        assert_eq!(html.matches(SECONDARY).count(), 2, "{html}");
+        assert!(
+            html.contains(&format!("{SECONDARY}\">Actor</th>")),
+            "{html}"
+        );
+        assert!(html.contains(&format!("{SECONDARY}\">ops</td>")), "{html}");
+        assert!(html.contains("align-middle\">acme</td>"), "{html}");
+    }
+
+    #[test]
+    fn a_row_input_keeps_a_minimum_width() {
+        assert!(row_input().contains(" min-w-32 "));
+        assert!(!row_input().contains("min-w-0"));
+        assert_eq!(row_input().replace("min-w-32", "min-w-0"), INPUT_CLASS);
+    }
+}
