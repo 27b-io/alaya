@@ -149,13 +149,13 @@ impl Config {
                 .eq_ignore_ascii_case("true"),
             summary_url: env_non_empty("SUMMARY_URL"),
             summary_api_key: env_non_empty("SUMMARY_API_KEY"),
-            summary_model: env_or("SUMMARY_MODEL", "claude-haiku-4-5-20251001"),
+            summary_model: env_or("SUMMARY_MODEL", "claude-haiku-5-5"),
             summary_provider,
             judge_provider,
             judge_url: env_non_empty("JUDGE_URL").or_else(|| env_non_empty("SUMMARY_URL")),
             judge_api_key: env_non_empty("JUDGE_API_KEY")
                 .or_else(|| env_non_empty("SUMMARY_API_KEY")),
-            judge_model: env_non_empty("JUDGE_MODEL").unwrap_or_else(|| "claude-sonnet-5".into()),
+            judge_model: env_non_empty("JUDGE_MODEL").unwrap_or_else(|| "claude-sonnet-5-5".into()),
             judge_daily_cap: parse_judge_daily_cap(env_non_empty("JUDGE_DAILY_CAP"))
                 .unwrap_or_else(|e| panic!("{e}")),
             rerank_url: env_non_empty("RERANK_URL"),
