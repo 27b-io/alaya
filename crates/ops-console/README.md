@@ -159,8 +159,8 @@ module must not grow one. Values render with their provenance; limits are
   `allowed_warning` and `throttled` as), hard-limit / throttle status, next
   5h reset; hottest first.
 
-Each card degrades on its own: a dark metrics store leaves live headroom
-up, an LB outage leaves the burn history up. Every upstream client in the
+Each card degrades on its own: a dark metrics store leaves the live budget
+meters up, an LB outage leaves the burn history up. Every upstream client in the
 console refuses redirects (no credential ever rides a 3xx off-host).
 
 ## Client-store module (LB client management)
@@ -315,9 +315,11 @@ security review first.
 - **Recent failures** — the newest failed tasks: verb, enqueued time and the
   200-character audit excerpt, each linking to `/selecta/task/<id>`, which
   renders `selecta_get_task` with the whole audit.
-- **Tasks by state** — `queue_depth` per state. All time: selecta never
-  deletes a queue row. A state the console does not know still gets a
-  tile, and is flagged as an error.
+- **Tasks by state** — `queue_depth` per state: a stacked bar of the tasks
+  still in flight (`queued` through `executing`) over a tile per state. The
+  tiles count all time: selecta never deletes a queue row, so `done`,
+  `aborted_stale` and `failed` only grow, and stay off the bar. A state the
+  console does not know still gets a tile, and is flagged as an error.
 - **Download health** — `selecta_download_health` signals and alerts.
 
 Each read is one stateless JSON-RPC `tools/call` POST (no `initialize`),

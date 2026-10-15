@@ -165,20 +165,9 @@ fn fmt_secs(s: f64) -> String {
     }
 }
 
-/// A figure from selecta's /metrics or its health snapshot, which are
-/// Prometheus-style numbers: `NaN` and `±Inf` print as a dash, never as
-/// "NaN" or "inf".
-fn count(v: f64) -> String {
-    if v.is_finite() {
-        fmt_count(v)
-    } else {
-        "—".into()
-    }
-}
-
 /// A count for a cell; the torn-read sentinel renders as what it is.
 fn count_or_torn(v: f64, fmt: impl Fn(f64) -> String) -> String {
-    // An infinity is not the sentinel: `count` and its kin print it as a dash.
+    // An infinity is not the sentinel: `fmt_count` and its kin print it as a dash.
     if v.is_finite() && v >= TORN_SENTINEL {
         "unreadable (torn ledger read)".into()
     } else {
@@ -283,7 +272,7 @@ fn runner_card(
             };
             let tokens = count_or_torn(b.tokens, fmt_tokens);
             let wallclock = count_or_torn(b.wallclock_s, fmt_secs);
-            let toolcalls = count_or_torn(b.toolcalls, count);
+            let toolcalls = count_or_torn(b.toolcalls, fmt_count);
             let caps = g
                 .day_caps
                 .iter()
@@ -531,7 +520,7 @@ fn states_card(gauges: &Result<Gauges, AppError>) -> impl IntoView + use<> {
                         "awaiting_approval" if n > 0.0 => "text-warning-dark",
                         _ => "",
                     };
-                    let (label, n) = (s.to_string(), count(n));
+                    let (label, n) = (s.to_string(), fmt_count(n));
                     view! { <Stat label=label><span class=class>{n}</span></Stat> }
                 })
                 .collect_view();

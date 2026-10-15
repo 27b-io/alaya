@@ -10,7 +10,7 @@ use leptos::prelude::*;
 use serde_json::Value;
 
 use crate::error::AppError;
-use crate::lb::{fmt_tokens, live_budgets};
+use crate::lb::{Budget, fmt_tokens, live_budgets};
 use crate::routes;
 use crate::routes::health::DAY_COLUMNS;
 use crate::session::{Session, take_flash};
@@ -262,26 +262,20 @@ fn alaya_kpis(stats: &Value) -> impl IntoView + use<> {
     }
 }
 
-/// The LB's budget headroom: the clients nearest their daily limit, each a
-/// meter, tightest first.
+/// The LB's clients nearest their daily limit, each a meter, tightest first.
 fn tightest_budgets(stats: &Value) -> impl IntoView + use<> {
     const SHOWN: usize = 3;
     let (budgets, fleet) = live_budgets(stats);
-    let mut rows: Vec<(String, Option<f64>, Option<f64>)> = budgets
-        .into_iter()
-        .map(|(client, (used, limit))| (client, used, limit))
-        .collect();
-    // A client with no share (a figure missing, or a zero limit) sorts last.
-    let share = |used: Option<f64>, limit: Option<f64>| match (used, limit) {
-        (Some(u), Some(l)) if l > 0.0 && (u / l).is_finite() => u / l,
-        _ => f64::NEG_INFINITY,
-    };
-    rows.sort_by(|a, b| share(b.1, b.2).total_cmp(&share(a.1, a.2)));
+    let mut rows: Vec<_> = budgets.into_iter().collect();
+    // The meter's own share rule: a client with none (a figure missing or
+    // negative, or a zero limit) sorts last, and its meter says "no data".
+    let rank = |&(used, limit): &Budget| share(used, limit).unwrap_or(f64::NEG_INFINITY);
+    rows.sort_by(|(_, a), (_, b)| rank(b).total_cmp(&rank(a)));
     let more = rows.len().saturating_sub(SHOWN);
     let meters = rows
         .into_iter()
         .take(SHOWN)
-        .map(|(client, used, limit)| {
+        .map(|(client, (used, limit))| {
             let label = format!("{client}: live budget");
             view! {
                 <li class="min-w-0 space-y-1">
@@ -327,7 +321,7 @@ mod tests {
             "tight": budget(95, 100),
             "unlimited": budget(5, 0),
             "middling": budget(50, 100),
-            // A limit with no used figure has no share: it sorts last too.
+            // A limit with no used figure has no share either.
             "unreported": json!({ "limit": 100 }),
             "over": budget(130, 100),
         }}});
@@ -346,6 +340,31 @@ mod tests {
         );
         assert!(out.contains("3 more on the module page."), "{out}");
         assert!(!out.contains("One replica"), "{out}");
+    }
+
+    /// A client with no share sorts below one with a share of nothing: a
+    /// missing figure is not a zero, and a negative one is not a share.
+    /// Their names sort first, so a tie with `idle` would put them on top.
+    #[test]
+    fn a_client_with_no_share_sorts_below_an_idle_one() {
+        let stats = json!({ "cluster": { "budget_usage": {
+            "absent": { "limit": 100 },
+            "broken": { "used": -5, "limit": 100 },
+            "idle": { "used": 0, "limit": 100 },
+        }}});
+        let out = html(tightest_budgets(&stats));
+        let order: Vec<usize> = ["idle", "absent", "broken"]
+            .iter()
+            .map(|c| {
+                out.find(&format!(r#"aria-label="{c}: live budget"#))
+                    .expect(c)
+            })
+            .collect();
+        assert!(order.is_sorted(), "{out}");
+        assert!(
+            out.contains("broken: live budget: — / 100 · no data"),
+            "{out}"
+        );
     }
 
     /// Figures from one replica's mirror say so.

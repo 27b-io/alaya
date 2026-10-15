@@ -82,12 +82,6 @@ fn int_or_dash(v: Option<&Value>) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
-fn ratio_pct(r: Option<f64>) -> String {
-    r.filter(|x| x.is_finite())
-        .map(|x| format!("{:.0}%", x * 100.0))
-        .unwrap_or_else(|| "—".into())
-}
-
 /// A token figure for a cell, or a dash: never a fictitious zero.
 fn tokens(v: Option<f64>) -> String {
     v.map_or_else(|| "—".into(), fmt_tokens)
@@ -95,8 +89,7 @@ fn tokens(v: Option<f64>) -> String {
 
 /// The exact figure for a cell's `title`, or a dash.
 fn exact(v: Option<f64>) -> String {
-    v.filter(|x| x.is_finite())
-        .map_or_else(|| "—".into(), |x| format!("{x:.0}"))
+    v.map_or_else(|| "—".into(), fmt_count)
 }
 
 /// `MM-DD` column header for a UTC-midnight epoch.
@@ -261,7 +254,8 @@ fn budgets_card(
         .map(|c| {
             let live_cell = match live.get(c) {
                 Some(&(used, limit)) => {
-                    let pct = ratio_pct(used.zip(limit.filter(|l| *l > 0.0)).map(|(u, l)| u / l));
+                    // The meter's own rule and format, so the two never disagree.
+                    let pct = share(used, limit).map_or_else(|| "—".into(), fmt_share);
                     let title = format!("{} / {} tokens", exact(used), exact(limit));
                     let text = format!("{} / {} ({pct})", tokens(used), tokens(limit));
                     Either::Left(view! {
@@ -270,8 +264,9 @@ fn budgets_card(
                 }
                 None => Either::Right(view! { <span class="text-muted-foreground">"—"</span> }),
             };
+            // A dark store has no days, so no day cells either.
             let cells = series_of(c)
-                .unwrap_or_else(|| vec![None; day_starts.len()])
+                .unwrap_or_default()
                 .into_iter()
                 .map(|v| {
                     let (label, title) = (tokens(v), exact(v));
@@ -527,7 +522,7 @@ mod tests {
         let html = budgets_card(&Ok(sample_stats()), &Ok(sample_burn())).to_html();
         // Fleet-wide 17.9M, not the replica-local mirror's 1 token. (Adjacent
         // text nodes carry SSR markers between them — assert per fragment.)
-        assert!(html.contains("17913067 / 50000000 tokens"), "{html}");
+        assert!(html.contains("17,913,067 / 50,000,000 tokens"), "{html}");
         assert!(html.contains("17.9M") && html.contains("50.0M") && html.contains("36%"));
         assert!(
             html.contains("aria-label=\"kody: live budget: 17.9M / 50.0M, 36%\""),
@@ -559,10 +554,14 @@ mod tests {
         stats["cluster"]["redis_connected"] = json!(false);
         let html = budgets_card(&Ok(stats), &Ok(sample_burn())).to_html();
         assert!(html.contains("replica-local"), "{html}");
+        // The table prints the meter's share: 1 of 50M is `<1%` in both,
+        // never `0%` in one of them.
         assert!(
             html.contains("aria-label=\"kody: live budget: 1 / 50.0M, &lt;1%\""),
             "{html}"
         );
+        assert!(html.contains(">1 / 50.0M (&lt;1%)<"), "{html}");
+        assert!(!html.contains("(0%)"), "{html}");
     }
 
     /// A dark source keeps its named notice, and no chart stands in for it
@@ -688,12 +687,5 @@ mod tests {
         assert_eq!(t, "allowed");
         let (_, t) = status_of(&json!({"name": "acct-new"}));
         assert_eq!(t, "unknown");
-    }
-
-    #[test]
-    fn ratio_pct_never_invents_a_number() {
-        assert_eq!(ratio_pct(None), "—");
-        assert_eq!(ratio_pct(Some(0.29)), "29%");
-        assert_eq!(ratio_pct((0.0_f64 > 0.0).then(|| 5.0 / 0.0)), "—");
     }
 }
