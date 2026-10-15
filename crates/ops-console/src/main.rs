@@ -3319,6 +3319,12 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(html.matches(">in effect<").count(), 2, "{html}");
             assert!(html.contains("acme"), "{html}");
+            // Whether a disable is served is how it stands: a phone shows it.
+            assert!(
+                html.contains("align-middle\"><span class=\"text-xs\">served</span>"),
+                "{html}"
+            );
+            assert!(!html.contains("md:table-cell\">Served</th>"), "{html}");
             assert!(!html.contains(STORE_TOKEN));
             // The bearer reached the store, and only GETs did.
             assert!(

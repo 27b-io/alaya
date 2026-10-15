@@ -387,7 +387,8 @@ rule and its element renders unstyled, silently.
 not hand-write layout or recurring markup.
 
 - `ui/components.rs`: the atoms (button, badge, card, table, form classes),
-  copy-paste vendored from the Rust/UI registry, class strings verbatim,
+  copy-paste vendored from the Rust/UI registry, class strings verbatim
+  except the departures marked in `components.rs`,
   `variants!`/`clx!` macros expanded to plain Leptos components. The Leptos
   registry now lives at [rust-ui/leptos-ui](https://github.com/rust-ui/leptos-ui)
   (`app_crates/registry/src/ui/*.rs`, theme tokens in `style/tailwind.css`);
@@ -399,15 +400,15 @@ not hand-write layout or recurring markup.
   `NotConfigured`, `Stat`/`StatGrid`, `PageHeader` (each page has exactly
   one), `Link` (the one link style; `external` sends no Referer) and
   `HashLink`.
-
-A wide table keeps the columns that say what a row is and how it stands; the
-rest are `secondary` on `TableHead` and `TableCell` and show from `md` up. A
-form stacks its fields below `sm` and lines them up from there.
 - `ui/shell.rs`: the document and the page shell. Every handler passes the
   `Nav` entry its page belongs under to `page()`; the shell marks that entry
   `aria-current="page"`. From `lg` the navigation is a sidebar grouped by
   module; below it, a `<details>` menu in the top bar. The top bar holds the
   theme switch and logout once at every width.
+
+A wide table keeps the columns that say what a row is and how it stands; the
+rest are `secondary` on `TableHead` and `TableCell` and show from `md` up. A
+form stacks its fields below `sm` and lines them up from there.
 
 The CSP forbids scripts and inline style, so nothing may emit a script, a
 style element or a style attribute, and colour comes only from the theme

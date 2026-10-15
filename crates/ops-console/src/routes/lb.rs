@@ -258,7 +258,7 @@ fn budgets_card(
             <CardHeader>
                 <CardTitle>"Per-client budget burn"</CardTitle>
                 <CardDescription>
-                    "Live: today's fleet-wide burn vs daily limit (anthropic-lb /_stats, Redis aggregate). History, on a wider screen: daily peak of anthropic_cluster_budget_used per UTC day from the metrics store; today's column is running. Limits are TOML, GitOps — nothing here edits them."
+                    "Live: today's fleet-wide burn vs daily limit (anthropic-lb /_stats, Redis aggregate). History: daily peak of anthropic_cluster_budget_used per UTC day from the metrics store; today's column is running. Limits are TOML, GitOps — nothing here edits them."
                 </CardDescription>
             </CardHeader>
             <CardContent>
@@ -378,7 +378,7 @@ fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
             <CardHeader>
                 <CardTitle>"Upstream accounts"</CardTitle>
                 <CardDescription>
-                    "Per account: Anthropic 5-hour / 7-day window utilisation and routing status, hottest first; protocol, priority and 5h reset on a wider screen. Endpoints and priorities are TOML, GitOps."
+                    "Per account: Anthropic 5-hour / 7-day window utilisation and routing status, hottest first. Endpoints and priorities are TOML, GitOps."
                 </CardDescription>
             </CardHeader>
             <CardContent>{body}</CardContent>

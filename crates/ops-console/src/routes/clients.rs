@@ -387,36 +387,35 @@ fn store_view(r: &Reading, csrf: &str, prefill: &str) -> impl IntoView + use<> {
 /// Everything that should stop an operator reading the rest as healthy.
 fn warnings(r: &Reading, part: &Result<ServedPart, String>) -> impl IntoView + use<> {
     let mut items: Vec<(Status, String)> = Vec::new();
-    let (destructive, warning) = (Status::Error, Status::Warn);
     match part {
         Err(e) => items.push((
-            destructive,
+            Status::Error,
             format!("Restrictions part unreadable: {e}. Nothing reads as in effect."),
         )),
-        Ok(p) if !p.full => items.push((destructive, effect::PARTIAL.to_string())),
+        Ok(p) if !p.full => items.push((Status::Error, effect::PARTIAL.to_string())),
         Ok(_) => {}
     }
     match &r.fleet.behind {
         Ok(b) if !b.is_empty() => items.push((
-            destructive,
+            Status::Error,
             format!(
                 "Restrictions behind on {}: those instances hold a disable or revoked digest the store lost. Re-send the name's disable (or enable), or reseed with restrictions_import.",
                 b.iter().cloned().collect::<Vec<_>>().join(", ")
             ),
         )),
         Ok(_) => {}
-        Err(e) => items.push((warning, format!("Restrictions-behind alerts unreadable (metrics store: {e})."))),
+        Err(e) => items.push((Status::Warn, format!("Restrictions-behind alerts unreadable (metrics store: {e})."))),
     }
     // A failed read of the readers' unmatched names hides the only flag on a
     // mistyped disable, which still reads as in effect: say it is missing.
     if let Err(e) = &r.fleet.unmatched {
         items.push((
-            warning,
+            Status::Warn,
             format!("Unmatched disabled names unreadable (metrics store: {e}): a mistyped disable is not flagged."),
         ));
     }
     if stacks_of(&r.store).is_empty() {
-        items.push((destructive, format!("{}.", capitalise(NO_STACKS))));
+        items.push((Status::Error, format!("{}.", capitalise(NO_STACKS))));
     }
     let doc = r.store.get("document");
     if doc.and_then(|d| d.get("status")).and_then(Value::as_str) != Some("ok") {
@@ -425,7 +424,7 @@ fn warnings(r: &Reading, part: &Result<ServedPart, String>) -> impl IntoView + u
             .and_then(Value::as_str)
             .unwrap_or("no detail");
         items.push((
-            warning,
+            Status::Warn,
             format!(
                 "The document side of the store did not answer ({}). Restriction ops still work.",
                 clip(e, 160)
@@ -443,7 +442,7 @@ fn warnings(r: &Reading, part: &Result<ServedPart, String>) -> impl IntoView + u
             .map(|s| clip(s, 160))
             .collect();
         items.push((
-            warning,
+            Status::Warn,
             format!(
                 "The store refuses document writes: {}. Restriction ops still work.",
                 reasons.join("; ")
@@ -451,25 +450,25 @@ fn warnings(r: &Reading, part: &Result<ServedPart, String>) -> impl IntoView + u
         ));
     }
     if r.store.get("pitr_window").and_then(Value::as_bool) == Some(true) {
-        items.push((warning, "A point-in-time recovery window is open: the store takes no document write but pitr. Restriction ops still work.".into()));
+        items.push((Status::Warn, "A point-in-time recovery window is open: the store takes no document write but pitr. Restriction ops still work.".into()));
     }
     if doc
         .and_then(|d| d.get("recovery_refused"))
         .and_then(Value::as_bool)
         == Some(true)
     {
-        items.push((destructive, "A recovery was refused: the store serves no document to readers until an import or another recovery commits. Restriction ops still work.".into()));
+        items.push((Status::Error, "A recovery was refused: the store serves no document to readers until an import or another recovery commits. Restriction ops still work.".into()));
     }
     match &r.fleet.store_alerts {
         Ok(who) if !who.is_empty() => items.push((
-            destructive,
+            Status::Error,
             format!(
                 "Instances report the store behind or edited: {}. Every document write needs a typed confirmation while they do. Restriction ops still work.",
                 clip(&who.iter().cloned().collect::<Vec<_>>().join(", "), 600)
             ),
         )),
         Ok(_) => {}
-        Err(e) => items.push((warning, format!("Store behind or edited alerts unreadable (metrics store: {e})."))),
+        Err(e) => items.push((Status::Warn, format!("Store behind or edited alerts unreadable (metrics store: {e})."))),
     }
     let list = items
         .into_iter()
@@ -579,7 +578,7 @@ fn restrictions_card(
                     <TableCell secondary=true><span class="text-xs wrap-break-word">{actor}</span></TableCell>
                     <TableCell secondary=true><span class="text-xs wrap-break-word">{reason}</span></TableCell>
                     <TableCell secondary=true><span class="text-xs whitespace-nowrap">{at}</span></TableCell>
-                    <TableCell secondary=true><span class="text-xs">{served}</span></TableCell>
+                    <TableCell><span class="text-xs">{served}</span></TableCell>
                     <TableCell>{action}</TableCell>
                 </TableRow>
             }
@@ -594,7 +593,7 @@ fn restrictions_card(
             <CardHeader>
                 <CardTitle>"Restrictions (kill switch)"</CardTitle>
                 <CardDescription>
-                    "disable refuses every key of a name on every instance, TOML keys of an ordinary client included; enable undoes it. Both reach every polling instance within a poll, whatever state the store's document is in, and nothing read from the metrics store can stop them. Each needs a reason, recorded with your identity. A phone shows each name's state; a wider screen adds its version, actor, reason, time and whether it is served. "
+                    "disable refuses every key of a name on every instance, TOML keys of an ordinary client included; enable undoes it. Both reach every polling instance within a poll, whatever state the store's document is in, and nothing read from the metrics store can stop them. Each needs a reason, recorded with your identity."
                     <Link href="/lb/clients/disable">"The disable page"</Link>
                     " loads without reading anything, for when the store or the metrics store is slow."
                 </CardDescription>
@@ -609,7 +608,7 @@ fn restrictions_card(
                         <TableHead secondary=true>"Actor"</TableHead>
                         <TableHead secondary=true>"Reason"</TableHead>
                         <TableHead secondary=true>"At"</TableHead>
-                        <TableHead secondary=true>"Served"</TableHead>
+                        <TableHead>"Served"</TableHead>
                         <TableHead>""</TableHead>
                     </TableRow></TableHeader>
                     <TableBody>{table}</TableBody>

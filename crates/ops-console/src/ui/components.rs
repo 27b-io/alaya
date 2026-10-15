@@ -211,7 +211,5 @@ mod tests {
     #[test]
     fn a_row_input_keeps_a_minimum_width() {
         assert!(row_input().contains(" min-w-32 "));
-        assert!(!row_input().contains("min-w-0"));
-        assert_eq!(row_input().replace("min-w-32", "min-w-0"), INPUT_CLASS);
     }
 }

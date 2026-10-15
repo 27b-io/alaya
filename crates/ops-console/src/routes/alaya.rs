@@ -462,7 +462,7 @@ pub async fn browse(
         <div class="space-y-6">
             <PageHeader
                 title="Memories"
-                description="Search or browse the corpus. Each mode offers only the filters the server applies in it. A phone shows each memory's hash and content; a wider screen adds its type, tags and date."
+                description="Search or browse the corpus. Each mode offers only the filters the server applies in it."
             />
             <Card>
                 <CardContent>{form}</CardContent>
@@ -2171,28 +2171,29 @@ pub async fn pair_page(
     // the verdict — so Keep both stays offered and the server is the judge
     // of whether the edge exists.
     let fallback_edge = json!({ "memory_a_hash": q.a, "memory_b_hash": q.b });
+    let missing = |status: Status, label: &'static str, msg: String| {
+        Either::Right(view! { <Notice status=status label=label>{msg}</Notice> })
+    };
     let (edge_view, action_edge) = match edge {
         Ok(Some(p)) => (Either::Left(edge_facts(&p)), p),
-        Ok(None) => {
-            let msg = format!(
-                "This pair is not on the queue page it was opened from (offset {offset}, same filters): it was settled, or the queue moved, so its verdict and resolution are unknown here. The memories below are live; to reopen a keep-both, find the pair in the queue with resolved pairs included."
-            );
-            (
-                Either::Right(Either::Left(
-                    view! { <Notice status=Status::Off label="not on this page">{msg}</Notice> },
-                )),
-                fallback_edge,
-            )
-        }
-        Err(e) => {
-            let msg = format!("Could not load the verdict: {}", e.detail());
-            (
-                Either::Right(Either::Right(
-                    view! { <Notice status=Status::Error label="unavailable">{msg}</Notice> },
-                )),
-                fallback_edge,
-            )
-        }
+        Ok(None) => (
+            missing(
+                Status::Off,
+                "not on this page",
+                format!(
+                    "This pair is not on the queue page it was opened from (offset {offset}, same filters): it was settled, or the queue moved, so its verdict and resolution are unknown here. The memories below are live; to reopen a keep-both, find the pair in the queue with resolved pairs included."
+                ),
+            ),
+            fallback_edge,
+        ),
+        Err(e) => (
+            missing(
+                Status::Error,
+                "unavailable",
+                format!("Could not load the verdict: {}", e.detail()),
+            ),
+            fallback_edge,
+        ),
     };
     let actions = pair_actions(&action_edge, &csrf, &back);
     let col_a = memory_column("A", q.a.clone(), mem_a);

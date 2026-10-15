@@ -983,12 +983,9 @@ fn history_view(store: &Value, csrf: &str) -> impl IntoView + use<> {
         Some(c) => format!("Document history (current version {c})"),
         None => "Document history (nothing can be restored now)".to_string(),
     };
-    let description = format!(
-        "{HISTORY} A phone shows each version's changes; a wider screen adds its digest, time, author, reason and ops."
-    );
     view! {
         <div class="space-y-6">
-            {sub_header(title, description)}
+            {sub_header(title, HISTORY.into())}
             <Card>
                 <CardContent>
                     {unreadable}
@@ -1132,7 +1129,7 @@ fn clients_shell(title: String, body: AnyView) -> AnyView {
             <CardHeader>
                 <CardTitle>{title}</CardTitle>
                 <CardDescription>
-                    "The clients the store's document grants, with their policies and keys (ids, labels and digests: the store keeps no key); utilization, models and pins on a wider screen. Every change previews the store's diff first, pinned to the version this page read. "
+                    "The clients the store's document grants, with their policies and keys (ids, labels and digests: the store keeps no key). Every change previews the store's diff first, pinned to the version this page read. "
                     <Link href="/lb/clients/history">"History and restore"</Link>
                 </CardDescription>
             </CardHeader>
