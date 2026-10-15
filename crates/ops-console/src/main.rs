@@ -1524,8 +1524,7 @@ mod tests {
             ">5<",
             "2026-09-30",
             ">148<",
-            ">41<",
-            ">1000<",
+            ">41 / 1,000<",
             ">5234<",
             "CONTRADICTS",
             ">4589<",
@@ -1543,6 +1542,8 @@ mod tests {
         let (status, body) = health_page(full_stats()).await;
         assert_eq!(status, StatusCode::OK);
         let card = &body[body.find("Write novelty").expect("novelty card")..];
+        // The table folded under the chart, not the chart's screen-reader one.
+        let card = &card[card.find("<details").expect("a folded table")..];
         let card = &card[..card.find("</table>").expect("a table")];
         let heads = [
             "UTC day",
@@ -1578,6 +1579,57 @@ mod tests {
         assert!(!body.contains("≥ 0.95"), "no novelty table");
     }
 
+    /// LAB-9489: each key value is drawn as a chart from the same data as
+    /// its table, and each chart's accessible name states its figures.
+    #[tokio::test]
+    async fn health_pane_draws_its_key_values_as_charts() {
+        let (status, body) = health_page(full_stats()).await;
+        assert_eq!(status, StatusCode::OK);
+        for needle in [
+            r#"aria-label="Judge admitted today against its daily cap: 41 / 1,000, 4%""#,
+            r#"aria-label="Open pairs by verdict: contradiction 7 (&lt;1%), supersession 1,613 (30%), coexist 1,172 (22%), unrelated 826 (15%), stored judge failure 9 (&lt;1%), never judged (backlog) 1,716 (32%); total 5,343""#,
+            r#"aria-label="Resolved pairs by verdict: contradiction 3 (2%)"#,
+            r#"aria-label="Stored judge failures by reason: unjudged: endpoint missing from vector store 4, other 5""#,
+            r#"aria-label="Pairs judged per day by verdict, 09-30 to 10-01: contradiction, supersession, coexist, unrelated, unjudged; highest 152 on 09-30; latest 30 on 10-01""#,
+            r#"aria-label="Memories created per day by similarity to their nearest neighbour, 09-30 to 10-01:"#,
+            r#"aria-label="Graph edges by type: CONTRADICTS 4,589 (96%), HEBBIAN 77 (2%), SUPERSEDES 131 (3%); total 4,797""#,
+            ">5000 nodes<",
+        ] {
+            assert!(body.contains(needle), "missing {needle:?} in {body}");
+        }
+        // Each table stays on the page, folded under its chart, except the
+        // verdict table, whose counts link to the queue.
+        assert_eq!(
+            body.matches("<details class=\"mt-4\">").count(),
+            4,
+            "{body}"
+        );
+    }
+
+    /// LAB-9489: a missing or mistyped count is no data in the chart, as it
+    /// is a dash in the table, never a zero; and a zero cap is no share.
+    #[tokio::test]
+    async fn health_pane_charts_a_bad_count_as_no_data() {
+        let mut stats = full_stats();
+        stats["contradictions"]["judged_per_day"][0]["counts"]["coexist"] = "lots".into();
+        stats["contradictions"]["by_verdict"]["coexist"]["open"] = serde_json::Value::Null;
+        stats["graph"]["edge_counts"]["HEBBIAN"] = (-1).into();
+        stats["judge_daily_cap"]["cap"] = 0.into();
+        let (status, body) = health_page(stats).await;
+        assert_eq!(status, StatusCode::OK);
+        for needle in [
+            "09-30: no data",
+            "; no data on 1 of 2",
+            "Open pairs by verdict: contradiction 7, supersession 1,613, coexist no data, unrelated 826,",
+            "never judged (backlog) 1,716; the whole is unknown",
+            "HEBBIAN no data",
+            "Judge admitted today against its daily cap: 41 / 0 · no data",
+        ] {
+            assert!(body.contains(needle), "missing {needle:?} in {body}");
+        }
+        assert!(!body.contains("coexist 0"), "{body}");
+    }
+
     /// AC-4/AC-6: the bridge down nulls the graph sections server-side; the
     /// pane says so per section and never renders them as zeros.
     #[tokio::test]
@@ -1599,6 +1651,14 @@ mod tests {
             "every graph-backed card and both notes must say unavailable"
         );
         assert!(!body.contains("never judged (backlog)"), "no verdict table");
+        for chart in [
+            "Open pairs by verdict",
+            "Stored judge failures by reason",
+            "Pairs judged per day by verdict",
+            "Graph edges by type",
+        ] {
+            assert!(!body.contains(chart), "no chart of zeros: {chart}");
+        }
         assert!(
             !body.contains("/alaya/contradictions?verdict="),
             "no links to zeros"
@@ -1684,6 +1744,40 @@ mod tests {
             body.contains(">disabled<") && !body.contains(">passing<"),
             "{body}"
         );
+    }
+
+    /// LAB-9489: home reads Ālaya's key values from `/stats`. When only that
+    /// read fails, the card names it unavailable and draws no tiles of
+    /// dashes or zeros; `/health/detail`'s own count is never shown.
+    #[tokio::test]
+    async fn home_alaya_card_reads_stats_and_names_a_failed_read() {
+        let home = |stats: bool| async move {
+            let mut upstream = Router::new().route(
+                "/health/detail",
+                get(|| async {
+                    axum::Json(serde_json::json!({ "status": "healthy", "total_memories": 0 }))
+                }),
+            );
+            if stats {
+                upstream = upstream.route("/stats", get(|| async { axum::Json(full_stats()) }));
+            }
+            let mut config = test_config();
+            config.alaya_url = fake_upstream(upstream).await.parse().unwrap();
+            render(AppState::new(config), "/").await.1
+        };
+        let html = home(true).await;
+        assert!(
+            html.contains(">5,234<") && html.contains(">1,716"),
+            "{html}"
+        );
+        assert!(html.contains("Pairs judged per day: 2 points"), "{html}");
+        assert!(!html.contains("unavailable"), "{html}");
+
+        let html = home(false).await;
+        assert!(html.contains("alaya-server GET /stats"), "{html}");
+        assert!(html.contains("unavailable"), "{html}");
+        assert!(!html.contains("Judge backlog"), "{html}");
+        assert!(!html.contains(">0<"), "{html}");
     }
 
     /// The pane's link targets must load on today's contradictions page:
@@ -3255,6 +3349,10 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("href=\"/selecta\""));
+        assert!(
+            html.contains(r#"aria-label="Tasks awaiting approval, by whether they have a PR: with an approval PR 1 (50%), no PR 1 (50%); total 2""#),
+            "{html}"
+        );
     }
 
     /// An unusable `pr_url` is as unapprovable as a missing one: both count
@@ -3302,6 +3400,13 @@ mod tests {
         let (_, home) = render(state.clone(), "/").await;
         assert!(
             home.contains("100+ awaiting your approval · 1 with no PR"),
+            "{home}"
+        );
+        // The chart breaks down only the rows the probe returned.
+        assert!(
+            home.contains(
+                r#"aria-label="The newest 100 tasks awaiting approval, by whether they have a PR: "#
+            ),
             "{home}"
         );
         let (_, pane) = render(state, "/selecta").await;
