@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use axum::Json;
 use axum::extract::{Path, Query};
+use leptos::prelude::*;
 use serde_json::{Value, json};
 use sha2::Digest;
 
@@ -19,6 +20,12 @@ use super::*;
 use crate::effect::RecordState;
 use crate::testkit::{
     FakeMetrics, FakeStore, STORE_TOKEN, T0, V0, World, k3s, k3s_documents, series,
+};
+use crate::theme::Theme;
+use crate::ui::{
+    BarSeries, Card, CardContent, CardDescription, CardHeader, CardTitle, Colour, HBarList, Meter,
+    PageHeader, Part, Series, Sparkline, StackedBar, Stat, StatGrid, Table, TableBody, TableCell,
+    TableHead, TableHeader, TableRow, TableWrapper, fmt_count,
 };
 
 const HOUR_US: u64 = 3_600 * 1_000_000;
@@ -368,11 +375,284 @@ async fn write_snapshots() {
             write(format!("{stem}.{theme}.html"), &html);
         }
     }
-    let stems: Vec<&str> = worlds
-        .iter()
-        .flat_map(|(_, pages, _)| pages.iter().map(|p| p.stem.as_str()))
+    for theme in [Theme::Light, Theme::Dark] {
+        write(
+            format!("{GALLERY}.{}.html", theme.as_str()),
+            &gallery_page(theme),
+        );
+    }
+    let stems: Vec<&str> = std::iter::once(GALLERY)
+        .chain(
+            worlds
+                .iter()
+                .flat_map(|(_, pages, _)| pages.iter().map(|p| p.stem.as_str())),
+        )
         .collect();
     write("pages.txt".into(), &format!("{}\n", stems.join("\n")));
+}
+
+// ─── The chart gallery ──────────────────────────────────────────────────────
+
+/// The stem the chart gallery is written under, first among the pages.
+const GALLERY: &str = "charts";
+
+/// The gallery in the shell, in `theme`. It is no route: only the snapshot
+/// tool renders it, so it is screenshotted with the pages and never served.
+fn gallery_page(theme: Theme) -> String {
+    let mut sess = session::new_session("admin-sub".into(), Some("ops@example.test".into()), None);
+    sess.theme = theme;
+    ui::page("Chart gallery", ui::Nav::Home, &sess, None, chart_gallery())
+}
+
+/// The judge's verdicts in display order, each on its own series slot in
+/// every chart that shows them, so a verdict keeps its colour across charts.
+const VERDICTS: [(&str, Colour); 6] = [
+    ("contradiction", Colour::SERIES[0]),
+    ("supersession", Colour::SERIES[1]),
+    ("coexist", Colour::SERIES[2]),
+    ("unrelated", Colour::SERIES[3]),
+    ("unjudged", Colour::SERIES[4]),
+    ("never judged", Colour::SERIES[5]),
+];
+
+/// `NOVELTY`'s similarity bands, closest first. They are ordered, so they
+/// take steps of one hue; "none" is no band at all.
+const BANDS: [(&str, Colour); 5] = [
+    ("≥ 0.95", Colour::RAMP[4]),
+    ("0.85–0.95", Colour::RAMP[3]),
+    ("0.70–0.85", Colour::RAMP[2]),
+    ("< 0.70", Colour::RAMP[1]),
+    ("none", Colour::OTHER),
+];
+
+/// Judge-cap admissions over a fortnight: two days with no sample and a day
+/// with none admitted.
+const ADMITTED: [Option<f64>; 14] = [
+    Some(612.0),
+    Some(845.0),
+    Some(1000.0),
+    Some(1000.0),
+    Some(733.0),
+    None,
+    Some(402.0),
+    Some(0.0),
+    Some(951.0),
+    Some(1000.0),
+    Some(688.0),
+    None,
+    Some(870.0),
+    Some(41.0),
+];
+
+/// One chart in the gallery, under a caption saying what it shows.
+fn example(caption: &'static str, chart: impl IntoView) -> impl IntoView {
+    view! {
+        <div class="min-w-0 space-y-2">
+            <p class="text-xs text-muted-foreground">{caption}</p>
+            {chart}
+        </div>
+    }
+}
+
+/// A gallery section: one chart kind, its use and its examples.
+fn section(
+    title: &'static str,
+    about: &'static str,
+    children: impl IntoView + 'static,
+) -> impl IntoView {
+    view! {
+        <Card>
+            <CardHeader>
+                <CardTitle>{title}</CardTitle>
+                <CardDescription>{about}</CardDescription>
+            </CardHeader>
+            <CardContent>{children}</CardContent>
+        </Card>
+    }
+}
+
+/// The chart kit on one page: each chart drawn from the fixtures' data,
+/// then its edge cases.
+fn chart_gallery() -> impl IntoView {
+    let n = |v: u64| Some(v as f64);
+    let week: Vec<String> = WEEK.iter().map(|d| d[5..].to_string()).collect();
+    let fortnight: Vec<String> = (18..=30)
+        .map(|d| format!("09-{d}"))
+        .chain(["10-01".to_string()])
+        .collect();
+    let by_day = |table: &[[u64; 5]; 7], j: usize| table.iter().map(|row| n(row[j])).collect();
+    let judged: Vec<Series> = VERDICTS[..5]
+        .iter()
+        .enumerate()
+        .map(|(j, (label, colour))| Series::new(*label, by_day(&JUDGED, j), *colour))
+        .collect();
+    let novelty: Vec<Series> = BANDS
+        .iter()
+        .enumerate()
+        .map(|(j, (label, colour))| Series::new(*label, by_day(&NOVELTY, j), *colour))
+        .collect();
+    let verdicts = |counts: [Option<f64>; 6]| {
+        VERDICTS
+            .iter()
+            .zip(counts)
+            .map(|((label, colour), v)| Part::new(*label, v, *colour))
+            .collect::<Vec<_>>()
+    };
+    let edges = ["CONTRADICTS", "SUPERSEDES", "HEBBIAN"]
+        .into_iter()
+        .zip([4_589, 131, 77])
+        .enumerate()
+        .map(|(i, (kind, count))| Part::new(kind, n(count), Colour::SERIES[i]))
+        .collect::<Vec<_>>();
+    let ranked = |rows: &[(&str, Option<f64>)]| {
+        rows.iter()
+            .map(|(label, v)| Part::new(*label, *v, Colour::SERIES[0]))
+            .collect::<Vec<_>>()
+    };
+    let mut failures: Vec<Part> = FAILURES
+        .iter()
+        .map(|(reason, count)| Part::new(*reason, n(*count), Colour::SERIES[0]))
+        .collect();
+    failures.push(Part::new("other", n(5), Colour::OTHER));
+
+    let budgets = BUDGETS
+        .iter()
+        .map(|(client, limit, used)| {
+            let (name, label) = (client.to_string(), format!("{client}: live budget"));
+            view! {
+                <TableRow>
+                    <TableCell><span class="font-mono text-xs">{name}</span></TableCell>
+                    <TableCell>
+                        <Meter label=label used=n(*used) limit=n(*limit) fmt=lb::fmt_tokens />
+                    </TableCell>
+                </TableRow>
+            }
+        })
+        .collect_view();
+    let burn = BURN
+        .iter()
+        .map(|(client, days)| (client.to_string(), days.to_vec()))
+        .chain([("dormant".to_string(), vec![None; 7])])
+        .map(|(client, days)| {
+            let latest = days[6].map_or_else(|| "—".to_string(), lb::fmt_tokens);
+            let label = format!("{client}: daily burn");
+            let x = week.clone();
+            view! {
+                <Stat label=client>
+                    {latest}
+                    <Sparkline label=label values=days x=x fmt=lb::fmt_tokens />
+                </Stat>
+            }
+        })
+        .collect_view();
+
+    let grid = "grid gap-6 md:grid-cols-2";
+    view! {
+        <div class="space-y-6">
+            <PageHeader
+                title="Chart gallery"
+                description="Every chart in the kit, drawn from the snapshot fixtures, then each one's edge cases. No route serves this page."
+            />
+            {section(
+                "Meter",
+                "Used against a limit. The fill turns to warning at 80% and critical at the limit; a tick marks the warning threshold.",
+                view! {
+                    <div class="space-y-6">
+                        <TableWrapper>
+                            <Table>
+                                <TableHeader>
+                                    <TableRow>
+                                        <TableHead>"Client"</TableHead>
+                                        <TableHead>"Live budget"</TableHead>
+                                    </TableRow>
+                                </TableHeader>
+                                <TableBody>{budgets}</TableBody>
+                            </Table>
+                        </TableWrapper>
+                        <div class=grid>
+                            {example("A daily cap, near it", view! { <Meter label="searches" used=n(188) limit=n(200) fmt=fmt_count /> })}
+                            {example("A daily cap, reached", view! { <Meter label="downloads" used=n(200) limit=n(200) fmt=fmt_count /> })}
+                            {example("Over budget: drawn full, the share as it is", view! { <Meter label="nightly-evals" used=Some(2.43e9) limit=Some(2e9) fmt=lb::fmt_tokens /> })}
+                            {example("A utilisation, a share already: 5h window", view! { <Meter label="5h utilisation" used=Some(0.62) limit=Some(1.0) /> })}
+                            {example("Disabled names against the store's cap", view! { <Meter label="disabled names" used=n(12) limit=n(1024) fmt=fmt_count /> })}
+                            {example("Used unknown: no data, no bar", view! { <Meter label="adds" used=None limit=n(40) fmt=fmt_count /> })}
+                            {example("A cap of zero: no share to draw", view! { <Meter label="judge daily cap" used=n(0) limit=n(0) fmt=fmt_count /> })}
+                            {example("Half a pair", view! { <Meter label="grabs" used=n(4) limit=None fmt=fmt_count /> })}
+                        </div>
+                    </div>
+                },
+            )}
+            {section(
+                "StackedBar",
+                "A part-to-whole mix, with each part's value and share in the legend. A verdict keeps its colour in every chart.",
+                view! {
+                    <div class=grid>
+                        {example("Open pairs by verdict", view! { <StackedBar label="Open pairs by verdict" parts=verdicts([n(7), n(1_613), n(1_172), n(826), n(9), n(1_716)]) /> })}
+                        {example("Resolved pairs by verdict", view! { <StackedBar label="Resolved pairs by verdict" parts=verdicts([n(3), n(15), n(36), n(26), n(0), n(97)]) /> })}
+                        {example("Corpus edges by type", view! { <StackedBar label="Corpus edges by type" parts=edges /> })}
+                        {example("All zero: an empty bar", view! { <StackedBar label="Resolved pairs by verdict" parts=verdicts([n(0); 6]) /> })}
+                        {example("A part with no data: no whole", view! { <StackedBar label="Open pairs by verdict" parts=verdicts([n(7), None, n(1_172), n(826), n(9), n(1_716)]) /> })}
+                        {example("Nothing known", view! { <StackedBar label="Open pairs by verdict" parts=verdicts([None; 6]) /> })}
+                    </div>
+                },
+            )}
+            {section(
+                "BarSeries",
+                "Bars per day, stacked by category. Ticks at round values; the first and last day labelled; every bar and day has a tooltip.",
+                view! {
+                    <div class=grid>
+                        {example("Pairs judged per day, by verdict", view! { <BarSeries label="Pairs judged per day" x=week.clone() series=judged /> })}
+                        {example("Writes per day, by similarity to their nearest neighbour", view! { <BarSeries label="Writes per day by similarity" x=week.clone() series=novelty /> })}
+                        {example("Admitted per day: a fortnight, two days with no sample", view! { <BarSeries label="Judge admissions per day" x=fortnight series=vec![Series::new("admitted", ADMITTED.to_vec(), Colour::SERIES[0])] /> })}
+                        {example("All zero: bars at the baseline", view! { <BarSeries label="Pairs judged per day" x=week.clone() series=vec![Series::new("judged", vec![n(0); 7], Colour::SERIES[0])] /> })}
+                        {example("Nothing known", view! { <BarSeries label="Pairs judged per day" x=week.clone() series=vec![Series::new("judged", vec![None; 7], Colour::SERIES[0])] /> })}
+                    </div>
+                },
+            )}
+            {section(
+                "Sparkline",
+                "A trend under a stat's value: a line from zero, broken where there is no data, the latest day in the accent.",
+                view! { <StatGrid>{burn}</StatGrid> },
+            )}
+            {section(
+                "HBarList",
+                "A ranking, largest first, each row against the largest. The rest folds into a grey \"other\".",
+                view! {
+                    <div class=grid>
+                        {example("Stored judge failures, by reason", view! { <HBarList label="Stored judge failures" rows=failures /> })}
+                        {example("Upstream transport errors, by kind", view! { <HBarList label="Transport errors" rows=ranked(&[("other", n(4_103)), ("timeout", n(706)), ("connect", n(12))]) /> })}
+                        {example("A zero and a row with no data", view! { <HBarList label="Transport errors" rows=ranked(&[("timeout", n(706)), ("connect", n(0)), ("reset", None)]) /> })}
+                        {example("Nothing known", view! { <HBarList label="Transport errors" rows=ranked(&[("timeout", None)]) /> })}
+                    </div>
+                },
+            )}
+        </div>
+    }
+}
+
+/// The gallery holds to the CSP like every page, draws every kind of chart
+/// in both colour families, and shows its no-data cases as such.
+#[test]
+fn the_chart_gallery_draws_every_chart() {
+    let html = gallery_page(Theme::Dark);
+    assert!(
+        html.contains(r#"<html lang="en" class="scroll-pt-14 dark""#),
+        "{html}"
+    );
+    assert!(!html.contains("<script"), "a script the CSP blocks");
+    assert!(!html.contains(" style="), "a style the CSP blocks");
+    for class in [
+        "fill-chart-1",
+        "fill-chart-6",
+        "fill-chart-ramp-5",
+        "fill-chart-warn",
+        "fill-chart-crit",
+        "<polyline",
+    ] {
+        assert!(html.contains(class), "{class}");
+    }
+    assert!(html.matches(r#"role="img""#).count() >= 30, "{html}");
+    assert!(html.contains(">no data</p>"), "{html}");
 }
 
 // ─── The worlds ─────────────────────────────────────────────────────────────
@@ -776,37 +1056,58 @@ fn auth_config() -> Value {
     })
 }
 
+/// The week the health fixture covers, oldest first.
+const WEEK: [&str; 7] = [
+    "2026-09-25",
+    "2026-09-26",
+    "2026-09-27",
+    "2026-09-28",
+    "2026-09-29",
+    "2026-09-30",
+    "2026-10-01",
+];
+
+/// Pairs judged each day of `WEEK`: contradiction, supersession, coexist,
+/// unrelated, unjudged.
+const JUDGED: [[u64; 5]; 7] = [
+    [2, 41, 133, 12, 1],
+    [0, 38, 120, 9, 0],
+    [1, 52, 141, 17, 3],
+    [0, 12, 31, 4, 0],
+    [3, 47, 155, 22, 2],
+    [0, 3, 148, 0, 1],
+    [1, 3, 26, 0, 1],
+];
+
+/// Writes each day of `WEEK` by similarity to their nearest neighbour:
+/// 0.95+, 0.85-0.95, 0.70-0.85, below 0.70, none.
+const NOVELTY: [[u64; 5]; 7] = [
+    [12, 88, 301, 140, 2],
+    [9, 102, 287, 133, 0],
+    [15, 97, 342, 121, 1],
+    [4, 21, 77, 40, 0],
+    [18, 131, 405, 162, 5],
+    [61, 212, 433, 97, 3],
+    [0, 0, 0, 0, 818],
+];
+
+/// The judge's most frequent stored failures, whose reasons run long.
+const FAILURES: [(&str, u64); 3] = [
+    ("unjudged: endpoint missing from vector store", 4),
+    (
+        "unjudged: schema violation: verdict_reason exceeded 2000 characters (got 2417) for pair 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08↔60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752",
+        3,
+    ),
+    (
+        "unjudged: empty response from https://llm-gateway.example.test/v1/messages?beta=structured-outputs-2026-08-01 (stop_reason max_tokens)",
+        2,
+    ),
+];
+
 /// `full_stats()` with a week of judging and writes, and stored judge
 /// failures whose reasons run long.
 fn health_stats() -> Value {
     let mut stats = full_stats();
-    let dates = [
-        "2026-09-25",
-        "2026-09-26",
-        "2026-09-27",
-        "2026-09-28",
-        "2026-09-29",
-        "2026-09-30",
-        "2026-10-01",
-    ];
-    let judged = [
-        [2, 41, 133, 12, 1],
-        [0, 38, 120, 9, 0],
-        [1, 52, 141, 17, 3],
-        [0, 12, 31, 4, 0],
-        [3, 47, 155, 22, 2],
-        [0, 3, 148, 0, 1],
-        [1, 3, 26, 0, 1],
-    ];
-    let novelty = [
-        [12, 88, 301, 140, 2],
-        [9, 102, 287, 133, 0],
-        [15, 97, 342, 121, 1],
-        [4, 21, 77, 40, 0],
-        [18, 131, 405, 162, 5],
-        [61, 212, 433, 97, 3],
-        [0, 0, 0, 0, 818],
-    ];
     let day = |date: &str, keys: [&str; 5], counts: [u64; 5]| {
         let counts: serde_json::Map<String, Value> = keys
             .iter()
@@ -815,9 +1116,9 @@ fn health_stats() -> Value {
             .collect();
         json!({ "date": date, "counts": counts })
     };
-    stats["contradictions"]["judged_per_day"] = dates
+    stats["contradictions"]["judged_per_day"] = WEEK
         .iter()
-        .zip(judged)
+        .zip(JUDGED)
         .map(|(d, c)| {
             day(
                 d,
@@ -832,9 +1133,9 @@ fn health_stats() -> Value {
             )
         })
         .collect();
-    stats["writes"]["novelty"] = dates
+    stats["writes"]["novelty"] = WEEK
         .iter()
-        .zip(novelty)
+        .zip(NOVELTY)
         .map(|(d, c)| {
             day(
                 d,
@@ -843,11 +1144,10 @@ fn health_stats() -> Value {
             )
         })
         .collect();
-    stats["contradictions"]["failures"]["top"] = json!([
-        { "reason": "unjudged: endpoint missing from vector store", "count": 4 },
-        { "reason": "unjudged: schema violation: verdict_reason exceeded 2000 characters (got 2417) for pair 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08↔60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752", "count": 3 },
-        { "reason": "unjudged: empty response from https://llm-gateway.example.test/v1/messages?beta=structured-outputs-2026-08-01 (stop_reason max_tokens)", "count": 2 },
-    ]);
+    stats["contradictions"]["failures"]["top"] = FAILURES
+        .iter()
+        .map(|(reason, count)| json!({ "reason": reason, "count": count }))
+        .collect();
     stats
 }
 

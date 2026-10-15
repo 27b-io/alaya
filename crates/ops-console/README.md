@@ -400,6 +400,17 @@ not hand-write layout or recurring markup.
   and `unavailable()` is the notice for a dark section; `EmptyState`,
   `NotConfigured`, `Stat`/`StatGrid`, `PageHeader`, `Link` (the one link
   style) and `HashLink`.
+- `ui/charts.rs`: key values as server-rendered SVG, which the CSP allows
+  where a chart library's script would not: `Meter` (used against a limit,
+  with warning and critical thresholds), `StackedBar` (a part-to-whole
+  mix), `BarSeries` (bars per day, optionally stacked), `Sparkline` (a trend
+  under a `Stat`'s value) and `HBarList` (a ranking). A chart is one
+  `role="img"` element with an `aria-label` that states its numbers, each
+  mark has a `<title>` tooltip, and the numbers are also text: beside the
+  marks, or, for the daily bars and the sparkline, in a visually hidden
+  table. A missing, NaN or negative value is "no data", never a zero.
+  Colours are `Colour` constants named by their job; `style/input.css`
+  holds their values and how they were checked.
 - `ui/shell.rs`: the document and the page shell. Every handler passes the
   `Nav` entry its page belongs under to `page()`; the shell marks that entry
   `aria-current="page"`. From `lg` the navigation is a sidebar grouped by
@@ -421,8 +432,10 @@ both healthy and with every upstream down, then screenshots each with
 headless Chrome at 390, 768 and 1280px, light and dark, into
 `target/snapshots/` at the workspace root, with one contact sheet per page.
 It fails if any page scrolls sideways; a table may, inside its own scroll
-box. A UI change attaches the sheets to its review. Needs python3 and Chrome
-(`CHROME=/path/to/chrome` if it is not on `PATH`).
+box. The first sheet, `charts`, is a gallery of every chart in its normal
+and edge states; no route serves that page. A UI change attaches the
+sheets to its review. Needs python3 and Chrome (`CHROME=/path/to/chrome`
+if it is not on `PATH`).
 
 **Theme.** Every colour is a CSS variable in `style/input.css`, defined once
 for light and once under `@variant dark`; components use the token classes

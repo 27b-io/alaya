@@ -66,6 +66,38 @@
   --warning-dark: oklch(0.35 0.16 55);
   --info-light: oklch(0.95 0.08 250);
   --info-dark: oklch(0.35 0.18 250);
+  /*
+   * Chart colours (src/ui/charts.rs), each named for its job, and each
+   * checked against the card, the surface charts sit on (#ffffff here,
+   * #171717 under dark):
+   * - chart-1..8 name a series. The order is what keeps neighbours apart:
+   *   the worst adjacent pair differs by OKLab ΔE 9.1 (8.4 dark) under
+   *   simulated protanopia and deuteranopia (Machado 2009), and by 19.6
+   *   (19.3) with full colour vision. On white, slots 3 to 5 fall under 3:1,
+   *   so every chart also prints its numbers beside its marks.
+   * - chart-ramp-1..5 are ordered steps of one blue, low to high: light to
+   *   dark here, dark to light under dark, so the low end recedes into the
+   *   surface. Steps differ by at least 0.06 in OKLCH lightness and the
+   *   faintest clears 2:1 (2.11, 2.21).
+   * - chart-warn and chart-crit fill a meter past a threshold. They are fixed
+   *   status colours, the same in both themes; a meter's level is also given
+   *   in words and by its threshold tick.
+   */
+  --chart-1: #2a78d6;
+  --chart-2: #eb6834;
+  --chart-3: #1baf7a;
+  --chart-4: #eda100;
+  --chart-5: #e87ba4;
+  --chart-6: #008300;
+  --chart-7: #4a3aa7;
+  --chart-8: #e34948;
+  --chart-ramp-1: #86b6ef;
+  --chart-ramp-2: #5598e7;
+  --chart-ramp-3: #2a78d6;
+  --chart-ramp-4: #1c5cab;
+  --chart-ramp-5: #104281;
+  --chart-warn: #fab219;
+  --chart-crit: #d03b3b;
 
   @variant dark {
     color-scheme: dark;
@@ -94,6 +126,19 @@
     --warning-dark: oklch(0.75 0.16 55);
     --info-light: oklch(0.25 0.08 250);
     --info-dark: oklch(0.75 0.18 250);
+    --chart-1: #3987e5;
+    --chart-2: #d95926;
+    --chart-3: #199e70;
+    --chart-4: #c98500;
+    --chart-5: #d55181;
+    --chart-6: #008300;
+    --chart-7: #9085e9;
+    --chart-8: #e66767;
+    --chart-ramp-1: #184f95;
+    --chart-ramp-2: #256abf;
+    --chart-ramp-3: #3987e5;
+    --chart-ramp-4: #6da7ec;
+    --chart-ramp-5: #9ec5f4;
   }
 }
 
@@ -129,6 +174,21 @@
   --color-warning-dark: var(--warning-dark);
   --color-info-light: var(--info-light);
   --color-info-dark: var(--info-dark);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-chart-6: var(--chart-6);
+  --color-chart-7: var(--chart-7);
+  --color-chart-8: var(--chart-8);
+  --color-chart-ramp-1: var(--chart-ramp-1);
+  --color-chart-ramp-2: var(--chart-ramp-2);
+  --color-chart-ramp-3: var(--chart-ramp-3);
+  --color-chart-ramp-4: var(--chart-ramp-4);
+  --color-chart-ramp-5: var(--chart-ramp-5);
+  --color-chart-warn: var(--chart-warn);
+  --color-chart-crit: var(--chart-crit);
 }
 
 @layer base {

@@ -6,6 +6,8 @@
 //! - `patterns`: the console's own components, built from the atoms: the
 //!   status-to-badge mapping, notices, empty states, stats, page headers and
 //!   links.
+//! - `charts`: key values as server-rendered SVG: meters, stacked bars, daily
+//!   bars, sparklines and rankings.
 //! - `shell`: the document and the responsive shell around every page.
 //!
 //! Rendering is SSR-only: `view!` output is serialized with `.to_html()`.
@@ -19,10 +21,16 @@
 //! and every file under `src/` (tests too: Tailwind reads them) and the
 //! shipped stylesheet to the second.
 
+mod charts;
 mod components;
 mod patterns;
 mod shell;
 
+#[cfg_attr(
+    not(test),
+    expect(unused_imports, reason = "no page draws a chart yet")
+)]
+pub use charts::*;
 pub use components::*;
 pub use patterns::*;
 pub use shell::*;
