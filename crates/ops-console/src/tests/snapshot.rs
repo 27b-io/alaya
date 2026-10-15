@@ -846,7 +846,7 @@ fn alaya_upstream() -> Router {
     Router::new()
         .route(
             "/health/detail",
-            get(|| async { Json(json!({ "status": "healthy", "total_memories": 5_234 })) }),
+            get(|| async { Json(json!({ "status": "healthy" })) }),
         )
         .route(
             "/search",

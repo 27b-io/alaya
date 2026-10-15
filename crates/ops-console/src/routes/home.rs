@@ -111,8 +111,7 @@ pub async fn home(
             <NotConfigured>"Set SELECTA_URL and SELECTA_API_KEY on the console to enable."</NotConfigured>
         }),
         Some(probe) => {
-            let mut awaiting = None;
-            let (status, label, summary) = match probe {
+            let (status, label, summary, awaiting) = match probe {
                 Ok(rows) => {
                     let no_pr = rows.iter().filter(|r| r.approval_pr().is_none()).count();
                     // A task with no PR cannot be approved: worth a look,
@@ -120,7 +119,6 @@ pub async fn home(
                     let status = if no_pr > 0 { Status::Warn } else { Status::Ok };
                     // A full probe means the list was cut, not that it is exact.
                     let full = rows.len() >= routes::selecta::AWAITING_SHOWN as usize;
-                    awaiting = Some((rows.len(), no_pr, full));
                     let mut summary = format!(
                         "{}{} awaiting your approval",
                         rows.len(),
@@ -129,11 +127,16 @@ pub async fn home(
                     if no_pr > 0 {
                         summary.push_str(&format!(" · {no_pr} with no PR"));
                     }
-                    (status, "reachable", summary)
+                    (
+                        status,
+                        "reachable",
+                        summary,
+                        Some((rows.len(), no_pr, full)),
+                    )
                 }
                 // "error", not "unreachable": a 401 or a tool error arrives
                 // over a healthy network. The detail names the kind.
-                Err(e) => (Status::Error, "error", e.detail().to_string()),
+                Err(e) => (Status::Error, "error", e.detail().to_string(), None),
             };
             let mix = awaiting.map(|(n, no_pr, full)| {
                 let parts = vec![
@@ -217,14 +220,13 @@ fn open(href: &'static str) -> impl IntoView {
     }
 }
 
-/// Ālaya's key values: the memory count and the judge backlog, with the
-/// pairs judged each day under it. Read from `GET /stats`, whose count is
-/// null when it failed; `/health/detail` reports a failed count as 0.
+/// Ālaya's key values: the memory count, the judge backlog and the pairs
+/// judged each day. Read from `GET /stats`, whose count is null when it
+/// failed; `/health/detail` reports a failed count as 0.
 fn alaya_kpis(stats: &Value) -> impl IntoView + use<> {
-    let count = |v: Option<&Value>| v.and_then(Value::as_u64).map(|n| n as f64);
     let figure = |v: Option<f64>| v.map_or_else(|| "—".to_string(), fmt_count);
-    let memories = count(stats.pointer("/memories/total"));
-    let backlog = count(stats.pointer("/contradictions/by_verdict/never_judged/open"));
+    let memories = routes::num(stats.pointer("/memories/total"));
+    let backlog = routes::num(stats.pointer("/contradictions/by_verdict/never_judged/open"));
     let days = stats
         .pointer("/contradictions/judged_per_day")
         .and_then(Value::as_array)
@@ -238,24 +240,19 @@ fn alaya_kpis(stats: &Value) -> impl IntoView + use<> {
             let counts = d.get("counts");
             DAY_COLUMNS
                 .iter()
-                .map(|(key, ..)| count(counts.and_then(|c| c.get(*key))))
+                .map(|(key, ..)| routes::num(counts.and_then(|c| c.get(*key))))
                 .sum::<Option<f64>>()
         })
         .collect::<Vec<_>>();
     let x = days
         .iter()
-        .map(|d| {
-            d.get("date")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string()
-        })
+        .map(|d| routes::vs(d, "date"))
         .collect::<Vec<_>>();
     view! {
         <dl class="mt-4 grid grid-cols-2 gap-3">
             <Stat label="Memories">{figure(memories)}</Stat>
-            <Stat label="Judge backlog">
-                {figure(backlog)}
+            <Stat label="Judge backlog">{figure(backlog)}</Stat>
+            <Stat label="Pairs judged per day">
                 <Sparkline label="Pairs judged per day" values=judged x=x />
             </Stat>
         </dl>
@@ -285,16 +282,15 @@ fn tightest_budgets(stats: &Value) -> impl IntoView + use<> {
             }
         })
         .collect_view();
-    let note = match (more, fleet) {
-        (0, true) => None,
-        (0, false) => {
-            Some("One replica's figures: the fleet-wide ones are unavailable.".to_string())
-        }
-        (n, true) => Some(format!("{n} more on the module page.")),
-        (n, false) => Some(format!(
-            "{n} more on the module page. One replica's figures: the fleet-wide ones are unavailable."
-        )),
-    };
+    let note = [
+        (more > 0).then(|| format!("{more} more on the module page.")),
+        (!fleet).then(|| "One replica's figures: the fleet-wide ones are unavailable.".to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
+    let note = (!note.is_empty()).then_some(note);
     view! {
         <ul class="mt-4 space-y-3">{meters}</ul>
         {note.map(|n| view! { <p class="mt-2 text-xs text-muted-foreground">{n}</p> })}
@@ -377,6 +373,17 @@ mod tests {
         assert!(out.contains("kody: live budget: 40 / 100, 40%"), "{out}");
         assert!(
             out.contains("the fleet-wide ones are unavailable."),
+            "{out}"
+        );
+
+        // More clients than shown, from one replica: both sentences, joined.
+        let budget = json!({ "daily_limit": 100, "used_today": 1 });
+        let stats = json!({ "client_budgets": {
+            "a": budget, "b": budget, "c": budget, "d": budget, "e": budget,
+        }});
+        let out = html(tightest_budgets(&stats));
+        assert!(
+            out.contains("2 more on the module page. One replica's figures: the fleet-wide ones are unavailable.<"),
             "{out}"
         );
     }

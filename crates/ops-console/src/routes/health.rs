@@ -16,7 +16,7 @@ use leptos::prelude::*;
 use serde_json::Value;
 
 use crate::error::AppError;
-use crate::routes::{fmt_epoch, vs};
+use crate::routes::{fmt_epoch, num, vs};
 use crate::session::{Session, take_flash};
 use crate::state::AppState;
 use crate::ui::*;
@@ -124,12 +124,6 @@ fn count(v: Option<&Value>) -> String {
     v.and_then(Value::as_u64)
         .map(|n| n.to_string())
         .unwrap_or_else(|| "—".into())
-}
-
-/// A count as a chart value: `None`, which a chart draws as no data, for a
-/// missing or mistyped field — never a fictitious zero.
-fn num(v: Option<&Value>) -> Option<f64> {
-    v.and_then(Value::as_u64).map(|n| n as f64)
 }
 
 /// The exact figures under a chart, folded away: operators read numbers.
