@@ -247,8 +247,8 @@ impl AlayaClient {
     }
 
     /// alaya-server split `/health` (LAB-2481): the bare probe carries only
-    /// `status`; the memory count the home card renders lives on the
-    /// authenticated detail view. The console holds the bearer anyway.
+    /// `status`, the rest lives on the authenticated detail view. The home
+    /// card reads only `status` from it; its counts come from `/stats`.
     pub async fn health(&self) -> Result<Value, AppError> {
         self.get("/health/detail").await
     }

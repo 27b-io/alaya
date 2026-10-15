@@ -1748,14 +1748,14 @@ mod tests {
 
     /// LAB-9489: home reads Ālaya's key values from `/stats`. When only that
     /// read fails, the card names it unavailable and draws no tiles of
-    /// dashes or zeros; `/health/detail`'s own count is never shown.
+    /// dashes or zeros; `/health/detail`'s own count (a distinctive 777) is never shown.
     #[tokio::test]
     async fn home_alaya_card_reads_stats_and_names_a_failed_read() {
         let home = |stats: bool| async move {
             let mut upstream = Router::new().route(
                 "/health/detail",
                 get(|| async {
-                    axum::Json(serde_json::json!({ "status": "healthy", "total_memories": 0 }))
+                    axum::Json(serde_json::json!({ "status": "healthy", "total_memories": 777 }))
                 }),
             );
             if stats {
@@ -1772,12 +1772,13 @@ mod tests {
         );
         assert!(html.contains("Pairs judged per day: 2 points"), "{html}");
         assert!(!html.contains("unavailable"), "{html}");
+        assert!(!html.contains("777"), "{html}");
 
         let html = home(false).await;
         assert!(html.contains("alaya-server GET /stats"), "{html}");
         assert!(html.contains("unavailable"), "{html}");
         assert!(!html.contains("Judge backlog"), "{html}");
-        assert!(!html.contains(">0<"), "{html}");
+        assert!(!html.contains("777"), "{html}");
     }
 
     /// The pane's link targets must load on today's contradictions page:

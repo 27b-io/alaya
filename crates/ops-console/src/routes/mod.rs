@@ -94,6 +94,12 @@ pub fn vs(v: &serde_json::Value, key: &str) -> String {
         .to_string()
 }
 
+/// A count as a chart value: `None`, which a chart draws as no data, for a
+/// missing or mistyped field — never a fictitious zero.
+pub fn num(v: Option<&serde_json::Value>) -> Option<f64> {
+    v.and_then(serde_json::Value::as_u64).map(|n| n as f64)
+}
+
 pub fn vf(v: &serde_json::Value, key: &str) -> f64 {
     v.get(key).and_then(|x| x.as_f64()).unwrap_or(0.0)
 }
