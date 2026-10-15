@@ -239,16 +239,33 @@ fn fmt_micros(v: u64) -> String {
 
 // ─── The page ───────────────────────────────────────────────────────────────
 
+/// The LB clients page's header, above its cards.
+fn header() -> impl IntoView {
+    view! {
+        <PageHeader
+            title="LB clients"
+            description="The kill switch, and the clients the store's document grants with their policies and keys. Every write needs a reason, recorded with your identity."
+        />
+    }
+}
+
 fn not_configured() -> impl IntoView {
     view! {
-        <Card>
-            <CardHeader>
-                <CardTitle>"LB clients — module not configured"</CardTitle>
-                <CardDescription>
-                    "Set CLIENT_STORE_URL and CLIENT_STORE_TOKEN (both, or neither) on the console deployment, with the anthropic-lb module configured, to manage LB clients through the client store."
-                </CardDescription>
-            </CardHeader>
-        </Card>
+        <div class="space-y-6">
+            {header()}
+            <NotConfigured>
+                "Set CLIENT_STORE_URL and CLIENT_STORE_TOKEN (both, or neither) on the console deployment, with the anthropic-lb module configured, to manage LB clients through the client store."
+            </NotConfigured>
+        </div>
+    }
+}
+
+/// A sub-page's header: its title, what it is for, and the way back.
+fn sub_header(title: String, description: String) -> impl IntoView {
+    view! {
+        <PageHeader title=title description=description>
+            <Link href="/lb/clients">"Back to LB clients"</Link>
+        </PageHeader>
     }
 }
 
@@ -269,8 +286,11 @@ pub async fn pane(
         // The store could not be read, but a disable needs no read: the form
         // stays, so a degraded store never hides the kill switch.
         Err(e) => Either::Left(view! {
-            <div class="mb-4">{unavailable("client store", e.detail())}</div>
-            {kill_switch_card(&session.csrf, &prefill)}
+            <div class="space-y-6">
+                {header()}
+                {unavailable("client store", e.detail())}
+                {kill_switch_card(&session.csrf, &prefill)}
+            </div>
         }),
         Ok(r) => Either::Right(store_view(&r, &session.csrf, &prefill)),
     };
@@ -291,7 +311,12 @@ pub async fn disable_page(
         return Ok((jar, Html(page_html(&session, flash, not_configured()))));
     }
     let prefill = prefill_of(raw.as_deref());
-    let content = kill_switch_card(&session.csrf, &prefill);
+    let content = view! {
+        <div class="space-y-6">
+            {header()}
+            {kill_switch_card(&session.csrf, &prefill)}
+        </div>
+    };
     Ok((jar, Html(page_html(&session, flash, content))))
 }
 
@@ -329,11 +354,16 @@ fn page_html(session: &Session, flash: Option<Flash>, content: impl IntoView) ->
     page(TITLE, Nav::LbClients, session, flash, content)
 }
 
-fn verdict_badge(v: &Verdict) -> (String, &'static str, String) {
-    match v {
-        Verdict::InEffect => (badge(BadgeKind::Success), "in effect", String::new()),
-        Verdict::NotInEffect(why) => (badge(BadgeKind::Warning), "not in effect", why.clone()),
-        Verdict::Unknown(why) => (badge(BadgeKind::Muted), "unknown", why.clone()),
+/// Whether a stack holds a write, as a badge, with why when it does not.
+fn verdict_view(v: &Verdict) -> impl IntoView + use<> {
+    let (status, label, why) = match v {
+        Verdict::InEffect => (Status::Ok, "in effect", None),
+        Verdict::NotInEffect(why) => (Status::Warn, "not in effect", Some(why.clone())),
+        Verdict::Unknown(why) => (Status::Off, "unknown", Some(why.clone())),
+    };
+    view! {
+        <StatusBadge status=status label=label />
+        {why.map(|w| view! { <p class="mt-1 text-xs wrap-break-word">{w}</p> })}
     }
 }
 
@@ -345,6 +375,7 @@ fn store_view(r: &Reading, csrf: &str, prefill: &str) -> impl IntoView + use<> {
     let unmatched = r.fleet.unmatched.clone().unwrap_or_default();
     view! {
         <div class="space-y-6">
+            {header()}
             {warnings(r, &part)}
             {stacks_card(&part, &doc, &sights, r)}
             {restrictions_card(&rows, &part, &unmatched, csrf, prefill)}
@@ -355,38 +386,37 @@ fn store_view(r: &Reading, csrf: &str, prefill: &str) -> impl IntoView + use<> {
 
 /// Everything that should stop an operator reading the rest as healthy.
 fn warnings(r: &Reading, part: &Result<ServedPart, String>) -> impl IntoView + use<> {
-    let mut items: Vec<(String, String)> = Vec::new();
-    let destructive = badge(BadgeKind::Destructive);
-    let warning = badge(BadgeKind::Warning);
+    let mut items: Vec<(Status, String)> = Vec::new();
+    let (destructive, warning) = (Status::Error, Status::Warn);
     match part {
         Err(e) => items.push((
-            destructive.clone(),
+            destructive,
             format!("Restrictions part unreadable: {e}. Nothing reads as in effect."),
         )),
-        Ok(p) if !p.full => items.push((destructive.clone(), effect::PARTIAL.to_string())),
+        Ok(p) if !p.full => items.push((destructive, effect::PARTIAL.to_string())),
         Ok(_) => {}
     }
     match &r.fleet.behind {
         Ok(b) if !b.is_empty() => items.push((
-            destructive.clone(),
+            destructive,
             format!(
                 "Restrictions behind on {}: those instances hold a disable or revoked digest the store lost. Re-send the name's disable (or enable), or reseed with restrictions_import.",
                 b.iter().cloned().collect::<Vec<_>>().join(", ")
             ),
         )),
         Ok(_) => {}
-        Err(e) => items.push((warning.clone(), format!("Restrictions-behind alerts unreadable (metrics store: {e})."))),
+        Err(e) => items.push((warning, format!("Restrictions-behind alerts unreadable (metrics store: {e})."))),
     }
     // A failed read of the readers' unmatched names hides the only flag on a
     // mistyped disable, which still reads as in effect: say it is missing.
     if let Err(e) = &r.fleet.unmatched {
         items.push((
-            warning.clone(),
+            warning,
             format!("Unmatched disabled names unreadable (metrics store: {e}): a mistyped disable is not flagged."),
         ));
     }
     if stacks_of(&r.store).is_empty() {
-        items.push((destructive.clone(), format!("{}.", capitalise(NO_STACKS))));
+        items.push((destructive, format!("{}.", capitalise(NO_STACKS))));
     }
     let doc = r.store.get("document");
     if doc.and_then(|d| d.get("status")).and_then(Value::as_str) != Some("ok") {
@@ -395,7 +425,7 @@ fn warnings(r: &Reading, part: &Result<ServedPart, String>) -> impl IntoView + u
             .and_then(Value::as_str)
             .unwrap_or("no detail");
         items.push((
-            warning.clone(),
+            warning,
             format!(
                 "The document side of the store did not answer ({}). Restriction ops still work.",
                 clip(e, 160)
@@ -413,7 +443,7 @@ fn warnings(r: &Reading, part: &Result<ServedPart, String>) -> impl IntoView + u
             .map(|s| clip(s, 160))
             .collect();
         items.push((
-            warning.clone(),
+            warning,
             format!(
                 "The store refuses document writes: {}. Restriction ops still work.",
                 reasons.join("; ")
@@ -421,29 +451,29 @@ fn warnings(r: &Reading, part: &Result<ServedPart, String>) -> impl IntoView + u
         ));
     }
     if r.store.get("pitr_window").and_then(Value::as_bool) == Some(true) {
-        items.push((warning.clone(), "A point-in-time recovery window is open: the store takes no document write but pitr. Restriction ops still work.".into()));
+        items.push((warning, "A point-in-time recovery window is open: the store takes no document write but pitr. Restriction ops still work.".into()));
     }
     if doc
         .and_then(|d| d.get("recovery_refused"))
         .and_then(Value::as_bool)
         == Some(true)
     {
-        items.push((destructive.clone(), "A recovery was refused: the store serves no document to readers until an import or another recovery commits. Restriction ops still work.".into()));
+        items.push((destructive, "A recovery was refused: the store serves no document to readers until an import or another recovery commits. Restriction ops still work.".into()));
     }
     match &r.fleet.store_alerts {
         Ok(who) if !who.is_empty() => items.push((
-            destructive.clone(),
+            destructive,
             format!(
                 "Instances report the store behind or edited: {}. Every document write needs a typed confirmation while they do. Restriction ops still work.",
                 clip(&who.iter().cloned().collect::<Vec<_>>().join(", "), 600)
             ),
         )),
         Ok(_) => {}
-        Err(e) => items.push((warning.clone(), format!("Store behind or edited alerts unreadable (metrics store: {e})."))),
+        Err(e) => items.push((warning, format!("Store behind or edited alerts unreadable (metrics store: {e})."))),
     }
     let list = items
         .into_iter()
-        .map(|(class, text)| view! { <p class="text-sm"><span class=class>"warning"</span>" "{text}</p> })
+        .map(|(status, text)| view! { <Notice status=status label="warning">{text}</Notice> })
         .collect_view();
     view! { <div class="space-y-2">{list}</div> }
 }
@@ -454,13 +484,6 @@ fn stacks_card(
     sights: &[(String, Sight)],
     r: &Reading,
 ) -> impl IntoView + use<> {
-    let cell = |v: &Verdict| {
-        let (class, label, why) = verdict_badge(v);
-        view! {
-            <TableCell><span class=class>{label}</span></TableCell>
-            <TableCell><span class="text-xs">{why}</span></TableCell>
-        }
-    };
     let rows = sights
         .iter()
         .map(|(stack, sight)| {
@@ -481,8 +504,8 @@ fn stacks_card(
             view! {
                 <TableRow>
                     <TableCell><span class="font-mono text-xs">{stack}</span></TableCell>
-                    {cell(&restrictions)}
-                    {cell(&held_doc)}
+                    <TableCell>{verdict_view(&restrictions)}</TableCell>
+                    <TableCell>{verdict_view(&held_doc)}</TableCell>
                 </TableRow>
             }
         })
@@ -500,9 +523,7 @@ fn stacks_card(
                     <TableHeader><TableRow>
                         <TableHead>"Stack"</TableHead>
                         <TableHead>"Served restrictions"</TableHead>
-                        <TableHead>"Why"</TableHead>
                         <TableHead>"Served document"</TableHead>
-                        <TableHead>"Why"</TableHead>
                     </TableRow></TableHeader>
                     <TableBody>{rows}</TableBody>
                 </Table></TableWrapper>
@@ -526,14 +547,14 @@ fn restrictions_card(
                 _ => false,
             };
             let served = if served { "served" } else { "not in the served part" };
-            let (state_class, state_text) = match r.state {
-                Some(RecordState::Disabled) => (badge(BadgeKind::Destructive), "disabled"),
-                Some(RecordState::Enabled) => (badge(BadgeKind::Success), "enabled"),
-                None => (badge(BadgeKind::Muted), "unreadable"),
+            let (state, state_text) = match r.state {
+                Some(RecordState::Disabled) => (Status::Error, "disabled"),
+                Some(RecordState::Enabled) => (Status::Ok, "enabled"),
+                None => (Status::Off, "unreadable"),
             };
             let flag = unmatched.get(&r.name).filter(|_| r.state == Some(RecordState::Disabled)).map(|stacks| {
                 let text = format!("matches no client on {} — mistyped?", clip(&stacks.iter().cloned().collect::<Vec<_>>().join(", "), 200));
-                view! { <span class=badge(BadgeKind::Warning)>{text}</span> }
+                view! { <StatusBadge status=Status::Warn label=text /> }
             });
             let (version_text, version_title) = match r.version {
                 Some(v) => (fmt_micros(v), v.to_string()),
@@ -547,13 +568,18 @@ fn restrictions_card(
             let (name, actor, reason, at) = (r.name.clone(), r.actor.clone(), r.reason.clone(), r.at.clone());
             view! {
                 <TableRow>
-                    <TableCell><span class="font-mono text-xs">{name}</span>" "{flag}</TableCell>
-                    <TableCell><span class=state_class>{state_text}</span></TableCell>
-                    <TableCell><span class="tabular-nums whitespace-nowrap" title=version_title>{version_text}</span></TableCell>
-                    <TableCell><span class="text-xs">{actor}</span></TableCell>
-                    <TableCell><span class="text-xs">{reason}</span></TableCell>
-                    <TableCell><span class="text-xs whitespace-nowrap">{at}</span></TableCell>
-                    <TableCell><span class="text-xs">{served}</span></TableCell>
+                    <TableCell>
+                        <div class="flex flex-wrap items-center gap-1">
+                            <span class="font-mono text-xs break-all">{name}</span>
+                            {flag}
+                        </div>
+                    </TableCell>
+                    <TableCell><StatusBadge status=state label=state_text /></TableCell>
+                    <TableCell secondary=true><span class="tabular-nums whitespace-nowrap" title=version_title>{version_text}</span></TableCell>
+                    <TableCell secondary=true><span class="text-xs wrap-break-word">{actor}</span></TableCell>
+                    <TableCell secondary=true><span class="text-xs wrap-break-word">{reason}</span></TableCell>
+                    <TableCell secondary=true><span class="text-xs whitespace-nowrap">{at}</span></TableCell>
+                    <TableCell secondary=true><span class="text-xs">{served}</span></TableCell>
                     <TableCell>{action}</TableCell>
                 </TableRow>
             }
@@ -568,8 +594,8 @@ fn restrictions_card(
             <CardHeader>
                 <CardTitle>"Restrictions (kill switch)"</CardTitle>
                 <CardDescription>
-                    "disable refuses every key of a name on every instance, TOML keys of an ordinary client included; enable undoes it. Both reach every polling instance within a poll, whatever state the store's document is in, and nothing read from the metrics store can stop them. Each needs a reason, recorded with your identity. "
-                    <a class="underline underline-offset-4" href="/lb/clients/disable">"The disable page"</a>
+                    "disable refuses every key of a name on every instance, TOML keys of an ordinary client included; enable undoes it. Both reach every polling instance within a poll, whatever state the store's document is in, and nothing read from the metrics store can stop them. Each needs a reason, recorded with your identity. A phone shows each name's state; a wider screen adds its version, actor, reason, time and whether it is served. "
+                    <Link href="/lb/clients/disable">"The disable page"</Link>
                     " loads without reading anything, for when the store or the metrics store is slow."
                 </CardDescription>
             </CardHeader>
@@ -579,11 +605,11 @@ fn restrictions_card(
                     <TableHeader><TableRow>
                         <TableHead>"Name"</TableHead>
                         <TableHead>"State"</TableHead>
-                        <TableHead>"Version (UTC)"</TableHead>
-                        <TableHead>"Actor"</TableHead>
-                        <TableHead>"Reason"</TableHead>
-                        <TableHead>"At"</TableHead>
-                        <TableHead>"Served"</TableHead>
+                        <TableHead secondary=true>"Version (UTC)"</TableHead>
+                        <TableHead secondary=true>"Actor"</TableHead>
+                        <TableHead secondary=true>"Reason"</TableHead>
+                        <TableHead secondary=true>"At"</TableHead>
+                        <TableHead secondary=true>"Served"</TableHead>
                         <TableHead>""</TableHead>
                     </TableRow></TableHeader>
                     <TableBody>{table}</TableBody>
@@ -623,17 +649,18 @@ fn disable_form(
                 view! {
                     <label class="flex items-center gap-2 text-xs">
                         <input type="checkbox" name="also_enable" value=value />
-                        <span class="font-mono">{label}</span>
+                        <span class="font-mono break-all">{label}</span>
                     </label>
                 }
             })
             .collect_view();
         view! {
             <div class="mt-3">
-                <p class="text-sm mb-2">
-                    <span class=badge(BadgeKind::Warning)>"disabled set full"</span>
-                    " The store refuses a request that leaves more than 1,024 names disabled and more than it found. Pick names to enable in the same request:"
-                </p>
+                <div class="mb-2">
+                    <Notice status=Status::Warn label="disabled set full">
+                        "The store refuses a request that leaves more than 1,024 names disabled and more than it found. Pick names to enable in the same request:"
+                    </Notice>
+                </div>
                 <div class="grid grid-cols-2 sm:grid-cols-4 gap-1 max-h-64 overflow-y-auto">{boxes}</div>
             </div>
         }
@@ -644,12 +671,12 @@ fn disable_form(
         <form method="post" action="/lb/clients/restrict" class="mb-6" id="disable">
             <input type="hidden" name="csrf" value=csrf />
             <input type="hidden" name="action" value="disable" />
-            <div class="flex items-end gap-3">
-                <div class="w-56">
+            <div class="flex flex-col gap-3 sm:flex-row sm:items-end">
+                <div class="sm:w-56">
                     <label class="text-xs text-muted-foreground" for="disable_name">"Name"</label>
                     <input class=INPUT_CLASS id="disable_name" name="name" value=prefill required maxlength="63" placeholder="client name" />
                 </div>
-                <div class="flex-1">
+                <div class="sm:flex-1">
                     <label class="text-xs text-muted-foreground" for="disable_reason">"Reason"</label>
                     <input class=INPUT_CLASS id="disable_reason" name="reason" required maxlength="200" placeholder="why this name is cut off" />
                 </div>
@@ -667,7 +694,7 @@ fn disable_form_inline(csrf: &str, name: &str) -> impl IntoView + use<> {
             <input type="hidden" name="csrf" value=csrf />
             <input type="hidden" name="action" value="disable" />
             <input type="hidden" name="name" value=name />
-            <input class=INPUT_CLASS name="reason" required maxlength="200" placeholder="reason" />
+            <input class=row_input() name="reason" required maxlength="200" placeholder="reason" />
             <button type="submit" class=btn_sm(Btn::Destructive)>"Disable"</button>
         </form>
     }
@@ -683,7 +710,7 @@ fn enable_form(csrf: &str, name: &str, version: u64) -> impl IntoView + use<> {
             <input type="hidden" name="action" value="enable" />
             <input type="hidden" name="name" value=name />
             <input type="hidden" name="expected_version" value=version />
-            <input class=INPUT_CLASS name="reason" required maxlength="200" placeholder="reason" />
+            <input class=row_input() name="reason" required maxlength="200" placeholder="reason" />
             <button type="submit" class=btn_sm(Btn::Outline)>"Enable"</button>
         </form>
     }
@@ -699,7 +726,7 @@ fn enable_unrecorded_form(csrf: &str) -> impl IntoView + use<> {
             <p class="text-xs text-muted-foreground my-2">
                 "Writes an enabled record, which releases an instance still holding a disable the store lost (restrictions behind). A name that has a record gets 409: use its row instead."
             </p>
-            <form method="post" action="/lb/clients/restrict" class="flex items-end gap-3">
+            <form method="post" action="/lb/clients/restrict" class="flex flex-col gap-3 sm:flex-row sm:items-end">
                 <input type="hidden" name="csrf" value=csrf />
                 <input type="hidden" name="action" value="enable" />
                 <input type="hidden" name="expected_version" value="0" />
@@ -1233,7 +1260,12 @@ pub async fn effect(
     let reading = match read_all(m).await {
         Ok(r) => r,
         Err(e) => {
-            let content = unavailable("client store", e.detail());
+            let content = view! {
+                <div class="space-y-6">
+                    {sub_header("In effect?".into(), "Whether every stack holds the write.".into())}
+                    {unavailable("client store", e.detail())}
+                </div>
+            };
             return Ok((jar, Html(page_html(&session, flash, content))).into_response());
         }
     };
@@ -1293,10 +1325,16 @@ pub async fn effect(
     let now = crate::session::now_epoch();
     let at = wanted.at;
     let refresh = settling && at <= now && now.saturating_sub(at) < REFRESH_FOR_SECS;
+    let note = if refresh {
+        "Refreshing every 5 s until every stack is in effect (readers poll every 5 s; the metrics store trails by up to a minute)."
+    } else {
+        "Not refreshing: everything is settled, or two minutes have passed. Reload to check again."
+    };
     let content = view! {
         <div class="space-y-6">
+            {sub_header("In effect?".into(), note.into())}
             {warnings(&reading, &part)}
-            {effect_card(&blocks, refresh)}
+            {effect_card(&blocks)}
         </div>
     };
     let html = Html(page_html(&session, flash, content));
@@ -1308,7 +1346,7 @@ pub async fn effect(
     Ok(resp)
 }
 
-fn effect_card(blocks: &[Block], refresh: bool) -> impl IntoView + use<> {
+fn effect_card(blocks: &[Block]) -> impl IntoView + use<> {
     let blocks_view = blocks
         .iter()
         .map(|(title, j)| {
@@ -1324,24 +1362,25 @@ fn effect_card(blocks: &[Block], refresh: bool) -> impl IntoView + use<> {
                         .stacks
                         .iter()
                         .map(|(stack, v)| {
-                            let (class, label, why) = verdict_badge(v);
-                            let stack = stack.clone();
+                            let (stack, verdict) = (stack.clone(), verdict_view(v));
                             view! {
                                 <TableRow>
                                     <TableCell><span class="font-mono text-xs">{stack}</span></TableCell>
-                                    <TableCell><span class=class>{label}</span></TableCell>
-                                    <TableCell><span class="text-xs">{why}</span></TableCell>
+                                    <TableCell>{verdict}</TableCell>
                                 </TableRow>
                             }
                         })
                         .collect_view();
                     Either::Right(view! {
-                        {head.map(|h| view! { <p class="text-sm mb-2"><span class=badge(BadgeKind::Muted)>"superseded"</span>" "{h}</p> })}
+                        {head.map(|h| view! {
+                            <div class="mb-2">
+                                <Notice status=Status::Off label="superseded">{h}</Notice>
+                            </div>
+                        })}
                         <TableWrapper><Table>
                             <TableHeader><TableRow>
                                 <TableHead>"Stack"</TableHead>
                                 <TableHead>"State"</TableHead>
-                                <TableHead>"Why"</TableHead>
                             </TableRow></TableHeader>
                             <TableBody>{rows}</TableBody>
                         </Table></TableWrapper>
@@ -1350,30 +1389,20 @@ fn effect_card(blocks: &[Block], refresh: bool) -> impl IntoView + use<> {
             };
             view! {
                 <div class="mb-6">
-                    <p class="text-sm font-medium mb-2 font-mono">{title}</p>
+                    <h2 class="text-sm font-medium mb-2 font-mono break-all">{title}</h2>
                     {body}
                 </div>
             }
         })
         .collect_view();
-    let note = if refresh {
-        "Refreshing every 5 s until every stack is in effect (readers poll every 5 s; the metrics store trails by up to a minute)."
-    } else {
-        "Not refreshing: everything is settled, or two minutes have passed. Reload to check again."
-    };
     let empty = blocks.is_empty().then(|| {
-        view! { <p class="text-sm">"Nothing to confirm: the request wrote no record (already in that state, or older than the store keeps)."</p> }
+        view! { <EmptyState>"Nothing to confirm: the request wrote no record (already in that state, or older than the store keeps)."</EmptyState> }
     });
     view! {
         <Card>
-            <CardHeader>
-                <CardTitle>"In effect?"</CardTitle>
-                <CardDescription>{note}</CardDescription>
-            </CardHeader>
             <CardContent>
                 {empty}
                 {blocks_view}
-                <p class="text-sm"><a class="underline underline-offset-4" href="/lb/clients">"Back to LB clients"</a></p>
             </CardContent>
         </Card>
     }

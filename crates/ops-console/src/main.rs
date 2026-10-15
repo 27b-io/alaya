@@ -4321,7 +4321,11 @@ mod tests {
             let sess = session::new_session("admin-sub".into(), None, None);
             let (_, html) =
                 get_page(&state, &session_cookie_header(&state, &sess), "/lb/clients").await;
-            assert!(html.contains("module not configured"), "{html}");
+            assert!(html.contains(">not configured</span>"), "{html}");
+            assert!(
+                html.contains("Set CLIENT_STORE_URL and CLIENT_STORE_TOKEN"),
+                "{html}"
+            );
         }
 
         // ─── Document ops ───────────────────────────────────────────────────

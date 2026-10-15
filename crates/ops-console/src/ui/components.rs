@@ -5,10 +5,11 @@
 //! expanded to plain functions so the console doesn't take
 //! `leptos_ui`/`tw_merge` dependencies for an SSR-only app.
 //!
-//! Three deliberate departures, each marked where it is made: the
+//! Four deliberate departures, each marked where it is made: the
 //! destructive button's ink is a theme token instead of a palette white, the
-//! table wrapper has a height cap so its sticky header can stick, and a
-//! table column can be marked secondary, to hide on a phone.
+//! table wrapper has a height cap so its sticky header can stick, a table
+//! column can be marked secondary, to hide on a phone, and a text input in a
+//! table row keeps a minimum width.
 
 use leptos::prelude::*;
 
@@ -167,6 +168,12 @@ pub fn TableCell(#[prop(optional)] secondary: bool, children: Children) -> impl 
 //     ui/select_native.rs — class strings only) ─────────────────────────────
 
 pub const INPUT_CLASS: &str = "border-input flex h-9 w-full min-w-0 rounded-md border bg-transparent px-3 py-1 text-base shadow-xs transition-[color,box-shadow] outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px] md:text-sm";
+
+/// A text input inside a table row, a departure from upstream: wide enough
+/// to type into, where the row's other columns would squeeze it to nothing.
+pub fn row_input() -> String {
+    INPUT_CLASS.replace("min-w-0", "min-w-32")
+}
 
 pub const LABEL_CLASS: &str =
     "flex items-center gap-2 text-sm leading-none font-medium select-none";
