@@ -57,8 +57,9 @@ const VERDICT_ROWS: [(&str, &str, &str, Colour); 6] = [
 ];
 
 /// Columns of the judged-per-day chart and table: `(the server's key in
-/// counts, heading, colour)`, the colours `VERDICT_ROWS`' own.
-const DAY_COLUMNS: [(&str, &str, Colour); 5] = [
+/// counts, heading, colour)`, the colours `VERDICT_ROWS`' own. The home
+/// card's daily total needs every one of these keys.
+pub(crate) const DAY_COLUMNS: [(&str, &str, Colour); 5] = [
     ("contradiction", "contradiction", Colour::SERIES[0]),
     ("supersession", "supersession", Colour::SERIES[1]),
     ("coexist", "coexist", Colour::SERIES[2]),

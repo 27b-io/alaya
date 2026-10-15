@@ -12,6 +12,7 @@ use serde_json::Value;
 use crate::error::AppError;
 use crate::lb::{fmt_tokens, live_budgets};
 use crate::routes;
+use crate::routes::health::DAY_COLUMNS;
 use crate::session::{Session, take_flash};
 use crate::state::AppState;
 use crate::ui::*;
@@ -229,13 +230,16 @@ fn alaya_kpis(stats: &Value) -> impl IntoView + use<> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    // A day's total is unknown when any of its counts is.
+    // A day's total is unknown when any verdict's count is missing or bad:
+    // the health pane's own columns, so a partial day is never a small one.
     let judged = days
         .iter()
         .map(|d| {
-            d.get("counts")
-                .and_then(Value::as_object)
-                .and_then(|c| c.values().map(|n| count(Some(n))).sum::<Option<f64>>())
+            let counts = d.get("counts");
+            DAY_COLUMNS
+                .iter()
+                .map(|(key, ..)| count(counts.and_then(|c| c.get(*key))))
+                .sum::<Option<f64>>()
         })
         .collect::<Vec<_>>();
     let x = days
@@ -363,7 +367,11 @@ mod tests {
     /// dash, never a 0, and a day with a bad count is a gap in the trend.
     #[test]
     fn alaya_kpis_read_stats_and_never_invent_a_zero() {
-        let day = |date: &str, coexist: Value| json!({ "date": date, "counts": { "coexist": coexist, "unrelated": 2 } });
+        let day = |date: &str, coexist: Value| {
+            json!({ "date": date, "counts": {
+                "contradiction": 0, "supersession": 0, "coexist": coexist, "unrelated": 2, "unjudged": 0,
+            }})
+        };
         let stats = json!({
             "memories": { "total": 5_234 },
             "contradictions": {
@@ -381,5 +389,24 @@ mod tests {
         let out = html(alaya_kpis(&json!({ "memories": { "total": null } })));
         assert_eq!(out.matches(">—<").count(), 2, "{out}");
         assert!(!out.contains(">0<"), "{out}");
+    }
+
+    /// A day missing any verdict's count has an unknown total: a partial
+    /// `counts` is not a smaller day, and an empty one is not a quiet day.
+    #[test]
+    fn a_day_missing_a_verdict_count_is_a_gap_in_the_trend() {
+        let full = json!({ "date": "2026-09-30", "counts": {
+            "contradiction": 1, "supersession": 2, "coexist": 3, "unrelated": 4, "unjudged": 5,
+        }});
+        let stats = json!({ "contradictions": { "judged_per_day": [
+            full,
+            { "date": "2026-10-01", "counts": { "coexist": 2 } },
+            { "date": "2026-10-02", "counts": {} },
+        ]}});
+        let out = html(alaya_kpis(&stats));
+        assert!(
+            out.contains("Pairs judged per day: 3 points from 2026-09-30 to 2026-10-02; latest no data; highest 15; lowest 15; no data for 2"),
+            "{out}"
+        );
     }
 }
