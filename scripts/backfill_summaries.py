@@ -60,7 +60,7 @@ SYSTEM_PROMPT = (
 MAX_CONTENT_CHARS = 4000
 # Same cap as the server (max_output_tokens in crates/alaya-backends/src/summary.rs):
 # a reply cut off at max_tokens is still stored, and 100 cut off one summary in six.
-MAX_OUTPUT_TOKENS = 500
+MAX_OUTPUT_TOKENS = 1024
 
 # Retryable exception types (network errors + mid-response resets)
 RETRYABLE = (

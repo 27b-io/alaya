@@ -162,7 +162,7 @@ services:
       # SUMMARY_PROVIDER: ${SUMMARY_PROVIDER:-anthropic}
       # SUMMARY_URL: https://api.anthropic.com
       # SUMMARY_API_KEY: ${SUMMARY_API_KEY:-}
-      # SUMMARY_MODEL: ${SUMMARY_MODEL:-claude-haiku-4-5-20251001}
+      # SUMMARY_MODEL: ${SUMMARY_MODEL:-claude-haiku-5-5}
       # Contradiction judge (LAB-3283) — provider, URL and key default to their
       # SUMMARY_* twin, so SUMMARY_URL + SUMMARY_API_KEY enable it too. The
       # model does not: the judge needs Sonnet-class precision, summaries do not.

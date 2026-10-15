@@ -12,15 +12,17 @@ const SYSTEM_PROMPT: &str = "Summarize the following in one concise sentence of 
      Return only the summary, no preamble.";
 
 /// Output budget per wire. A cut-off completion is still stored as the
-/// summary, so the cap must clear the longest one-sentence summary: at 100
-/// on the Anthropic wire, Haiku 4.5 hit `max_tokens` on 15-18% of a 300-memory
-/// sample; at 500 every one of those finished, the longest at 195 tokens.
-/// A reasoning model on the OpenAI wire spends `max_completion_tokens` on
-/// hidden reasoning first, and needs more (`finish_reason: "length"`, no
+/// summary, so the cap must clear the longest summary plus any thinking that
+/// precedes it: at 100, Haiku 4.5 hit `max_tokens` on 15-18% of a 300-memory
+/// sample (at 500 all finished, the longest at 195 tokens). `claude-haiku-5-5`
+/// thinks by default: at 500 it still came back empty or cut off on 35 of 274
+/// memories, at 1024 on none, the largest reply using 894
+/// (`scripts/summary_eval.py`). A reasoning model on the OpenAI wire spends
+/// `max_completion_tokens` the same way (`finish_reason: "length"`, no
 /// content). The cap is an upper bound, not a spend.
 const fn max_output_tokens(provider: Provider) -> u32 {
     match provider {
-        Provider::Anthropic => 500,
+        Provider::Anthropic => 1024,
         Provider::OpenAi => 1024,
     }
 }
@@ -99,12 +101,51 @@ mod tests {
         assert!(!msg.contains("abc"), "error echoed the key: {msg}");
     }
 
-    /// The Anthropic wire clears the longest measured summary; the openai
-    /// wire adds headroom for hidden reasoning.
+    /// Both wires leave room for thinking or hidden reasoning before the
+    /// summary.
     #[test]
     fn budget_per_wire() {
-        assert_eq!(max_output_tokens(Provider::Anthropic), 500);
+        assert_eq!(max_output_tokens(Provider::Anthropic), 1024);
         assert_eq!(max_output_tokens(Provider::OpenAi), 1024);
+    }
+
+    /// The anthropic wire sends the budget and no `thinking` field, so a
+    /// model that thinks by default keeps doing so within the budget, and the
+    /// text block after a thinking block is the summary.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn anthropic_wire_sends_the_budget_and_no_thinking_field() {
+        use serde_json::json;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_json(json!({
+                "model": "test-model",
+                "max_tokens": 1024,
+                "system": SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": "the memory"}],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "content": [
+                    {"type": "thinking", "thinking": "…", "signature": "s"},
+                    {"type": "text", "text": " A summary. "},
+                ],
+                "stop_reason": "end_turn",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = SummaryClient::new(
+            Provider::Anthropic,
+            server.uri(),
+            "test-model".into(),
+            Some("test-key".into()),
+        )
+        .unwrap();
+        assert_eq!(client.summarize("the memory").await.unwrap(), "A summary.");
     }
 
     /// LAB-6877 AC-5: the openai wire carries the same prompt as system and
