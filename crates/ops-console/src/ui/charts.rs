@@ -115,8 +115,13 @@ fn known(v: Option<f64>) -> Option<f64> {
 }
 
 /// A count with thousands separators, `18,342`: the charts' default format.
-/// A count above zero but under one prints `<1`, never a fictitious `0`.
+/// A count above zero but under one prints `<1`, never a fictitious `0`. A
+/// value that is not a number (Prometheus text allows `NaN` and `+Inf`)
+/// prints as a dash, never as "NaN" or "inf".
 pub fn fmt_count(v: f64) -> String {
+    if !v.is_finite() {
+        return "—".to_string();
+    }
     if v > 0.0 && v < 1.0 {
         return "<1".to_string();
     }
@@ -162,12 +167,22 @@ fn fmt_tick(v: f64, step: f64) -> String {
     format!("{trimmed}{unit}")
 }
 
+/// `used` as a share of `limit`: both known, the limit above zero, and the
+/// share in f64's range. Anything else has no share. The one rule for every
+/// share the console prints or ranks, so a meter and a table never disagree.
+pub(crate) fn share(used: Option<f64>, limit: Option<f64>) -> Option<f64> {
+    known(used)
+        .zip(known(limit).filter(|l| *l > 0.0))
+        .map(|(u, l)| u / l)
+        .filter(|s| s.is_finite())
+}
+
 /// A share as a whole percentage that never rounds to a fictitious end: one
 /// strictly between 0% and 1% prints `<1%`, and one strictly between 99%
 /// and the whole `>99%`. The bounds are on what prints, never on a rounding
 /// edge: Rust rounds a tie to even, so a share of exactly 0.005 would print
 /// `0%`.
-fn fmt_share(share: f64) -> String {
+pub(crate) fn fmt_share(share: f64) -> String {
     if share > 0.0 && share < 0.01 {
         "<1%".to_string()
     } else if share > 0.99 && share < 1.0 {
@@ -365,17 +380,11 @@ pub fn Meter(
     #[prop(optional)]
     fmt: Option<fn(f64) -> String>,
 ) -> impl IntoView {
-    let used = known(used);
     let figures = fmt.map(|f| {
-        let figure = |v: Option<f64>| v.map_or_else(|| "—".to_string(), f);
-        format!("{} / {}", figure(used), figure(known(limit)))
+        let figure = |v: Option<f64>| known(v).map_or_else(|| "—".to_string(), f);
+        format!("{} / {}", figure(used), figure(limit))
     });
-    let share = used
-        .zip(known(limit).filter(|l| *l > 0.0))
-        .map(|(u, l)| u / l)
-        // A share past f64's range is no share either.
-        .filter(|s| s.is_finite());
-    let Some(share) = share else {
+    let Some(share) = share(used, limit) else {
         let text = figures.map_or_else(|| "no data".to_string(), |f| format!("{f} · no data"));
         let summary = format!("{label}: {text}");
         return view! {
@@ -1105,6 +1114,9 @@ mod tests {
             (18342.0, "18,342"),
             (1234567.4, "1,234,567"),
             (-1234.0, "-1,234"),
+            (f64::NAN, "—"),
+            (f64::INFINITY, "—"),
+            (f64::NEG_INFINITY, "—"),
         ] {
             assert_eq!(fmt_count(v), want, "{v}");
         }
