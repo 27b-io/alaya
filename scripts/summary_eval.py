@@ -12,9 +12,9 @@ system prompt is read from ``crates/alaya-backends/src/summary.rs``, the content
 is cut to 4000 characters and the timeout is 30 s, as in ``anthropic.rs``. Arms A
 and B send exactly the body ``anthropic_body`` builds today.
 
-    A  claude-haiku-4-5-20251001  max_tokens 100   (baseline: the previous default)
-    B  claude-haiku-5-5           max_tokens 100
-    C  claude-haiku-5-5           max_tokens 100   thinking {type: disabled}
+    A  claude-haiku-4-5-20251001  max_tokens 500   (baseline)
+    B  claude-haiku-5-5           max_tokens 500
+    C  claude-haiku-5-5           max_tokens 500   thinking {type: disabled}
     D  claude-haiku-5-5           max_tokens 1024
 
 A summary call is never retried: the server does not retry, so an error counts.
@@ -26,7 +26,8 @@ summary: faithful (no claim the content does not support), main point (captures
 the content's central point) and one sentence. Rates are over memories fetched,
 so an empty summary counts as a failure.
 
-An arm passes when it has no empty or errored summary, its faithful and
+An arm passes when no summary is empty, errored or stopped on max_tokens (the
+server stores a cut-off summary as is, so text alone is not enough), its faithful and
 main-point rates are each within 0.03 of arm A's, and its p95 latency is under
 10 s.
 
@@ -67,11 +68,11 @@ SUMMARY_TIMEOUT_S = 30
 ANTHROPIC_VERSION = "2023-06-01"
 
 ARMS = {
-    "A": {"model": "claude-haiku-4-5-20251001", "max_tokens": 100},
-    "B": {"model": "claude-haiku-5-5", "max_tokens": 100},
+    "A": {"model": "claude-haiku-4-5-20251001", "max_tokens": 500},
+    "B": {"model": "claude-haiku-5-5", "max_tokens": 500},
     "C": {
         "model": "claude-haiku-5-5",
-        "max_tokens": 100,
+        "max_tokens": 500,
         "thinking": {"type": "disabled"},
     },
     "D": {"model": "claude-haiku-5-5", "max_tokens": 1024},
@@ -298,7 +299,15 @@ def main() -> None:
     )
     ap.add_argument("--grader", default="claude-opus-5-5")
     ap.add_argument("--limit", type=int, help="first N memories only (smoke run)")
+    ap.add_argument(
+        "--arms",
+        default="".join(ARMS),
+        help="arms to run, e.g. ABC; must include the baseline",
+    )
     args = ap.parse_args()
+    arms = [arm for arm in ARMS if arm in args.arms.upper()]
+    if BASELINE not in arms:
+        sys.exit(f"--arms must include the baseline {BASELINE}")
 
     alaya_url, alaya_key = env("ALAYA_URL"), env("ALAYA_API_KEY")
     llm_url, llm_key = env("SUMMARY_URL"), env("SUMMARY_API_KEY")
@@ -325,9 +334,9 @@ def main() -> None:
         return h, arm, messages(llm_url, llm_key, body, SUMMARY_TIMEOUT_S)
 
     rng = random.Random(SEED)
-    jobs = [(h, arm) for h in memories for arm in ARMS]
+    jobs = [(h, arm) for h in memories for arm in arms]
     rng.shuffle(jobs)
-    results: dict[str, dict[str, Call]] = {arm: {} for arm in ARMS}
+    results: dict[str, dict[str, Call]] = {arm: {} for arm in arms}
     with ThreadPoolExecutor(CONCURRENCY) as pool:
         for i, (h, arm, call) in enumerate(pool.map(summarise, jobs), 1):
             results[arm][h] = call
@@ -335,9 +344,9 @@ def main() -> None:
                 print(f"  summarised {i}/{len(jobs)}", file=sys.stderr)
 
     def grade_one(h: str) -> tuple[str, dict[str, Grade], Call]:
-        arms = [arm for arm in ARMS if results[arm][h].status == "ok"]
-        random.Random(f"{SEED}:{h}").shuffle(arms)
-        labels = {f"S{i + 1}": arm for i, arm in enumerate(arms)}
+        graded = [arm for arm in arms if results[arm][h].status == "ok"]
+        random.Random(f"{SEED}:{h}").shuffle(graded)
+        labels = {f"S{i + 1}": arm for i, arm in enumerate(graded)}
         if not labels:
             return h, {}, Call("ok")
         grades, call = grade(
@@ -349,7 +358,7 @@ def main() -> None:
         )
         return h, {labels[sid]: g for sid, g in grades.items()}, call
 
-    grades: dict[str, dict[str, Grade]] = {arm: {} for arm in ARMS}
+    grades: dict[str, dict[str, Grade]] = {arm: {} for arm in arms}
     grader_calls: list[Call] = []
     with ThreadPoolExecutor(CONCURRENCY) as pool:
         for i, (h, by_arm, call) in enumerate(pool.map(grade_one, memories), 1):
@@ -402,6 +411,7 @@ def main() -> None:
         spec = ARMS[arm]
         passes = arm != BASELINE and (
             r["failed"] == 0
+            and r["cut"] == 0
             and r["faithful"] >= base["faithful"] - MAX_RATE_DROP
             and r["main_point"] >= base["main_point"] - MAX_RATE_DROP
             and r["p95"] < MAX_P95_S
@@ -414,28 +424,37 @@ def main() -> None:
             f"{'base' if arm == BASELINE else ('YES' if passes else 'no'):<5} {r['by_reason'] or '-'}"
         )
 
-    winner = next((arm for arm in ("B", "D", "C") if rows[arm]["pass"]), None)
+    winner = next(
+        (arm for arm in ("B", "D", "C") if arm in rows and rows[arm]["pass"]), None
+    )
     decision = {
         "B": "B passes: switch the model, no request change",
         "D": "D passes: raise the Anthropic-wire summary budget to 1024 and switch",
         "C": "only C passes: needs a model-capability design, do not ship",
         None: "nothing passes: keep the current model",
     }[winner]
-    print(f"\ndecision: {decision}")
+    skipped = [arm for arm in ARMS if arm not in rows]
+    print(
+        f"\ndecision: {decision}"
+        + (f" (arms not run: {', '.join(skipped)})" if skipped else "")
+    )
 
     print("\n== failing summaries, first 5 per candidate arm")
-    for arm in ("B", "C", "D"):
+    for arm in [a for a in ("B", "C", "D") if a in results]:
         shown = 0
         for h, c in results[arm].items():
             g = grades[arm].get(h)
             if c.status != "ok":
                 why = c.error or f"stop_reason={c.stop_reason}"
             else:
-                why = ",".join(
+                failed = [
                     k
                     for k in ("faithful", "main_point", "one_sentence")
                     if not getattr(g, k)
-                )
+                ]
+                if c.stop_reason == "max_tokens":
+                    failed.insert(0, "cut at max_tokens")
+                why = ",".join(failed)
             if not why:
                 continue
             print(f"[{arm}] {h}  {why}\n    {c.text!r}")

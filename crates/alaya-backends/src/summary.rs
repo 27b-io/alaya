@@ -11,17 +11,26 @@ use crate::{Provider, SummaryProvider};
 const SYSTEM_PROMPT: &str = "Summarize the following in one concise sentence of approximately 50 tokens. \
      Return only the summary, no preamble.";
 
-/// Output budget, both wires. A model that reasons first spends the budget on
-/// that before the summary: an OpenAI-wire reasoning model ends with
-/// `finish_reason: "length"` and no content, and `claude-haiku-5-5`, which
-/// thinks by default, returned no text for about 4 in 5 memories at 100
-/// (`scripts/summary_eval.py`). At 1024 none came back empty; the largest
-/// reply, thinking included, used 894. The cap is an upper bound, not a spend.
-const MAX_OUTPUT_TOKENS: u32 = 1024;
+/// Output budget per wire. A cut-off completion is still stored as the
+/// summary, so the cap must clear the longest summary plus any thinking that
+/// precedes it: at 100, Haiku 4.5 hit `max_tokens` on 15-18% of a 300-memory
+/// sample (at 500 all finished, the longest at 195 tokens). `claude-haiku-5-5`
+/// thinks by default: at 500 it still came back empty or cut off on 35 of 274
+/// memories, at 1024 on none, the largest reply using 894
+/// (`scripts/summary_eval.py`). A reasoning model on the OpenAI wire spends
+/// `max_completion_tokens` the same way (`finish_reason: "length"`, no
+/// content). The cap is an upper bound, not a spend.
+const fn max_output_tokens(provider: Provider) -> u32 {
+    match provider {
+        Provider::Anthropic => 1024,
+        Provider::OpenAi => 1024,
+    }
+}
 
 pub struct SummaryClient {
     transport: MessagesTransport,
     model: String,
+    max_tokens: u32,
 }
 
 impl SummaryClient {
@@ -42,6 +51,7 @@ impl SummaryClient {
                 DEFAULT_REQUEST_TIMEOUT,
             )?,
             model,
+            max_tokens: max_output_tokens(provider),
         })
     }
 }
@@ -54,7 +64,7 @@ impl SummaryProvider for SummaryClient {
             model: &self.model,
             system: SYSTEM_PROMPT,
             user: truncate_chars(content),
-            max_tokens: MAX_OUTPUT_TOKENS,
+            max_tokens: self.max_tokens,
             schema: None,
         };
 
@@ -91,8 +101,17 @@ mod tests {
         assert!(!msg.contains("abc"), "error echoed the key: {msg}");
     }
 
-    /// The anthropic wire sends the shared budget and no `thinking` field, so
-    /// a model that thinks by default keeps doing so within the budget.
+    /// Both wires leave room for thinking or hidden reasoning before the
+    /// summary.
+    #[test]
+    fn budget_per_wire() {
+        assert_eq!(max_output_tokens(Provider::Anthropic), 1024);
+        assert_eq!(max_output_tokens(Provider::OpenAi), 1024);
+    }
+
+    /// The anthropic wire sends the budget and no `thinking` field, so a
+    /// model that thinks by default keeps doing so within the budget, and the
+    /// text block after a thinking block is the summary.
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn anthropic_wire_sends_the_budget_and_no_thinking_field() {
