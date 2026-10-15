@@ -83,8 +83,20 @@ fn int_or_dash(v: Option<&Value>) -> String {
 }
 
 fn ratio_pct(r: Option<f64>) -> String {
-    r.map(|x| format!("{:.0}%", x * 100.0))
+    r.filter(|x| x.is_finite())
+        .map(|x| format!("{:.0}%", x * 100.0))
         .unwrap_or_else(|| "—".into())
+}
+
+/// A token figure for a cell, or a dash: never a fictitious zero.
+fn tokens(v: Option<f64>) -> String {
+    v.map_or_else(|| "—".into(), fmt_tokens)
+}
+
+/// The exact figure for a cell's `title`, or a dash.
+fn exact(v: Option<f64>) -> String {
+    v.filter(|x| x.is_finite())
+        .map_or_else(|| "—".into(), |x| format!("{x:.0}"))
 }
 
 /// `MM-DD` column header for a UTC-midnight epoch.
@@ -96,6 +108,28 @@ fn fmt_day(midnight: i64) -> String {
 }
 
 // ─── Fleet: strategy, replicas, shared state ────────────────────────────────
+
+/// Transport errors by kind, most first: a count that is not a number is
+/// "no data", never a zero. An empty map is no errors; no map is no
+/// cluster info, so the ranking says it has no data.
+fn transport_errors(cluster: Option<&Value>) -> impl IntoView + use<> {
+    let errors = cluster
+        .and_then(|c| c.get("transport_errors"))
+        .and_then(Value::as_object);
+    if errors.is_some_and(|m| m.is_empty()) {
+        return Either::Left(
+            view! { <p class="text-sm text-muted-foreground">"None recorded."</p> },
+        );
+    }
+    let mut rows: Vec<Part> = errors
+        .into_iter()
+        .flatten()
+        .map(|(kind, n)| Part::new(kind.clone(), n.as_f64(), Colour::SERIES[0]))
+        .collect();
+    // serde_json maps iterate in key order, which the stable sort keeps for ties.
+    rows.sort_by(|a, b| b.value.unwrap_or(-1.0).total_cmp(&a.value.unwrap_or(-1.0)));
+    Either::Right(view! { <HBarList label="Upstream transport errors" rows=rows /> })
+}
 
 fn fleet_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
     let body = match stats {
@@ -112,19 +146,7 @@ fn fleet_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                 Some(false) => (Status::Error, "disconnected"),
                 None => (Status::Off, "no cluster info"),
             };
-            // serde_json maps iterate in key order — no sort needed.
-            let transport = cluster
-                .and_then(|c| c.get("transport_errors"))
-                .and_then(Value::as_object)
-                .map(|m| {
-                    m.iter()
-                        .map(|(k, v)| format!("{k} {}", v.as_u64().unwrap_or(0)))
-                        .collect::<Vec<_>>()
-                        .join(" · ")
-                })
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| "—".into());
-
+            let transport = transport_errors(cluster);
             Either::Right(view! {
                 <StatGrid>
                     <Stat label="Strategy" text=true>{strategy}</Stat>
@@ -137,10 +159,9 @@ fn fleet_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                         <StatusBadge status=redis label=redis_text />
                     </Stat>
                     // No pooled-headroom tile: see the note above accounts_card (LAB-4554).
-                    <Stat label="Upstream transport errors (fleet, cumulative)" text=true>
-                        {transport}
-                    </Stat>
                 </StatGrid>
+                <h3 class="text-sm font-medium mt-6 mb-2">"Upstream transport errors (fleet, cumulative)"</h3>
+                {transport}
             })
         }
     };
@@ -180,11 +201,57 @@ fn budgets_card(
         )
         .collect();
 
-    // Component children are boxed 'static closures: hand them owned values.
-    let day_heads = day_starts
+    let day_labels: Vec<String> = day_starts.iter().map(|d| fmt_day(*d)).collect();
+    // A client's history, a dash per day it has none; `None` while the
+    // metrics store is dark, so no chart claims to know the week.
+    let series_of = |c: &str| -> Option<Vec<Option<f64>>> {
+        history.map(|b| {
+            b.by_client
+                .get(c)
+                .cloned()
+                .unwrap_or_else(|| vec![None; day_starts.len()])
+        })
+    };
+
+    let tiles = clients
         .iter()
-        .map(|d| {
-            let label = fmt_day(*d);
+        .map(|c| {
+            let live_meter = match live.get(c) {
+                Some(&(used, limit)) => {
+                    let label = format!("{c}: live budget");
+                    Either::Left(
+                        view! { <Meter label=label used=used limit=limit fmt=fmt_tokens /> },
+                    )
+                }
+                None => Either::Right(
+                    view! { <p class="text-sm text-muted-foreground">"no live figure"</p> },
+                ),
+            };
+            let trend = series_of(c).map(|values| {
+                let (label, x) = (format!("{c}: daily burn"), day_labels.clone());
+                view! {
+                    <div>
+                        <p class="mt-3 text-xs text-muted-foreground">"Daily burn, 7 days"</p>
+                        <Sparkline label=label values=values x=x fmt=fmt_tokens />
+                    </div>
+                }
+            });
+            let name = c.clone();
+            view! {
+                <li class="min-w-0 space-y-2 rounded-lg border bg-card p-4">
+                    <p class="font-mono text-xs wrap-break-word">{name}</p>
+                    {live_meter}
+                    {trend}
+                </li>
+            }
+        })
+        .collect_view();
+
+    // Component children are boxed 'static closures: hand them owned values.
+    let day_heads = day_labels
+        .iter()
+        .map(|label| {
+            let label = label.clone();
             view! { <TableHead secondary=true>{label}</TableHead> }
         })
         .collect_view();
@@ -194,32 +261,23 @@ fn budgets_card(
         .map(|c| {
             let live_cell = match live.get(c) {
                 Some(&(used, limit)) => {
-                    let pct = ratio_pct((limit > 0.0).then(|| used / limit));
+                    let pct = ratio_pct(used.zip(limit.filter(|l| *l > 0.0)).map(|(u, l)| u / l));
+                    let title = format!("{} / {} tokens", exact(used), exact(limit));
+                    let text = format!("{} / {} ({pct})", tokens(used), tokens(limit));
                     Either::Left(view! {
-                        <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
-                            <progress class="h-2 w-24" value=format!("{used:.0}") max=format!("{limit:.0}")></progress>
-                            <span class="tabular-nums whitespace-nowrap" title=format!("{used:.0} / {limit:.0} tokens")>
-                                {fmt_tokens(used)}" / "{fmt_tokens(limit)}" ("{pct}")"
-                            </span>
-                        </div>
+                        <span class="tabular-nums whitespace-nowrap" title=title>{text}</span>
                     })
                 }
                 None => Either::Right(view! { <span class="text-muted-foreground">"—"</span> }),
             };
-            let series = history
-                .and_then(|b| b.by_client.get(c))
-                .cloned()
-                .unwrap_or_else(|| vec![None; day_starts.len()]);
-            let cells = series
+            let cells = series_of(c)
+                .unwrap_or_else(|| vec![None; day_starts.len()])
                 .into_iter()
                 .map(|v| {
-                    let (label, exact) = match v {
-                        Some(x) => (fmt_tokens(x), format!("{x:.0}")),
-                        None => ("—".to_string(), String::new()),
-                    };
+                    let (label, title) = (tokens(v), exact(v));
                     view! {
                         <TableCell secondary=true>
-                            <span class="tabular-nums" title=exact>{label}</span>
+                            <span class="tabular-nums" title=title>{label}</span>
                         </TableCell>
                     }
                 })
@@ -234,6 +292,28 @@ fn budgets_card(
             }
         })
         .collect_view();
+
+    // Nothing to chart when no source named a client: the notices say why.
+    let charts = (!clients.is_empty()).then(|| {
+        view! {
+        <ul class="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">{tiles}</ul>
+        <details class="mt-6">
+            <summary class="text-sm cursor-pointer">"Daily figures"</summary>
+            <div class="mt-3">
+                <TableWrapper><Table>
+                    <TableHeader>
+                        <TableRow>
+                            <TableHead>"Client"</TableHead>
+                            <TableHead>"Today (live) — used / limit"</TableHead>
+                            {day_heads}
+                        </TableRow>
+                    </TableHeader>
+                    <TableBody>{rows}</TableBody>
+                </Table></TableWrapper>
+            </div>
+        </details>
+        }
+    });
 
     let live_note = stats
         .as_ref()
@@ -258,23 +338,14 @@ fn budgets_card(
             <CardHeader>
                 <CardTitle>"Per-client budget burn"</CardTitle>
                 <CardDescription>
-                    "Live: today's fleet-wide burn vs daily limit (anthropic-lb /_stats, Redis aggregate). History: daily peak of anthropic_cluster_budget_used per UTC day from the metrics store; today's column is running. Limits are TOML, GitOps — nothing here edits them."
+                    "Live: today's fleet-wide burn vs daily limit (anthropic-lb /_stats, Redis aggregate). History: daily peak of anthropic_cluster_budget_used per UTC day from the metrics store, today's still running. Each client's meter turns amber at 80% and red at its limit; the daily figures fold out below. Limits are TOML, GitOps — nothing here edits them."
                 </CardDescription>
             </CardHeader>
             <CardContent>
                 {live_note}
                 {mirror_note}
                 {history_note}
-                <TableWrapper><Table>
-                    <TableHeader>
-                        <TableRow>
-                            <TableHead>"Client"</TableHead>
-                            <TableHead>"Today (live) — used / limit"</TableHead>
-                            {day_heads}
-                        </TableRow>
-                    </TableHeader>
-                    <TableBody>{rows}</TableBody>
-                </Table></TableWrapper>
+                {charts}
             </CardContent>
         </Card>
     }
@@ -297,6 +368,13 @@ fn status_of(e: &Value) -> (Status, String) {
     }
     (Status::Ok, "allowed".into())
 }
+
+/// Where an account's utilisation meter turns amber and red: the floors the
+/// LB itself reads its upstream statuses as, `allowed_warning` at 0.80 and
+/// `throttled` at 0.98 (anthropic-lb's `utilization.rs`). The status badge
+/// still carries the upstream's own word, which the meter never overrides.
+const UTIL_WARN: f64 = 0.80;
+const UTIL_CRIT: f64 = 0.98;
 
 // Deliberately no request-headroom column, and none of the `headroom_requests`
 // / `total_headroom_requests` fields `/_stats` publishes: Anthropic's headers
@@ -329,8 +407,16 @@ fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                         .unwrap_or(false)
                         .then(|| view! { <StatusBadge status=Status::Off label="passthrough" /> });
                     let priority = int_or_dash(e.get("priority"));
-                    let u5 = ratio_pct(e.get("utilization_5h").and_then(Value::as_f64));
-                    let u7 = ratio_pct(e.get("utilization_7d").and_then(Value::as_f64));
+                    let util = |window: &str| {
+                        let label = format!("{name}: {window} utilisation");
+                        let used = e.get(format!("utilization_{window}").as_str()).and_then(Value::as_f64);
+                        view! {
+                            <div class="min-w-24">
+                                <Meter label=label used=used limit=Some(1.0) warn=UTIL_WARN crit=UTIL_CRIT />
+                            </div>
+                        }
+                    };
+                    let (u5, u7) = (util("5h"), util("7d"));
                     let (status, status_text) = status_of(e);
                     let reset_5h = e
                         .get("reset_5h")
@@ -347,8 +433,8 @@ fn accounts_card(stats: &Result<Value, AppError>) -> impl IntoView + use<> {
                             </TableCell>
                             <TableCell secondary=true>{protocol}</TableCell>
                             <TableCell secondary=true>{priority}</TableCell>
-                            <TableCell><span class="tabular-nums">{u5}</span></TableCell>
-                            <TableCell><span class="tabular-nums">{u7}</span></TableCell>
+                            <TableCell>{u5}</TableCell>
+                            <TableCell>{u7}</TableCell>
                             <TableCell><StatusBadge status=status label=status_text /></TableCell>
                             <TableCell secondary=true><span class="whitespace-nowrap">{reset_5h}</span></TableCell>
                         </TableRow>
@@ -444,13 +530,20 @@ mod tests {
         assert!(html.contains("17913067 / 50000000 tokens"), "{html}");
         assert!(html.contains("17.9M") && html.contains("50.0M") && html.contains("36%"));
         assert!(
-            html.contains("<progress value=\"17913067\" max=\"50000000\""),
+            html.contains("aria-label=\"kody: live budget: 17.9M / 50.0M, 36%\""),
             "{html}"
         );
         assert!(!html.contains("replica-local"));
-        // Union of live + history clients; a gap renders as a dash.
+        // Union of live + history clients; a gap renders as a dash in the
+        // table and as no data in the trend, never as a zero.
         assert!(html.contains("alaya"));
         assert!(html.contains("22.0M") && html.contains(">—<"), "{html}");
+        assert!(
+            html.contains("aria-label=\"kody: daily burn: 3 points from 09-17 to 09-19; latest 17.9M; highest 22.0M; lowest 17.9M; no data for 1\""),
+            "{html}"
+        );
+        // alaya has a live budget and no history: its trend says so.
+        assert!(html.contains("alaya: daily burn: no data"), "{html}");
         assert!(html.contains("09-17") && html.contains("09-19"), "{html}");
         assert!(html.contains("TOML, GitOps"));
         assert!(!html.contains("<form"));
@@ -467,9 +560,54 @@ mod tests {
         let html = budgets_card(&Ok(stats), &Ok(sample_burn())).to_html();
         assert!(html.contains("replica-local"), "{html}");
         assert!(
-            html.contains("<progress value=\"1\" max=\"50000000\""),
+            html.contains("aria-label=\"kody: live budget: 1 / 50.0M, &lt;1%\""),
             "{html}"
         );
+    }
+
+    /// A dark source keeps its named notice, and no chart stands in for it
+    /// with zeros: no meter without `/_stats`, no trend without the metrics
+    /// store.
+    #[test]
+    fn budgets_card_draws_nothing_for_a_dark_source() {
+        let down = || AppError::Upstream("connection refused".into());
+        let html = budgets_card(&Err(down()), &Ok(sample_burn())).to_html();
+        assert!(
+            html.contains("live budgets (anthropic-lb /_stats)"),
+            "{html}"
+        );
+        assert!(!html.contains("live budget:"), "{html}");
+        assert!(html.contains("kody: daily burn: 3 points"), "{html}");
+        let html = budgets_card(&Ok(sample_stats()), &Err(down())).to_html();
+        assert!(html.contains("7-day history (metrics store)"), "{html}");
+        assert!(!html.contains("daily burn"), "{html}");
+        assert!(
+            html.contains("kody: live budget: 17.9M / 50.0M, 36%"),
+            "{html}"
+        ); // Both dark: the two notices, and no empty grid or table under them.
+        let html = budgets_card(&Err(down()), &Err(down())).to_html();
+        assert!(
+            html.contains("live budgets (anthropic-lb /_stats)"),
+            "{html}"
+        );
+        assert!(html.contains("7-day history (metrics store)"), "{html}");
+        assert!(
+            !html.contains("Daily figures") && !html.contains("<ul"),
+            "{html}"
+        );
+    }
+
+    /// A budget the LB reports without a figure says "no data", not 0%.
+    #[test]
+    fn a_budget_missing_its_used_figure_is_no_data() {
+        let mut stats = sample_stats();
+        stats["cluster"]["budget_usage"]["kody"] = json!({"limit": 50000000});
+        let html = budgets_card(&Ok(stats), &Ok(sample_burn())).to_html();
+        assert!(
+            html.contains("kody: live budget: — / 50.0M · no data"),
+            "{html}"
+        );
+        assert!(html.contains(">— / 50.0M (—)<"), "{html}");
     }
 
     #[test]
@@ -481,6 +619,17 @@ mod tests {
         assert!(html.contains("hard-limited 120s"));
         assert!(html.contains("passthrough"));
         assert!(html.contains("97%"));
+        // Utilisation is a meter on the LB's own status floors: 0.97 is
+        // past the warning floor, short of the throttled one.
+        assert!(
+            html.contains("aria-label=\"acct-hot: 7d utilisation: 97%, warning\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("acct-hot: 5h utilisation: 90%, warning"),
+            "{html}"
+        );
+        assert!(html.contains("acct-cool: 5h utilisation: 0%\""), "{html}");
         // LAB-4554: request headroom is structurally empty upstream. Matched
         // case-insensitively so a re-add under any label trips the guard.
         assert!(!html.to_lowercase().contains("headroom"), "{html}");
@@ -493,7 +642,11 @@ mod tests {
         let html = fleet_card(&Ok(sample_stats())).to_html();
         assert!(html.contains("sticky-weighted-v2"));
         assert!(html.contains(">connected<"), "{html}");
-        assert!(html.contains("other 4103 · timeout 706"), "{html}");
+        // Transport errors ranked, most first.
+        assert!(
+            html.contains("aria-label=\"Upstream transport errors: other 4,103, timeout 706\""),
+            "{html}"
+        );
         assert!(!html.contains("multica-runtime"), "{html}");
         // LAB-4554: the pooled request-headroom tile is gone for good, and the
         // instance count says what it counts rather than "Replicas seen".
@@ -503,6 +656,26 @@ mod tests {
             "{html}"
         );
         assert!(!html.contains("Replicas seen"), "{html}");
+    }
+
+    /// No errors is not no data, and no cluster info is not no errors.
+    #[test]
+    fn transport_errors_tell_none_from_unknown() {
+        let html = transport_errors(Some(&json!({"transport_errors": {}}))).to_html();
+        assert!(html.contains("None recorded."), "{html}");
+        let html = transport_errors(None).to_html();
+        assert!(
+            html.contains("no data") && !html.contains("None recorded."),
+            "{html}"
+        );
+        let html = transport_errors(Some(
+            &json!({"transport_errors": {"a": 1, "b": "x", "c": 5}}),
+        ))
+        .to_html();
+        assert!(
+            html.contains("Upstream transport errors: c 5, a 1, b no data"),
+            "{html}"
+        );
     }
 
     #[test]

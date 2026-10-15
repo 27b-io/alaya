@@ -62,9 +62,14 @@ impl LbClient {
     }
 }
 
-fn f64_of(v: &Value, key: &str) -> f64 {
-    v.get(key).and_then(Value::as_f64).unwrap_or(0.0)
+/// A number the body may lack: `None`, never a fictitious zero.
+fn f64_of(v: &Value, key: &str) -> Option<f64> {
+    v.get(key).and_then(Value::as_f64)
 }
+
+/// A client's `(used, limit)` today; either is `None` when the LB did not
+/// report it.
+pub type Budget = (Option<f64>, Option<f64>);
 
 /// Today's per-client `(used, limit)` from a `/_stats` body. Prefers the
 /// fleet-wide Redis aggregate; falls back to this replica's local mirror —
@@ -72,8 +77,8 @@ fn f64_of(v: &Value, key: &str) -> f64 {
 /// aggregate is absent OR empty (the LB emits `budget_usage: {}` when its
 /// Redis read failed). The flag is `true` when the numbers are fleet-wide;
 /// callers must say so when it is not.
-pub fn live_budgets(stats: &Value) -> (BTreeMap<String, (f64, f64)>, bool) {
-    let pairs = |v: Option<&Value>, used: &str, limit: &str| -> BTreeMap<String, (f64, f64)> {
+pub fn live_budgets(stats: &Value) -> (BTreeMap<String, Budget>, bool) {
+    let pairs = |v: Option<&Value>, used: &str, limit: &str| -> BTreeMap<String, Budget> {
         v.and_then(Value::as_object)
             .into_iter()
             .flatten()
@@ -222,8 +227,12 @@ impl MetricsClient {
 }
 
 /// Humanised token count for table cells; the exact value goes in `title`.
+/// A value that is not a number (Prometheus text allows `NaN` and `+Inf`)
+/// prints as a dash, never as "NaN" or "inf".
 pub fn fmt_tokens(n: f64) -> String {
-    if n >= 1e9 {
+    if !n.is_finite() {
+        "—".to_string()
+    } else if n >= 1e9 {
         format!("{:.2}B", n / 1e9)
     } else if n >= 1e6 {
         format!("{:.1}M", n / 1e6)
@@ -287,14 +296,20 @@ mod tests {
             "cluster": {"budget_usage": {"kody": {"limit": 50000000, "used": 17913067}}}
         }));
         assert!(fleet);
-        assert_eq!(m["kody"], (17_913_067.0, 50_000_000.0));
+        assert_eq!(m["kody"], (Some(17_913_067.0), Some(50_000_000.0)));
         // Redis read failed: the LB emits an EMPTY aggregate — fall back.
         let (m, fleet) = live_budgets(&json!({
             "client_budgets": mirror,
             "cluster": {"redis_connected": false, "budget_usage": {}}
         }));
         assert!(!fleet);
-        assert_eq!(m["kody"], (1.0, 50_000_000.0));
+        assert_eq!(m["kody"], (Some(1.0), Some(50_000_000.0)));
+        // A missing or non-numeric figure is unknown, not zero.
+        let (m, _) = live_budgets(&json!({
+            "cluster": {"budget_usage": {"kody": {"limit": 50000000}, "radar": {"used": "x", "limit": 10}}}
+        }));
+        assert_eq!(m["kody"], (None, Some(50_000_000.0)));
+        assert_eq!(m["radar"], (None, Some(10.0)));
         // No cluster info at all (Redis unconfigured / before first tick).
         let (m, fleet) = live_budgets(&json!({"client_budgets": mirror}));
         assert!(!fleet && m.len() == 1);
@@ -327,5 +342,8 @@ mod tests {
         assert_eq!(fmt_tokens(17_913_067.0), "17.9M");
         // The largest configured daily limit is in the billions.
         assert_eq!(fmt_tokens(15_000_000_000.0), "15.00B");
+        for v in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(fmt_tokens(v), "—");
+        }
     }
 }

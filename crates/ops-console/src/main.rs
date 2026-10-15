@@ -3036,7 +3036,10 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("1.8M"), "{html}");
-        assert!(html.contains("<progress value=\"12\" max=\"40\""), "{html}");
+        assert!(
+            html.contains("aria-label=\"adds: used today: 12 / 40, 30%\""),
+            "{html}"
+        );
         // Waiting on you: the PR as a link, the PR-less task flagged.
         assert!(
             html.contains("href=\"https://github.com/acme/agent/pull/7\""),
@@ -3064,6 +3067,11 @@ mod tests {
             "{html}"
         );
         assert!(!html.contains(">ready<"));
+        // The in-flight bar holds the live states only, absent ones as 0.
+        assert!(
+            html.contains("aria-label=\"Tasks in flight by state: queued 3 (60%), running 0 (0%), awaiting_approval 2 (40%), approved 0 (0%), executing 0 (0%); total 5\""),
+            "{html}"
+        );
         // Download health: alerts and signals.
         assert!(html.contains("slskd unreachable: connection refused"));
         assert!(html.contains("queue_count"));
@@ -3219,9 +3227,68 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("held, 42s left"), "{html}");
-        assert!(html.contains("<progress value=\"12\" max=\"40\""), "{html}");
+        assert!(html.contains("adds: used today: 12 / 40, 30%"), "{html}");
         assert!(html.contains("Showing the newest 1 of 412."), "{html}");
         assert!(!html.contains("selecta /metrics:"), "{html}");
+    }
+
+    /// Prometheus text allows `NaN` and `+Inf`: neither prints as such, and
+    /// neither passes for a number (a NaN lease is not "not held").
+    #[tokio::test]
+    async fn selecta_pane_prints_no_nan_or_inf() {
+        let seen = SelectaSeen::default();
+        let metrics: &'static str = Box::leak(
+            SELECTA_METRICS
+                .replace("lease_remaining_s 41.5", "lease_remaining_s NaN")
+                .replace(
+                    "budget_consumed_toolcalls 212",
+                    "budget_consumed_toolcalls +Inf",
+                )
+                .replace(
+                    "budget_consumed_wallclock 1200.0",
+                    "budget_consumed_wallclock NaN",
+                )
+                .replace(
+                    "day_cap_used{cap=\"adds\"} 12",
+                    "day_cap_used{cap=\"adds\"} NaN",
+                )
+                .replace(
+                    "queue_depth{state=\"ready\"} 3",
+                    "queue_depth{state=\"ready\"} NaN",
+                )
+                .into_boxed_str(),
+        );
+        let state = fake_selecta(
+            &seen,
+            selecta_answer,
+            metrics,
+            (StatusCode::OK, r#"{"status":"ok","seq":9124}"#),
+        )
+        .await;
+        let (status, html) = render(state, "/selecta").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!html.contains("NaN") && !html.contains("inf<"), "{html}");
+        // Neither reads as a verdict: an infinity is not the torn-read
+        // sentinel, and a NaN lease is not "not held".
+        assert!(!html.contains("torn ledger read"), "{html}");
+        let tile = html
+            .split("Tool calls consumed</dt>")
+            .nth(1)
+            .expect("tool calls tile");
+        assert!(
+            tile.split("</dd>").next().unwrap().ends_with(">—"),
+            "{html}"
+        );
+        assert!(!html.contains("not held"), "{html}");
+        assert!(
+            html.contains("adds: used today: — / 40 · no data"),
+            "{html}"
+        );
+        // An unknown live state leaves the whole unknown.
+        assert!(
+            html.contains("Tasks in flight by state: queued no data"),
+            "{html}"
+        );
     }
 
     #[tokio::test]
@@ -3548,6 +3615,12 @@ mod tests {
             let (cookie, _) = cookie_for(&state, "admin-sub");
             let (_, html) = get_page(&state, &cookie, "/lb/clients").await;
             assert!(html.contains("disabled set full"), "{html}");
+            assert!(html.contains("more than 1,024 names disabled"), "{html}");
+            // The cap is drawn: full, at the critical level.
+            assert!(
+                html.contains("aria-label=\"Disabled names: 1,024 / 1,024, 100%, critical\""),
+                "{html}"
+            );
             let first = html.find("name=\"also_enable\"").unwrap();
             assert!(
                 html[first..].starts_with(&format!("name=\"also_enable\" value=\"n0999:{T0}\"")),

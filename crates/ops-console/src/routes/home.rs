@@ -267,17 +267,14 @@ fn alaya_kpis(stats: &Value) -> impl IntoView + use<> {
 fn tightest_budgets(stats: &Value) -> impl IntoView + use<> {
     const SHOWN: usize = 3;
     let (budgets, fleet) = live_budgets(stats);
-    let mut rows: Vec<(String, f64, f64)> = budgets
+    let mut rows: Vec<(String, Option<f64>, Option<f64>)> = budgets
         .into_iter()
         .map(|(client, (used, limit))| (client, used, limit))
         .collect();
-    // A client with no share (a zero limit) sorts last.
-    let share = |used: f64, limit: f64| {
-        if limit > 0.0 {
-            used / limit
-        } else {
-            f64::NEG_INFINITY
-        }
+    // A client with no share (a figure missing, or a zero limit) sorts last.
+    let share = |used: Option<f64>, limit: Option<f64>| match (used, limit) {
+        (Some(u), Some(l)) if l > 0.0 && (u / l).is_finite() => u / l,
+        _ => f64::NEG_INFINITY,
     };
     rows.sort_by(|a, b| share(b.1, b.2).total_cmp(&share(a.1, a.2)));
     let more = rows.len().saturating_sub(SHOWN);
@@ -289,7 +286,7 @@ fn tightest_budgets(stats: &Value) -> impl IntoView + use<> {
             view! {
                 <li class="min-w-0 space-y-1">
                     <p class="font-mono text-xs wrap-break-word">{client}</p>
-                    <Meter label=label used=Some(used) limit=Some(limit) fmt=fmt_tokens />
+                    <Meter label=label used=used limit=limit fmt=fmt_tokens />
                 </li>
             }
         })
@@ -330,6 +327,8 @@ mod tests {
             "tight": budget(95, 100),
             "unlimited": budget(5, 0),
             "middling": budget(50, 100),
+            // A limit with no used figure has no share: it sorts last too.
+            "unreported": json!({ "limit": 100 }),
             "over": budget(130, 100),
         }}});
         let out = html(tightest_budgets(&stats));
@@ -342,10 +341,10 @@ mod tests {
             .collect();
         assert!(order.is_sorted(), "{out}");
         assert!(
-            !out.contains("loose") && !out.contains("unlimited"),
+            !out.contains("loose") && !out.contains("unlimited") && !out.contains("unreported"),
             "{out}"
         );
-        assert!(out.contains("2 more on the module page."), "{out}");
+        assert!(out.contains("3 more on the module page."), "{out}");
         assert!(!out.contains("One replica"), "{out}");
     }
 

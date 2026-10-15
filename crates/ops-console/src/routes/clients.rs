@@ -584,7 +584,8 @@ fn restrictions_card(
             }
         })
         .collect_view();
-    let full = disabled_count(rows) >= DISABLED_CAP;
+    let disabled = disabled_count(rows);
+    let full = disabled >= DISABLED_CAP;
     // Component children are boxed 'static closures: build them first.
     let form = disable_form(csrf, prefill, full, rows, unmatched);
     let unrecorded = enable_unrecorded_form(csrf);
@@ -599,6 +600,10 @@ fn restrictions_card(
                 </CardDescription>
             </CardHeader>
             <CardContent>
+                <div class="mb-6 max-w-md">
+                    <h3 class="text-sm font-medium mb-2">"Disabled names, against the store's cap"</h3>
+                    <Meter label="Disabled names" used=Some(disabled as f64) limit=Some(DISABLED_CAP as f64) fmt=fmt_count />
+                </div>
                 {form}
                 <TableWrapper><Table>
                     <TableHeader><TableRow>
@@ -657,7 +662,10 @@ fn disable_form(
             <div class="mt-3">
                 <div class="mb-2">
                     <Notice status=Status::Warn label="disabled set full">
-                        "The store refuses a request that leaves more than 1,024 names disabled and more than it found. Pick names to enable in the same request:"
+                        {format!(
+                            "The store refuses a request that leaves more than {} names disabled and more than it found. Pick names to enable in the same request:",
+                            fmt_count(DISABLED_CAP as f64)
+                        )}
                     </Notice>
                 </div>
                 <div class="grid grid-cols-2 sm:grid-cols-4 gap-1 max-h-64 overflow-y-auto">{boxes}</div>
