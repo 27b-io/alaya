@@ -18,11 +18,14 @@
 //! drawn as such and never as a zero; a zero is drawn as a zero. So is a
 //! total or a share that overflows `f64`.
 //!
-//! No page draws a chart yet; the pages adopt them in their own changes.
-//! Until then only the tests and the snapshot gallery use this module, and
-//! the expectation below fails the lint once every item is in use, so it
-//! cannot outlive its reason.
-#![cfg_attr(not(test), expect(dead_code, reason = "no page draws a chart yet"))]
+//! The pages adopt the charts in their own changes, and until every chart
+//! is drawn by a page some items are used only by the tests and the
+//! snapshot gallery. The expectation below fails the lint once every item
+//! is in use, so it cannot outlive its reason.
+#![cfg_attr(
+    not(test),
+    expect(dead_code, reason = "not every chart is drawn by a page yet")
+)]
 
 use leptos::either::Either;
 use leptos::prelude::*;

@@ -137,25 +137,27 @@ module must not grow one. Values render with their provenance; limits are
 "TOML, GitOps".
 
 - **Fleet** — routing strategy, replicas seen, shared-state (Redis) health,
-  pooled headroom, cumulative upstream transport errors. Source:
+  cumulative upstream transport errors ranked by kind. Source:
   `GET /_stats`. Only fleet-wide values render: `/_stats` also carries
   process-local counters (per-consumer request rates, per-endpoint burn
   rates) that describe one random replica behind a Service, so they are
   deliberately left out.
-- **Per-client budget burn** — today's fleet-wide used / limit with a
-  progress bar (`/_stats` → `cluster.budget_usage`, the Redis aggregate).
+- **Per-client budget burn** — one tile per client: today's fleet-wide used /
+  limit as a meter (`/_stats` → `cluster.budget_usage`, the Redis aggregate)
+  over a 7-day sparkline, the exact figures folded into a table below.
   When that aggregate is absent or empty the card falls back to the
   replica-local `client_budgets` mirror and says so with a "replica-local"
   badge — that mirror resets on pod restart and undercounts the fleet. Plus
-  a 7-column history: the daily peak of `anthropic_cluster_budget_used` per
+  a 7-day history: the daily peak of `anthropic_cluster_budget_used` per
   UTC day, today's column running. History is one `query_range` against
   `METRICS_URL` (`max by (client) (max_over_time(…[23h58m]))` at 23:59 UTC
   of each day — the trimmed window keeps the first post-midnight scrape,
   which can still carry yesterday's total, out of today's peak). No history
   store in the console, no dashboard embeds.
-- **Upstream accounts** — per endpoint: 5-hour / 7-day window utilisation,
-  hard-limit / throttle status, remaining requests, next 5h reset; hottest
-  first.
+- **Upstream accounts** — per endpoint: 5-hour / 7-day window utilisation as
+  meters (amber from 0.80, red from 0.98: the floors the LB reads
+  `allowed_warning` and `throttled` as), hard-limit / throttle status, next
+  5h reset; hottest first.
 
 Each card degrades on its own: a dark metrics store leaves live headroom
 up, an LB outage leaves the burn history up. Every upstream client in the

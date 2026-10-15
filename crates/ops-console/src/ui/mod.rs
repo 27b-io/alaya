@@ -26,10 +26,6 @@ mod components;
 mod patterns;
 mod shell;
 
-#[cfg_attr(
-    not(test),
-    expect(unused_imports, reason = "no page draws a chart yet")
-)]
 pub use charts::*;
 pub use components::*;
 pub use patterns::*;

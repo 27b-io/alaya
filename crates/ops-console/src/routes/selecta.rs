@@ -31,6 +31,9 @@ use crate::state::AppState;
 use crate::ui::*;
 
 const TITLE: &str = "selecta — ops console";
+/// The states a task ends in. selecta keeps every row, so their counts are
+/// all time.
+const TERMINAL: [&str; 3] = ["done", "aborted_stale", "failed"];
 const FAILED_SHOWN: u32 = 20;
 /// Also the home card's probe size: it says "N+" when a list fills it.
 pub const AWAITING_SHOWN: u32 = 100;
@@ -149,8 +152,11 @@ pub async fn task(
 
 // ─── Rendering helpers ──────────────────────────────────────────────────────
 
-/// `1h 02m`, `4m 05s`, `12s`.
+/// `1h 02m`, `4m 05s`, `12s`; a dash for a value that is not a number.
 fn fmt_secs(s: f64) -> String {
+    if !s.is_finite() {
+        return "—".into();
+    }
     let s = s.max(0.0).round() as u64;
     match (s / 3600, (s % 3600) / 60, s % 60) {
         (0, 0, sec) => format!("{sec}s"),
@@ -159,9 +165,21 @@ fn fmt_secs(s: f64) -> String {
     }
 }
 
+/// A figure from selecta's /metrics or its health snapshot, which are
+/// Prometheus-style numbers: `NaN` and `±Inf` print as a dash, never as
+/// "NaN" or "inf".
+fn count(v: f64) -> String {
+    if v.is_finite() {
+        fmt_count(v)
+    } else {
+        "—".into()
+    }
+}
+
 /// A count for a cell; the torn-read sentinel renders as what it is.
 fn count_or_torn(v: f64, fmt: impl Fn(f64) -> String) -> String {
-    if v >= TORN_SENTINEL {
+    // An infinity is not the sentinel: `count` and its kin print it as a dash.
+    if v.is_finite() && v >= TORN_SENTINEL {
         "unreadable (torn ledger read)".into()
     } else {
         fmt(v)
@@ -244,7 +262,9 @@ fn runner_card(
     let body = match gauges {
         Err(e) => Either::Left(unavailable("lease and budget", e.detail())),
         Ok(g) => {
-            let (lease, lease_text) = if g.lease_remaining_s > 0.0 {
+            let (lease, lease_text) = if !g.lease_remaining_s.is_finite() {
+                (Status::Off, "unknown".to_string())
+            } else if g.lease_remaining_s > 0.0 {
                 (
                     Status::Ok,
                     format!("held, {} left", fmt_secs(g.lease_remaining_s)),
@@ -263,31 +283,19 @@ fn runner_card(
             };
             let tokens = count_or_torn(b.tokens, fmt_tokens);
             let wallclock = count_or_torn(b.wallclock_s, fmt_secs);
-            let toolcalls = count_or_torn(b.toolcalls, |v| format!("{v:.0}"));
+            let toolcalls = count_or_torn(b.toolcalls, count);
             let caps = g
                 .day_caps
                 .iter()
                 .map(|(cap, (used, limit))| {
                     let name = cap.clone();
-                    let cell = match (used, limit) {
-                        (Some(u), Some(l)) => {
-                            let (u, l) = (*u, *l);
-                            Either::Left(view! {
-                                <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
-                                    <progress class="h-2 w-24" value=format!("{u:.0}") max=format!("{l:.0}")></progress>
-                                    <span class="tabular-nums whitespace-nowrap">{format!("{u:.0} / {l:.0}")}</span>
-                                </div>
-                            })
-                        }
-                        // Half a pair is a selecta bug; show what exists.
-                        (u, l) => {
-                            let text = format!(
-                                "{} / {}",
-                                u.map_or("—".into(), |v| format!("{v:.0}")),
-                                l.map_or("—".into(), |v| format!("{v:.0}"))
-                            );
-                            Either::Right(view! { <span class="tabular-nums">{text}</span> })
-                        }
+                    // Half a pair is a selecta bug: the meter shows what
+                    // exists and draws no share.
+                    let label = format!("{cap}: used today");
+                    let cell = view! {
+                        <div class="min-w-24">
+                            <Meter label=label used=*used limit=*limit fmt=fmt_count />
+                        </div>
                     };
                     view! {
                         <TableRow>
@@ -504,22 +512,35 @@ fn states_card(gauges: &Result<Gauges, AppError>) -> impl IntoView + use<> {
                 }
             });
             // selecta omits zero-count states: every state renders, absent = 0.
+            let depth = |s: &str| g.queue_depth.get(s).copied().unwrap_or(0.0);
+            // The live states only: done, aborted_stale and failed count all
+            // time and would leave nothing else visible.
+            let live = STATES
+                .iter()
+                .filter(|s| !TERMINAL.contains(s))
+                .enumerate()
+                .map(|(i, s)| Part::new(*s, Some(depth(s)), Colour::SERIES[i]))
+                .collect::<Vec<_>>();
             let tiles = STATES
                 .iter()
                 .chain(&unknown)
                 .map(|s| {
-                    let n = g.queue_depth.get(*s).copied().unwrap_or(0.0);
+                    let n = depth(s);
                     let class = match *s {
                         "failed" | "aborted_stale" if n > 0.0 => "text-destructive",
                         "awaiting_approval" if n > 0.0 => "text-warning-dark",
                         _ => "",
                     };
-                    let (label, count) = (s.to_string(), format!("{n:.0}"));
-                    view! { <Stat label=label><span class=class>{count}</span></Stat> }
+                    let (label, n) = (s.to_string(), count(n));
+                    view! { <Stat label=label><span class=class>{n}</span></Stat> }
                 })
                 .collect_view();
             Either::Right(view! {
                 {unknown_note}
+                <div class="mb-6">
+                    <h3 class="text-sm font-medium mb-2">"In flight"</h3>
+                    <StackedBar label="Tasks in flight by state" parts=live />
+                </div>
                 <StatGrid>{tiles}</StatGrid>
             })
         }
@@ -529,7 +550,7 @@ fn states_card(gauges: &Result<Gauges, AppError>) -> impl IntoView + use<> {
             <CardHeader>
                 <CardTitle>"Tasks by state"</CardTitle>
                 <CardDescription>
-                    "queue_depth from selecta's /metrics. All time: selecta never deletes a queue row, so done and failed only grow."
+                    "queue_depth from selecta's /metrics. The bar holds the tasks still in flight; the tiles count all time, since selecta never deletes a queue row, so done, aborted_stale and failed only grow."
                 </CardDescription>
             </CardHeader>
             <CardContent>{body}</CardContent>
@@ -538,6 +559,17 @@ fn states_card(gauges: &Result<Gauges, AppError>) -> impl IntoView + use<> {
 }
 
 // ─── Download health ────────────────────────────────────────────────────────
+
+/// A health signal as selecta reports it (`812.5`, `1`), or a dash for a
+/// value that is not a number. The signals mix units (gigabytes, queue
+/// lengths, up flags), so they stay tiles: no one axis would hold them.
+fn signal(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v}")
+    } else {
+        "—".into()
+    }
+}
 
 fn health_card(health: &Result<HealthSnapshot, AppError>) -> impl IntoView + use<> {
     let body = match health {
@@ -563,7 +595,7 @@ fn health_card(health: &Result<HealthSnapshot, AppError>) -> impl IntoView + use
                 .signals
                 .iter()
                 .map(|(k, v)| {
-                    let (name, value) = (k.clone(), format!("{v}"));
+                    let (name, value) = (k.clone(), signal(*v));
                     view! { <Stat label=name>{value}</Stat> }
                 })
                 .collect_view();
