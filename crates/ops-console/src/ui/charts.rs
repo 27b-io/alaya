@@ -17,12 +17,6 @@
 //! A value that is missing (`None`), not finite or negative is "no data",
 //! drawn as such and never as a zero; a zero is drawn as a zero. So is a
 //! total or a share that overflows `f64`.
-//!
-//! No page draws a chart yet; the pages adopt them in their own changes.
-//! Until then only the tests and the snapshot gallery use this module, and
-//! the expectation below fails the lint once every item is in use, so it
-//! cannot outlive its reason.
-#![cfg_attr(not(test), expect(dead_code, reason = "no page draws a chart yet"))]
 
 use leptos::either::Either;
 use leptos::prelude::*;
@@ -239,8 +233,8 @@ fn scale(max: f64, whole: bool) -> Option<Scale> {
     };
     // Shaved before the ceiling, so float noise never adds an empty step.
     let intervals = (max / step * (1.0 - 1e-12)).ceil().max(1.0);
-    // Written to reject NaN too: a zero or subnormal step makes `intervals`
-    // infinite, and an unchecked cast would ask for four billion ticks.
+    // `is_normal` rejects a zero, subnormal, NaN or infinite step; the cap
+    // bounds the tick loop.
     let holds = step.is_normal() && intervals <= MAX_INTERVALS && (step * intervals).is_finite();
     holds.then_some(Scale {
         step,
@@ -557,7 +551,8 @@ const BAR_W: f64 = 24.0;
 /// One bar of a `BarSeries`.
 #[derive(Debug, PartialEq)]
 enum Column {
-    /// A series has no value here, so the bar's total is unknown.
+    /// The bar's total is unknown: a series has no value here, or the
+    /// stack sums past `f64`'s range.
     NoData,
     /// The stack, bottom up, as (series, top y, height) in pixels; the
     /// stack is empty for a zero.
@@ -648,8 +643,8 @@ pub fn BarSeries(
     #[prop(default = fmt_count)] fmt: fn(f64) -> String,
 ) -> impl IntoView {
     let n = x.len();
-    let totals = totals(n, &series);
-    if series.is_empty() || totals.iter().all(Option::is_none) {
+    let sums = totals(n, &series);
+    if series.is_empty() || sums.iter().all(Option::is_none) {
         return no_data(&label);
     }
     let whole = series
@@ -657,7 +652,7 @@ pub fn BarSeries(
         .flat_map(|s| s.values.iter().take(n))
         .filter_map(|v| known(*v))
         .all(|v| v.fract() == 0.0);
-    let max = totals.iter().flatten().copied().fold(0.0, f64::max);
+    let max = sums.iter().flatten().copied().fold(0.0, f64::max);
     let Some(axis) = scale(max, whole) else {
         return no_data(&label);
     };
@@ -688,7 +683,7 @@ pub fn BarSeries(
 
     let slot = 1.0 / n as f64;
     let stacked = series.len() > 1;
-    let bars = columns(&series, &totals, top)
+    let bars = columns(&series, &sums, top)
         .into_iter()
         .enumerate()
         .map(|(i, column)| {
@@ -697,7 +692,7 @@ pub fn BarSeries(
                 .map(|s| format!("{} {}", s.label, figure(s.at(i), fmt)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let slot_tip = match totals[i] {
+            let slot_tip = match sums[i] {
                 Some(t) if stacked => format!("{}: {figures}; total {}", x[i], fmt(t)),
                 _ => format!("{}: {figures}", x[i]),
             };
@@ -752,7 +747,7 @@ pub fn BarSeries(
         })}
     };
 
-    let peak = totals
+    let peak = sums
         .iter()
         .enumerate()
         .filter_map(|(i, t)| t.map(|t| (i, t)))
@@ -760,7 +755,7 @@ pub fn BarSeries(
             Some((_, b)) if b >= t => best,
             _ => Some((i, t)),
         });
-    let missing = totals.iter().filter(|t| t.is_none()).count();
+    let missing = sums.iter().filter(|t| t.is_none()).count();
     let span = last.map_or_else(|| first.clone(), |l| format!("{first} to {l}"));
     let names = series
         .iter()
@@ -771,7 +766,7 @@ pub fn BarSeries(
     if let Some((i, t)) = peak {
         summary.push_str(&format!("; highest {} on {}", fmt(t), x[i]));
     }
-    if let Some(t) = totals[n - 1] {
+    if let Some(t) = sums[n - 1] {
         summary.push_str(&format!("; latest {} on {}", fmt(t), x[n - 1]));
     }
     if missing > 0 {
@@ -785,7 +780,7 @@ pub fn BarSeries(
                 .collect(),
         )
     });
-    let columns = series
+    let headings = series
         .iter()
         .map(|s| s.label.clone())
         .chain(stacked.then(|| "total".to_string()))
@@ -795,12 +790,12 @@ pub fn BarSeries(
             let cells = series
                 .iter()
                 .map(|s| figure(s.at(i), fmt))
-                .chain(stacked.then(|| figure(totals[i], fmt)))
+                .chain(stacked.then(|| figure(sums[i], fmt)))
                 .collect();
             (x[i].clone(), cells)
         })
         .collect();
-    let table = figure_table(label, columns, rows);
+    let table = figure_table(label, headings, rows);
 
     view! {
         <div class="space-y-2 font-normal">
@@ -1169,10 +1164,7 @@ mod tests {
             ticks(1e-16, false),
             ["0", "2e-17", "4e-17", "6e-17", "8e-17", "1e-16"]
         );
-        assert_eq!(
-            ticks(1.3e-5, false),
-            ["0", "5e-6", "1.0e-5", "1.5e-5"].map(|t| t.replace("1.0e", "1e"))
-        );
+        assert_eq!(ticks(1.3e-5, false), ["0", "5e-6", "1e-5", "1.5e-5"]);
         let mut max = 1e-300;
         while max < 5e9 {
             for whole in [false, max >= 1.0] {

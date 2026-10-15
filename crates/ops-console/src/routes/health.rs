@@ -24,34 +24,57 @@ use crate::ui::*;
 const TITLE: &str = "Judge health — ops console";
 
 /// Verdict rows in display order: `(key in by_verdict, label, the
-/// contradictions page's `verdict` filter)`. A stored failure and a pair
-/// never judged share the `unjudged` filter, which matches both.
-const VERDICT_ROWS: [(&str, &str, &str); 6] = [
-    ("contradiction", "contradiction", "contradiction"),
-    ("supersession", "supersession", "supersession"),
-    ("coexist", "coexist", "coexist"),
-    ("unrelated", "unrelated", "unrelated"),
-    ("unjudged", "stored judge failure", "unjudged"),
-    ("never_judged", "never judged (backlog)", "unjudged"),
+/// contradictions page's `verdict` filter, colour)`. A stored failure and a
+/// pair never judged share the `unjudged` filter, which matches both. Each
+/// verdict keeps its series slot in every chart on the page.
+const VERDICT_ROWS: [(&str, &str, &str, Colour); 6] = [
+    (
+        "contradiction",
+        "contradiction",
+        "contradiction",
+        Colour::SERIES[0],
+    ),
+    (
+        "supersession",
+        "supersession",
+        "supersession",
+        Colour::SERIES[1],
+    ),
+    ("coexist", "coexist", "coexist", Colour::SERIES[2]),
+    ("unrelated", "unrelated", "unrelated", Colour::SERIES[3]),
+    (
+        "unjudged",
+        "stored judge failure",
+        "unjudged",
+        Colour::SERIES[4],
+    ),
+    (
+        "never_judged",
+        "never judged (backlog)",
+        "unjudged",
+        Colour::SERIES[5],
+    ),
 ];
 
-/// Columns of the judged-per-day table: `(the server's key in counts,
-/// heading)`.
-const DAY_COLUMNS: [(&str, &str); 5] = [
-    ("contradiction", "contradiction"),
-    ("supersession", "supersession"),
-    ("coexist", "coexist"),
-    ("unrelated", "unrelated"),
-    ("unjudged", "unjudged"),
+/// Columns of the judged-per-day chart and table: `(the server's key in
+/// counts, heading, colour)`, the colours `VERDICT_ROWS`' own.
+const DAY_COLUMNS: [(&str, &str, Colour); 5] = [
+    ("contradiction", "contradiction", Colour::SERIES[0]),
+    ("supersession", "supersession", Colour::SERIES[1]),
+    ("coexist", "coexist", Colour::SERIES[2]),
+    ("unrelated", "unrelated", Colour::SERIES[3]),
+    ("unjudged", "unjudged", Colour::SERIES[4]),
 ];
 
-/// Columns of the write-novelty table, by nearest-neighbour similarity.
-const NOVELTY_COLUMNS: [(&str, &str); 5] = [
-    ("0.95+", "≥ 0.95"),
-    ("0.85-0.95", "0.85–0.95"),
-    ("0.70-0.85", "0.70–0.85"),
-    ("below_0.70", "< 0.70"),
-    ("none", "none"),
+/// Columns of the write-novelty chart and table, by nearest-neighbour
+/// similarity. The bands are ordered, so they take steps of one hue, the
+/// closest the darkest; "none" is no band at all.
+const NOVELTY_COLUMNS: [(&str, &str, Colour); 5] = [
+    ("0.95+", "≥ 0.95", Colour::RAMP[4]),
+    ("0.85-0.95", "0.85–0.95", Colour::RAMP[3]),
+    ("0.70-0.85", "0.70–0.85", Colour::RAMP[2]),
+    ("below_0.70", "< 0.70", Colour::RAMP[1]),
+    ("none", "none", Colour::OTHER),
 ];
 
 /// The four classes the judge answers with — the degenerate-reason rows.
@@ -100,6 +123,22 @@ fn count(v: Option<&Value>) -> String {
     v.and_then(Value::as_u64)
         .map(|n| n.to_string())
         .unwrap_or_else(|| "—".into())
+}
+
+/// A count as a chart value: `None`, which a chart draws as no data, for a
+/// missing or mistyped field — never a fictitious zero.
+fn num(v: Option<&Value>) -> Option<f64> {
+    v.and_then(Value::as_u64).map(|n| n as f64)
+}
+
+/// The exact figures under a chart, folded away: operators read numbers.
+fn folded(table: impl IntoView + 'static) -> impl IntoView {
+    view! {
+        <details class="mt-4">
+            <summary class="cursor-pointer text-sm text-muted-foreground">"Table"</summary>
+            <div class="mt-3">{table}</div>
+        </details>
+    }
 }
 
 /// `section` when the server sent it, else `None` and the card says it is
@@ -241,11 +280,15 @@ fn pod_card(s: &Value) -> impl IntoView + use<> {
 
 fn summary(s: &Value) -> impl IntoView + use<> {
     let cap = s.get("judge_daily_cap");
-    let cap_value = match cap.and_then(|c| c.get("cap")) {
-        Some(Value::Null) => "no judge configured".to_string(),
-        v => count(v),
+    let admitted = num(cap.and_then(|c| c.get("admitted_today")));
+    // A null cap is no judge. A cap of 0 is a setting the meter shows as no
+    // share, as it does a missing one.
+    let judge = match cap.and_then(|c| c.get("cap")) {
+        Some(Value::Null) => Either::Left("no judge configured"),
+        limit => Either::Right(view! {
+            <Meter label="Judge admitted today against its daily cap" used=admitted limit=num(limit) fmt=fmt_count />
+        }),
     };
-    let admitted = count(cap.and_then(|c| c.get("admitted_today")));
     let day = cap
         .map(|c| vs(c, "utc_day"))
         .filter(|d| !d.is_empty())
@@ -255,8 +298,7 @@ fn summary(s: &Value) -> impl IntoView + use<> {
         <div class="space-y-2">
             <StatGrid>
                 <Stat label="Memories (vector store)">{memories}</Stat>
-                <Stat label="Judge daily cap">{cap_value}</Stat>
-                <Stat label="Admitted today">{admitted}</Stat>
+                <Stat label="Judge admitted today / daily cap">{judge}</Stat>
                 <Stat label="UTC day">{day}</Stat>
             </StatGrid>
             <p class="text-xs text-muted-foreground">
@@ -273,9 +315,22 @@ fn verdicts_card(s: &Value) -> impl IntoView + use<> {
     let body = match c.and_then(|c| c.get("by_verdict")) {
         None => Either::Left(unavailable("contradiction stats", "see the errors above")),
         Some(by) => {
+            let parts = |state: &str| {
+                VERDICT_ROWS
+                    .iter()
+                    .map(|(key, label, _, colour)| {
+                        Part::new(
+                            *label,
+                            num(by.get(*key).and_then(|r| r.get(state))),
+                            *colour,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let (open, resolved) = (parts("open"), parts("resolved"));
             let rows = VERDICT_ROWS
                 .iter()
-                .map(|(key, label, filter)| {
+                .map(|(key, label, filter, _)| {
                     let row = by.get(*key);
                     let open = row.and_then(|r| r.get("open"));
                     let resolved = row.and_then(|r| r.get("resolved"));
@@ -305,19 +360,32 @@ fn verdicts_card(s: &Value) -> impl IntoView + use<> {
                     }
                 })
                 .collect_view();
+            // The table stays open: its counts link to the queue.
             Either::Right(view! {
-                <TableWrapper>
-                    <Table>
-                        <TableHeader>
-                            <TableRow>
-                                <TableHead>"Verdict"</TableHead>
-                                <TableHead>"Open"</TableHead>
-                                <TableHead>"Resolved"</TableHead>
-                            </TableRow>
-                        </TableHeader>
-                        <TableBody>{rows}</TableBody>
-                    </Table>
-                </TableWrapper>
+                <div class="space-y-6">
+                    <div class="grid gap-6 md:grid-cols-2">
+                        <div class="min-w-0 space-y-2">
+                            <p class="text-sm font-medium">"Open"</p>
+                            <StackedBar label="Open pairs by verdict" parts=open />
+                        </div>
+                        <div class="min-w-0 space-y-2">
+                            <p class="text-sm font-medium">"Resolved"</p>
+                            <StackedBar label="Resolved pairs by verdict" parts=resolved />
+                        </div>
+                    </div>
+                    <TableWrapper>
+                        <Table>
+                            <TableHeader>
+                                <TableRow>
+                                    <TableHead>"Verdict"</TableHead>
+                                    <TableHead>"Open"</TableHead>
+                                    <TableHead>"Resolved"</TableHead>
+                                </TableRow>
+                            </TableHeader>
+                            <TableBody>{rows}</TableBody>
+                        </Table>
+                    </TableWrapper>
+                </div>
             })
         }
     };
@@ -359,7 +427,13 @@ fn failures_card(s: &Value) -> impl IntoView + use<> {
                 })
                 .collect_view();
             let other = count(f.get("other"));
-            Either::Right(view! {
+            // Every failure is a stored judge failure: the verdict's colour.
+            let ranked = top
+                .iter()
+                .map(|r| Part::new(vs(r, "reason"), num(r.get("count")), Colour::SERIES[4]))
+                .chain([Part::new("other", num(f.get("other")), Colour::OTHER)])
+                .collect::<Vec<_>>();
+            let table = view! {
                 <TableWrapper>
                     <Table>
                         <TableHeader>
@@ -377,6 +451,10 @@ fn failures_card(s: &Value) -> impl IntoView + use<> {
                         </TableBody>
                     </Table>
                 </TableWrapper>
+            };
+            Either::Right(view! {
+                <HBarList label="Stored judge failures by reason" rows=ranked />
+                {folded(table)}
             })
         }
     };
@@ -399,7 +477,10 @@ fn per_day_card(s: &Value) -> impl IntoView + use<> {
     let days = section(s, "contradictions").and_then(|c| c.get("judged_per_day"));
     let body = match days.and_then(Value::as_array) {
         None => Either::Left(unavailable("contradiction stats", "see the errors above")),
-        Some(days) => Either::Right(day_table(days, &DAY_COLUMNS)),
+        Some(days) => Either::Right(view! {
+            {day_chart("Pairs judged per day by verdict", days, &DAY_COLUMNS)}
+            {folded(day_table(days, &DAY_COLUMNS))}
+        }),
     };
     view! {
         <Card>
@@ -414,10 +495,37 @@ fn per_day_card(s: &Value) -> impl IntoView + use<> {
     }
 }
 
+/// `[{date, counts}]` as bars: one per UTC day, labelled `MM-DD`, stacked
+/// by column.
+fn day_chart(
+    label: &'static str,
+    days: &[Value],
+    columns: &'static [(&'static str, &'static str, Colour)],
+) -> impl IntoView + use<> {
+    let x = days
+        .iter()
+        .map(|d| {
+            let date = vs(d, "date");
+            date.get(5..).map_or_else(|| date.clone(), str::to_string)
+        })
+        .collect();
+    let series = columns
+        .iter()
+        .map(|(key, heading, colour)| {
+            let values = days
+                .iter()
+                .map(|d| num(d.get("counts").and_then(|c| c.get(*key))))
+                .collect();
+            Series::new(*heading, values, *colour)
+        })
+        .collect();
+    view! { <BarSeries label=label x=x series=series /> }
+}
+
 /// `[{date, counts}]` as a table: one row per UTC day, one column per count.
 fn day_table(
     days: &[Value],
-    columns: &'static [(&'static str, &'static str)],
+    columns: &'static [(&'static str, &'static str, Colour)],
 ) -> impl IntoView + use<> {
     let rows = days
         .iter()
@@ -425,7 +533,7 @@ fn day_table(
             let counts = d.get("counts");
             let cells = columns
                 .iter()
-                .map(|(k, _)| {
+                .map(|(k, _, _)| {
                     let n = count(counts.and_then(|c| c.get(*k)));
                     view! { <TableCell>{n}</TableCell> }
                 })
@@ -441,7 +549,7 @@ fn day_table(
         .collect_view();
     let heads = columns
         .iter()
-        .map(|(_, label)| view! { <TableHead>{*label}</TableHead> })
+        .map(|(_, label, _)| view! { <TableHead>{*label}</TableHead> })
         .collect_view();
     view! {
         <TableWrapper>
@@ -464,7 +572,10 @@ fn novelty_card(s: &Value) -> impl IntoView + use<> {
     let days = section(s, "writes").and_then(|w| w.get("novelty"));
     let body = match days.and_then(Value::as_array) {
         None => Either::Left(unavailable("write novelty", "see the errors above")),
-        Some(days) => Either::Right(day_table(days, &NOVELTY_COLUMNS)),
+        Some(days) => Either::Right(view! {
+            {day_chart("Memories created per day by similarity to their nearest neighbour", days, &NOVELTY_COLUMNS)}
+            {folded(day_table(days, &NOVELTY_COLUMNS))}
+        }),
     };
     view! {
         <Card>
@@ -551,7 +662,9 @@ fn corpus_card(s: &Value) -> impl IntoView + use<> {
                 })
                 .collect_view();
             let nodes = count(g.get("node_count"));
-            Either::Right(view! {
+            let parts = edge_parts(&edges);
+            let headline = format!("{nodes} nodes");
+            let table = view! {
                 <TableWrapper>
                     <Table>
                         <TableHeader>
@@ -569,6 +682,11 @@ fn corpus_card(s: &Value) -> impl IntoView + use<> {
                         </TableBody>
                     </Table>
                 </TableWrapper>
+            };
+            Either::Right(view! {
+                <p class="mb-3 text-sm tabular-nums">{headline}</p>
+                <StackedBar label="Graph edges by type" parts=parts />
+                {folded(table)}
             })
         }
     };
@@ -581,4 +699,27 @@ fn corpus_card(s: &Value) -> impl IntoView + use<> {
             <CardContent>{body}</CardContent>
         </Card>
     }
+}
+
+/// Edge counts by type, in key order, each type on its series slot. Past
+/// eight types the rest fold into one "other" part, whose count is unknown
+/// when any of theirs is.
+fn edge_parts(edges: &serde_json::Map<String, Value>) -> Vec<Part> {
+    let slots = Colour::SERIES.len();
+    let shown = if edges.len() > slots {
+        slots - 1
+    } else {
+        slots
+    };
+    let mut parts: Vec<Part> = edges
+        .iter()
+        .take(shown)
+        .zip(Colour::SERIES)
+        .map(|((kind, n), colour)| Part::new(kind.clone(), num(Some(n)), colour))
+        .collect();
+    if edges.len() > shown {
+        let rest = edges.values().skip(shown).map(|n| num(Some(n))).sum();
+        parts.push(Part::new("other", rest, Colour::OTHER));
+    }
+    parts
 }
