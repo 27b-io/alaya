@@ -593,7 +593,7 @@ fn restrictions_card(
             <CardHeader>
                 <CardTitle>"Restrictions (kill switch)"</CardTitle>
                 <CardDescription>
-                    "disable refuses every key of a name on every instance, TOML keys of an ordinary client included; enable undoes it. Both reach every polling instance within a poll, whatever state the store's document is in, and nothing read from the metrics store can stop them. Each needs a reason, recorded with your identity."
+                    "disable refuses every key of a name on every instance, TOML keys of an ordinary client included; enable undoes it. Both reach every polling instance within a poll, whatever state the store's document is in, and nothing read from the metrics store can stop them. Each needs a reason, recorded with your identity. "
                     <Link href="/lb/clients/disable">"The disable page"</Link>
                     " loads without reading anything, for when the store or the metrics store is slow."
                 </CardDescription>
