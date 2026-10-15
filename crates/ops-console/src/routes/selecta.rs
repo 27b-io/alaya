@@ -35,16 +35,23 @@ const FAILED_SHOWN: u32 = 20;
 /// Also the home card's probe size: it says "N+" when a list fills it.
 pub const AWAITING_SHOWN: u32 = 100;
 
+fn header() -> impl IntoView {
+    view! {
+        <PageHeader
+            title="selecta"
+            description="What selecta is doing: whether it is alive, what waits on your approval, what failed and why, and download health. Read-only: approvals happen on GitHub."
+        />
+    }
+}
+
 fn not_configured() -> impl IntoView + use<> {
     view! {
-        <Card>
-            <CardHeader>
-                <CardTitle>"selecta — module not configured"</CardTitle>
-                <CardDescription>
-                    "Set SELECTA_URL and SELECTA_API_KEY (a selecta read-only token) on the console deployment, both or neither, to enable the read-only selecta pane."
-                </CardDescription>
-            </CardHeader>
-        </Card>
+        <div class="space-y-6">
+            {header()}
+            <NotConfigured>
+                "Set SELECTA_URL and SELECTA_API_KEY (a selecta read-only token) on the console deployment, both or neither, to enable the read-only selecta pane."
+            </NotConfigured>
+        </div>
     }
 }
 
@@ -72,6 +79,7 @@ pub async fn pane(
 
     let content = view! {
         <div class="space-y-6">
+            {header()}
             {runner_card(&live, &gauges)}
             {approvals_card(&awaiting, &gauges)}
             {failures_card(&failed, &gauges)}
@@ -108,30 +116,30 @@ pub async fn task(
             let audit = t.audit.unwrap_or_else(|| "—".into());
             let result_path = t.result_path.unwrap_or_else(|| "—".into());
             Either::Right(view! {
-                <dl class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm mb-6">
-                    <div><dt class="text-muted-foreground text-xs">"Verb"</dt><dd class="font-mono text-xs">{t.verb}</dd></div>
-                    <div><dt class="text-muted-foreground text-xs">"State"</dt><dd>{t.state}</dd></div>
-                    <div><dt class="text-muted-foreground text-xs">"Tier"</dt><dd>{t.tier}</dd></div>
-                    <div><dt class="text-muted-foreground text-xs">"Approval PR"</dt><dd>{pr}</dd></div>
-                    <div class="col-span-2 sm:col-span-4"><dt class="text-muted-foreground text-xs">"Result path"</dt><dd class="font-mono text-xs break-all">{result_path}</dd></div>
-                </dl>
-                <h3 class="text-sm font-medium mb-2">"Audit"</h3>
+                <StatGrid>
+                    <Stat label="Verb"><span class="font-mono text-sm">{t.verb}</span></Stat>
+                    <Stat label="State">{t.state}</Stat>
+                    <Stat label="Tier">{t.tier}</Stat>
+                    <Stat label="Approval PR"><span class="text-sm">{pr}</span></Stat>
+                </StatGrid>
+                <h3 class="text-sm font-medium mt-6 mb-2">"Result path"</h3>
+                <p class="font-mono text-xs break-all">{result_path}</p>
+                <h3 class="text-sm font-medium mt-6 mb-2">"Audit"</h3>
                 <pre class="text-xs whitespace-pre-wrap break-words rounded-md border bg-muted p-4">{audit}</pre>
             })
         }
     };
-    let id_text = id.clone();
     let content = view! {
-        <p class="text-sm mb-4"><a class="text-primary underline underline-offset-4" href="/selecta">"← selecta"</a></p>
-        <Card>
-            <CardHeader>
-                <CardTitle>"Task "<span class="font-mono text-sm">{id_text}</span></CardTitle>
-                <CardDescription>
-                    "Live from selecta's " {GET_TASK} " (read-only mount). The audit is selecta's own scrubbed text."
-                </CardDescription>
-            </CardHeader>
-            <CardContent>{body}</CardContent>
-        </Card>
+        <div class="space-y-6">
+            <p class="text-sm"><Link href="/selecta">"← selecta"</Link></p>
+            <PageHeader
+                title=format!("Task {id}")
+                description=format!("Live from selecta's {GET_TASK} (read-only mount). The audit is selecta's own scrubbed text.")
+            />
+            <Card>
+                <CardContent>{body}</CardContent>
+            </Card>
+        </div>
     };
     Ok((
         jar,
@@ -173,19 +181,21 @@ fn pr_cell(pr_url: Option<&str>, awaiting: bool) -> impl IntoView + use<> {
                     .map(|n| format!("PR #{n}"))
                     .unwrap_or_default();
                 Either::Left(view! {
-                    <a class="text-primary underline underline-offset-4 whitespace-nowrap" href=href rel="noreferrer">{label}</a>
+                    <span class="whitespace-nowrap">
+                        <Link href=href external=true>{label}</Link>
+                    </span>
                 })
             }
             None => {
                 let text = raw.to_string();
                 Either::Right(Either::Left(view! {
-                    <span class=badge(BadgeKind::Destructive)>"unrecognised PR link"</span>
+                    <StatusBadge status=Status::Error label="unrecognised PR link" />
                     " "<span class="font-mono text-xs break-all">{text}</span>
                 }))
             }
         },
         None if awaiting => Either::Right(Either::Right(Either::Left(view! {
-            <span class=badge(BadgeKind::Destructive)>"no PR — cannot be approved"</span>
+            <StatusBadge status=Status::Error label="no PR — cannot be approved" />
         }))),
         None => Either::Right(Either::Right(Either::Right(view! {
             <span class="text-muted-foreground">"—"</span>
@@ -201,7 +211,7 @@ fn shown_of(shown: usize, gauges: &Result<Gauges, AppError>, state: &str) -> Opt
 
 fn task_link(id: &str) -> impl IntoView + use<> {
     let href = format!("/selecta/task/{id}");
-    view! { <a class="text-primary underline underline-offset-4 whitespace-nowrap" href=href>"details"</a> }
+    view! { <Link href=href>"details"</Link> }
 }
 
 // ─── Runner: heartbeat, lease, run budget, daily caps ───────────────────────
@@ -213,12 +223,12 @@ fn runner_card(
     let heartbeat = match live {
         Err(e) => Either::Left(unavailable("heartbeat", e.detail())),
         Ok(l) => {
-            let seq = l.seq.map(|s| format!("seq {s}")).unwrap_or_default();
-            let (class, text) = if l.advancing {
-                (badge(BadgeKind::Success), "advancing".to_string())
+            let seq = l.seq.map(|s| format!(", seq {s}")).unwrap_or_default();
+            let (status, text) = if l.advancing {
+                (Status::Ok, "advancing".to_string())
             } else {
                 (
-                    badge(BadgeKind::Destructive),
+                    Status::Error,
                     format!(
                         "stalled — {}",
                         l.detail.clone().unwrap_or_else(|| "no reason given".into())
@@ -226,7 +236,7 @@ fn runner_card(
                 )
             };
             Either::Right(view! {
-                <span class=class>{text}</span>" "<span class="text-muted-foreground tabular-nums">{seq}</span>
+                <Notice status=status label=text>{format!("Heartbeat{seq}.")}</Notice>
             })
         }
     };
@@ -234,25 +244,22 @@ fn runner_card(
     let body = match gauges {
         Err(e) => Either::Left(unavailable("lease and budget", e.detail())),
         Ok(g) => {
-            let (lease_class, lease_text) = if g.lease_remaining_s > 0.0 {
+            let (lease, lease_text) = if g.lease_remaining_s > 0.0 {
                 (
-                    badge(BadgeKind::Success),
+                    Status::Ok,
                     format!("held, {} left", fmt_secs(g.lease_remaining_s)),
                 )
             } else {
                 (
-                    badge(BadgeKind::Destructive),
+                    Status::Error,
                     "not held — irreversible work is refused".to_string(),
                 )
             };
             let b = &g.budget;
-            let (park_class, park_text) = if b.parked {
-                (
-                    badge(BadgeKind::Destructive),
-                    format!("parked — {}", b.reason),
-                )
+            let (park, park_text) = if b.parked {
+                (Status::Error, format!("parked — {}", b.reason))
             } else {
-                (badge(BadgeKind::Success), "not parked".to_string())
+                (Status::Ok, "not parked".to_string())
             };
             let tokens = count_or_torn(b.tokens, fmt_tokens);
             let wallclock = count_or_torn(b.wallclock_s, fmt_secs);
@@ -266,9 +273,9 @@ fn runner_card(
                         (Some(u), Some(l)) => {
                             let (u, l) = (*u, *l);
                             Either::Left(view! {
-                                <div class="flex items-center gap-2 whitespace-nowrap">
+                                <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
                                     <progress class="h-2 w-24" value=format!("{u:.0}") max=format!("{l:.0}")></progress>
-                                    <span class="tabular-nums">{format!("{u:.0} / {l:.0}")}</span>
+                                    <span class="tabular-nums whitespace-nowrap">{format!("{u:.0} / {l:.0}")}</span>
                                 </div>
                             })
                         }
@@ -284,16 +291,14 @@ fn runner_card(
                     };
                     view! {
                         <TableRow>
-                            <TableCell><span class="font-mono text-xs">{name}</span></TableCell>
+                            <TableCell><span class="font-mono text-xs break-all">{name}</span></TableCell>
                             <TableCell>{cell}</TableCell>
                         </TableRow>
                     }
                 })
                 .collect_view();
             let caps_body = if g.day_caps.is_empty() {
-                Either::Left(view! {
-                    <p class="text-sm text-muted-foreground">"No daily caps seeded yet."</p>
-                })
+                Either::Left(view! { <EmptyState>"No daily caps seeded yet."</EmptyState> })
             } else {
                 Either::Right(view! {
                     <TableWrapper><Table>
@@ -308,28 +313,15 @@ fn runner_card(
                 })
             };
             Either::Right(view! {
-                <dl class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm mb-6">
-                    <div class="col-span-2">
-                        <dt class="text-muted-foreground text-xs">"Lease"</dt>
-                        <dd><span class=lease_class>{lease_text}</span></dd>
-                    </div>
-                    <div class="col-span-2">
-                        <dt class="text-muted-foreground text-xs">"Run budget"</dt>
-                        <dd><span class=park_class>{park_text}</span></dd>
-                    </div>
-                    <div>
-                        <dt class="text-muted-foreground text-xs">"Tokens consumed"</dt>
-                        <dd class="tabular-nums">{tokens}</dd>
-                    </div>
-                    <div>
-                        <dt class="text-muted-foreground text-xs">"Wall clock consumed"</dt>
-                        <dd class="tabular-nums">{wallclock}</dd>
-                    </div>
-                    <div>
-                        <dt class="text-muted-foreground text-xs">"Tool calls consumed"</dt>
-                        <dd class="tabular-nums">{toolcalls}</dd>
-                    </div>
-                </dl>
+                <div class="mb-6">
+                    <StatGrid>
+                        <Stat label="Lease"><StatusBadge status=lease label=lease_text /></Stat>
+                        <Stat label="Run budget"><StatusBadge status=park label=park_text /></Stat>
+                        <Stat label="Tokens consumed">{tokens}</Stat>
+                        <Stat label="Wall clock consumed">{wallclock}</Stat>
+                        <Stat label="Tool calls consumed">{toolcalls}</Stat>
+                    </StatGrid>
+                </div>
                 {caps_body}
             })
         }
@@ -344,9 +336,7 @@ fn runner_card(
                 </CardDescription>
             </CardHeader>
             <CardContent>
-                <div class="text-sm mb-4">
-                    <span class="text-muted-foreground text-xs mr-2">"Heartbeat"</span>{heartbeat}
-                </div>
+                <div class="mb-4">{heartbeat}</div>
                 {body}
             </CardContent>
         </Card>
@@ -362,18 +352,18 @@ fn approvals_card(
     let body = match awaiting {
         Err(e) => Either::Left(unavailable(LIST_TASKS, e.detail())),
         Ok(rows) if rows.is_empty() => Either::Right(Either::Left(view! {
-            <p class="text-sm text-muted-foreground">"Nothing is waiting on you."</p>
+            <EmptyState>"Nothing is waiting on you."</EmptyState>
         })),
         Ok(rows) => {
             let no_pr = rows.iter().filter(|r| r.approval_pr().is_none()).count();
             let no_pr_note = (no_pr > 0).then(|| {
                 let msg = format!(
-                    " {no_pr} gated task(s) have no usable approval PR, so nothing can approve them."
+                    "{no_pr} gated task(s) have no usable approval PR, so nothing can approve them."
                 );
                 view! {
-                    <p class="text-sm mb-4">
-                        <span class=badge(BadgeKind::Destructive)>"error"</span>{msg}
-                    </p>
+                    <div class="mb-4">
+                        <Notice status=Status::Error label="error">{msg}</Notice>
+                    </div>
                 }
             });
             let more = shown_of(rows.len(), gauges, "awaiting_approval")
@@ -388,9 +378,9 @@ fn approvals_card(
                     let link = task_link(&r.task_id);
                     view! {
                         <TableRow>
-                            <TableCell><span class="font-mono text-xs">{verb}</span></TableCell>
-                            <TableCell>{tier}</TableCell>
-                            <TableCell><span class="whitespace-nowrap">{when}</span></TableCell>
+                            <TableCell><span class="font-mono text-xs break-all">{verb}</span></TableCell>
+                            <TableCell secondary=true>{tier}</TableCell>
+                            <TableCell secondary=true><span class="whitespace-nowrap">{when}</span></TableCell>
                             <TableCell>{pr}</TableCell>
                             <TableCell>{link}</TableCell>
                         </TableRow>
@@ -404,8 +394,8 @@ fn approvals_card(
                     <TableHeader>
                         <TableRow>
                             <TableHead>"Verb"</TableHead>
-                            <TableHead>"Tier"</TableHead>
-                            <TableHead>"Enqueued (UTC)"</TableHead>
+                            <TableHead secondary=true>"Tier"</TableHead>
+                            <TableHead secondary=true>"Enqueued (UTC)"</TableHead>
                             <TableHead>"Approval"</TableHead>
                             <TableHead>""</TableHead>
                         </TableRow>
@@ -437,7 +427,7 @@ fn failures_card(
     let body = match failed {
         Err(e) => Either::Left(unavailable(LIST_TASKS, e.detail())),
         Ok(rows) if rows.is_empty() => Either::Right(Either::Left(view! {
-            <p class="text-sm text-muted-foreground">"No failed tasks."</p>
+            <EmptyState>"No failed tasks."</EmptyState>
         })),
         Ok(rows) => {
             let more = shown_of(rows.len(), gauges, "failed")
@@ -451,9 +441,9 @@ fn failures_card(
                     let link = task_link(&r.task_id);
                     view! {
                         <TableRow>
-                            <TableCell><span class="font-mono text-xs">{verb}</span></TableCell>
-                            <TableCell><span class="whitespace-nowrap">{when}</span></TableCell>
-                            <TableCell><span class="text-xs break-words">{audit}</span></TableCell>
+                            <TableCell><span class="font-mono text-xs break-all">{verb}</span></TableCell>
+                            <TableCell secondary=true><span class="whitespace-nowrap">{when}</span></TableCell>
+                            <TableCell><span class="text-xs wrap-break-word">{audit}</span></TableCell>
                             <TableCell>{link}</TableCell>
                         </TableRow>
                     }
@@ -465,7 +455,7 @@ fn failures_card(
                     <TableHeader>
                         <TableRow>
                             <TableHead>"Verb"</TableHead>
-                            <TableHead>"Enqueued (UTC)"</TableHead>
+                            <TableHead secondary=true>"Enqueued (UTC)"</TableHead>
                             <TableHead>"Audit (excerpt)"</TableHead>
                             <TableHead>""</TableHead>
                         </TableRow>
@@ -504,13 +494,13 @@ fn states_card(gauges: &Result<Gauges, AppError>) -> impl IntoView + use<> {
                 .collect();
             let unknown_note = (!unknown.is_empty()).then(|| {
                 let msg = format!(
-                    " selecta reports queue states this console does not know: {}.",
+                    "selecta reports queue states this console does not know: {}.",
                     unknown.join(", ")
                 );
                 view! {
-                    <p class="text-sm mb-4">
-                        <span class=badge(BadgeKind::Destructive)>"error"</span>{msg}
-                    </p>
+                    <div class="mb-4">
+                        <Notice status=Status::Error label="error">{msg}</Notice>
+                    </div>
                 }
             });
             // selecta omits zero-count states: every state renders, absent = 0.
@@ -525,17 +515,12 @@ fn states_card(gauges: &Result<Gauges, AppError>) -> impl IntoView + use<> {
                         _ => "",
                     };
                     let (label, count) = (s.to_string(), format!("{n:.0}"));
-                    view! {
-                        <div>
-                            <dt class="text-muted-foreground text-xs font-mono">{label}</dt>
-                            <dd class=format!("tabular-nums text-lg {class}")>{count}</dd>
-                        </div>
-                    }
+                    view! { <Stat label=label><span class=class>{count}</span></Stat> }
                 })
                 .collect_view();
             Either::Right(view! {
                 {unknown_note}
-                <dl class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">{tiles}</dl>
+                <StatGrid>{tiles}</StatGrid>
             })
         }
     };
@@ -568,12 +553,10 @@ fn health_card(health: &Result<HealthSnapshot, AppError>) -> impl IntoView + use
                     .iter()
                     .map(|a| {
                         let text = a.clone();
-                        view! {
-                            <li><span class=badge(BadgeKind::Warning)>"alert"</span>" "{text}</li>
-                        }
+                        view! { <Notice status=Status::Warn label="alert">{text}</Notice> }
                     })
                     .collect_view();
-                Either::Right(view! { <ul class="text-sm space-y-1 mb-4">{items}</ul> })
+                Either::Right(view! { <div class="space-y-2 mb-4">{items}</div> })
             };
             // serde_json maps → BTreeMap: already in key order.
             let tiles = h
@@ -581,17 +564,12 @@ fn health_card(health: &Result<HealthSnapshot, AppError>) -> impl IntoView + use
                 .iter()
                 .map(|(k, v)| {
                     let (name, value) = (k.clone(), format!("{v}"));
-                    view! {
-                        <div>
-                            <dt class="text-muted-foreground text-xs font-mono">{name}</dt>
-                            <dd class="tabular-nums">{value}</dd>
-                        </div>
-                    }
+                    view! { <Stat label=name>{value}</Stat> }
                 })
                 .collect_view();
             Either::Right(view! {
                 {alerts}
-                <dl class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">{tiles}</dl>
+                <StatGrid>{tiles}</StatGrid>
             })
         }
     };

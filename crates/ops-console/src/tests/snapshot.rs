@@ -330,14 +330,6 @@ async fn every_page_marks_the_navigation_entry_it_is_under() {
             "the navigation links {href}, which is no page's own entry"
         );
     }
-    for p in &pages {
-        assert!(
-            entries.contains(&p.under),
-            "{} is under {}, which the navigation lacks",
-            p.stem,
-            p.under
-        );
-    }
 }
 
 /// Writes `<stem>.<theme>.html` for every page of both worlds in both

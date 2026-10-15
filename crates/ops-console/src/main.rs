@@ -554,11 +554,10 @@ mod tests {
         let cleared = theme_cookie(&resp).expect("a removal cookie");
         assert!(cleared.contains("Max-Age=0"), "{cleared}");
 
-        // A crafted `back` cannot leave the console.
-        for off_site in ["//evil.com", "https://evil.com/x", "/%5Cevil.com"] {
-            let resp = switch(cookie.clone(), "dark", off_site).await;
-            assert_eq!(location(&resp), "/", "{off_site}");
-        }
+        // A crafted `back` cannot leave the console: `safe_next`'s own tests
+        // hold the rest of its table.
+        let resp = switch(cookie.clone(), "dark", "//evil.com").await;
+        assert_eq!(location(&resp), "/");
     }
 
     #[tokio::test]

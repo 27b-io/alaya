@@ -106,7 +106,7 @@ pub fn StatGrid(children: Children) -> impl IntoView {
 pub fn Stat(#[prop(into)] label: String, children: Children) -> impl IntoView {
     view! {
         <div class="min-w-0 rounded-lg border bg-card p-4">
-            <dt class="text-xs text-muted-foreground">{label}</dt>
+            <dt class="text-xs text-muted-foreground wrap-break-word">{label}</dt>
             <dd class="mt-1 text-xl font-semibold tabular-nums wrap-break-word">{children()}</dd>
         </div>
     }
@@ -141,9 +141,16 @@ pub fn PageHeader(
 const LINK: &str =
     "underline decoration-muted-foreground/60 underline-offset-4 hover:decoration-foreground";
 
+/// An `external` link leaves the console, so it sends no Referer: a console
+/// URL is nobody else's business.
 #[component]
-pub fn Link(#[prop(into)] href: String, children: Children) -> impl IntoView {
-    view! { <a class=LINK href=href>{children()}</a> }
+pub fn Link(
+    #[prop(into)] href: String,
+    #[prop(optional)] external: bool,
+    children: Children,
+) -> impl IntoView {
+    let rel = external.then_some("noreferrer");
+    view! { <a class=LINK href=href rel=rel>{children()}</a> }
 }
 
 /// Short, linked content-hash — the one way a hash renders anywhere in the

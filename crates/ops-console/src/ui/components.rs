@@ -5,9 +5,10 @@
 //! expanded to plain functions so the console doesn't take
 //! `leptos_ui`/`tw_merge` dependencies for an SSR-only app.
 //!
-//! Two deliberate departures, each marked where it is made: the destructive
-//! button's ink is a theme token instead of a palette white, and the table
-//! wrapper has a height cap so its sticky header can stick.
+//! Three deliberate departures, each marked where it is made: the
+//! destructive button's ink is a theme token instead of a palette white, the
+//! table wrapper has a height cap so its sticky header can stick, and a
+//! table column can be marked secondary, to hide on a phone.
 
 use leptos::prelude::*;
 
@@ -134,18 +135,32 @@ pub fn TableRow(children: Children) -> impl IntoView {
     view! { <tr class="border-b transition-colors hover:bg-muted/50">{children()}</tr> }
 }
 
-#[component]
-pub fn TableHead(children: Children) -> impl IntoView {
-    view! {
-        <th class="h-10 px-2 text-left align-middle font-medium text-muted-foreground">
-            {children()}
-        </th>
+/// A column's priority, a departure from upstream: a `secondary` column
+/// shows from `md` up and is hidden on a phone, so a wide table keeps the
+/// columns that say what a row is and how it stands. Mark its head and every
+/// one of its cells, or the columns slip.
+const SECONDARY: &str = "hidden md:table-cell";
+
+fn column(base: &str, secondary: bool) -> String {
+    if secondary {
+        format!("{base} {SECONDARY}")
+    } else {
+        base.to_string()
     }
 }
 
 #[component]
-pub fn TableCell(children: Children) -> impl IntoView {
-    view! { <td class="p-3 align-middle">{children()}</td> }
+pub fn TableHead(#[prop(optional)] secondary: bool, children: Children) -> impl IntoView {
+    let class = column(
+        "h-10 px-2 text-left align-middle font-medium text-muted-foreground",
+        secondary,
+    );
+    view! { <th class=class>{children()}</th> }
+}
+
+#[component]
+pub fn TableCell(#[prop(optional)] secondary: bool, children: Children) -> impl IntoView {
+    view! { <td class=column("p-3 align-middle", secondary)>{children()}</td> }
 }
 
 // ─── Form atoms (vendored: ui/input.rs, ui/label.rs, ui/textarea.rs,
