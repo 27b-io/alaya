@@ -17,9 +17,10 @@ async fn main() {
     let graph_name = std::env::var("GRAPH_NAME").unwrap_or_else(|_| "memory_graph".into());
 
     let client = redis::Client::open(redis_url.as_str()).expect("Invalid REDIS_URL");
-    let redis = redis::aio::ConnectionManager::new(client.clone())
-        .await
-        .expect("Failed to connect to Redis");
+    let Ok(redis) = alaya_bridge::connect(&client, alaya_bridge::query_config(), "query").await
+    else {
+        std::process::exit(1);
+    };
 
     let state = Arc::new(AppState {
         redis,
@@ -29,9 +30,11 @@ async fn main() {
 
     // BRPOP is a blocking command that starves a multiplexed ConnectionManager.
     // Give the consumer its own dedicated connection so it doesn't block query handlers.
-    let queue_conn = redis::aio::ConnectionManager::new(client)
-        .await
-        .expect("Failed to create queue connection");
+    let Ok(queue_conn) =
+        alaya_bridge::connect(&client, alaya_bridge::queue_config(), "queue").await
+    else {
+        std::process::exit(1);
+    };
 
     alaya_bridge::queue::spawn_consumer(state.clone(), queue_conn);
 

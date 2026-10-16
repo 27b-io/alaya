@@ -78,5 +78,9 @@ pub async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Value>, St
 async fn ping_redis(state: &AppState) -> bool {
     let mut conn = state.redis.clone();
     let result: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut conn).await;
+    // Logged so a wedged FalkorDB shows in the bridge's own logs (LAB-9869).
+    if let Err(e) = &result {
+        tracing::warn!(error = %e, "FalkorDB PING failed");
+    }
     matches!(result, Ok(ref s) if s == "PONG")
 }
