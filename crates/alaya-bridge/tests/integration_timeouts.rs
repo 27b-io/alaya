@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alaya_bridge::{
-    CONNECT_TIMEOUT, RESPONSE_TIMEOUT, connect, cypher, query_config, queue_config,
+    CONNECT_TIMEOUT, QUEUE_RESPONSE_TIMEOUT, RESPONSE_TIMEOUT, connect, cypher, query_config,
+    queue_config,
 };
 use alaya_types::graph::CoAccessPair;
 
@@ -68,48 +69,63 @@ async fn connect_to_a_mute_peer_times_out() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A query that never gets a reply errors after `RESPONSE_TIMEOUT`, while the
-/// queue connection rides out a blocking pop longer than that deadline.
+/// Send a blocking pop on `conn` and time its outcome. The server-side block
+/// is finite, so a connection the test abandons is released, not leaked.
+async fn timed_pop(
+    conn: &mut redis::aio::ConnectionManager,
+    key: &str,
+    block: Duration,
+) -> (redis::RedisResult<Option<(String, String)>>, Duration) {
+    let started = Instant::now();
+    let result = redis::cmd("BRPOP")
+        .arg(key)
+        .arg(block.as_secs_f64())
+        .query_async(conn)
+        .await;
+    (result, started.elapsed())
+}
+
+/// Each connection errors at its own reply deadline when no reply comes, and
+/// the consumer's own BRPOP (1 s) is not cut off by the queue deadline.
 #[tokio::test]
-async fn query_reply_times_out_but_queue_blocking_pop_does_not() -> anyhow::Result<()> {
+async fn replies_time_out_at_each_deadline_but_the_consumer_pop_does_not() -> anyhow::Result<()> {
     let Some(client) = client() else {
         eprintln!("REDIS_URL not set — skipping integration test");
         return Ok(());
     };
+    let key = format!("lab9869:never:{}", std::process::id());
+    let past = |d: Duration| d + Duration::from_secs(2);
     let mut query = connect(&client, query_config(), "query").await?;
     let mut queue = connect(&client, queue_config(), "queue").await?;
-    let key = format!("lab9869:never:{}", std::process::id());
-    let pop_secs = RESPONSE_TIMEOUT.as_secs_f64() + 1.0;
+    let mut consumer = connect(&client, queue_config(), "queue").await?;
 
-    let started = Instant::now();
-    // BLPOP with timeout 0 blocks forever: the query connection's reply never comes.
-    let stuck = async {
-        redis::cmd("BLPOP")
-            .arg(&key)
-            .arg(0)
-            .query_async::<Option<(String, String)>>(&mut query)
-            .await
-    };
-    let pop = async {
-        redis::cmd("BRPOP")
-            .arg(&key)
-            .arg(pop_secs)
-            .query_async::<Option<(String, String)>>(&mut queue)
-            .await
-    };
-    let (stuck, pop) =
-        tokio::time::timeout(RESPONSE_TIMEOUT * 3, async { tokio::join!(stuck, pop) })
-            .await
-            .expect("a reply deadline did not fire");
+    let ((query, query_took), (queue, queue_took), (pop, _)) =
+        tokio::time::timeout(RESPONSE_TIMEOUT * 2, async {
+            tokio::join!(
+                timed_pop(&mut query, &key, past(RESPONSE_TIMEOUT)),
+                timed_pop(&mut queue, &key, past(QUEUE_RESPONSE_TIMEOUT)),
+                timed_pop(&mut consumer, &key, Duration::from_secs(1)),
+            )
+        })
+        .await
+        .expect("a reply deadline did not fire");
 
-    let err = stuck.expect_err("query connection waited forever for a reply");
-    assert!(err.is_timeout(), "expected a timeout, got {err}");
-    assert_eq!(pop?, None, "queue connection must outlast RESPONSE_TIMEOUT");
-    assert!(started.elapsed() >= Duration::from_secs_f64(pop_secs));
+    for (role, result, took, deadline) in [
+        ("query", query, query_took, RESPONSE_TIMEOUT),
+        ("queue", queue, queue_took, QUEUE_RESPONSE_TIMEOUT),
+    ] {
+        let err = result.expect_err(&format!("{role}: a pop past its deadline returned"));
+        assert!(err.is_timeout(), "{role}: expected a timeout, got {err}");
+        assert!(
+            took >= deadline && took < past(deadline),
+            "{role}: timed out after {took:?}"
+        );
+    }
+    assert_eq!(pop?, None, "the consumer's 1 s BRPOP must complete");
     Ok(())
 }
 
-/// The Hebbian consumer still drains the queue over its timeout-exempt connection.
+/// The Hebbian consumer still drains the queue over its own connection.
 #[tokio::test]
 async fn hebbian_consumer_drains_the_queue() -> anyhow::Result<()> {
     let Some(ctx) = common::TestContext::new().await else {

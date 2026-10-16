@@ -14,7 +14,7 @@ const QUEUE_KEY: &str = "alaya:hebbian:queue";
 const INITIAL_WEIGHT: f64 = 0.1;
 const STRENGTHEN_RATE: f64 = 0.15;
 const MAX_WEIGHT: f64 = 1.0;
-const BRPOP_TIMEOUT_SECS: f64 = 1.0;
+pub(crate) const BRPOP_TIMEOUT_SECS: f64 = 1.0;
 const MAX_OPS_PER_SEC: u32 = 100;
 
 /// Spawn the Hebbian write-queue consumer as a background tokio task.

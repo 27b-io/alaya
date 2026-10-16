@@ -33,16 +33,25 @@ pub struct AppState {
 // A FalkorDB that accepts TCP and never replies used to hang the bridge with
 // nothing logged: startup awaited the connection forever, so the liveness probe
 // killed it silently, and a wedge mid-flight hung every graph call. Every
-// connection attempt is now bounded, and query traffic has a response timeout.
+// connection attempt is now bounded, and so is every reply.
 
 /// Bounds one connection attempt: TCP connect plus redis-rs's setup commands,
 /// which is where a mute peer hangs.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bounds one query reply. Above FalkorDB's own query timeout, and below
-/// alaya-server's 30 s bridge deadline, so a wedged FalkorDB reaches the
-/// server as the bridge's 502 rather than as the server's own timeout.
-pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounds one query reply. Just under alaya-server's 30 s bridge deadline:
+/// FalkorDB bounds reads but not writes, so a slow but legitimate write still
+/// lands as before, and a wedge still reaches the server as the bridge's 502,
+/// logged here, rather than as the server's own timeout.
+pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Bounds one reply on the Hebbian consumer's connection. Its BRPOP blocks
+/// server-side for `queue::BRPOP_TIMEOUT_SECS`, so this sits well above that:
+/// the pop is never cut off, but a mute peer cannot stall the consumer silently.
+/// A reply that arrives after the deadline is dropped, losing that one item;
+/// Hebbian strengthening tolerates loss.
+pub const QUEUE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const _: () = assert!(queue::BRPOP_TIMEOUT_SECS + 2.0 <= QUEUE_RESPONSE_TIMEOUT.as_secs_f64());
 
 /// Retries after a failed attempt, at startup and on reconnect. redis-rs
 /// 0.27's default (6, with a backoff that reaches 60 s per step) keeps a mute
@@ -53,13 +62,15 @@ const MAX_RETRY_DELAY_MS: u64 = 1_000;
 
 /// Config for the multiplexed connection the query handlers share.
 pub fn query_config() -> ConnectionManagerConfig {
-    queue_config().set_response_timeout(RESPONSE_TIMEOUT)
+    connect_config().set_response_timeout(RESPONSE_TIMEOUT)
 }
 
-/// Config for the Hebbian consumer's dedicated connection. No response
-/// timeout: BRPOP blocks server-side by design, and a reply deadline would
-/// cut it off.
+/// Config for the Hebbian consumer's dedicated connection.
 pub fn queue_config() -> ConnectionManagerConfig {
+    connect_config().set_response_timeout(QUEUE_RESPONSE_TIMEOUT)
+}
+
+fn connect_config() -> ConnectionManagerConfig {
     ConnectionManagerConfig::new()
         .set_connection_timeout(CONNECT_TIMEOUT)
         .set_number_of_retries(CONNECT_RETRIES)
