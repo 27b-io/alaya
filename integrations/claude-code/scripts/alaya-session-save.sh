@@ -117,24 +117,32 @@ jq -r '.' "$_HOOKDIR/prompts.jsonl" > "$_HOOKDIR/all_messages.txt" 2>/dev/null |
 # Extractor context source. A Multica issue run's only prompts are the
 # platform's per-turn template: its commands and boilerplate would fill the
 # context and push out the human's request. Reduce each such prompt to the
-# human comment it quotes (the lines between the "[NEW COMMENT] A user ..."
-# trigger's blank line and the template's next paragraph) and drop the rest,
-# so the extractor sees what was asked and no template text. Comments quoted
-# from agents or the platform, and wakeups, add nothing. A prompt whose shape
-# is not recognised adds nothing either: the request is lost, the template
-# never leaks. Every other prompt passes through unchanged. The save gate
-# still counts all_messages.txt.
+# human comment it quotes and drop the rest, so the extractor sees what was
+# asked and no template text. Comments quoted from agents or the platform, and
+# wakeups, add nothing. A prompt whose shape is not recognised adds nothing
+# either: the request is lost, the template never leaks. Every other prompt
+# passes through unchanged. The save gate still counts all_messages.txt.
+#
+# Both boundaries are positional, because comment text can copy any template
+# line. The trigger is line 4, under "Your assigned issue ID is:" (a trigger
+# line quoted inside an agent comment or a wakeup is never at line 4). The
+# comment opens at line 6 and runs to the LAST blank-line-plus-resume paragraph
+# before the joined-wakeup header, which follows the "You are acting on behalf
+# of" line (a resume-like paragraph inside the comment comes before the real
+# one; wakeup instruction text after the header is never searched).
 jq -r '
     def resumes: startswith("Start by running `multica issue get")
         or startswith("The issue is unchanged since your last run")
         or startswith("Since your last run the issue changed");
     if startswith("You are running as a local coding agent for a Multica workspace.") | not then .
     else split("\n") as $l
-        | ($l | map(startswith("[NEW COMMENT] A user just left a new comment")) | index(true)) as $t
-        | select($t != null)
-        | ([range($t + 3; $l | length) | select($l[. - 1] == "" and ($l[.] | resumes))] | .[0]) as $e
+        | select(($l[2] // "" | startswith("Your assigned issue ID is: ")) and $l[3] == ""
+            and ($l[4] // "" | startswith("[NEW COMMENT] A user just left a new comment")) and $l[5] == "")
+        | (([range(8; $l | length) | select(($l[.] | startswith("[WAKEUP")) and $l[. - 1] == ""
+            and ($l[. - 2] | startswith("You are acting on behalf of")))] | .[0]) // ($l | length)) as $w
+        | ([range(7; $w) | select($l[. - 1] == "" and ($l[.] | resumes))] | .[-1]) as $e
         | select($e != null)
-        | $l[$t + 2:$e - 1] | join("\n") | select(length > 0)
+        | $l[6:$e - 1] | join("\n") | select(length > 0)
     end' "$_HOOKDIR/prompts.jsonl" > "$_HOOKDIR/context_source.txt" 2>/dev/null || true
 
 TOTAL=$(wc -l < "$_HOOKDIR/all_messages.txt" 2>/dev/null || echo 0)

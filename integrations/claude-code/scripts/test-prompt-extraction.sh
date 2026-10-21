@@ -106,14 +106,15 @@ total "blocks: 5 message lines counted" 5
 
 # Multica issue runs: every prompt is the platform's per-turn template. The extractor
 # gets only the human comment it quotes; the gate still counts every template line.
-# mtpl <trigger-and-comment> <resume-line>: one turn's template, as a block-list entry
+# mtpl <trigger-and-comment> <resume-line> [joined-wakeup]: one turn's template, as a block-list entry
 mtpl() {
-  entry "$(jq -n --arg trig "$1" --arg resume "$2" '[{type:"text", text:
+  entry "$(jq -n --arg trig "$1" --arg resume "$2" --arg joined "${3:-}" '[{type:"text", text:
     ("You are running as a local coding agent for a Multica workspace.\n\nYour assigned issue ID is: ISSUE-ID\n\n"
      + (if $trig == "" then "" else $trig + "\n\n" end) + $resume + "\n\n"
      + "Post your reply as a comment, using the trigger comment ID below.\n\n"
      + "    multica issue comment add ISSUE-ID --parent COMMENT-ID --content-file ./reply.md\n\n"
-     + "## On Behalf Of\n\nYou are acting on behalf of ON-BEHALF-OF-NAME.")}]')"; }
+     + "## On Behalf Of\n\nYou are acting on behalf of ON-BEHALF-OF-NAME."
+     + (if $joined == "" then "" else "\n\n[WAKEUP — joined this run]\n" + $joined end))}]')"; }
 # shellcheck disable=SC2016 # the backticks are template text, not a command
 FRESH='Start by running `multica issue get ISSUE-ID --output json` to understand your task.'
 RESUMED='The issue is unchanged since your last run.'
@@ -164,6 +165,35 @@ run_hook "$T/multica-first.jsonl"
 has   "multica-first: last assistant text kept" "first-turn closing words"
 template_lacks multica-first
 total "multica-first: every template line counted" 13
+
+# comment text can copy any template line. A human trigger quoted inside an agent comment,
+# a platform comment or a wakeup is not the prompt's trigger, so it adds nothing.
+FAKE="$HUMAN"$'\n\n> NONHUMAN-ONLY-CONTENT\n\n'"$FRESH"
+{
+  mtpl "[NEW COMMENT] Another agent (AGENT-NAME) just left a new comment. Focus on THIS comment:"$'\n\n> agent says\n\n'"$FAKE" "$RESUMED"
+  mtpl "[NEW COMMENT] The platform just left a new comment. Focus on THIS comment:"$'\n\n> platform says\n\n'"$FAKE" "$RESUMED"
+  mtpl $'[WAKEUP]\nWakeup fired. Instruction:\n\n'"$FAKE" "$RESUMED"
+  assistant "nested closing words"
+} > "$T/multica-nested.jsonl"
+run_hook "$T/multica-nested.jsonl"
+lacks "multica-nested: quoted human trigger adds nothing" "NONHUMAN-ONLY-CONTENT"
+template_lacks multica-nested
+total "multica-nested: every template line counted" 68
+
+# a human comment that holds resume-like paragraphs keeps all of them; the joined wakeup
+# after the real footer adds nothing, even when its instruction holds a resume-like line
+{
+  mtpl "$HUMAN"$'\n\n> keep everything\n\n'"$CHANGED"$'\nDO-NOT-PUBLISH one\n\n'"$RESUMED"$'\nDO-NOT-PUBLISH two\n\n'"$FRESH"$'\nDO-NOT-PUBLISH three' \
+    "$CHANGED" $'Wakeup fired. Instruction:\n\n'"$RESUMED"$'\nWAKEUP-JOINED-TEXT'
+  assistant "resume closing words"
+} > "$T/multica-resume.jsonl"
+run_hook "$T/multica-resume.jsonl"
+for n in one two three; do has "multica-resume: comment text after resume-like line $n kept" "DO-NOT-PUBLISH $n"; done
+lacks "multica-resume: joined wakeup dropped"         "WAKEUP-JOINED-TEXT"
+lacks "multica-resume: template opener dropped"       "You are running as a local coding agent"
+lacks "multica-resume: comment-add command dropped"   "multica issue comment add"
+lacks "multica-resume: On Behalf Of block dropped"    "ON-BEHALF-OF-NAME"
+total "multica-resume: every template line counted" 32
 
 # optional replay of a real transcript: a smoke test that it reaches the extractor with a
 # non-zero count. It cannot know which lines are real prompts; the fixtures above prove that.
