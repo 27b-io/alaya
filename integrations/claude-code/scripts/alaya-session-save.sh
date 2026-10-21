@@ -105,12 +105,37 @@ BRANCH=$(git branch --show-current 2>/dev/null || echo "n/a")
 # <command-name>, <task-notification>): drop it whole, since a line filter
 # leaks the body of a multi-line wrapper. A typed prompt that starts with < is
 # lost too, on purpose: a list of known wrapper tags would leak every new one.
+# One JSON string per prompt, so the count and the context below read the same set.
 grep '"type":"user"' "$TRANSCRIPT" \
-    | jq -r 'select(.type == "user" and .isMeta != true and .isSidechain != true) | .message.content
+    | jq -c 'select(.type == "user" and .isMeta != true and .isSidechain != true) | .message.content
         | if type == "string" then . else (.[]? | select(.type? == "text") | .text) end
         | strings | select(startswith("<") | not)
         | select(. != "[Request interrupted by user]" and . != "[Request interrupted by user for tool use]")' 2>/dev/null \
-    > "$_HOOKDIR/all_messages.txt" || true
+    > "$_HOOKDIR/prompts.jsonl" || true
+jq -r '.' "$_HOOKDIR/prompts.jsonl" > "$_HOOKDIR/all_messages.txt" 2>/dev/null || true
+
+# Extractor context source. A Multica issue run's only prompts are the
+# platform's per-turn template: its commands and boilerplate would fill the
+# context and push out the human's request. Reduce each such prompt to the
+# human comment it quotes (the lines between the "[NEW COMMENT] A user ..."
+# trigger's blank line and the template's next paragraph) and drop the rest,
+# so the extractor sees what was asked and no template text. Comments quoted
+# from agents or the platform, and wakeups, add nothing. A prompt whose shape
+# is not recognised adds nothing either: the request is lost, the template
+# never leaks. Every other prompt passes through unchanged. The save gate
+# still counts all_messages.txt.
+jq -r '
+    def resumes: startswith("Start by running `multica issue get")
+        or startswith("The issue is unchanged since your last run")
+        or startswith("Since your last run the issue changed");
+    if startswith("You are running as a local coding agent for a Multica workspace.") | not then .
+    else split("\n") as $l
+        | ($l | map(startswith("[NEW COMMENT] A user just left a new comment")) | index(true)) as $t
+        | select($t != null)
+        | ([range($t + 3; $l | length) | select($l[. - 1] == "" and ($l[.] | resumes))] | .[0]) as $e
+        | select($e != null)
+        | $l[$t + 2:$e - 1] | join("\n") | select(length > 0)
+    end' "$_HOOKDIR/prompts.jsonl" > "$_HOOKDIR/context_source.txt" 2>/dev/null || true
 
 TOTAL=$(wc -l < "$_HOOKDIR/all_messages.txt" 2>/dev/null || echo 0)
 [[ $TOTAL -eq 0 ]] && exit 0
@@ -142,15 +167,16 @@ ELAPSED=$((NOW_EPOCH - LAST_SAVE_EPOCH))
 [[ $ELAPSED -lt $COOLDOWN_SECS ]] && exit 0
 
 # --- Build context window: first message + recent messages ---
-if [[ $TOTAL -le 15 ]]; then
-    head -c 32768 "$_HOOKDIR/all_messages.txt" > "$_HOOKDIR/context.txt"
+CTX_LINES=$(wc -l < "$_HOOKDIR/context_source.txt" 2>/dev/null || echo 0)
+if [[ $CTX_LINES -le 15 ]]; then
+    head -c 32768 "$_HOOKDIR/context_source.txt" > "$_HOOKDIR/context.txt"
 else
     {
         echo "=== SESSION TOPIC ==="
-        head -1 "$_HOOKDIR/all_messages.txt"
+        head -1 "$_HOOKDIR/context_source.txt"
         echo ""
         echo "=== RECENT USER MESSAGES ==="
-        tail -12 "$_HOOKDIR/all_messages.txt"
+        tail -12 "$_HOOKDIR/context_source.txt"
     } > "$_HOOKDIR/context.txt"
 fi
 
