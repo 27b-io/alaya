@@ -126,26 +126,32 @@ jq -r '.' "$_HOOKDIR/prompts.jsonl" > "$_HOOKDIR/all_messages.txt" 2>/dev/null |
 # Both boundaries are positional, because comment text can copy any template
 # line. The trigger is line 4, under "Your assigned issue ID is:" (a trigger
 # line quoted inside an agent comment or a wakeup is never at line 4). The
-# comment opens at line 6 and runs to the LAST blank-line-plus-resume paragraph
-# before the first platform section header after a blank line, such as
-# "[WAKEUP — joined this run]" (a resume-like paragraph inside the comment
-# comes before the real one; text a joined section carries after its header is
-# never searched). Only the platform's own header names count, so a comment
-# line like "[TODO] ..." or a markdown link stays in the request. A human
-# comment holding such a header cuts its own request short: that loses human
-# text, never leaks template text.
+# comment opens at line 6 and ends at a blank-line-plus-resume paragraph. The
+# FIRST such paragraph never leaks (everything before it is the comment) but a
+# resume-like paragraph inside the comment would cut it short; the LAST keeps
+# the comment whole but could lie inside text that follows the template. So:
+# search only up to the first platform section header after a blank line, such
+# as "[WAKEUP — joined this run]" (only the platform's own header names, so a
+# comment line like "[TODO] ..." or a markdown link stays in the request), take
+# the LAST match, and fall back to the FIRST whenever the lines between them
+# hold a template footer line. A missed or unknown header can then cost human
+# text, never leak template text.
 jq -r '
     def resumes: startswith("Start by running `multica issue get")
         or startswith("The issue is unchanged since your last run")
         or startswith("Since your last run the issue changed");
+    def footer: startswith("Post your reply as a comment") or . == "## On Behalf Of"
+        or startswith("You are acting on behalf of") or startswith("This task was initiated by")
+        or startswith("    multica issue comment add");
     if startswith("You are running as a local coding agent for a Multica workspace.") | not then .
     else split("\n") as $l
         | select(($l[2] // "" | startswith("Your assigned issue ID is: ")) and $l[3] == ""
             and ($l[4] // "" | startswith("[NEW COMMENT] A user just left a new comment")) and $l[5] == "")
         | (([range(8; $l | length) | select($l[. - 1] == "" and ($l[.] | test("^\\[(WAKEUP|NEW COMMENT|ADDITIONAL GUIDANCE)(\\]| —)")))]
             | .[0]) // ($l | length)) as $w
-        | ([range(7; $w) | select($l[. - 1] == "" and ($l[.] | resumes))] | .[-1]) as $e
-        | select($e != null)
+        | [range(7; $w) | select($l[. - 1] == "" and ($l[.] | resumes))] as $m
+        | select($m | length > 0)
+        | (if any($l[$m[0]:$m[-1]][]; footer) then $m[0] else $m[-1] end) as $e
         | $l[6:$e - 1] | join("\n") | select(length > 0)
     end' "$_HOOKDIR/prompts.jsonl" > "$_HOOKDIR/context_source.txt" 2>/dev/null || true
 
