@@ -58,15 +58,15 @@ NEW_GROUP=("$PY" -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.arg
 
 # run <label> <path-dir> — the "CLI": start the hook in its own process group,
 # feed it the input and close its stdin, read its stdout and stderr through a
-# pipe as the CLI does, kill the group the moment the hook returns, then wait
-# up to 15s for the detached save
+# pipe as the CLI does, kill the group the moment the hook returns, give the
+# pipe until 1s after the start to reach EOF, then wait up to 15s for the save
 run() {
-  local home="$T/home-$1" cap="$T/cap-$1" out="$T/out-$1" pid start dur reader eof
+  local home="$T/home-$1" cap="$T/cap-$1" out="$T/out-$1" pid start dur reader eof held
   mkdir -p "$home" "$cap"
   mkfifo "$out"
   # the CLI's end of the hook's output: EOF comes only when every holder of the
   # pipe has closed it, so a copy that keeps it open holds the CLI
-  ( cat "$out" >/dev/null; now_ms > "$cap/eof" ) & reader=$!
+  cat "$out" >/dev/null & reader=$!
   start=$(now_ms)
   printf '{"session_id":"s1","transcript_path":"%s"}' "$T/transcript.jsonl" \
     | (cd "$T" && exec "${NEW_GROUP[@]}" env -i HOME="$home" CAP="$cap" PATH="$2" \
@@ -81,9 +81,13 @@ run() {
   kill -TERM -- "-$pid" 2>/dev/null
   dur=$(( $(now_ms) - start ))
   kill "$watchdog" 2>/dev/null; wait "$watchdog" 2>/dev/null
-  for _ in $(seq 1 30); do [[ -s "$home/state/s1" ]] && break; sleep 0.5; done
+  # bounded: a pipe still held 1s after the start is a failure, and the reader
+  # is stopped, so a copy that holds the pipe for long cannot hang the test
+  while kill -0 "$reader" 2>/dev/null && (( $(now_ms) - start < 1000 )); do sleep 0.02; done
+  eof=$(( $(now_ms) - start )); held=0
+  if kill -0 "$reader" 2>/dev/null; then held=1; kill "$reader" 2>/dev/null; fi
   wait "$reader" 2>/dev/null
-  eof=$(( $(cat "$cap/eof" 2>/dev/null || echo 0) - start ))
+  for _ in $(seq 1 30); do [[ -s "$home/state/s1" ]] && break; sleep 0.5; done
 
   if [[ -s "$cap/store.json" ]] && jq -e '.content == "stub memory"' "$cap/store.json" >/dev/null 2>&1
   then echo "ok    $1: store call made after the CLI exit"; else echo "FAIL  $1: no store call"; RC=1; fi
@@ -93,8 +97,8 @@ run() {
   if [[ $dur -lt 1000 ]]; then echo "ok    $1: hook returned in ${dur}ms"
   else echo "FAIL  $1: hook still running after ${dur}ms"; RC=1; fi
   # nor hold its output pipe: the copy must not keep the hook's stdout or stderr
-  if [[ $eof -ge 0 && $eof -lt 1000 ]]; then echo "ok    $1: hook output closed in ${eof}ms"
-  else echo "FAIL  $1: hook output held open ${eof}ms"; RC=1; fi
+  if [[ $held -eq 0 ]]; then echo "ok    $1: hook output closed within ${eof}ms"
+  else echo "FAIL  $1: hook output still open after ${eof}ms"; RC=1; fi
 }
 if command -v setsid >/dev/null 2>&1; then
   run setsid "$T/path-setsid"
