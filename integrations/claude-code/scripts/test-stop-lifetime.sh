@@ -8,7 +8,9 @@
 # does not), kills the hook's whole process group. The extractor answers after
 # two seconds (stub curl, as in test-prompt-extraction.sh), so a foreground
 # save, or a copy not yet in its own session when the hook returns, is killed.
-# Then it asserts the store call happened and the state file was written.
+# Then it asserts the store call happened and the state file was written, and
+# that the hook's stdout and stderr, read through a pipe as the CLI reads them,
+# reached EOF at once: a copy that kept either would hold the CLI until it ends.
 #
 #   scripts/test-stop-lifetime.sh
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -55,17 +57,22 @@ PY=$(command -v python3)
 NEW_GROUP=("$PY" -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])')
 
 # run <label> <path-dir> — the "CLI": start the hook in its own process group,
-# feed it the input and close its stdin, kill the group 1s later, then wait up
-# to 15s for the detached save
+# feed it the input and close its stdin, read its stdout and stderr through a
+# pipe as the CLI does, kill the group the moment the hook returns, then wait
+# up to 15s for the detached save
 run() {
-  local home="$T/home-$1" cap="$T/cap-$1" pid start dur
+  local home="$T/home-$1" cap="$T/cap-$1" out="$T/out-$1" pid start dur reader eof
   mkdir -p "$home" "$cap"
+  mkfifo "$out"
+  # the CLI's end of the hook's output: EOF comes only when every holder of the
+  # pipe has closed it, so a copy that keeps it open holds the CLI
+  ( cat "$out" >/dev/null; now_ms > "$cap/eof" ) & reader=$!
   start=$(now_ms)
   printf '{"session_id":"s1","transcript_path":"%s"}' "$T/transcript.jsonl" \
     | (cd "$T" && exec "${NEW_GROUP[@]}" env -i HOME="$home" CAP="$cap" PATH="$2" \
         ALAYA_URL=http://alaya.test/store ALAYA_LLM_URL=http://llm.test/v1/chat/completions \
         ALAYA_LLM_API_KEY=k ALAYA_API_KEY=k ALAYA_HOOK_STATE_DIR="$home/state" \
-        bash "$HOOK") >/dev/null 2>&1 &
+        bash "$HOOK") >"$out" 2>&1 &
   pid=$!
   # kill the group the moment the hook returns, or after 1s if it does not:
   # a copy still in the hook's group when it returns dies here
@@ -75,6 +82,8 @@ run() {
   dur=$(( $(now_ms) - start ))
   kill "$watchdog" 2>/dev/null; wait "$watchdog" 2>/dev/null
   for _ in $(seq 1 30); do [[ -s "$home/state/s1" ]] && break; sleep 0.5; done
+  wait "$reader" 2>/dev/null
+  eof=$(( $(cat "$cap/eof" 2>/dev/null || echo 0) - start ))
 
   if [[ -s "$cap/store.json" ]] && jq -e '.content == "stub memory"' "$cap/store.json" >/dev/null 2>&1
   then echo "ok    $1: store call made after the CLI exit"; else echo "FAIL  $1: no store call"; RC=1; fi
@@ -83,6 +92,9 @@ run() {
   # a synchronous hook must not hold the CLI: it returns before the extraction ends
   if [[ $dur -lt 1000 ]]; then echo "ok    $1: hook returned in ${dur}ms"
   else echo "FAIL  $1: hook still running after ${dur}ms"; RC=1; fi
+  # nor hold its output pipe: the copy must not keep the hook's stdout or stderr
+  if [[ $eof -ge 0 && $eof -lt 1000 ]]; then echo "ok    $1: hook output closed in ${eof}ms"
+  else echo "FAIL  $1: hook output held open ${eof}ms"; RC=1; fi
 }
 if command -v setsid >/dev/null 2>&1; then
   run setsid "$T/path-setsid"

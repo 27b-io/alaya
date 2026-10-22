@@ -165,7 +165,9 @@ Starts the real Stop hook the way a CLI exit treats it: the parent closes the ho
 kills the hook's process group the moment the hook returns (or after a second if it does not),
 while the stub extractor takes two seconds. It
 proves the store call still happens and the state file is written, with and without `setsid(1)`
-on `PATH`, and that `hooks.json` registers the Stop hook synchronously.
+on `PATH`, that the hook's output pipe closes as soon as the hook returns (the detached copy
+holds neither stdout nor stderr, so it cannot hold the CLI), and that `hooks.json` registers
+the Stop hook synchronously.
 
 ```bash
 scripts/test-precompact-gate.sh
