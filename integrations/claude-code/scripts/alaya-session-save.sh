@@ -131,8 +131,10 @@ jq -r '.' "$_HOOKDIR/prompts.jsonl" > "$_HOOKDIR/all_messages.txt" 2>/dev/null |
 # resume-like paragraph inside the comment would cut it short; the LAST keeps
 # the comment whole but could lie inside text that follows the template. So:
 # search only up to the first platform section header after a blank line, such
-# as "[WAKEUP — joined this run]" (only the platform's own header names, so a
-# comment line like "[TODO] ..." or a markdown link stays in the request), take
+# as "[WAKEUP — joined this run]", that follows a template footer line (only
+# the platform's own header names, so a comment line like "[TODO] ..." or a
+# markdown link stays in the request; and only after a footer, so a header
+# label pasted into the comment, which precedes every footer, is not a bound), take
 # the LAST match, and fall back to the FIRST whenever the lines between them
 # hold a template footer line. A missed or unknown header can then cost human
 # text, never leak template text.
@@ -147,7 +149,8 @@ jq -r '
     else split("\n") as $l
         | select(($l[2] // "" | startswith("Your assigned issue ID is: ")) and $l[3] == ""
             and ($l[4] // "" | startswith("[NEW COMMENT] A user just left a new comment")) and $l[5] == "")
-        | (([range(8; $l | length) | select($l[. - 1] == "" and ($l[.] | test("^\\[(WAKEUP|NEW COMMENT|ADDITIONAL GUIDANCE)(\\]| —)")))]
+        | (([range(7; $l | length) | select($l[.] | footer)] | .[0]) // ($l | length)) as $f
+        | (([range($f + 1; $l | length) | select($l[. - 1] == "" and ($l[.] | test("^\\[(WAKEUP|NEW COMMENT|ADDITIONAL GUIDANCE)(\\]| —)")))]
             | .[0]) // ($l | length)) as $w
         | [range(7; $w) | select($l[. - 1] == "" and ($l[.] | resumes))] as $m
         | select($m | length > 0)

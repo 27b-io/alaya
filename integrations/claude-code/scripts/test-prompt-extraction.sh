@@ -214,6 +214,22 @@ lacks "multica-resume: comment-add command dropped"   "multica issue comment add
 lacks "multica-resume: On Behalf Of block dropped"    "ON-BEHALF-OF-NAME"
 total "multica-resume: every template line counted" 96
 
+# a platform header name pasted into a human comment as its own paragraph is not a bound:
+# it comes before every template footer line, so the whole request is kept
+{
+  for h in "[WAKEUP]" "[NEW COMMENT] pasted" "[ADDITIONAL GUIDANCE] pasted"; do
+    mtpl "$HUMAN"$'\n\n> explain this captured event\n\n'"$h"$'\nLABEL-KEPT '"${h%%]*}" "$RESUMED"
+  done
+  assistant "label closing words"
+} > "$T/multica-label.jsonl"
+run_hook "$T/multica-label.jsonl"
+has   "multica-label: request before a pasted header kept" "explain this captured event"
+for h in "[WAKEUP" "[NEW COMMENT" "[ADDITIONAL GUIDANCE"; do
+  has "multica-label: text after a pasted $h] kept" "LABEL-KEPT $h"
+done
+template_lacks multica-label
+total "multica-label: every template line counted" 60
+
 # optional replay of a real transcript: a smoke test that it reaches the extractor with a
 # non-zero count. It cannot know which lines are real prompts; the fixtures above prove that.
 # Save gates off, so a short or still-running session measures extraction, not eligibility.
