@@ -8,6 +8,8 @@
 # does not), kills the hook's whole process group. The extractor answers after
 # two seconds (stub curl, as in test-prompt-extraction.sh), so a foreground
 # save, or a copy not yet in its own session when the hook returns, is killed.
+# The hook's TMPDIR is deleted as soon as it returns, as a Multica run's
+# per-task temp dir is, so a copy that keeps its work dir there loses it.
 # Then it asserts the store call happened and the state file was written, and
 # that the hook's stdout and stderr, read through a pipe as the CLI reads them,
 # reached EOF at once: a copy that kept either would hold the CLI until it ends.
@@ -26,7 +28,7 @@ cat > "$T/bin/curl" <<'STUB'
 prev=; body=
 for a; do [ "$prev" = "-d" ] && body=$a; prev=$a; done
 case "$*" in
-  *llm.test*) sleep 2
+  *llm.test*) [ -n "$RMWORK" ] && rm -rf "$TMPDIR"/tmp.*; sleep 2
     echo '{"choices":[{"message":{"content":"[{\"content\":\"stub memory\"}]"}}]}' ;;
   *) printf '%s' "$body" > "$CAP/store.json"; printf 200 ;;
 esac
@@ -61,8 +63,8 @@ NEW_GROUP=("$PY" -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.arg
 # pipe as the CLI does, kill the group the moment the hook returns, give the
 # pipe until 1s after the start to reach EOF, then wait up to 15s for the save
 run() {
-  local home="$T/home-$1" cap="$T/cap-$1" out="$T/out-$1" pid start dur reader eof held
-  mkdir -p "$home" "$cap"
+  local home="$T/home-$1" cap="$T/cap-$1" out="$T/out-$1" tmp="$T/task-tmp-$1" pid start dur reader eof held
+  mkdir -p "$home" "$cap" "$tmp"
   mkfifo "$out"
   # the CLI's end of the hook's output: EOF comes only when every holder of the
   # pipe has closed it, so a copy that keeps it open holds the CLI
@@ -72,13 +74,14 @@ run() {
     | (cd "$T" && exec "${NEW_GROUP[@]}" env -i HOME="$home" CAP="$cap" PATH="$2" \
         ALAYA_URL=http://alaya.test/store ALAYA_LLM_URL=http://llm.test/v1/chat/completions \
         ALAYA_LLM_API_KEY=k ALAYA_API_KEY=k ALAYA_HOOK_STATE_DIR="$home/state" \
-        bash "$HOOK") >"$out" 2>&1 &
+        TMPDIR="$tmp" bash "$HOOK") >"$out" 2>&1 &
   pid=$!
   # kill the group the moment the hook returns, or after 1s if it does not:
   # a copy still in the hook's group when it returns dies here
   ( sleep 1; kill -TERM -- "-$pid" ) 2>/dev/null & watchdog=$!
   wait "$pid" 2>/dev/null
   kill -TERM -- "-$pid" 2>/dev/null
+  rm -rf "$tmp" # a Multica task's TMPDIR is deleted when the task ends
   dur=$(( $(now_ms) - start ))
   kill "$watchdog" 2>/dev/null; wait "$watchdog" 2>/dev/null
   # bounded: a pipe still held 1s after the start is a failure, and the reader
@@ -106,6 +109,17 @@ else
   echo "skip  setsid: not installed here (the no-setsid fallback runs below)"
 fi
 run no-setsid "$T/path-nosetsid"
+
+# a work dir removed mid-save is logged as that, not as bad LLM output
+home="$T/home-rmwork"; mkdir -p "$home" "$T/tmp-rmwork"
+printf '{"session_id":"s1","transcript_path":"%s"}' "$T/transcript.jsonl" \
+  | (cd "$T" && env -i HOME="$home" CAP="$T" PATH="$T/path-nosetsid" RMWORK=1 TMPDIR="$T/tmp-rmwork" \
+      _ALAYA_HOOK_FOREGROUND=1 ALAYA_URL=http://alaya.test/store ALAYA_LLM_URL=http://llm.test/v1/chat/completions \
+      ALAYA_LLM_API_KEY=k ALAYA_API_KEY=k ALAYA_HOOK_STATE_DIR="$home/state" bash "$HOOK") >/dev/null 2>&1
+log="$home/state/failures.log"
+if [[ "$(wc -l < "$log" 2>/dev/null)" -eq 1 ]] && grep -q 'cannot write .*memories.json: the work dir is gone' "$log"
+then echo "ok    rmwork: lost work dir logged as the cause"
+else echo "FAIL  rmwork: failures.log: $(cat "$log" 2>/dev/null)"; RC=1; fi
 
 # a synchronous registration: an async hook is killed with the CLI before it can detach
 if jq -e '.hooks.Stop[].hooks[] | select(.command | contains("alaya-session-save.sh")) | .async != true' \

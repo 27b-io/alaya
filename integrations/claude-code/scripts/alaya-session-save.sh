@@ -87,7 +87,12 @@ set +e
 # the copy is started; this part takes milliseconds. The copy's stderr goes to
 # failures.log. _ALAYA_HOOK_FOREGROUND=1 runs the save in this process (the
 # detached copy, and tests that read its result).
+# The copy's work dir goes under /tmp, not the caller's TMPDIR: a Multica run
+# sets TMPDIR to a per-task directory the daemon deletes when the task ends,
+# which is before the extractor answers, so the copy lost its work dir
+# mid-save. mktemp -d still makes the dir owner-only, and the copy removes it.
 if [[ -z "${_ALAYA_HOOK_FOREGROUND:-}" ]]; then
+    export TMPDIR=/tmp
     INPUT=$(cat)
     if command -v setsid >/dev/null 2>&1; then
         _new_session=(setsid)
@@ -120,7 +125,7 @@ NOW_EPOCH=$(date +%s)
 DURATION=$((NOW_EPOCH - START_EPOCH))
 [[ $DURATION -lt $MIN_DURATION_SECS ]] && exit 0
 
-_HOOKDIR=$(mktemp -d)
+_HOOKDIR=$(mktemp -d) || _skip "cannot create a work dir under ${TMPDIR:-/tmp}, skipping save"
 trap 'rm -rf "$_HOOKDIR"' EXIT
 PROJECT=$(basename "$(pwd)")
 BRANCH=$(git branch --show-current 2>/dev/null || echo "n/a")
@@ -372,7 +377,8 @@ RESPONSE=$(printf '%s' "$RAW" | jq -r '.choices[0].message.content // empty' 2>/
 [[ -z "$RESPONSE" ]] && _skip "LLM extraction failed model=$LLM_MODEL resp=${RAW:0:300}"
 
 # --- Parse LLM output (strip markdown fences if present) ---
-printf '%s\n' "$RESPONSE" | sed 's/^```[a-zA-Z]*//;/^$/d' > "$_HOOKDIR/memories.json"
+printf '%s\n' "$RESPONSE" | sed 's/^```[a-zA-Z]*//;/^$/d' 2>/dev/null > "$_HOOKDIR/memories.json" \
+    || _skip "cannot write $_HOOKDIR/memories.json: the work dir is gone or unwritable, skipping save"
 
 # -1 = valid JSON but not an array (output-envelope drift, e.g. {"memories":[...]})
 # — must be logged, or a model/gateway change silently stops all saves (LAB-170).
