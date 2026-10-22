@@ -8,7 +8,7 @@
 # does not), kills the hook's whole process group. The extractor answers after
 # two seconds (stub curl, as in test-prompt-extraction.sh), so a foreground
 # save, or a copy not yet in its own session when the hook returns, is killed.
-# The hook's TMPDIR is deleted as soon as it returns, as a Multica run's
+# The hook's TMPDIR is deleted as soon as it returns, as an agent runner's
 # per-task temp dir is, so a copy that keeps its work dir there loses it.
 # Then it asserts the store call happened and the state file was written, and
 # that the hook's stdout and stderr, read through a pipe as the CLI reads them,
@@ -81,7 +81,7 @@ run() {
   ( sleep 1; kill -TERM -- "-$pid" ) 2>/dev/null & watchdog=$!
   wait "$pid" 2>/dev/null
   kill -TERM -- "-$pid" 2>/dev/null
-  rm -rf "$tmp" # a Multica task's TMPDIR is deleted when the task ends
+  rm -rf "$tmp" # an agent runner's per-task TMPDIR is deleted when the task ends
   dur=$(( $(now_ms) - start ))
   kill "$watchdog" 2>/dev/null; wait "$watchdog" 2>/dev/null
   # bounded: a pipe still held 1s after the start is a failure, and the reader

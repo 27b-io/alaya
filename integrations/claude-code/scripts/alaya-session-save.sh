@@ -87,8 +87,8 @@ set +e
 # the copy is started; this part takes milliseconds. The copy's stderr goes to
 # failures.log. _ALAYA_HOOK_FOREGROUND=1 runs the save in this process (the
 # detached copy, and tests that read its result).
-# The copy's work dir goes under /tmp, not the caller's TMPDIR: a Multica run
-# sets TMPDIR to a per-task directory the daemon deletes when the task ends,
+# The copy's work dir goes under /tmp, not the caller's TMPDIR: an agent
+# runner can set TMPDIR to a per-task directory it deletes when the task ends,
 # which is before the extractor answers, so the copy lost its work dir
 # mid-save. mktemp -d still makes the dir owner-only, and the copy removes it.
 if [[ -z "${_ALAYA_HOOK_FOREGROUND:-}" ]]; then
