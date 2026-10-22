@@ -1,29 +1,39 @@
 #!/usr/bin/env bash
-# PreCompact hook: block compaction unless Claude has saved memories recently,
-# or has said on purpose that nothing qualifies.
+# PreCompact hook: block a manual /compact unless Claude has saved memories
+# recently, or has said on purpose that nothing qualifies.
 #
 # Recency rule: within the last N lines (default 500) of the transcript, either
 # at least one mcp__alaya__store_memory tool_use call, or an assistant text block
 # containing ALAYA_NOTHING_TO_SAVE. Without the second path a session with nothing
 # worth saving could never compact, or would store filler just to pass.
 #
-# Exit 0 = allow, exit 2 = block (stderr injected into Claude's context).
+# Exit 0 = allow, exit 2 = block (on a manual /compact, stderr is shown to the user).
 # Fails CLOSED (blocks) when the transcript can't be found or parsed, same as
 # a genuine "no recent save" — an unreadable transcript never bypasses the gate.
+#
+# Always allows trigger "auto"; every other trigger (manual, missing, unknown)
+# is gated. Claude never sees the block message of an automatic compaction, so a
+# block there only skips compaction until the session hits the context limit.
 
 set -u
 RECENT_LINES=${ALAYA_PRECOMPACT_RECENT_LINES:-500}
 
 input=$(cat)
 
-# Extract transcript_path from the hook's stdin JSON. Use python3 — universally available.
-transcript=$(printf '%s' "$input" | python3 -c '
+# Read a top-level field from the hook's stdin JSON. Use python3 — universally available.
+field() {
+    printf '%s' "$input" | python3 -c '
 import json, sys
 try:
-    print(json.load(sys.stdin).get("transcript_path", ""))
+    print(json.load(sys.stdin).get(sys.argv[1], ""))
 except Exception:
     pass
-' 2>/dev/null)
+' "$1" 2>/dev/null
+}
+
+[ "$(field trigger)" = "auto" ] && exit 0
+
+transcript=$(field transcript_path)
 
 if [ -n "$transcript" ] && [ -r "$transcript" ]; then
     # Scan the last $RECENT_LINES of the transcript for any store_memory tool_use.
