@@ -6,7 +6,10 @@ memory server:
 - **Stop** (`scripts/alaya-session-save.sh`) — async, after each turn ends. Extracts 0–3
   memories from the transcript via an LLM and POSTs them to Ālaya's `/store` endpoint, with
   gates against saving too often and a dedup threshold to catch LLM rephrases of the same fact.
-- **PreCompact** (`scripts/alaya-precompact.sh`) — blocks compaction (exit 2) unless a
+- **PreCompact** (`scripts/alaya-precompact.sh`) — gates manual `/compact` only; automatic
+  compaction always passes, because Claude Code never shows Claude the block message of an
+  automatic compaction, so a block there only skips compaction until the session hits the
+  context limit. A manual `/compact` is blocked (exit 2) unless a
   `mcp__alaya__store_memory` call shows up in the last 500 transcript lines, so valuable
   context doesn't get compacted away unsaved. When nothing qualifies, Claude writes
   `ALAYA_NOTHING_TO_SAVE` alone as the last line of its reply instead (nothing after it in that
@@ -166,7 +169,7 @@ window (with a control showing the same marker passes inside it).
   `~/.cache/alaya-hook/failures.log`). Every failure path (missing config or `jq`, unresolved
   or hung secret command, dead LLM endpoint, unexpected LLM output shape, failed store call)
   logs one line there — see LAB-170: a silent failure here once cost 5 days of unsaved memories.
-- **PreCompact keeps blocking** — it only unblocks once an `mcp__alaya__store_memory` tool
+- **PreCompact keeps blocking** — it gates manual `/compact` only, and unblocks once an `mcp__alaya__store_memory` tool
   call, or an assistant reply whose final line is `ALAYA_NOTHING_TO_SAVE` alone (Claude's
   deliberate "nothing worth saving"), appears in the last `ALAYA_PRECOMPACT_RECENT_LINES`
   transcript lines. The marker counts only in Claude's own reply text, so a file, tool result

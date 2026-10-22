@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Black-box test of the PreCompact gate (alaya-precompact.sh). It must pass (exit 0) on a
-# recent store_memory call or on ALAYA_NOTHING_TO_SAVE in Claude's own reply text, and block
-# (exit 2) everywhere else — above all when the marker only arrives in content Claude read,
-# so nothing outside Claude's own words can open the gate.
+# Black-box test of the PreCompact gate (alaya-precompact.sh). It must pass (exit 0) on an
+# automatic compaction, on a recent store_memory call or on ALAYA_NOTHING_TO_SAVE in Claude's own
+# reply text, and block (exit 2) everywhere else — above all when the marker only arrives in
+# content Claude read, so nothing outside Claude's own words can open the gate.
 #
 #   scripts/test-precompact-gate.sh
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -117,6 +117,21 @@ malformed "user entry with no message"            '{"type":"user"}'
   | case_ "marker in a subagent (sidechain) reply: blocks" 2
 { base; jq -cn --arg m "$M" '{type:"system", content:$m}'; } | case_ "marker in a system entry: blocks" 2
 
+# the trigger: Claude Code never shows Claude the block message of an automatic compaction, so a
+# block there only skips compaction until the context limit. Only "manual" (/compact) is gated.
+trig() { # <name> <want-exit> <trigger> <transcript-path>
+  printf '{"session_id":"s1","trigger":"%s","transcript_path":"%s"}' "$3" "$4" | bash "$HOOK" >/dev/null 2>&1
+  local got=$?
+  if [[ $got -eq $2 ]]; then echo "ok    $1"; else echo "FAIL  $1: want exit $2, got $got"; RC=1; fi
+}
+base > "$T/trig.jsonl"
+trig "auto trigger, no store, no marker: passes" 0 auto "$T/trig.jsonl"
+trig "auto trigger, missing transcript: passes" 0 auto "$T/does-not-exist.jsonl"
+trig "manual trigger, no store, no marker: blocks" 2 manual "$T/trig.jsonl"
+trig "unknown trigger, no store, no marker: blocks" 2 bogus "$T/trig.jsonl"
+{ base; assistant '[{"type":"tool_use","id":"t1","name":"mcp__alaya__store_memory","input":{"content":"x"}}]'; } > "$T/trig-store.jsonl"
+trig "manual trigger, store_memory tool_use: passes" 0 manual "$T/trig-store.jsonl"
+
 # fail closed
 expect "missing transcript: blocks" 2 "$T/does-not-exist.jsonl"
 printf 'not json {{{\n' > "$T/garbage.jsonl"; expect "unparseable transcript: blocks" 2 "$T/garbage.jsonl"
@@ -142,5 +157,5 @@ for want in "end your reply with the marker $M alone on its own line" "Storing n
 done
 
 [[ -e "$T/failed" ]] && RC=1
-[[ $RC -eq 0 ]] && echo "ALL PASS: store or assistant-text marker opens the gate; no forged marker does; failures block"
+[[ $RC -eq 0 ]] && echo "ALL PASS: auto compaction, a store or an assistant-text marker opens the gate; no forged marker does; failures block"
 exit $RC
