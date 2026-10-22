@@ -188,7 +188,7 @@ total "multica-nested: every template line counted" 68
   # the joined wakeup is bounded by its own header, not by the On Behalf Of block before it
   entry "$(jq -n --arg trig "$HUMAN" --arg resume "$RESUMED" '[{type:"text", text:
     ("You are running as a local coding agent for a Multica workspace.\n\nYour assigned issue ID is: ISSUE-ID\n\n"
-     + $trig + "\n\n> no behalf block\n\n" + $resume + "\n\nPost your reply as a comment.\n\n"
+     + $trig + "\n\n> no behalf block\n[TODO] TODO-LINE-KEPT\n[README](./README.md) LINK-LINE-KEPT\n\n" + $resume + "\n\nPost your reply as a comment.\n\n"
      + "[WAKEUP — joined this run]\nWakeup fired. Instruction:\n\n" + $resume + "\nNO-BEHALF-WAKEUP-TEXT")}]')"
   assistant "resume closing words"
 } > "$T/multica-resume.jsonl"
@@ -196,12 +196,14 @@ run_hook "$T/multica-resume.jsonl"
 for n in one two three; do has "multica-resume: comment text after resume-like line $n kept" "DO-NOT-PUBLISH $n"; done
 lacks "multica-resume: joined wakeup dropped"         "WAKEUP-JOINED-TEXT"
 has   "multica-resume: comment without a behalf block kept" "no behalf block"
+has   "multica-resume: bracketed comment line kept"   "TODO-LINE-KEPT"
+has   "multica-resume: markdown-link comment line kept" "LINK-LINE-KEPT"
 lacks "multica-resume: joined wakeup without a behalf block dropped" "NO-BEHALF-WAKEUP-TEXT"
 lacks "multica-resume: reply instruction dropped"     "Post your reply"
 lacks "multica-resume: template opener dropped"       "You are running as a local coding agent"
 lacks "multica-resume: comment-add command dropped"   "multica issue comment add"
 lacks "multica-resume: On Behalf Of block dropped"    "ON-BEHALF-OF-NAME"
-total "multica-resume: every template line counted" 49
+total "multica-resume: every template line counted" 51
 
 # optional replay of a real transcript: a smoke test that it reaches the extractor with a
 # non-zero count. It cannot know which lines are real prompts; the fixtures above prove that.
