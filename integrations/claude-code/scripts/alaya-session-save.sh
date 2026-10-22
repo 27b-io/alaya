@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stop hook: async memory extraction from transcript → Alaya REST API.
+# Stop hook: detached memory extraction from transcript → Alaya REST API.
 # Fires after Claude stops. Reads transcript, calls an LLM for structured
 # extraction, POSTs memories with dedup. Never blocks the UX.
 #
@@ -71,6 +71,31 @@ command -v jq >/dev/null 2>&1 || _skip "config: jq not found on PATH, skipping s
 # to SIGPIPE under pipefail, and any parse failure past this point must reach
 # a logged skip, not an unlogged errexit death (LAB-170).
 set +e
+
+# Hand the save to a detached copy of this script and return at once. Claude
+# Code sends SIGTERM to a Stop hook that is still running when the CLI exits,
+# and an SDK-driven CLI exits within seconds of its last result, while the
+# extraction and store take longer: a run's final Stop was killed before it
+# saved anything. The copy runs in its own session (setsid), so it outlives the
+# CLI and any kill aimed at the hook's process group, and it holds none of
+# the CLI's pipes. hooks.json registers the hook synchronously, so the CLI
+# cannot exit before the copy is started; this part takes milliseconds. The
+# copy's stderr goes to failures.log. _ALAYA_HOOK_FOREGROUND=1 runs the save
+# in this process (the detached copy, and tests that read its result).
+if [[ -z "${_ALAYA_HOOK_FOREGROUND:-}" ]]; then
+    INPUT=$(cat)
+    if command -v setsid >/dev/null 2>&1; then
+        _new_session=(setsid)
+    else # macOS/BSD ship no setsid(1)
+        _new_session=(python3 -c 'import os, sys
+try: os.setsid()
+except OSError: pass
+os.execvp(sys.argv[1], sys.argv[1:])')
+    fi
+    _ALAYA_HOOK_FOREGROUND=1 "${_new_session[@]}" bash "${BASH_SOURCE[0]}" <<<"$INPUT" \
+        >/dev/null 2>>"$STATE_DIR/failures.log" &
+    exit 0
+fi
 
 INPUT=$(cat)
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)

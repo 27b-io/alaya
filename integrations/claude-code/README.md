@@ -3,9 +3,11 @@
 Two hooks that make Claude Code sessions persist into an [Ālaya](../../README.md) long-term
 memory server:
 
-- **Stop** (`scripts/alaya-session-save.sh`) — async, after each turn ends. Extracts 0–3
+- **Stop** (`scripts/alaya-session-save.sh`) — after each turn ends. Extracts 0–3
   memories from the transcript via an LLM and POSTs them to Ālaya's `/store` endpoint, with
   gates against saving too often and a dedup threshold to catch LLM rephrases of the same fact.
+  The hook returns within milliseconds and does the save in a detached copy of itself, so the
+  save survives the CLI exiting right after its last turn, as SDK-driven runs do.
 - **PreCompact** (`scripts/alaya-precompact.sh`) — blocks compaction (exit 2) unless a
   `mcp__alaya__store_memory` call shows up in the last 500 transcript lines, so valuable
   context doesn't get compacted away unsaved. When nothing qualifies, Claude writes
@@ -150,6 +152,15 @@ platform, and wakeups, add nothing. The save gate still counts every prompt line
 transcript to also run a smoke replay. It checks only that a non-zero message count reaches the
 extractor, not which lines those are, and it turns off the duration and message-count save gates
 so a short or still-running session counts too.
+
+```bash
+scripts/test-stop-lifetime.sh
+```
+
+Starts the real Stop hook the way a CLI exit treats it: the parent closes the hook's stdin, then
+kills the hook's process group within a second, while the stub extractor takes two seconds. It
+proves the store call still happens and the state file is written, with and without `setsid(1)`
+on `PATH`, and that `hooks.json` registers the Stop hook synchronously.
 
 ```bash
 scripts/test-precompact-gate.sh
