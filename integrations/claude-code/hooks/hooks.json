@@ -6,8 +6,7 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/alaya-session-save.sh\"",
-            "timeout": 60,
-            "async": true
+            "timeout": 10
           }
         ]
       }

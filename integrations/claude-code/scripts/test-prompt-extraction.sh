@@ -37,7 +37,7 @@ run_hook() {
   printf '{"session_id":"s1","transcript_path":"%s"}' "$tr" \
     | (cd "$T" && env -i HOME="$home" CAP="$cap" PATH="$T/bin:$JQ_DIR:/usr/bin:/bin" \
         ALAYA_URL=http://alaya.test/store ALAYA_LLM_URL=http://llm.test/v1/chat/completions \
-        ALAYA_LLM_API_KEY=k ALAYA_API_KEY=k ALAYA_HOOK_STATE_DIR="$home/state" "${@:2}" \
+        ALAYA_LLM_API_KEY=k ALAYA_API_KEY=k ALAYA_HOOK_STATE_DIR="$home/state" _ALAYA_HOOK_FOREGROUND=1 "${@:2}" \
         bash "$HOOK") >/dev/null 2>&1
   sed -n 2p "$home/state/s1" > "$cap/total" 2>/dev/null
 }
