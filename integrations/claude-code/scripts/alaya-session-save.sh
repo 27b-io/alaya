@@ -76,12 +76,17 @@ set +e
 # Code sends SIGTERM to a Stop hook that is still running when the CLI exits,
 # and an SDK-driven CLI exits within seconds of its last result, while the
 # extraction and store take longer: a run's final Stop was killed before it
-# saved anything. The copy runs in its own session (setsid), so it outlives the
-# CLI and any kill aimed at the hook's process group, and it holds none of
-# the CLI's pipes. hooks.json registers the hook synchronously, so the CLI
-# cannot exit before the copy is started; this part takes milliseconds. The
-# copy's stderr goes to failures.log. _ALAYA_HOOK_FOREGROUND=1 runs the save
-# in this process (the detached copy, and tests that read its result).
+# saved anything. The copy runs in its own session, so it outlives the CLI and
+# any kill aimed at the hook's process group, and it holds none of the CLI's
+# pipes. The new session is made in the foreground and only then is the copy
+# backgrounded from inside it, so the copy has left the hook's group before
+# the hook returns; a copy backgrounded first and moved later dies to a group
+# kill sent the moment the hook returns. <&0 keeps the input on the copy's
+# stdin (a background job in a non-interactive shell gets /dev/null).
+# hooks.json registers the hook synchronously, so the CLI cannot exit before
+# the copy is started; this part takes milliseconds. The copy's stderr goes to
+# failures.log. _ALAYA_HOOK_FOREGROUND=1 runs the save in this process (the
+# detached copy, and tests that read its result).
 if [[ -z "${_ALAYA_HOOK_FOREGROUND:-}" ]]; then
     INPUT=$(cat)
     if command -v setsid >/dev/null 2>&1; then
@@ -89,11 +94,13 @@ if [[ -z "${_ALAYA_HOOK_FOREGROUND:-}" ]]; then
     else # macOS/BSD ship no setsid(1)
         _new_session=(python3 -c 'import os, sys
 try: os.setsid()
-except OSError: pass
+except OSError as e: sys.stderr.write("alaya-session-save: setsid failed: %s\n" % e)
 os.execvp(sys.argv[1], sys.argv[1:])')
     fi
-    _ALAYA_HOOK_FOREGROUND=1 "${_new_session[@]}" bash "${BASH_SOURCE[0]}" <<<"$INPUT" \
-        >/dev/null 2>>"$STATE_DIR/failures.log" &
+    # shellcheck disable=SC2016 # "$@" expands in the inner shell
+    _ALAYA_HOOK_FOREGROUND=1 "${_new_session[@]}" bash -c '"$@" <&0 &' _ bash "${BASH_SOURCE[0]}" \
+        <<<"$INPUT" >/dev/null 2>>"$STATE_DIR/failures.log" \
+        || _log_failure "detach failed (exit $?), the save did not run"
     exit 0
 fi
 

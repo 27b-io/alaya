@@ -4,9 +4,10 @@
 # within seconds of its last result, so a hook that extracts and stores in the
 # foreground is killed at a run's final Stop and saves nothing. This starts the
 # real hook the way that exit treats it: a parent writes the hook input, closes
-# the hook's stdin, waits up to one second for it to return, then kills the
-# hook's whole process group and exits. The extractor answers after two seconds (stub curl, as in
-# test-prompt-extraction.sh), so a foreground save is always killed first.
+# the hook's stdin and, the moment the hook returns (or after one second if it
+# does not), kills the hook's whole process group. The extractor answers after
+# two seconds (stub curl, as in test-prompt-extraction.sh), so a foreground
+# save, or a copy not yet in its own session when the hook returns, is killed.
 # Then it asserts the store call happened and the state file was written.
 #
 #   scripts/test-stop-lifetime.sh
@@ -66,10 +67,13 @@ run() {
         ALAYA_LLM_API_KEY=k ALAYA_API_KEY=k ALAYA_HOOK_STATE_DIR="$home/state" \
         bash "$HOOK") >/dev/null 2>&1 &
   pid=$!
-  for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.05; done
-  dur=$(( $(now_ms) - start ))
-  kill -TERM -- "-$pid" 2>/dev/null # the hook's process group, if it still runs
+  # kill the group the moment the hook returns, or after 1s if it does not:
+  # a copy still in the hook's group when it returns dies here
+  ( sleep 1; kill -TERM -- "-$pid" ) 2>/dev/null & watchdog=$!
   wait "$pid" 2>/dev/null
+  kill -TERM -- "-$pid" 2>/dev/null
+  dur=$(( $(now_ms) - start ))
+  kill "$watchdog" 2>/dev/null; wait "$watchdog" 2>/dev/null
   for _ in $(seq 1 30); do [[ -s "$home/state/s1" ]] && break; sleep 0.5; done
 
   if [[ -s "$cap/store.json" ]] && jq -e '.content == "stub memory"' "$cap/store.json" >/dev/null 2>&1

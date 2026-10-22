@@ -161,7 +161,8 @@ scripts/test-stop-lifetime.sh
 ```
 
 Starts the real Stop hook the way a CLI exit treats it: the parent closes the hook's stdin, then
-kills the hook's process group within a second, while the stub extractor takes two seconds. It
+kills the hook's process group the moment the hook returns (or after a second if it does not),
+while the stub extractor takes two seconds. It
 proves the store call still happens and the state file is written, with and without `setsid(1)`
 on `PATH`, and that `hooks.json` registers the Stop hook synchronously.
 
