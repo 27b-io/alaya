@@ -6,10 +6,10 @@ memory server:
 - **Stop** (`scripts/alaya-session-save.sh`) — async, after each turn ends. Extracts 0–3
   memories from the transcript via an LLM and POSTs them to Ālaya's `/store` endpoint, with
   gates against saving too often and a dedup threshold to catch LLM rephrases of the same fact.
-- **PreCompact** (`scripts/alaya-precompact.sh`) — gates manual `/compact` only; automatic
-  compaction always passes, because Claude Code never shows Claude the block message of an
-  automatic compaction, so a block there only skips compaction until the session hits the
-  context limit. A manual `/compact` is blocked (exit 2) unless a
+- **PreCompact** (`scripts/alaya-precompact.sh`) — automatic compaction always passes:
+  Claude Code never shows Claude the block message of an automatic compaction, so a block
+  there only skips compaction until the session hits the context limit. Every other trigger
+  (a manual `/compact`, or a missing or unknown one) is blocked (exit 2) unless a
   `mcp__alaya__store_memory` call shows up in the last 500 transcript lines, so valuable
   context doesn't get compacted away unsaved. When nothing qualifies, Claude writes
   `ALAYA_NOTHING_TO_SAVE` alone as the last line of its reply instead (nothing after it in that
@@ -155,7 +155,8 @@ so a short or still-running session counts too.
 scripts/test-precompact-gate.sh
 ```
 
-Runs the real PreCompact hook against fixture transcripts. It proves the gate passes on a recent
+Runs the real PreCompact hook against fixture transcripts. It proves any automatic compaction
+passes and manual or unknown triggers are gated, and that the gate passes on a recent
 `store_memory` call or on `ALAYA_NOTHING_TO_SAVE` alone as the last line of Claude's own reply
 text, and still blocks when the marker is only mentioned inside a sentence or shown in a fenced
 example or followed by more text or a tool call in the same turn, or appears only in a tool
@@ -169,7 +170,8 @@ window (with a control showing the same marker passes inside it).
   `~/.cache/alaya-hook/failures.log`). Every failure path (missing config or `jq`, unresolved
   or hung secret command, dead LLM endpoint, unexpected LLM output shape, failed store call)
   logs one line there — see LAB-170: a silent failure here once cost 5 days of unsaved memories.
-- **PreCompact keeps blocking** — it gates manual `/compact` only, and unblocks once an `mcp__alaya__store_memory` tool
+- **PreCompact keeps blocking** — automatic compaction always passes; the gate on a
+  manual `/compact` unblocks once an `mcp__alaya__store_memory` tool
   call, or an assistant reply whose final line is `ALAYA_NOTHING_TO_SAVE` alone (Claude's
   deliberate "nothing worth saving"), appears in the last `ALAYA_PRECOMPACT_RECENT_LINES`
   transcript lines. The marker counts only in Claude's own reply text, so a file, tool result
@@ -177,7 +179,7 @@ window (with a control showing the same marker passes inside it).
   independent persistence paths, and the PreCompact gate wants Claude itself to decide before
   context is compacted away — a curated save via the Ālaya MCP server, or the marker. The Stop
   hook's automatic REST extraction satisfies neither and is not meant to. Ask Claude to save or
-  to state the marker (the block message prompts it to), or disable the gate by removing the
+  to state the marker (the block message, shown to you on a manual `/compact`, says how), or disable the gate by removing the
   PreCompact hook if you don't run the Ālaya MCP server.
 - **`claude plugin validate` fails** — run it with `--strict` locally before pushing; it flags
   unrecognized fields and missing metadata that the runtime otherwise tolerates silently.

@@ -7,15 +7,13 @@
 # containing ALAYA_NOTHING_TO_SAVE. Without the second path a session with nothing
 # worth saving could never compact, or would store filler just to pass.
 #
-# Exit 0 = allow, exit 2 = block (stderr shown for a manual /compact).
+# Exit 0 = allow, exit 2 = block (on a manual /compact, stderr is shown to the user).
 # Fails CLOSED (blocks) when the transcript can't be found or parsed, same as
 # a genuine "no recent save" — an unreadable transcript never bypasses the gate.
 #
-# Always allows trigger "auto". Claude Code never shows Claude the block message
-# of an automatic compaction: it skips the compaction and the conversation keeps
-# growing, so Claude cannot save or answer the gate and the session runs into
-# the context limit ("Prompt is too long"). Blocking there loses the session
-# instead of protecting it.
+# Always allows trigger "auto"; every other trigger (manual, missing, unknown)
+# is gated. Claude never sees the block message of an automatic compaction, so a
+# block there only skips compaction until the session hits the context limit.
 
 set -u
 RECENT_LINES=${ALAYA_PRECOMPACT_RECENT_LINES:-500}

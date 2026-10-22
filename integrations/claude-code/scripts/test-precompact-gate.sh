@@ -19,9 +19,10 @@ base() { # an ordinary exchange with no store and no marker
   assistant '[{"type":"text","text":"Fixed it."}]'
 }
 
-# expect <name> <want-exit> <transcript-path>
+# expect <name> <want-exit> <transcript-path> [trigger]
 expect() {
-  printf '{"session_id":"s1","transcript_path":"%s"}' "$3" | bash "$HOOK" >/dev/null 2>&1
+  local trigger=""; [[ -n "${4:-}" ]] && trigger="\"trigger\":\"$4\","
+  printf '{"session_id":"s1",%s"transcript_path":"%s"}' "$trigger" "$3" | bash "$HOOK" >/dev/null 2>&1
   local got=$?
   # case_ runs in a pipeline subshell, where RC=1 is lost: the marker file reaches the parent
   if [[ $got -eq $2 ]]; then echo "ok    $1"; else echo "FAIL  $1: want exit $2, got $got"; RC=1; : > "$T/failed"; fi
@@ -117,20 +118,12 @@ malformed "user entry with no message"            '{"type":"user"}'
   | case_ "marker in a subagent (sidechain) reply: blocks" 2
 { base; jq -cn --arg m "$M" '{type:"system", content:$m}'; } | case_ "marker in a system entry: blocks" 2
 
-# the trigger: Claude Code never shows Claude the block message of an automatic compaction, so a
-# block there only skips compaction until the context limit. Only "manual" (/compact) is gated.
-trig() { # <name> <want-exit> <trigger> <transcript-path>
-  printf '{"session_id":"s1","trigger":"%s","transcript_path":"%s"}' "$3" "$4" | bash "$HOOK" >/dev/null 2>&1
-  local got=$?
-  if [[ $got -eq $2 ]]; then echo "ok    $1"; else echo "FAIL  $1: want exit $2, got $got"; RC=1; fi
-}
+# only trigger "auto" bypasses the gate; manual, missing and unknown triggers are gated
 base > "$T/trig.jsonl"
-trig "auto trigger, no store, no marker: passes" 0 auto "$T/trig.jsonl"
-trig "auto trigger, missing transcript: passes" 0 auto "$T/does-not-exist.jsonl"
-trig "manual trigger, no store, no marker: blocks" 2 manual "$T/trig.jsonl"
-trig "unknown trigger, no store, no marker: blocks" 2 bogus "$T/trig.jsonl"
-{ base; assistant '[{"type":"tool_use","id":"t1","name":"mcp__alaya__store_memory","input":{"content":"x"}}]'; } > "$T/trig-store.jsonl"
-trig "manual trigger, store_memory tool_use: passes" 0 manual "$T/trig-store.jsonl"
+expect "auto trigger, no store, no marker: passes" 0 "$T/trig.jsonl" auto
+expect "auto trigger, missing transcript: passes" 0 "$T/does-not-exist.jsonl" auto
+expect "manual trigger, no store, no marker: blocks" 2 "$T/trig.jsonl" manual
+expect "unknown trigger, no store, no marker: blocks" 2 "$T/trig.jsonl" bogus
 
 # fail closed
 expect "missing transcript: blocks" 2 "$T/does-not-exist.jsonl"
