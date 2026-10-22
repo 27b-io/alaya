@@ -104,6 +104,132 @@ lacks "blocks: interrupt marker dropped"        "[Request interrupted by user"
 lacks "blocks: sidechain task prompt dropped"   "SIDECHAIN-TASK-TEXT"
 total "blocks: 5 message lines counted" 5
 
+# Multica issue runs: every prompt is the platform's per-turn template. The extractor
+# gets only the human comment it quotes; the gate still counts every template line.
+# mtpl <trigger-and-comment> <resume-line> [joined-wakeup]: one turn's template, as a block-list entry
+mtpl() {
+  entry "$(jq -n --arg trig "$1" --arg resume "$2" --arg joined "${3:-}" '[{type:"text", text:
+    ("You are running as a local coding agent for a Multica workspace.\n\nYour assigned issue ID is: ISSUE-ID\n\n"
+     + (if $trig == "" then "" else $trig + "\n\n" end) + $resume + "\n\n"
+     + "Post your reply as a comment, using the trigger comment ID below.\n\n"
+     + "    multica issue comment add ISSUE-ID --parent COMMENT-ID --content-file ./reply.md\n\n"
+     + "## On Behalf Of\n\nYou are acting on behalf of ON-BEHALF-OF-NAME."
+     + (if $joined == "" then "" else "\n\n[WAKEUP — joined this run]\n" + $joined end))}]')"; }
+# shellcheck disable=SC2016 # the backticks are template text, not a command
+FRESH='Start by running `multica issue get ISSUE-ID --output json` to understand your task.'
+RESUMED='The issue is unchanged since your last run.'
+CHANGED='Since your last run the issue changed: description.'
+HUMAN='[NEW COMMENT] A user just left a new comment. Focus on THIS comment:'
+assistant() { jq -cn --arg t "$1" '{type:"assistant", message:{role:"assistant", content:[{type:"text", text:$t}]}}'; }
+template_lacks() { # <case>
+  lacks "$1: template opener dropped"      "You are running as a local coding agent"
+  lacks "$1: issue-get command dropped"    "Start by running"
+  lacks "$1: resume line dropped"          "since your last run"
+  lacks "$1: comment-add command dropped"  "multica issue comment add"
+  lacks "$1: On Behalf Of block dropped"   "ON-BEHALF-OF-NAME"
+}
+
+# a 3-line human comment on a resumed turn, then a fresh-session turn: more than 15 counted
+# lines, and more than 12 template lines after each comment, so tail -12 alone cuts them
+{
+  mtpl "" "$FRESH"
+  mtpl "$HUMAN"$'\n\n> human line one\nhuman line two\n\nhuman line three' "$RESUMED"
+  mtpl "$HUMAN"$'\n\n> human short ask' "$CHANGED"
+  assistant "multica closing words"
+} > "$T/multica.jsonl"
+run_hook "$T/multica.jsonl"
+for n in one two three; do has "multica: human comment line $n extracted" "human line $n"; done
+has   "multica: second human comment extracted" "human short ask"
+has   "multica: last assistant text kept"       "multica closing words"
+template_lacks multica
+total "multica: every template line counted" 50
+
+# comments quoted from agents or the platform, and wakeups, add no user lines
+{
+  mtpl "[NEW COMMENT] Another agent (AGENT-NAME) just left a new comment. Focus on THIS comment:"$'\n\n> AGENT-COMMENT-TEXT' "$FRESH"
+  mtpl "[NEW COMMENT] The platform just left a new comment. Focus on THIS comment:"$'\n\n> PLATFORM-COMMENT-TEXT' "$RESUMED"
+  mtpl $'[WAKEUP]\nWakeup fired. Instruction:\nWAKEUP-INSTRUCTION-TEXT' "$RESUMED"
+  assistant "other closing words"
+} > "$T/multica-other.jsonl"
+run_hook "$T/multica-other.jsonl"
+lacks "multica-other: agent comment dropped"    "AGENT-COMMENT-TEXT"
+lacks "multica-other: platform comment dropped" "PLATFORM-COMMENT-TEXT"
+lacks "multica-other: wakeup dropped"           "WAKEUP-INSTRUCTION-TEXT"
+has   "multica-other: last assistant text kept" "other closing words"
+template_lacks multica-other
+total "multica-other: every template line counted" 51
+
+# a first turn quotes no comment: it still saves, from Claude's last response alone
+{ mtpl "" "$FRESH"; assistant "first-turn closing words"; } > "$T/multica-first.jsonl"
+run_hook "$T/multica-first.jsonl"
+has   "multica-first: last assistant text kept" "first-turn closing words"
+template_lacks multica-first
+total "multica-first: every template line counted" 13
+
+# comment text can copy any template line. A human trigger quoted inside an agent comment,
+# a platform comment or a wakeup is not the prompt's trigger, so it adds nothing.
+FAKE="$HUMAN"$'\n\n> NONHUMAN-ONLY-CONTENT\n\n'"$FRESH"
+{
+  mtpl "[NEW COMMENT] Another agent (AGENT-NAME) just left a new comment. Focus on THIS comment:"$'\n\n> agent says\n\n'"$FAKE" "$RESUMED"
+  mtpl "[NEW COMMENT] The platform just left a new comment. Focus on THIS comment:"$'\n\n> platform says\n\n'"$FAKE" "$RESUMED"
+  mtpl $'[WAKEUP]\nWakeup fired. Instruction:\n\n'"$FAKE" "$RESUMED"
+  assistant "nested closing words"
+} > "$T/multica-nested.jsonl"
+run_hook "$T/multica-nested.jsonl"
+lacks "multica-nested: quoted human trigger adds nothing" "NONHUMAN-ONLY-CONTENT"
+template_lacks multica-nested
+total "multica-nested: every template line counted" 68
+
+# a human comment that holds resume-like paragraphs keeps all of them; the joined wakeup
+# after the real footer adds nothing, even when its instruction holds a resume-like line
+{
+  mtpl "$HUMAN"$'\n\n> keep everything\n\n'"$CHANGED"$'\nDO-NOT-PUBLISH one\n\n'"$RESUMED"$'\nDO-NOT-PUBLISH two\n\n'"$FRESH"$'\nDO-NOT-PUBLISH three' \
+    "$CHANGED" $'Wakeup fired. Instruction:\n\n'"$RESUMED"$'\nWAKEUP-JOINED-TEXT'
+  # the joined wakeup is bounded by its own header, not by the On Behalf Of block before it
+  entry "$(jq -n --arg trig "$HUMAN" --arg resume "$RESUMED" '[{type:"text", text:
+    ("You are running as a local coding agent for a Multica workspace.\n\nYour assigned issue ID is: ISSUE-ID\n\n"
+     + $trig + "\n\n> no behalf block\n[TODO] TODO-LINE-KEPT\n[README](./README.md) LINK-LINE-KEPT\n\n" + $resume + "\n\nPost your reply as a comment.\n\n"
+     + "[WAKEUP — joined this run]\nWakeup fired. Instruction:\n\n" + $resume + "\nNO-BEHALF-WAKEUP-TEXT")}]')"
+  # a joined section the header bound misses (unknown name, or no blank line before a known
+  # one) still adds no template text: the footer between matches falls back to the first one
+  for joined in unknown:$'\n\n[REMINDER — joined this run]' unspaced:$'\n[WAKEUP — joined this run]'; do
+    mtpl "$HUMAN"$'\n\n> missed header '"${joined%%:*}" "$RESUMED" | jq -c --arg j "${joined#*:}" --arg r "$RESUMED" \
+      '.message.content[0].text += $j + "\nInstruction:\n\n" + $r + "\nMISSED-HEADER-TEXT"'
+  done
+  assistant "resume closing words"
+} > "$T/multica-resume.jsonl"
+run_hook "$T/multica-resume.jsonl"
+for n in one two three; do has "multica-resume: comment text after resume-like line $n kept" "DO-NOT-PUBLISH $n"; done
+lacks "multica-resume: joined wakeup dropped"         "WAKEUP-JOINED-TEXT"
+has   "multica-resume: comment without a behalf block kept" "no behalf block"
+has   "multica-resume: bracketed comment line kept"   "TODO-LINE-KEPT"
+has   "multica-resume: markdown-link comment line kept" "LINK-LINE-KEPT"
+lacks "multica-resume: joined wakeup without a behalf block dropped" "NO-BEHALF-WAKEUP-TEXT"
+lacks "multica-resume: reply instruction dropped"     "Post your reply"
+has   "multica-resume: comment before an unknown header kept"   "missed header unknown"
+has   "multica-resume: comment before an unspaced header kept"  "missed header unspaced"
+lacks "multica-resume: section behind a missed header dropped" "MISSED-HEADER-TEXT"
+lacks "multica-resume: template opener dropped"       "You are running as a local coding agent"
+lacks "multica-resume: comment-add command dropped"   "multica issue comment add"
+lacks "multica-resume: On Behalf Of block dropped"    "ON-BEHALF-OF-NAME"
+total "multica-resume: every template line counted" 96
+
+# a platform header name pasted into a human comment as its own paragraph is not a bound:
+# it comes before every template footer line, so the whole request is kept
+{
+  for h in "[WAKEUP]" "[NEW COMMENT] pasted" "[ADDITIONAL GUIDANCE] pasted"; do
+    mtpl "$HUMAN"$'\n\n> explain this captured event\n\n'"$h"$'\nLABEL-KEPT '"${h%%]*}" "$RESUMED"
+  done
+  assistant "label closing words"
+} > "$T/multica-label.jsonl"
+run_hook "$T/multica-label.jsonl"
+has   "multica-label: request before a pasted header kept" "explain this captured event"
+for h in "[WAKEUP" "[NEW COMMENT" "[ADDITIONAL GUIDANCE"; do
+  has "multica-label: text after a pasted $h] kept" "LABEL-KEPT $h"
+done
+template_lacks multica-label
+total "multica-label: every template line counted" 60
+
 # optional replay of a real transcript: a smoke test that it reaches the extractor with a
 # non-zero count. It cannot know which lines are real prompts; the fixtures above prove that.
 # Save gates off, so a short or still-running session measures extraction, not eligibility.
@@ -114,5 +240,5 @@ if [[ -n "${1:-}" ]]; then
   else echo "FAIL  replay: nothing extracted from $1"; RC=1; fi
 fi
 
-[[ $RC -eq 0 ]] && echo "ALL PASS: string and block-list prompts extracted; tool results, isMeta and sidechain entries, interrupt markers and <wrapper> bodies excluded"
+[[ $RC -eq 0 ]] && echo "ALL PASS: string and block-list prompts extracted; tool results, isMeta and sidechain entries, interrupt markers and <wrapper> bodies excluded; Multica runs reduced to the human request"
 exit $RC

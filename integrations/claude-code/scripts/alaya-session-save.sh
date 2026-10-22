@@ -105,12 +105,58 @@ BRANCH=$(git branch --show-current 2>/dev/null || echo "n/a")
 # <command-name>, <task-notification>): drop it whole, since a line filter
 # leaks the body of a multi-line wrapper. A typed prompt that starts with < is
 # lost too, on purpose: a list of known wrapper tags would leak every new one.
+# One JSON string per prompt, so the count and the context below read the same set.
 grep '"type":"user"' "$TRANSCRIPT" \
-    | jq -r 'select(.type == "user" and .isMeta != true and .isSidechain != true) | .message.content
+    | jq -c 'select(.type == "user" and .isMeta != true and .isSidechain != true) | .message.content
         | if type == "string" then . else (.[]? | select(.type? == "text") | .text) end
         | strings | select(startswith("<") | not)
         | select(. != "[Request interrupted by user]" and . != "[Request interrupted by user for tool use]")' 2>/dev/null \
-    > "$_HOOKDIR/all_messages.txt" || true
+    > "$_HOOKDIR/prompts.jsonl" || true
+jq -r '.' "$_HOOKDIR/prompts.jsonl" > "$_HOOKDIR/all_messages.txt" 2>/dev/null || true
+
+# Extractor context source. A Multica issue run's only prompts are the
+# platform's per-turn template: its commands and boilerplate would fill the
+# context and push out the human's request. Reduce each such prompt to the
+# human comment it quotes and drop the rest, so the extractor sees what was
+# asked and no template text. Comments quoted from agents or the platform, and
+# wakeups, add nothing. A prompt whose shape is not recognised adds nothing
+# either: the request is lost, the template never leaks. Every other prompt
+# passes through unchanged. The save gate still counts all_messages.txt.
+#
+# Both boundaries are positional, because comment text can copy any template
+# line. The trigger is line 4, under "Your assigned issue ID is:" (a trigger
+# line quoted inside an agent comment or a wakeup is never at line 4). The
+# comment opens at line 6 and ends at a blank-line-plus-resume paragraph. The
+# FIRST such paragraph never leaks (everything before it is the comment) but a
+# resume-like paragraph inside the comment would cut it short; the LAST keeps
+# the comment whole but could lie inside text that follows the template. So:
+# search only up to the first platform section header after a blank line, such
+# as "[WAKEUP — joined this run]", that follows a template footer line (only
+# the platform's own header names, so a comment line like "[TODO] ..." or a
+# markdown link stays in the request; and only after a footer, so a header
+# label pasted into the comment, which precedes every footer, is not a bound), take
+# the LAST match, and fall back to the FIRST whenever the lines between them
+# hold a template footer line. A missed or unknown header can then cost human
+# text, never leak template text.
+jq -r '
+    def resumes: startswith("Start by running `multica issue get")
+        or startswith("The issue is unchanged since your last run")
+        or startswith("Since your last run the issue changed");
+    def footer: startswith("Post your reply as a comment") or . == "## On Behalf Of"
+        or startswith("You are acting on behalf of") or startswith("This task was initiated by")
+        or startswith("    multica issue comment add");
+    if startswith("You are running as a local coding agent for a Multica workspace.") | not then .
+    else split("\n") as $l
+        | select(($l[2] // "" | startswith("Your assigned issue ID is: ")) and $l[3] == ""
+            and ($l[4] // "" | startswith("[NEW COMMENT] A user just left a new comment")) and $l[5] == "")
+        | (([range(7; $l | length) | select($l[.] | footer)] | .[0]) // ($l | length)) as $f
+        | (([range($f + 1; $l | length) | select($l[. - 1] == "" and ($l[.] | test("^\\[(WAKEUP|NEW COMMENT|ADDITIONAL GUIDANCE)(\\]| —)")))]
+            | .[0]) // ($l | length)) as $w
+        | [range(7; $w) | select($l[. - 1] == "" and ($l[.] | resumes))] as $m
+        | select($m | length > 0)
+        | (if any($l[$m[0]:$m[-1]][]; footer) then $m[0] else $m[-1] end) as $e
+        | $l[6:$e - 1] | join("\n") | select(length > 0)
+    end' "$_HOOKDIR/prompts.jsonl" > "$_HOOKDIR/context_source.txt" 2>/dev/null || true
 
 TOTAL=$(wc -l < "$_HOOKDIR/all_messages.txt" 2>/dev/null || echo 0)
 [[ $TOTAL -eq 0 ]] && exit 0
@@ -142,15 +188,16 @@ ELAPSED=$((NOW_EPOCH - LAST_SAVE_EPOCH))
 [[ $ELAPSED -lt $COOLDOWN_SECS ]] && exit 0
 
 # --- Build context window: first message + recent messages ---
-if [[ $TOTAL -le 15 ]]; then
-    head -c 32768 "$_HOOKDIR/all_messages.txt" > "$_HOOKDIR/context.txt"
+CTX_LINES=$(wc -l < "$_HOOKDIR/context_source.txt" 2>/dev/null || echo 0)
+if [[ $CTX_LINES -le 15 ]]; then
+    head -c 32768 "$_HOOKDIR/context_source.txt" > "$_HOOKDIR/context.txt"
 else
     {
         echo "=== SESSION TOPIC ==="
-        head -1 "$_HOOKDIR/all_messages.txt"
+        head -1 "$_HOOKDIR/context_source.txt"
         echo ""
         echo "=== RECENT USER MESSAGES ==="
-        tail -12 "$_HOOKDIR/all_messages.txt"
+        tail -12 "$_HOOKDIR/context_source.txt"
     } > "$_HOOKDIR/context.txt"
 fi
 

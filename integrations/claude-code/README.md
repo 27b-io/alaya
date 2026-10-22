@@ -143,7 +143,10 @@ Runs the real Stop hook against a stub `curl` and proves what reaches the extrac
 read whether they are strings (terminal sessions) or lists of text blocks (SDK and agent
 sessions), while tool results, `isMeta` injections such as skill bodies, subagent (`isSidechain`)
 task prompts, `[Request interrupted by user]` markers, and `<wrapper>` messages like
-`<system-reminder>` are left out. A typed prompt that starts with `<` is left out too. Pass a real
+`<system-reminder>` are left out. A typed prompt that starts with `<` is left out too. In a
+Multica issue run, each per-turn template is reduced to the human comment it quotes: the
+extractor sees that request and no template text, and comments quoted from agents or the
+platform, and wakeups, add nothing. The save gate still counts every prompt line. Pass a real
 transcript to also run a smoke replay. It checks only that a non-zero message count reaches the
 extractor, not which lines those are, and it turns off the duration and message-count save gates
 so a short or still-running session counts too.
