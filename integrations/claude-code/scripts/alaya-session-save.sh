@@ -127,9 +127,11 @@ jq -r '.' "$_HOOKDIR/prompts.jsonl" > "$_HOOKDIR/all_messages.txt" 2>/dev/null |
 # line. The trigger is line 4, under "Your assigned issue ID is:" (a trigger
 # line quoted inside an agent comment or a wakeup is never at line 4). The
 # comment opens at line 6 and runs to the LAST blank-line-plus-resume paragraph
-# before the joined-wakeup header, which follows the "You are acting on behalf
-# of" line (a resume-like paragraph inside the comment comes before the real
-# one; wakeup instruction text after the header is never searched).
+# before the first bracketed upper-case header such as "[WAKEUP — joined this
+# run]" (a resume-like paragraph inside the comment comes before the real one;
+# text a joined section carries after its header is never searched). A human
+# comment holding such a header line cuts its own request short: that loses
+# human text, never leaks template text.
 jq -r '
     def resumes: startswith("Start by running `multica issue get")
         or startswith("The issue is unchanged since your last run")
@@ -138,8 +140,7 @@ jq -r '
     else split("\n") as $l
         | select(($l[2] // "" | startswith("Your assigned issue ID is: ")) and $l[3] == ""
             and ($l[4] // "" | startswith("[NEW COMMENT] A user just left a new comment")) and $l[5] == "")
-        | (([range(8; $l | length) | select(($l[.] | startswith("[WAKEUP")) and $l[. - 1] == ""
-            and ($l[. - 2] | startswith("You are acting on behalf of")))] | .[0]) // ($l | length)) as $w
+        | (([range(7; $l | length) | select($l[.] | test("^\\[[A-Z][A-Z ]+(\\]| —)"))] | .[0]) // ($l | length)) as $w
         | ([range(7; $w) | select($l[. - 1] == "" and ($l[.] | resumes))] | .[-1]) as $e
         | select($e != null)
         | $l[6:$e - 1] | join("\n") | select(length > 0)
