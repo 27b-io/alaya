@@ -166,7 +166,8 @@ kills the hook's process group the moment the hook returns (or after a second if
 while the stub extractor takes two seconds. It
 proves the store call still happens and the state file is written, with and without `setsid(1)`
 on `PATH`, even though the caller's `TMPDIR` is deleted the moment the hook returns (as an agent
-runner's per-task temp dir is), that the hook's output pipe closes as soon as the hook returns (the
+runner's per-task temp dir is, and again with `/tmp` not writable, when the work dir must fall
+back to the state dir), that the hook's output pipe closes as soon as the hook returns (the
 detached copy holds neither stdout nor stderr, so it cannot hold the CLI), that a work dir lost
 mid-save is logged as that rather than as bad LLM output, and that `hooks.json` registers the
 Stop hook synchronously.

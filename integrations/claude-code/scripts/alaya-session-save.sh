@@ -90,9 +90,15 @@ set +e
 # The copy's work dir goes under /tmp, not the caller's TMPDIR: an agent
 # runner can set TMPDIR to a per-task directory it deletes when the task ends,
 # which is before the extractor answers, so the copy lost its work dir
-# mid-save. mktemp -d still makes the dir owner-only, and the copy removes it.
+# mid-save. Where /tmp is not writable (a read-only root, a sandbox), it goes
+# under the state dir, which also outlives the task; the caller's TMPDIR is
+# kept only when neither is writable. mktemp -d still makes the dir
+# owner-only, and the copy removes it. _ALAYA_HOOK_TMP_ROOT replaces /tmp in
+# tests.
 if [[ -z "${_ALAYA_HOOK_FOREGROUND:-}" ]]; then
-    export TMPDIR=/tmp
+    for _root in "${_ALAYA_HOOK_TMP_ROOT:-/tmp}" "$STATE_DIR/tmp"; do
+        mkdir -p "$_root" 2>/dev/null && [[ -w "$_root" ]] && { export TMPDIR="$_root"; break; }
+    done
     INPUT=$(cat)
     if command -v setsid >/dev/null 2>&1; then
         _new_session=(setsid)

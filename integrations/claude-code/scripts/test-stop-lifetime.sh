@@ -58,7 +58,7 @@ PY=$(command -v python3)
 # setsid(1) for the harness itself, portable: a new session and process group
 NEW_GROUP=("$PY" -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])')
 
-# run <label> <path-dir> — the "CLI": start the hook in its own process group,
+# run <label> <path-dir> [VAR=value...] — the "CLI": start the hook in its own process group,
 # feed it the input and close its stdin, read its stdout and stderr through a
 # pipe as the CLI does, kill the group the moment the hook returns, give the
 # pipe until 1s after the start to reach EOF, then wait up to 15s for the save
@@ -74,7 +74,7 @@ run() {
     | (cd "$T" && exec "${NEW_GROUP[@]}" env -i HOME="$home" CAP="$cap" PATH="$2" \
         ALAYA_URL=http://alaya.test/store ALAYA_LLM_URL=http://llm.test/v1/chat/completions \
         ALAYA_LLM_API_KEY=k ALAYA_API_KEY=k ALAYA_HOOK_STATE_DIR="$home/state" \
-        TMPDIR="$tmp" bash "$HOOK") >"$out" 2>&1 &
+        TMPDIR="$tmp" "${@:3}" bash "$HOOK") >"$out" 2>&1 &
   pid=$!
   # kill the group the moment the hook returns, or after 1s if it does not:
   # a copy still in the hook's group when it returns dies here
@@ -109,6 +109,17 @@ else
   echo "skip  setsid: not installed here (the no-setsid fallback runs below)"
 fi
 run no-setsid "$T/path-nosetsid"
+# /tmp not writable (a read-only root, a sandbox) and the caller's TMPDIR
+# deleted: the save can only succeed through the state-dir fallback
+if [[ $EUID -eq 0 ]]; then
+  echo "skip  ro-tmp: root writes through a read-only mode"
+else
+  mkdir -p "$T/ro-tmp"; chmod 555 "$T/ro-tmp"
+  run ro-tmp "$T/path-nosetsid" _ALAYA_HOOK_TMP_ROOT="$T/ro-tmp"
+  if [[ -d "$T/home-ro-tmp/state/tmp" && -z "$(ls -A "$T/home-ro-tmp/state/tmp")" ]]
+  then echo "ok    ro-tmp: work dir made under the state dir and removed"
+  else echo "FAIL  ro-tmp: state-dir work dir missing or left behind"; RC=1; fi
+fi
 
 # a work dir removed mid-save is logged as that, not as bad LLM output
 home="$T/home-rmwork"; mkdir -p "$home" "$T/tmp-rmwork"
