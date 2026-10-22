@@ -8,10 +8,11 @@ memory server:
   gates against saving too often and a dedup threshold to catch LLM rephrases of the same fact.
   The hook returns within milliseconds and does the save in a detached copy of itself, so the
   save survives the CLI exiting right after its last turn, as SDK-driven runs do.
-- **PreCompact** (`scripts/alaya-precompact.sh`) — automatic compaction always passes:
-  Claude Code never shows Claude the block message of an automatic compaction, so a block
-  there only skips compaction until the session hits the context limit. Every other trigger
-  (a manual `/compact`, or a missing or unknown one) is blocked (exit 2) unless a
+- **PreCompact** (`scripts/alaya-precompact.sh`) — trigger `auto` (proactive and reactive
+  compaction) always passes: Claude Code never shows Claude the block message of an automatic
+  compaction, so a block there only skips compaction until the session hits the context limit.
+  Every other trigger (a manual `/compact`, idle compaction, which Claude Code sends as
+  `manual`, or a missing or unknown one) is blocked (exit 2) unless a
   `mcp__alaya__store_memory` call shows up in the last 500 transcript lines, so valuable
   context doesn't get compacted away unsaved. When nothing qualifies, Claude writes
   `ALAYA_NOTHING_TO_SAVE` alone as the last line of its reply instead (nothing after it in that
@@ -170,8 +171,8 @@ on `PATH`, and that `hooks.json` registers the Stop hook synchronously.
 scripts/test-precompact-gate.sh
 ```
 
-Runs the real PreCompact hook against fixture transcripts. It proves any automatic compaction
-passes and manual or unknown triggers are gated, and that the gate passes on a recent
+Runs the real PreCompact hook against fixture transcripts. It proves trigger `auto` passes
+and manual or unknown triggers are gated, and that the gate passes on a recent
 `store_memory` call or on `ALAYA_NOTHING_TO_SAVE` alone as the last line of Claude's own reply
 text, and still blocks when the marker is only mentioned inside a sentence or shown in a fenced
 example or followed by more text or a tool call in the same turn, or appears only in a tool
@@ -185,8 +186,10 @@ window (with a control showing the same marker passes inside it).
   `~/.cache/alaya-hook/failures.log`). Every failure path (missing config or `jq`, unresolved
   or hung secret command, dead LLM endpoint, unexpected LLM output shape, failed store call)
   logs one line there — see LAB-170: a silent failure here once cost 5 days of unsaved memories.
-- **PreCompact keeps blocking** — automatic compaction always passes; the gate on a
-  manual `/compact` unblocks once an `mcp__alaya__store_memory` tool
+- **PreCompact keeps blocking** — trigger `auto` (proactive and reactive compaction) always
+  passes. Idle compaction arrives as `manual`, so the gate applies to it as it does to a
+  manual `/compact`. On a manual `/compact` the block message reaches you, not Claude. The gate
+  unblocks once an `mcp__alaya__store_memory` tool
   call, or an assistant reply whose final line is `ALAYA_NOTHING_TO_SAVE` alone (Claude's
   deliberate "nothing worth saving"), appears in the last `ALAYA_PRECOMPACT_RECENT_LINES`
   transcript lines. The marker counts only in Claude's own reply text, so a file, tool result

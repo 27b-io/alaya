@@ -11,9 +11,11 @@
 # Fails CLOSED (blocks) when the transcript can't be found or parsed, same as
 # a genuine "no recent save" — an unreadable transcript never bypasses the gate.
 #
-# Always allows trigger "auto"; every other trigger (manual, missing, unknown)
-# is gated. Claude never sees the block message of an automatic compaction, so a
-# block there only skips compaction until the session hits the context limit.
+# Always allows trigger "auto" (proactive and reactive compaction); every other
+# trigger (manual, missing, unknown) is gated. Idle compaction arrives as
+# "manual", so it is gated too. Claude never sees the block message of an
+# automatic compaction, so a block there only skips compaction until the
+# session hits the context limit.
 
 set -u
 RECENT_LINES=${ALAYA_PRECOMPACT_RECENT_LINES:-500}
@@ -94,7 +96,9 @@ sys.exit(0 if ended_with_marker else 1)
     fi
 fi
 
-# No recent save (or couldn't determine) — block and prompt Claude to save.
+# No recent save (or couldn't determine) — block. On a manual /compact this
+# message reaches the user, not Claude: the user asks Claude to save or to
+# write the marker, then compacts again.
 cat >&2 <<'PROMPT'
 MEMORY CHECK before compaction. Review this session for reusable knowledge. If any qualifies, call mcp__alaya__store_memory (up to 3 calls) to persist it. Save ONLY:
 

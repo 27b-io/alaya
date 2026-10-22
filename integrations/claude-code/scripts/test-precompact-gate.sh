@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Black-box test of the PreCompact gate (alaya-precompact.sh). It must pass (exit 0) on an
-# automatic compaction, on a recent store_memory call or on ALAYA_NOTHING_TO_SAVE in Claude's own
+# Black-box test of the PreCompact gate (alaya-precompact.sh). It must pass (exit 0) on
+# trigger "auto", on a recent store_memory call or on ALAYA_NOTHING_TO_SAVE in Claude's own
 # reply text, and block (exit 2) everywhere else — above all when the marker only arrives in
 # content Claude read, so nothing outside Claude's own words can open the gate.
 #
@@ -141,7 +141,7 @@ window 2; got=$?
 if [[ $got -eq 2 ]]; then echo "ok    marker outside the window: blocks"; else echo "FAIL  marker outside the window: got $got"; RC=1; fi
 if window 5; then echo "ok    same marker inside the window: passes"; else echo "FAIL  same marker inside the window: blocked"; RC=1; fi
 
-# the block message tells Claude about the marker, keeps "storing nothing is normal", and the
+# the block message (shown to the user on a manual /compact) names the marker, keeps "storing nothing is normal", and the
 # prompt's own mention of the marker is inline, so Claude quoting it cannot open the gate
 base > "$T/msg.jsonl"
 msg=$(printf '{"transcript_path":"%s"}' "$T/msg.jsonl" | bash "$HOOK" 2>&1 >/dev/null)
