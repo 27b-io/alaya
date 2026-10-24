@@ -282,5 +282,6 @@ of the 35 written by `claude-sonnet-5-5` and on 45 of the 65 written by
 ## Spend
 
 Third-party readers USD 6.37 (`gpt-6.1-sol` 3.00, `gemini-4-argon` 3.36).
-Anthropic calls at list price USD 19.46: the Opus reader 9.37 and the k = 3
-run 10.09.
+Anthropic calls at list price USD 29.68: the Opus reader 9.37, the k = 3 run
+10.09, an earlier k = 3 run whose numbers this note does not use 10.09, and a
+smoke run 0.13.

@@ -290,8 +290,8 @@ class Pair:
     source: str
     sub_label: str | None = None
     tags: tuple[str, ...] = ()
-    # A label still awaiting adjudication: scored per pass, kept out of the
-    # headline bars.
+    # A label still awaiting adjudication: judged, but left out of tuning,
+    # per-pass scores and the headline bars.
     disputed: bool = False
 
     def survivor_letter(self) -> str | None:
