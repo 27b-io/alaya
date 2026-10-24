@@ -290,8 +290,8 @@ class Pair:
     source: str
     sub_label: str | None = None
     tags: tuple[str, ...] = ()
-    # A label still awaiting adjudication: scored per pass, kept out of the
-    # headline bars.
+    # A label still awaiting adjudication: judged, but left out of tuning,
+    # per-pass scores and the headline bars.
     disputed: bool = False
 
     def survivor_letter(self) -> str | None:
@@ -1727,9 +1727,10 @@ def qualifies(m: dict, seed_acc: float) -> bool:
 class Stopper:
     """Stop on spend, or once a *tuned* candidate is landable.
 
-    The seed never stops the run: with 14 coexist pairs the bar resolves in
-    steps of one pair, so the seed clearing it on the split says more about
-    the split than the prompt (it escalated 5/35 on the full set).
+    The seed never stops the run. The rule dates from a split of 14 coexist
+    pairs, where the bar resolved in steps of one pair, so the seed clearing
+    it said more about the split than the prompt (it escalated 5/35 on the
+    full set).
     """
 
     def __init__(self, adapter: JudgeAdapter, ledger: Ledger, max_usd: float):
@@ -1857,6 +1858,10 @@ def cmd_tune(args) -> None:
     out.mkdir(parents=True, exist_ok=True)
     pairs = load_fixture()
     train, val = load_split(pairs)
+    # A disputed label is not ground truth yet: tuning neither learns from it
+    # nor is gated on it, as eval's headline leaves it out.
+    train = [p for p in train if not p.disputed]
+    val = [p for p in val if not p.disputed]
     seed = seed_prompt()
     judge_model = os.environ.get("JUDGE_MODEL", "claude-sonnet-5")
     reflection_model = os.environ.get("REFLECTION_MODEL", "claude-opus-5")
@@ -2365,8 +2370,8 @@ def cmd_eval(args) -> None:
             "unanimity": unanimity(decided)
             if args.regime == "default" and args.passes > 1
             else None,
-            "per_pass": [
-                metrics([(p, vs[k]) for p, vs in kept], model)
+            "per_pass": [  # the pairs the Rust harness scores: no disputed ones
+                metrics([(p, vs[k]) for p, vs in kept if not p.disputed], model)
                 for k in range(args.passes)
             ],
             "disagreements": consensus_disagreements(

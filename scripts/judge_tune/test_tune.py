@@ -115,7 +115,8 @@ def check_fixture() -> None:
         got = (p["label"], p["sub_label"], p["survivor"], p["tags"], p["source"])
         assert got == (label, sub, want, tags, "adjudicated"), (a[:8], got)
     assert sum(p["source"] == "adjudicated" for p in raw["pairs"]) == len(rows)
-    assert sum("partial" in p.tags for p in tune.load_fixture()) == 4
+    # 4 adjudicated + 66 from the blind three-reader pass.
+    assert sum("partial" in p.tags for p in tune.load_fixture()) == 70
 
 
 def check_consensus_scoring() -> None:
@@ -841,9 +842,19 @@ def check_eval_scrub(real_env: dict) -> None:
             choice = {"file": None, "names": 0}
             assert result(Path(tmp) / "runs/unlisted")["host_names"] == choice
             assert len(sent) == 2
+            # A disputed pair is judged but scored nowhere: not in the headline,
+            # not per pass (the Rust harness skips it too).
+            disputed = tune.Pair(1, a, b, "supersession", a, "operator", disputed=True)
+            tune.load_fixture = lambda: [pair, disputed]
+            run(no_host_names=True, run="disputed")
+            tune.load_fixture = stubs["load_fixture"]
+            res = result(Path(tmp) / "runs/disputed")
+            assert res["headline"]["excluded_disputed"] == 1
+            assert [m["pairs"] for m in res["per_pass"]] == [1], res["per_pass"]
+            assert len(sent) == 4
             memories[a] = mem("creds = " + "9f86d081" + "884c7d659a2feaa0c55ad015", 0.0)
             assert "gitleaks:generic-api-key" in exits(no_host_names=True, run="leak")
-            assert len(sent) == 2, "the gate stops the run before any request"
+            assert len(sent) == 4, "the gate stops the run before any request"
         finally:
             for name, value in real.items():
                 setattr(tune, name, value)
@@ -1257,7 +1268,8 @@ def check_compare_run() -> None:
     """compare end to end over a fake run directory: a failed second vote is
     left out, never a veto; sent counts include an eval that aborted."""
     pairs = tune.load_fixture()
-    sups = [p for p in pairs if p.label == "supersession"]
+    # The headline leaves disputed pairs out, so the counts below do too.
+    sups = [p for p in pairs if p.label == "supersession" and not p.disputed]
     flaky = sups[0]  # the second judge fails here
 
     def vote(p, failed=False, hide=None):
@@ -1643,7 +1655,7 @@ def main() -> None:
     s1, s2 = tune.make_split(pairs, 0, 0.6), tune.make_split(pairs, 0, 0.6)
     assert s1 == s2 and not set(s1["train"]) & set(s1["val"])
     assert len(s1["train"]) + len(s1["val"]) == len(pairs)
-    assert s1["counts"]["coexist"] == {"train": 31, "val": 20}, s1["counts"]
+    assert s1["counts"]["coexist"] == {"train": 151, "val": 101}, s1["counts"]
 
     check_fixture()
     check_consensus_scoring()
