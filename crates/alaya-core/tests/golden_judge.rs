@@ -1,8 +1,9 @@
 //! Golden-set evaluation of the contradiction judge (LAB-3283 AC-8).
 //!
 //! `#[ignore]` — needs a live Ālaya to fetch pair contents and a judge
-//! endpoint. The fixture holds hashes and human labels only (memory content
-//! is the memory of record and never lands in git).
+//! endpoint. The fixture holds hashes and labels only (memory content is the
+//! memory of record and never lands in git); its `source` says where each
+//! label came from.
 //!
 //! ```bash
 //! ALAYA_URL=http://localhost:13001 ALAYA_API_KEY=... \
@@ -53,6 +54,8 @@ struct GoldenPair {
     survivor: Option<String>,
     #[serde(default)]
     source: String,
+    #[serde(default)]
+    dispute: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -69,7 +72,15 @@ fn env(key: &str) -> String {
 #[tokio::test(flavor = "current_thread")]
 #[ignore]
 async fn golden_set_precision_recall() {
-    let fixture: Fixture = serde_json::from_str(FIXTURE).expect("fixture parses");
+    let mut fixture: Fixture = serde_json::from_str(FIXTURE).expect("fixture parses");
+    // A disputed label is not ground truth yet; scripts/judge_tune leaves it
+    // out of the headline the same way.
+    let total = fixture.pairs.len();
+    fixture.pairs.retain(|p| p.dispute.is_none());
+    println!(
+        "{} disputed pairs left out (labels awaiting adjudication)",
+        total - fixture.pairs.len()
+    );
     assert!(
         fixture.pairs.len() >= 50,
         "AC-8 requires ≥50 labelled pairs, fixture has {}",
@@ -77,8 +88,7 @@ async fn golden_set_precision_recall() {
     );
     // A class with no labelled sample cannot be measured; say so up front
     // rather than printing NaN and letting a reader miss it. Not a failure:
-    // the golden set is grown by human ratification, and the other classes
-    // are still worth measuring meanwhile.
+    // the other classes are still worth measuring meanwhile.
     let unmeasured: Vec<&str> = Verdict::CLASSES
         .iter()
         .filter(|c| !fixture.pairs.iter().any(|p| p.label == **c))

@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "description": "Golden set for the contradiction judge. Hashes and labels only; contents live in Alaya. Each pair records what an operator did with it (action) apart from what the label rule says (label). Operator pairs are pairs an operator resolved with memory_supersede (action_survivor = superseded_by, verified in Qdrant metadata; dedup merges excluded); queue-read pairs were drawn from the unresolved queue.",
+  "description": "Golden set for the contradiction judge. Hashes and labels only; contents live in Alaya. Each pair records what an operator did with it (action) apart from what the label rule says (label). Operator pairs are pairs an operator resolved with memory_supersede (action_survivor = superseded_by, verified in Qdrant metadata; dedup merges excluded); queue-read pairs were drawn from the unresolved queue. A blind reading is made by three readers from different model families on the full text of both memories; the reading is their majority (label, survivor, P or C by vote count, a tie going to P). It sets `partial` when the majority reads coexist and at least two readers say the newer memory corrects some claim of the older one, and `near-duplicate` when at least two readers say so. Each majority supersession is checked against the store for a later ruling that revokes the newer claim.",
   "rule_version": 2,
   "label_rule": {
     "supersession": "S: the newer text corrects, reverses or replaces a claim, so a reader trusting the older one today is misled.",
@@ -14,22 +14,23 @@
   "fields": {
     "action": "what the operator did: superseded (action_survivor is the memory kept) or none",
     "label": "what the rule says: supersession, coexist, unrelated or contradiction",
-    "sub_label": "S, P or C under rule v2; null when the pair has not been read under rule v2, or is unrelated",
+    "sub_label": "S, P or C under rule v2; null when no reading under rule v2 set it (unread, disputed or unrelated)",
     "tags": "partial, near-duplicate, newer-revoked",
-    "source": "operator: the label follows the operator's action and has not been read under rule v2; queue-read: a reviewer read an unresolved pair; agreed: a blind full-text reading under rule v2 agreed with the earlier label; adjudicated: settled by adjudication after reviewers disagreed",
-    "dispute": "present while a blind reading disagrees with the label and adjudication is pending; such pairs stay out of the headline bars"
+    "source": "operator: the label follows the operator's action and no blind reading under rule v2 has agreed with it; queue-read: a reviewer read an unresolved pair; agreed: a blind full-text reading under rule v2 agreed with the earlier label; adjudicated: settled by adjudication after reviewers disagreed",
+    "dispute": "present while a blind reading disagrees with the label and adjudication is pending; it holds the reading's label, sub_label, survivor and tags, with votes (how many of the three readers gave that label) or revoked_by (the later ruling that revokes the newer claim); such pairs stay out of the headline bars",
+    "drawn": "on queue-read pairs added by the three-reader pass: queue-random (a random draw of the unresolved queue, stratified by cosine tercile and edge-age quartile) or queue-high-confidence (the queue's supersession verdicts at confidence >= 0.90 with the newer memory as survivor: every such verdict by the then-default judge model, and a random draw from those by the model before it)"
   },
   "pairs": [
     {
       "a": "0d0afe450cf8da7cee1c22d7d3bcfeed2fdde008d4a09360540bb932e36d85b9",
       "b": "b73cd0066f89e5078cafdf89c8c8644dbe4d9a398577d9018f30fe1621aec3ca",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "0d0afe450cf8da7cee1c22d7d3bcfeed2fdde008d4a09360540bb932e36d85b9",
       "tags": [],
       "action": "superseded",
       "action_survivor": "0d0afe450cf8da7cee1c22d7d3bcfeed2fdde008d4a09360540bb932e36d85b9",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "b31eec04725bd541b7af89c2fa0161622a9b7d84e996381ce34f738c3bf99622",
@@ -40,18 +41,27 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "b31eec04725bd541b7af89c2fa0161622a9b7d84e996381ce34f738c3bf99622",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 3
+      }
     },
     {
       "a": "049f9486d2c4d48c29689d8d0003a6e6b2a2de98cb90d3bac5408a582a190bf6",
       "b": "1cae8b3b41ada2a7e593cbdfd7272095af747d33c3c7f326bc00134fc6d49fa1",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "049f9486d2c4d48c29689d8d0003a6e6b2a2de98cb90d3bac5408a582a190bf6",
       "tags": [],
       "action": "superseded",
       "action_survivor": "049f9486d2c4d48c29689d8d0003a6e6b2a2de98cb90d3bac5408a582a190bf6",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "c4528796db3d5c9ea541d350fa63b0764732f6bc0df50bb4735a02bf406fbf64",
@@ -62,18 +72,27 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "c4528796db3d5c9ea541d350fa63b0764732f6bc0df50bb4735a02bf406fbf64",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 3
+      }
     },
     {
       "a": "d8d955346f1b223a715bd137907e83e72e0251ae13e989c4848c9ab58a6701fe",
       "b": "a1495fccb53759bcf3a102be7111b71aed0787ee603c0eec0fc96fcbbb836f7d",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "d8d955346f1b223a715bd137907e83e72e0251ae13e989c4848c9ab58a6701fe",
       "tags": [],
       "action": "superseded",
       "action_survivor": "d8d955346f1b223a715bd137907e83e72e0251ae13e989c4848c9ab58a6701fe",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "50d6b3eb04f7ec6d5d84238257ab374f39f728cdd9ac6fa606806cfc7baa8c7c",
@@ -84,7 +103,14 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "50d6b3eb04f7ec6d5d84238257ab374f39f728cdd9ac6fa606806cfc7baa8c7c",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [],
+        "votes": 3
+      }
     },
     {
       "a": "d0dc28863433f88c127010d42019091e713d0ed85b53b202b05fc0066518dfa9",
@@ -95,7 +121,14 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "d0dc28863433f88c127010d42019091e713d0ed85b53b202b05fc0066518dfa9",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [],
+        "votes": 3
+      }
     },
     {
       "a": "f2e01bb76311c8e2964aed64315e129bf81b575bc55f1f2d8976763499ebb222",
@@ -106,18 +139,25 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "f2e01bb76311c8e2964aed64315e129bf81b575bc55f1f2d8976763499ebb222",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [],
+        "votes": 2
+      }
     },
     {
       "a": "034fd9359aa866907356c43282c1e4ac965449f6d5db07b05eea647cf2339263",
       "b": "c47cac351492ea782aed20f8fa2bebc4085125f23fddd80760a6fbb19e3e2d13",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "034fd9359aa866907356c43282c1e4ac965449f6d5db07b05eea647cf2339263",
       "tags": [],
       "action": "superseded",
       "action_survivor": "034fd9359aa866907356c43282c1e4ac965449f6d5db07b05eea647cf2339263",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "7014b6100a1338e485ce05a44e36da70144ff9efbd1621f9551446ea2e44b8f8",
@@ -128,18 +168,25 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "7014b6100a1338e485ce05a44e36da70144ff9efbd1621f9551446ea2e44b8f8",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [],
+        "votes": 3
+      }
     },
     {
       "a": "d24aa4048b3f9f0fda10f1e6a9df7ab381a1a1eecfb634db6cae8c4f4eb213c6",
       "b": "468cc0f7213de5369b50ffc2e503912cdb84ffcf01908cb7071e6ee5918f4581",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "d24aa4048b3f9f0fda10f1e6a9df7ab381a1a1eecfb634db6cae8c4f4eb213c6",
       "tags": [],
       "action": "superseded",
       "action_survivor": "d24aa4048b3f9f0fda10f1e6a9df7ab381a1a1eecfb634db6cae8c4f4eb213c6",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "468cc0f7213de5369b50ffc2e503912cdb84ffcf01908cb7071e6ee5918f4581",
@@ -150,7 +197,16 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "468cc0f7213de5369b50ffc2e503912cdb84ffcf01908cb7071e6ee5918f4581",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 3
+      }
     },
     {
       "a": "f5f27c48ec51455ea9976b98f8607c6f91279eeb1d43b50d82c0fc807dd9610c",
@@ -167,34 +223,34 @@
       "a": "c953fcc063114ca8e12ab00804658b3714d00c6ad9a0e7863f6d85b023adeb95",
       "b": "8fbd750000086a71ece91f83d655cd460b4b0381faf5e45c2395a37e07dd118d",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "c953fcc063114ca8e12ab00804658b3714d00c6ad9a0e7863f6d85b023adeb95",
       "tags": [],
       "action": "superseded",
       "action_survivor": "c953fcc063114ca8e12ab00804658b3714d00c6ad9a0e7863f6d85b023adeb95",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "2dc728a78e6a1086fc0b6c324ff11415e5b33375aef3f30215109692ac2c07a4",
       "b": "b1e9b1ae7776338adb91dd67ffd75e0d415f2cd078b54fa0eae813f309445f2a",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "2dc728a78e6a1086fc0b6c324ff11415e5b33375aef3f30215109692ac2c07a4",
       "tags": [],
       "action": "superseded",
       "action_survivor": "2dc728a78e6a1086fc0b6c324ff11415e5b33375aef3f30215109692ac2c07a4",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "9e9dfda8e8f198dcdfac25b52d38e94e37dadcd007ade121b00836e19424ee30",
       "b": "b8f98393b65c15544f2cfc28fadfa63da409c352756c4987ca9206ce3671379a",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "9e9dfda8e8f198dcdfac25b52d38e94e37dadcd007ade121b00836e19424ee30",
       "tags": [],
       "action": "superseded",
       "action_survivor": "9e9dfda8e8f198dcdfac25b52d38e94e37dadcd007ade121b00836e19424ee30",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "c5a209d5df8e46110791a5d6b427db45c0af15cd3077e1d9060626707a897242",
@@ -205,18 +261,25 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "c5a209d5df8e46110791a5d6b427db45c0af15cd3077e1d9060626707a897242",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [],
+        "votes": 3
+      }
     },
     {
       "a": "6fe9bae0434c8625cf7e39f21d96c5f0192d5e14804a8e50aac8ff6ef71c863b",
       "b": "a29c47e4c7ed13eab5dfb7cec20af623edb38b41fb86c4d2d8ec76ecbf7f9c7b",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "6fe9bae0434c8625cf7e39f21d96c5f0192d5e14804a8e50aac8ff6ef71c863b",
       "tags": [],
       "action": "superseded",
       "action_survivor": "6fe9bae0434c8625cf7e39f21d96c5f0192d5e14804a8e50aac8ff6ef71c863b",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "b36a28f8f47bf1cd36de2f3bf61486fe77ede9f896696e0c346c1881cbc8f94c",
@@ -235,45 +298,45 @@
       "a": "4a8fe3d36168517471de06280607aa78739823fca429bf2ef2e143a7df6d2377",
       "b": "a62aeb8e003afee8c398201613a485097b3ec8d74dfecf4825090277af8d81e8",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "4a8fe3d36168517471de06280607aa78739823fca429bf2ef2e143a7df6d2377",
       "tags": [],
       "action": "superseded",
       "action_survivor": "4a8fe3d36168517471de06280607aa78739823fca429bf2ef2e143a7df6d2377",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "8a0b20cda73d8077627187b1c831358eb647e94998d0789afa8595262889d20a",
       "b": "0d0afe450cf8da7cee1c22d7d3bcfeed2fdde008d4a09360540bb932e36d85b9",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "8a0b20cda73d8077627187b1c831358eb647e94998d0789afa8595262889d20a",
       "tags": [],
       "action": "superseded",
       "action_survivor": "8a0b20cda73d8077627187b1c831358eb647e94998d0789afa8595262889d20a",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "e8b5bdd83221528e5721d8e9598f645b5bb3fc711595d82d5a4c375db9ce2d7c",
       "b": "936389e35aaaf88e66471ff262ba5cb2ce2563d87571cabbd3f876f0ee44e1a9",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "e8b5bdd83221528e5721d8e9598f645b5bb3fc711595d82d5a4c375db9ce2d7c",
       "tags": [],
       "action": "superseded",
       "action_survivor": "e8b5bdd83221528e5721d8e9598f645b5bb3fc711595d82d5a4c375db9ce2d7c",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "9c928015731c107785d8a8182f998e31db7fe07b93e131aebf14259158fe46ed",
       "b": "2019ffbf12241108c0b5ef10b0b38794722849ac342827eb1507f3fa42569308",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "9c928015731c107785d8a8182f998e31db7fe07b93e131aebf14259158fe46ed",
       "tags": [],
       "action": "superseded",
       "action_survivor": "9c928015731c107785d8a8182f998e31db7fe07b93e131aebf14259158fe46ed",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "b03a9faea013bcc2a35af899d296e0a1f2021e8855a1b9895be25e329da1ba21",
@@ -284,7 +347,14 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "b03a9faea013bcc2a35af899d296e0a1f2021e8855a1b9895be25e329da1ba21",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [],
+        "votes": 2
+      }
     },
     {
       "a": "2a5516580ed0bdb8a47fe7c4ba1475dd6353ade2701d024a54c2689add926b4e",
@@ -295,18 +365,27 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "2a5516580ed0bdb8a47fe7c4ba1475dd6353ade2701d024a54c2689add926b4e",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [],
+        "votes": 3
+      }
     },
     {
       "a": "f38a364fd04b9f32b4539651853882e27ade2ef647de5e86b84f1e2fb3813590",
       "b": "3836ca6bf7c725215abf64e6a213a98a4fcd89fc654101ab0ad41c678261f1e9",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "f38a364fd04b9f32b4539651853882e27ade2ef647de5e86b84f1e2fb3813590",
-      "tags": [],
+      "tags": [
+        "near-duplicate"
+      ],
       "action": "superseded",
       "action_survivor": "f38a364fd04b9f32b4539651853882e27ade2ef647de5e86b84f1e2fb3813590",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "8567cc97472a3c59829a079d5eed76761033a7e1bf8910210eacc3d31e6db7d4",
@@ -341,18 +420,25 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "3c364ea5c60ac004b093a33468e6a593430397db8ef9897776691dd883ac4eac",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [],
+        "votes": 2
+      }
     },
     {
       "a": "533cf75a1bd67d57ed57bb6522f0cdf8eddf4e88653fee39eee594c3a1dbf95f",
       "b": "72ebffaf277d7b06b2e2224ae39fe20ba4555a03e37604542132ab40afc57210",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "533cf75a1bd67d57ed57bb6522f0cdf8eddf4e88653fee39eee594c3a1dbf95f",
       "tags": [],
       "action": "superseded",
       "action_survivor": "533cf75a1bd67d57ed57bb6522f0cdf8eddf4e88653fee39eee594c3a1dbf95f",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "2019ffbf12241108c0b5ef10b0b38794722849ac342827eb1507f3fa42569308",
@@ -363,18 +449,27 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "2019ffbf12241108c0b5ef10b0b38794722849ac342827eb1507f3fa42569308",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 2
+      }
     },
     {
       "a": "2c74b139a21c75fe1e3417e07af9fe6754393670aeb7176009b1c978d8e96936",
       "b": "b5ec4fd41fba6ead5c10596fdca29b9e36d1d3d4bb4cd817c16226eb7ac4c7e3",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "2c74b139a21c75fe1e3417e07af9fe6754393670aeb7176009b1c978d8e96936",
       "tags": [],
       "action": "superseded",
       "action_survivor": "2c74b139a21c75fe1e3417e07af9fe6754393670aeb7176009b1c978d8e96936",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "19b1b56127ac220226c0f35a9d7fc5757c4391bc0d90eb0b7d7761bd388f5dec",
@@ -385,95 +480,106 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "19b1b56127ac220226c0f35a9d7fc5757c4391bc0d90eb0b7d7761bd388f5dec",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 3
+      }
     },
     {
       "a": "104f3c3e2956e20b835d2f93e89133b17563c379eef7514c3135c56c6466b5c6",
       "b": "723eae7ec4ad0c85310eccce99094f3e6693e543013e1634fabb8439de6f3c5d",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "104f3c3e2956e20b835d2f93e89133b17563c379eef7514c3135c56c6466b5c6",
       "tags": [],
       "action": "superseded",
       "action_survivor": "104f3c3e2956e20b835d2f93e89133b17563c379eef7514c3135c56c6466b5c6",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "59dc0f5b18b7d4dcdb9cb5e6384543b585a3da24796c5ce79fce82f5c54bc0d5",
       "b": "cf964ee17967e15af4f1d45b5b5e4b9e123da06fddb67a658217b7caccdb8454",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "59dc0f5b18b7d4dcdb9cb5e6384543b585a3da24796c5ce79fce82f5c54bc0d5",
-      "tags": [],
+      "tags": [
+        "near-duplicate"
+      ],
       "action": "superseded",
       "action_survivor": "59dc0f5b18b7d4dcdb9cb5e6384543b585a3da24796c5ce79fce82f5c54bc0d5",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "08a484899e6b8c4d9c534bbc21c3babfc4c8891f39c7c14dbb3c8f02e3aa178c",
       "b": "852d28f157f42745e4c5b46149b8bcbf97d64eb181ec8d250418c5200de1e512",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "08a484899e6b8c4d9c534bbc21c3babfc4c8891f39c7c14dbb3c8f02e3aa178c",
       "tags": [],
       "action": "superseded",
       "action_survivor": "08a484899e6b8c4d9c534bbc21c3babfc4c8891f39c7c14dbb3c8f02e3aa178c",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "ddec6bc21e9bf5e30b95576bc159065ea4a922bf9bcfe40ff2ce8d12df35af2e",
       "b": "d73c54dbfc49dc339dc76e4e7c0863ab3f02ea689a24a915d58bdf8c4a49fdd8",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "ddec6bc21e9bf5e30b95576bc159065ea4a922bf9bcfe40ff2ce8d12df35af2e",
       "tags": [],
       "action": "superseded",
       "action_survivor": "ddec6bc21e9bf5e30b95576bc159065ea4a922bf9bcfe40ff2ce8d12df35af2e",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "9b14ccf46143023ad79a4f0ff88072d9b37d9fb1cc69f5cc82a69fc4ca74ff59",
       "b": "3ac2986b9be35822629d9457dff2ba9e0eb359316196ede1a0f3b153b2742921",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "9b14ccf46143023ad79a4f0ff88072d9b37d9fb1cc69f5cc82a69fc4ca74ff59",
       "tags": [],
       "action": "superseded",
       "action_survivor": "9b14ccf46143023ad79a4f0ff88072d9b37d9fb1cc69f5cc82a69fc4ca74ff59",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "7750d56767844ce64cbc6f7610736dbd9a3fc3b519f646a809ef71fb3213936e",
       "b": "6c87261f25740819508a808164e65b7374e7a6d38b65ad898135d28890e639f0",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "7750d56767844ce64cbc6f7610736dbd9a3fc3b519f646a809ef71fb3213936e",
       "tags": [],
       "action": "superseded",
       "action_survivor": "7750d56767844ce64cbc6f7610736dbd9a3fc3b519f646a809ef71fb3213936e",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "2e8ceb5e91fc5cac44d464b7bc7afcc559b42ad9abab167c3cfc41503016cb86",
       "b": "e329c743ec503dc71d0d14feb3db31f5bea0e82e4ee586ffc89b770b617fd11e",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "2e8ceb5e91fc5cac44d464b7bc7afcc559b42ad9abab167c3cfc41503016cb86",
       "tags": [],
       "action": "superseded",
       "action_survivor": "2e8ceb5e91fc5cac44d464b7bc7afcc559b42ad9abab167c3cfc41503016cb86",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "5bc0e9d05623844cfa465b76d91366d40030d406f08d41776ffc4bce666cf377",
       "b": "5267a6bc2ccf9f5a0bea54aeca6bbe95585c583237e2de7809534cb9222304ee",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "5bc0e9d05623844cfa465b76d91366d40030d406f08d41776ffc4bce666cf377",
       "tags": [],
       "action": "superseded",
       "action_survivor": "5bc0e9d05623844cfa465b76d91366d40030d406f08d41776ffc4bce666cf377",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "5267a6bc2ccf9f5a0bea54aeca6bbe95585c583237e2de7809534cb9222304ee",
@@ -484,7 +590,16 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "5267a6bc2ccf9f5a0bea54aeca6bbe95585c583237e2de7809534cb9222304ee",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 3
+      }
     },
     {
       "a": "ccb08cd3ad90bdabf52518950450b28a517b976f48e27969320aaeb5a0ee7c62",
@@ -495,29 +610,40 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "ccb08cd3ad90bdabf52518950450b28a517b976f48e27969320aaeb5a0ee7c62",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 2
+      }
     },
     {
       "a": "1c8d601decd32c7fea25aa6653abdd880ba9543a76dc6d5d45800622ee162d48",
       "b": "edcf7b7becba8b312e1927ad164369f203d4c5ca6716dd228e4b204cc4f95903",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "1c8d601decd32c7fea25aa6653abdd880ba9543a76dc6d5d45800622ee162d48",
-      "tags": [],
+      "tags": [
+        "near-duplicate"
+      ],
       "action": "superseded",
       "action_survivor": "1c8d601decd32c7fea25aa6653abdd880ba9543a76dc6d5d45800622ee162d48",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "62682eb1ac37b9b0f3a584e22592de735bbc63f37f77794d5318adfd0edaad81",
       "b": "6248038349b34fc5c64f21f7a489bae1b38e7c47a8b1e2b9daa60044041c455e",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "62682eb1ac37b9b0f3a584e22592de735bbc63f37f77794d5318adfd0edaad81",
       "tags": [],
       "action": "superseded",
       "action_survivor": "62682eb1ac37b9b0f3a584e22592de735bbc63f37f77794d5318adfd0edaad81",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "3aea554c37b21a977a1c4a97fae59dc4058acad677a82a88f2e93560fa64e3af",
@@ -539,7 +665,14 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "8eb531044bfe78c4bf922eba436fddfe7f9683c8edcc9929a4ed259a439ec30e",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [],
+        "votes": 3
+      }
     },
     {
       "a": "13a60222480c205ab48a1041ed37873b8674c0a2d7aab05a8ac3b179b20b7ef7",
@@ -550,7 +683,17 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "13a60222480c205ab48a1041ed37873b8674c0a2d7aab05a8ac3b179b20b7ef7",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial",
+          "near-duplicate"
+        ],
+        "votes": 2
+      }
     },
     {
       "a": "9d3a8e9439e4e9b3a63c3f6adcb2d59fc827958248bbe5cb13a2ca9daa7b50f7",
@@ -561,29 +704,38 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "9d3a8e9439e4e9b3a63c3f6adcb2d59fc827958248bbe5cb13a2ca9daa7b50f7",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 3
+      }
     },
     {
       "a": "31acb06d2e26e3dbf12f151fdd0fb22b7a93de894d8316cacafc28567c5eb011",
       "b": "e07af3f85c5d218fc20235885b6165846f17a850cce153c24290b19304d0f6db",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "31acb06d2e26e3dbf12f151fdd0fb22b7a93de894d8316cacafc28567c5eb011",
       "tags": [],
       "action": "superseded",
       "action_survivor": "31acb06d2e26e3dbf12f151fdd0fb22b7a93de894d8316cacafc28567c5eb011",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "e569bfa8d24a5f451cd558c2aaa70c10a951f95133d479dad1b64df0d35baf5c",
       "b": "3b725764378adf593216903655d827cc3a14b1a1fbeb4c53659a55bb9d7dbe0b",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "e569bfa8d24a5f451cd558c2aaa70c10a951f95133d479dad1b64df0d35baf5c",
       "tags": [],
       "action": "superseded",
       "action_survivor": "e569bfa8d24a5f451cd558c2aaa70c10a951f95133d479dad1b64df0d35baf5c",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "d4b4a532913b914dcf03a8fd1ad1d94f72cf0ee8fe2252763d413478f7bfab55",
@@ -594,7 +746,16 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "d4b4a532913b914dcf03a8fd1ad1d94f72cf0ee8fe2252763d413478f7bfab55",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 2
+      }
     },
     {
       "a": "74130bb93aa8e35b171b17ac5588c0e97a4a678ce523652f34258441391121e1",
@@ -605,7 +766,14 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "74130bb93aa8e35b171b17ac5588c0e97a4a678ce523652f34258441391121e1",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [],
+        "votes": 3
+      }
     },
     {
       "a": "67f95c9615dd22dda3c78da43d26ef3a9bb3513081c56d9d38f24f2fb27526ff",
@@ -616,29 +784,38 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "67f95c9615dd22dda3c78da43d26ef3a9bb3513081c56d9d38f24f2fb27526ff",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 2
+      }
     },
     {
       "a": "8f1b37e04e11a47f52f590f21b625c9fbadda161c0fab0be2595e0886fb3984e",
       "b": "bebc9b94d20f6c013f7a268deb692213fddfe983d31837ba49df1efe53fc3dbe",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "8f1b37e04e11a47f52f590f21b625c9fbadda161c0fab0be2595e0886fb3984e",
       "tags": [],
       "action": "superseded",
       "action_survivor": "8f1b37e04e11a47f52f590f21b625c9fbadda161c0fab0be2595e0886fb3984e",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "b124cd684bcc6a325a12fb0b3cb98aabd3e73e9518d72db5842762b0ae24ba9b",
       "b": "c519d0dfe8fcf6ef6e6febf027c70d0c3aa4a5f2534e3a9ef5ed38964fa6f4fd",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "b124cd684bcc6a325a12fb0b3cb98aabd3e73e9518d72db5842762b0ae24ba9b",
       "tags": [],
       "action": "superseded",
       "action_survivor": "b124cd684bcc6a325a12fb0b3cb98aabd3e73e9518d72db5842762b0ae24ba9b",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "3fe2687163f9580e0c243dd247dfd15ca3fff8a2753db2d0afbcf1c63147aba8",
@@ -649,73 +826,82 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "3fe2687163f9580e0c243dd247dfd15ca3fff8a2753db2d0afbcf1c63147aba8",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [],
+        "votes": 3
+      }
     },
     {
       "a": "fd87f0a4782e236c8813f097ef5b4427fa78babe9c51a575c6008812c87fe050",
       "b": "257deed395e120780fac342065a5853041f03d74910d901cc0fceb129b75ce48",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "fd87f0a4782e236c8813f097ef5b4427fa78babe9c51a575c6008812c87fe050",
       "tags": [],
       "action": "superseded",
       "action_survivor": "fd87f0a4782e236c8813f097ef5b4427fa78babe9c51a575c6008812c87fe050",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "06345a5fc8f7dc8a7229b7f573fefda96472b3e7f814ca1bf678e53a61f920d8",
       "b": "e960c97597cd81fa02efcbcc3fada4829bf3ed1a7a7f402dc2c120286678a950",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "06345a5fc8f7dc8a7229b7f573fefda96472b3e7f814ca1bf678e53a61f920d8",
       "tags": [],
       "action": "superseded",
       "action_survivor": "06345a5fc8f7dc8a7229b7f573fefda96472b3e7f814ca1bf678e53a61f920d8",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "1596fdec677a528812643a38a0d49b80c91c924e4192954380dbf9809acaa5e2",
       "b": "642570b635e423d186ba60c529105644d36be73fba1d5f48b553a2bedc09c0b9",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "1596fdec677a528812643a38a0d49b80c91c924e4192954380dbf9809acaa5e2",
       "tags": [],
       "action": "superseded",
       "action_survivor": "1596fdec677a528812643a38a0d49b80c91c924e4192954380dbf9809acaa5e2",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "f506e79755e3abeb03f1506aed0e92bb00e13fdbc6bcb02713ff08565e8002de",
       "b": "063c96ee73739b84adaa4bd1633362a301c67f5d5d70d29b48497a92950c8623",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "f506e79755e3abeb03f1506aed0e92bb00e13fdbc6bcb02713ff08565e8002de",
       "tags": [],
       "action": "superseded",
       "action_survivor": "f506e79755e3abeb03f1506aed0e92bb00e13fdbc6bcb02713ff08565e8002de",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "063c96ee73739b84adaa4bd1633362a301c67f5d5d70d29b48497a92950c8623",
       "b": "17a8290a40384539c8913614ea6a915583534091b9e4a5b20602cf22e94d5bcb",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "063c96ee73739b84adaa4bd1633362a301c67f5d5d70d29b48497a92950c8623",
       "tags": [],
       "action": "superseded",
       "action_survivor": "063c96ee73739b84adaa4bd1633362a301c67f5d5d70d29b48497a92950c8623",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "a0fe1f4af5cb66415a75edb62f9d9db43a439debf7af74d7a2edf0b1766fa864",
       "b": "800549198591101c8c31ebb03f8c5bea3f11be76d2c13254ffd1745842a8a45d",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "a0fe1f4af5cb66415a75edb62f9d9db43a439debf7af74d7a2edf0b1766fa864",
-      "tags": [],
+      "tags": [
+        "near-duplicate"
+      ],
       "action": "superseded",
       "action_survivor": "a0fe1f4af5cb66415a75edb62f9d9db43a439debf7af74d7a2edf0b1766fa864",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "b13e54a2c9218765a46c422ad71af94625ca85872ecb58a0a4ab9b5b6806cdfe",
@@ -754,12 +940,12 @@
       "a": "528a1b2a889725166e6d6c59c6a1b1f601361712ec2e1f4429c17a1fd9a1161c",
       "b": "4fbc5785d13e692d398f791eb2859758175b1131dd0d0638494882c2692022ab",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "528a1b2a889725166e6d6c59c6a1b1f601361712ec2e1f4429c17a1fd9a1161c",
       "tags": [],
       "action": "superseded",
       "action_survivor": "528a1b2a889725166e6d6c59c6a1b1f601361712ec2e1f4429c17a1fd9a1161c",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "b1a52fb8fa5b20df1325bb296c0c6d1419d088ae6dbee07cee54a012d1b43481",
@@ -794,40 +980,49 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "11f1c5e34f2be474e30d36c78ebecae5eeae522727067b0210c5515e2ad3e768",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 3
+      }
     },
     {
       "a": "f93ca6c3eab64ac9e7fa8d346e81d33802e002d2a12a74ed2363e4c0b88d02d1",
       "b": "c04771fb46bc80903cc6aad810ab2eb7b5d41f4bffa6fbaed44f81d58b865bc0",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "f93ca6c3eab64ac9e7fa8d346e81d33802e002d2a12a74ed2363e4c0b88d02d1",
       "tags": [],
       "action": "superseded",
       "action_survivor": "f93ca6c3eab64ac9e7fa8d346e81d33802e002d2a12a74ed2363e4c0b88d02d1",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "367f03d7c9569f881465777218611a3b2acc5c2747fbe434e17f1c3478ce0446",
       "b": "caf267e7a661d1125bb6efe8b0bb5003fe8aed8d7e1ad9a6e77e87d34b95c454",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "367f03d7c9569f881465777218611a3b2acc5c2747fbe434e17f1c3478ce0446",
       "tags": [],
       "action": "superseded",
       "action_survivor": "367f03d7c9569f881465777218611a3b2acc5c2747fbe434e17f1c3478ce0446",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "367f03d7c9569f881465777218611a3b2acc5c2747fbe434e17f1c3478ce0446",
       "b": "1e97aceb0f90006d8c38513f3ea806b94248d5c7f3ef397ce1688ce149363aa7",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "367f03d7c9569f881465777218611a3b2acc5c2747fbe434e17f1c3478ce0446",
       "tags": [],
       "action": "superseded",
       "action_survivor": "367f03d7c9569f881465777218611a3b2acc5c2747fbe434e17f1c3478ce0446",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "40907745d7f8d1cd3c40bee483d3c51b73e888f83cba2b3c8094416af2a4754a",
@@ -860,7 +1055,14 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "b96049ecfb7b18af41c5862ed779ab3693c2929a719e51c07009dafffea33b8d",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [],
+        "votes": 3
+      }
     },
     {
       "a": "570f969c0996a6c6981fdc98c455e53a08905b715cc97280e52a0adee4166be7",
@@ -888,12 +1090,12 @@
       "a": "dd022c9189c62e80e74a0f41a76cc35b97fbeb6229fbb4e685bafa40a19f8ea5",
       "b": "003ecbb544c64dd7bc9e72d567b8c156d590effd01dd2fd68e9da5071eedd1ba",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "dd022c9189c62e80e74a0f41a76cc35b97fbeb6229fbb4e685bafa40a19f8ea5",
       "tags": [],
       "action": "superseded",
       "action_survivor": "dd022c9189c62e80e74a0f41a76cc35b97fbeb6229fbb4e685bafa40a19f8ea5",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "017449d19803190c26aedbfd0ba6b48f3396d58a5cd5986c9e0fd9b5f4ff8539",
@@ -915,40 +1117,47 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "017449d19803190c26aedbfd0ba6b48f3396d58a5cd5986c9e0fd9b5f4ff8539",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [],
+        "votes": 3
+      }
     },
     {
       "a": "fc9b66a46928453eae6d77b6ff9b206c288da2bb046ae138bff24cd4a9e55ab5",
       "b": "019b9e5e05cfc29fb0485857d7e3ee60936b4c64a5b333e738110d7c08d2df92",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "fc9b66a46928453eae6d77b6ff9b206c288da2bb046ae138bff24cd4a9e55ab5",
       "tags": [],
       "action": "superseded",
       "action_survivor": "fc9b66a46928453eae6d77b6ff9b206c288da2bb046ae138bff24cd4a9e55ab5",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "4e6854e73ded8c4592c043af10763009dc4cecc638b3954cfe9d51d8f2638d6e",
       "b": "3bc34703e6d12b6662ea17cc229eaa7d9674404fb006c686968bc92e8795a688",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "4e6854e73ded8c4592c043af10763009dc4cecc638b3954cfe9d51d8f2638d6e",
       "tags": [],
       "action": "superseded",
       "action_survivor": "4e6854e73ded8c4592c043af10763009dc4cecc638b3954cfe9d51d8f2638d6e",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "02fcb197f6d6d8f433c53f7ca9428c8e983910e47f24c45f54e178cd6fc65bd3",
       "b": "d58bf6dbc7c9aaeed6b9f0bbacb71ce201cc53819b07cb39bc7d16e73e7a3684",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "02fcb197f6d6d8f433c53f7ca9428c8e983910e47f24c45f54e178cd6fc65bd3",
       "tags": [],
       "action": "superseded",
       "action_survivor": "02fcb197f6d6d8f433c53f7ca9428c8e983910e47f24c45f54e178cd6fc65bd3",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "19317381ce1131a8dd5ce90325b39838e2ecd39443ddc47d2805da99fa674fc8",
@@ -967,23 +1176,23 @@
       "a": "517e034d3ae37982180d6be7bce95dfaa7ec31e1d2a7ecba060e12ab47e3fc83",
       "b": "3193483b27cd4a625294c8ffcd18bfd9a408154d3c94ffffacda11eca400ddfc",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "517e034d3ae37982180d6be7bce95dfaa7ec31e1d2a7ecba060e12ab47e3fc83",
       "tags": [],
       "action": "superseded",
       "action_survivor": "517e034d3ae37982180d6be7bce95dfaa7ec31e1d2a7ecba060e12ab47e3fc83",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "49460a371c97e1e4dde46e836e26ce0ed66db825230cf87d59bb087f3b622835",
       "b": "8a0b20cda73d8077627187b1c831358eb647e94998d0789afa8595262889d20a",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "49460a371c97e1e4dde46e836e26ce0ed66db825230cf87d59bb087f3b622835",
       "tags": [],
       "action": "superseded",
       "action_survivor": "49460a371c97e1e4dde46e836e26ce0ed66db825230cf87d59bb087f3b622835",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "406734a119598d5b2c9892b0636e04e034c2fb4c92abc20e83db85cd55b131c0",
@@ -994,7 +1203,16 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "406734a119598d5b2c9892b0636e04e034c2fb4c92abc20e83db85cd55b131c0",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 3
+      }
     },
     {
       "a": "d045b299b8cba0f9ccb7e131d658fe8a991d263f9f757395f6797ed877dc2ee6",
@@ -1016,18 +1234,27 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "9ebd8b7c98e57ab9ccdc7b0a017c4a9fe8dc66676c1be0517143c572ed14eb21",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 3
+      }
     },
     {
       "a": "1085368feb99695c4a97392ad204f984438d38bf99ff49c6375e761956a5bba4",
       "b": "63718af4556d7e068d8f6b6c426007e1c3e365d985257e8c0db139b49c516548",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "1085368feb99695c4a97392ad204f984438d38bf99ff49c6375e761956a5bba4",
       "tags": [],
       "action": "superseded",
       "action_survivor": "1085368feb99695c4a97392ad204f984438d38bf99ff49c6375e761956a5bba4",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "c5684faf45481901c6fbcd8b2bc578004f9690f0e278d2a4a97cfe87ee5fcc63",
@@ -1038,7 +1265,16 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "c5684faf45481901c6fbcd8b2bc578004f9690f0e278d2a4a97cfe87ee5fcc63",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 2
+      }
     },
     {
       "a": "68f72440f0b27bf85d9ff5ced7dedba2c8593d4817c6987003b46f31433909c6",
@@ -1049,7 +1285,16 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "68f72440f0b27bf85d9ff5ced7dedba2c8593d4817c6987003b46f31433909c6",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 3
+      }
     },
     {
       "a": "ddd443f04175a37831231bb29351ee24197a4fe734831fe61bbbcbdf46852dcb",
@@ -1068,67 +1313,67 @@
       "a": "e73bb5ddabe8ca435b63794589fc54c0f526a568d617b14fd5f6eea7aa7e28ee",
       "b": "ff1b00e7bdf640392b4080de0c2e195cf11a547fc7efe53882e733f550cff336",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "e73bb5ddabe8ca435b63794589fc54c0f526a568d617b14fd5f6eea7aa7e28ee",
       "tags": [],
       "action": "superseded",
       "action_survivor": "e73bb5ddabe8ca435b63794589fc54c0f526a568d617b14fd5f6eea7aa7e28ee",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "09af3f9dea6a327c8727ab0b5a077a44774ae685a5c70f7333b56dd601194189",
       "b": "ef82bc1d8fe2fd3ef02dcdcf13f17a4db3cc66bd227cd1f6014cfba0086e13d7",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "09af3f9dea6a327c8727ab0b5a077a44774ae685a5c70f7333b56dd601194189",
       "tags": [],
       "action": "superseded",
       "action_survivor": "09af3f9dea6a327c8727ab0b5a077a44774ae685a5c70f7333b56dd601194189",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "9f80fb6aaa16827ccd1c24ed3256f6c1bd18451cb30f0455753943d3b4b3a0be",
       "b": "8751ca10c93005e38509c3a2473d6d4ec01bf8eacc97bab863e032d23d92b67d",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "9f80fb6aaa16827ccd1c24ed3256f6c1bd18451cb30f0455753943d3b4b3a0be",
       "tags": [],
       "action": "superseded",
       "action_survivor": "9f80fb6aaa16827ccd1c24ed3256f6c1bd18451cb30f0455753943d3b4b3a0be",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "f849efef7c492246b3d2271e15f82b63585e855f73de0735830e52c0e47a9f09",
       "b": "5656f04099887316980a4f96977dae98ea1505d75540f1173fffa52c5500429a",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "f849efef7c492246b3d2271e15f82b63585e855f73de0735830e52c0e47a9f09",
       "tags": [],
       "action": "superseded",
       "action_survivor": "f849efef7c492246b3d2271e15f82b63585e855f73de0735830e52c0e47a9f09",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "1513d92c10f14268d1dfbb8c534292f8c99f828c9f8f77e58bb75a302bafd030",
       "b": "9eb3647d69b7b53328753594545036b26d1dbc56699b24a5cbec57a2cb1d2590",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "1513d92c10f14268d1dfbb8c534292f8c99f828c9f8f77e58bb75a302bafd030",
       "tags": [],
       "action": "superseded",
       "action_survivor": "1513d92c10f14268d1dfbb8c534292f8c99f828c9f8f77e58bb75a302bafd030",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "768dbafdb6a48dc8161784e5ed12899f34711ae0f90fbc985c4656bee1979cf7",
       "b": "49460a371c97e1e4dde46e836e26ce0ed66db825230cf87d59bb087f3b622835",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "768dbafdb6a48dc8161784e5ed12899f34711ae0f90fbc985c4656bee1979cf7",
       "tags": [],
       "action": "superseded",
       "action_survivor": "768dbafdb6a48dc8161784e5ed12899f34711ae0f90fbc985c4656bee1979cf7",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "908c8106b6002c582800b7043c57bf54076de513f981be24591916afe9239751",
@@ -1139,51 +1384,62 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "908c8106b6002c582800b7043c57bf54076de513f981be24591916afe9239751",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 2
+      }
     },
     {
       "a": "ffdff52c2b66bc54f606bb52acd6b8dfa01178bae9f32cc8c1ae460ef1ccc669",
       "b": "3d7c7a9210f28aaebadd304e1fab607bbef7286400436d57fde5102af3fd78dd",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "ffdff52c2b66bc54f606bb52acd6b8dfa01178bae9f32cc8c1ae460ef1ccc669",
       "tags": [],
       "action": "superseded",
       "action_survivor": "ffdff52c2b66bc54f606bb52acd6b8dfa01178bae9f32cc8c1ae460ef1ccc669",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "8962f42df308bd97db88f2d560298afde3d7217fcad7a7f5937ca9bb7d668bd8",
       "b": "7b2ce6b8ef89388109c8fd144d85b8f34750880723f7d85eeb464ad0410045c2",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "8962f42df308bd97db88f2d560298afde3d7217fcad7a7f5937ca9bb7d668bd8",
-      "tags": [],
+      "tags": [
+        "near-duplicate"
+      ],
       "action": "superseded",
       "action_survivor": "8962f42df308bd97db88f2d560298afde3d7217fcad7a7f5937ca9bb7d668bd8",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "fa1d02fa756ce79af754ae7c7fcfe85ceb150f15a00a8c7982c7198da66f82ae",
       "b": "54f9ad0764fe38774d6c65a6431d3eb2028fadc23e5c950347ed39ea29fe90d1",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "fa1d02fa756ce79af754ae7c7fcfe85ceb150f15a00a8c7982c7198da66f82ae",
       "tags": [],
       "action": "superseded",
       "action_survivor": "fa1d02fa756ce79af754ae7c7fcfe85ceb150f15a00a8c7982c7198da66f82ae",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "6a978f08e4117beae6864f0baf03b66a7806a62b1d34c8b587c6004e364b3bdb",
       "b": "8c4fab1cc18826b35350d720579854155f6104d6c214299c1e5f672b98d3a874",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "6a978f08e4117beae6864f0baf03b66a7806a62b1d34c8b587c6004e364b3bdb",
       "tags": [],
       "action": "superseded",
       "action_survivor": "6a978f08e4117beae6864f0baf03b66a7806a62b1d34c8b587c6004e364b3bdb",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "df4d1a6e19159880e66454ea62d55dd1c2472123577f89f5a303a2324a6c0a46",
@@ -1194,7 +1450,16 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "df4d1a6e19159880e66454ea62d55dd1c2472123577f89f5a303a2324a6c0a46",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "supersession",
+        "sub_label": "S",
+        "survivor": "feea222764773cd7a88513a9b65fabe77112e69e2310ee7ce0a45aac226f3873",
+        "tags": [
+          "newer-revoked"
+        ],
+        "revoked_by": "4a001ef165b65adc014d307ed60e70b1e209785a4a7ee7a99436a918a4ebaf0b"
+      }
     },
     {
       "a": "dc25b2b20ff37234017b6c7c5d2c5241ef0929b9907f8b26c3710cb3f17cd3e3",
@@ -1216,7 +1481,16 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "16a673f2447fc1b9a6b3883529eced1efe0a44e3174223abb5ca06540a099ffd",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 2
+      }
     },
     {
       "a": "4a13cbb2f10548c1e1268ba3331b04095a3fd871a1665b219086b6950a3d8cc1",
@@ -1227,7 +1501,16 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "4a13cbb2f10548c1e1268ba3331b04095a3fd871a1665b219086b6950a3d8cc1",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 3
+      }
     },
     {
       "a": "ecff9b5db3742791c04b10d805c2e8ae3f0d7e940df53798e8f72927e785fd67",
@@ -1238,18 +1521,27 @@
       "tags": [],
       "action": "superseded",
       "action_survivor": "ecff9b5db3742791c04b10d805c2e8ae3f0d7e940df53798e8f72927e785fd67",
-      "source": "operator"
+      "source": "operator",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "C",
+        "survivor": null,
+        "tags": [
+          "partial"
+        ],
+        "votes": 3
+      }
     },
     {
       "a": "88db2896ebeed70ce946a05cc27508465f577fd6710e1fdb34e685a53c68998a",
       "b": "98f93839416b0bef69272db7f3d90b9cf84ce9e52015fc031829dfdb30910197",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "88db2896ebeed70ce946a05cc27508465f577fd6710e1fdb34e685a53c68998a",
       "tags": [],
       "action": "superseded",
       "action_survivor": "88db2896ebeed70ce946a05cc27508465f577fd6710e1fdb34e685a53c68998a",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "3d22859dc47d8c64d94467cac366e9e358258174ff4e250b563c219532d6a8cd",
@@ -1266,23 +1558,23 @@
       "a": "1c9099f891c3715b4b1b22b77ffd935e88f1be82a54e3921a2938741813d84c7",
       "b": "84edd9dd068eedc5bd131979de321c33d9b3dce93a85637e77bea57c8d92a50f",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "1c9099f891c3715b4b1b22b77ffd935e88f1be82a54e3921a2938741813d84c7",
       "tags": [],
       "action": "superseded",
       "action_survivor": "1c9099f891c3715b4b1b22b77ffd935e88f1be82a54e3921a2938741813d84c7",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "cf8ccd03419aee96ffc87cf75ce767342a0f112f8bc7568e7786f4664ca6c6e5",
       "b": "77ea6b7ffe512a04bc52aff01f8c1b1b19bfd6339212a79adea0b72acb9a2a4c",
       "label": "supersession",
-      "sub_label": null,
+      "sub_label": "S",
       "survivor": "cf8ccd03419aee96ffc87cf75ce767342a0f112f8bc7568e7786f4664ca6c6e5",
       "tags": [],
       "action": "superseded",
       "action_survivor": "cf8ccd03419aee96ffc87cf75ce767342a0f112f8bc7568e7786f4664ca6c6e5",
-      "source": "operator"
+      "source": "agreed"
     },
     {
       "a": "80f0853ac0b160c8f80ffd7995a27f9ffa58a75d05fca0f111e413fb6dbe98c0",
@@ -1293,106 +1585,110 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "80f0853ac0b160c8f80ffd7995a27f9ffa58a75d05fca0f111e413fb6dbe98c0",
       "b": "a0c0caad2375aecaaf51cf75141d69a6c5dc1c024097cbfcac77cfdca43ba290",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "C",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "7481fc252fee94e540b1ab506ad83cacf934ee04b5699dcd7cda5c26eb9ed64f",
       "b": "876ac8fdbb439add91a7ad4e277273967db630c63783c18fb180c1ff5bfb538b",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "C",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "7481fc252fee94e540b1ab506ad83cacf934ee04b5699dcd7cda5c26eb9ed64f",
       "b": "f754bd3cf1baeed3f78c70dc841933e5905dc532945abd5505c0e2609c3f6616",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "C",
       "survivor": null,
-      "tags": [],
+      "tags": [
+        "partial"
+      ],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "7481fc252fee94e540b1ab506ad83cacf934ee04b5699dcd7cda5c26eb9ed64f",
       "b": "913a0c249a0c83923690a7dc363dd6fbfec4325624178cadd690f82070f21b69",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "P",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "7481fc252fee94e540b1ab506ad83cacf934ee04b5699dcd7cda5c26eb9ed64f",
       "b": "b8a3de6a062fb617cefc767fe0fe4a34203f9afa9aa82d2b52e4faf001531204",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "C",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "7481fc252fee94e540b1ab506ad83cacf934ee04b5699dcd7cda5c26eb9ed64f",
       "b": "0a23af5f83e19221ffbb7998203fa2260801aaf74877889ac2891b0dbbbc3c9f",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "C",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "7481fc252fee94e540b1ab506ad83cacf934ee04b5699dcd7cda5c26eb9ed64f",
       "b": "f49c07c06de70e8fbaec78d84eb8d57264ed56439ef0340080e43cf4021e139f",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "C",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "7481fc252fee94e540b1ab506ad83cacf934ee04b5699dcd7cda5c26eb9ed64f",
       "b": "1ae5657d3ac5c996d71628f83b9086bdbf46484aed22709d14ab43fd9d8bda5d",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "P",
       "survivor": null,
-      "tags": [],
+      "tags": [
+        "partial"
+      ],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "7481fc252fee94e540b1ab506ad83cacf934ee04b5699dcd7cda5c26eb9ed64f",
       "b": "5f87e722a2aef808bc8c1cb324a822aaf14a605d669c30ec3e7c58a7f0617ee2",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "C",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "7481fc252fee94e540b1ab506ad83cacf934ee04b5699dcd7cda5c26eb9ed64f",
@@ -1409,12 +1705,12 @@
       "a": "4a2d6c8cc998a9ab0d235c772cb606fef8e7adde56a77c3bab5678a280cc7732",
       "b": "876ac8fdbb439add91a7ad4e277273967db630c63783c18fb180c1ff5bfb538b",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "C",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "6a8ac662ec922c090b443cf597aa215e1af96965a78631320aaab48594e1018b",
@@ -1425,18 +1721,25 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "queue-read",
+      "dispute": {
+        "label": "unrelated",
+        "sub_label": null,
+        "survivor": null,
+        "tags": [],
+        "votes": 2
+      }
     },
     {
       "a": "6a8ac662ec922c090b443cf597aa215e1af96965a78631320aaab48594e1018b",
       "b": "a0c0caad2375aecaaf51cf75141d69a6c5dc1c024097cbfcac77cfdca43ba290",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "C",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "6a8ac662ec922c090b443cf597aa215e1af96965a78631320aaab48594e1018b",
@@ -1447,18 +1750,18 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "6a8ac662ec922c090b443cf597aa215e1af96965a78631320aaab48594e1018b",
       "b": "4af21da2318e6e926b716cc43c3c7bab7b9dc7409a2c16b52f84fedd6bc128ab",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "C",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "6a8ac662ec922c090b443cf597aa215e1af96965a78631320aaab48594e1018b",
@@ -1469,7 +1772,7 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "6a8ac662ec922c090b443cf597aa215e1af96965a78631320aaab48594e1018b",
@@ -1480,7 +1783,7 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "6a8ac662ec922c090b443cf597aa215e1af96965a78631320aaab48594e1018b",
@@ -1491,18 +1794,25 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "queue-read",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "C",
+        "survivor": null,
+        "tags": [],
+        "votes": 2
+      }
     },
     {
       "a": "17b7579807e91628b79e6a0a8a0a9e82c070c1347730564b3aa71b9a80c933ba",
       "b": "a0c0caad2375aecaaf51cf75141d69a6c5dc1c024097cbfcac77cfdca43ba290",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "C",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "17b7579807e91628b79e6a0a8a0a9e82c070c1347730564b3aa71b9a80c933ba",
@@ -1513,18 +1823,18 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "17b7579807e91628b79e6a0a8a0a9e82c070c1347730564b3aa71b9a80c933ba",
       "b": "4af21da2318e6e926b716cc43c3c7bab7b9dc7409a2c16b52f84fedd6bc128ab",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "C",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "17b7579807e91628b79e6a0a8a0a9e82c070c1347730564b3aa71b9a80c933ba",
@@ -1535,7 +1845,14 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "queue-read",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "C",
+        "survivor": null,
+        "tags": [],
+        "votes": 2
+      }
     },
     {
       "a": "17b7579807e91628b79e6a0a8a0a9e82c070c1347730564b3aa71b9a80c933ba",
@@ -1546,7 +1863,14 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "queue-read",
+      "dispute": {
+        "label": "unrelated",
+        "sub_label": null,
+        "survivor": null,
+        "tags": [],
+        "votes": 2
+      }
     },
     {
       "a": "17b7579807e91628b79e6a0a8a0a9e82c070c1347730564b3aa71b9a80c933ba",
@@ -1557,7 +1881,7 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "17b7579807e91628b79e6a0a8a0a9e82c070c1347730564b3aa71b9a80c933ba",
@@ -1568,29 +1892,29 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "29c883b3dc5c42d6204d72e3c81a672082fc513ae48f4b27164296b99a4a62eb",
       "b": "33b2afdb648f6b219cb9d4dc3c3da508dc8011339198b7d28669e2e763c5f42f",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "P",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "29c883b3dc5c42d6204d72e3c81a672082fc513ae48f4b27164296b99a4a62eb",
       "b": "1ae5657d3ac5c996d71628f83b9086bdbf46484aed22709d14ab43fd9d8bda5d",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "C",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "220f63031408b409775b5c02ea1dd40ed5d683bfbab79fa2d14256f280492336",
@@ -1601,7 +1925,7 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "220f63031408b409775b5c02ea1dd40ed5d683bfbab79fa2d14256f280492336",
@@ -1612,7 +1936,7 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "220f63031408b409775b5c02ea1dd40ed5d683bfbab79fa2d14256f280492336",
@@ -1623,7 +1947,7 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "8e6f2ad3c91950865aff442374953b557f674187a412b72720403b12d63552c3",
@@ -1634,7 +1958,7 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "8e6f2ad3c91950865aff442374953b557f674187a412b72720403b12d63552c3",
@@ -1645,29 +1969,31 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "8e6f2ad3c91950865aff442374953b557f674187a412b72720403b12d63552c3",
       "b": "1d9fabc5274a0f19a6f923581365955f9cd353ca6b66f9fb8f65be29c6151324",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "P",
       "survivor": null,
-      "tags": [],
+      "tags": [
+        "partial"
+      ],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "a02b0adeee5946bb591de18854f8a8f82baeae7334bb45d14a0133f3edfc9ca0",
       "b": "997a86aea4628264765fb56f84ee5129eb8c17425b2e3571f50b840ce88a823d",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "C",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read",
+      "source": "agreed",
       "note": "a grooming note vs the reference memory it cites"
     },
     {
@@ -1679,7 +2005,7 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "373e91e2e43d75b418ad644e9ee58ef6edcaf0a087b302a46b12680a7b89d6a2",
@@ -1690,18 +2016,20 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "373e91e2e43d75b418ad644e9ee58ef6edcaf0a087b302a46b12680a7b89d6a2",
       "b": "1d9fabc5274a0f19a6f923581365955f9cd353ca6b66f9fb8f65be29c6151324",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "P",
       "survivor": null,
-      "tags": [],
+      "tags": [
+        "partial"
+      ],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read",
+      "source": "agreed",
       "note": "borderline: a later decision changed the oracle source; the earlier ruling record still stands"
     },
     {
@@ -1713,7 +2041,14 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "queue-read",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "C",
+        "survivor": null,
+        "tags": [],
+        "votes": 2
+      }
     },
     {
       "a": "373e91e2e43d75b418ad644e9ee58ef6edcaf0a087b302a46b12680a7b89d6a2",
@@ -1724,51 +2059,58 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "queue-read",
+      "dispute": {
+        "label": "coexist",
+        "sub_label": "P",
+        "survivor": null,
+        "tags": [],
+        "votes": 3
+      }
     },
     {
       "a": "21c531bdf64fe78ecc4e75815caf6c9f73d62771acc6ec6978cc64aeac243c12",
       "b": "a2329414001222f06e25f6b252d0a764ce0199301e53b412bbb0da2be7f90ba6",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "P",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "3eb3ccdd3361c02fcea19ab6670418b9112ec6f7f2effddf6375523024b88675",
       "b": "192a995319191aea289bf71d6176cd78e7e7910a0adedc78b317b40c8d93fb5d",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "P",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "6a3f2194b5ea3d20a4cce25c944be88186e3512b9d70c3f75ab53214482c6ec7",
       "b": "d039a0bc105c54b6a89362c766a527152193c9327916d7b355383f785e3b5e70",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "P",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "6a3f2194b5ea3d20a4cce25c944be88186e3512b9d70c3f75ab53214482c6ec7",
       "b": "707bbaf52c1d0ad7065c2570cbc7ee9168ab0c46aff042720a0edcd6f7bf5fe3",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "P",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "6a3f2194b5ea3d20a4cce25c944be88186e3512b9d70c3f75ab53214482c6ec7",
@@ -1788,46 +2130,52 @@
       "a": "6a3f2194b5ea3d20a4cce25c944be88186e3512b9d70c3f75ab53214482c6ec7",
       "b": "865903489bc39105a0b6eeee584710f376c7f2d33144cb83709e08eed86cbd20",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "P",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "6a3f2194b5ea3d20a4cce25c944be88186e3512b9d70c3f75ab53214482c6ec7",
       "b": "8c0a4233adc266fcbdd6b4fae9cadc8112222a21f33ba8b8e5dc3497f9903c62",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "P",
       "survivor": null,
-      "tags": [],
+      "tags": [
+        "partial"
+      ],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "a6f48eb19518c064dce97ff8f9b7f85d815509f8e776072ea2f1403da6132fa9",
       "b": "d02dc8d5ffe562f7967ed59c09734bbcafb783703ed2f9eb421b58a3dee3a204",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "C",
       "survivor": null,
-      "tags": [],
+      "tags": [
+        "near-duplicate"
+      ],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read",
+      "source": "agreed",
       "note": "two phrasings of the same zsh rm-alias workaround"
     },
     {
       "a": "a6f48eb19518c064dce97ff8f9b7f85d815509f8e776072ea2f1403da6132fa9",
       "b": "f0f848786a4f5c53ba35b0ff324c199e9673d16fa8d045e69db18c3f3b5e0a8d",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "C",
       "survivor": null,
-      "tags": [],
+      "tags": [
+        "near-duplicate"
+      ],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read",
+      "source": "agreed",
       "note": "two phrasings of the same zsh rm-alias workaround"
     },
     {
@@ -1839,7 +2187,7 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "40603fee5f52b46a3210ff49fe3f9f6ee3c1769389e046419e844fe87bd77110",
@@ -1850,18 +2198,18 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "40603fee5f52b46a3210ff49fe3f9f6ee3c1769389e046419e844fe87bd77110",
       "b": "2b97d77c1682c0dd433d219e6589f0f31516efb4985401f8f69f0e0ad4e9c234",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "P",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "40603fee5f52b46a3210ff49fe3f9f6ee3c1769389e046419e844fe87bd77110",
@@ -1872,7 +2220,7 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "40603fee5f52b46a3210ff49fe3f9f6ee3c1769389e046419e844fe87bd77110",
@@ -1883,7 +2231,7 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "40603fee5f52b46a3210ff49fe3f9f6ee3c1769389e046419e844fe87bd77110",
@@ -1894,7 +2242,7 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "40603fee5f52b46a3210ff49fe3f9f6ee3c1769389e046419e844fe87bd77110",
@@ -1905,18 +2253,18 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "40603fee5f52b46a3210ff49fe3f9f6ee3c1769389e046419e844fe87bd77110",
       "b": "0bb0d463ab27c082f0fdc968769d0ddc641db751b2a3444569d498aa29a82a3b",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "P",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "40603fee5f52b46a3210ff49fe3f9f6ee3c1769389e046419e844fe87bd77110",
@@ -1927,29 +2275,3755 @@
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "356c4f8b8653047b95cbc74ea3b0a3f98f091facf6c33468846d87481297a727",
       "b": "106da64f6e8ab2d133d44bbf94aa6fabebdd319c2a769e1a3bb2a19f0ba77e80",
       "label": "coexist",
-      "sub_label": null,
+      "sub_label": "P",
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "agreed"
     },
     {
       "a": "356c4f8b8653047b95cbc74ea3b0a3f98f091facf6c33468846d87481297a727",
       "b": "b486d6269bc30c37a8124e360cd248190a6d5ebc48e4734137d57cd0d69d703b",
       "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "agreed"
+    },
+    {
+      "a": "755b470d7d9f10a4ee3f581352d5070086f8917fa976e4ef9c50080e0a331810",
+      "b": "5d2d6ea96f2a5af72d4bd33fdd3507718a42285206820431f1bbf4170c7c7c99",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "2ececa093365c677c570b7f085055240a0a9056e6dcf14cecb321f883ef92c03",
+      "b": "1e7e1188f70320e7625a5e953e8717b15fd6c928956030c9a60468a114545242",
+      "label": "unrelated",
       "sub_label": null,
       "survivor": null,
       "tags": [],
       "action": "none",
       "action_survivor": null,
-      "source": "queue-read"
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "352a4eb087ee406d5074c0bd13a8d6d807bd5a866728407a24c8e882ac203bf1",
+      "b": "ba31d12009afd332bd2422ac9aab39e5a955207e491c92adda9a5f9b3ec30d1e",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "42225e5af1d203830e6e30081e74045a83369c41a08f19d455b65ff95253336d",
+      "b": "b4dedb6937372db1ac607a2203a6135ad123f468a8273d669b80c917f8787fa8",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "1964f907dcc41c67564ef11eea25b5cd08a747772ef111f4d0bbb02ec661bf9b",
+      "b": "a67b3dfdd2a58f03fafe8ec1d8bd55e7c89236ce6476dd4fee0435fcaab9c92b",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "5a7ac4a1fad93b72afaca748761009a51f536dae3d8fe4e071f0c82ba749795f",
+      "b": "7154b025b99a040c91d760baeb7cf46db2d747f90b0a2325a44ea31991ccbed5",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "26ea827eb0c1506f98749df599f92bf1fc8abddbc8414f7caa83cc660a94988d",
+      "b": "c9e54f1833f4d0bc6800a072d139ad48aae047e3bec15193f66e45e936963e6b",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "7159bae684458488e81d712bef2e908eb9da2e384b1b5762f54e0b685b648db2",
+      "b": "d47f7da04b38710a94bbd4ff43bae967fd54b5f3dc12fd7366bd2608c2bae24f",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "7159bae684458488e81d712bef2e908eb9da2e384b1b5762f54e0b685b648db2",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "8e9557a5868e4d4fa9f74b13425d93451d6c5cbac8a8e79288c2d6311aac4661",
+      "b": "c3ba6f6aa7fd8bed0b7ae6ea43c88fb8d85df2c943a134f6fb0ccac045c79128",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "343e65fa574b30f52b9ef2f038a8ad5ce193e4b131c218cc84573db35be7b62f",
+      "b": "9b04362b342bb9622942833d839f61ca94aa478ea365b5c98a678fdc8259fb7f",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "68f88020270902306e774f113338cb00839775966120bce4d96dc3c6b2cb3141",
+      "b": "14b6a3fc038487700ed1122868e23c1b55bb99f4e6483d8048e2a409dcad1ee5",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "c3db68c3f29a9251e5f2c0eed154d69048ca9e3350a9870f0e9dd63693a020d6",
+      "b": "87c3fab26ca98b8f4705bab6d9761adcdf0a6f9fb39b6483a969bd625e6ba534",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "0ce47707acc946ca931731d1e07ade666734d436efd9a5fd009b355c5d2e0392",
+      "b": "86080f58dd8f4564028618c22432bd61e93a2b843be7c8f2a75281f4420b8063",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "b24a60a705d0ef690e3dc5e336055e3a8a120253b4a6c3a287911197adfba8ee",
+      "b": "d02dc8d5ffe562f7967ed59c09734bbcafb783703ed2f9eb421b58a3dee3a204",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "ce70e902e320560e32c3f3c6b26198364b60e7d6ff09448b0b77ca8ce4ed0a4f",
+      "b": "45c27baaef1af58f08c7081636c8b726858d36bf3434b87ab760054921b54ae0",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "06a23d7af53e25ff9a63f331ed05268c56ffae81e04d4b039c7d6ba88a10017c",
+      "b": "99b5e9007541b9b2d8e95d0b62b3cbce0edb6210ee276801947f30b7c1230efa",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "e33059fa01badabdd11ba6792efce109bb371d88a306fe1e52b783e98d35e416",
+      "b": "50132cd21c609ad4ef62b1dd87052b96ea5f8dc3d770efdf8efb5364e8f95bbd",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "75bbd259dda31a59e3bc72a1049f712ca8de17a9d8ac728e8e19603fbcf835ef",
+      "b": "37305a4241d6f600eeca2e791b5018c040f48c0f5239fe82c1da412d8623f453",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "04dc6a7ac4c6456628bbd35a64e1c5425e5910514a1a494821df41546491b8b1",
+      "b": "c2265269e674d86d7f1452e3e15fd609576c42b6d9d0b81b910f781809dec64b",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "22496fb6ca1b60a4e60397edb0ddf306b55571b01e50f0434b05fc107d02cc45",
+      "b": "1e5561d56f3d743c7bb52e7092f377bacd3e7f1559c7fef23023b7004ee3c266",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "5725d5d059f9de612fbe262b474baf2434612c78c9695ee111cb49af7abe8a46",
+      "b": "b4b8a6c068a3f02fa10ce63fe4fde24e705f488bdf0d58437fab24364c2a6a54",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "f6114d5f4e9f5b3ed9d7da3e8a5492b719be758487451a7988aee1e6bdadbac0",
+      "b": "8b423400f9be02a79208ba7e734bbcdb314a1768cce0253ae88f48b18ed424f0",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "9bf709db42ed2e14260444aa463610e6e092cff23acb6899e77f28e87e18af66",
+      "b": "42450a5d578d313e2fe3c9a556eb8ffe8611085a2696f6c5170e79ab1a03458c",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "5cd15fc066915bece4971e4ee7d0ef862eb31837f71de6f388cf3b4048dc0c20",
+      "b": "16789de4c9750378e180e8bbefbf0254bc629fa5a7d0594faba1c73c7c506bce",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "fdee205f932f90ccfa7340b396d98108db9aa7d5f943a498e7426a89fefadea6",
+      "b": "626a9fce53becf1489dbdfc98802df0168b394e32f18ea14dcf048c2452f2ee2",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "a48a3e6812c665de3b5c37c7c356ad77eaa25386b1fceb03c616e926a6a61783",
+      "b": "e848eda6db28b014062910251cf54c8497be3b52765be25c634f4cc05ff4d18c",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "d25d53f22955faaf2b4ceeab4b6eb74e83d9d59e0fdc6f850c567776cde5bf2a",
+      "b": "a1f36a79bf1aa07264f66c005d8c1fd166c395aebc14002dc3ce194a8a67bd0e",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "ccdb1941187ed1dde829c5a47c6818a89ab2e1a56c58e4a15ddee3b42ecc34ec",
+      "b": "95713e5c232c42cf63d46c3f90a2d262bc42efa8365fedf560941f048b8f7c8d",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "989379712d7406dc8dbfca076516922aab1734d3078cb69899d9a9903ce9750a",
+      "b": "b4ffb67087976ba2a2368bc1360e63ca7b1ec39c0c374ee88bdab0eb83770db2",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "30141c13a61dd000f9f5a799771cac60ceb2df01de3886a3f76244f841569e81",
+      "b": "e7d0aebd9749ef099b51baa09fae89a18b4462f5c8d0be691900e9df7cc57676",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "1310a526182658baf6ddaae80df08022a6dc7267d02cd0bebcf53d7e1fc9397e",
+      "b": "86c43307ca970bd7791f3b3469c5a0df30f6f93caf9a25c3c46825b65a0691fd",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "46c3c789d7433779aad20a41c9572c79ce21d4e47b83c72716d8007140e2bf8c",
+      "b": "1a710b60c83985451085e4f2c6e436ea8ea3d2eb09ac8348e9b3ddbf1c8eff78",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "fe7faa7c070b98c558465d20772a19665d8424422ff057a2c257efe96d254763",
+      "b": "b3d129cf8a3bf499217633e3f25466c9312c39acfd536c367ed2d95188e26fd9",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "27c142dc1a33450f9729b72b65e1c2f6fcbabfca79a10a190e4269621cde8954",
+      "b": "d2b92e5983604049c22eb3358fc2817162f7d4b1db788a07edf3dee531c0b779",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "e3048f362ac675cee91717b03077241bf194d05c7ce84113b37052e36a9daee8",
+      "b": "05d0d9f8ec6869ad7188b0a4341aa93f4331954f10380cae0f0bead2a8a28f92",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "7deab6b5c7b53851077e67df6f4e16ff4a3a8518153139ecb95389a66441d7dc",
+      "b": "059018841dcd2027421fc28ac4f2b443645b730e8a417a7ca6be30f99a7fcc71",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "c9a17a72c01597a2f2fe50ebf8498bc901928370b9d61bff2c4f06c1456fe5fd",
+      "b": "372fcc021d8fa1de6556f0701d111da7a9a89d8e1f6313b32275f1f01b6d9f7c",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "c89580dca80976dc7ebb30d8f3b98a33ac68cd01e7404ee38ff774ed5788e1ea",
+      "b": "6511b8660f21b5e5e5818f4118edfd57868ac16a144a7bdeecb33262c94a3ee2",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "3c55e1a9e737c5ea34ba8dd673bae5df036390a86a5ff5ccc4c4b1f1bafd304d",
+      "b": "4c20f9fa5ec33c944001e64d8ae46977c6a890e50eb2c5532ec8db54d85c2651",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "7f1c67cc6c32de39c30f568318226eff44cd42429d280219358745bc9b606790",
+      "b": "0653a88b19eeb336522428e01cc1c492cf26ebc4d6c01ef836b09372725d6498",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "2ab7771962bd8a15dd7938568d292af4db1160578a1a26d7e12fd1da5daad5c8",
+      "b": "4d92f0cfd576fc2233379eaafc606a48de79fd769d4b54d14db260f2a042467a",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "c76ecfb2b51b48bc360859c7eee04fa7fe6ff614408b1755a2797be922720539",
+      "b": "5aee105b2da6f5ecb37f7c7bd0064fc7cfcc404442b0752bd04bee5e737c1aeb",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "07caefa542dc3aaae0130d0fad282d85b758d296520d83b4c5359e5e6e681022",
+      "b": "14b6a3fc038487700ed1122868e23c1b55bb99f4e6483d8048e2a409dcad1ee5",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "36002945fe0c225ca7cc3bfa85a3d84540c1014f247e692cac2a84d8b75334fd",
+      "b": "6518a6d7849fdd337984fcc7c181182d45391196577a1966f7c3a2b2695beb0a",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "a082d77bbe715748bfd4f07f727d4d36c143fa6c0fa097a45676ea66597f2c85",
+      "b": "dbc8a193419f8785d2a85f9cba2e83b8957d50ebfdccb0fc844334df29a6d392",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "61aa4e5c59325853ca176c61c889c793cebb86c2c68b3722487774fb96c388b4",
+      "b": "5a8c0d76678f46b2bfcf41aa6ad9680a295fa33e8606f561c2bf35c30972803a",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "7664ef91e78152a4101fe7fef41aeb014f56edf450f838474acb398104ed8038",
+      "b": "f113ba15f5ae3e933d6079c6107844e05dd05276f0ab66ddc0768307a4b81991",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "fef315e2752dfb6ee5c97cf91ce0260af185b7f95877474d6a7c7f7373527060",
+      "b": "aadbff5a9dd7df9fa15d1622611bf9ad2645a1cd56dc0180a4571c2adbb9457f",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "29133bc25c880c7786054b6ea427ccc847b60c133fcbad5e3e730c6a6d950d7f",
+      "b": "1f04c631c0e8e2700acfe000e3fdf70d47874c0bf4d0831488b5b6fa15cda650",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "5c6a52f4b3488d01ea02af5ebcd1a65d3b3ce9b4b8e2c85f682a4d7ab5708bbd",
+      "b": "ccb17630f4ba3a8e5babfddf7371825c3dafb806e15726dca8b5581a78417b05",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "6b6c900e76b1a1fafce8d97bc1e9c9c8137433f9e01ca135192124241ca6df2c",
+      "b": "d41f0e47bbb8d313f3b2dc3732d5048642c1b0e215b101fda52bc9cafde12655",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "7fe487e4920567af4243ef64c7faf9bdff1edee693db118354b695595682cb75",
+      "b": "01b1adee9ce062ba49e8c8af0114d867e50af5d6c1eff33fbb388e4d2740456a",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "315b8e48c56af38bf9e0ce20ca216bcfe89cfa4bf52809bb348bc87f3b3739a5",
+      "b": "f25bd84bed5651e80341fc9b36385e2d021b58672f13501ab5409396c08963ba",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "aa524d696d15104fee797da4e2ab45e2eb93a53568d170faec7e3d7fcbf58fc8",
+      "b": "6ecc772faca613e95c2e799bfd053339e13802d4fb7b675ae722a96081293441",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "ae930d2abb4926e1194c666722040b9ae3faf434e27a760d1b33bf494e1e51df",
+      "b": "21df3ad4a9e4f44841722eaa0e39738b8450e91d4f54c57d801445317ae9c5a7",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "0d64b6da242e3886b6ea40ee018ef099bd2bf3578f7160afeddf415a83e8388f",
+      "b": "dc51b03e6e751dd88ff9602610bbc18516fd4a813ccd703a743171dcf61e347a",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "3aea30147ff94728c44c296df990b81453ee9935562e92e88bfc2d07b01aefde",
+      "b": "4184addc70f31d93644a4d2a07f46016ecf4e0921852267a0c2c1956dbd86d5a",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "87f6aed8c3fe532627756a7f38aaace730b6d47b1b3ae180e65408ceabaf9afd",
+      "b": "0b4aa1c35cd14d780d7e8e6e6be026621e7f9f015f434164ebff643cf36a5d6e",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "3ccbf5e7b8b9c67b53037a71cf56930ead0349ff2b639146c4b50a2e5f662f52",
+      "b": "a31521952dbd482894a9769cfdfb742535f116bd3ede42248eee8ea8a7b56020",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "2ccc434aaa89f60bed2bdd6e2c3c44cbc4861fd294a138f777d6e10d5cfcaa75",
+      "b": "38131e024c0cf66753d571216492a00b03f4573fae640edc6d56030d9efd748f",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "91f3d6f18d6f44861ca6d171f3059eb0c2cdc3ca6a8439cb38db87dbdc31f81f",
+      "b": "39c08d0600a2230131b6b394c1bc9800c98fbc3c873e29e4640fd613d99252fc",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "344045249064d950dab1bd01f8aceddc868f9cc237fde061888992e8c41d3bad",
+      "b": "50219525be56655351d79a55e6542d058889ec7f44deddc85931567aa626d507",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "b87d6be6568dbb41269d3cb11c1661e0e70aecfb7af3759f740b17cf6f884101",
+      "b": "925271f769c3aed570ab3180261a1281b16c9f9df67a0237998e3827f19d5d91",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "da6fdfb808b5b3aaf28bdecabdceb07d6ff0c5f985b731ebeeda4c4ea80860da",
+      "b": "7f258cbf45ba5d194602d94e1781000dca93b07a127aa91e8c3882708aace92d",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "b4c11dd00be9241c1f9562c950b63185ab90f89a0a74c5f0fb285bde8b4b830f",
+      "b": "16cbdb09b384fa1517e3cd345c23d3c91e6367c248552cdcf74e1957c1a756df",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "081d2bef3902794f0486ea7ef686e00252d0ad8b926d3efaecb04497e9af5d4f",
+      "b": "f6e875309b59b5afc778b12e60686ebf888a12c9a757d7ab1f4f0f767caddcda",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "f925ed8e71ee929b4628d8a663a56ac598879f33ba579b7151815f961b68b453",
+      "b": "362984c88857d8c7587f7688138cb48b6fa539d6605b69f0bc4e9bf719b615b2",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "378a27f2cabec6b84371839f0284312823142f6c8557742b324f2a6d320a7c30",
+      "b": "84f4f04a5563fdb3524bf5200027e17da18b6593f7da48feccd0174a5d570ec0",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "8bee0f3de7d1cba5a6320899e9dfbff69f1740c9a2a1391e5a8b35bd05c99fbd",
+      "b": "029328b0d54b025a5edea70ca513969f721af744b1bbba34f5a6c5934d99fec9",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "6943d5cc10c4cb4aba5776eb65e29af12bb62fc117c6b5317b107386d508005f",
+      "b": "4b5d2accd3d1ed5da2b8c327ec17bfc1c3ca90ac678760b9fed642d404292db2",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "31b4b822a64ef5128905c5a5455903f10c6210701f19eb272f07ee581f632f0e",
+      "b": "9353eac9b55916a6367705e7c59dc9ce42bbc3ba4ca458ad960da5650866eec0",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "30076a162e0ff8f562ca2919d12274f9c247090f523fda615c17c5362a685e37",
+      "b": "e6afbc3173263c528c9381d537a91f8468fd75d6c20d6b4e4543a3757976b30b",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "ca9cfd3909a122bf13b4d57b60b6ad29abeece5ecab8c71a1a8c7b65fd908bd0",
+      "b": "114085063a5ca89b07b48cda3ab169017849be3ca593736b5b613ba2b336f868",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "929a196761298a8a042dd965f862a4e04d7d6e67e4f94975b0c4ac2bceb50e28",
+      "b": "6ebbf53afd44eacea41f967a3a40d5f4b2626da8ddb7caf3b69f37188ca04021",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "3accd87fe38305a2299831794001105daa5fa7448742f9fe99f896ea5ceccb95",
+      "b": "c09f78a2d731263c85034d604c2a6ab6fd6db291cb10bec63e57cc735e658756",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "e16faa8d619e721b6aecd6ca52a2ac57aa7f828c252b39624bce22656a242840",
+      "b": "4d8373835b01bfa744464fb53f0f3e514ef291b39bf8637d14bdeb8bbd455199",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "535ab10ade23ac5aa24c3055c9b0fd3b1054fc069b52e43d283ade3ea359a68b",
+      "b": "0e0c5c320ca5a210651e7e22ef181a0a9d2cb541b16d5a254062fc843e94410d",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "b91092468a9cacd88af7a5295f7699caa050c1553b14660b38a55d8e9ee936b1",
+      "b": "d44389b6d059a2a2bc8573b013ae3ec73744e6cf17126f28ef6ac94d3f41b0d9",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "4010f3a775b952eac9e551739673310e13a1c88788caa1019df9b84c3325fd8f",
+      "b": "61c679781b25254ad894db1e7c5a40157087d181ef925b0f8d42f7dd8e7a3d79",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "2f7cc3a02f72a353fee00e13008f060633110ce2a028eaadb51093afbec77de2",
+      "b": "c9e54f1833f4d0bc6800a072d139ad48aae047e3bec15193f66e45e936963e6b",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "bb475cb2d50b0ea7d628aac65012e9f3e05ef49b14303f46da90f2b7ad962e46",
+      "b": "c7a159570136e15baf5b29042b139d71ab8eb5cd131a048fb8a4f31bc7175b8a",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "e57f826357ffe4d626161341486a21cf03c4c1a15759fe1b9235cb22bc0668d2",
+      "b": "4c1bf877b6722291ac0d97ec29fbe1efd74bff2c10ae6d2cf9a060c1fbcd65d3",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "b80aad08cd87b65983aa1d82445b5a04a895c35b3412bf0bb25652f178b971b2",
+      "b": "3f041ad2be0e987b84a7d2a0c2a79ff6373537ea8913c06f9aacbd57e068b853",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "0ed34ab086a66ee86e8ee4adffd8784df38ec6419198101cbbb1e309bceb140a",
+      "b": "731b0157a44dd30f64df0fc0b01db69e60718dab70121852411c39b97902c9bf",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "79040c6fe9907e6b049a41a531432b6b2a1367e2e28502ef9a66bee1fa067ef8",
+      "b": "585c4743aaf916ec35e5d165dabe73bb35e3cfd131f5435e4e42c568050700b8",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "60893b864a3a61bd7ec51620c19cc65ee582d946a79c8650c4b45382f39d1808",
+      "b": "eba58f24aa652c06dde6636fbe62b4c4b6360a8020eb83ce01bda916a67c6111",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "1475ecc8d78134f9d9219e178f775e1a7707a619105cbc69a8ac3344cad819d0",
+      "b": "80fbc15310484517d78728f52d9bdde2d29b0c85c460fd964346f9518f6b02d3",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "a5e7bb6ec7e9629ff40d0bcbdb3decae99c06ac2b230496186038cef60cdf076",
+      "b": "c73484963ca6d5b75bc7829d68bb39c01392a4fb865e4b76b368704a5686d951",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "5a378648d557c8b321c7bf08e14433c0e2df6bfb3b549dfec907c5d52b5cbb93",
+      "b": "dbc8a193419f8785d2a85f9cba2e83b8957d50ebfdccb0fc844334df29a6d392",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "e2ad41f5269a9b14b3cf03a7d5615b0fcca59bd00bdd573211d1794ae304aa47",
+      "b": "59dc0f5b18b7d4dcdb9cb5e6384543b585a3da24796c5ce79fce82f5c54bc0d5",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "620514cfa923fb55b6d1582c3efeb448d4f82ba867817a4d6803712e14fcb6e2",
+      "b": "b920d0c655dbc47c9fe4c9f9af47eabf4535ab3abf78ae18f036cf705923c253",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "1ce0452d0cd226b52d07eced2be03a84611804f9278c038f1823eeaf646a1202",
+      "b": "9bdacee1d8012d407c9f5f6be6b63112664ccac81e2dc9109a47abe07e136416",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "98942a8ca036b58e7cf765eb8adf520fc1f55fc0895d0215fd107a1caddb4e33",
+      "b": "b4ffb67087976ba2a2368bc1360e63ca7b1ec39c0c374ee88bdab0eb83770db2",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "ed942906134cf2169e2e70662fc70b8e4eb03fc5ad074a3cf3094519e078e312",
+      "b": "9a8406768e8989d4260f27dece14db628d7e637b1cac1e91436d05ee63e2b461",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "dcc5a7faa8c09fe3e5f248733a2a6fe2d67a31bde90b04a79651fcca72169def",
+      "b": "f925ed8e71ee929b4628d8a663a56ac598879f33ba579b7151815f961b68b453",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "5cd15fc066915bece4971e4ee7d0ef862eb31837f71de6f388cf3b4048dc0c20",
+      "b": "9ab85c2fcced8ad238909326a00e6f3e45e18f6d723b79e96c0973f620ba2cb3",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "8e0b0fc8cc0bd763980b7d18f9a06d48027822d9c1574264d26a3c98dfb2948c",
+      "b": "9f99b306edda3cef84332657966b705c9ffdfd6d75e450d2fbc5c06d344fa7a4",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "794de94de4488184a5f2aca39f71356a2a5ea04eea645c0d25de2facd6b963eb",
+      "b": "9db5d4f316d962ea63cf2ce8c1f7d20fd2ab6c59436fcdb2d15b7c7aa5a82e66",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "6cb03ed670402f6e0cf5751d8383548797d27f1d4b99d808b1802d03939dbe1e",
+      "b": "ecbea1fc7aff7040eb47f548670ebd23e951e313c0fa20867811a66ccdb2c1a6",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "9a5f678696f0fb4160dbe4c2e83fda28b27ff179528af2b16f922fa7894e656c",
+      "b": "317862d36dde323e2d2ee1b3fd652a04afef19da947f4d07f5f94e23d1d25f81",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "157194e0c5b43faf010752d2dd378c58d2e4a87258f1081cee7fdc0aa6967033",
+      "b": "98c662fe0c2b7221a5df782b687bd15b354b8f07eb64506d81cb8350fc9c5c1c",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "28e5f6615dcf48a4fd7583c1049bef97827cbbff4996c64b333190e74b42121a",
+      "b": "696fe3405363dc64ace940600535f45b00129b7ce4e2bdb41ce0a6892f8f013f",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "2bdd3a21e4d71ef2daa17862366a285722b5c69c7c139ab2cdb8797133614c0f",
+      "b": "602c5fdada99c3948a32e451d64456a0c97cf7317ba5f7136392c21a51623c58",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "60a715243e40658c2ef41a854745a9b55e44a9e7c11828a717b16e4ad8d55adb",
+      "b": "2d3e471d47b24633b409e94a3c8248b6a7abb8a5abdaa88c4a7de8f99e59bfc6",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "e75247973fb6eb9ba216eefb8ff2ad5639c4670895fb01f39f12d03b2507d490",
+      "b": "04e6c9395f8faa9942cc100095cd43ce50500f35c39f8431d54b85cb18a16790",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "912cd55ce1ba9d3ff66d3c397004e8d63c7ad6d611404f50e8f64192c2501f59",
+      "b": "0e949593e895c11cf6a52bc1083f6ddabdc08deb81614515862650fb22df433b",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "b026a956aa8340d7f1b8bead58f78a9f30d835377d1416be5c689f3da37233a8",
+      "b": "a21c1dc7a7d885428f79189c4e78f295ee48e44957db504eeae58a503637ee11",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "c586f0de700d5a878bead4e2d549b325150ce52c2a273f59d83aa2bead052b94",
+      "b": "45e471c77e1d2b5587074a46f2a954745822e2c4f0efc90c00d1f9c443fb1a23",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "d855b764b21cd411f3feb08b8285f849dcf7f25c6cb01592129bf17f7d91e690",
+      "b": "73c23a065b52369c5e5fb61757a1a4b7dc0bb01bb1701224d2a4748339740415",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "67659b0b6e58b446245cad3e4874a114afb9ad0e67401db0a622494bd6b49ebd",
+      "b": "454aab275858d71b14e8f8842ba5f79632b1bf79e0b086a831f4d99ef949c487",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "ab26081d5248f18a7741ae08dd3cdf4570a1420a136974193b7b0be9ee85434e",
+      "b": "f0a33b41f47160c996a0146d4c7a98d6d4875f0a4f502532cad4eba2b4ebf9ba",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "5001eedba0ccda0aa3427658e6a596ef0bbf2d8b65ee0bd0a5869b3a4c4cc388",
+      "b": "bb2c628a89d3f8cd0cf5205ca1cb3bc844f0efc5b76b47e87d542e3084d7c0f4",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "ac6c2819523dcf60ef688b982ef0df49c4206413866e58708568915363428d49",
+      "b": "d89040167f3337a0604a8eb90c1746d18efc44421c5e891b6247b604e7d45f53",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "22544953d903c023cfa4225d6a3f6bdf4379ac913f7a94a7885fd7859e86c8ef",
+      "b": "dd4cd12b211a323ff9e1361c3d187dca4ba3478a8a73b110ae2b9219cfbca29a",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "3f836c809c292ff05eff3ff83ba9f43ca8abb2d5117e5683ae0646908d51e17c",
+      "b": "74ea1ed8b99de881aacbb66a3d3084105ccc25f551e619964b054686a19f0586",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "e821d505103488238462300883412d3ec5537f2500c87c1a89e4d22eacef955e",
+      "b": "1d9fabc5274a0f19a6f923581365955f9cd353ca6b66f9fb8f65be29c6151324",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "7631b2d1861601d02f8eb4b7c48ff2fc510f71112456b023c47ecb799ef80750",
+      "b": "b80b94f5376c78781a61e445a85b2aafa6719909f30bc878a792b9fa3273c7d7",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "5aab2aaaef178a2594150455f76a4c9919a9c035f32cd8643290dd0416e661f5",
+      "b": "461c3967b420f1a68c143dcabc4dd5fd846120d9c28d0efccb5806775d9b4a98",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "70443b9b220a0dd87a89ca529acdac2fde3b7ff3ae8015d44d5470abfab43af5",
+      "b": "b1da52c3a3ca52753a174304431992af4bb1c256b3484dbb380e5501ef7b53a5",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "666470614d28d238ffd52f694026b451a05c3315e695ce012a924ea349a9773c",
+      "b": "b42b61e99dd708ddf051bb87711d7f3ddbeed66e859782979125825302bc0ff7",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [
+        "near-duplicate"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "3781975c642086a992cb8bbd352f26fb636bea662a39da27a74b7edc2f1198a3",
+      "b": "e2ea49e100f1255f90e472df574529f5f194cd0d7e73831556a8a3e4995ebe02",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "d948defe489dc9484454240d2d05564649b5f3896c93478a24fab4b6b121a25b",
+      "b": "975f1333932fe75dc6cd7b3f273c705c608f6cc724252622dc622f4fe2ad7f5c",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "a3e62ba4b2d7689ccd1468d82d03940e3b660aa8b97c627f8eb21a74e01e7542",
+      "b": "db0f1f3898b15e4aead75d2ce8a224cc052dcb1713c7925e84823fa010e4abb7",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "24d7c5aa4e6cf08719909cf631c07f46c050696808edd831a408e8a63268eb63",
+      "b": "bd87ce2c666d551d8a0e1965431776ac6ce57f42cf90b06d535c1c950b9b4927",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "1080bed221baa70b204185077079ce56af7ee90152cfa0dd6dc35d45d8163565",
+      "b": "81a8f63ea3234e07fa6a7f0bdbe24aa157a60418e28c9119f579fd1e3fd60e82",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "6c24e64f4902d9c7538324cd2b65123efc6453203f4980b0c0f1e1140b439ff6",
+      "b": "b50b76b626a87c5cf2200ca6ddd8362dee58a56158fceb66873b0d020fdb37c9",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "88689d40c67132662144764ed8e4c240981e996bd1a980e37b0e7e2df66cbaa0",
+      "b": "80b45ea7dfeb78c9330fadc40e267c35c929346ccd07b19bf0bbd4a1dcb43c6c",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "c65b5f3fe389c271667fe4e9c619d4e2bf29b51a6f9ca8fe37b6b3521a7b42f4",
+      "b": "13d90a50a3171218531867cd179494e831f8f0d209b252211340a661342d4863",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "575ad0b24572653f620db7f8b5487868a1dde7ee5f6c95ff4815327a5fb501dc",
+      "b": "94f970a94bbc8d554e3af8e902ae52fdfe19e311e074496fb74ae53ee3961085",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "3015dd192a1a3d245e52624aa328039a96f3435c5e615a7024ecb3f94a8787ac",
+      "b": "66411880804827a9b6121da23eb733d4e7f3e06947d530f18e021b98855d02a6",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "958f5dea375a5d7f1b663422bc828fdca7f04f2dd1d425c1139eee20e730418e",
+      "b": "097013de09cd0144dda3e863e4de58845b22a2640fa5e61c8b93217c983de992",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "ac55bb6acbb4fe558658c96d184edc5567ae407b99d7839a5d7056c618c0761d",
+      "b": "b15983532cb24c4628b430b3310431ef21b0fd7559896c1c6cf5e9f4e0deb2e1",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "148b99586efe7db725c1f98bfd43add04680db8e7055c04540a58084ef7c96d5",
+      "b": "0ce47707acc946ca931731d1e07ade666734d436efd9a5fd009b355c5d2e0392",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "c812c21989659db1d855c841a9db6237e1b59fb9a7ed9c797ae555c956fb826f",
+      "b": "585c4743aaf916ec35e5d165dabe73bb35e3cfd131f5435e4e42c568050700b8",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "fe57fbc0dbee1be60fb7752e62f1817cd7e0c27ce505120d270713dfac61b8b5",
+      "b": "a31b57cc06e8f782dbd53d684307c4bff805d22b7b742d800077ec15abcb3949",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "283933cf6618cf2adf3009325a4ff4512f261ec369a150127fa73ec9f64fe658",
+      "b": "b4ad49ab7ec03cd9e5e8dbcbeb2cc651737a549679b052a6f598a81305dcaa7f",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "d5da075a5d4eedb4a9387b02a055a79362346633c4e20593963b64b19383e8b4",
+      "b": "8d67247a45a3e5002863d8c2c45b7c3b4464b7339fc652a79216b350dd46706e",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "cd5a27e4146d4046238e2ec6d93bdfb0eeb2fa351fe6aaa3499091ad1718e468",
+      "b": "35d42e89134c38d942ac3bcbf3a727ee079a9962eb33dc89a736c77cfcce62e1",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "a0f804d33765ba66d01107dea666c41dc90cc911f604eb701e22ebd7e570f29a",
+      "b": "0884a332877d059e66da45f1496203e58881bcd850bbbd99be14bc6cb2c5acdc",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "a85fefd01c47975846227781a86699cca00e602a8f31e1c268a6062d4351e218",
+      "b": "5e58702f66c465bccb23dbfbcd5e1e9dde862653b0171286f0945f9a9091201b",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "a2045a9abcae104862f3a3c6cfe2a5acd575a40527116adb9b9b06d88b51d56b",
+      "b": "5b4247885c8aacb32b23a02277908ad6dd6eb03e37f2268ecd4443bf79f07749",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "14b6a3fc038487700ed1122868e23c1b55bb99f4e6483d8048e2a409dcad1ee5",
+      "b": "957c5235d65deed158666300f2bf15cae8daa93dc441276eea6cd68c4223949b",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "96f80c742871353b0a94516b0460111f199bdb1cfe276429578dacd8091b153e",
+      "b": "6e9a6dbd9b52afc8ed24dc5d011f0743c6382cc9c8655a9aea9900a8e5fda9d6",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "4d96c4d4742234269292c076ede2040dc3fef11ba6718f380663c8849abb0c18",
+      "b": "27bf2b7fafd0392349db090fe0c6853438236e8c6d9a311ceeee584017a218f6",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "964784df2e360c545efd4bbdfe526de231c9d94747f7d71a5ec3b35b32dda434",
+      "b": "65cb9daa3961bd086e48a82fce137a54a1e0490b0ac4d6fa65292e67cd7a66ac",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "0884a332877d059e66da45f1496203e58881bcd850bbbd99be14bc6cb2c5acdc",
+      "b": "f5636c4be055574b1b43e6585a19096f5794dfd73b3e81b37fbd3bc83f943ea8",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "fb149caa18c48adc624b281a56181c4fa0807095123786851828ab83684e9a99",
+      "b": "7297f1edaec8bc7dc6294f3f7a102bdfe6204a6635bc3c519ba2b1601e6aa070",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "d0e649a3ce4ee10b2bb36d66be2be145ccabc633519f8831e903b70e45dc71be",
+      "b": "d648e6a02f392746b64c8e7c9b8d589f8811d25b699cb309a58b074156efe6a5",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "568d328391d87d4c03ea6f86e285e879b103e23ad8f9e2a6a4a41b45f74da2c2",
+      "b": "0f175023b06fc5255139a5bb869086ef9a1eafd326abb4393f4dbaef4f447a82",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "147b326e658de9e4d821476fa1667a7523a544bbd712103d18c5149da65c9afd",
+      "b": "ae459b32795f3f8d917c6c588bec38f83dfa00b52da6b16d2b91ff9e3141ab5d",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "4293e97cbebec8e2fcb0d756034a727de80722b0bc890b0920658d4fd91343ed",
+      "b": "6fd166309e610472d81717974a3ddb5a023b8e5f944dab7236ab6776be7ba1ab",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "02c1ca6065cd5f5affc3fd577a33c716e29e20002e5ebc71b533f0fe5fedf48d",
+      "b": "ca67a197a390dc9a112e0e6e17366c6b3054c7b409760503e4787619739c2edf",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "46b9db9d35a50cb3bbf357e9c5a72f266b0cf9359bdc1f8a08d462c1407bad0a",
+      "b": "b4c888138f7d97aedeac6ac52dfe116eb4c3f175d9a38ae6cc105668b9e49313",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "91fee86edb33fffc17445d6ac8761aead106883ac548ad88a99c59123bea9d12",
+      "b": "135b47e388eede8b06fd538f389ce3119d4753fabc687b975ee78d5fc4e5eec2",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "7a30f02a8dc881026fbbc10ec27202cc4ea6992f48aa513071c250b18014085d",
+      "b": "6d06d7338729ffad74027d7ed78fabc40bb8af402bd0d2ef13a62b36fe577381",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "afa425ace6bd114822309571f6045aa2e2715354e8122a9a440a5998a2069963",
+      "b": "f9fc65ad2bb7ee667e936d507f9f5104f852903578d2e45d11fd54fc6a03d08c",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "c142b2c7913f2688819656593d90637cf34edfabe56c2def237793d15736a8af",
+      "b": "e00a83911f3f7265237beca689d738f7b7dd6463215c830815dbeb5c409b9bdc",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "9cf1d272c468b9d68a93d9320dff8adb72ab2b32935c6db2802d254dc495e4fb",
+      "b": "822a84002e8db363b04cb0ee519edfd69cda1f47f627fe103721f293a3a6ec1b",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "5b785d02bb83a415080b57d196f134828550426cd510832c8e83c229620d7fed",
+      "b": "5cfdbd34638fdcbca051dcbae89924092facd4843cf06c65d338de1f389a9dee",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "466c89fbb8dff436d99a9ee69651450a93d1685235503c397f4ae22c7f14d99d",
+      "b": "a8706925119c289d44d2eb64382cb79d4367952143fd255f998aa048f8098fba",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "5b7ace0e4bdd92cee6af9294a00be42014b0c7dc5cd8a966e3840ba5c6e43d99",
+      "b": "8b3f86178b7c53587bab9c606620b3f1535d10b90fa8a84bd8247801ff3853ca",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "348cbc4c6fd3052341dc8abfaac31a6bb28896b1c4bf3e2b0c828bf03e8502b0",
+      "b": "46c40aa37343832d5b07bf69ec57359d82ee9546e353b38cfa45f82f063aa736",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "6c328cdb73ff5789dd694033a6aa83cfe93939cb2a631aab11663662769ad3ff",
+      "b": "6da4b7cc12b346efe827c747538f69685357ff2c783d94784aa1f7a08d678f94",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "a6e42aaaa84832c815ebf472c1b4c716447c363da3d055c473925d10eb44e564",
+      "b": "c5bbff67022da618667afe698319824a2828142f04f7de81899a77312e0685c1",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "f4a14eb04cda00a3b0f5073b3c7d66f4dd5a2e02862f6a78ce81ad0d7af59bc9",
+      "b": "4ab50ad8349751121c9af49d2300af4294e5899cac3090230391a1f7db360f2b",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "2025b43de812524c12074e7e262207d5572ec6536c0b9a372a74b9cee5f68114",
+      "b": "81bc8c98205da21efaa879296af916bca8dfe8c8f7f578f6e24b931e428fa257",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "fd816d0fb845c45c4819a97f3bce8fb0f34b67ffde80945b5562edc37dd1bdd9",
+      "b": "541ed36e775e4f822ee463caaf0aa73f1f98742dec4ec5bb31ff363ec26d9d57",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "c4467c5dc7a7907fdf2812c118b8e1c8d73af563e339b8578d973a7eef64885a",
+      "b": "03373191069d56d59987ee0dfb906a47d44b19194c3c261362c872d9c4878dda",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "4f1c87cac2e99ba98080e682aac00b457ac1c0a3899c0dbe95a2a890c7d3586c",
+      "b": "ea102a2c2c68079f2f9369d5a305a224846035458f542cec172c075738154d8d",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "dde58be3bb7c9718e9f6629ad6bbd51f8fe436e3fb76de76a0cf8e4cd389cf5f",
+      "b": "869b0bedb2b1d3f27eecef26b6e79cd77bf0f6adcd5e9a90721930bac185ca09",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "a67670ccf49870b4f972ab54e19b275546fd154169da164005f244664a895222",
+      "b": "63762dc20d4be020da914cbb444239df413271cd1741250c930a1e32f99655ac",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "9d681e6a67681051958678ff7e3c2368b79369df51fa8577bae4f81efbfa56b0",
+      "b": "b9a45215b9453a83d44ecf956669a6bc8b99ccc1f1d83cb2c9f042cfd1ba5403",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "a0c0caad2375aecaaf51cf75141d69a6c5dc1c024097cbfcac77cfdca43ba290",
+      "b": "78a0405f05be2c245669e07b0fae962422078a76be330f4f31885aa19afaf45c",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "8ad2d334f1e9992dcec35663ee886cb5db9f367cf5c1eb607696007cd6ad05d0",
+      "b": "f874dc003779fcc035c14cc1465d4678df3e2d45ee611cae968e113d7ff47eeb",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "c82fbcecfbb0500e195a561756b79a8c297ce5bf2533524477da291e13107a1d",
+      "b": "fb9075be3505bd506ecbea8b38647c333cc02d235c1a7ffe020ad1d20a48f859",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "6f516a8b8a38d54f896ce1d6ee3dd0ca0d063edb3df1d353887d944182965997",
+      "b": "2ccc434aaa89f60bed2bdd6e2c3c44cbc4861fd294a138f777d6e10d5cfcaa75",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "a1dc4103286e82bca5f208ee0bcdb495a46972837121e0df898de649b411c4f0",
+      "b": "e925c84c9eb79a5a38358706a36b6c3124ab42aefda4ba9d754386c8df7c860c",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "b6dce07303e246d761221eca04bcd8bab80503878a4474e51bc7fead63c7e1b7",
+      "b": "43d8d0ff70421e2f63834e04dba9e42b86c4828d1522b507874a69ae1b2bd5fe",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "2f14d0379c97b25a8a0d54852986749dffa3654df5ff496915478c15e146f4a6",
+      "b": "4814f465366fbfecd5241ec799af48daa86e9f98035363e6334667bd0d2b3788",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "9acc9707703585b497b54900d1b124e6ebd5dc43e5201c4c3d4737f6ae9f744a",
+      "b": "d31331238111f1f9342feda13cecc0faeb1ee293201aea0fdfacb9df011586d8",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "362d4b6907989201b63f011a11adc02c46a9cac4b127d660f429515b73d63c24",
+      "b": "442e1270bdc0fa78ad6e04d6c0ac217f8e8ee78b7611a6c49eb018c0ce8e37c7",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "e368093e3273ae84b02c2401c7f28c072b6cf8e7462354d65145de5a22482184",
+      "b": "213ec7380c871fca566957094d80b629452eb2157d6541e3a7fdd4bb67a786e1",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "7c1a91c95be343d25bf2d759df49e42dc423e0bc93e03886cde4b28f2bb962d0",
+      "b": "ae4df399276d3fe5cb0870c4ab77255067c683532c6ba5dc5522914dd1fc5c40",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "542414a122e02f85f34d519c5e2405cec948638a1b9ccb57d904e06773a67a68",
+      "b": "67a141f1daa45f2238f9317db8ec8a749ffa9106b1427b7534f1efaca85ff135",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "c039dcf5a7240a1205363a2cfbe55c7eb48e6b4c04f590c32fb8a1ba7295f212",
+      "b": "3907c1621be06f47499503629a6d047234dce780171df60e8ad7dddd20e3b7df",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "eac9e3749594b156c34aca284975e724f0083a1be36539da54d71fbf2427f163",
+      "b": "8d0b88b045175e731d9f7da6a0e95e9a5a4b1265cd50b278ba1e7a9c74ebd1eb",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "da94fd1f458ad65f10292b262653f884400bf492f37d9545744762a361464ba8",
+      "b": "bb2c628a89d3f8cd0cf5205ca1cb3bc844f0efc5b76b47e87d542e3084d7c0f4",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "62f3a4798da6acbfb2f6d7ab0baa20967bca25c9694598ecad10f12f116d081a",
+      "b": "b0fc41aab5e27d8deba2fe0a75201240541d297bd2635a53a2430d0750940307",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "e958a9e022a74038ad2584d4d5c02a0b8445e12fb265480e310cf3ccd8171492",
+      "b": "4e9a41b0a2e962dc69a76f080036e2abef9266d57e8bf8503c5350cc3351cadd",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [
+        "near-duplicate"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "3943982b46dc9261e18b100ecb80d7bbd18c114640c76a1c47ce6fc2af1d55ac",
+      "b": "011e5eef44a0bb9aed4e8099229e95fc047c244453e5d98ddddfc1c05672ea5f",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "1bb83706786c6d0df7a4ef5eb0ffb2006b067d66974474054173cb021da9cc84",
+      "b": "06610ed7d0ff3368a8acb72788419013e1663e11dad2d86b365b4d689d657a84",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "879fe9290d52af4a827d3a575fb42639f145df8e144c3f646d062da441c59385",
+      "b": "ee0f8c4b3ca21577ece3ce4c13cf4d950cdb99a46fd73fad2dca3e99bb69f7a9",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "0983a19031d227be7f38968643ddf3169646d0d4e4ea198b62af534b4d91784d",
+      "b": "dfd634423e8345e7f5945b7d9de9d73b32384486625acbfac1797b53befc4276",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "d6bd7e34ae4de43874eab0c898c0a907b4be20c49edd2bc66823583f6a826777",
+      "b": "4e24295e73c455134b3e11534e2cb4bfd7db6124d65d4ba44b636f14f78ff6cf",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "41b9be903e08920cd51629c8d448faccff1132d4f851a8920a47e084a449806d",
+      "b": "4f62851c80fbebd35b573e0e7214b0249888fdcf46cf2602aa37d98146169d7f",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "941944ee4581a63759e0b0cc8b18f735c0abd4b6dca76ba7961b6c6170fed1ce",
+      "b": "d08c3e4be73d2e7b5257588bedbdfe36b87f1df19d390d9ac3b4b05936a9f42e",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "34eee3284e3472810f6e6654d4649ec2e629d90169805b59d66bb084f2f58643",
+      "b": "dc4ac48d5db82f3aa3802f96a12ffeb66a9570ff8f42f7a92726c6215734dd1c",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "5c51932105b3b1babf59bc9796904f2de8244ca14607e96dcdbeb8faf589df25",
+      "b": "37305a4241d6f600eeca2e791b5018c040f48c0f5239fe82c1da412d8623f453",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "c529d9148657f51e2e343db31e6693eba0e05f12402ffaceec9009d9b60cb092",
+      "b": "20704e1af91e0b665655c456db2daeeb3a3485aa8acdb9dd5e0e352d6e430c3c",
+      "label": "unrelated",
+      "sub_label": null,
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "30de9675f95eea0bc8b3f0289c6811504af91e5dbace9ca86bab7cb0f4a844e4",
+      "b": "a1b53fe16e6c12f2b16d532ee5eb96f283d9e80d72aa961a44b569ab627d5ce3",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-random"
+    },
+    {
+      "a": "98729d3b78f3765f7197765a914df86de55d59d68377906ead8aed9ac1ebfa83",
+      "b": "902d9b491b485b0b3d8ef979d8dd3d566fae9e41a5a88e7068bc8fd995cbbf3c",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "4d5b1a4650a8ed9d0282e3a3b71c5f45bfd0f3e1004bfd9fe6032d9ada9deeb0",
+      "b": "c21489cc244d6f40cd42f9d217afb5464355033b9a01e24e0cc8d2bf4d88a3fc",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "4b552d80a726863d50d6fb0bc01362a025afd6bdb5580b7e845d81b876f51cc5",
+      "b": "3acc0706c990260a2e96d82b3daca253999aaa22e548cb9fa7f3c7e3d243cc16",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "4b552d80a726863d50d6fb0bc01362a025afd6bdb5580b7e845d81b876f51cc5",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "b8673545f12ddb5b1b228961b808a7b192fe88dbdda1ed82b18430b444d78a0b",
+      "b": "b74f8b38877f1c621d86e285cc983573249cca07aabb08d35285a7048eb23369",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "d8b9752dcc12e01738b4b79a0f72cecd87d211e43db2566ecc41d85648bcfcd5",
+      "b": "367f03d7c9569f881465777218611a3b2acc5c2747fbe434e17f1c3478ce0446",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "fa5033a2c4921dedda56d7e50be67301c3ba4f505078eff8afcc99529d4e9d55",
+      "b": "df2158d164028bcc188c8a69fa8177880c89ff91fe90b5bbfb395c866f88867b",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "1428d6ddf5e13d77cdc5e92ef6264a718300d06a75ed008d1196a59615e63a0c",
+      "b": "77015776576cebfd25b6d9da3e58baf58ac42d6d5e96b7e719f7928f33477c7b",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "b2bc4d638173afa576c1c9ae59cd2315663e449975ab38d320029dfaa09cce36",
+      "b": "00b7f52164960cf5eb23cbc49caedaa205ef92e23b2c86c94023890b7b887e69",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "b2bc4d638173afa576c1c9ae59cd2315663e449975ab38d320029dfaa09cce36",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "5b8fe7ad7405690d70af7b6027fc81f094ac134c7efe739b15e13b3db72ead3f",
+      "b": "94d395ab20bc0a9267b19af1539af628b4f8a642b68c558a0595aa6dee869980",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "2429cd4d27b1b031b0953a271f1da1139aca2d2887fb31646762b8e11bf3456b",
+      "b": "1601222c3e311a9b7d0c69bcc23b75c1428d380b73b241e9503c72913df186e1",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "d0ce21d68fd017e6398fc6d6ae05f94584f7eb17ee9bcd3dc920b1ecfe9ec7b2",
+      "b": "431a821a7f2a86e7205cbb5884d03e57b3b2700c4e67ee68428d86bab773d4c7",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "1e77b5aff8489aba4083ec713fa5e222473cb0b2424e752f9c5c03720bcace0d",
+      "b": "591f30ea07faaa78f99d8f9a75051b97169e57a566cfee624ea1d9dd239c429d",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "1e77b5aff8489aba4083ec713fa5e222473cb0b2424e752f9c5c03720bcace0d",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "a5fc6b0830fcd60e19c881e28b980ff062b4ad4794f6f1e40edf0eaa216b0153",
+      "b": "5d05e76b84c12773776842ffef1e5ab45f244d9e6ba1f0838a933f2d42dfb914",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "0d9535a06ce1350e8df8c02d242c5c2a54362b906bba389b097d54ba0d72d1fb",
+      "b": "5dcf250e435de25766ecd74760e6b9216edf47fbb0c6bef44347b7f45328439c",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "0d9535a06ce1350e8df8c02d242c5c2a54362b906bba389b097d54ba0d72d1fb",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "858360167aa86f3094f10850cbf561a09acebcf6a8669207d725c9cb97d5599e",
+      "b": "a75858115c8d9e0b5cc0fe32fa1ce864257b6f5e55c61ce1d4337fc86aee6967",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "96e441268b39e842443d4a23dc89b0e9a38b86740c63d86244fec229dfeb14b4",
+      "b": "1466ed377b99ba2f82b0c9e7ebe7e81121db8a9a2fde2b1af8bd32cb12cd7329",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "96e441268b39e842443d4a23dc89b0e9a38b86740c63d86244fec229dfeb14b4",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "dea3cddfdcff949e609079a71a7e14c8ab76410b460872b7417da0223dc5b958",
+      "b": "5ae88112ec90a1f6abbb5722b39a7f989007094ac10caffa7776483591704a58",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "dea3cddfdcff949e609079a71a7e14c8ab76410b460872b7417da0223dc5b958",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "30b704a5ff1e1a14ec9b2753ee092f7cadd3f7689fc8429954409293769653c1",
+      "b": "7404769072dd82f9c5c12c3d6aa60119530f3340a39221a86723295229f1254e",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "72b49c28eb062255b4ed5e4c9aca54e17a6a7e38d9520b8caa9719c32d4156db",
+      "b": "498b668ed1aaae9daead72d91b90b05853744605de51d99c782244b1d059b91c",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "72b49c28eb062255b4ed5e4c9aca54e17a6a7e38d9520b8caa9719c32d4156db",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "079088565064114c5fb93e88734257226ecdc5c21f7afef8ca3babd737d020c4",
+      "b": "62fcba8261f1cf6880ff9fea80af948fc69817b1a60d523cb588bb03a21f03df",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "9c9fd4832a5a2709b86f4c266f20223aa88a349bf585721ed0ff530a81c788f8",
+      "b": "aa1a383055aaacbd8d35fe9a1b73d98e3c843fec23ae44f3efc7c4068a5c7231",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "9c9fd4832a5a2709b86f4c266f20223aa88a349bf585721ed0ff530a81c788f8",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "0bf46e9f8b789c18773bbcd343069e79d23807be1931d0872d2ce6b1f04050b4",
+      "b": "4f2c076e5cc346497c78f25992ca634b62184a235db5241003f67c799d92f6ed",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "0bf46e9f8b789c18773bbcd343069e79d23807be1931d0872d2ce6b1f04050b4",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "75491c3be0b66c0c8c9169ebabae571acc30e5ad6096332487e7785964a5d113",
+      "b": "c0a85ca29e84ad9503b2da4662b70f4a6fe6e57aa454287c54cb5ee8c9502850",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "75491c3be0b66c0c8c9169ebabae571acc30e5ad6096332487e7785964a5d113",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "b24dfc2fba8867078964d93ed155db0f620e2830d47d9f17b761f2390734188d",
+      "b": "2d04da24df3f53da55b385dcf263e6633c47a39ff0a53f211051c38bbd68886a",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "8d142c4f79e0249e8306253731c500481a67a5e412d1b9a01f4ffaa8a0fe2af1",
+      "b": "2a966f17f4bd3812e14e3f325e0f9b57a28cb361df29c0d40d6a1449d52f8415",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "8d142c4f79e0249e8306253731c500481a67a5e412d1b9a01f4ffaa8a0fe2af1",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "8d142c4f79e0249e8306253731c500481a67a5e412d1b9a01f4ffaa8a0fe2af1",
+      "b": "67454dd96d70705c355b5d069c3f020c0f3c1a9bd5f3aaa035b28a429710d3d7",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "8d142c4f79e0249e8306253731c500481a67a5e412d1b9a01f4ffaa8a0fe2af1",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "35516e013e9f920da290ff9fcf30b187f7ff065a10f010126bc510db4c3f83b7",
+      "b": "bddf4c2aff67d8d9354319fcf4e9171e47b190edec51d125999801553f267852",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "b2feb9db9953b034715c2e88851506dfe8d5672c5500a8ad68ba1126e99389fe",
+      "b": "802ebf5b5100a99b77ada07baee880c66dbdb62bb65b4f3d6378974885c63158",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "58671ad90f8b9a0869a8218e1e0e4d08705275c622bbba531b46c97687b18a70",
+      "b": "b2a99a3c57383d693fdee8eb745b380850b11f258f5464f264a8247432eb0036",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "58671ad90f8b9a0869a8218e1e0e4d08705275c622bbba531b46c97687b18a70",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "58671ad90f8b9a0869a8218e1e0e4d08705275c622bbba531b46c97687b18a70",
+      "b": "c812c21989659db1d855c841a9db6237e1b59fb9a7ed9c797ae555c956fb826f",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "23b1319c3e2034b8a20720dfe234ea96aea0fe67dd994f991af32bbad65e835a",
+      "b": "1d31ab8b23021ffa276ba01d8a1f054e90af739a429368d28ca42acc0d7692a0",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "14387f532118b98121468480cc7bf92090b57eefc5e3045716728a5d3b15e7d6",
+      "b": "9ead3dae04792b9faa82ca01c1146ec8f489440ecbbed7ef8f5384ab2195d3ed",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "f1e6c50e8321cb59b34c20dad6e04be4a85ce4ed2f9ca33b027c87af1eed785d",
+      "b": "4751f9ed9c5d2bb77fd16e466363dcd074e6e9e645da61da89767335c0db9b23",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "f1e6c50e8321cb59b34c20dad6e04be4a85ce4ed2f9ca33b027c87af1eed785d",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "cec7bbc37cc785b2701c3a8948f4fe3501b7287afeee90c57870dc2b05b89ef4",
+      "b": "4751f9ed9c5d2bb77fd16e466363dcd074e6e9e645da61da89767335c0db9b23",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "cec7bbc37cc785b2701c3a8948f4fe3501b7287afeee90c57870dc2b05b89ef4",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "e8a0d684a457550f8ddd8b46d8ec594bffd0cc531a086b2e11b0caa013cf42e9",
+      "b": "2a88c8d55b44e3a9e3ada84292f851c7cf26e2fc8e50318857c0c5c480b3f28b",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "b266e14c326ffe28399aebe383fdacf8ab9f651f2330a0dae3dc53834e8049c9",
+      "b": "8c6d083815a92c7894934749d87d75537764f4d5511ea72ab3a3f64108d598c7",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "088f104ca5cde4a9ba2a5f04c8acab0f7e2e3318b6f45db4021fc4156f3f9099",
+      "b": "71cc9dba81a1ad9289cc648926528dc39e0fcc3136f64796dcbf70844cce38cd",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "088f104ca5cde4a9ba2a5f04c8acab0f7e2e3318b6f45db4021fc4156f3f9099",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "eb3228e3b7754ced1f8b2ec55ff3f98d27a71d330ef39ff37e0b6b064723abcb",
+      "b": "253e419d068153c2fd29349298f0bebed11af611495360f22b29178b10f8e51b",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "a2d1c9b4a1fa1d117b93245ea8cd7f53621350799831cdaf88c45103809db9ed",
+      "b": "1abee2dbfce030e79e1705f006365b89f920e4c12608db0f8c6a2a0c1e7028ff",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "20a23a541e60838d1c4bba7f08852793f390a4e902d05f95dbf1d915d5ac3789",
+      "b": "8201903e0e46fb8c58bcfe66b2ac278ffb44d8241eb19b553d781273a78d617d",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "336c46f686139bdb5ab89c5da09c4916d8a8295ae72b757c7caad4e0a15ea1f8",
+      "b": "bc5b95ed82adca2393ff9862c87757b4eeb5f10cf82b0aa4a0f6ba0e6a5b6240",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "9168ce0909745145c968fe8a2f9ba48b8ea4303f4b8538d42861cd292f7a3095",
+      "b": "9d6d6976db4166b57958e285f62c7b37c2a1a263ddaaf651953c499c81643a71",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "14e88ca3e430445214a8ac822106fbcef3f1354b11aef0168da1a10d9f9491ad",
+      "b": "e9da71cc9e83c26601c772bcbd898bcc1f112fe825b0fbc09a56fc5dcbc7fbba",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "e77b251cf72a1500295e10224e6ce5d907cd9ea033c69c8f222f4669d2ba422c",
+      "b": "aa00b5fe22c2c8a5e9e51eb18ed7535cd05f6214d5022e4ba980b9e682f6ce7c",
+      "label": "coexist",
+      "sub_label": "C",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "899aa19e0f201bdb6153d10c365c98a84005ab734e4ec4df1be731f52eeb1bcf",
+      "b": "a5a47dba1b42b7c631c0f5fca0fd16dce59b99531182bcdc5b6bd1c66fbf8ddd",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "228021ebe1b8d9f32f53de9a0d072413ed084d3dfc6bfed98183ec859ffd13f5",
+      "b": "39364772aafd4ea4d2149dabc942515b2addc17083c32a564e3d172b7fdb068f",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "56d4c1c1bb3bbffaa62b03f1b32229967a246e95e0babfa79e42565a21516ed4",
+      "b": "6f15337acdc30ca724b00ed7150a6aadcfd62309b81f9f68863bdc0e2e08e0bd",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "d770a34143f8a06ebf2889701ea4d42712637cceca7a744cd97c122fda760632",
+      "b": "e2ceebf58c01726d741378be7dba823d0485c70b6c2cbba4d46dc7407c32170e",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "231748dc7baa64ae18b81630e7b252128dcb43d01989f4c7b56dc3c847570d11",
+      "b": "39b1c2da57e3b76a021a8796820846970364064293491d3c7087374c6f6a77e4",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "eb9c1e815a3357f01d7a8983e11cee5c9cfd773553b6164679248093de4846a6",
+      "b": "1c5c19aa9c31238b320b16b57c3f76e11dad06925da84e2a69eb112f5efd4377",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "cca0a91ec0fb4587bea75d1fc4c22ab435e070d6804c750a7bef7f621e2d91b1",
+      "b": "ab6043592f55b01c8bf98f2b441fe13de63b71162ef3dbf87dfba138d15a7338",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "daf2759427a9a9334e7a720bd0995996d45cedead50ea0de45c2a5e8b1aede3f",
+      "b": "40986cceb2a5bc61032c215ac1911717ad6831cad2fae261c0bb700f7b8a35d5",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "884ea74b82533f3402cf83f0347745cd6cc0b64aa5ebe77ddefef5a2e9a3964e",
+      "b": "f60f1425bcfd52ed17f16f0af9cf2960a49f8894450185991d9ec5d2b0b246ca",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "f8fc3e9b2b7a38985f1720002d700f4ee803ed21eaeaf696f82d94c2646edf0f",
+      "b": "8359f543249ae07e34b0b655ff17305dfd238401b48dec7a133f08c4110b2882",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "641373679aa589c1df05926d58564d2d06869af659f174bc2df2513641a834dd",
+      "b": "d50d8470b336340c97f20a682835720734aeab3f721240a811abf5d310c4cd92",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "1e756b5f0dc9efe83c15b71d3be4bbcb6eeb85e213c64970dbb69bb5d73c921a",
+      "b": "086f20f288a7d68b667ea4d0475f02e8ea00de90d9d275f9313f6f0200530383",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "0f43dff11dc82b3abc6b0a0f5e69793543382fa410482483feaf37bebd38a052",
+      "b": "aadbff5a9dd7df9fa15d1622611bf9ad2645a1cd56dc0180a4571c2adbb9457f",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "05be52b567217835097d99745d6cc7bad3a926b18b5ea53257c1d2e320118544",
+      "b": "66fc1981329af9243b6b74d1ff86c55f45c8b55c193643b9cd59f6941666263f",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "05be52b567217835097d99745d6cc7bad3a926b18b5ea53257c1d2e320118544",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "1928d450f70290fd42c410f991575e1454a018d311be692b4f69170a6a4fe8cd",
+      "b": "bd69ac659c87ad079d8cad2f5a6834121407fce1fa9538705aebb5b26d10ee6f",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "2824fe67b12d3d0658abcbb7e5b3a987bffc4e24d65060599c050441159549c2",
+      "b": "6abd83ec887a508f0f6510e098a408d3c5546e80d94eabcdb77b83c482e59aa9",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "2824fe67b12d3d0658abcbb7e5b3a987bffc4e24d65060599c050441159549c2",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "d34f1205c4fac886b45714121e9b86083d9cbdd8b6d1d156abcfae6e6087d963",
+      "b": "974f63bea739b7d38f94f0afc0fca93729447d86c1a158c54422953e711d1e91",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "d34f1205c4fac886b45714121e9b86083d9cbdd8b6d1d156abcfae6e6087d963",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "4720bf81fccbd34cff7c28ccdc30b87b2cccdad85ffaf5d360371d77aec2c728",
+      "b": "f067f2ffc89dd8c228cb156418986acf71676925a10d2e63df2a7dc171e7e2aa",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "4720bf81fccbd34cff7c28ccdc30b87b2cccdad85ffaf5d360371d77aec2c728",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "309c25158c5f5beef82ba5ffd41a14011b2cc682cb2f787dfe64eeab5a81efb2",
+      "b": "c92906cf893960cd3e93f6c8da940830031ad0fd54d9523c3d0d801181f986d1",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "3b1679cd87a780597f30ba0546ab5fe850997bcaa6d7372293021c54264e8221",
+      "b": "5ad44460ea8dde2a88aa791d8d05fef3adbea7064c774bc6cff47947d6fc7731",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "3b1679cd87a780597f30ba0546ab5fe850997bcaa6d7372293021c54264e8221",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "ab11d569ccc3b804a618e5a8c8accb070afcd141d42428c0838f4b688a9d0111",
+      "b": "6134edfc6cc7b16b08ff4d30e8560bf806f4b259c54ae31b9a02ef2b6ba7882d",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "071c1d7ac5967dd75e3a1dec59531bf3811c3cf04ac5094840fa93c139d95772",
+      "b": "9a191d4ce247eb4b2bd30656a6680e1dc3071b7c4dcb368bbedfd4b12750c5d9",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "071c1d7ac5967dd75e3a1dec59531bf3811c3cf04ac5094840fa93c139d95772",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "58b6d5b995f78b4194be90c8b8658684c3227cdd6a8c28fb019de47493e7538b",
+      "b": "e22073dd0ad76af620e1abdaea6853a1b72813c16758b629566f5e10c8ffd7c4",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "58b6d5b995f78b4194be90c8b8658684c3227cdd6a8c28fb019de47493e7538b",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "2d1de02d18ee8aea81317a065c61a50f9947565de975c20da0d78aa8486a3e33",
+      "b": "20713782d7715a29f768aceaf7ef4705d60cf0f05cf7cbf25ff6165d7f2e588c",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "2d1de02d18ee8aea81317a065c61a50f9947565de975c20da0d78aa8486a3e33",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "75b13b968320a22b8340e7ce0114fbaa6377e52672b16e4ff128bef24d8c4868",
+      "b": "82432d59c5db226fb73c81be71e7ccdf56cea2c1933091e71a52301927741aec",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "8b89a645cf4028242860723ce19e53761036f77f9dded0cf2667ffee69900a8f",
+      "b": "21af5df3dbc598a20a153de717ffdfc8340dc0cf371a2faf19b53fe70e90e0ca",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "4a54713e0052f491a1166d5e91eb338163f3be220a668181fd5a78735d7af2ae",
+      "b": "62deb99ed6ce097dbb60928b03341a8b160dd0dc1349a229721073845d099f92",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "4a54713e0052f491a1166d5e91eb338163f3be220a668181fd5a78735d7af2ae",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "3c8ec887aa99d1b6d560b710c5cf8dfe0dc0775e6793f92012b15778afc59534",
+      "b": "ea01a6bf9f8f6918e86dace62fb199d7c43da5b8944e9d6d96a0878dfee0749b",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "3c8ec887aa99d1b6d560b710c5cf8dfe0dc0775e6793f92012b15778afc59534",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "27d2af9f370852a30bebebb4aa9381443f0503bbc3e9fd66da1ff0798fa6ab74",
+      "b": "716e6d7da358201534c95ae7399ccc84e8c04fc8f2dd72665a2f4d6bccec64f1",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "5d7de40a566f8424e91a907d6b7af2e63ce5e6820642006cf7e56f603b5ff7a5",
+      "b": "5fabdc38448bcee1c023221c0b335ead43d1b31579061b0137338b12ec8863a7",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "5d7de40a566f8424e91a907d6b7af2e63ce5e6820642006cf7e56f603b5ff7a5",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "54b1675cf5a730fcb7335aa557962d10765a54763431988c948e092bb471d3b0",
+      "b": "4d911e8c786ff91d85ffec75c9085c18bee3c1b3204cedf2a2b78a7c109ee1d5",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "ca2ad52402c5d48edc3a446e3377d7cfc3ffcfec33ede24300a4daac6379cfba",
+      "b": "ee8a9719c8729f90d2b5d87f9537d43fba6801b11a4e5afbb1fa74db33c5af71",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "3c8ec887aa99d1b6d560b710c5cf8dfe0dc0775e6793f92012b15778afc59534",
+      "b": "d9c537efc4991a583f0bab53e39e932337833db87f6dee260d611f73934e92c3",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "088f104ca5cde4a9ba2a5f04c8acab0f7e2e3318b6f45db4021fc4156f3f9099",
+      "b": "21c692d99318083df8b4c0649a25f7b0c024e2a990efa03cda31296d6ea0f840",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "088f104ca5cde4a9ba2a5f04c8acab0f7e2e3318b6f45db4021fc4156f3f9099",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "0e949593e895c11cf6a52bc1083f6ddabdc08deb81614515862650fb22df433b",
+      "b": "3efbcbcd9aa78459f4ca341004e410ddac7db28ed1dda9637218b4f93a392609",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "0e949593e895c11cf6a52bc1083f6ddabdc08deb81614515862650fb22df433b",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "257c89ef24eec6b9ca96f488e8f8da6accd4f027ec7e57406a498eedbec24efa",
+      "b": "ebcd2367a6af10f17c1c533a194fae776453e2a3fbc873b885922b09f74c16e6",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "76406c884fdad3d713be5432a2d54769c4c60d0c7df7859d1af0641ae3e2ebec",
+      "b": "c98579880bb60288eb314eadb4596b5c1d883ffd8c7c962d13ee67cae28315c8",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "46df5db63aba6701204f48e95b10b3a361632eb73909993a3d8d9e84f5283061",
+      "b": "20b99589005c6dc8780fc6ae92b74c55d7718295b6f580854217e02273e83147",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "f63ad7d15af178c9a143925d94cd34ac449b81ae12e8278193d6581442739a5c",
+      "b": "4d31428c6ed9bed042f2c8b316b704ecf34822a8c826fecef0c4694a7bdb8644",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "4320dc15cd42f61ecc8c1d0db28fc11695ad46d50c814ffa30fc7f8561ece528",
+      "b": "98e4b86154b6837b5a74f427b26a17271e65e21806c6ff9842ad843e2f85ae6f",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "139fbb105f70e12b29f7fb353e74560744a312b5e1b9c0724fa1860fc1056a4d",
+      "b": "67659b0b6e58b446245cad3e4874a114afb9ad0e67401db0a622494bd6b49ebd",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "139fbb105f70e12b29f7fb353e74560744a312b5e1b9c0724fa1860fc1056a4d",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "825536b397708ce3644a80584838ab50bd5ef98a2ef78ec1c191fc9dafb31dd4",
+      "b": "122ec9715fe894cf43f2336cf0a81bfd9f3c91a6734fd3c750c2efeb072db95d",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "825536b397708ce3644a80584838ab50bd5ef98a2ef78ec1c191fc9dafb31dd4",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "b8f08d7a689733e174ffdb831ec08270aee499c41e22e2995be3357ba320bb40",
+      "b": "edf0443c37393cb610602fec283839d4bee5ce81989eccec15894e186f4e69c2",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "b8f08d7a689733e174ffdb831ec08270aee499c41e22e2995be3357ba320bb40",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "c5ba60fe5cda7d41104a81b023f513983e99a2ef7cc6e26646e97fa1134d97b4",
+      "b": "5dda33a97698a2e8dba9d17ce1df8012c039f26f52910f1f8cdac938c6fc94dd",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "f2cf75178f4f3dee6dbf00c0b94cd1ba932c1080858c3b01ab5580d77641e909",
+      "b": "643e798930b4d53b70a4d28de47cea38a92502883b6efae931defd9b3ae62a80",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "da6fdfb808b5b3aaf28bdecabdceb07d6ff0c5f985b731ebeeda4c4ea80860da",
+      "b": "e2720a947e7bdcc3d3e79bc909672d6ba56cedc3f0b72e3aff26c2e91ce31a2d",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "76cb796ef399988405dfb4fb8c48714da9df0a016a35c47d68f6f9f6eaa4e465",
+      "b": "f90bcc9447e85991ae2346e14d02b3e086bde0ac8cc10021277ddb0a0c805bf0",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "17649a84b16bffc980693ef26c93b14142b4d9d8a70e86804f10bb3e4e9fd3de",
+      "b": "4793c921898058eb296c48b636a7db5e7f89bc8adce68efbf8bc42f087f0ff8b",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "e6945ccb376b8f692c46518db0157197b4c4b0169dcb53565cc0f60d1c5d8955",
+      "b": "dac73976e193e22561005b8d1b0cce40484a1cb653af6aae0c09045dfb458873",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "bcfe72f4fc796e3b7a2429dd747e7a847e9da9cd53094f41874ff0b6ce07e199",
+      "b": "f21f5abfbe2d811d8f70c65bcc5d1069708fb90ac6fe8f169072d840f5adc580",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "3998ccfedb360a8433fe5833b956d175e190e4dcaac0308b8bf0bbe6714d6de5",
+      "b": "d69302f46a2139649ca99b4be9d843ba1ee2abfc0d3d23eb6e0ce15c2eb9c602",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "3998ccfedb360a8433fe5833b956d175e190e4dcaac0308b8bf0bbe6714d6de5",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "72abe6c85b93e0659612e32aca405b9ad406a6ec697079b410c329d8d83cba9a",
+      "b": "87b3b6387b76269fbec690fc1c342007dee5b3e8308b488f080461e264f5325d",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "953cc2190561b91710ff88b2e6ee7da6cda31f43486f1d592faea3db2b7a1dec",
+      "b": "cc57c6eb0b01cf1c5e67a20cacbf7f393d33cd2dc28f1a43c9b604cff338cc3c",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "953cc2190561b91710ff88b2e6ee7da6cda31f43486f1d592faea3db2b7a1dec",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "3e414b54dce8ac756196d046eb6a0f75c2014a150c5d651b9b6e8966f267fe9f",
+      "b": "002cc0b8ac7f037b588d1c839d7279a8f121ece1809c9c460b5daa6a36ab0501",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "3e414b54dce8ac756196d046eb6a0f75c2014a150c5d651b9b6e8966f267fe9f",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "59cd54e0af12ce38de8ee5a352950e313595379b75b01c53f0a0a7a480671d98",
+      "b": "0b0b97a00c3d998b4ff228a96249297222abcecdc8a5def178356df889a44b7e",
+      "label": "supersession",
+      "sub_label": "S",
+      "survivor": "59cd54e0af12ce38de8ee5a352950e313595379b75b01c53f0a0a7a480671d98",
+      "tags": [],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
+    },
+    {
+      "a": "2e766968ef57271c91d064e0b3024d51889509a66fec35ff80d91322ab273b6d",
+      "b": "77c15d29efe2bf1ebce5e83c6ad128cd9759e131b16a20923edad0d677dda814",
+      "label": "coexist",
+      "sub_label": "P",
+      "survivor": null,
+      "tags": [
+        "partial"
+      ],
+      "action": "none",
+      "action_survivor": null,
+      "source": "queue-read",
+      "drawn": "queue-high-confidence"
     }
   ]
 }

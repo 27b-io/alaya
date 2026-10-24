@@ -193,3 +193,98 @@ Re-judged on the production pairs, Sonnet itself repeats "supersession, same
 survivor, confidence ≥ 0.90" on only 16 of the 51. They were selected for a
 high score on one sample, so a second sample regresses. A single pass at a
 0.90 cut is a noisy gate however the second vote is chosen.
+
+# Results: three-reader relabel, growth, and a k = 3 measurement of `claude-sonnet-5-5` (2026-10-24)
+
+**Outcome.** The golden set grows from 174 to 474 pairs. The headline holds
+434 of them (101 supersession, 250 coexist, 83 unrelated); 40 pairs whose label
+a blind reading disputes stay out until they are adjudicated. On it,
+`claude-sonnet-5-5` reads supersession one claim at a time: with `partial`
+pairs counted as supersession its false-supersede rate is 0.044, and with them
+counted as coexist it is 0.159.
+
+## Labels
+
+- Three readers from different model families (`claude-opus-5-5`,
+  `gpt-6.1-sol`, `gemini-4-argon`) read every pair blind: opaque ids, random
+  sides, the full text of both memories scrubbed as `--scrub` does, and rule v2
+  as the rubric. A pair's label is the majority of the three. No pair split
+  three ways.
+- Agreement on supersession-with-survivor versus not (Cohen's κ): Opus and
+  Sol 0.80, Opus and Argon 0.84, Sol and Argon 0.66; Fleiss' κ over all three
+  0.77. All three agree on 359 of 474 pairs.
+- Every new pair the majority reads as a supersession by the newer memory was
+  checked by searching the store for a later ruling that revokes the newer
+  claim. None of the 37 had one. One existing pair does; it is disputed with
+  the older memory as survivor.
+- Against the 22 adjudicated pairs each reader matches 18. All three read the
+  same four adjudicated supersessions as coexist. On three of them all three
+  readers say the newer memory corrects a side claim (`partial`); on the
+  fourth one reader does. One of the four is the pair whose revoking ruling
+  sits outside the pair, which no pairwise reader can see.
+- Existing pairs: 112 of the 152 not yet adjudicated agree with their label
+  (`agreed`). The other 40 carry a `dispute` with the reading: 33 operator
+  supersessions read as coexist (22 by all three readers; 20 of the 33 read as
+  `partial`), 6 coexist/unrelated boundary pairs, and the revoked pair.
+- New pairs (`queue-read`, action `none`, `drawn` says how): 200
+  `queue-random`, drawn at random from the unresolved queue and stratified by
+  cosine tercile and edge-age quartile, read 137 coexist, 62 unrelated and 1
+  supersession. 100 `queue-high-confidence`, from the queue's supersession
+  verdicts at confidence ≥ 0.90 with the newer memory as survivor, read 64
+  coexist and 36 supersession. These are all 35 such verdicts by
+  `claude-sonnet-5-5` and 65 drawn at random from the 359 by
+  `claude-sonnet-5`, so the headline below includes every pair
+  `claude-sonnet-5-5` had already flagged at that confidence.
+
+## k = 3 measurement on the headline (434 pairs)
+
+`eval --pairs all --passes 3 --model claude-sonnet-5-5`: the production
+request (no `thinking` field), three passes, unanimous or abstain. 20 pairs
+abstained.
+
+| view | false supersede | coexist→conflict | recall(S) | precision(S) | survivor | yield |
+|---|---|---|---|---|---|---|
+| `partial` as coexist | 40/251 = 0.159 [0.119, 0.210] | 40/250 = 0.160 | 93/101 = 0.921 | 93/132 = 0.705 | 92/93 | 0.795 |
+| `partial` as supersession | 8/181 = 0.044 [0.023, 0.085] | 8/180 = 0.044 | 125/171 = 0.731 | 125/132 = 0.947 | 124/125 | 0.800 |
+
+Unrelated pairs never drew a conflict verdict (0/83). The `contradiction`
+class is unmeasured: no pair carries the label.
+
+The judge's supersession lines up with "the newer memory corrects some claim
+of the older one", not with the main-point clause: 32 of the 39 coexist pairs
+it calls supersession are `partial`. For a read-time pointer that hides
+nothing, the second view is the one that matters; for anything that hides a
+whole memory, the first.
+
+## Confidence on a fresh judgement
+
+All 100 `queue-high-confidence` pairs had a stored verdict at ≥ 0.90. On the
+first pass of the run above, only 11 of them reach 0.90 again. Of the 202
+supersession verdicts the three passes gave those pairs, 117 sit at exactly
+0.80 or 0.88, so a 0.90 cut on one pass sits on a step.
+
+The table counts supersession verdicts naming the newer memory, first pass,
+headline pairs. A verdict is correct when the fixture says the newer memory
+corrects some claim of the older one: a supersession, or coexist tagged
+`partial`.
+
+| cut | `queue-high-confidence` (100) | whole headline (434) |
+|---|---|---|
+| ≥ 0.80 | 57 fire, 54 correct | 116 fire, 112 correct |
+| ≥ 0.85 | 30 fire, 29 correct | 81 fire, 80 correct |
+| ≥ 0.88 | 25 fire, 24 correct | 75 fire, 74 correct |
+| ≥ 0.90 | 11 fire, 11 correct | 52 fire, 52 correct |
+
+Scored the same way, the verdicts stored on the 100 pairs are correct on 32
+of the 35 written by `claude-sonnet-5-5` and on 45 of the 65 written by
+`claude-sonnet-5`.
+
+## Spend
+
+Amounts are rounded; totals are of the unrounded amounts.
+
+- Third-party readers, USD 6.37: `gpt-6.1-sol` 3.00 and `gemini-4-argon`
+  3.36.
+- Anthropic calls at list price, USD 29.69: the Opus reader 9.37, the k = 3
+  run 10.09, an earlier k = 3 run 10.09 (its numbers are not used here), and a
+  smoke run 0.13.
