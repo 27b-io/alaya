@@ -53,6 +53,10 @@ struct GoldenPair {
     survivor: Option<String>,
     #[serde(default)]
     source: String,
+    /// Present while a blind reading disagrees with `label` and adjudication
+    /// is pending.
+    #[serde(default)]
+    dispute: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -69,7 +73,13 @@ fn env(key: &str) -> String {
 #[tokio::test(flavor = "current_thread")]
 #[ignore]
 async fn golden_set_precision_recall() {
-    let fixture: Fixture = serde_json::from_str(FIXTURE).expect("fixture parses");
+    let mut fixture: Fixture = serde_json::from_str(FIXTURE).expect("fixture parses");
+    // A disputed label is not ground truth yet; scripts/judge_tune leaves it
+    // out of the headline the same way.
+    let disputed = fixture.pairs.len();
+    fixture.pairs.retain(|p| p.dispute.is_none());
+    let disputed = disputed - fixture.pairs.len();
+    println!("{disputed} disputed pairs left out (labels awaiting adjudication)");
     assert!(
         fixture.pairs.len() >= 50,
         "AC-8 requires ≥50 labelled pairs, fixture has {}",

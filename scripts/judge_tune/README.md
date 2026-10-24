@@ -186,7 +186,8 @@ rather than re-cutting.
 what an operator did with it (`action`, `action_survivor`) apart from what the
 label rule says (`label`, `sub_label`, `survivor`, `tags`, `source`). The
 fixture's own `fields`, `rule_version` and `label_rule` keys define them. The
-Rust harness reads `label`, `survivor` and `source` and ignores the rest.
+Rust harness reads `label`, `survivor`, `source` and `dispute`, skips disputed
+pairs as the headline here does, and ignores the rest.
 
 ## What eval reports
 

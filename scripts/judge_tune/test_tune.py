@@ -115,7 +115,8 @@ def check_fixture() -> None:
         got = (p["label"], p["sub_label"], p["survivor"], p["tags"], p["source"])
         assert got == (label, sub, want, tags, "adjudicated"), (a[:8], got)
     assert sum(p["source"] == "adjudicated" for p in raw["pairs"]) == len(rows)
-    assert sum("partial" in p.tags for p in tune.load_fixture()) == 4
+    # 4 adjudicated + 66 from the blind three-reader pass.
+    assert sum("partial" in p.tags for p in tune.load_fixture()) == 70
 
 
 def check_consensus_scoring() -> None:
@@ -1257,7 +1258,8 @@ def check_compare_run() -> None:
     """compare end to end over a fake run directory: a failed second vote is
     left out, never a veto; sent counts include an eval that aborted."""
     pairs = tune.load_fixture()
-    sups = [p for p in pairs if p.label == "supersession"]
+    # The headline leaves disputed pairs out, so the counts below do too.
+    sups = [p for p in pairs if p.label == "supersession" and not p.disputed]
     flaky = sups[0]  # the second judge fails here
 
     def vote(p, failed=False, hide=None):
@@ -1643,7 +1645,7 @@ def main() -> None:
     s1, s2 = tune.make_split(pairs, 0, 0.6), tune.make_split(pairs, 0, 0.6)
     assert s1 == s2 and not set(s1["train"]) & set(s1["val"])
     assert len(s1["train"]) + len(s1["val"]) == len(pairs)
-    assert s1["counts"]["coexist"] == {"train": 31, "val": 20}, s1["counts"]
+    assert s1["counts"]["coexist"] == {"train": 151, "val": 101}, s1["counts"]
 
     check_fixture()
     check_consensus_scoring()
