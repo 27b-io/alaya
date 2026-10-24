@@ -842,9 +842,19 @@ def check_eval_scrub(real_env: dict) -> None:
             choice = {"file": None, "names": 0}
             assert result(Path(tmp) / "runs/unlisted")["host_names"] == choice
             assert len(sent) == 2
+            # A disputed pair is judged but scored nowhere: not in the headline,
+            # not per pass (the Rust harness skips it too).
+            disputed = tune.Pair(1, a, b, "supersession", a, "operator", disputed=True)
+            tune.load_fixture = lambda: [pair, disputed]
+            run(no_host_names=True, run="disputed")
+            tune.load_fixture = stubs["load_fixture"]
+            res = result(Path(tmp) / "runs/disputed")
+            assert res["headline"]["excluded_disputed"] == 1
+            assert [m["pairs"] for m in res["per_pass"]] == [1], res["per_pass"]
+            assert len(sent) == 4
             memories[a] = mem("creds = " + "9f86d081" + "884c7d659a2feaa0c55ad015", 0.0)
             assert "gitleaks:generic-api-key" in exits(no_host_names=True, run="leak")
-            assert len(sent) == 2, "the gate stops the run before any request"
+            assert len(sent) == 4, "the gate stops the run before any request"
         finally:
             for name, value in real.items():
                 setattr(tune, name, value)

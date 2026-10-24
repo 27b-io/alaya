@@ -217,25 +217,30 @@ counted as coexist it is 0.159.
   checked by searching the store for a later ruling that revokes the newer
   claim. None of the 37 had one. One existing pair does; it is disputed with
   the older memory as survivor.
-- Against the 22 adjudicated pairs each reader matches 18. All three miss the
-  same four: three pairs adjudicated as supersession that every reader reads
-  as a correction of a side claim (`partial`), and the pair whose revoking
-  ruling sits outside the pair.
+- Against the 22 adjudicated pairs each reader matches 18. All three read the
+  same four adjudicated supersessions as coexist. On three of them all three
+  readers say the newer memory corrects a side claim (`partial`); on the
+  fourth one reader does. One of the four is the pair whose revoking ruling
+  sits outside the pair, which no pairwise reader can see.
 - Existing pairs: 112 of the 152 not yet adjudicated agree with their label
   (`agreed`). The other 40 carry a `dispute` with the reading: 33 operator
-  supersessions read as coexist (22 by all three readers), 6 coexist/unrelated
-  boundary pairs, and the revoked pair.
-- New pairs (`queue-read`, action `none`): 200 drawn at random from the
-  unresolved queue, stratified by cosine tercile and edge-age quartile, read
-  137 coexist, 62 unrelated and 1 supersession; and 100 from the queue's
-  supersession verdicts at confidence ≥ 0.90 with the newer memory as
-  survivor, read 64 coexist and 36 supersession.
+  supersessions read as coexist (22 by all three readers; 20 of the 33 read as
+  `partial`), 6 coexist/unrelated boundary pairs, and the revoked pair.
+- New pairs (`queue-read`, action `none`, `drawn` says how): 200
+  `queue-random`, drawn at random from the unresolved queue and stratified by
+  cosine tercile and edge-age quartile, read 137 coexist, 62 unrelated and 1
+  supersession. 100 `queue-high-confidence`, from the queue's supersession
+  verdicts at confidence ≥ 0.90 with the newer memory as survivor, read 64
+  coexist and 36 supersession. These are all 35 such verdicts by
+  `claude-sonnet-5-5` and 65 drawn at random from the 359 by
+  `claude-sonnet-5`, so the headline below includes every pair
+  `claude-sonnet-5-5` had already flagged at that confidence.
 
 ## k = 3 measurement on the headline (434 pairs)
 
-The production request (no `thinking` field), three passes, unanimous or
-abstain. 20 pairs abstained; 450 of 474 pairs got the same verdict on all
-three passes.
+`eval --pairs all --passes 3 --model claude-sonnet-5-5`: the production
+request (no `thinking` field), three passes, unanimous or abstain. 20 pairs
+abstained.
 
 | view | false supersede | coexist→conflict | recall(S) | precision(S) | survivor | yield |
 |---|---|---|---|---|---|---|
@@ -253,24 +258,29 @@ whole memory, the first.
 
 ## Confidence on a fresh judgement
 
-On the 100 high-confidence queue pairs, one fresh pass reaches 0.90 on only 6.
-Most fresh supersession verdicts land on 0.80 or 0.88, so a 0.90 cut on one
-pass sits on a step. Precision
-at the claim level (the majority of three readers says the newer memory
-corrects some claim of the older one), first pass:
+All 100 `queue-high-confidence` pairs had a stored verdict at ≥ 0.90. On the
+first pass of the run above, only 11 of them reach 0.90 again. Of the 202
+supersession verdicts the three passes gave those pairs, 117 sit at exactly
+0.80 or 0.88, so a 0.90 cut on one pass sits on a step.
 
-| cut | high-confidence queue pairs (100) | golden fixture pairs (174) |
+The table counts supersession verdicts naming the newer memory, first pass,
+headline pairs. A verdict is correct when the fixture says the newer memory
+corrects some claim of the older one: a supersession, or coexist tagged
+`partial`.
+
+| cut | `queue-high-confidence` (100) | whole headline (434) |
 |---|---|---|
-| ≥ 0.80 | 55 fire, 53 correct (0.96) | 79 fire, 71 correct (0.90) |
-| ≥ 0.85 | 25 fire, 25 correct | 70 fire, 66 correct (0.94) |
-| ≥ 0.90 | 6 fire, 6 correct | 48 fire, 47 correct (0.98) |
+| ≥ 0.80 | 57 fire, 54 correct | 116 fire, 112 correct |
+| ≥ 0.85 | 30 fire, 29 correct | 81 fire, 80 correct |
+| ≥ 0.88 | 25 fire, 24 correct | 75 fire, 74 correct |
+| ≥ 0.90 | 11 fire, 11 correct | 52 fire, 52 correct |
 
-The verdicts stored on those 100 pairs, all at ≥ 0.90, are correct at the
-claim level on 32 of 35 written by `claude-sonnet-5-5` and on 45 of 65 written
-by the earlier default, `claude-sonnet-5`.
+Scored the same way, the verdicts stored on the 100 pairs are correct on 32
+of the 35 written by `claude-sonnet-5-5` and on 45 of the 65 written by
+`claude-sonnet-5`.
 
 ## Spend
 
 Third-party readers USD 6.37 (`gpt-6.1-sol` 3.00, `gemini-4-argon` 3.36).
-Anthropic calls at list price USD 29.55: the Opus reader 9.37 and two k = 3
-runs of `claude-sonnet-5-5` over 474 pairs at 10.09 each.
+Anthropic calls at list price USD 19.46: the Opus reader 9.37 and the k = 3
+run 10.09.

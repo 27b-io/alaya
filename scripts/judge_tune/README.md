@@ -161,7 +161,8 @@ failed on is left out of that rule, never counted as a veto.
   validation split. A tuned candidate is *landable* when it meets both without
   losing accuracy against the seed; the first landable candidate stops the run,
   and the report's best is the most accurate landable one. The seed alone never
-  stops the run, because 14 coexist pairs resolve the bar in steps of one pair.
+  stops the run: the rule dates from a split of 14 coexist pairs, where the bar
+  resolved in steps of one pair.
   With no landable candidate the report shows the most accurate candidate of
   all, so a negative result still says what tuning did.
 - **Prompt hygiene.** A candidate is scored 0 without a judge call if it drops
