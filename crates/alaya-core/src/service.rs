@@ -628,6 +628,20 @@ pub const UNSUPERSEDE_RESOLVED_VIA: &str = "unsupersede";
 /// that want `coexist`/`unrelated` name them explicitly.
 const DEFAULT_VERDICT_FILTER: [&str; 3] = ["contradiction", "supersession", Verdict::UNJUDGED];
 
+/// A caller's verdict filter must be a non-empty subset of `Verdict::ALL`:
+/// an empty list would select nothing and an unknown value nothing it names.
+/// The message names only the allowed values, never the caller's, so a REST
+/// route may return it as is.
+pub fn validate_verdict_filter(verdicts: &[String]) -> std::result::Result<(), String> {
+    if verdicts.is_empty() || verdicts.iter().any(|v| Verdict::parse(v).is_none()) {
+        return Err(format!(
+            "verdicts must be a non-empty subset of {:?}",
+            Verdict::ALL.map(|v| v.as_str())
+        ));
+    }
+    Ok(())
+}
+
 /// Result of judging one CONTRADICTS pair.
 #[derive(Debug)]
 pub enum JudgeOutcome {
@@ -3739,12 +3753,7 @@ impl MemoryService {
             .map(|s| s.to_string())
             .collect();
         let verdicts = verdicts.unwrap_or(&default);
-        if verdicts.is_empty() || verdicts.iter().any(|v| Verdict::parse(v).is_none()) {
-            return Err(AlayaError::Validation(format!(
-                "verdicts must be a non-empty subset of {:?}",
-                Verdict::ALL.map(|v| v.as_str())
-            )));
-        }
+        validate_verdict_filter(verdicts).map_err(AlayaError::Validation)?;
         let limit = limit.clamp(1, ContradictionQuery::MAX_LIMIT);
 
         let query = ContradictionQuery {

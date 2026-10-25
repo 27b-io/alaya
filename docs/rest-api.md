@@ -503,7 +503,7 @@ Content-Type: application/json
 | `limit` | `20` | Page size (1–500), newest edge first. |
 | `offset` | `0` | Page cursor: pass back the previous response's `next_offset`. |
 | `include_resolved` | `false` | `false` hides resolved pairs: either memory superseded, or the pair stamped `keep_both` via [`POST /contradictions/resolution`](#post-contradictionsresolution). The filter runs in the graph (an incoming `SUPERSEDES` edge or `e.resolution` is the resolved state), so a run of resolved pairs at the top of the queue never hides the rest. |
-| `verdicts` | `["contradiction","supersession","unjudged"]` | Only pairs whose judge verdict is in the list. `unjudged` = no verdict yet, or a pair the judge could not classify (see `verdict_reason`). Add `coexist` / `unrelated` to see everything. Unknown values are a `400`. |
+| `verdicts` | `["contradiction","supersession","unjudged"]` | Only pairs whose judge verdict is in the list. `unjudged` = no verdict yet, or a pair the judge could not classify (see `verdict_reason`). Add `coexist` / `unrelated` to see everything. An empty list or an unknown value is a `400`. |
 
 Each pair carries the lexical detector's `confidence` plus the judge's advisory verdict (LAB-3283). A verdict never mutates a memory; `survivor` is a recommendation for `POST /supersede`.
 
@@ -616,8 +616,10 @@ Judge `CONTRADICTS` pairs that have no verdict yet (LAB-3283). Operator-only, sa
 POST /backfill/contradictions
 Content-Type: application/json
 
-{"limit": 100, "rejudge": false}
+{"limit": 100, "rejudge": false, "verdicts": ["supersession"]}
 ```
+
+`verdicts` is optional. Omitted, the pass selects as described below, whatever verdict an edge carries. Given, it selects only edges whose verdict is in the list. `unjudged` matches an edge with no verdict and the failure marker, as on [`POST /contradictions`](#post-contradictions). An empty list or an unknown value is a `400`. Without `rejudge` the pass selects only edges with no verdict, so only `unjudged` can match; use the filter with `"rejudge": true` to re-judge just the verdicts a reader depends on, for example `{"rejudge": true, "verdicts": ["supersession"], "limit": 200}` after a model switch.
 
 Blocks until the pass completes and returns what happened:
 
@@ -633,7 +635,7 @@ Failures are classified so one poison pair cannot stall the pass or re-bill fore
 - **transient** (timeout, 5xx, 429 after retries, upstream misconfiguration, endpoint missing) → nothing is written; counted in `unjudged`, retried next pass.
 - `judged - persisted` is verdicts produced that did not land on an edge (graph blip); they are retried next pass.
 
-Re-running is idempotent: only edges with no verdict at all are selected. **Switching `JUDGE_MODEL`** (or `JUDGE_PROVIDER` with it) does not touch existing verdicts; run with `"rejudge": true` to also re-annotate every edge whose `verdict_model` differs from the configured model **and every `unjudged` marker** (the operator's way to retry deterministic failures after a fix), paging with `limit` until `queued` is `0`. A marker never overwrites a real verdict — if a re-judge fails on a pair that already has one, the old verdict stands. Verdicts are written onto the graph edge only; no memory record is modified.
+Re-running is idempotent: only edges with no verdict at all are selected. **Switching `JUDGE_MODEL`** (or `JUDGE_PROVIDER` with it) does not touch existing verdicts; run with `"rejudge": true` to also re-annotate every edge whose `verdict_model` differs from the configured model **and every `unjudged` marker** (the operator's way to retry deterministic failures after a fix), paging with `limit` until `queued` is `0`. A marker never overwrites a real verdict — if a re-judge fails on a pair that already has one, the old verdict stands. Such a pair keeps its old `verdict_model`, so it is selected again by the next call: when `queued` stops falling and every queued pair ends in `marked` or `unjudged`, stop paging; the server log names each failure. Verdicts are written onto the graph edge only; no memory record is modified.
 
 One pass at a time per `alaya-server` process: a second call to the same process while one is running returns `{"success": false, "error": "backfill already running"}`. With more than one replica behind the Service, a second call can land on another process and run alongside the first. The two passes select the same unjudged pairs, so some pairs are judged, and billed, twice; each verdict write is last-writer-wins on the edge and touches no memory, so nothing is corrupted. Send backfills to one pod (`kubectl port-forward pod/...`) to avoid the double spend. The HTTP reply waits at most 630 s, so keep `limit` around 200 per call; a pass that outlives the reply still runs to completion and the next call is refused until it finishes.
 

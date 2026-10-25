@@ -855,10 +855,12 @@ pub(crate) enum CmdInner {
         reply: oneshot::Sender<Value>,
     },
     /// Judge up to `limit` CONTRADICTS pairs with no verdict (LAB-3283 AC-5);
-    /// `rejudge` also re-annotates pairs judged by a different model.
+    /// `rejudge` also re-annotates pairs judged by a different model, and
+    /// `verdicts` narrows either selection to edges carrying those verdicts.
     BackfillContradictions {
         limit: usize,
         rejudge: bool,
+        verdicts: Option<Vec<String>>,
         reply: oneshot::Sender<Value>,
     },
     /// Write the BM25 keyword vector of up to `limit` memories that have
@@ -2307,6 +2309,7 @@ async fn service_worker(
             CmdInner::BackfillContradictions {
                 limit,
                 rejudge,
+                verdicts,
                 reply,
             } => {
                 if backfill_running.get() {
@@ -2322,7 +2325,10 @@ async fn service_worker(
                     tokio::task::spawn_local(
                         async move {
                             let _flight = flight;
-                            run_backfill_contradictions(&svc, &gate, limit, rejudge, reply).await;
+                            run_backfill_contradictions(
+                                &svc, &gate, limit, rejudge, verdicts, reply,
+                            )
+                            .await;
                         }
                         .instrument(span),
                     );
@@ -2721,6 +2727,7 @@ async fn run_backfill_contradictions(
     gate: &std::rc::Rc<tokio::sync::Semaphore>,
     limit: usize,
     rejudge: bool,
+    verdicts: Option<Vec<String>>,
     reply: oneshot::Sender<Value>,
 ) {
     let Some(judge) = svc.judge.as_ref() else {
@@ -2730,18 +2737,7 @@ async fn run_backfill_contradictions(
         }));
         return;
     };
-    // Only edges with no verdict at all: a persisted `unjudged` marker is a
-    // deterministic failure and is skipped, so re-running is idempotent and
-    // never re-spends (AC-5). `rejudge` widens the selection to edges judged
-    // by a different model — the recovery path for a model switch. Resolved
-    // pairs are hidden from the read surface, so judging them is waste.
-    let query = ContradictionQuery {
-        limit,
-        needs_judging: true,
-        rejudge_model: rejudge.then(|| judge.model_name().to_string()),
-        exclude_resolved: true,
-        ..Default::default()
-    };
+    let query = backfill_selection(limit, rejudge.then(|| judge.model_name()), verdicts);
     let pairs = match svc.graph.get_all_contradictions(&query).await {
         Ok(p) => p,
         Err(e) => {
@@ -2751,7 +2747,12 @@ async fn run_backfill_contradictions(
         }
     };
     let queued = pairs.len();
-    tracing::info!(queued, rejudge, "backfill: judging contradictions");
+    tracing::info!(
+        queued,
+        rejudge,
+        verdicts = ?query.verdicts,
+        "backfill: judging contradictions"
+    );
     let t = backfill_judge(svc, gate, pairs).await;
     tracing::info!(
         queued,
@@ -2772,6 +2773,29 @@ async fn run_backfill_contradictions(
         "input_tokens": t.input_tokens,
         "output_tokens": t.output_tokens,
     }));
+}
+
+/// The pairs a backfill pass judges. Only edges with no verdict at all: a
+/// persisted `unjudged` marker is a deterministic failure and is skipped, so
+/// re-running is idempotent and never re-spends (AC-5). `rejudge_model`
+/// widens the selection to edges judged by a different model — the recovery
+/// path for a model switch. `verdicts` narrows either selection to edges
+/// carrying one of those verdicts, so a re-judge can be scoped to the
+/// verdicts a reader uses instead of every legacy edge. Resolved pairs are
+/// hidden from the read surface, so judging them is waste.
+fn backfill_selection(
+    limit: usize,
+    rejudge_model: Option<&str>,
+    verdicts: Option<Vec<String>>,
+) -> ContradictionQuery {
+    ContradictionQuery {
+        limit,
+        needs_judging: true,
+        rejudge_model: rejudge_model.map(str::to_string),
+        verdicts,
+        exclude_resolved: true,
+        ..Default::default()
+    }
 }
 
 /// Judge `pairs` with at most `JUDGE_CONCURRENCY` calls in flight (the
@@ -3753,10 +3777,24 @@ fn default_limit() -> usize {
     20
 }
 
+/// A `verdicts` filter that is empty or names an unknown verdict, refused
+/// before dispatch so the caller gets a 400 rather than an op error in a 200
+/// body. `None` when the filter is absent or valid.
+fn bad_verdicts(verdicts: Option<&[String]>) -> Option<(StatusCode, Json<Value>)> {
+    let msg = alaya_core::service::validate_verdict_filter(verdicts?).err()?;
+    Some((
+        StatusCode::BAD_REQUEST,
+        Json(json!({"success": false, "error": msg})),
+    ))
+}
+
 async fn contradictions(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
     Json(req): Json<ContradictionsReq>,
 ) -> (StatusCode, Json<Value>) {
+    if let Some(refusal) = bad_verdicts(req.verdicts.as_deref()) {
+        return refusal;
+    }
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::Contradictions {
@@ -4013,6 +4051,10 @@ struct BackfillContradictionsParams {
     /// judge model (recovery path for a model switch).
     #[serde(default)]
     rejudge: bool,
+    /// Only edges whose verdict is in the list (`unjudged` = none yet, or
+    /// the failure marker). Omitted = any verdict.
+    #[serde(default)]
+    verdicts: Option<Vec<String>>,
 }
 
 /// Operator-only (same auth class as `/backfill/summaries`, enforced in
@@ -4022,11 +4064,15 @@ async fn backfill_contradictions(
     axum::extract::State(h): axum::extract::State<ServiceHandle>,
     Json(params): Json<BackfillContradictionsParams>,
 ) -> (StatusCode, Json<Value>) {
+    if let Some(refusal) = bad_verdicts(params.verdicts.as_deref()) {
+        return refusal;
+    }
     let (tx, rx) = oneshot::channel();
     h.call(
         CmdInner::BackfillContradictions {
             limit: params.limit,
             rejudge: params.rejudge,
+            verdicts: params.verdicts,
             reply: tx,
         },
         rx,
@@ -4688,6 +4734,27 @@ mod tests {
         r
     }
 
+    /// A scoped re-judge keeps every guard of the unscoped one (NULL-only
+    /// unless re-judging, resolved pairs excluded) and adds the verdict
+    /// filter; omitted, the selection is exactly what it was before.
+    #[test]
+    fn backfill_selection_scopes_by_verdict_without_dropping_guards() {
+        let q = backfill_selection(
+            200,
+            Some("claude-sonnet-5-5"),
+            Some(vec!["supersession".into()]),
+        );
+        assert_eq!(q.limit, 200);
+        assert_eq!(q.skip, 0);
+        assert!(q.needs_judging && q.exclude_resolved);
+        assert_eq!(q.rejudge_model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(q.verdicts, Some(vec!["supersession".to_string()]));
+
+        let q = backfill_selection(100, None, None);
+        assert!(q.needs_judging && q.exclude_resolved);
+        assert_eq!((q.rejudge_model, q.verdicts), (None, None));
+    }
+
     /// The stub graph's `get_all_contradictions` panics, so the backfill
     /// task dies before it replies.
     #[tokio::test]
@@ -4697,6 +4764,7 @@ mod tests {
             CmdInner::BackfillContradictions {
                 limit: 1,
                 rejudge: false,
+                verdicts: None,
                 reply,
             }
         })
@@ -7632,6 +7700,86 @@ mod wedge_tests {
             .await
             .unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), held);
+    }
+
+    /// Both routes that take a `verdicts` filter refuse an empty or unknown
+    /// one with a 400 before dispatch, naming the allowed values.
+    #[tokio::test]
+    async fn verdict_filter_routes_refuse_a_bad_filter_before_dispatch() {
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let app = protected_router(ServiceHandle { tx }, test_auth_state());
+        for uri in ["/contradictions", "/backfill/contradictions"] {
+            for body in [
+                json!({"verdicts": ["supersession", "superseded"]}),
+                json!({"verdicts": []}),
+            ] {
+                let req = axum::http::Request::post(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap();
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri} {body}");
+                let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                let got: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(got["success"], false, "{uri} {body}");
+                assert!(
+                    got["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("verdicts must be a non-empty subset of"),
+                    "{uri} {got}"
+                );
+                assert!(rx.try_recv().is_err(), "{uri} {body} was dispatched");
+            }
+        }
+    }
+
+    /// `POST /backfill/contradictions` dispatches a valid `verdicts` filter
+    /// as given; omitted, the command carries none, so the selection is the
+    /// unscoped one.
+    #[tokio::test]
+    async fn backfill_contradictions_route_dispatches_verdicts() {
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let app = protected_router(ServiceHandle { tx }, test_auth_state());
+        let post = |body: Value| {
+            axum::http::Request::post("/backfill/contradictions")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        for (body, want) in [
+            (
+                json!({"rejudge": true, "verdicts": ["supersession"], "limit": 200}),
+                Some(vec!["supersession".to_string()]),
+            ),
+            (json!({"rejudge": true}), None),
+        ] {
+            let resp = tokio::spawn(app.clone().oneshot(post(body.clone())));
+            let CmdInner::BackfillContradictions {
+                limit,
+                rejudge,
+                verdicts,
+                reply,
+            } = rx.recv().await.expect("dispatched").inner
+            else {
+                panic!("expected CmdInner::BackfillContradictions");
+            };
+            assert!(rejudge, "{body}");
+            assert_eq!(limit, body["limit"].as_u64().unwrap_or(100) as usize);
+            assert_eq!(verdicts, want, "{body}");
+            reply.send(json!({"queued": 0})).unwrap();
+            let resp = resp.await.unwrap().unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{body}");
+        }
     }
 
     /// `GET /memories/{hash}/relations` dispatches exactly the command
