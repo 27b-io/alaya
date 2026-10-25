@@ -288,3 +288,22 @@ Amounts are rounded; totals are of the unrounded amounts.
 - Anthropic calls at list price, USD 29.69: the Opus reader 9.37, the k = 3
   run 10.09, an earlier k = 3 run 10.09 (its numbers are not used here), and a
   smoke run 0.13.
+
+# Adjudication of 24 disputed pairs (2026-10-25)
+
+24 of the 40 disputed pairs are now `adjudicated`, with the blind reading as
+their label. `action` and `action_survivor` still record what the operator
+did.
+
+- The 23 pairs that all three readers read against their label take the
+  reading. 22 operator supersessions become coexist (21 P, 1 C; 12 tagged
+  `partial`), and one unrelated pair becomes coexist (P).
+- The pair whose newer claim a later ruling revokes becomes a supersession
+  with the older memory as survivor, tagged `newer-revoked`.
+- The 16 two-of-three readings stay disputed and out of the headline.
+
+The headline grows from 434 to 458 pairs: 102 supersession, 273 coexist and
+83 unrelated. `split.json` is re-cut from the new fixture with seed 0: train
+285 (68/165/52), validation 189 (45/110/34). Both halves still hold the
+disputed pairs, which tuning leaves out. The 2026-10-24 tables above score
+the 434-pair headline and are not rescored here.

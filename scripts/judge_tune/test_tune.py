@@ -45,9 +45,11 @@ def verdict(**over) -> dict:
     return base | over
 
 
-# The 22 adjudicated pairs, exactly as settled, one per line:
+# The 46 adjudicated pairs, exactly as settled, one per line:
 # a b label sub_label survivor(a|b|-) tags(comma-separated|-).
-# In every one the fixture's `a` is the adjudication sheet's A.
+# In the first 22 the fixture's `a` is the adjudication sheet's A. The other
+# 24 adopt the blind three-reader reading: the 23 all three readers gave, and
+# the pair a later ruling revokes.
 ADJUDICATED = """
 f5f27c48ec51455ea9976b98f8607c6f91279eeb1d43b50d82c0fc807dd9610c 3d0099a0c08710f038277b6f47b79c5a21e5ca5b3adf552aa6ea49cb65f1a8ba coexist P - -
 b36a28f8f47bf1cd36de2f3bf61486fe77ede9f896696e0c346c1881cbc8f94c 081daaea208fb950e4c97f3f99ec678a10a9e1279bc3b0a55a4706b73200f485 coexist P - partial
@@ -71,6 +73,30 @@ dc25b2b20ff37234017b6c7c5d2c5241ef0929b9907f8b26c3710cb3f17cd3e3 41e2e5fde2c9da3
 3d22859dc47d8c64d94467cac366e9e358258174ff4e250b563c219532d6a8cd 8bf437781ac6bc07370cc087dbf6c872e90bc6e3eb31d662293ba7f091cf80f6 coexist P - -
 7481fc252fee94e540b1ab506ad83cacf934ee04b5699dcd7cda5c26eb9ed64f 6ae3e1a09864c5de87fe5b08681189e725adf5fed00503d8f9c94b913af924b2 coexist P - -
 6a3f2194b5ea3d20a4cce25c944be88186e3512b9d70c3f75ab53214482c6ec7 d7dd699202e1eafc03baa9735f08ef3cd3ff39a6b1962780226dac9ed31c827d supersession S b newer-revoked
+b31eec04725bd541b7af89c2fa0161622a9b7d84e996381ce34f738c3bf99622 9349109a363e69aca979d2c98e4a533b43d0907d8cc3e9f4a0a7c14375a16e39 coexist P - partial
+c4528796db3d5c9ea541d350fa63b0764732f6bc0df50bb4735a02bf406fbf64 63064c77200d3608bbcd056f48e55168410ee5523f02590a4096d3ca70f8bf51 coexist P - partial
+50d6b3eb04f7ec6d5d84238257ab374f39f728cdd9ac6fa606806cfc7baa8c7c d0dc28863433f88c127010d42019091e713d0ed85b53b202b05fc0066518dfa9 coexist P - -
+d0dc28863433f88c127010d42019091e713d0ed85b53b202b05fc0066518dfa9 f2e01bb76311c8e2964aed64315e129bf81b575bc55f1f2d8976763499ebb222 coexist P - -
+7014b6100a1338e485ce05a44e36da70144ff9efbd1621f9551446ea2e44b8f8 d24aa4048b3f9f0fda10f1e6a9df7ab381a1a1eecfb634db6cae8c4f4eb213c6 coexist P - -
+468cc0f7213de5369b50ffc2e503912cdb84ffcf01908cb7071e6ee5918f4581 b02216cde6de3b2f259fcab5bddd2b12d0ec099ae919ffffae205ff357fdeb51 coexist P - partial
+c5a209d5df8e46110791a5d6b427db45c0af15cd3077e1d9060626707a897242 b1c90933acfaece419d5d15a08a7f5cd2daa09e577770181de6a295520eff3a5 coexist P - -
+2a5516580ed0bdb8a47fe7c4ba1475dd6353ade2701d024a54c2689add926b4e 9aa87fbe1bfcdb252b94177a65988b0f7a56166cd117ce25bca702e0799216e8 coexist P - -
+19b1b56127ac220226c0f35a9d7fc5757c4391bc0d90eb0b7d7761bd388f5dec b1fc5a35a948d6de841546a832934d1cd3323b77d938570f3fd3de430447f314 coexist P - partial
+5267a6bc2ccf9f5a0bea54aeca6bbe95585c583237e2de7809534cb9222304ee e4d34629e71731baf2957e0987c637021beb640ed714d73d5b4554b40c0b9d28 coexist P - partial
+8eb531044bfe78c4bf922eba436fddfe7f9683c8edcc9929a4ed259a439ec30e a3c4585ad024d65d288d0a5a822ed481b7a00d115a5c66f6824323ac9cca0788 coexist P - -
+9d3a8e9439e4e9b3a63c3f6adcb2d59fc827958248bbe5cb13a2ca9daa7b50f7 31acb06d2e26e3dbf12f151fdd0fb22b7a93de894d8316cacafc28567c5eb011 coexist P - partial
+74130bb93aa8e35b171b17ac5588c0e97a4a678ce523652f34258441391121e1 a8e1580d18a45453af803b65305f25a18759b80876bfa3c4a5511623705e81d6 coexist P - -
+3fe2687163f9580e0c243dd247dfd15ca3fff8a2753db2d0afbcf1c63147aba8 c53f49ec5cf4ad78920c33ae7d26a1dbe4fcf9224d015eb3fbc6e80a98efcb90 coexist P - -
+11f1c5e34f2be474e30d36c78ebecae5eeae522727067b0210c5515e2ad3e768 b7d30c21d0153cf05d3e3f0bfb95d265a664abcab495dc6782bdacd59d1a5eea coexist P - partial
+b96049ecfb7b18af41c5862ed779ab3693c2929a719e51c07009dafffea33b8d f90977d2a81fe20412cb8b65357aa97054a90603c837270d2d41f0b4642511fe coexist P - -
+017449d19803190c26aedbfd0ba6b48f3396d58a5cd5986c9e0fd9b5f4ff8539 de9912d6785b4561bb03e9b93905f21d1de05bfbab4ad36b834b16c426b1cacf coexist P - -
+406734a119598d5b2c9892b0636e04e034c2fb4c92abc20e83db85cd55b131c0 662d023f9daf329b91b93ca20d90d3788f85f0d449cc2af9ddf0d8a4b6201f99 coexist P - partial
+9ebd8b7c98e57ab9ccdc7b0a017c4a9fe8dc66676c1be0517143c572ed14eb21 a4f06340386fc0ec8a96e7c6ff8fb5ce9e78da4d373c7090029a8a347b87b4ba coexist P - partial
+68f72440f0b27bf85d9ff5ced7dedba2c8593d4817c6987003b46f31433909c6 385a497dda9f4635344c22d7338bbf4eaa55b5d3138578f83a51a65596fd7efb coexist P - partial
+4a13cbb2f10548c1e1268ba3331b04095a3fd871a1665b219086b6950a3d8cc1 a61d9a1bab052078936547bb44b7e00cc314fc0532d24662e4852bf365fd2b94 coexist P - partial
+ecff9b5db3742791c04b10d805c2e8ae3f0d7e940df53798e8f72927e785fd67 d1387421b74438ba583c26ef37d27baaf334e4711a9b0abead0bbe6b6fb5e131 coexist C - partial
+373e91e2e43d75b418ad644e9ee58ef6edcaf0a087b302a46b12680a7b89d6a2 794465edf89eb0208b491c72790b0fd6e28e40a40d547c45bcdcc998952fef79 coexist P - -
+df4d1a6e19159880e66454ea62d55dd1c2472123577f89f5a303a2324a6c0a46 feea222764773cd7a88513a9b65fabe77112e69e2310ee7ce0a45aac226f3873 supersession S b newer-revoked
 """
 SUB_LABELS = {
     "supersession": {"S"},
@@ -83,7 +109,7 @@ TAGS = {"partial", "near-duplicate", "newer-revoked"}
 
 
 def check_fixture() -> None:
-    """Schema v2 holds for every pair, and the 22 adjudicated pairs are exact."""
+    """Schema v2 holds for every pair, and the 46 adjudicated pairs are exact."""
     raw = json.loads(tune.FIXTURE.read_text(encoding="utf-8"))
     assert raw["rule_version"] == 2
     assert {"supersession", "coexist", "revocation", "main_point"} <= raw[
@@ -105,9 +131,10 @@ def check_fixture() -> None:
         assert "partial" not in p["tags"] or p["label"] == "coexist", p
         if "dispute" in p:
             assert p["dispute"]["label"] in SUB_LABELS, p
+            assert p["source"] != "adjudicated", p
     by_pair = {(p["a"], p["b"]): p for p in raw["pairs"]}
     rows = [line.split() for line in ADJUDICATED.strip().splitlines()]
-    assert len(rows) == 22
+    assert len(rows) == 46
     for a, b, label, sub, surv, tags in rows:
         tags = [] if tags == "-" else tags.split(",")
         p = by_pair[(a, b)]
@@ -115,8 +142,9 @@ def check_fixture() -> None:
         got = (p["label"], p["sub_label"], p["survivor"], p["tags"], p["source"])
         assert got == (label, sub, want, tags, "adjudicated"), (a[:8], got)
     assert sum(p["source"] == "adjudicated" for p in raw["pairs"]) == len(rows)
-    # 4 adjudicated + 66 from the blind three-reader pass.
-    assert sum("partial" in p.tags for p in tune.load_fixture()) == 70
+    # 4 adjudicated on the sheet + 78 from the blind three-reader pass.
+    assert sum("partial" in p.tags for p in tune.load_fixture()) == 82
+    assert sum("dispute" in p for p in raw["pairs"]) == 16
 
 
 def check_consensus_scoring() -> None:
@@ -1655,7 +1683,7 @@ def main() -> None:
     s1, s2 = tune.make_split(pairs, 0, 0.6), tune.make_split(pairs, 0, 0.6)
     assert s1 == s2 and not set(s1["train"]) & set(s1["val"])
     assert len(s1["train"]) + len(s1["val"]) == len(pairs)
-    assert s1["counts"]["coexist"] == {"train": 151, "val": 101}, s1["counts"]
+    assert s1["counts"]["coexist"] == {"train": 165, "val": 110}, s1["counts"]
 
     check_fixture()
     check_consensus_scoring()
