@@ -893,6 +893,22 @@ mod tests {
     }
 
     #[test]
+    fn get_all_contradictions_verdict_filter_narrows_a_rejudge() {
+        let (c, p, _) = get_all_contradictions(&ContradictionQuery {
+            needs_judging: true,
+            rejudge_model: Some("claude-sonnet-5-5".into()),
+            verdicts: Some(vec!["supersession".into()]),
+            ..cq(200)
+        });
+        assert!(c.contains(
+            "WHERE e.verdict IN $verdicts AND (e.verdict IS NULL OR e.verdict = $marker \
+             OR e.verdict_model IS NULL OR e.verdict_model <> $model) "
+        ));
+        assert_eq!(p["verdicts"], json!(["supersession"]));
+        assert_eq!(p["model"], json!("claude-sonnet-5-5"));
+    }
+
+    #[test]
     fn get_all_contradictions_exclude_resolved_uses_supersedes_edges_and_resolution_and_ands_clauses()
      {
         let (c, _, _) = get_all_contradictions(&ContradictionQuery {

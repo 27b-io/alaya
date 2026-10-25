@@ -245,6 +245,84 @@ async fn needs_judging_skips_marked_failures_and_rejudge_selects_other_models() 
     Ok(())
 }
 
+/// A re-judge scoped by verdict selects only open edges that carry one of
+/// those verdicts from another model, and a fresh verdict from the current
+/// model takes the edge out of the selection whatever it says, so paging
+/// with `skip = 0` until nothing is queued terminates.
+#[tokio::test]
+async fn rejudge_scoped_by_verdict_selects_only_other_models_matching_open_edges()
+-> anyhow::Result<()> {
+    let Some(ctx) = common::TestContext::new().await else {
+        return Ok(());
+    };
+    // Pair 0 is resolved (SUPERSEDES onto b_0); pair 4 has no verdict.
+    seed_pairs(&ctx, 6, 1).await;
+    for (i, verdict, model) in [
+        (0usize, Verdict::Supersession, "model-x"),
+        (1, Verdict::Supersession, "model-x"),
+        (2, Verdict::Supersession, "model-y"),
+        (3, Verdict::Coexist, "model-x"),
+        (5, Verdict::Unjudged, "model-y"),
+    ] {
+        let r = ctx
+            .exec_tuple(cypher::set_contradiction_verdict(
+                &hash(1000 + i),
+                &hash(2000 + i),
+                &EdgeVerdict {
+                    verdict,
+                    verdict_survivor: None,
+                    verdict_reason: "r".into(),
+                    verdict_confidence: 0.9,
+                    verdict_model: model.into(),
+                    judged_at: 1.0,
+                },
+            ))
+            .await;
+        assert_eq!(r.count(), Some(1), "edge {i} must match");
+    }
+    let scoped = ContradictionQuery {
+        limit: 10,
+        needs_judging: true,
+        rejudge_model: Some("model-y".into()),
+        verdicts: Some(vec!["supersession".into()]),
+        exclude_resolved: true,
+        ..Default::default()
+    };
+
+    let page = ctx
+        .exec_tuple(cypher::get_all_contradictions(&scoped))
+        .await;
+    assert_eq!(
+        a_hashes(&page),
+        [hash(1001)],
+        "resolved, current-model, other-verdict, unjudged and marked edges stay out"
+    );
+
+    // The new model reads pair 1 as coexist: it leaves the scoped selection.
+    let r = ctx
+        .exec_tuple(cypher::set_contradiction_verdict(
+            &hash(1001),
+            &hash(2001),
+            &EdgeVerdict {
+                verdict: Verdict::Coexist,
+                verdict_survivor: None,
+                verdict_reason: "both true".into(),
+                verdict_confidence: 0.8,
+                verdict_model: "model-y".into(),
+                judged_at: 2.0,
+            },
+        ))
+        .await;
+    assert_eq!(r.count(), Some(1));
+    let page = ctx
+        .exec_tuple(cypher::get_all_contradictions(&scoped))
+        .await;
+    assert!(page.result_set.is_empty(), "nothing left to queue");
+
+    ctx.cleanup().await;
+    Ok(())
+}
+
 /// Panel CRIT: every edge written by one `store` shares `created_at`, and
 /// FalkorDB orders ties differently per SKIP/LIMIT window. With the pair
 /// tiebreak, paging over a tie group returns every edge exactly once.
