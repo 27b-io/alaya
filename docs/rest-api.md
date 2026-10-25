@@ -616,7 +616,7 @@ Judge `CONTRADICTS` pairs that have no verdict yet (LAB-3283). Operator-only, sa
 POST /backfill/contradictions
 Content-Type: application/json
 
-{"limit": 100, "rejudge": false, "verdicts": ["supersession"]}
+{"limit": 100, "rejudge": false}
 ```
 
 `verdicts` is optional. Omitted, the pass selects as described below, whatever verdict an edge carries. Given, it selects only edges whose verdict is in the list. `unjudged` matches an edge with no verdict and the failure marker, as on [`POST /contradictions`](#post-contradictions). An empty list or an unknown value is a `400`. Without `rejudge` the pass selects only edges with no verdict, so only `unjudged` can match; use the filter with `"rejudge": true` to re-judge just the verdicts a reader depends on, for example `{"rejudge": true, "verdicts": ["supersession"], "limit": 200}` after a model switch.
