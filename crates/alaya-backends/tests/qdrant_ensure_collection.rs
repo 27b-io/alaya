@@ -1,8 +1,8 @@
 //! Startup collection bootstrap (#31): `ensure_collection` creates the memory
-//! collection (and its tag sidecar) with Cosine vectors when absent, and is a
-//! no-op when the collection already exists. The memory collection also
-//! carries the BM25 sparse vector (LAB-7716): created with it, or given it in
-//! place when it lacks it.
+//! collection with Cosine vectors when absent, and is a no-op when the
+//! collection already exists. The memory collection also carries the BM25
+//! sparse vector (LAB-7716): created with it, or given it in place when it
+//! lacks it. No tag sidecar is created (LAB-8998).
 
 use alaya_backends::qdrant::QdrantClient;
 use serde_json::{Value, json};
@@ -17,7 +17,7 @@ async fn creates_absent_collections_with_cosine_config() {
         .respond_with(ResponseTemplate::new(404))
         .mount(&server)
         .await;
-    // …so both the main collection and its tag sidecar are created exactly once.
+    // …so the main collection is created exactly once, and no tag sidecar.
     Mock::given(method("PUT"))
         .and(path("/collections/memories"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": true})))
@@ -27,7 +27,7 @@ async fn creates_absent_collections_with_cosine_config() {
     Mock::given(method("PUT"))
         .and(path("/collections/memories_tags"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": true})))
-        .expect(1)
+        .expect(0)
         .mount(&server)
         .await;
 
@@ -37,30 +37,21 @@ async fn creates_absent_collections_with_cosine_config() {
         .await
         .expect("ensure succeeds");
 
-    // Each create PUT carried the configured vector size and Cosine distance;
-    // only the memory collection's carried the BM25 sparse vector.
+    // The create PUT carried the configured vector size, Cosine distance and
+    // the BM25 sparse vector.
     let reqs = server.received_requests().await.unwrap();
-    let create = |p: &str| {
-        let r = reqs
-            .iter()
-            .find(|r| r.method.as_str() == "PUT" && r.url.path() == p)
-            .expect("a create was sent");
-        serde_json::from_slice::<Value>(&r.body).expect("body is JSON")
-    };
-    for p in ["/collections/memories", "/collections/memories_tags"] {
-        assert_eq!(
-            create(p)["vectors"],
-            json!({"size": 1024, "distance": "Cosine"})
-        );
-    }
+    let r = reqs
+        .iter()
+        .find(|r| r.method.as_str() == "PUT" && r.url.path() == "/collections/memories")
+        .expect("a create was sent");
+    let create: Value = serde_json::from_slice(&r.body).expect("body is JSON");
     assert_eq!(
-        create("/collections/memories")["sparse_vectors"],
-        json!({"bm25": {"modifier": "idf"}})
+        create["vectors"],
+        json!({"size": 1024, "distance": "Cosine"})
     );
-    assert!(
-        create("/collections/memories_tags")
-            .get("sparse_vectors")
-            .is_none()
+    assert_eq!(
+        create["sparse_vectors"],
+        json!({"bm25": {"modifier": "idf"}})
     );
     // Mount .expect(1) counts are verified on server drop.
 }
@@ -106,8 +97,7 @@ async fn adds_the_keyword_vector_to_a_collection_that_lacks_it() {
         .expect("ensure succeeds");
 
     // One PUT in all: the vector, with the lowercase `idf` modifier Qdrant
-    // requires. No collection is recreated, and the tag sidecar is not given
-    // one.
+    // requires. No collection is recreated.
     let reqs = server.received_requests().await.unwrap();
     let puts: Vec<_> = reqs.iter().filter(|r| r.method.as_str() == "PUT").collect();
     assert_eq!(puts.len(), 1, "{puts:?}");

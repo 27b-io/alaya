@@ -1,89 +1,33 @@
-//! Hybrid search — RRF fusion, adaptive alpha, keyword extraction, recency decay.
+//! Hybrid search — RRF fusion, adaptive alpha, recency decay.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
 
-// ─── Stop words ─────────────────────────────────────────────────────────────
-
-const STOP_WORDS: &[&str] = &[
-    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
-    "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
-    "need", "dare", "ought", "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
-    "as", "into", "through", "during", "before", "after", "above", "below", "between", "out",
-    "off", "over", "under", "again", "further", "then", "once", "here", "there", "when", "where",
-    "why", "how", "all", "each", "every", "both", "few", "more", "most", "other", "some", "such",
-    "no", "not", "only", "own", "same", "so", "than", "too", "very", "just", "because", "but",
-    "and", "or", "if", "while", "about", "up", "it", "its", "i", "me", "my", "we", "our", "you",
-    "your", "he", "him", "his", "she", "her", "they", "them", "their", "what", "which", "who",
-    "this", "that", "these", "those", "am",
-];
-
-static STOP_SET: LazyLock<HashSet<&str>> = LazyLock::new(|| STOP_WORDS.iter().copied().collect());
-
-/// Display score of a keyword-only hit (tag or BM25: no cosine similarity available).
-/// GEPA-optimized: lowered from 0.1 to reduce tag-only match influence.
+/// Display score of a keyword-only (BM25) hit: no cosine similarity available.
+/// GEPA-optimized against the former tag-only keyword pool: lowered from 0.1
+/// to reduce keyword-only match influence.
 const KEYWORD_ONLY_BASE_SCORE: f64 = 0.02;
 
 /// RRF smoothing constant. Lower = sharper rank differentiation.
 /// GEPA-optimized: lowered from 60 to 20 for better top-k separation.
 pub const RRF_K: usize = 20;
 
-// ─── Keyword extraction ─────────────────────────────────────────────────────
-
-/// Extract keywords from a query, optionally filtering to existing tags.
-///
-/// Tokenizes on non-alphanumeric, lowercases, removes stop words and short tokens,
-/// and generates hyphenated compounds from adjacent tokens.
-pub fn extract_query_keywords(query: &str, existing_tags: Option<&HashSet<String>>) -> Vec<String> {
-    // Tokenize: split on non-alphanumeric
-    let tokens: Vec<String> = query
-        .split(|c: char| !c.is_alphanumeric())
-        .map(|s| s.to_lowercase())
-        .filter(|s| s.len() >= 2 && !STOP_SET.contains(s.as_str()))
-        .collect();
-
-    let mut keywords: Vec<String> = tokens.clone();
-
-    // Generate hyphenated compounds from adjacent pairs
-    for pair in tokens.windows(2) {
-        keywords.push(format!("{}-{}", pair[0], pair[1]));
-    }
-
-    // Filter to existing tags if provided
-    if let Some(tags) = existing_tags {
-        keywords.retain(|k| tags.contains(k));
-    }
-
-    // Deduplicate preserving order
-    let mut seen = HashSet::new();
-    keywords.retain(|k| seen.insert(k.clone()));
-
-    keywords
-}
-
 // ─── Adaptive alpha ─────────────────────────────────────────────────────────
 
 /// Compute adaptive alpha for hybrid search blending.
 ///
-/// Alpha weights semantic (vector) vs tag search:
+/// Alpha weights semantic (vector) vs keyword (BM25) search:
 /// - Higher alpha = more weight on semantic
-/// - Lower alpha = more weight on tags
-pub fn get_adaptive_alpha(corpus_size: usize, matching_tag_count: usize) -> f64 {
-    // GEPA-optimized: raised small-corpus alpha from 0.5 to 0.72
-    // (more weight on vector similarity vs tags for typical memory corpora)
-    let base_alpha = if corpus_size < 500 {
+/// - Lower alpha = more weight on keywords
+pub fn get_adaptive_alpha(corpus_size: usize) -> f64 {
+    // GEPA-optimized against the former tag-only keyword pool: raised
+    // small-corpus alpha from 0.5 to 0.72 (more weight on vector similarity
+    // for typical memory corpora)
+    if corpus_size < 500 {
         0.72
     } else if corpus_size < 5000 {
         0.7
     } else {
         0.8
-    };
-
-    // GEPA-optimized: threshold 3→5, factor 1.5→1.2 (less aggressive tag boost)
-    if matching_tag_count >= 5 {
-        (1.0_f64 - 1.2 * (1.0 - base_alpha)).clamp(0.0, 1.0)
-    } else {
-        base_alpha
     }
 }
 
@@ -94,17 +38,15 @@ pub fn rrf_score(rank: usize, k: usize) -> f64 {
     1.0 / (k + rank) as f64
 }
 
-/// Combine vector search results with keyword pools via Reciprocal Rank
-/// Fusion.
+/// Combine vector search results with the keyword (BM25) pool via Reciprocal
+/// Rank Fusion.
 ///
 /// Each input is `(content_hash, original_score)`, best first. The vector
-/// pool weighs `alpha` and each keyword pool `1 - alpha` (the tag pool, the
-/// BM25 pool, or both, LAB-7716); an empty pool adds nothing, so passing one
-/// is the same as leaving it out.
+/// pool weighs `alpha` and the keyword pool `1 - alpha`.
 /// Returns `(content_hash, combined_rrf_score, display_score)` sorted descending.
 pub fn combine_results_rrf(
     vector_results: &[(String, f64)],
-    keyword_results: &[&[(String, f64)]],
+    keyword_results: &[(String, f64)],
     alpha: f64,
     k: usize,
 ) -> Vec<(String, f64, f64)> {
@@ -113,12 +55,12 @@ pub fn combine_results_rrf(
         vector_ranks.insert(hash.as_str(), (rank + 1, *score));
     }
 
-    // Each hash's summed keyword RRF across the pools it appears in.
+    // Each hash's keyword RRF at its first (best) rank.
     let mut keyword_rrf: HashMap<&str, f64> = HashMap::new();
-    for pool in keyword_results {
-        for (rank, (hash, _)) in pool.iter().enumerate() {
-            *keyword_rrf.entry(hash.as_str()).or_default() += rrf_score(rank + 1, k);
-        }
+    for (rank, (hash, _)) in keyword_results.iter().enumerate() {
+        keyword_rrf
+            .entry(hash.as_str())
+            .or_insert_with(|| rrf_score(rank + 1, k));
     }
 
     // Collect all unique hashes
@@ -196,84 +138,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_keywords_basic() {
-        let kw = extract_query_keywords("How do I configure Rust logging?", None);
-        assert!(kw.contains(&"configure".to_string()));
-        assert!(kw.contains(&"rust".to_string()));
-        assert!(kw.contains(&"logging".to_string()));
-        // Stop words removed
-        assert!(!kw.contains(&"how".to_string()));
-        assert!(!kw.contains(&"do".to_string()));
-    }
-
-    #[test]
-    fn extract_keywords_compounds() {
-        let kw = extract_query_keywords("proton bridge setup", None);
-        assert!(kw.contains(&"proton-bridge".to_string()));
-        assert!(kw.contains(&"bridge-setup".to_string()));
-    }
-
-    #[test]
-    fn extract_keywords_filter_existing() {
-        let tags: HashSet<String> = ["rust", "python"].iter().map(|s| s.to_string()).collect();
-        let kw = extract_query_keywords("I love Rust and Python programming", Some(&tags));
-        assert!(kw.contains(&"rust".to_string()));
-        assert!(kw.contains(&"python".to_string()));
-        assert!(!kw.contains(&"programming".to_string()));
-        assert!(!kw.contains(&"love".to_string()));
-    }
-
-    #[test]
-    fn extract_keywords_deduplicated() {
-        let kw = extract_query_keywords("rust rust rust", None);
-        assert_eq!(kw.iter().filter(|k| *k == "rust").count(), 1);
-    }
-
-    #[test]
-    fn extract_keywords_static_stop_set_repeated_calls() {
-        // Verify the static STOP_SET works correctly across multiple invocations.
-        // If the LazyLock is broken, the second call would panic or return wrong results.
-        let kw1 = extract_query_keywords("configure Rust logging", None);
-        let kw2 = extract_query_keywords("deploy Python service", None);
-        let kw3 = extract_query_keywords("configure Rust logging", None);
-
-        // First and third calls are identical input — must produce identical output
-        assert_eq!(kw1, kw3);
-
-        // Second call filters its own stop words correctly
-        assert!(kw2.contains(&"deploy".to_string()));
-        assert!(kw2.contains(&"python".to_string()));
-        assert!(kw2.contains(&"service".to_string()));
-        // "the", "a", etc. must still be filtered on every call
-        assert!(!kw2.iter().any(|k| STOP_WORDS.contains(&k.as_str())));
-    }
-
-    #[test]
     fn adaptive_alpha_small_corpus() {
-        assert_eq!(get_adaptive_alpha(100, 0), 0.72);
+        assert_eq!(get_adaptive_alpha(100), 0.72);
     }
 
     #[test]
     fn adaptive_alpha_medium_corpus() {
-        assert_eq!(get_adaptive_alpha(1000, 0), 0.7);
+        assert_eq!(get_adaptive_alpha(1000), 0.7);
     }
 
     #[test]
     fn adaptive_alpha_large_corpus() {
-        assert_eq!(get_adaptive_alpha(10000, 0), 0.8);
-    }
-
-    #[test]
-    fn adaptive_alpha_tag_boost() {
-        let alpha = get_adaptive_alpha(100, 5);
-        // base=0.72, boosted: 1.0 - 1.2*(1.0-0.72) = 0.664
-        assert!((alpha - 0.664).abs() < 1e-10);
-    }
-
-    #[test]
-    fn adaptive_alpha_below_threshold_no_boost() {
-        // 4 tags < threshold 5 → no boost
-        assert_eq!(get_adaptive_alpha(100, 4), 0.72);
+        assert_eq!(get_adaptive_alpha(10000), 0.8);
     }
 
     #[test]
@@ -286,7 +162,7 @@ mod tests {
     fn combine_rrf_vector_only() {
         let v = vec![("hash1".into(), 0.9), ("hash2".into(), 0.8)];
         let t: Vec<(String, f64)> = vec![];
-        let results = combine_results_rrf(&v, &[&t], 0.7, 60);
+        let results = combine_results_rrf(&v, &t, 0.7, 60);
         assert_eq!(results.len(), 2);
         // hash1 should be first (higher vector rank)
         assert_eq!(results[0].0, "hash1");
@@ -296,7 +172,7 @@ mod tests {
     fn combine_rrf_overlap() {
         let v = vec![("hash1".into(), 0.9), ("hash2".into(), 0.7)];
         let t = vec![("hash2".into(), 1.0), ("hash3".into(), 1.0)];
-        let results = combine_results_rrf(&v, &[&t], 0.5, 60);
+        let results = combine_results_rrf(&v, &t, 0.5, 60);
         assert_eq!(results.len(), 3);
         // hash2 appears in both — should get boosted
         let hash2_score = results.iter().find(|r| r.0 == "hash2").unwrap().1;
@@ -305,42 +181,24 @@ mod tests {
     }
 
     #[test]
-    fn combine_rrf_tag_only_display_score() {
+    fn combine_rrf_keyword_only_display_score() {
         let v: Vec<(String, f64)> = vec![];
         let t = vec![("hash1".into(), 1.0)];
-        let results = combine_results_rrf(&v, &[&t], 0.5, 60);
+        let results = combine_results_rrf(&v, &t, 0.5, 60);
         assert_eq!(results[0].2, KEYWORD_ONLY_BASE_SCORE);
     }
 
     #[test]
-    fn combine_rrf_an_empty_keyword_pool_changes_nothing() {
-        let v = vec![("hash1".into(), 0.9), ("hash2".into(), 0.7)];
-        let t = vec![("hash2".into(), 1.0), ("hash3".into(), 1.0)];
-        let none: Vec<(String, f64)> = vec![];
-        assert_eq!(
-            sorted(combine_results_rrf(&v, &[&t, &none], 0.8, 20)),
-            sorted(combine_results_rrf(&v, &[&t], 0.8, 20))
-        );
-    }
-
-    #[test]
-    fn combine_rrf_sums_each_keyword_pool_at_one_minus_alpha() {
+    fn combine_rrf_weighs_the_keyword_pool_at_one_minus_alpha() {
         let v = vec![("hash1".into(), 0.9)];
-        let tags = vec![("hash2".into(), 1.0)];
         let bm25 = vec![("hash2".into(), 7.5), ("hash3".into(), 3.0)];
-        let results = combine_results_rrf(&v, &[&tags, &bm25], 0.8, 20);
+        let results = combine_results_rrf(&v, &bm25, 0.8, 20);
         let score = |h: &str| results.iter().find(|r| r.0 == h).unwrap();
-        // In both keyword pools at rank 1: twice one pool's weight.
-        assert!((score("hash2").1 - 0.2 * 2.0 * rrf_score(1, 20)).abs() < 1e-12);
+        assert!((score("hash2").1 - 0.2 * rrf_score(1, 20)).abs() < 1e-12);
         assert!((score("hash3").1 - 0.2 * rrf_score(2, 20)).abs() < 1e-12);
         assert!((score("hash1").1 - 0.8 * rrf_score(1, 20)).abs() < 1e-12);
         assert_eq!(score("hash3").2, KEYWORD_ONLY_BASE_SCORE);
         assert_eq!(results[0].0, "hash1");
-    }
-
-    fn sorted(mut r: Vec<(String, f64, f64)>) -> Vec<(String, f64, f64)> {
-        r.sort_by(|a, b| a.0.cmp(&b.0));
-        r
     }
 
     #[test]

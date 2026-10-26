@@ -352,6 +352,7 @@ Rules:
 - Content must stand alone — no "in this session" or "we discussed" references
 - Tags: always include project name, plus relevant technologies/topics
 - Storing nothing is a normal outcome: if nothing qualifies, output []
+- Reply with the JSON array only: no code fences, and no prose or examples before or after it
 SYS
 
 DURATION_MIN=$((DURATION / 60))
@@ -382,15 +383,64 @@ RESPONSE=$(printf '%s' "$RAW" | jq -r '.choices[0].message.content // empty' 2>/
 # A dead LLM gate must never be silent again (LAB-170: 5 lost days taught us that)
 [[ -z "$RESPONSE" ]] && _skip "LLM extraction failed model=$LLM_MODEL resp=${RAW:0:300}"
 
-# --- Parse LLM output (strip markdown fences if present) ---
-printf '%s\n' "$RESPONSE" | sed 's/^```[a-zA-Z]*//;/^$/d' 2>/dev/null > "$_HOOKDIR/memories.json" \
-    || _skip "cannot write $_HOOKDIR/memories.json: the work dir is gone or unwritable, skipping save"
+# --- Parse LLM output ---
+# The extractor often fences the array and explains it in prose, most often a
+# fenced [] followed by why nothing qualifies. Prose can hold anything: links,
+# commands, an example array, the result written inline. No reading of prose
+# can tell an example from the result, and storing an example is a false
+# memory, which is worse than a skipped save. So memories are stored only when
+# the reply, fence lines aside, is one JSON array and nothing else. Every JSON
+# value in the reply is found, at any position, skipping what is nested inside
+# one. A [ or { that does not decode is malformed JSON (a truncated or
+# single-quoted reply), and a [] found inside it proves nothing, so the reply
+# is logged and not stored. Otherwise, when every value is [] there is nothing
+# to save, whatever surrounds it: a quiet exit. A lone value that is not an
+# array is logged as not an array below. A non-empty result with prose or
+# another value beside it is logged with the reply and not stored, and so is a
+# reply with no JSON value.
+command -v python3 >/dev/null 2>&1 || _skip "config: python3 not found on PATH, skipping save"
+printf '%s\n' "$RESPONSE" > "$_HOOKDIR/reply.txt" \
+    || _skip "cannot write $_HOOKDIR/reply.txt: the work dir is gone or unwritable, skipping save"
+_PARSE_ERR=$(python3 -c '
+import json, re, sys
+with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+    text = re.sub(r"(?m)^[ \t]*```[\w+-]*[ \t]*\r?$", "", f.read())
+decode = json.JSONDecoder().raw_decode
+values, prose, i, broken = [], [], 0, False
+while i < len(text):
+    if text[i] in "[{":
+        try:
+            value, i = decode(text, i)
+            values.append(value)
+            continue
+        except ValueError:
+            broken = True
+    prose.append(text[i])
+    i += 1
+if not values:
+    sys.exit(10)
+if broken:
+    sys.exit(12)
+if all(v == [] for v in values):
+    print("[]")
+elif len(values) == 1 and not "".join(prose).strip():
+    print(json.dumps(values[0]))
+else:
+    sys.exit(11)' \
+    "$_HOOKDIR/reply.txt" 2>&1 > "$_HOOKDIR/memories.json")
+case $? in
+    0) ;;
+    10) _skip "LLM output not valid JSON: $(printf '%s' "$RESPONSE" | tr '\n' ' ' | head -c 300)" ;;
+    11) _skip "LLM output not stored: a non-empty result with prose or another value beside it: $(printf '%s' "$RESPONSE" | tr '\n' ' ' | head -c 300)" ;;
+    12) _skip "LLM output not stored: malformed JSON in the reply: $(printf '%s' "$RESPONSE" | tr '\n' ' ' | head -c 300)" ;;
+    *) _skip "cannot parse $_HOOKDIR/reply.txt, skipping save: $(printf '%s' "$_PARSE_ERR" | tr '\n' ' ' | tail -c 300)" ;;
+esac
 
 # -1 = valid JSON but not an array (output-envelope drift, e.g. {"memories":[...]})
 # — must be logged, or a model/gateway change silently stops all saves (LAB-170).
 # An empty [] is a legitimate "nothing worth saving" and stays a quiet exit.
-MEMORY_COUNT=$(jq 'if type == "array" then length else -1 end' "$_HOOKDIR/memories.json" 2>&1) \
-    || _skip "LLM output not valid JSON: ${MEMORY_COUNT:0:200}"
+MEMORY_COUNT=$(jq 'if type == "array" then length else -1 end' "$_HOOKDIR/memories.json" 2>/dev/null) \
+    || _skip "cannot read $_HOOKDIR/memories.json, skipping save"
 [[ "$MEMORY_COUNT" -eq -1 ]] && _skip "LLM output valid JSON but not an array: $(head -c 200 "$_HOOKDIR/memories.json")"
 [[ "$MEMORY_COUNT" -eq 0 ]] && exit 0
 

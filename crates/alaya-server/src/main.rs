@@ -51,9 +51,8 @@ use alaya_backends::{
 use alaya_core::calendar::utc_date_str;
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{
-    JudgeOutcome, KeywordLeg, MemoryService, OutputMode, RankingFlags, Refutation, RefuteStage,
-    RelationParams, SearchParams, StoreParams, current_timestamp, parse_user_relation,
-    validate_as_of,
+    JudgeOutcome, MemoryService, OutputMode, RankingFlags, Refutation, RefuteStage, RelationParams,
+    SearchParams, StoreParams, current_timestamp, parse_user_relation, validate_as_of,
 };
 use alaya_core::vitals::{CountingEmbedding, SelfCheckOutcome, Vitals};
 use alaya_types::graph::{Contradiction, ContradictionQuery, Resolution};
@@ -666,7 +665,7 @@ async fn require_conditional_writes(qdrant: &QdrantClient) {
 async fn ensure_qdrant_collection(qdrant: &QdrantClient, dimensions: usize) {
     for attempt in 0..L2_MAX_ATTEMPTS {
         match qdrant.ensure_collection(dimensions).await {
-            Ok(()) => return,
+            Ok(()) => return warn_missing_keyword_vectors(qdrant).await,
             Err(e) if attempt + 1 == L2_MAX_ATTEMPTS => {
                 tracing::error!(
                     error = %e,
@@ -686,6 +685,27 @@ async fn ensure_qdrant_collection(qdrant: &QdrantClient, dimensions: usize) {
                 .await;
             }
         }
+    }
+}
+
+/// BM25 is hybrid search's only keyword pool (LAB-8998), and it cannot find a
+/// memory that lacks the keyword vector. A deployment that ran the old `tags`
+/// default and never ran `POST /backfill/keywords` would lose keyword recall
+/// on its older memories with no sign of it, so startup says so. Never fatal:
+/// search still answers, from the dense pool for those memories.
+async fn warn_missing_keyword_vectors(qdrant: &QdrantClient) {
+    use alaya_backends::VectorStorage;
+    match qdrant.count_missing_keyword_vectors().await {
+        Ok(0) => {}
+        Ok(missing) => tracing::warn!(
+            missing,
+            "memories lack the BM25 keyword vector, so hybrid keyword search cannot find \
+             them; run POST /backfill/keywords"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not count memories missing the BM25 keyword vector"
+        ),
     }
 }
 
@@ -2371,12 +2391,16 @@ fn parse_provider(var: &str, raw: Option<String>, fallback: Provider) -> Result<
     })
 }
 
-/// The `RANK_*` switches (LAB-7714). Unset leaves every boost on and the tag
-/// keyword leg. Set, a switch takes only `true` or `false`, the exempt list
-/// only known memory types with no empty entry, and `RANK_KEYWORD_LEG`
-/// (LAB-7716) only `tags`, `bm25` or `both`, so a typo refuses boot instead of
-/// silently ranking as before. Read raw, not through `env_non_empty`: a blank value is
-/// set, and an operator who blanked one meant something by it.
+/// The `RANK_*` switches (LAB-7714). Unset leaves every boost on. Set, a
+/// switch takes only `true` or `false` and the exempt list only known memory
+/// types with no empty entry, so a typo refuses boot instead of silently
+/// ranking as before. BM25 is the only keyword leg since LAB-8998, so
+/// `RANK_KEYWORD_LEG` (LAB-7716) is gone: `bm25`, what a deployment from before
+/// the removal sets, boots with a warning to unset it; any other value refuses
+/// boot, so an operator who set `tags` to roll back learns that this image
+/// cannot, instead of getting BM25 silently. Read raw, not through
+/// `env_non_empty`: a blank value is set, and an operator who blanked one
+/// meant something by it.
 fn parse_ranking(env: impl Fn(&str) -> Option<String>) -> Result<RankingFlags, String> {
     let switch = |var: &str| match env(var) {
         None => Ok(true),
@@ -2403,23 +2427,22 @@ fn parse_ranking(env: impl Fn(&str) -> Option<String>) -> Result<RankingFlags, S
             })
             .collect::<Result<Vec<_>, _>>()?,
     };
-    let keyword_leg = match env("RANK_KEYWORD_LEG") {
-        None => KeywordLeg::Tags,
-        Some(s) => {
-            let want = s.trim().to_ascii_lowercase();
-            KeywordLeg::ALL
-                .iter()
-                .find(|(name, _)| *name == want)
-                .map(|(_, leg)| *leg)
-                .ok_or_else(|| format!("RANK_KEYWORD_LEG must be tags, bm25 or both, got {s:?}"))?
+    if let Some(s) = env("RANK_KEYWORD_LEG") {
+        if !s.trim().eq_ignore_ascii_case("bm25") {
+            return Err(format!(
+                "RANK_KEYWORD_LEG was removed: BM25 is the only keyword leg, got {s:?}. \
+                 Unset it, or run an earlier release to rank with the tag pools"
+            ));
         }
-    };
+        tracing::warn!(
+            "RANK_KEYWORD_LEG=bm25 has no effect: BM25 is the only keyword leg; unset it"
+        );
+    }
     Ok(RankingFlags {
         access_salience: switch("RANK_ACCESS_BOOST")?,
         spacing: switch("RANK_SPACING_BOOST")?,
         graph: switch("RANK_GRAPH_BOOST")?,
         decay_exempt_types,
-        keyword_leg,
     })
 }
 
@@ -3116,7 +3139,6 @@ fn main() {
             spacing_boost = config.ranking.spacing,
             graph_boost = config.ranking.graph,
             decay_exempt_types = ?config.ranking.decay_exempt_types,
-            keyword_leg = ?config.ranking.keyword_leg,
             "hybrid ranking switches"
         );
         tracing::info!(
@@ -4459,7 +4481,6 @@ mod tests {
             ("RANK_SPACING_BOOST", "FALSE"),
             ("RANK_GRAPH_BOOST", " false "),
             ("RANK_DECAY_EXEMPT_TYPES", " decision, reference"),
-            ("RANK_KEYWORD_LEG", " Both "),
         ]))
         .unwrap();
         assert_eq!(
@@ -4469,21 +4490,20 @@ mod tests {
                 spacing: false,
                 graph: false,
                 decay_exempt_types: vec!["decision".into(), "reference".into()],
-                keyword_leg: KeywordLeg::Both,
             }
         );
-        for (value, leg) in [
-            ("tags", KeywordLeg::Tags),
-            ("bm25", KeywordLeg::Bm25),
-            ("BM25", KeywordLeg::Bm25),
-        ] {
-            let got = parse_ranking(|v| (v == "RANK_KEYWORD_LEG").then(|| value.to_string()));
-            assert_eq!(got.unwrap().keyword_leg, leg, "{value:?}");
-        }
         assert_eq!(
             parse_ranking(env(&[("RANK_GRAPH_BOOST", "true")])).unwrap(),
             RankingFlags::default()
         );
+        // A deployment from before LAB-8998 still sets `bm25`: it boots as if unset.
+        for value in ["bm25", " BM25 "] {
+            assert_eq!(
+                parse_ranking(|v| (v == "RANK_KEYWORD_LEG").then(|| value.to_string())).unwrap(),
+                RankingFlags::default(),
+                "{value:?}"
+            );
+        }
 
         let err = parse_ranking(env(&[("RANK_SPACING_BOOST", "off")])).unwrap_err();
         assert!(
@@ -4499,10 +4519,10 @@ mod tests {
             ("RANK_DECAY_EXEMPT_TYPES", ","),
             ("RANK_DECAY_EXEMPT_TYPES", "decision,"),
             ("RANK_DECAY_EXEMPT_TYPES", "decision,,reference"),
+            // Removed in LAB-8998: any value but `bm25` refuses boot.
+            ("RANK_KEYWORD_LEG", "tags"),
+            ("RANK_KEYWORD_LEG", "both"),
             ("RANK_KEYWORD_LEG", ""),
-            ("RANK_KEYWORD_LEG", " "),
-            ("RANK_KEYWORD_LEG", "keywords"),
-            ("RANK_KEYWORD_LEG", "tags,bm25"),
         ] {
             let err = parse_ranking(|v| (v == var).then(|| value.to_string())).unwrap_err();
             assert!(err.starts_with(var), "{var}={value:?}: {err}");
@@ -5650,9 +5670,60 @@ mod tests {
         );
     }
 
+    /// Startup warns, with the count, when memories lack the BM25 keyword
+    /// vector (LAB-8998), and says nothing when none do.
+    #[tokio::test]
+    async fn startup_warns_about_memories_missing_the_keyword_vector() {
+        for (count, warned) in [(3, true), (0, false)] {
+            // One-shot Qdrant stand-in: answers the count request with `count`.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
+            let addr = listener.local_addr().unwrap();
+            let responder = std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = conn.read(&mut buf).unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = format!(r#"{{"result":{{"count":{count}}},"status":"ok"}}"#);
+                write!(
+                    conn,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                request
+            });
+
+            let log = crate::testlog::LogBuf::default();
+            let _guard = crate::testlog::scoped(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::INFO)
+                    .with_writer(log.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            let client =
+                QdrantClient::new(format!("http://{addr}"), "memories".into(), None).unwrap();
+            warn_missing_keyword_vectors(&client).await;
+
+            let request = responder.join().unwrap();
+            assert!(
+                request.starts_with("POST /collections/memories/points/count"),
+                "{request}"
+            );
+            let log = log.text();
+            assert_eq!(
+                log.contains("missing=3") && log.contains("POST /backfill/keywords"),
+                warned,
+                "count {count}:\n{log}"
+            );
+            assert!(!log.contains("could not count"), "{log}");
+        }
+    }
+
     /// LAB-8297: a tag search records how many tags it was given, not the
-    /// tags: a search's tags are caller text, and hybrid search passes the
-    /// query words that match a stored tag.
+    /// tags: a search's tags are caller text.
     #[tokio::test]
     async fn tag_search_span_carries_no_tag_text() {
         use alaya_backends::VectorStorage;
@@ -5672,9 +5743,7 @@ mod tests {
             .expect("free port");
         let client =
             QdrantClient::new(format!("http://{refused}"), "memories".into(), None).unwrap();
-        let found = client
-            .search_by_tags(&["TAG-MARKER"], false, 10, Some("note"), None, None)
-            .await;
+        let found = client.search_by_tags(&["TAG-MARKER"], false, 10).await;
         assert!(found.is_err());
 
         let log = log.text();
@@ -5807,20 +5876,15 @@ mod wedge_tests {
             _tags: &[&str],
             _match_all: bool,
             _limit: usize,
-            _mt: Option<&str>,
-            _mts: Option<f64>,
-            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             unimplemented!()
         }
-        async fn search_similar_tags(
+        async fn search_by_text(
             &self,
-            _tag_embedding: &[f32],
+            _query: &str,
             _limit: usize,
-        ) -> Result<Vec<String>> {
-            unimplemented!()
-        }
-        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
+            _filters: Option<PayloadFilter>,
+        ) -> Result<Vec<ScoredMemory>> {
             unimplemented!()
         }
         async fn get_all(&self, _limit: usize, _offset: Option<&str>) -> Result<ScrollResult> {
@@ -5836,9 +5900,6 @@ mod wedge_tests {
         }
         async fn count(&self) -> Result<usize> {
             std::future::pending().await
-        }
-        async fn get_all_tags(&self) -> Result<Vec<String>> {
-            unimplemented!()
         }
         async fn increment_access_count(&self, _content_hash: &str) -> Result<()> {
             unimplemented!()
@@ -6376,10 +6437,9 @@ mod wedge_tests {
     /// Outer bound on any reply await, so a wedge fails instead of hanging.
     const NEVER: Duration = Duration::from_secs(3600);
 
-    /// VectorStorage whose `search_by_tags` takes `SLOW_SEARCH`. Only hybrid
-    /// search calls it, and every one does, the tag cache notwithstanding:
-    /// `get_all_tags` answers "flag", a keyword of the test query. The store
-    /// path runs at full speed: its `search_by_vector` answers `neighbour` at
+    /// VectorStorage whose BM25 `search_by_text` takes `SLOW_SEARCH`. Only
+    /// hybrid search calls it, and every one does. The store path runs at
+    /// full speed: its `search_by_vector` answers `neighbour` at
     /// once, and `stored` records every write. A supersede finds every hash
     /// it names, as a copy of `neighbour`, and its marker write succeeds.
     /// Methods none of these paths calls panic.
@@ -6455,22 +6515,17 @@ mod wedge_tests {
             _tags: &[&str],
             _match_all: bool,
             _limit: usize,
-            _mt: Option<&str>,
-            _mts: Option<f64>,
-            _mca: Option<f64>,
+        ) -> Result<Vec<ScoredMemory>> {
+            unimplemented!()
+        }
+        async fn search_by_text(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _filters: Option<PayloadFilter>,
         ) -> Result<Vec<ScoredMemory>> {
             tokio::time::sleep(SLOW_SEARCH).await;
             Ok(Vec::new())
-        }
-        async fn search_similar_tags(
-            &self,
-            _tag_embedding: &[f32],
-            _limit: usize,
-        ) -> Result<Vec<String>> {
-            Ok(Vec::new())
-        }
-        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
-            Ok(())
         }
         async fn get_all(&self, _limit: usize, _offset: Option<&str>) -> Result<ScrollResult> {
             unimplemented!()
@@ -6485,9 +6540,6 @@ mod wedge_tests {
         }
         async fn count(&self) -> Result<usize> {
             Ok(1)
-        }
-        async fn get_all_tags(&self) -> Result<Vec<String>> {
-            Ok(vec!["flag".into()])
         }
         async fn increment_access_count(&self, _content_hash: &str) -> Result<()> {
             Ok(())
@@ -6538,8 +6590,7 @@ mod wedge_tests {
             .await;
     }
 
-    /// The query of the hybrid search every test here sends: its keyword
-    /// "flag" is the tag `SlowSearchVectors` knows.
+    /// The query of the hybrid search every test here sends.
     const SEARCH_QUERY: &str = "flag state";
 
     fn hybrid_search(reply: oneshot::Sender<Value>) -> CmdInner {
@@ -6708,20 +6759,7 @@ mod wedge_tests {
             _tags: &[&str],
             _match_all: bool,
             _limit: usize,
-            _mt: Option<&str>,
-            _mts: Option<f64>,
-            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
-            unimplemented!()
-        }
-        async fn search_similar_tags(
-            &self,
-            _tag_embedding: &[f32],
-            _limit: usize,
-        ) -> Result<Vec<String>> {
-            unimplemented!()
-        }
-        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
             unimplemented!()
         }
         async fn get_all(&self, _limit: usize, _offset: Option<&str>) -> Result<ScrollResult> {
@@ -6736,9 +6774,6 @@ mod wedge_tests {
             unimplemented!()
         }
         async fn count(&self) -> Result<usize> {
-            unimplemented!()
-        }
-        async fn get_all_tags(&self) -> Result<Vec<String>> {
             unimplemented!()
         }
         async fn increment_access_count(&self, _content_hash: &str) -> Result<()> {
@@ -7139,7 +7174,8 @@ mod wedge_tests {
         local
             .run_until(async {
                 let (tx, rx) = mpsc::channel::<Cmd>(8);
-                // `HangVectors::get_all_tags` panics: hybrid search calls it first.
+                // `HangVectors::search_by_text` panics: hybrid search's BM25
+                // branch calls it on the fan-out's first poll.
                 tokio::task::spawn_local(service_worker(
                     rx,
                     hanging_service(),

@@ -128,7 +128,7 @@ printf '{"session_id":"s1","transcript_path":"%s"}' "$T/transcript.jsonl" \
       _ALAYA_HOOK_FOREGROUND=1 ALAYA_URL=http://alaya.test/store ALAYA_LLM_URL=http://llm.test/v1/chat/completions \
       ALAYA_LLM_API_KEY=k ALAYA_API_KEY=k ALAYA_HOOK_STATE_DIR="$home/state" bash "$HOOK") >/dev/null 2>&1
 log="$home/state/failures.log"
-if [[ "$(wc -l < "$log" 2>/dev/null)" -eq 1 ]] && grep -q 'cannot write .*memories.json: the work dir is gone' "$log"
+if [[ "$(wc -l < "$log" 2>/dev/null)" -eq 1 ]] && grep -q 'cannot write .*reply.txt: the work dir is gone' "$log"
 then echo "ok    rmwork: lost work dir logged as the cause"
 else echo "FAIL  rmwork: failures.log: $(cat "$log" 2>/dev/null)"; RC=1; fi
 

@@ -28,7 +28,7 @@ memory server:
 - `bash`
 - `jq`
 - `curl`
-- `python3` (PreCompact stdin parsing; Stop hook timestamp parsing on macOS/BSD, where GNU `date -d` is unavailable)
+- `python3` (PreCompact stdin parsing; Stop hook reply parsing, and timestamp parsing on macOS/BSD, where GNU `date -d` is unavailable)
 - An Ālaya server reachable from wherever `claude` runs, with `ALAYA_API_KEY` auth enabled
 - An OpenAI chat-completions-compatible LLM endpoint for transcript extraction (the Stop hook
   calls this once per save; it does not have to be the same provider as the agent itself)
@@ -171,6 +171,20 @@ back to the state dir), that the hook's output pipe closes as soon as the hook r
 detached copy holds neither stdout nor stderr, so it cannot hold the CLI), that a work dir lost
 mid-save is logged as that rather than as bad LLM output, and that `hooks.json` registers the
 Stop hook synchronously.
+
+```bash
+scripts/test-reply-parse.sh
+```
+
+Runs the real Stop hook against a stub extractor and proves what it makes of the reply. Memories
+are stored only when the reply, fence lines aside, is one JSON array of objects and nothing else.
+A reply whose every JSON value is `[]` is a quiet "nothing to save", whatever prose surrounds it,
+unless a `[` or `{` in it does not decode: a truncated or single-quoted reply is logged as
+malformed, since a `[]` inside it proves nothing.
+A non-empty result with prose or another value beside it is logged with the reply and not stored:
+the prose may mark it as an example, and storing an example would be a false memory. A lone JSON
+object, pretty-printed or not, is logged as not an array. A reply with no JSON value is logged once
+on one line with the reply text, and a reply file that cannot be read is logged as that.
 
 ```bash
 scripts/test-precompact-gate.sh

@@ -115,6 +115,7 @@ pub struct Vitals {
     selfcheck_enabled: bool,
     embed_failures: AtomicU64,
     rerank_failures: AtomicU64,
+    keyword_failures: AtomicU64,
     store_failures: AtomicU64,
     enrich_overruns: AtomicU64,
     selfcheck: Mutex<SelfCheckState>,
@@ -136,6 +137,10 @@ impl Vitals {
 
     pub fn rerank_failed(&self) {
         self.rerank_failures.fetch_add(1, Relaxed);
+    }
+
+    pub fn keyword_failed(&self) {
+        self.keyword_failures.fetch_add(1, Relaxed);
     }
 
     pub fn store_failed(&self) {
@@ -182,6 +187,7 @@ impl Vitals {
             "failures": {
                 "embedding": self.embed_failures.load(Relaxed),
                 "rerank": self.rerank_failures.load(Relaxed),
+                "keyword": self.keyword_failures.load(Relaxed),
                 "store": self.store_failures.load(Relaxed),
                 "enrich_overrun": self.enrich_overruns.load(Relaxed),
             },

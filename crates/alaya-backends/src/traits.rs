@@ -238,20 +238,14 @@ pub trait VectorStorage {
         limit: usize,
         filters: Option<PayloadFilter>,
     ) -> Result<Vec<ScoredMemory>>;
-    /// `memory_type` (exact match), `min_trust_score` (stored
-    /// `provenance.trust_score` at least this) and `max_created_at`
-    /// (`created_at` at or before this), when set, apply before `limit`.
+    /// Memories carrying `tags` (every tag when `match_all`, else any),
+    /// at most `limit`.
     async fn search_by_tags(
         &self,
         tags: &[&str],
         match_all: bool,
         limit: usize,
-        memory_type: Option<&str>,
-        min_trust_score: Option<f64>,
-        max_created_at: Option<f64>,
     ) -> Result<Vec<ScoredMemory>>;
-    async fn search_similar_tags(&self, tag_embedding: &[f32], limit: usize)
-    -> Result<Vec<String>>;
 
     // Keyword (BM25) index over memory content (LAB-7716)
 
@@ -293,10 +287,6 @@ pub trait VectorStorage {
         ))
     }
 
-    /// Upsert tag embeddings into the tag collection.
-    /// Each entry is `(tag_name, embedding_vector)`.
-    async fn upsert_tags(&self, tags: &[(&str, Vec<f32>)]) -> Result<()>;
-
     // Scroll / list
     async fn get_all(&self, limit: usize, offset: Option<&str>) -> Result<ScrollResult>;
     /// Fetch memories ordered by `created_at` descending.
@@ -323,7 +313,6 @@ pub trait VectorStorage {
             "write_novelty is not supported by this backend".into(),
         ))
     }
-    async fn get_all_tags(&self) -> Result<Vec<String>>;
     async fn increment_access_count(&self, content_hash: &str) -> Result<()>;
 
     /// Batch increment access counts for multiple memories.
