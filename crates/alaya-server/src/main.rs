@@ -665,7 +665,7 @@ async fn require_conditional_writes(qdrant: &QdrantClient) {
 async fn ensure_qdrant_collection(qdrant: &QdrantClient, dimensions: usize) {
     for attempt in 0..L2_MAX_ATTEMPTS {
         match qdrant.ensure_collection(dimensions).await {
-            Ok(()) => return,
+            Ok(()) => return warn_missing_keyword_vectors(qdrant).await,
             Err(e) if attempt + 1 == L2_MAX_ATTEMPTS => {
                 tracing::error!(
                     error = %e,
@@ -685,6 +685,27 @@ async fn ensure_qdrant_collection(qdrant: &QdrantClient, dimensions: usize) {
                 .await;
             }
         }
+    }
+}
+
+/// BM25 is hybrid search's only keyword pool (LAB-8998), and it cannot find a
+/// memory that lacks the keyword vector. A deployment that ran the old `tags`
+/// default and never ran `POST /backfill/keywords` would lose keyword recall
+/// on its older memories with no sign of it, so startup says so. Never fatal:
+/// search still answers, from the dense pool for those memories.
+async fn warn_missing_keyword_vectors(qdrant: &QdrantClient) {
+    use alaya_backends::VectorStorage;
+    match qdrant.count_missing_keyword_vectors().await {
+        Ok(0) => {}
+        Ok(missing) => tracing::warn!(
+            missing,
+            "memories lack the BM25 keyword vector, so hybrid keyword search cannot find \
+             them; run POST /backfill/keywords"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not count memories missing the BM25 keyword vector"
+        ),
     }
 }
 
@@ -5647,6 +5668,58 @@ mod tests {
             !log.contains("QUERY-MARKER"),
             "query text reached the log:\n{log}"
         );
+    }
+
+    /// Startup warns, with the count, when memories lack the BM25 keyword
+    /// vector (LAB-8998), and says nothing when none do.
+    #[tokio::test]
+    async fn startup_warns_about_memories_missing_the_keyword_vector() {
+        for (count, warned) in [(3, true), (0, false)] {
+            // One-shot Qdrant stand-in: answers the count request with `count`.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
+            let addr = listener.local_addr().unwrap();
+            let responder = std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = conn.read(&mut buf).unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = format!(r#"{{"result":{{"count":{count}}},"status":"ok"}}"#);
+                write!(
+                    conn,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                request
+            });
+
+            let log = crate::testlog::LogBuf::default();
+            let _guard = crate::testlog::scoped(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::INFO)
+                    .with_writer(log.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            let client =
+                QdrantClient::new(format!("http://{addr}"), "memories".into(), None).unwrap();
+            warn_missing_keyword_vectors(&client).await;
+
+            let request = responder.join().unwrap();
+            assert!(
+                request.starts_with("POST /collections/memories/points/count"),
+                "{request}"
+            );
+            let log = log.text();
+            assert_eq!(
+                log.contains("missing=3") && log.contains("POST /backfill/keywords"),
+                warned,
+                "count {count}:\n{log}"
+            );
+            assert!(!log.contains("could not count"), "{log}");
+        }
     }
 
     /// LAB-8297: a tag search records how many tags it was given, not the
