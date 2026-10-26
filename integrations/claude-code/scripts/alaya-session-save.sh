@@ -384,58 +384,49 @@ RESPONSE=$(printf '%s' "$RAW" | jq -r '.choices[0].message.content // empty' 2>/
 [[ -z "$RESPONSE" ]] && _skip "LLM extraction failed model=$LLM_MODEL resp=${RAW:0:300}"
 
 # --- Parse LLM output ---
-# The extractor often fences the array and explains it in prose before or
-# after, most often a fenced [] followed by why nothing qualifies, and the prose
-# can hold [ or a fence of its own (a markdown link, a remark about [], a
-# fenced command, an example). So a candidate is a JSON value that starts a
-# line and ends one, and scanning resumes after it, so a value nested inside
-# another (a pretty-printed envelope) is never a candidate of its own. Fences
-# need no special case: a fence line never starts with [, so the array inside
-# is found. A line such as "[] means none" goes on after its value: prose.
-# The payload is a non-empty array of objects when it is the only array. Only
-# empty arrays: nothing to save. A non-empty array beside any other array, []
-# included: either may be an example, and storing an example as a memory is
-# worse than skipping the save, so it is logged, never guessed. No array: the
-# first other value is passed on, so an envelope like {"memories":[...]} is
-# logged as not an array below. Each failure is logged with the reply itself,
-# on one line, so its shape is known.
+# The extractor often fences the array and explains it in prose, most often a
+# fenced [] followed by why nothing qualifies. Prose can hold anything: links,
+# commands, an example array, the result written inline. No reading of prose
+# can tell an example from the result, and storing an example is a false
+# memory, which is worse than a skipped save. So memories are stored only when
+# the reply, fence lines aside, is one JSON array and nothing else. Every JSON
+# value in the reply is found, at any position, skipping what is nested inside
+# one. When every value is [] there is nothing to save, whatever surrounds it:
+# a quiet exit. A lone value that is not an array is logged as not an array
+# below. A non-empty result with prose or another value beside it is logged
+# with the reply and not stored, and so is a reply with no JSON value.
 command -v python3 >/dev/null 2>&1 || _skip "config: python3 not found on PATH, skipping save"
 printf '%s\n' "$RESPONSE" > "$_HOOKDIR/reply.txt" \
     || _skip "cannot write $_HOOKDIR/reply.txt: the work dir is gone or unwritable, skipping save"
 _PARSE_ERR=$(python3 -c '
-import json, sys
+import json, re, sys
 with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
-    text = f.read()
+    text = re.sub(r"(?m)^[ \t]*```[\w+-]*[ \t]*\r?$", "", f.read())
 decode = json.JSONDecoder().raw_decode
-pos = resume = 0
-arrays, other = [], []
-for line in text.splitlines(True):
-    start, pos = pos + len(line) - len(line.lstrip()), pos + len(line)
-    if start < resume or text[start:start + 1] not in ("[", "{"):
-        continue
-    try:
-        value, end = decode(text, start)
-    except ValueError:
-        continue
-    resume = end
-    eol = text.find("\n", end)
-    if text[end:eol if eol >= 0 else len(text)].strip():
-        continue
-    if isinstance(value, list) and all(isinstance(m, dict) for m in value):
-        arrays.append(value)
-    else:
-        other.append(value)
-full = [a for a in arrays if a]
-if full and len(arrays) > 1:
-    sys.exit(11)
-if not arrays and not other:
+values, prose, i = [], [], 0
+while i < len(text):
+    if text[i] in "[{":
+        try:
+            value, i = decode(text, i)
+            values.append(value)
+            continue
+        except ValueError:
+            pass
+    prose.append(text[i])
+    i += 1
+if not values:
     sys.exit(10)
-print(json.dumps(full[0] if full else arrays[0] if arrays else other[0]))' \
+if all(v == [] for v in values):
+    print("[]")
+elif len(values) == 1 and not "".join(prose).strip():
+    print(json.dumps(values[0]))
+else:
+    sys.exit(11)' \
     "$_HOOKDIR/reply.txt" 2>&1 > "$_HOOKDIR/memories.json")
 case $? in
     0) ;;
     10) _skip "LLM output not valid JSON: $(printf '%s' "$RESPONSE" | tr '\n' ' ' | head -c 300)" ;;
-    11) _skip "LLM output ambiguous: a non-empty array and another array, none stored: $(printf '%s' "$RESPONSE" | tr '\n' ' ' | head -c 300)" ;;
+    11) _skip "LLM output not stored: a non-empty result with prose or another value beside it: $(printf '%s' "$RESPONSE" | tr '\n' ' ' | head -c 300)" ;;
     *) _skip "cannot parse $_HOOKDIR/reply.txt, skipping save: $(printf '%s' "$_PARSE_ERR" | tr '\n' ' ' | tail -c 300)" ;;
 esac
 
