@@ -1807,23 +1807,14 @@ impl VectorStorage for QdrantClient {
             .collect())
     }
 
-    #[tracing::instrument(skip(self, tags, memory_type), fields(n_tags = tags.len(), match_all, limit, memory_type = ?memory_type.map(crate::clip_for_log)))]
+    #[tracing::instrument(skip(self, tags), fields(n_tags = tags.len(), match_all, limit))]
     async fn search_by_tags(
         &self,
         tags: &[&str],
         match_all: bool,
         limit: usize,
-        memory_type: Option<&str>,
-        min_trust_score: Option<f64>,
-        max_created_at: Option<f64>,
     ) -> Result<Vec<ScoredMemory>> {
-        // Qdrant applies memory_type, min_trust_score and max_created_at
-        // before `limit`, so tag matches the caller excluded cannot fill the
-        // page ahead of the memories it asked for.
         let filter = PayloadFilter {
-            memory_type: memory_type.map(String::from),
-            min_trust_score,
-            max_created_at,
             tags: Some(tags.iter().map(|t| t.to_string()).collect()),
             tags_match_all: match_all,
             ..Default::default()
