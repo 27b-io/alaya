@@ -31,14 +31,14 @@ for i in 1 2 3 4 5; do
   jq -nc --arg t "prompt $i" '{type:"user", timestamp:"2020-01-01T00:00:00Z", message:{role:"user", content:$t}}'
 done > "$T/transcript.jsonl"
 
-# case_ <label> <stores wanted> <failures.log line wanted, or empty for none> <reply>
+# case_ <label> <stores wanted> <failures.log line wanted, or empty for none> <reply> [PATH prefix]
 # (an argument, not stdin: a piped case_ runs in a subshell and loses RC)
 case_() {
   local home="$T/home" cap="$T/cap" stores log
   rm -rf "$home" "$cap"; mkdir -p "$home" "$cap"
   printf '%s' "$4" > "$cap/reply"
   printf '{"session_id":"s1","transcript_path":"%s"}' "$T/transcript.jsonl" \
-    | (cd "$T" && env -i HOME="$home" CAP="$cap" PATH="$T/bin:$JQ_DIR:/usr/bin:/bin" \
+    | (cd "$T" && env -i HOME="$home" CAP="$cap" PATH="${5:-}$T/bin:$JQ_DIR:/usr/bin:/bin" \
         ALAYA_URL=http://alaya.test/store ALAYA_LLM_URL=http://llm.test/v1/chat/completions \
         ALAYA_LLM_API_KEY=k ALAYA_API_KEY=k ALAYA_HOOK_STATE_DIR="$home/state" _ALAYA_HOOK_FOREGROUND=1 \
         bash "$HOOK") >/dev/null 2>&1
@@ -74,6 +74,17 @@ case_ "bare array then prose with a fenced []: stored" 1 "" \
   "$(printf '[%s]\nAn empty result would look like:\n%sjson\n[]\n%s\n' "$MEM" "$FENCE" "$FENCE")"
 case_ "fenced command then fenced array: stored" 1 "" \
   "$(printf 'Verified with:\n%ssh\nnpm test\n%s\n%sjson\n[%s]\n%s\n' "$FENCE" "$FENCE" "$FENCE" "$MEM" "$FENCE")"
+case_ "fenced [] example then fenced array: stored" 1 "" \
+  "$(printf 'An empty result looks like:\n%sjson\n[]\n%s\nThis session has one:\n%sjson\n[%s]\n%s\n' \
+    "$FENCE" "$FENCE" "$FENCE" "$MEM" "$FENCE")"
+# two non-empty arrays: which is the result is unknowable, so it is logged, never guessed
+case_ "two non-empty arrays: logged as ambiguous" 0 "LLM output ambiguous: 2 or more non-empty arrays" \
+  "$(printf 'A memory looks like:\n[%s]\nThis session has:\n[%s]\n' "$MEM" "$MEM")"
+# a pretty-printed envelope is one value: arrays inside it are not payloads
+case_ "pretty envelope with a nested []: logged as not an array" 0 "valid JSON but not an array" \
+  "$(printf '{\n  "memories": [%s],\n  "tags":\n  []\n}\n' "$MEM")"
+case_ "pretty envelope with the array on its own line: logged as not an array" 0 "valid JSON but not an array" \
+  "$(printf '{\n  "memories":\n  [\n    %s\n  ]\n}\n' "$MEM")"
 # a footnote-style line that opens with a JSON value but goes on is prose
 case_ "footnote line then fenced array: stored" 1 "" \
   "$(printf '[1] see the ticket.\n%sjson\n[%s]\n%s\n' "$FENCE" "$MEM" "$FENCE")"
@@ -92,6 +103,14 @@ case_ "truncated array: logged with the reply" 0 'LLM output not valid JSON: [{"
   "$(printf '[%s, {"content":"cut sho' "$MEM")"
 case_ "object envelope: logged as not an array" 0 "valid JSON but not an array" \
   "$(printf '{"memories":[%s]}\n' "$MEM")"
+
+# the reply file gone before the parser reads it is logged as that, not as bad model output
+mkdir -p "$T/rmreply"
+# shellcheck disable=SC2016 # $3 and $@ belong to the wrapper, not this shell
+printf '#!/bin/sh\nrm -f "$3"\nexec %s "$@"\n' "$(command -v python3)" > "$T/rmreply/python3"
+chmod +x "$T/rmreply/python3"
+case_ "reply file gone before the parse: logged as a read failure" 0 "No such file or directory" \
+  "$(printf '[%s]' "$MEM")" "$T/rmreply:"
 
 [[ $RC -eq 0 ]] && echo "ALL PASS: the Stop hook reads the extractor's array and ignores prose around it"
 exit $RC

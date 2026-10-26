@@ -176,12 +176,14 @@ Stop hook synchronously.
 scripts/test-reply-parse.sh
 ```
 
-Runs the real Stop hook against a stub extractor and proves what it makes of the reply: a fenced
-or bare `[]` followed by prose is a quiet "nothing to save", an array with prose before or after
-it (fenced or not) is stored, and so is an array whose surrounding prose holds a `[` or a fence of
-its own: a markdown link, a remark about `[]`, a footnote, a fenced command or a fenced `[]` example,
-before or after it. A reply with no JSON value, or a truncated one, is logged once on one line with
-the reply text. A JSON object is still logged as not an array.
+Runs the real Stop hook against a stub extractor and proves what it makes of the reply. A
+candidate is a JSON value that starts a line and ends one, and nothing nested inside it counts on
+its own. A fenced or bare `[]` followed by prose is a quiet "nothing to save". An array is stored
+whatever prose surrounds it, including a `[` or a fence of its own: a markdown link, a remark about
+`[]`, a footnote, a fenced command, or a fenced `[]` example before or after it. Two or more
+non-empty arrays are logged as ambiguous and nothing is stored. A JSON object, pretty-printed or
+not, is logged as not an array. A reply with no JSON value, or a truncated one, is logged once on
+one line with the reply text, and a reply file that cannot be read is logged as that.
 
 ```bash
 scripts/test-precompact-gate.sh

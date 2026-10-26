@@ -352,6 +352,7 @@ Rules:
 - Content must stand alone — no "in this session" or "we discussed" references
 - Tags: always include project name, plus relevant technologies/topics
 - Storing nothing is a normal outcome: if nothing qualifies, output []
+- Reply with the JSON array only: no code fences, and no prose or examples before or after it
 SYS
 
 DURATION_MIN=$((DURATION / 60))
@@ -386,41 +387,55 @@ RESPONSE=$(printf '%s' "$RAW" | jq -r '.choices[0].message.content // empty' 2>/
 # The extractor often fences the array and explains it in prose before or
 # after, most often a fenced [] followed by why nothing qualifies, and the prose
 # can hold [ or a fence of its own (a markdown link, a remark about [], a
-# fenced command). So the payload is the first line that starts a whole JSON
-# array of objects and has nothing after it on the line where it ends. Fences
+# fenced command, an example). So a candidate is a JSON value that starts a
+# line and ends one, and scanning resumes after it, so a value nested inside
+# another (a pretty-printed envelope) is never a candidate of its own. Fences
 # need no special case: a fence line never starts with [, so the array inside
-# is found. With no such array, the first JSON object found the same way is
-# passed on, so an envelope like {"memories":[...]} is logged as not an array
-# below. A reply with neither is logged with the reply itself, on one line, so
-# its shape is known.
+# is found. A line such as "[] means none" goes on after its value: prose.
+# The payload is the one non-empty array of objects. Only empty arrays: nothing
+# to save. Two or more non-empty: which is the result cannot be known, so it is
+# logged, never guessed. No array: the first other value is passed on, so an
+# envelope like {"memories":[...]} is logged as not an array below. Each
+# failure is logged with the reply itself, on one line, so its shape is known.
 command -v python3 >/dev/null 2>&1 || _skip "config: python3 not found on PATH, skipping save"
 printf '%s\n' "$RESPONSE" > "$_HOOKDIR/reply.txt" \
     || _skip "cannot write $_HOOKDIR/reply.txt: the work dir is gone or unwritable, skipping save"
-python3 -c '
+_PARSE_ERR=$(python3 -c '
 import json, sys
-text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
-decode, pos, other = json.JSONDecoder().raw_decode, 0, None
+with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+    text = f.read()
+decode = json.JSONDecoder().raw_decode
+pos = resume = 0
+arrays, other = [], []
 for line in text.splitlines(True):
     start, pos = pos + len(line) - len(line.lstrip()), pos + len(line)
-    if text[start:start + 1] not in ("[", "{"):
+    if start < resume or text[start:start + 1] not in ("[", "{"):
         continue
     try:
         value, end = decode(text, start)
     except ValueError:
         continue
+    resume = end
     eol = text.find("\n", end)
     if text[end:eol if eol >= 0 else len(text)].strip():
-        continue  # the line goes on: prose such as "[] means none" or "[1] see"
+        continue
     if isinstance(value, list) and all(isinstance(m, dict) for m in value):
-        print(json.dumps(value))
-        sys.exit(0)
-    if other is None:
-        other = value
-if other is None:
-    sys.exit(1)
-print(json.dumps(other))' \
-    "$_HOOKDIR/reply.txt" > "$_HOOKDIR/memories.json" 2>/dev/null \
-    || _skip "LLM output not valid JSON: $(printf '%s' "$RESPONSE" | tr '\n' ' ' | head -c 300)"
+        arrays.append(value)
+    else:
+        other.append(value)
+full = [a for a in arrays if a]
+if len(full) > 1:
+    sys.exit(11)
+if not arrays and not other:
+    sys.exit(10)
+print(json.dumps(full[0] if full else arrays[0] if arrays else other[0]))' \
+    "$_HOOKDIR/reply.txt" 2>&1 > "$_HOOKDIR/memories.json")
+case $? in
+    0) ;;
+    10) _skip "LLM output not valid JSON: $(printf '%s' "$RESPONSE" | tr '\n' ' ' | head -c 300)" ;;
+    11) _skip "LLM output ambiguous: 2 or more non-empty arrays, none stored: $(printf '%s' "$RESPONSE" | tr '\n' ' ' | head -c 300)" ;;
+    *) _skip "cannot parse $_HOOKDIR/reply.txt, skipping save: $(printf '%s' "$_PARSE_ERR" | tr '\n' ' ' | tail -c 300)" ;;
+esac
 
 # -1 = valid JSON but not an array (output-envelope drift, e.g. {"memories":[...]})
 # — must be logged, or a model/gateway change silently stops all saves (LAB-170).
