@@ -173,6 +173,15 @@ mid-save is logged as that rather than as bad LLM output, and that `hooks.json` 
 Stop hook synchronously.
 
 ```bash
+scripts/test-reply-parse.sh
+```
+
+Runs the real Stop hook against a stub extractor and proves what it makes of the reply: a fenced
+or bare `[]` followed by prose is a quiet "nothing to save", an array with prose before or after
+it (fenced or not) is stored, and a reply with no JSON value, or a truncated one, is logged once
+on one line with the reply text. A JSON object is still logged as not an array.
+
+```bash
 scripts/test-precompact-gate.sh
 ```
 

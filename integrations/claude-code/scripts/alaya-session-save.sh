@@ -382,15 +382,22 @@ RESPONSE=$(printf '%s' "$RAW" | jq -r '.choices[0].message.content // empty' 2>/
 # A dead LLM gate must never be silent again (LAB-170: 5 lost days taught us that)
 [[ -z "$RESPONSE" ]] && _skip "LLM extraction failed model=$LLM_MODEL resp=${RAW:0:300}"
 
-# --- Parse LLM output (strip markdown fences if present) ---
-printf '%s\n' "$RESPONSE" | sed 's/^```[a-zA-Z]*//;/^$/d' 2>/dev/null > "$_HOOKDIR/memories.json" \
-    || _skip "cannot write $_HOOKDIR/memories.json: the work dir is gone or unwritable, skipping save"
+# --- Parse LLM output ---
+# The extractor often fences the array and explains it in prose before or
+# after, most often a fenced [] followed by why nothing qualifies. So drop the
+# fence lines, start at the first line that opens an array or object, and read
+# only the first JSON value: the prose around it is ignored. A reply that still
+# fails is logged with the reply itself, on one line, so its shape is known.
+printf '%s\n' "$RESPONSE" | sed -n '/^```/d; /^[[:space:]]*[[{]/,$p' > "$_HOOKDIR/reply.txt" \
+    || _skip "cannot write $_HOOKDIR/reply.txt: the work dir is gone or unwritable, skipping save"
+jq -cn input "$_HOOKDIR/reply.txt" > "$_HOOKDIR/memories.json" 2>/dev/null \
+    || _skip "LLM output not valid JSON: $(printf '%s' "$RESPONSE" | tr '\n' ' ' | head -c 300)"
 
 # -1 = valid JSON but not an array (output-envelope drift, e.g. {"memories":[...]})
 # — must be logged, or a model/gateway change silently stops all saves (LAB-170).
 # An empty [] is a legitimate "nothing worth saving" and stays a quiet exit.
-MEMORY_COUNT=$(jq 'if type == "array" then length else -1 end' "$_HOOKDIR/memories.json" 2>&1) \
-    || _skip "LLM output not valid JSON: ${MEMORY_COUNT:0:200}"
+MEMORY_COUNT=$(jq 'if type == "array" then length else -1 end' "$_HOOKDIR/memories.json" 2>/dev/null) \
+    || _skip "cannot read $_HOOKDIR/memories.json, skipping save"
 [[ "$MEMORY_COUNT" -eq -1 ]] && _skip "LLM output valid JSON but not an array: $(head -c 200 "$_HOOKDIR/memories.json")"
 [[ "$MEMORY_COUNT" -eq 0 ]] && exit 0
 
