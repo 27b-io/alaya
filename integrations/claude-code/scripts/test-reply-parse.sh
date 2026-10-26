@@ -62,6 +62,13 @@ case_ "fenced array then prose: both stored" 2 "" \
   "$(printf '%sjson\n[\n  %s,\n  %s\n]\n%s\n\nBoth are new.\n' "$FENCE" "$MEM" "$MEM" "$FENCE")"
 case_ "prose then fenced array: stored" 1 "" \
   "$(printf 'Here are the memories:\n\n%sjson\n[%s]\n%s\n' "$FENCE" "$MEM" "$FENCE")"
+# prose before the fence that itself opens with [ is not the payload: the fenced block is
+case_ "bracket-led link then fenced array: stored" 1 "" \
+  "$(printf 'Filed:\n[LAB-123](https://example.test/issue) covers the bug.\n\n%sjson\n[%s]\n%s\n' "$FENCE" "$MEM" "$FENCE")"
+case_ "bracket-led [] remark then fenced array: stored" 1 "" \
+  "$(printf '[] means no memories; this session does have one:\n%sjson\n[%s]\n%s\n' "$FENCE" "$MEM" "$FENCE")"
+case_ "indented fenced array then prose: stored" 1 "" \
+  "$(printf '  %sjson\n  [%s]\n  %s\nDone.\n' "$FENCE" "$MEM" "$FENCE")"
 case_ "prose then bare array: stored" 1 "" \
   "$(printf 'Here are the memories:\n[%s]\n' "$MEM")"
 case_ "bare array: stored" 1 "" \

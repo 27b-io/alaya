@@ -178,8 +178,9 @@ scripts/test-reply-parse.sh
 
 Runs the real Stop hook against a stub extractor and proves what it makes of the reply: a fenced
 or bare `[]` followed by prose is a quiet "nothing to save", an array with prose before or after
-it (fenced or not) is stored, and a reply with no JSON value, or a truncated one, is logged once
-on one line with the reply text. A JSON object is still logged as not an array.
+it (fenced or not) is stored, a fenced array is stored even when the prose before it opens with `[`
+(a markdown link, a remark about `[]`), and a reply with no JSON value, or a truncated one, is
+logged once on one line with the reply text. A JSON object is still logged as not an array.
 
 ```bash
 scripts/test-precompact-gate.sh

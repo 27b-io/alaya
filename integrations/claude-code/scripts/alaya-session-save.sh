@@ -384,11 +384,20 @@ RESPONSE=$(printf '%s' "$RAW" | jq -r '.choices[0].message.content // empty' 2>/
 
 # --- Parse LLM output ---
 # The extractor often fences the array and explains it in prose before or
-# after, most often a fenced [] followed by why nothing qualifies. So drop the
-# fence lines, start at the first line that opens an array or object, and read
-# only the first JSON value: the prose around it is ignored. A reply that still
-# fails is logged with the reply itself, on one line, so its shape is known.
-printf '%s\n' "$RESPONSE" | sed -n '/^```/d; /^[[:space:]]*[[{]/,$p' > "$_HOOKDIR/reply.txt" \
+# after, most often a fenced [] followed by why nothing qualifies. So read the
+# fenced block when there is one (prose before it can open with [ too: a
+# markdown link, a remark about []), else start at the first line that opens an
+# array or object, and read only the first JSON value: the prose around it is
+# ignored. A reply that still fails is logged with the reply itself, on one
+# line, so its shape is known.
+_FENCE='^[[:space:]]*```'
+if printf '%s\n' "$RESPONSE" | grep -q "$_FENCE"; then
+    _PAYLOAD="/$_FENCE/,/$_FENCE/{/$_FENCE/d;p;}"
+else
+    # shellcheck disable=SC2016 # $p is sed's last-line address, not a variable
+    _PAYLOAD='/^[[:space:]]*[[{]/,$p'
+fi
+printf '%s\n' "$RESPONSE" | sed -n "$_PAYLOAD" > "$_HOOKDIR/reply.txt" \
     || _skip "cannot write $_HOOKDIR/reply.txt: the work dir is gone or unwritable, skipping save"
 jq -cn input "$_HOOKDIR/reply.txt" > "$_HOOKDIR/memories.json" 2>/dev/null \
     || _skip "LLM output not valid JSON: $(printf '%s' "$RESPONSE" | tr '\n' ' ' | head -c 300)"
