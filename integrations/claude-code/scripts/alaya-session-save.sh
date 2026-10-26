@@ -392,11 +392,13 @@ RESPONSE=$(printf '%s' "$RAW" | jq -r '.choices[0].message.content // empty' 2>/
 # another (a pretty-printed envelope) is never a candidate of its own. Fences
 # need no special case: a fence line never starts with [, so the array inside
 # is found. A line such as "[] means none" goes on after its value: prose.
-# The payload is the one non-empty array of objects. Only empty arrays: nothing
-# to save. Two or more non-empty: which is the result cannot be known, so it is
-# logged, never guessed. No array: the first other value is passed on, so an
-# envelope like {"memories":[...]} is logged as not an array below. Each
-# failure is logged with the reply itself, on one line, so its shape is known.
+# The payload is a non-empty array of objects when it is the only array. Only
+# empty arrays: nothing to save. A non-empty array beside any other array, []
+# included: either may be an example, and storing an example as a memory is
+# worse than skipping the save, so it is logged, never guessed. No array: the
+# first other value is passed on, so an envelope like {"memories":[...]} is
+# logged as not an array below. Each failure is logged with the reply itself,
+# on one line, so its shape is known.
 command -v python3 >/dev/null 2>&1 || _skip "config: python3 not found on PATH, skipping save"
 printf '%s\n' "$RESPONSE" > "$_HOOKDIR/reply.txt" \
     || _skip "cannot write $_HOOKDIR/reply.txt: the work dir is gone or unwritable, skipping save"
@@ -424,7 +426,7 @@ for line in text.splitlines(True):
     else:
         other.append(value)
 full = [a for a in arrays if a]
-if len(full) > 1:
+if full and len(arrays) > 1:
     sys.exit(11)
 if not arrays and not other:
     sys.exit(10)
@@ -433,7 +435,7 @@ print(json.dumps(full[0] if full else arrays[0] if arrays else other[0]))' \
 case $? in
     0) ;;
     10) _skip "LLM output not valid JSON: $(printf '%s' "$RESPONSE" | tr '\n' ' ' | head -c 300)" ;;
-    11) _skip "LLM output ambiguous: 2 or more non-empty arrays, none stored: $(printf '%s' "$RESPONSE" | tr '\n' ' ' | head -c 300)" ;;
+    11) _skip "LLM output ambiguous: a non-empty array and another array, none stored: $(printf '%s' "$RESPONSE" | tr '\n' ' ' | head -c 300)" ;;
     *) _skip "cannot parse $_HOOKDIR/reply.txt, skipping save: $(printf '%s' "$_PARSE_ERR" | tr '\n' ' ' | tail -c 300)" ;;
 esac
 

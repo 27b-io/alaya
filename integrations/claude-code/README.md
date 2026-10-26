@@ -180,8 +180,9 @@ Runs the real Stop hook against a stub extractor and proves what it makes of the
 candidate is a JSON value that starts a line and ends one, and nothing nested inside it counts on
 its own. A fenced or bare `[]` followed by prose is a quiet "nothing to save". An array is stored
 whatever prose surrounds it, including a `[` or a fence of its own: a markdown link, a remark about
-`[]`, a footnote, a fenced command, or a fenced `[]` example before or after it. Two or more
-non-empty arrays are logged as ambiguous and nothing is stored. A JSON object, pretty-printed or
+`[]`, a footnote or a fenced command. A non-empty array beside any other array, `[]` included, is
+logged as ambiguous and nothing is stored: either one may be an example, and storing an example
+would be a false memory. A JSON object, pretty-printed or
 not, is logged as not an array. A reply with no JSON value, or a truncated one, is logged once on
 one line with the reply text, and a reply file that cannot be read is logged as that.
 

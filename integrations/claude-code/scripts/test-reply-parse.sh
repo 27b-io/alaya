@@ -70,16 +70,25 @@ case_ "bracket-led [] remark then fenced array: stored" 1 "" \
 # a fence in the explanation is not the payload: the leading bare array is
 case_ "bare array then prose with a fenced command: stored" 1 "" \
   "$(printf '[%s]\nTo check it, run:\n%ssh\nnpm test\n%s\n' "$MEM" "$FENCE" "$FENCE")"
-case_ "bare array then prose with a fenced []: stored" 1 "" \
+# a non-empty array beside any other array, [] included, is ambiguous: either one may be
+# an example, and storing an example would be a false memory, so nothing is stored
+case_ "bare array then prose with a fenced []: logged as ambiguous" 0 "LLM output ambiguous: a non-empty array and another array" \
   "$(printf '[%s]\nAn empty result would look like:\n%sjson\n[]\n%s\n' "$MEM" "$FENCE" "$FENCE")"
 case_ "fenced command then fenced array: stored" 1 "" \
   "$(printf 'Verified with:\n%ssh\nnpm test\n%s\n%sjson\n[%s]\n%s\n' "$FENCE" "$FENCE" "$FENCE" "$MEM" "$FENCE")"
-case_ "fenced [] example then fenced array: stored" 1 "" \
+case_ "fenced [] example then fenced array: logged as ambiguous" 0 "LLM output ambiguous: a non-empty array and another array" \
   "$(printf 'An empty result looks like:\n%sjson\n[]\n%s\nThis session has one:\n%sjson\n[%s]\n%s\n' \
     "$FENCE" "$FENCE" "$FENCE" "$MEM" "$FENCE")"
-# two non-empty arrays: which is the result is unknowable, so it is logged, never guessed
-case_ "two non-empty arrays: logged as ambiguous" 0 "LLM output ambiguous: 2 or more non-empty arrays" \
+case_ "two non-empty arrays: logged as ambiguous" 0 "LLM output ambiguous: a non-empty array and another array" \
   "$(printf 'A memory looks like:\n[%s]\nThis session has:\n[%s]\n' "$MEM" "$MEM")"
+case_ "illustrative array then the actual []: logged as ambiguous" 0 "LLM output ambiguous: a non-empty array and another array" \
+  "$(printf 'For illustration only, not a fact from this session:\n%sjson\n[%s]\n%s\nActual extraction result; nothing qualifies:\n%sjson\n[]\n%s\n' \
+    "$FENCE" "$MEM" "$FENCE" "$FENCE" "$FENCE")"
+case_ "the actual [] then an illustrative array: logged as ambiguous" 0 "LLM output ambiguous: a non-empty array and another array" \
+  "$(printf 'Actual extraction result; nothing qualifies:\n%sjson\n[]\n%s\nFor illustration only, not a fact from this session:\n%sjson\n[%s]\n%s\n' \
+    "$FENCE" "$FENCE" "$FENCE" "$MEM" "$FENCE")"
+case_ "two [] arrays: nothing to save, nothing logged" 0 "" \
+  "$(printf '%sjson\n[]\n%s\nStill nothing:\n[]\n' "$FENCE" "$FENCE")"
 # a pretty-printed envelope is one value: arrays inside it are not payloads
 case_ "pretty envelope with a nested []: logged as not an array" 0 "valid JSON but not an array" \
   "$(printf '{\n  "memories": [%s],\n  "tags":\n  []\n}\n' "$MEM")"
