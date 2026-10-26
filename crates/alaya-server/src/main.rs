@@ -51,9 +51,8 @@ use alaya_backends::{
 use alaya_core::calendar::utc_date_str;
 use alaya_core::deduplication::CanonicalStrategy;
 use alaya_core::service::{
-    JudgeOutcome, KeywordLeg, MemoryService, OutputMode, RankingFlags, Refutation, RefuteStage,
-    RelationParams, SearchParams, StoreParams, current_timestamp, parse_user_relation,
-    validate_as_of,
+    JudgeOutcome, MemoryService, OutputMode, RankingFlags, Refutation, RefuteStage, RelationParams,
+    SearchParams, StoreParams, current_timestamp, parse_user_relation, validate_as_of,
 };
 use alaya_core::vitals::{CountingEmbedding, SelfCheckOutcome, Vitals};
 use alaya_types::graph::{Contradiction, ContradictionQuery, Resolution};
@@ -2371,12 +2370,16 @@ fn parse_provider(var: &str, raw: Option<String>, fallback: Provider) -> Result<
     })
 }
 
-/// The `RANK_*` switches (LAB-7714). Unset leaves every boost on and the tag
-/// keyword leg. Set, a switch takes only `true` or `false`, the exempt list
-/// only known memory types with no empty entry, and `RANK_KEYWORD_LEG`
-/// (LAB-7716) only `tags`, `bm25` or `both`, so a typo refuses boot instead of
-/// silently ranking as before. Read raw, not through `env_non_empty`: a blank value is
-/// set, and an operator who blanked one meant something by it.
+/// The `RANK_*` switches (LAB-7714). Unset leaves every boost on. Set, a
+/// switch takes only `true` or `false` and the exempt list only known memory
+/// types with no empty entry, so a typo refuses boot instead of silently
+/// ranking as before. BM25 is the only keyword leg since LAB-8998, so
+/// `RANK_KEYWORD_LEG` (LAB-7716) is gone: `bm25`, what a deployment from before
+/// the removal sets, boots with a warning to unset it; any other value refuses
+/// boot, so an operator who set `tags` to roll back learns that this image
+/// cannot, instead of getting BM25 silently. Read raw, not through
+/// `env_non_empty`: a blank value is set, and an operator who blanked one
+/// meant something by it.
 fn parse_ranking(env: impl Fn(&str) -> Option<String>) -> Result<RankingFlags, String> {
     let switch = |var: &str| match env(var) {
         None => Ok(true),
@@ -2403,23 +2406,22 @@ fn parse_ranking(env: impl Fn(&str) -> Option<String>) -> Result<RankingFlags, S
             })
             .collect::<Result<Vec<_>, _>>()?,
     };
-    let keyword_leg = match env("RANK_KEYWORD_LEG") {
-        None => KeywordLeg::Tags,
-        Some(s) => {
-            let want = s.trim().to_ascii_lowercase();
-            KeywordLeg::ALL
-                .iter()
-                .find(|(name, _)| *name == want)
-                .map(|(_, leg)| *leg)
-                .ok_or_else(|| format!("RANK_KEYWORD_LEG must be tags, bm25 or both, got {s:?}"))?
+    if let Some(s) = env("RANK_KEYWORD_LEG") {
+        if !s.trim().eq_ignore_ascii_case("bm25") {
+            return Err(format!(
+                "RANK_KEYWORD_LEG was removed: BM25 is the only keyword leg, got {s:?}. \
+                 Unset it, or run an image older than LAB-8998 to rank with the tag pools"
+            ));
         }
-    };
+        tracing::warn!(
+            "RANK_KEYWORD_LEG=bm25 has no effect: BM25 is the only keyword leg; unset it"
+        );
+    }
     Ok(RankingFlags {
         access_salience: switch("RANK_ACCESS_BOOST")?,
         spacing: switch("RANK_SPACING_BOOST")?,
         graph: switch("RANK_GRAPH_BOOST")?,
         decay_exempt_types,
-        keyword_leg,
     })
 }
 
@@ -3116,7 +3118,6 @@ fn main() {
             spacing_boost = config.ranking.spacing,
             graph_boost = config.ranking.graph,
             decay_exempt_types = ?config.ranking.decay_exempt_types,
-            keyword_leg = ?config.ranking.keyword_leg,
             "hybrid ranking switches"
         );
         tracing::info!(
@@ -4459,7 +4460,6 @@ mod tests {
             ("RANK_SPACING_BOOST", "FALSE"),
             ("RANK_GRAPH_BOOST", " false "),
             ("RANK_DECAY_EXEMPT_TYPES", " decision, reference"),
-            ("RANK_KEYWORD_LEG", " Both "),
         ]))
         .unwrap();
         assert_eq!(
@@ -4469,21 +4469,20 @@ mod tests {
                 spacing: false,
                 graph: false,
                 decay_exempt_types: vec!["decision".into(), "reference".into()],
-                keyword_leg: KeywordLeg::Both,
             }
         );
-        for (value, leg) in [
-            ("tags", KeywordLeg::Tags),
-            ("bm25", KeywordLeg::Bm25),
-            ("BM25", KeywordLeg::Bm25),
-        ] {
-            let got = parse_ranking(|v| (v == "RANK_KEYWORD_LEG").then(|| value.to_string()));
-            assert_eq!(got.unwrap().keyword_leg, leg, "{value:?}");
-        }
         assert_eq!(
             parse_ranking(env(&[("RANK_GRAPH_BOOST", "true")])).unwrap(),
             RankingFlags::default()
         );
+        // A deployment from before LAB-8998 still sets `bm25`: it boots as if unset.
+        for value in ["bm25", " BM25 "] {
+            assert_eq!(
+                parse_ranking(|v| (v == "RANK_KEYWORD_LEG").then(|| value.to_string())).unwrap(),
+                RankingFlags::default(),
+                "{value:?}"
+            );
+        }
 
         let err = parse_ranking(env(&[("RANK_SPACING_BOOST", "off")])).unwrap_err();
         assert!(
@@ -4499,10 +4498,10 @@ mod tests {
             ("RANK_DECAY_EXEMPT_TYPES", ","),
             ("RANK_DECAY_EXEMPT_TYPES", "decision,"),
             ("RANK_DECAY_EXEMPT_TYPES", "decision,,reference"),
+            // Removed in LAB-8998: any value but `bm25` refuses boot.
+            ("RANK_KEYWORD_LEG", "tags"),
+            ("RANK_KEYWORD_LEG", "both"),
             ("RANK_KEYWORD_LEG", ""),
-            ("RANK_KEYWORD_LEG", " "),
-            ("RANK_KEYWORD_LEG", "keywords"),
-            ("RANK_KEYWORD_LEG", "tags,bm25"),
         ] {
             let err = parse_ranking(|v| (v == var).then(|| value.to_string())).unwrap_err();
             assert!(err.starts_with(var), "{var}={value:?}: {err}");
@@ -5813,14 +5812,12 @@ mod wedge_tests {
         ) -> Result<Vec<ScoredMemory>> {
             unimplemented!()
         }
-        async fn search_similar_tags(
+        async fn search_by_text(
             &self,
-            _tag_embedding: &[f32],
+            _query: &str,
             _limit: usize,
-        ) -> Result<Vec<String>> {
-            unimplemented!()
-        }
-        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
+            _filters: Option<PayloadFilter>,
+        ) -> Result<Vec<ScoredMemory>> {
             unimplemented!()
         }
         async fn get_all(&self, _limit: usize, _offset: Option<&str>) -> Result<ScrollResult> {
@@ -5836,9 +5833,6 @@ mod wedge_tests {
         }
         async fn count(&self) -> Result<usize> {
             std::future::pending().await
-        }
-        async fn get_all_tags(&self) -> Result<Vec<String>> {
-            unimplemented!()
         }
         async fn increment_access_count(&self, _content_hash: &str) -> Result<()> {
             unimplemented!()
@@ -6376,10 +6370,9 @@ mod wedge_tests {
     /// Outer bound on any reply await, so a wedge fails instead of hanging.
     const NEVER: Duration = Duration::from_secs(3600);
 
-    /// VectorStorage whose `search_by_tags` takes `SLOW_SEARCH`. Only hybrid
-    /// search calls it, and every one does, the tag cache notwithstanding:
-    /// `get_all_tags` answers "flag", a keyword of the test query. The store
-    /// path runs at full speed: its `search_by_vector` answers `neighbour` at
+    /// VectorStorage whose BM25 `search_by_text` takes `SLOW_SEARCH`. Only
+    /// hybrid search calls it, and every one does. The store path runs at
+    /// full speed: its `search_by_vector` answers `neighbour` at
     /// once, and `stored` records every write. A supersede finds every hash
     /// it names, as a copy of `neighbour`, and its marker write succeeds.
     /// Methods none of these paths calls panic.
@@ -6459,18 +6452,16 @@ mod wedge_tests {
             _mts: Option<f64>,
             _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
+            unimplemented!()
+        }
+        async fn search_by_text(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _filters: Option<PayloadFilter>,
+        ) -> Result<Vec<ScoredMemory>> {
             tokio::time::sleep(SLOW_SEARCH).await;
             Ok(Vec::new())
-        }
-        async fn search_similar_tags(
-            &self,
-            _tag_embedding: &[f32],
-            _limit: usize,
-        ) -> Result<Vec<String>> {
-            Ok(Vec::new())
-        }
-        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
-            Ok(())
         }
         async fn get_all(&self, _limit: usize, _offset: Option<&str>) -> Result<ScrollResult> {
             unimplemented!()
@@ -6485,9 +6476,6 @@ mod wedge_tests {
         }
         async fn count(&self) -> Result<usize> {
             Ok(1)
-        }
-        async fn get_all_tags(&self) -> Result<Vec<String>> {
-            Ok(vec!["flag".into()])
         }
         async fn increment_access_count(&self, _content_hash: &str) -> Result<()> {
             Ok(())
@@ -6538,8 +6526,7 @@ mod wedge_tests {
             .await;
     }
 
-    /// The query of the hybrid search every test here sends: its keyword
-    /// "flag" is the tag `SlowSearchVectors` knows.
+    /// The query of the hybrid search every test here sends.
     const SEARCH_QUERY: &str = "flag state";
 
     fn hybrid_search(reply: oneshot::Sender<Value>) -> CmdInner {
@@ -6714,16 +6701,6 @@ mod wedge_tests {
         ) -> Result<Vec<ScoredMemory>> {
             unimplemented!()
         }
-        async fn search_similar_tags(
-            &self,
-            _tag_embedding: &[f32],
-            _limit: usize,
-        ) -> Result<Vec<String>> {
-            unimplemented!()
-        }
-        async fn upsert_tags(&self, _tags: &[(&str, Vec<f32>)]) -> Result<()> {
-            unimplemented!()
-        }
         async fn get_all(&self, _limit: usize, _offset: Option<&str>) -> Result<ScrollResult> {
             unimplemented!()
         }
@@ -6736,9 +6713,6 @@ mod wedge_tests {
             unimplemented!()
         }
         async fn count(&self) -> Result<usize> {
-            unimplemented!()
-        }
-        async fn get_all_tags(&self) -> Result<Vec<String>> {
             unimplemented!()
         }
         async fn increment_access_count(&self, _content_hash: &str) -> Result<()> {
@@ -7139,7 +7113,8 @@ mod wedge_tests {
         local
             .run_until(async {
                 let (tx, rx) = mpsc::channel::<Cmd>(8);
-                // `HangVectors::get_all_tags` panics: hybrid search calls it first.
+                // `HangVectors::search_by_text` panics: hybrid search's BM25
+                // branch calls it on the fan-out's first poll.
                 tokio::task::spawn_local(service_worker(
                     rx,
                     hanging_service(),

@@ -80,9 +80,10 @@ fn memory(hash: char, trust: f64) -> Memory {
 async fn drop_collections(url: &str, name: &str) {
     #[allow(clippy::disallowed_methods, reason = "test-only client")]
     let client = reqwest::Client::new();
-    for c in [name.to_string(), format!("{name}_tags")] {
-        let _ = client.delete(format!("{url}/collections/{c}")).send().await;
-    }
+    let _ = client
+        .delete(format!("{url}/collections/{name}"))
+        .send()
+        .await;
 }
 
 fn params(mode: SearchMode, min_trust_score: Option<f64>) -> SearchParams {

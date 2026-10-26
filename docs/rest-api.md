@@ -273,7 +273,7 @@ curl -X POST http://localhost:3001/search \
 - `hybrid` computes recency decay from T instead of the current time.
 - The response carries `"as_of": T`. A server that predates the field ignores it and omits the echo, so check for it.
 
-Some state cannot be rewound and is read as it is now: graph state (Hebbian weights, and which neighbours spreading activation injects, though each injected neighbour still passes the `as_of` bound and the supersession rule); access counts and access timestamps (the salience and spacing boosts); BM25 term statistics, computed over today's collection; the tag vocabulary that keyword extraction and the semantic tag pool read; tags, type, summary, trust and `metadata.citations` patched since T; `metadata.last_confirmed_at`, which can be later than T; hard deletes; supersessions reversed by `/unsupersede`, which leave no marker, so the memory passes the supersession check at every T (the `created_at` bound still applies); and a marker re-pointed to a second survivor, which names only the last one. The corpus size behind hybrid's fusion weight is today's too.
+Some state cannot be rewound and is read as it is now: graph state (Hebbian weights, and which neighbours spreading activation injects, though each injected neighbour still passes the `as_of` bound and the supersession rule); access counts and access timestamps (the salience and spacing boosts); BM25 term statistics, computed over today's collection; tags, type, summary, trust and `metadata.citations` patched since T; `metadata.last_confirmed_at`, which can be later than T; hard deletes; supersessions reversed by `/unsupersede`, which leave no marker, so the memory passes the supersession check at every T (the `created_at` bound still applies); and a marker re-pointed to a second survivor, which names only the last one. The corpus size behind hybrid's fusion weight is today's too.
 
 **Response:** an object whose `results` array holds the memories in the order the mode sets, with the paging keys of the mode and `mode` itself; a search sent with `as_of` also echoes `"as_of": T`. Per-mode order, keys and the result fields are listed under [MCP: `search`](./mcp-tools.md#search). A hybrid page looks like this:
 
@@ -641,7 +641,7 @@ One pass at a time per `alaya-server` process: a second call to the same process
 
 ## `POST /backfill/keywords`
 
-Writes the BM25 keyword vector of up to `limit` memories that have none. Operator-only, same auth class as the other backfills — the read-only bearer gets `403`. Hybrid search's `bm25` and `both` keyword legs (`RANK_KEYWORD_LEG`) find only memories that carry this vector. Every store writes it, so this is for memories stored before the server had the keyword index, and for repairs.
+Writes the BM25 keyword vector of up to `limit` memories that have none. Operator-only, same auth class as the other backfills — the read-only bearer gets `403`. Hybrid search's keyword pool finds only memories that carry this vector. Every store writes it, so this is for memories stored before the server had the keyword index, and for repairs.
 
 ```http
 POST /backfill/keywords

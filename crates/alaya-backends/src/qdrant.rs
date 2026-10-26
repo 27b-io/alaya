@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use alaya_types::{
     AlayaError, Result,
@@ -69,7 +68,6 @@ pub struct QdrantClient {
     client: reqwest::Client,
     base_url: String,
     collection: String,
-    tag_collection: String,
     /// Serialises this client's writes to the memories collection. Every
     /// write is already conditional on the revision it read (see
     /// `update_points`), so this is no longer what keeps writes from undoing
@@ -126,12 +124,10 @@ impl QdrantClient {
             ))
         })?;
 
-        let tag_collection = format!("{collection}_tags");
         Ok(Self {
             client,
             base_url,
             collection,
-            tag_collection,
             write_lock: futures::lock::Mutex::new(()),
             access_lock: futures::lock::Mutex::new(()),
             // OS-seeded per process on native targets. wasm32 (deferred, no
@@ -466,42 +462,22 @@ impl QdrantClient {
         Ok(())
     }
 
-    /// Ensure the memory collections exist, creating any that are absent with
+    /// Ensure the memories collection exists, creating it when absent with
     /// the configured vector size and Cosine distance. Idempotent — an existing
     /// collection is left untouched (never recreated, so no data is dropped).
     /// Run once at startup so a fresh Qdrant volume accepts writes with no
     /// manual `curl -X PUT` bootstrap (#31).
     ///
-    /// The main collection also carries the BM25 sparse vector
-    /// (`KEYWORD_VECTOR`, LAB-7716): created with it, or given it in place
-    /// when it lacks it (Qdrant >= 1.18). Adding the vector changes no point;
-    /// every point simply has no keyword vector until a store or the keyword
-    /// backfill writes one.
+    /// The collection also carries the BM25 sparse vector (`KEYWORD_VECTOR`,
+    /// LAB-7716): created with it, or given it in place when it lacks it
+    /// (Qdrant >= 1.18). Adding the vector changes no point; every point
+    /// simply has no keyword vector until a store or the keyword backfill
+    /// writes one.
     ///
-    /// The main collection is required: an error propagates so the caller can
-    /// retry (Qdrant may not be ready yet at boot). The `{collection}_tags`
-    /// sidecar is best-effort — tag upserts and semantic-tag search are already
-    /// non-fatal in the service layer, so its absence must not block startup.
+    /// An error propagates so the caller can retry (Qdrant may not be ready
+    /// yet at boot).
     pub async fn ensure_collection(&self, dimensions: usize) -> Result<()> {
-        self.ensure_one(&self.collection, dimensions, true).await?;
-        if let Err(e) = self
-            .ensure_one(&self.tag_collection, dimensions, false)
-            .await
-        {
-            tracing::warn!(
-                collection = %self.tag_collection,
-                error = %e,
-                "tag collection ensure failed (non-fatal)"
-            );
-        }
-        Ok(())
-    }
-
-    /// Create `collection` with `dimensions`-wide Cosine vectors if it does not
-    /// already exist; with `keyword`, also the BM25 sparse vector, added in
-    /// place to a present collection that lacks it. Otherwise a present
-    /// collection is a no-op.
-    async fn ensure_one(&self, collection: &str, dimensions: usize, keyword: bool) -> Result<()> {
+        let collection = self.collection.as_str();
         // Existence probe: a 2xx means present, a 404 means absent (create).
         // Any other status or a transport error is a real fault — propagate it
         // so the startup retry backs off on the true cause rather than
@@ -515,9 +491,6 @@ impl QdrantClient {
 
         if resp.status().is_success() {
             tracing::debug!(collection = %collection, "Qdrant collection present");
-            if !keyword {
-                return Ok(());
-            }
             let info: Value = resp
                 .json()
                 .await
@@ -529,10 +502,10 @@ impl QdrantClient {
         }
 
         // Absent (404) → create with the configured vector size and Cosine distance.
-        let mut body = json!({ "vectors": { "size": dimensions, "distance": "Cosine" } });
-        if keyword {
-            body["sparse_vectors"] = json!({ KEYWORD_VECTOR: keyword_vector_config() });
-        }
+        let body = json!({
+            "vectors": { "size": dimensions, "distance": "Cosine" },
+            "sparse_vectors": { KEYWORD_VECTOR: keyword_vector_config() },
+        });
         let resp = self
             .client
             .put(format!("{}/collections/{}", self.base_url, collection))
@@ -548,7 +521,6 @@ impl QdrantClient {
         tracing::info!(
             collection = %collection,
             dimensions,
-            keyword,
             "created Qdrant collection (distance=Cosine)"
         );
         Ok(())
@@ -1895,53 +1867,6 @@ impl VectorStorage for QdrantClient {
             .collect())
     }
 
-    #[tracing::instrument(skip(self, tag_embedding), fields(limit))]
-    async fn search_similar_tags(
-        &self,
-        tag_embedding: &[f32],
-        limit: usize,
-    ) -> Result<Vec<String>> {
-        let body = json!({
-            "vector": tag_embedding,
-            "limit": limit,
-            "with_payload": true,
-            "with_vector": false,
-            "score_threshold": 0.5,
-        });
-
-        let resp = self
-            .client
-            .post(format!(
-                "{}/collections/{}/points/search",
-                self.base_url, self.tag_collection
-            ))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
-
-        if !resp.status().is_success() {
-            return Err(qdrant_error(resp).await);
-        }
-
-        let data: QdrantResponse<Vec<Value>> = resp
-            .json()
-            .await
-            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
-
-        Ok(data
-            .result
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|p| {
-                p.get("payload")
-                    .and_then(|pl| pl.get("tag"))
-                    .and_then(|t| t.as_str())
-                    .map(String::from)
-            })
-            .collect())
-    }
-
     #[tracing::instrument(skip_all, fields(limit = limit))]
     async fn search_by_text(
         &self,
@@ -2049,49 +1974,6 @@ impl VectorStorage for QdrantClient {
             }
         }
         Ok(written)
-    }
-
-    async fn upsert_tags(&self, tags: &[(&str, Vec<f32>)]) -> Result<()> {
-        if tags.is_empty() {
-            return Ok(());
-        }
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-
-        let points: Vec<Value> = tags
-            .iter()
-            .map(|(tag, embedding)| {
-                let hex = format!("{:x}", Sha256::digest(tag.as_bytes()));
-                let uuid = uuid::Uuid::parse_str(&hex[..32])
-                    .expect("first 32 hex chars are always valid UUID input");
-                json!({
-                    "id": uuid.to_string(),
-                    "vector": embedding,
-                    "payload": { "tag": *tag, "created_at": now }
-                })
-            })
-            .collect();
-
-        let body = json!({ "points": points });
-        let resp = self
-            .client
-            .put(format!(
-                "{}/collections/{}/points?wait=true",
-                self.base_url, self.tag_collection
-            ))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
-
-        if !resp.status().is_success() {
-            return Err(qdrant_error(resp).await);
-        }
-
-        Ok(())
     }
 
     async fn get_all(&self, limit: usize, offset: Option<&str>) -> Result<ScrollResult> {
@@ -2250,63 +2132,6 @@ impl VectorStorage for QdrantClient {
                 None => return Ok(rows),
             }
         }
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn get_all_tags(&self) -> Result<Vec<String>> {
-        // Scroll the tag collection to get all tags
-        let mut all_tags = Vec::new();
-        let mut offset: Option<Value> = None;
-
-        loop {
-            let mut body = json!({
-                "limit": 100,
-                "with_payload": true,
-                "with_vector": false,
-            });
-
-            if let Some(ref off) = offset {
-                body["offset"] = off.clone();
-            }
-
-            let resp = self
-                .client
-                .post(format!(
-                    "{}/collections/{}/points/scroll",
-                    self.base_url, self.tag_collection
-                ))
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
-
-            if !resp.status().is_success() {
-                return Err(qdrant_error(resp).await);
-            }
-
-            let data: QdrantResponse<ScrollResponse> = resp
-                .json()
-                .await
-                .map_err(|e| AlayaError::Storage(crate::redact_reqwest_error(e)))?;
-
-            let result = data.result.unwrap_or_default();
-            for point in &result.points {
-                if let Some(tag) = point
-                    .get("payload")
-                    .and_then(|p| p.get("tag"))
-                    .and_then(|t| t.as_str())
-                {
-                    all_tags.push(tag.to_string());
-                }
-            }
-
-            match result.next_page_offset {
-                Some(next) => offset = Some(next),
-                None => break,
-            }
-        }
-
-        Ok(all_tags)
     }
 
     async fn increment_access_count(&self, content_hash: &str) -> Result<()> {

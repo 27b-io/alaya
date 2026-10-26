@@ -95,7 +95,7 @@ The one retrieval tool. Mode selects the algorithm.
 
 | Mode | What it does |
 |:--|:--|
-| `hybrid` | Vector similarity fused with a keyword pool by [RRF](https://qdrant.tech/documentation/concepts/hybrid-queries/), optionally re-scored by a cross-encoder if `RERANK_URL` is set. The keyword pool is the server's `RANK_KEYWORD_LEG`: by default memories whose tags the query names (or whose tags sit near it), not their content; `bm25` replaces the tag pools with BM25 over memory content, which matches exact identifiers; `both` fuses the tag pools and BM25. **Default — use this unless you have a reason not to.** |
+| `hybrid` | Vector similarity fused with a keyword pool by [RRF](https://qdrant.tech/documentation/concepts/hybrid-queries/), optionally re-scored by a cross-encoder if `RERANK_URL` is set. The keyword pool is BM25 over memory content, which matches exact identifiers. **Default — use this unless you have a reason not to.** |
 | `similar` | Pure vector similarity. Faster than `hybrid` but ignores the keyword pool. |
 | `tag` | Filter by tag(s). With `match_all=true`, all tags must match. |
 | `recent` | Reverse chronological. Use `cursor` to paginate. |
