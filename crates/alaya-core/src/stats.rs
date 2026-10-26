@@ -330,13 +330,6 @@ mod tests {
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
-        async fn search_similar_tags(&self, _e: &[f32], _l: usize) -> Result<Vec<String>> {
-            Ok(vec![])
-        }
-        async fn upsert_tags(&self, _t: &[(&str, Vec<f32>)]) -> Result<()> {
-            bump(&self.writes);
-            Ok(())
-        }
         async fn get_all(&self, _l: usize, _o: Option<&str>) -> Result<ScrollResult> {
             Ok(ScrollResult {
                 memories: vec![],
@@ -381,9 +374,6 @@ mod tests {
                 // A replica clock a few seconds ahead at midnight: no slot.
                 (today + DAY_SECS, Some(0.99)),
             ])
-        }
-        async fn get_all_tags(&self) -> Result<Vec<String>> {
-            Ok(vec![])
         }
         async fn increment_access_count(&self, _h: &str) -> Result<()> {
             bump(&self.writes);

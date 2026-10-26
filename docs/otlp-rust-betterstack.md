@@ -259,16 +259,16 @@ Rules:
 Wrap `futures::join!` groups in spans to show concurrent structure:
 
 ```rust
-let (embed_result, tag_results, count) = {
-    let _span = tracing::info_span!("fan_out", keywords = keywords.len()).entered();
+let (embed_result, bm25_results, count) = {
+    let _span = tracing::info_span!("fan_out").entered();
     let embed_fut = self.embeddings.embed_batch(&texts, PromptName::Query);
-    let tag_fut = self.vectors.search_by_tags(&tags, false, limit);
+    let bm25_fut = self.vectors.search_by_text(&query, limit, None);
     let count_fut = self.vectors.count();
-    futures::join!(embed_fut, tag_fut, count_fut)
+    futures::join!(embed_fut, bm25_fut, count_fut)
 };
 ```
 
-In the trace waterfall, `embed_batch`, `search_by_tags`, and `count` appear as overlapping children of `fan_out` — showing they ran concurrently.
+In the trace waterfall, `embed_batch`, `search_by_text`, and `count` appear as overlapping children of `fan_out` — showing they ran concurrently.
 
 ## Graceful Shutdown
 
