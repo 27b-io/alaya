@@ -764,8 +764,8 @@ impl MemoryService {
     }
 
     /// Store a memory. When `read_only` is true, the side-effect writes that
-    /// touch shared owner state — tag-index upsert and interference graph-edge
-    /// creation — are skipped (vector + own node only). The caller's
+    /// touch shared owner state — the graph node and interference graph-edge
+    /// creation — are skipped (vector write only). The caller's
     /// fire-and-forget summary patch must also be suppressed (see worker).
     pub async fn store_memory_with(
         &self,
@@ -781,7 +781,7 @@ impl MemoryService {
 
     /// The store, with insert-only split from `read_only`: an insert-only
     /// store that finds the memory there already writes nothing at all (not
-    /// the tag index, graph node or interference edges either) and returns
+    /// the graph node or interference edges either) and returns
     /// `None`; under `read_only` that is an error instead.
     async fn store_memory_mode(
         &self,
@@ -2078,10 +2078,7 @@ impl MemoryService {
                 vis,
                 // Tag mode reads neither memory_type (the console says so) nor
                 // min_trust_score (the docs say so).
-                |n| {
-                    self.vectors
-                        .search_by_tags(&tag_refs, params.match_all, n, None, None, None)
-                },
+                |n| self.vectors.search_by_tags(&tag_refs, params.match_all, n),
             )
             .await?;
 
@@ -4673,9 +4670,6 @@ mod tests {
             _t: &[&str],
             _m: bool,
             _l: usize,
-            _mt: Option<&str>,
-            _mts: Option<f64>,
-            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -5284,9 +5278,6 @@ mod tests {
             _t: &[&str],
             _m: bool,
             _l: usize,
-            _mt: Option<&str>,
-            _mts: Option<f64>,
-            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -5662,9 +5653,6 @@ mod tests {
             _t: &[&str],
             _m: bool,
             _l: usize,
-            _mt: Option<&str>,
-            _mts: Option<f64>,
-            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -6276,9 +6264,6 @@ mod tests {
             _t: &[&str],
             _m: bool,
             _l: usize,
-            _mt: Option<&str>,
-            _mts: Option<f64>,
-            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -6860,11 +6845,8 @@ mod tests {
             _tags: &[&str],
             _m: bool,
             _limit: usize,
-            _memory_type: Option<&str>,
-            _min_trust_score: Option<f64>,
-            _max_created_at: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
-            unimplemented!("hybrid never queries the tag pools")
+            unimplemented!("hybrid never calls `search_by_tags`")
         }
         async fn search_by_text(
             &self,
@@ -7352,7 +7334,7 @@ mod tests {
     }
 
     /// Hybrid search fuses the BM25 pool beside the dense one, querying it
-    /// once and never the tag pools (LAB-8998).
+    /// once and never calling `search_by_tags`.
     #[tokio::test(flavor = "current_thread")]
     async fn hybrid_fuses_the_bm25_pool() {
         let mock = MockVectorsWithInjection {
@@ -7360,7 +7342,7 @@ mod tests {
             bm25_pool: vec![make_scored_memory(&"c".repeat(64), "bm25 hit", 7.5)],
             ..Default::default()
         };
-        // The mock's search_by_tags panics, so a tag-pool query fails the test.
+        // The mock's search_by_tags panics, so hybrid calling it fails the test.
         let bm25_calls = mock.bm25_calls.clone();
         let svc = MemoryService::new(
             Box::new(mock),
@@ -8908,9 +8890,6 @@ mod tests {
             _t: &[&str],
             _m: bool,
             _l: usize,
-            _mt: Option<&str>,
-            _mts: Option<f64>,
-            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(vec![])
         }
@@ -9535,9 +9514,6 @@ mod tests {
             _t: &[&str],
             _m: bool,
             limit: usize,
-            _mt: Option<&str>,
-            _mts: Option<f64>,
-            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(self.scored(limit))
         }
@@ -9874,8 +9850,7 @@ mod tests {
 
     /// The worker drops a search at its deadline; the line must still come
     /// out, naming the stage it was stuck in. Inside fan-out a branch that
-    /// never answered has no duration (here `embed_ms`); `tag_search_ms` is
-    /// absent too, because no query word matched a tag.
+    /// never answered has no duration (here `embed_ms`).
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn dropped_hybrid_search_logs_the_stage_it_was_stuck_in() {
         let svc = MemoryService::new(
@@ -10202,9 +10177,6 @@ mod tests {
                 _t: &[&str],
                 _a: bool,
                 _l: usize,
-                _mt: Option<&str>,
-                _mts: Option<f64>,
-                _mca: Option<f64>,
             ) -> Result<Vec<ScoredMemory>> {
                 unimplemented!()
             }
@@ -11361,9 +11333,6 @@ mod tests {
             _t: &[&str],
             _m: bool,
             limit: usize,
-            _mt: Option<&str>,
-            _mts: Option<f64>,
-            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             Ok(scored_from(&self.0.memories.borrow(), limit))
         }

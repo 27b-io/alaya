@@ -3,7 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 /// Display score of a keyword-only (BM25) hit: no cosine similarity available.
-/// GEPA-optimized: lowered from 0.1 to reduce keyword-only match influence.
+/// GEPA-optimized against the former tag-only keyword pool: lowered from 0.1
+/// to reduce keyword-only match influence.
 const KEYWORD_ONLY_BASE_SCORE: f64 = 0.02;
 
 /// RRF smoothing constant. Lower = sharper rank differentiation.
@@ -18,8 +19,9 @@ pub const RRF_K: usize = 20;
 /// - Higher alpha = more weight on semantic
 /// - Lower alpha = more weight on keywords
 pub fn get_adaptive_alpha(corpus_size: usize) -> f64 {
-    // GEPA-optimized: raised small-corpus alpha from 0.5 to 0.72
-    // (more weight on vector similarity for typical memory corpora)
+    // GEPA-optimized against the former tag-only keyword pool: raised
+    // small-corpus alpha from 0.5 to 0.72 (more weight on vector similarity
+    // for typical memory corpora)
     if corpus_size < 500 {
         0.72
     } else if corpus_size < 5000 {

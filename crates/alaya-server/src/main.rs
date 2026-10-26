@@ -5743,9 +5743,7 @@ mod tests {
             .expect("free port");
         let client =
             QdrantClient::new(format!("http://{refused}"), "memories".into(), None).unwrap();
-        let found = client
-            .search_by_tags(&["TAG-MARKER"], false, 10, Some("note"), None, None)
-            .await;
+        let found = client.search_by_tags(&["TAG-MARKER"], false, 10).await;
         assert!(found.is_err());
 
         let log = log.text();
@@ -5878,9 +5876,6 @@ mod wedge_tests {
             _tags: &[&str],
             _match_all: bool,
             _limit: usize,
-            _mt: Option<&str>,
-            _mts: Option<f64>,
-            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             unimplemented!()
         }
@@ -6520,9 +6515,6 @@ mod wedge_tests {
             _tags: &[&str],
             _match_all: bool,
             _limit: usize,
-            _mt: Option<&str>,
-            _mts: Option<f64>,
-            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             unimplemented!()
         }
@@ -6767,9 +6759,6 @@ mod wedge_tests {
             _tags: &[&str],
             _match_all: bool,
             _limit: usize,
-            _mt: Option<&str>,
-            _mts: Option<f64>,
-            _mca: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
             unimplemented!()
         }
