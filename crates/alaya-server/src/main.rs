@@ -2431,7 +2431,7 @@ fn parse_ranking(env: impl Fn(&str) -> Option<String>) -> Result<RankingFlags, S
         if !s.trim().eq_ignore_ascii_case("bm25") {
             return Err(format!(
                 "RANK_KEYWORD_LEG was removed: BM25 is the only keyword leg, got {s:?}. \
-                 Unset it, or run an image older than LAB-8998 to rank with the tag pools"
+                 Unset it, or run an earlier release to rank with the tag pools"
             ));
         }
         tracing::warn!(
@@ -5723,8 +5723,7 @@ mod tests {
     }
 
     /// LAB-8297: a tag search records how many tags it was given, not the
-    /// tags: a search's tags are caller text, and hybrid search passes the
-    /// query words that match a stored tag.
+    /// tags: a search's tags are caller text.
     #[tokio::test]
     async fn tag_search_span_carries_no_tag_text() {
         use alaya_backends::VectorStorage;

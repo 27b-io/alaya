@@ -103,7 +103,7 @@ Connect any MCP client to `http://localhost:3001/mcp` (Streamable HTTP with SSE)
 | Tool | Description |
 |:-----|:------------|
 | `store_memory` | Store content with tags, metadata, citations, and optional auto-summary |
-| `search` | Hybrid semantic + tag-boosted retrieval (5 modes: hybrid, scan, similar, tag, recent) |
+| `search` | Hybrid semantic + BM25 keyword retrieval (5 modes: hybrid, scan, similar, tag, recent) |
 | `get_memory` | Fetch a single memory by content hash |
 | `delete_memory` | Delete by content hash |
 | `relation` | Create / get / delete typed edges (RELATES_TO, PRECEDES, CONTRADICTS) |

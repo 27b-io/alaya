@@ -1333,7 +1333,7 @@ impl MemoryService {
         // again here keeps one predicate for every pool, graph injection
         // included. Both also apply min_trust_score and the as_of
         // `created_at` bound Qdrant-side; graph neighbours rely on this check
-        // alone for all three.
+        // alone for memory_type, trust and the as_of bound.
         let admits = |m: &Memory, survivors: &HashMap<String, f64>| {
             vis.shows(m, survivors)
                 && params
@@ -1378,7 +1378,7 @@ impl MemoryService {
                 .map(|s| (s.memory.content_hash.clone(), s.score))
                 .collect();
 
-            hybrid_search::combine_results_rrf(&v_tuples, &[&b_tuples], alpha, RRF_K)
+            hybrid_search::combine_results_rrf(&v_tuples, &b_tuples, alpha, RRF_K)
         };
 
         // Build hash→memory lookup
@@ -6780,23 +6780,19 @@ mod tests {
 
     /// Mock VectorStorage that returns pre-configured vector search results
     /// and can serve specific memories from get_batch (for graph injection).
-    /// `tag_pools` answers search_by_tags per tag, honouring its limit,
-    /// memory_type, min_trust_score and max_created_at as Qdrant does.
-    /// `bm25_pool` is what search_by_text
-    /// returns, unfiltered, so only the service's own filter can drop a
-    /// member. Counts access-count increments, so a test can see search's
-    /// writes, and the calls to each keyword pool's backend and to get_batch.
-    /// `bounds_seen` records the `max_created_at` each vector, BM25 and tag
-    /// search was sent, since only the tag search honours it.
+    /// `bm25_pool` is what search_by_text returns, unfiltered, so only the
+    /// service's own filter can drop a member. Counts access-count
+    /// increments, so a test can see search's writes, and the calls to the
+    /// BM25 search and to get_batch. `bounds_seen` records the
+    /// `max_created_at` each vector and BM25 search was sent. search_by_tags
+    /// panics: hybrid never calls it.
     /// `failing_batch` makes get_batch fail whenever it is asked for that hash.
     #[derive(Default)]
     struct MockVectorsWithInjection {
         search_results: Vec<ScoredMemory>,
         injectable_memories: HashMap<String, Memory>,
-        tag_pools: HashMap<String, Vec<ScoredMemory>>,
         bm25_pool: Vec<ScoredMemory>,
         access_increments: Rc<Cell<usize>>,
-        tag_calls: Rc<Cell<usize>>,
         bm25_calls: Rc<Cell<usize>>,
         batch_calls: Rc<Cell<usize>>,
         bounds_seen: Rc<std::cell::RefCell<Vec<Option<f64>>>>,
@@ -6861,25 +6857,14 @@ mod tests {
         }
         async fn search_by_tags(
             &self,
-            tags: &[&str],
+            _tags: &[&str],
             _m: bool,
-            limit: usize,
-            memory_type: Option<&str>,
-            min_trust_score: Option<f64>,
-            max_created_at: Option<f64>,
+            _limit: usize,
+            _memory_type: Option<&str>,
+            _min_trust_score: Option<f64>,
+            _max_created_at: Option<f64>,
         ) -> Result<Vec<ScoredMemory>> {
-            self.tag_calls.set(self.tag_calls.get() + 1);
-            self.bounds_seen.borrow_mut().push(max_created_at);
-            Ok(tags
-                .iter()
-                .filter_map(|t| self.tag_pools.get(*t))
-                .flatten()
-                .filter(|sm| memory_type.is_none_or(|t| sm.memory.memory_type == t))
-                .filter(|sm| min_trust_score.is_none_or(|min| meets_trust(&sm.memory, min)))
-                .filter(|sm| max_created_at.is_none_or(|t| sm.memory.created_at <= t))
-                .take(limit)
-                .cloned()
-                .collect())
+            unimplemented!("hybrid never queries the tag pools")
         }
         async fn search_by_text(
             &self,
@@ -7372,14 +7357,11 @@ mod tests {
     async fn hybrid_fuses_the_bm25_pool() {
         let mock = MockVectorsWithInjection {
             search_results: vec![make_scored_memory(&"a".repeat(64), "vector hit", 0.9)],
-            tag_pools: HashMap::from([(
-                "stability".into(),
-                vec![make_scored_memory(&"b".repeat(64), "tag hit", 1.0)],
-            )]),
             bm25_pool: vec![make_scored_memory(&"c".repeat(64), "bm25 hit", 7.5)],
             ..Default::default()
         };
-        let (tag_calls, bm25_calls) = (mock.tag_calls.clone(), mock.bm25_calls.clone());
+        // The mock's search_by_tags panics, so a tag-pool query fails the test.
+        let bm25_calls = mock.bm25_calls.clone();
         let svc = MemoryService::new(
             Box::new(mock),
             Box::new(MockEmbeddings),
@@ -7400,7 +7382,6 @@ mod tests {
             .collect();
         hashes.sort();
         assert_eq!(hashes, ["a", "c"]);
-        assert_eq!(tag_calls.get(), 0, "hybrid never queries the tag pools");
         assert_eq!(bm25_calls.get(), 1);
         assert_eq!(svc.vitals.snapshot()["failures"]["keyword"], 0);
     }
@@ -9848,31 +9829,6 @@ mod tests {
                     .unwrap_or_else(|_| panic!("{k}={v} is not a u64"));
             }
         }
-    }
-
-    /// Hybrid times its BM25 search as `bm25_search_ms` and logs no tag
-    /// stage (LAB-8998).
-    #[tokio::test(flavor = "current_thread")]
-    async fn bm25_leg_logs_its_search_and_no_tag_stage() {
-        let svc = MemoryService::new(
-            Box::new(MockVectorsWithInjection::default()),
-            Box::new(MockEmbeddings),
-            Box::new(MockGraph),
-            Box::new(MockHebbian),
-            Box::new(MockConsolidation),
-            None,
-        );
-
-        let (out, lines) = stage_lines(svc.search(search_params("stability notes"))).await;
-
-        out.expect("search succeeds");
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        let keys = keys(&lines[0]);
-        assert!(keys.contains(&"bm25_search_ms"), "{keys:?}");
-        assert!(
-            !keys.contains(&"tags_ms") && !keys.contains(&"tag_search_ms"),
-            "{keys:?}"
-        );
     }
 
     /// Graph injection and rerank run only with graph neighbours to inject and
