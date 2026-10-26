@@ -67,6 +67,18 @@ case_ "bracket-led link then fenced array: stored" 1 "" \
   "$(printf 'Filed:\n[LAB-123](https://example.test/issue) covers the bug.\n\n%sjson\n[%s]\n%s\n' "$FENCE" "$MEM" "$FENCE")"
 case_ "bracket-led [] remark then fenced array: stored" 1 "" \
   "$(printf '[] means no memories; this session does have one:\n%sjson\n[%s]\n%s\n' "$FENCE" "$MEM" "$FENCE")"
+# a fence in the explanation is not the payload: the leading bare array is
+case_ "bare array then prose with a fenced command: stored" 1 "" \
+  "$(printf '[%s]\nTo check it, run:\n%ssh\nnpm test\n%s\n' "$MEM" "$FENCE" "$FENCE")"
+case_ "bare array then prose with a fenced []: stored" 1 "" \
+  "$(printf '[%s]\nAn empty result would look like:\n%sjson\n[]\n%s\n' "$MEM" "$FENCE" "$FENCE")"
+case_ "fenced command then fenced array: stored" 1 "" \
+  "$(printf 'Verified with:\n%ssh\nnpm test\n%s\n%sjson\n[%s]\n%s\n' "$FENCE" "$FENCE" "$FENCE" "$MEM" "$FENCE")"
+# a footnote-style line that opens with a JSON value but goes on is prose
+case_ "footnote line then fenced array: stored" 1 "" \
+  "$(printf '[1] see the ticket.\n%sjson\n[%s]\n%s\n' "$FENCE" "$MEM" "$FENCE")"
+case_ "CRLF fenced array: stored" 1 "" \
+  "$(printf '%sjson\r\n[%s]\r\n%s\r\n' "$FENCE" "$MEM" "$FENCE")"
 case_ "indented fenced array then prose: stored" 1 "" \
   "$(printf '  %sjson\n  [%s]\n  %s\nDone.\n' "$FENCE" "$MEM" "$FENCE")"
 case_ "prose then bare array: stored" 1 "" \

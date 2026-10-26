@@ -384,22 +384,42 @@ RESPONSE=$(printf '%s' "$RAW" | jq -r '.choices[0].message.content // empty' 2>/
 
 # --- Parse LLM output ---
 # The extractor often fences the array and explains it in prose before or
-# after, most often a fenced [] followed by why nothing qualifies. So read the
-# fenced block when there is one (prose before it can open with [ too: a
-# markdown link, a remark about []), else start at the first line that opens an
-# array or object, and read only the first JSON value: the prose around it is
-# ignored. A reply that still fails is logged with the reply itself, on one
-# line, so its shape is known.
-_FENCE='^[[:space:]]*```'
-if printf '%s\n' "$RESPONSE" | grep -q "$_FENCE"; then
-    _PAYLOAD="/$_FENCE/,/$_FENCE/{/$_FENCE/d;p;}"
-else
-    # shellcheck disable=SC2016 # $p is sed's last-line address, not a variable
-    _PAYLOAD='/^[[:space:]]*[[{]/,$p'
-fi
-printf '%s\n' "$RESPONSE" | sed -n "$_PAYLOAD" > "$_HOOKDIR/reply.txt" \
+# after, most often a fenced [] followed by why nothing qualifies, and the prose
+# can hold [ or a fence of its own (a markdown link, a remark about [], a
+# fenced command). So the payload is the first line that starts a whole JSON
+# array of objects and has nothing after it on the line where it ends. Fences
+# need no special case: a fence line never starts with [, so the array inside
+# is found. With no such array, the first JSON object found the same way is
+# passed on, so an envelope like {"memories":[...]} is logged as not an array
+# below. A reply with neither is logged with the reply itself, on one line, so
+# its shape is known.
+command -v python3 >/dev/null 2>&1 || _skip "config: python3 not found on PATH, skipping save"
+printf '%s\n' "$RESPONSE" > "$_HOOKDIR/reply.txt" \
     || _skip "cannot write $_HOOKDIR/reply.txt: the work dir is gone or unwritable, skipping save"
-jq -cn input "$_HOOKDIR/reply.txt" > "$_HOOKDIR/memories.json" 2>/dev/null \
+python3 -c '
+import json, sys
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+decode, pos, other = json.JSONDecoder().raw_decode, 0, None
+for line in text.splitlines(True):
+    start, pos = pos + len(line) - len(line.lstrip()), pos + len(line)
+    if text[start:start + 1] not in ("[", "{"):
+        continue
+    try:
+        value, end = decode(text, start)
+    except ValueError:
+        continue
+    eol = text.find("\n", end)
+    if text[end:eol if eol >= 0 else len(text)].strip():
+        continue  # the line goes on: prose such as "[] means none" or "[1] see"
+    if isinstance(value, list) and all(isinstance(m, dict) for m in value):
+        print(json.dumps(value))
+        sys.exit(0)
+    if other is None:
+        other = value
+if other is None:
+    sys.exit(1)
+print(json.dumps(other))' \
+    "$_HOOKDIR/reply.txt" > "$_HOOKDIR/memories.json" 2>/dev/null \
     || _skip "LLM output not valid JSON: $(printf '%s' "$RESPONSE" | tr '\n' ' ' | head -c 300)"
 
 # -1 = valid JSON but not an array (output-envelope drift, e.g. {"memories":[...]})
