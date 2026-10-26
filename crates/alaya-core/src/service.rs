@@ -1296,6 +1296,7 @@ impl MemoryService {
                     .await
                     .unwrap_or_else(|e| {
                         tracing::warn!(error = %e, "BM25 search failed (non-fatal); no keyword pool");
+                        self.vitals.keyword_failed();
                         Vec::new()
                     })
             };
@@ -7401,10 +7402,11 @@ mod tests {
         assert_eq!(hashes, ["a", "c"]);
         assert_eq!(tag_calls.get(), 0, "hybrid never queries the tag pools");
         assert_eq!(bm25_calls.get(), 1);
+        assert_eq!(svc.vitals.snapshot()["failures"]["keyword"], 0);
     }
 
     /// A BM25 search that fails leaves the search dense-only rather than
-    /// failing it.
+    /// failing it, and is counted.
     #[tokio::test(flavor = "current_thread")]
     async fn a_failed_bm25_search_is_not_fatal() {
         // MockVectors keeps the trait's default search_by_text: an error.
@@ -7412,6 +7414,7 @@ mod tests {
         svc.search(search_params("anything"))
             .await
             .expect("a BM25 error leaves a dense-only search");
+        assert_eq!(svc.vitals.snapshot()["failures"]["keyword"], 1);
     }
 
     /// With `memory_type` set, hybrid returns only that type from every

@@ -730,7 +730,7 @@ curl -H "Authorization: Bearer $ALAYA_API_KEY" http://localhost:3001/stats
   "pod": {
     "name": "alaya-server-7d9f",
     "started_at": 1790990000,
-    "failures": {"embedding": 3, "rerank": 11, "store": 2, "enrich_overrun": 0},
+    "failures": {"embedding": 3, "rerank": 11, "keyword": 0, "store": 2, "enrich_overrun": 0},
     "selfcheck": {
       "enabled": true,
       "consecutive_failures": 0,
@@ -772,6 +772,7 @@ the counts, and with several replicas each call shows the pod that answered.
 |:--|:--|
 | `failures.embedding` | Embedding calls that failed. Cache hits are not calls and never count. |
 | `failures.rerank` | Hybrid searches whose rerank errored, timed out or returned the wrong number of scores, and so served RRF order. The search itself succeeded. |
+| `failures.keyword` | Hybrid searches whose BM25 keyword search failed, and so fused the dense pool alone. The search itself succeeded. A memory with no keyword vector is not a failure: `keyword_index.missing` counts those. |
 | `failures.store` | Stores that failed on a backend or hit the command deadline. A request refused as invalid (`Invalid request parameters`) is not counted. |
 | `failures.enrich_overrun` | Hybrid searches whose access-count bump or Hebbian co-access enqueue was still unfinished at the 2 s budget, so the search answered without it. The search itself succeeded. When the bump was the unfinished side, some access counts on its page may not be recorded, and its results report the counts as stored before the bump. |
 | `selfcheck.enabled` | Whether `SELFCHECK_QUERY` and `SELFCHECK_EXPECT_HASH` are set. |
