@@ -14,6 +14,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOK="$HERE/alaya-session-save.sh"
 T=$(mktemp -d) || exit 1; trap 'rm -rf "$T"' EXIT
 JQ_DIR=$(dirname "$(command -v jq)")
+PY_DIR=$(dirname "$(command -v python3)") # env -i keeps only PATH: python3 may live outside /usr/bin
 RC=0
 
 # stub curl: answer the extraction call with the reply in $CAP/reply; count
@@ -40,7 +41,7 @@ case_() {
   rm -rf "$home" "$cap"; mkdir -p "$home" "$cap"
   printf '%s' "$4" > "$cap/reply"
   printf '{"session_id":"s1","transcript_path":"%s"}' "$T/transcript.jsonl" \
-    | (cd "$T" && env -i HOME="$home" CAP="$cap" PATH="${5:-}$T/bin:$JQ_DIR:/usr/bin:/bin" \
+    | (cd "$T" && env -i HOME="$home" CAP="$cap" PATH="${5:-}$T/bin:$JQ_DIR:$PY_DIR:/usr/bin:/bin" \
         ALAYA_URL=http://alaya.test/store ALAYA_LLM_URL=http://llm.test/v1/chat/completions \
         ALAYA_LLM_API_KEY=k ALAYA_API_KEY=k ALAYA_HOOK_STATE_DIR="$home/state" _ALAYA_HOOK_FOREGROUND=1 \
         bash "$HOOK") >/dev/null 2>&1
