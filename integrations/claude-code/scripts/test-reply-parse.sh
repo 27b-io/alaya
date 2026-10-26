@@ -81,7 +81,7 @@ case_ "fenced array then prose: logged" 0 "LLM output not stored: a non-empty re
   "$(printf '%sjson\n[%s]\n%s\n\nIt is new.\n' "$FENCE" "$MEM" "$FENCE")"
 case_ "prose then bare array: logged" 0 "LLM output not stored: a non-empty result with prose or another value beside it" \
   "$(printf 'Here are the memories:\n[%s]\n' "$MEM")"
-case_ "markdown link then fenced array: logged" 0 "LLM output not stored: a non-empty result with prose or another value beside it" \
+case_ "markdown link then fenced array: logged" 0 "LLM output not stored:" \
   "$(printf 'Filed:\n[LAB-123](https://example.test/issue) covers the bug.\n%sjson\n[%s]\n%s\n' "$FENCE" "$MEM" "$FENCE")"
 case_ "fenced command then fenced array: logged" 0 "LLM output not stored: a non-empty result with prose or another value beside it" \
   "$(printf 'Verified with:\n%ssh\nnpm test\n%s\n%sjson\n[%s]\n%s\n' "$FENCE" "$FENCE" "$FENCE" "$MEM" "$FENCE")"
@@ -109,6 +109,16 @@ case_ "pretty envelope with the array on its own line: logged as not an array" 0
 # a reply with no JSON value is logged once, on one line, with the reply itself
 case_ "prose only: logged with the reply" 0 "LLM output not valid JSON: I could not find anything. Sorry." \
   "$(printf 'I could not find anything.\nSorry.\n')"
+# malformed JSON is never a quiet empty result, even when a [] inside it decodes
+M='LLM output not stored: malformed JSON in the reply'
+case_ "truncated array with a nested []: logged" 0 "$M" \
+  "$(printf '[{"content":"a lesson","memory_type":"reference","tags":[]')"
+case_ "truncated string holding []: logged" 0 "$M" \
+  "$(printf '[{"content":"see [] and more')"
+case_ "single-quoted array with a nested []: logged" 0 "$M" \
+  "$(printf "[{'content': 'x', 'tags': []}]")"
+case_ "markdown link beside a fenced []: logged" 0 "$M" \
+  "$(printf '%sjson\n[]\n%s\nSee [LAB-123](https://example.test/issue).\n' "$FENCE" "$FENCE")"
 # a truncated array may hold whole objects, so its message varies: logged with the reply, not stored
 case_ "truncated array: logged with the reply" 0 ': [{"content":"a lesson","memory_type"' \
   "$(printf '[%s, {"content":"cut sho' "$MEM")"

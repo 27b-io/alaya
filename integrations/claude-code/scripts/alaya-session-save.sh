@@ -391,10 +391,13 @@ RESPONSE=$(printf '%s' "$RAW" | jq -r '.choices[0].message.content // empty' 2>/
 # memory, which is worse than a skipped save. So memories are stored only when
 # the reply, fence lines aside, is one JSON array and nothing else. Every JSON
 # value in the reply is found, at any position, skipping what is nested inside
-# one. When every value is [] there is nothing to save, whatever surrounds it:
-# a quiet exit. A lone value that is not an array is logged as not an array
-# below. A non-empty result with prose or another value beside it is logged
-# with the reply and not stored, and so is a reply with no JSON value.
+# one. A [ or { that does not decode is malformed JSON (a truncated or
+# single-quoted reply), and a [] found inside it proves nothing, so the reply
+# is logged and not stored. Otherwise, when every value is [] there is nothing
+# to save, whatever surrounds it: a quiet exit. A lone value that is not an
+# array is logged as not an array below. A non-empty result with prose or
+# another value beside it is logged with the reply and not stored, and so is a
+# reply with no JSON value.
 command -v python3 >/dev/null 2>&1 || _skip "config: python3 not found on PATH, skipping save"
 printf '%s\n' "$RESPONSE" > "$_HOOKDIR/reply.txt" \
     || _skip "cannot write $_HOOKDIR/reply.txt: the work dir is gone or unwritable, skipping save"
@@ -403,7 +406,7 @@ import json, re, sys
 with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
     text = re.sub(r"(?m)^[ \t]*```[\w+-]*[ \t]*\r?$", "", f.read())
 decode = json.JSONDecoder().raw_decode
-values, prose, i = [], [], 0
+values, prose, i, broken = [], [], 0, False
 while i < len(text):
     if text[i] in "[{":
         try:
@@ -411,11 +414,13 @@ while i < len(text):
             values.append(value)
             continue
         except ValueError:
-            pass
+            broken = True
     prose.append(text[i])
     i += 1
 if not values:
     sys.exit(10)
+if broken:
+    sys.exit(12)
 if all(v == [] for v in values):
     print("[]")
 elif len(values) == 1 and not "".join(prose).strip():
@@ -427,6 +432,7 @@ case $? in
     0) ;;
     10) _skip "LLM output not valid JSON: $(printf '%s' "$RESPONSE" | tr '\n' ' ' | head -c 300)" ;;
     11) _skip "LLM output not stored: a non-empty result with prose or another value beside it: $(printf '%s' "$RESPONSE" | tr '\n' ' ' | head -c 300)" ;;
+    12) _skip "LLM output not stored: malformed JSON in the reply: $(printf '%s' "$RESPONSE" | tr '\n' ' ' | head -c 300)" ;;
     *) _skip "cannot parse $_HOOKDIR/reply.txt, skipping save: $(printf '%s' "$_PARSE_ERR" | tr '\n' ' ' | tail -c 300)" ;;
 esac
 

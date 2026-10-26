@@ -178,7 +178,9 @@ scripts/test-reply-parse.sh
 
 Runs the real Stop hook against a stub extractor and proves what it makes of the reply. Memories
 are stored only when the reply, fence lines aside, is one JSON array of objects and nothing else.
-A reply whose every JSON value is `[]` is a quiet "nothing to save", whatever prose surrounds it.
+A reply whose every JSON value is `[]` is a quiet "nothing to save", whatever prose surrounds it,
+unless a `[` or `{` in it does not decode: a truncated or single-quoted reply is logged as
+malformed, since a `[]` inside it proves nothing.
 A non-empty result with prose or another value beside it is logged with the reply and not stored:
 the prose may mark it as an example, and storing an example would be a false memory. A lone JSON
 object, pretty-printed or not, is logged as not an array. A reply with no JSON value is logged once
