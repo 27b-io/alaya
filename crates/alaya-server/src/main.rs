@@ -25,7 +25,7 @@ mod wellknown;
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Request},
+    extract::{DefaultBodyLimit, MatchedPath, Request},
     http::{Method, StatusCode, header},
     middleware,
     routing::{get, post},
@@ -3386,23 +3386,71 @@ fn protected_router(handle: ServiceHandle, auth_state: AuthState) -> Router {
             auth::require_auth,
         ))
         .layer(DefaultBodyLimit::max(MAX_BODY))
-        .layer(TraceLayer::new_for_http().make_span_with(request_span))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(request_span)
+                .on_response(record_response_status),
+        )
         .with_state(handle)
 }
 
-/// The request span for authenticated REST routes: `method` and `path`
-/// only — a query string is never safe to log (mirrors ops-console).
+/// The root span of every protected route, REST and `/mcp`. It records the
+/// path, never the query string — that is never safe to log (mirrors
+/// ops-console).
 /// `info_span!` targets this module (`alaya_server`), so the directive that
 /// keeps it alive is `alaya_server=info` in the default filter
 /// (`telemetry.rs`); `tower_http=info` only governs tower-http's own
 /// request/response events. `DefaultMakeSpan` can set the span's level but
 /// cannot drop its `uri` field, so a custom `MakeSpan` is required.
+///
+/// It is also the root of every exported trace, so it carries the OTel HTTP
+/// server conventions: named `{method} {route}` from the matched route
+/// template (never the concrete path), kind `server`. The status and, on
+/// `/mcp`, the JSON-RPC fields are declared empty here and recorded later —
+/// a field not declared at creation can never be recorded.
 fn request_span(req: &Request) -> tracing::Span {
+    let method = otel_http_method(req.method());
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str);
+    let name_method = if method == "_OTHER" { "HTTP" } else { method };
+    let name = match route {
+        Some(route) => format!("{name_method} {route}"),
+        None => name_method.to_string(),
+    };
     tracing::info_span!(
         "request",
-        method = %clip_for_log(req.method().as_str()),
-        path = %clip_for_log(req.uri().path())
+        path = %clip_for_log(req.uri().path()),
+        otel.name = %name,
+        otel.kind = "server",
+        http.request.method = method,
+        http.route = route,
+        http.response.status_code = tracing::field::Empty,
+        mcp.method.name = tracing::field::Empty,
+        gen_ai.tool.name = tracing::field::Empty,
+        rpc.response.status_code = tracing::field::Empty,
     )
+}
+
+/// The HTTP method as the OTel conventions bound it: a client can send any
+/// token as a method, so anything outside the standard set is `_OTHER`.
+fn otel_http_method(method: &Method) -> &str {
+    match method.as_str() {
+        m @ ("GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "CONNECT" | "OPTIONS" | "TRACE"
+        | "PATCH") => m,
+        _ => "_OTHER",
+    }
+}
+
+/// Replaces tower-http's `DefaultOnResponse`, which only logs at DEBUG —
+/// below the default filter — and never puts the status on the span.
+fn record_response_status(
+    res: &axum::http::Response<axum::body::Body>,
+    _latency: std::time::Duration,
+    span: &tracing::Span,
+) {
+    span.record("http.response.status_code", res.status().as_u16());
 }
 
 async fn shutdown_signal() {
@@ -7142,7 +7190,7 @@ mod wedge_tests {
         let log = log.text();
         let clipped = clip_for_log(&label);
         for seen in [
-            format!("method={}", clip_for_log(&label.to_uppercase())),
+            r#"http.request.method="_OTHER""#.to_string(),
             format!("path={}", clip_for_log(&path)),
             format!("mem_type={clipped}"),
             format!("client=\"{clipped}\""),
@@ -8405,6 +8453,286 @@ mod wedge_tests {
             !log.contains("QUERY-SENTINEL"),
             "query string reached the log:\n{log}"
         );
+    }
+
+    /// Test-local stand-in for the OTLP exporter: keeps every span the SDK
+    /// exports, so assertions read the OTel spans themselves, not fmt output.
+    #[derive(Clone, Debug, Default)]
+    struct SpanSink(std::sync::Arc<std::sync::Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
+
+    impl opentelemetry_sdk::trace::SpanExporter for SpanSink {
+        async fn export(
+            &self,
+            batch: Vec<opentelemetry_sdk::trace::SpanData>,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.0.lock().unwrap().extend(batch);
+            Ok(())
+        }
+    }
+
+    impl SpanSink {
+        /// Production's filter and layer over this sink, current on this
+        /// thread until the guard drops. A simple (not batch) processor
+        /// exports each span as it closes, so no flush is needed. Scoped for
+        /// the reason `request_span_omits_query_string` gives.
+        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+            use opentelemetry::trace::TracerProvider;
+            use tracing_subscriber::layer::SubscriberExt;
+
+            let sink = Self::default();
+            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_simple_exporter(sink.clone())
+                .build();
+            let subscriber = tracing_subscriber::registry()
+                .with(tracing_subscriber::EnvFilter::new(
+                    telemetry::DEFAULT_FILTER,
+                ))
+                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+            (sink, crate::testlog::scoped(subscriber))
+        }
+
+        fn spans(&self) -> Vec<opentelemetry_sdk::trace::SpanData> {
+            self.0.lock().unwrap().clone()
+        }
+
+        /// The one exported span named `name`.
+        fn named(&self, name: &str) -> opentelemetry_sdk::trace::SpanData {
+            let spans = self.spans();
+            let found: Vec<_> = spans.iter().filter(|s| s.name == name).collect();
+            let names: Vec<_> = spans.iter().map(|s| &s.name).collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "want one span named {name:?}, exported: {names:?}"
+            );
+            found[0].clone()
+        }
+    }
+
+    fn otel_attr(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<String> {
+        span.attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.to_string())
+    }
+
+    /// Drive one request through `app` and close its request span: the
+    /// `TraceLayer` response body owns the span, so it ends on drop.
+    async fn traced(app: &Router, req: Request) -> StatusCode {
+        use tower::ServiceExt;
+        let resp = app.clone().oneshot(req).await.unwrap();
+        resp.status()
+    }
+
+    fn mcp_call(body: Value) -> Request {
+        axum::http::Request::post("/mcp")
+            .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// A REST root span is named for the matched route template, is a
+    /// SERVER span, and carries the status it answered with.
+    #[tokio::test]
+    async fn rest_request_span_is_named_for_its_route_and_status() {
+        let (sink, _guard) = SpanSink::capture();
+        let (tx, mut rx) = mpsc::channel::<Cmd>(4);
+        let app = protected_router(ServiceHandle { tx }, test_auth_state());
+
+        let hash = "ab".repeat(32);
+        let anon = axum::http::Request::get(format!("/memories/{hash}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(traced(&app, anon).await, StatusCode::UNAUTHORIZED);
+
+        let worker = tokio::spawn(async move {
+            match rx.recv().await.map(|c| c.inner) {
+                Some(CmdInner::Stats { reply }) => {
+                    let _ = reply.send(json!({ "errors": [] }));
+                }
+                _ => panic!("expected a Stats command"),
+            }
+        });
+        let stats = axum::http::Request::get("/stats")
+            .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(traced(&app, stats).await, StatusCode::OK);
+        worker.await.unwrap();
+
+        for (name, route, status) in [
+            (
+                "GET /memories/{content_hash}",
+                "/memories/{content_hash}",
+                "401",
+            ),
+            ("GET /stats", "/stats", "200"),
+        ] {
+            let span = sink.named(name);
+            assert_eq!(
+                span.span_kind,
+                opentelemetry::trace::SpanKind::Server,
+                "{name}"
+            );
+            assert_eq!(
+                otel_attr(&span, "http.request.method").as_deref(),
+                Some("GET")
+            );
+            assert_eq!(otel_attr(&span, "http.route").as_deref(), Some(route));
+            assert_eq!(
+                otel_attr(&span, "http.response.status_code").as_deref(),
+                Some(status),
+                "{name}"
+            );
+        }
+        let names: Vec<_> = sink.spans().into_iter().map(|s| s.name).collect();
+        assert!(
+            !names.iter().any(|n| n.contains(&hash)),
+            "a concrete hash reached a span name: {names:?}"
+        );
+    }
+
+    /// `/mcp` root spans are named per the OTel MCP conventions once the body
+    /// parses as JSON-RPC, and keep the HTTP name when it never does.
+    #[tokio::test]
+    async fn mcp_request_span_is_named_for_the_rpc() {
+        let (sink, _guard) = SpanSink::capture();
+        let (tx, _rx) = mpsc::channel::<Cmd>(1);
+        let app = protected_router(ServiceHandle { tx }, test_auth_state());
+
+        let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} });
+        assert_eq!(traced(&app, mcp_call(init)).await, StatusCode::OK);
+        let note = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+        assert_eq!(traced(&app, mcp_call(note)).await, StatusCode::ACCEPTED);
+        let no_json = axum::http::Request::post("/mcp")
+            .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        assert_eq!(
+            traced(&app, no_json).await,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+
+        for (name, status) in [("initialize", "200"), ("notifications/initialized", "202")] {
+            let span = sink.named(name);
+            assert_eq!(
+                span.span_kind,
+                opentelemetry::trace::SpanKind::Server,
+                "{name}"
+            );
+            assert_eq!(otel_attr(&span, "mcp.method.name").as_deref(), Some(name));
+            assert_eq!(
+                otel_attr(&span, "http.request.method").as_deref(),
+                Some("POST")
+            );
+            assert_eq!(otel_attr(&span, "http.route").as_deref(), Some("/mcp"));
+            assert_eq!(
+                otel_attr(&span, "http.response.status_code").as_deref(),
+                Some(status),
+                "{name}"
+            );
+            assert_eq!(otel_attr(&span, "gen_ai.tool.name"), None, "{name}");
+            assert_eq!(otel_attr(&span, "rpc.response.status_code"), None, "{name}");
+        }
+        let rejected = sink.named("POST /mcp");
+        assert_eq!(otel_attr(&rejected, "mcp.method.name"), None);
+        assert_eq!(
+            otel_attr(&rejected, "http.response.status_code").as_deref(),
+            Some("415")
+        );
+    }
+
+    /// A method or tool the server does not know is named with a fixed token,
+    /// never the client's string; no argument text reaches any span; and a
+    /// JSON-RPC error records its code, not its message (which echoes the
+    /// client's method or tool name).
+    #[tokio::test]
+    async fn mcp_span_never_carries_client_strings() {
+        let (sink, _guard) = SpanSink::capture();
+        let (tx, _rx) = mpsc::channel::<Cmd>(1);
+        let app = protected_router(ServiceHandle { tx }, test_auth_state());
+
+        let method = json!({ "jsonrpc": "2.0", "id": 1, "method": "SENTINEL-METHOD" });
+        assert_eq!(traced(&app, mcp_call(method)).await, StatusCode::OK);
+        let tool = json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "SENTINEL-TOOL", "arguments": { "query": "SENTINEL-QUERY" } },
+        });
+        assert_eq!(traced(&app, mcp_call(tool)).await, StatusCode::OK);
+
+        let span = sink.named("unknown");
+        assert_eq!(
+            otel_attr(&span, "mcp.method.name").as_deref(),
+            Some("unknown")
+        );
+        assert_eq!(
+            otel_attr(&span, "rpc.response.status_code").as_deref(),
+            Some("-32601")
+        );
+        let span = sink.named("tools/call unknown");
+        assert_eq!(
+            otel_attr(&span, "mcp.method.name").as_deref(),
+            Some("tools/call")
+        );
+        assert_eq!(
+            otel_attr(&span, "gen_ai.tool.name").as_deref(),
+            Some("unknown")
+        );
+        assert_eq!(
+            otel_attr(&span, "rpc.response.status_code").as_deref(),
+            Some("-32601")
+        );
+        let export = format!("{:?}", sink.spans());
+        assert!(
+            !export.contains("SENTINEL"),
+            "client text reached the export: {export}"
+        );
+    }
+
+    /// A `tools/call search` root span is named for the tool, and the span
+    /// `call_rpc` hands the worker as `cmd.span` is that root: a span opened
+    /// under it on another thread, the way the worker loop opens its op
+    /// spans, exports as the root's child in the same trace.
+    #[tokio::test]
+    async fn tools_call_cmd_span_parents_worker_spans() {
+        let (sink, _guard) = SpanSink::capture();
+        let (tx, mut rx) = mpsc::channel::<Cmd>(1);
+        let app = protected_router(ServiceHandle { tx }, test_auth_state());
+
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let worker = std::thread::spawn(move || {
+            let _default = tracing::dispatcher::set_default(&dispatch);
+            let cmd = rx.blocking_recv().expect("a command");
+            let _op = tracing::info_span!(parent: &cmd.span, "worker_probe").entered();
+            match cmd.inner {
+                CmdInner::Search { reply, .. } => {
+                    let _ = reply.send(json!({ "memories": [] }));
+                }
+                _ => panic!("expected a Search command"),
+            }
+        });
+        let call = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "search", "arguments": { "query": "q" } },
+        });
+        assert_eq!(traced(&app, mcp_call(call)).await, StatusCode::OK);
+        worker.join().unwrap();
+
+        let root = sink.named("tools/call search");
+        assert_eq!(
+            otel_attr(&root, "mcp.method.name").as_deref(),
+            Some("tools/call")
+        );
+        assert_eq!(
+            otel_attr(&root, "gen_ai.tool.name").as_deref(),
+            Some("search")
+        );
+        assert_eq!(otel_attr(&root, "rpc.response.status_code"), None);
+        assert_eq!(root.parent_span_id, opentelemetry::trace::SpanId::INVALID);
+        let child = sink.named("worker_probe");
+        assert_eq!(child.span_context.trace_id(), root.span_context.trace_id());
+        assert_eq!(child.parent_span_id, root.span_context.span_id());
     }
 
     /// `GET /stats` on the composed router: the read-only bearer is refused
