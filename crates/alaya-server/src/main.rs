@@ -3394,8 +3394,9 @@ fn protected_router(handle: ServiceHandle, auth_state: AuthState) -> Router {
         .with_state(handle)
 }
 
-/// The request span for authenticated REST routes: `method` and `path`
-/// only — a query string is never safe to log (mirrors ops-console).
+/// The root span of every protected route, REST and `/mcp`. It records the
+/// path, never the query string — that is never safe to log (mirrors
+/// ops-console).
 /// `info_span!` targets this module (`alaya_server`), so the directive that
 /// keeps it alive is `alaya_server=info` in the default filter
 /// (`telemetry.rs`); `tower_http=info` only governs tower-http's own
@@ -3420,7 +3421,6 @@ fn request_span(req: &Request) -> tracing::Span {
     };
     tracing::info_span!(
         "request",
-        method = %clip_for_log(req.method().as_str()),
         path = %clip_for_log(req.uri().path()),
         otel.name = %name,
         otel.kind = "server",
@@ -7190,7 +7190,7 @@ mod wedge_tests {
         let log = log.text();
         let clipped = clip_for_log(&label);
         for seen in [
-            format!("method={}", clip_for_log(&label.to_uppercase())),
+            r#"http.request.method="_OTHER""#.to_string(),
             format!("path={}", clip_for_log(&path)),
             format!("mem_type={clipped}"),
             format!("client=\"{clipped}\""),
@@ -8497,18 +8497,15 @@ mod wedge_tests {
 
         /// The one exported span named `name`.
         fn named(&self, name: &str) -> opentelemetry_sdk::trace::SpanData {
-            let mut found: Vec<_> = self
-                .spans()
-                .into_iter()
-                .filter(|s| s.name == name)
-                .collect();
-            let names: Vec<_> = self.spans().into_iter().map(|s| s.name).collect();
+            let spans = self.spans();
+            let found: Vec<_> = spans.iter().filter(|s| s.name == name).collect();
+            let names: Vec<_> = spans.iter().map(|s| &s.name).collect();
             assert_eq!(
                 found.len(),
                 1,
                 "want one span named {name:?}, exported: {names:?}"
             );
-            found.remove(0)
+            found[0].clone()
         }
     }
 
@@ -8693,11 +8690,12 @@ mod wedge_tests {
         );
     }
 
-    /// A `tools/call search` root span is named for the tool, and a span the
-    /// worker opens under `cmd.span` — on another thread, as production's
-    /// worker does — joins the same trace as its child.
+    /// A `tools/call search` root span is named for the tool, and the span
+    /// `call_rpc` hands the worker as `cmd.span` is that root: a span opened
+    /// under it on another thread, the way the worker loop opens its op
+    /// spans, exports as the root's child in the same trace.
     #[tokio::test]
-    async fn tools_call_trace_joins_across_the_worker() {
+    async fn tools_call_cmd_span_parents_worker_spans() {
         let (sink, _guard) = SpanSink::capture();
         let (tx, mut rx) = mpsc::channel::<Cmd>(1);
         let app = protected_router(ServiceHandle { tx }, test_auth_state());

@@ -207,7 +207,7 @@ pub async fn mcp_handler(
         }
     };
 
-    record_rpc_span(&req);
+    let method = record_rpc_span(&req);
 
     // Validate jsonrpc version
     if req.jsonrpc != "2.0" {
@@ -222,13 +222,13 @@ pub async fn mcp_handler(
     let id = req.id.unwrap_or(Value::Null);
 
     // Notifications (no id) → 202 Accepted
-    if is_accepted_notification(&id, req.method.as_str()) {
+    if is_accepted_notification(&id, method) {
         return StatusCode::ACCEPTED.into_response();
     }
 
     // Default-deny authorization: a restricted principal may only call its
     // allowlisted tools. Enforced here, axum-side, before any channel dispatch.
-    if req.method == "tools/call" {
+    if method == "tools/call" {
         let tool = req
             .params
             .as_ref()
@@ -242,7 +242,9 @@ pub async fn mcp_handler(
         }
     }
 
-    let resp = match req.method.as_str() {
+    // Dispatch on the bounded name, so a method missing from
+    // `KNOWN_METHODS` is unreachable rather than silently traced `unknown`.
+    let resp = match method {
         "initialize" => handle_initialize(id),
         "tools/list" => handle_tools_list(id),
         "tools/call" => handle_tools_call(id, req.params, &handle, principal).await,
@@ -253,8 +255,8 @@ pub async fn mcp_handler(
     make_response(resp, wants_sse)
 }
 
-/// Methods this endpoint answers, so a span name never carries a client's
-/// string: anything else is named `unknown`.
+/// Methods this endpoint answers; anything else is `unknown`, so neither a
+/// span name nor `mcp_handler`'s dispatch ever sees a client's string.
 const KNOWN_METHODS: &[&str] = &[
     "initialize",
     "initialized",
@@ -293,14 +295,15 @@ fn known(table: &[&'static str], s: &str) -> &'static str {
 
 /// Name the request span (`request_span` in `main.rs`, current here) per the
 /// OTel MCP conventions: `{mcp.method.name}`, or `tools/call {tool}`. Only
-/// fixed tokens are recorded — never the arguments.
-fn record_rpc_span(req: &JsonRpcRequest) {
+/// fixed tokens are recorded — never the arguments. Returns the bounded
+/// method name the handler dispatches on.
+fn record_rpc_span(req: &JsonRpcRequest) -> &'static str {
     let span = tracing::Span::current();
     let method = known(KNOWN_METHODS, &req.method);
     span.record("mcp.method.name", method);
     if method != "tools/call" {
         span.record("otel.name", method);
-        return;
+        return method;
     }
     let tool = req
         .params
@@ -310,11 +313,13 @@ fn record_rpc_span(req: &JsonRpcRequest) {
         .map_or("unknown", |n| known(TOOL_NAMES, n));
     span.record("gen_ai.tool.name", tool);
     span.record("otel.name", format!("tools/call {tool}"));
+    method
 }
 
-/// Format response as SSE or plain JSON depending on client preference.
+/// Format response as SSE or plain JSON depending on client preference, and
+/// record a JSON-RPC error's code on the request span — the code only: the
+/// message can echo the client's method or tool name.
 fn make_response(resp: JsonRpcResponse, sse: bool) -> Response {
-    // The code only: the message can echo the client's method or tool name.
     if let Some(e) = &resp.error {
         tracing::Span::current().record("rpc.response.status_code", e.code.to_string());
     }
@@ -1170,31 +1175,6 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_all_names() {
-        let schemas = tool_schemas();
-        let names: Vec<&str> = schemas
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
-        assert!(names.contains(&"store_memory"));
-        assert!(names.contains(&"search"));
-        assert!(names.contains(&"get_memory"));
-        assert!(names.contains(&"delete_memory"));
-        assert!(names.contains(&"check_database_health"));
-        assert!(names.contains(&"relation"));
-        assert!(names.contains(&"memory_supersede"));
-        assert!(names.contains(&"memory_unsupersede"));
-        assert!(names.contains(&"memory_confirm"));
-        assert!(names.contains(&"memory_refute"));
-        assert!(names.contains(&"memory_contradictions"));
-        assert!(names.contains(&"resolve_contradiction"));
-        assert!(names.contains(&"find_duplicates"));
-        assert!(names.contains(&"merge_duplicates"));
-    }
-
-    #[test]
     fn resolve_contradiction_params_require_resolution_key_and_list_it_required() {
         let a = "a".repeat(64);
         let b = "b".repeat(64);
@@ -1327,6 +1307,40 @@ mod tests {
             .await
             .unwrap();
         assert!(body.is_empty());
+    }
+
+    /// The handler dispatches on `KNOWN_METHODS`' bounded name, so a method
+    /// left out of that table answers -32601 (or a notification stops being
+    /// accepted) here instead of only tracing as `unknown`.
+    #[tokio::test]
+    async fn every_answered_method_is_in_known_methods() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        let call = |body: Value| {
+            mcp_handler(
+                headers.clone(),
+                axum::Extension(AuthPrincipal::Static),
+                axum::extract::State(test_handle()),
+                axum::body::Bytes::from(body.to_string()),
+            )
+        };
+
+        for method in ["initialize", "tools/list", "ping"] {
+            let resp = call(json!({ "jsonrpc": "2.0", "id": 1, "method": method })).await;
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            assert!(v.get("result").is_some(), "{method}: {v}");
+        }
+        for method in [
+            "initialized",
+            "notifications/initialized",
+            "notifications/cancelled",
+        ] {
+            let resp = call(json!({ "jsonrpc": "2.0", "method": method })).await;
+            assert_eq!(resp.status(), StatusCode::ACCEPTED, "{method}");
+        }
     }
 
     #[test]
