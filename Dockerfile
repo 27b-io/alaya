@@ -29,5 +29,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=builder /app/target/release/alaya-bridge /usr/local/bin/
 COPY --from=builder /app/target/release/alaya-server /usr/local/bin/
 COPY --from=builder /app/target/release/ops-console /usr/local/bin/
+USER 65534:65534
 
 EXPOSE 3000 3001 3002
