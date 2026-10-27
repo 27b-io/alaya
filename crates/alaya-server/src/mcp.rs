@@ -207,6 +207,8 @@ pub async fn mcp_handler(
         }
     };
 
+    record_rpc_span(&req);
+
     // Validate jsonrpc version
     if req.jsonrpc != "2.0" {
         let resp = JsonRpcResponse::error(
@@ -251,8 +253,71 @@ pub async fn mcp_handler(
     make_response(resp, wants_sse)
 }
 
+/// Methods this endpoint answers, so a span name never carries a client's
+/// string: anything else is named `unknown`.
+const KNOWN_METHODS: &[&str] = &[
+    "initialize",
+    "initialized",
+    "notifications/initialized",
+    "notifications/cancelled",
+    "tools/list",
+    "tools/call",
+    "ping",
+];
+
+/// Every tool `tools/list` advertises; pinned to `tool_schemas` by a test.
+const TOOL_NAMES: &[&str] = &[
+    "store_memory",
+    "search",
+    "get_memory",
+    "delete_memory",
+    "check_database_health",
+    "relation",
+    "memory_supersede",
+    "memory_unsupersede",
+    "memory_confirm",
+    "memory_refute",
+    "memory_contradictions",
+    "resolve_contradiction",
+    "find_duplicates",
+    "merge_duplicates",
+];
+
+fn known(table: &[&'static str], s: &str) -> &'static str {
+    table
+        .iter()
+        .find(|k| **k == s)
+        .copied()
+        .unwrap_or("unknown")
+}
+
+/// Name the request span (`request_span` in `main.rs`, current here) per the
+/// OTel MCP conventions: `{mcp.method.name}`, or `tools/call {tool}`. Only
+/// fixed tokens are recorded — never the arguments.
+fn record_rpc_span(req: &JsonRpcRequest) {
+    let span = tracing::Span::current();
+    let method = known(KNOWN_METHODS, &req.method);
+    span.record("mcp.method.name", method);
+    if method != "tools/call" {
+        span.record("otel.name", method);
+        return;
+    }
+    let tool = req
+        .params
+        .as_ref()
+        .and_then(|p| p.get("name"))
+        .and_then(Value::as_str)
+        .map_or("unknown", |n| known(TOOL_NAMES, n));
+    span.record("gen_ai.tool.name", tool);
+    span.record("otel.name", format!("tools/call {tool}"));
+}
+
 /// Format response as SSE or plain JSON depending on client preference.
 fn make_response(resp: JsonRpcResponse, sse: bool) -> Response {
+    // The code only: the message can echo the client's method or tool name.
+    if let Some(e) = &resp.error {
+        tracing::Span::current().record("rpc.response.status_code", e.code.to_string());
+    }
     let json_str = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
 
     if sse {
@@ -910,6 +975,20 @@ mod tests {
             "application/json, text/event-stream".parse().unwrap(),
         );
         headers
+    }
+
+    /// A span names only tools `tools/list` advertises; a tool added there
+    /// without joining `TOOL_NAMES` would trace as `tools/call unknown`.
+    #[test]
+    fn tool_names_match_tool_schemas() {
+        let schemas = tool_schemas();
+        let advertised: Vec<&str> = schemas
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(advertised, TOOL_NAMES);
     }
 
     /// A caller-set supersession marker or novelty value is -32602 and never

@@ -3,8 +3,8 @@
 //! If `OTEL_EXPORTER_OTLP_ENDPOINT` is set, configures OTLP HTTP exporter.
 //! If not set, tracing goes to stderr only.
 //!
-//! Default filter includes `tower_http=info` so HTTP request spans
-//! propagate to both the console and the OTLP exporter.
+//! The filter is global, so the OTLP exporter sees exactly the spans the
+//! console does.
 
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_otlp::{SpanExporter, WithHttpConfig};
@@ -18,9 +18,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// Global tracer provider — stored here so `shutdown_tracing()` can flush it.
 static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
-/// Default log filter — includes tower_http so HTTP request spans reach the
-/// OTLP exporter, and opentelemetry for internal diagnostics.
-const DEFAULT_FILTER: &str =
+/// Default log filter. `alaya_server=info` keeps the request span (it takes
+/// this crate's target, see `request_span`) and so every trace's root;
+/// `tower_http=info` governs only tower-http's own events.
+pub(crate) const DEFAULT_FILTER: &str =
     "alaya_server=info,alaya_core=info,alaya_backends=info,tower_http=info";
 
 /// Initialize tracing with optional OTLP export.
