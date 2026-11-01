@@ -537,11 +537,22 @@ mod tests {
     #[test]
     fn a_failed_export_reaches_the_console() {
         let (base, log) = http_stub(reply("401 Unauthorized", ""));
-        let authority = base.strip_prefix("http://").unwrap();
+        // Bound and dropped, so nothing listens and the dial is refused: the
+        // transport-failure report must withhold the URL as the 401's does.
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
         let (_crate, module) = module_path!().split_once("::").unwrap();
         // The deployed `RUST_LOG` and the documented one, set as an operator
         // would: neither names `opentelemetry_sdk`.
-        for filter in [super::DEFAULT_FILTER, "alaya_server=info"] {
+        for (collector, failure, filter) in [
+            (&base, "status code: 401", super::DEFAULT_FILTER),
+            (&base, "status code: 401", "alaya_server=info"),
+            (&refused, "network error", super::DEFAULT_FILTER),
+            (&refused, "network error", "alaya_server=info"),
+        ] {
+            let authority = collector.strip_prefix("http://").unwrap();
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             // The SDK defaults, not the shell's: an inherited
             // `OTEL_BSP_MAX_EXPORT_BATCH_SIZE=1` exports before the flush, a
@@ -561,7 +572,7 @@ mod tests {
                 .env(EXPORT_FAILURE_CHILD, "1")
                 .env("RUST_LOG", filter)
                 .env("NO_COLOR", "1")
-                .env("OTEL_EXPORTER_OTLP_ENDPOINT", &base)
+                .env("OTEL_EXPORTER_OTLP_ENDPOINT", collector)
                 .env(
                     "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
                     format!(
@@ -579,17 +590,17 @@ mod tests {
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
-            assert!(out.status.success(), "{filter}: {console}");
+            assert!(out.status.success(), "{failure}, {filter}: {console}");
             let report = console
                 .lines()
                 .find(|l| l.contains("BatchSpanProcessor.ExportError"))
                 .unwrap_or_else(|| {
-                    panic!("{filter}: no export failure on the console:\n{console}")
+                    panic!("{failure}, {filter}: no export failure on the console:\n{console}")
                 });
-            assert!(report.contains("401"), "{filter}: {report}");
+            assert!(report.contains(failure), "{failure}, {filter}: {report}");
             assert!(
                 !console.to_ascii_lowercase().contains(EXPORT_CANARY),
-                "{filter}: {console}"
+                "{failure}, {filter}: {console}"
             );
         }
         // Control: the canary was really dialled, in the query and a header,
