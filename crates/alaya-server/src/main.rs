@@ -503,10 +503,10 @@ async fn init_l2_redis(
     //
     // Retry connection with backoff — at pod startup the CNI/kube-proxy may
     // not have finished installing network rules yet, causing ECONNREFUSED.
-    // Each attempt is deadline-bounded: fred's own connect timeout covers
-    // only the dial, and this bound also covers the AUTH/HELLO exchange after
-    // it, which a blackholed target would otherwise hang, stalling the worker
-    // thread before its command loop ever starts (#63).
+    // Each attempt is deadline-bounded (#63). fred 9.4 bounds the dial with
+    // its 10s `connection_timeout` and the AUTH/HELLO setup after it with its
+    // separate 10s `internal_command_timeout`, so a blackholed target holds
+    // one attempt for up to 20s. This deadline caps the whole attempt at 10s.
     let mut last_err: Option<String> = None;
     for attempt in 0..L2_MAX_ATTEMPTS {
         let connected = tokio::time::timeout(
