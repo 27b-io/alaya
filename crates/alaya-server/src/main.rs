@@ -232,8 +232,8 @@ impl Config {
                 // `false` holds only because neither sender attaches a
                 // credential: the worker passes `None` to
                 // `EmbeddingClient::new`, and `HealthChecker::check_embedding`
-                // sends no bearer — leaving userinfo as the only credential
-                // this can carry. Mirrored at both call sites; the
+                // sends no bearer — leaving userinfo or a query string as the
+                // only credential this can carry. Mirrored at both call sites; the
                 // `HealthChecker` one is pinned by `qdrant_key_reaches_only_qdrant`.
                 "EMBEDDING_URL",
                 Some(cfg.embedding_url.as_str()),
@@ -410,9 +410,11 @@ enum Transport {
 /// is the API key when one is set, or URL-embedded credentials
 /// (`http://user:secret@host` sent as Basic auth by reqwest,
 /// `redis://user:pw@host` sent as `AUTH` by fred), or any non-empty query
-/// string (`?api_key=…` rides every request line). The query counts whatever
-/// its parameter names, the same over-count as the OTLP header check: reading
-/// names would miss the ones nobody listed. Classified on the URL as the
+/// string (`?api_key=…` rides every reqwest request line; fred reads the query
+/// as client config and never sends it, so for `Redis` counting it is a
+/// fail-closed over-count on a URL that is plaintext anyway). The query counts
+/// whatever its parameter names, the same over-count as the OTLP header check:
+/// reading names would miss the ones nobody listed. Classified on the URL as the
 /// `url` crate parses it (lowercased
 /// scheme, real host), so the check and the transport cannot disagree about
 /// where the credential goes. Messages name the host, never the raw value: a
@@ -480,8 +482,8 @@ fn check_credential_transport(
              variants only (fred opens plain TCP regardless of scheme)",
         )),
         (_, scheme) => Err(format!(
-            "{var}: {scheme}://{} is not {}; an API key or URL credential must \
-             not travel in the clear",
+            "{var}: {scheme}://{} is not {}; an API key, URL userinfo or query \
+             string must not travel in the clear",
             parsed.host_str().unwrap_or(""),
             match transport {
                 Transport::Http => "https and not a cluster-local http endpoint",
@@ -5218,7 +5220,7 @@ mod tests {
             );
         }
         // Allowed: https anywhere, cluster-local plaintext, or nothing to
-        // protect (no key and no userinfo).
+        // protect (no key, no userinfo and no query).
         for ok in [
             "https://api.anthropic.com",
             "HTTPS://api.anthropic.com",
@@ -5359,7 +5361,7 @@ mod tests {
             err.contains("redis.cloud.io") && !err.contains(FAKE_SECRET),
             "{off_query}: {err}"
         );
-        assert!(redis("REDIS_CACHE_URL", "redis://redis-svc:6379?node=a", false).is_ok());
+        assert!(redis("REDIS_CACHE_URL", "redis://redis-svc:6379?timeout=5", false).is_ok());
 
         // Non-redis scheme with Redis transport: fred opens plain TCP
         // regardless, so `https` buys no encryption. The refusal must name
