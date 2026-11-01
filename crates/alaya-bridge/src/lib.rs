@@ -53,28 +53,29 @@ pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(25);
 pub const QUEUE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const _: () = assert!(queue::BRPOP_TIMEOUT_SECS + 2.0 <= QUEUE_RESPONSE_TIMEOUT.as_secs_f64());
 
-/// Retries after a failed attempt, at startup and on reconnect. redis-rs
-/// 0.27's default (6, with a backoff that reaches 60 s per step) keeps a mute
-/// peer from failing for minutes; this caps startup at
-/// 3 × `CONNECT_TIMEOUT` plus at most 4 s of jittered backoff.
+/// Retries after a failed attempt, at startup and on reconnect. redis-rs's
+/// default of 6 retries keeps a mute peer from failing for tens of seconds;
+/// this caps startup at 3 × `CONNECT_TIMEOUT` plus the backoff between
+/// attempts, which starts at 100 ms, doubles, adds jitter and is capped at
+/// `MAX_RETRY_DELAY` per step: about 0.3–0.6 s over both retries.
 const CONNECT_RETRIES: usize = 2;
-const MAX_RETRY_DELAY_MS: u64 = 1_000;
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Config for the multiplexed connection the query handlers share.
 pub fn query_config() -> ConnectionManagerConfig {
-    connect_config().set_response_timeout(RESPONSE_TIMEOUT)
+    connect_config().set_response_timeout(Some(RESPONSE_TIMEOUT))
 }
 
 /// Config for the Hebbian consumer's dedicated connection.
 pub fn queue_config() -> ConnectionManagerConfig {
-    connect_config().set_response_timeout(QUEUE_RESPONSE_TIMEOUT)
+    connect_config().set_response_timeout(Some(QUEUE_RESPONSE_TIMEOUT))
 }
 
 fn connect_config() -> ConnectionManagerConfig {
     ConnectionManagerConfig::new()
-        .set_connection_timeout(CONNECT_TIMEOUT)
+        .set_connection_timeout(Some(CONNECT_TIMEOUT))
         .set_number_of_retries(CONNECT_RETRIES)
-        .set_max_delay(MAX_RETRY_DELAY_MS)
+        .set_max_delay(MAX_RETRY_DELAY)
 }
 
 /// Open a `ConnectionManager`, logging the target before the first attempt and
@@ -85,7 +86,7 @@ pub async fn connect(
     config: ConnectionManagerConfig,
     role: &str,
 ) -> redis::RedisResult<ConnectionManager> {
-    let addr = &client.get_connection_info().addr;
+    let addr = client.get_connection_info().addr();
     tracing::info!(%addr, role, "connecting to FalkorDB");
     ConnectionManager::new_with_config(client.clone(), config)
         .await

@@ -36,7 +36,7 @@ impl TestContext {
         let graph_name = format!("test_{}_{}", std::process::id(), suffix);
 
         let client = redis::Client::open(redis_url.as_str()).expect("Invalid REDIS_URL");
-        let conn = redis::aio::ConnectionManager::new(client)
+        let conn = alaya_bridge::connect(&client, alaya_bridge::query_config(), "test")
             .await
             .expect("Failed to connect to Redis");
 
