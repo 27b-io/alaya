@@ -270,8 +270,9 @@ mod tests {
     /// a client, it does not dial), and substituting the async
     /// `reqwest::Client` leaves this test green, because a missing reactor
     /// panics at first export on the batch thread rather than at
-    /// construction. Reaching that needs a live span flushed to a real
-    /// endpoint, which is not a unit test's job.
+    /// construction. `redirecting_collector_never_forwards_the_credential`
+    /// is the test that flushes a live span through `otlp_http_client` on the
+    /// batch thread, off any runtime.
     #[test]
     fn installs_without_a_tokio_runtime() {
         assert!(tokio::runtime::Handle::try_current().is_err());
@@ -414,7 +415,8 @@ mod tests {
 
     use std::sync::{Arc, Mutex};
 
-    /// Lowercase, because reqwest keeps a header value's case.
+    /// Lowercase: `http_stub` lowercases the head it logs, so a mixed-case
+    /// needle would never match.
     const CANARY: &str = "otlp-redirect-canary";
 
     /// A loopback HTTP/1.1 server that answers every request with `response`
@@ -450,9 +452,21 @@ mod tests {
         format!("HTTP/1.1 {status}\r\n{extra}content-length: 0\r\nconnection: close\r\n\r\n")
     }
 
+    /// The one request `log` holds, which must carry the credential.
+    fn only_request(log: &Mutex<Vec<String>>) -> String {
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert!(log[0].contains(&format!("x-api-key: {CANARY}")), "{log:?}");
+        log[0].clone()
+    }
+
     /// One real span through the production exporter and batch processor,
-    /// carrying a custom credential header, flushed to `endpoint`.
-    fn export_one_span(endpoint: &str, client: reqwest::blocking::Client) {
+    /// carrying a custom credential header, flushed to `endpoint`. Returns
+    /// the export's result; dropping the provider shuts it down.
+    fn export_one_span(
+        endpoint: &str,
+        client: reqwest::blocking::Client,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
         use opentelemetry::trace::{Tracer, TracerProvider};
         use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig};
 
@@ -467,9 +481,7 @@ mod tests {
             .with_batch_exporter(exporter)
             .build();
         provider.tracer("redirect-test").in_span("probe", |_| {});
-        // A refused redirect fails the export; only the sockets are asserted.
-        let _ = provider.force_flush();
-        let _ = provider.shutdown();
+        provider.force_flush()
     }
 
     #[test]
@@ -480,24 +492,20 @@ mod tests {
             &format!("location: {sink}/stolen\r\n"),
         ));
         let (direct, direct_log) = http_stub(reply("200 OK", ""));
-        let carried = |head: &String| head.contains(&format!("x-api-key: {CANARY}"));
 
         // Control: an export that reaches nothing — no client, no span, no
         // flush — would pass the sink assertion below for free.
-        export_one_span(&format!("{direct}/v1/traces"), super::otlp_http_client());
-        let direct_log = direct_log.lock().unwrap().clone();
-        assert_eq!(direct_log.len(), 1, "{direct_log:?}");
-        assert!(
-            direct_log[0].starts_with("post /v1/traces "),
-            "{direct_log:?}"
-        );
-        assert!(carried(&direct_log[0]), "{direct_log:?}");
+        let direct_export =
+            export_one_span(&format!("{direct}/v1/traces"), super::otlp_http_client());
+        assert!(direct_export.is_ok(), "{direct_export:?}");
+        assert!(only_request(&direct_log).starts_with("post /v1/traces "));
 
         // The collector was configured, so it may see the key; the origin
-        // its 307 names was not, so it must see nothing at all.
-        export_one_span(&format!("{collector}/v1/traces"), super::otlp_http_client());
-        assert_eq!(collector_log.lock().unwrap().len(), 1);
-        assert!(carried(&collector_log.lock().unwrap()[0]));
+        // its 307 names was not, so it must see nothing, and the export fails.
+        let redirected =
+            export_one_span(&format!("{collector}/v1/traces"), super::otlp_http_client());
+        assert!(redirected.is_err(), "a 3xx counted as exported");
+        only_request(&collector_log);
         assert!(sink_log.lock().unwrap().is_empty(), "redirect followed");
 
         // Control: reqwest's default policy follows the same 307 and forwards
@@ -510,10 +518,7 @@ mod tests {
             .no_proxy()
             .build()
             .unwrap();
-        export_one_span(&format!("{collector}/v1/traces"), following);
-        let sink_log = sink_log.lock().unwrap().clone();
-        assert_eq!(sink_log.len(), 1, "{sink_log:?}");
-        assert!(sink_log[0].starts_with("post /stolen "), "{sink_log:?}");
-        assert!(carried(&sink_log[0]), "{sink_log:?}");
+        let _ = export_one_span(&format!("{collector}/v1/traces"), following);
+        assert!(only_request(&sink_log).starts_with("post /stolen "));
     }
 }
