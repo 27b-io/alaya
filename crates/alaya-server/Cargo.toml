@@ -29,7 +29,7 @@ subtle = { workspace = true }
 
 # OpenTelemetry (optional — enabled when OTEL_ENDPOINT is set)
 opentelemetry = "0.33"
-opentelemetry_sdk = { version = "0.33", features = ["rt-tokio-current-thread"] }
+opentelemetry_sdk = "0.33"
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }
 tracing-opentelemetry = "0.34"
 

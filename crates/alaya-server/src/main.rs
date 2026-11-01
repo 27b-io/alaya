@@ -494,16 +494,18 @@ const L2_BASE_RETRY_MS: u64 = 500;
 async fn init_l2_redis(
     url: &str,
 ) -> std::result::Result<cachekit::CacheKit, Box<dyn std::error::Error>> {
-    // Built through `CacheKit::production` because it applies fred's reconnect
-    // policy (`auto_reconnect()`, crate-private before cachekit-rs 0.13). Without it a connection lost to a Redis restart is never redialled and
-    // every L2 op times out until this process restarts. The preset's TTL and
-    // L1 are overridden in `build_l2_client`; its retry/breaker stack needs
-    // cachekit's `reliability` feature, which this workspace leaves off.
+    // Built through `CacheKit::production` because it applies fred's
+    // reconnect policy. Without it a connection lost to a Redis restart is
+    // never redialled and every L2 op times out until this process restarts.
+    // The preset's TTL and L1 are overridden in `build_l2_client`; its
+    // retry/breaker stack needs cachekit's `reliability` feature, which this
+    // workspace leaves off.
     //
     // Retry connection with backoff — at pod startup the CNI/kube-proxy may
     // not have finished installing network rules yet, causing ECONNREFUSED.
-    // Each attempt is deadline-bounded: cachekit sets no fred connect
-    // timeout (its 5s command timeout does not cover connect), and a blackholed target here would otherwise hang the worker
+    // Each attempt is deadline-bounded: fred's own connect timeout covers
+    // only the dial, and this bound also covers the AUTH/HELLO exchange after
+    // it, which a blackholed target would otherwise hang, stalling the worker
     // thread before its command loop ever starts (#63).
     let mut last_err: Option<String> = None;
     for attempt in 0..L2_MAX_ATTEMPTS {

@@ -32,12 +32,11 @@ const BREAKER_COOLDOWN_SECS: f64 = 30.0;
 /// concurrently, so the batch wall clock stays ~this bound either way).
 ///
 /// A blackholed connection — e.g. the Redis pod IP vanishing without an RST —
-/// used to hang `get`/`set` awaits indefinitely: cachekit-rs set no fred
-/// command timeout before 0.13. That silence never trips the circuit breaker
-/// (it only counts errors) and wedged the whole service for 25h (#63).
-/// cachekit's own 5s command timeout now bounds a Redis op too, but this
-/// deadline is shorter, also covers the SaaS backend, and converts the hang
-/// into a failure the breaker can act on, degrading to L1-only.
+/// once hung `get`/`set` awaits indefinitely. That silence never trips the
+/// circuit breaker (it only counts errors) and wedged the whole service for
+/// 25h (#63). cachekit's 5s Redis command timeout bounds an op now too; this
+/// deadline is shorter, also covers the SaaS backend, and turns the hang into
+/// a failure the breaker can act on, degrading to L1-only.
 const L2_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn now_secs() -> f64 {
@@ -753,6 +752,17 @@ mod tests {
             build_l2_client(cachekit::CacheKit::builder().backend(backend.clone())).unwrap();
         let healed: Option<Vec<f32>> = reader.interop_get(&key).await.unwrap();
         assert_eq!(healed.unwrap().len(), 4, "re-embed must overwrite poison");
+    }
+
+    /// The key bytes are a cross-version and cross-SDK contract: a change here
+    /// turns every existing L2 entry into a miss. The literal was derived
+    /// under cachekit-rs 0.7.0 and still holds under 0.13.0.
+    #[test]
+    fn interop_key_is_pinned() {
+        assert_eq!(
+            cache_key("model-a", 1024, PromptName::Passage, "hello").unwrap(),
+            "alaya:embed:341d40075ca4c2c37cd563ae4967f056e4251d8f175e80ac639ce14dabceedd5"
+        );
     }
 
     /// Key derivation is deterministic and every argument is key-affecting.

@@ -19,20 +19,23 @@ Battle-tested instructions from alaya-server. Covers every pitfall discovered du
 
 ## Dependencies
 
+The current versions and features are in `crates/alaya-server/Cargo.toml`. The shape:
+
 ```toml
-# Cargo.toml
-opentelemetry = "0.29"
-opentelemetry_sdk = { version = "0.29", features = ["rt-tokio-current-thread"] }
-opentelemetry-otlp = { version = "0.29", default-features = false, features = ["http-proto", "reqwest-client", "trace"] }
-tracing-opentelemetry = "0.30"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.12", features = ["blocking"] }  # blocking required for OTLP exporter
+opentelemetry = "0.33"
+opentelemetry_sdk = "0.33"
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }
+tracing-opentelemetry = "0.34"
+reqwest = { version = "0.13", features = ["blocking", "rustls"] }  # blocking required for OTLP exporter
 ```
 
-### Critical: `default-features = false` on opentelemetry-otlp
+### Critical: the blocking client feature
 
-The default features enable `reqwest-blocking-client`. If you also enable `reqwest-client`, the cfg guards are mutually exclusive — both enabled means neither compiles in, and you get `NoHttpClient` at runtime with zero error message.
+The batch processor exports from its own OS thread, outside any tokio runtime, so the exporter needs `reqwest::blocking::Client`. Since 0.33 its `HttpClient` impl exists only under `reqwest-blocking-client`; `reqwest-client` alone gives a compile error at `.with_http_client(...)`. Keep the three `opentelemetry*` crates on one minor line, or the SDK types do not match.
+
+### Pitfall: renaming a span after it starts
+
+Since tracing-opentelemetry 0.32 the OTel span starts when the tracing span is first entered, and an `otel.name` recorded after that is silently dropped (status and attributes still land). Rename a running span through the OTel API instead: `span.context().span().update_name(name)` (see `rename_span` in `crates/alaya-server/src/mcp.rs`).
 
 ## Telemetry Init
 
