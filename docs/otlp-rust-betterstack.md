@@ -90,7 +90,9 @@ pub fn init_tracing() {
             Ok(e) => e,
             Err(e) => {
                 tracing_subscriber::registry().with(filter).with(fmt).init();
-                tracing::warn!("OTLP exporter failed ({e}), tracing to stderr only");
+                // Never log `e`: it quotes the endpoint value, which may
+                // carry userinfo or a query-string token (CWE-532).
+                tracing::warn!("OTLP exporter failed to build, tracing to stderr only");
                 return;
             }
         };
@@ -111,7 +113,11 @@ pub fn init_tracing() {
             .init();
 
         let _ = TRACER_PROVIDER.set(provider);
-        tracing::info!("OTLP tracing enabled → {endpoint} (version: {git_sha})");
+        // Origin only, for the same reason: this line is in every boot log.
+        let origin = reqwest::Url::parse(endpoint)
+            .map(|u| u.origin().ascii_serialization())
+            .unwrap_or_else(|_| "<unparseable>".into());
+        tracing::info!("OTLP tracing enabled → {origin} (version: {git_sha})");
     } else {
         tracing_subscriber::registry().with(filter).with(fmt).init();
     }
@@ -129,7 +135,7 @@ pub fn shutdown_tracing() {
 ## Environment Variables
 
 ```bash
-OTEL_EXPORTER_OTLP_ENDPOINT=https://s2349817.eu-fsn-3.betterstackdata.com
+OTEL_EXPORTER_OTLP_ENDPOINT=https://<your-ingesting-host>.betterstackdata.com
 OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer <token>"
 OTEL_SERVICE_NAME=my-service
 RUST_LOG=my_crate=info,my_lib=info,tower_http=info
@@ -182,7 +188,7 @@ RUST_LOG=my_crate=info,opentelemetry=debug,opentelemetry_sdk=debug
 
 ## Cross-Thread Span Propagation
 
-**Contextual span lookup does NOT work across thread boundaries in tracing-opentelemetry 0.30.**
+**Contextual span lookup does NOT work across thread boundaries.**
 
 If you have a multi-threaded architecture (e.g., axum on one thread, service worker on another via mpsc channel), spans created via `#[tracing::instrument]` or `.instrument(span)` on the worker thread will NOT become children of spans from the axum thread.
 
@@ -346,7 +352,7 @@ queries keep matching), and the startup log.
 ```yaml
 env:
 - name: OTEL_EXPORTER_OTLP_ENDPOINT
-  value: "https://s2349817.eu-fsn-3.betterstackdata.com"
+  value: "https://<your-ingesting-host>.betterstackdata.com"
 - name: OTEL_EXPORTER_OTLP_HEADERS
   valueFrom:
     secretKeyRef:

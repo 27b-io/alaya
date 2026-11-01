@@ -35,8 +35,9 @@ pub(crate) const DEFAULT_FILTER: &str =
 /// - `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `_HEADERS`: the signal-specific
 ///   twins, which take precedence over the pair above.
 ///
-/// Panics when `checked_otlp_endpoint` refuses — see it for which pair is
-/// checked and why.
+/// Panics when `checked_otlp_endpoint` refuses a parseable endpoint the
+/// credential would cross in plaintext — see it for which pair is checked and
+/// why. An endpoint that does not parse never stops boot.
 pub fn init_tracing() {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_FILTER));
@@ -53,7 +54,7 @@ pub fn init_tracing() {
     {
         // Checked before the exporter is built, so a refusal means the process
         // never starts rather than starting and posting the token.
-        let endpoint = checked_otlp_endpoint(
+        let endpoint = match checked_otlp_endpoint(
             &generic_endpoint,
             std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
                 .ok()
@@ -62,8 +63,20 @@ pub fn init_tracing() {
             std::env::var("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
                 .ok()
                 .as_deref(),
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
+        ) {
+            Ok(OtlpPlan::Export(endpoint)) => endpoint,
+            Ok(OtlpPlan::Skip(var)) => {
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(fmt_layer)
+                    .init();
+                tracing::warn!(
+                    "{var} is not a URI the OTLP exporter can parse; export skipped, tracing to stderr only"
+                );
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        };
 
         let service_name =
             std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "alaya-server".to_string());
@@ -132,8 +145,18 @@ pub fn init_tracing() {
     }
 }
 
-/// The endpoint the exporter will dial, after guarding it together with the
-/// headers it will send. The pair is selected from the same four raw values
+/// What `init_tracing` does with the OTLP config, after guarding the endpoint
+/// the exporter will dial together with the headers it will send.
+#[derive(Debug, PartialEq)]
+enum OtlpPlan {
+    /// Build the exporter. Carries the selected var's raw value, without the
+    /// signal path, for the origin log line only.
+    Export(String),
+    /// Build nothing and trace to stderr. Carries the selected var's name.
+    Skip(&'static str),
+}
+
+/// The plan for the selected endpoint and headers. The pair is selected from the same four raw values
 /// `opentelemetry-otlp` 0.33 reads, by its own rules (`resolve_http_endpoint`,
 /// `read_env_var` and `build_client` in `exporter/`):
 ///
@@ -162,7 +185,7 @@ fn checked_otlp_endpoint(
     traces_endpoint: Option<&str>,
     generic_headers: Option<&str>,
     traces_headers: Option<&str>,
-) -> Result<String, String> {
+) -> Result<OtlpPlan, String> {
     let has_credential = traces_headers
         .or(generic_headers)
         .is_some_and(|h| !h.trim().is_empty());
@@ -186,19 +209,20 @@ fn checked_otlp_endpoint(
     // own parser. `reqwest::Url` would not do: its WHATWG parser strips
     // whitespace and punycodes hosts that `http::Uri` rejects outright, so it
     // would certify a string the exporter refuses. A refused build dials
-    // nothing, but booting would hide that the credential's endpoint is
-    // broken, so a credential makes this fatal. The message never carries the
-    // value: an endpoint may hold a query-string token.
+    // nothing, so refusing boot over it protected nothing and turned a broken
+    // tracing config into an outage. With a credential the exporter is not
+    // built at all rather than left to refuse: if this emulation of its
+    // parse ever drifts, the credential stays unsent instead of reaching an
+    // endpoint the transport check never saw. Without one, the exporter's own
+    // build error reports it, through `log_safe_build_error`.
     if dialled.parse::<axum::http::Uri>().is_err() {
         if has_credential {
-            return Err(format!(
-                "{var} is not a URI the exporter can parse; it would refuse to build"
-            ));
+            return Ok(OtlpPlan::Skip(var));
         }
-        return Ok(endpoint.to_string());
+        return Ok(OtlpPlan::Export(endpoint.to_string()));
     }
     crate::check_credential_transport(var, endpoint, has_credential, crate::Transport::Http)?;
-    Ok(endpoint.to_string())
+    Ok(OtlpPlan::Export(endpoint.to_string()))
 }
 
 /// An exporter build error, minus the value it quotes. `opentelemetry-otlp`
@@ -277,6 +301,7 @@ mod tests {
     // is pinned in `main.rs`. These pin which pair reaches it. Arguments are
     // the four raw env values in the order `init_tracing` reads them; `None`
     // is unset, `Some("")` is set-but-empty.
+    use super::OtlpPlan::{Export, Skip};
     use super::checked_otlp_endpoint as guard;
 
     const BEARER: Option<&str> = Some("Authorization=Bearer token");
@@ -291,7 +316,7 @@ mod tests {
             BEARER,
             BEARER,
         );
-        assert_eq!(ok.as_deref(), Ok("https://active.example.com"));
+        assert_eq!(ok, Ok(Export("https://active.example.com".into())));
         // The mirror image is the leak the guard exists for: the compliant
         // generic is the decoy, the plaintext signal-specific one is dialled.
         let err = guard(
@@ -308,19 +333,16 @@ mod tests {
     fn a_set_signal_specific_endpoint_is_selected_even_when_unparseable() {
         // 0.33's `resolve_http_endpoint` parses a non-empty signal-specific
         // value verbatim and fails the build on error, with no fallback to the
-        // generic one. With a bearer that is refused, naming the var and never
-        // quoting the value; without one, the build fails closed on its own.
+        // generic one. With a bearer the export is skipped under the var's
+        // name; without one, the exporter's build fails closed on its own.
         let secret = " https://collector.example.com/v1/traces?api_key=SECRET ";
-        let err = guard("https://legacy.example.com", Some(secret), BEARER, None).unwrap_err();
-        assert!(err.contains("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"), "{err}");
-        assert!(!err.contains("SECRET"), "{err}");
-        assert!(guard("https://legacy.example.com", Some(secret), None, None).is_ok());
-        // A plaintext generic behind it is not what gets dialled, so it
-        // cannot be the reason for the refusal.
-        assert!(
-            !guard("http://legacy.example.com", Some(secret), BEARER, None)
-                .unwrap_err()
-                .contains("OTEL_EXPORTER_OTLP_ENDPOINT:")
+        assert_eq!(
+            guard("https://legacy.example.com", Some(secret), BEARER, None),
+            Ok(Skip("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"))
+        );
+        assert_eq!(
+            guard("https://legacy.example.com", Some(secret), None, None),
+            Ok(Export(secret.into()))
         );
     }
 
@@ -345,21 +367,29 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_generic_endpoint_is_refused_only_when_a_credential_rides_on_it() {
+    fn unparseable_endpoint_with_a_credential_skips_export_instead_of_refusing_boot() {
         // `build_endpoint_uri` fails on each of these and the exporter refuses
-        // to build. `reqwest::Url` accepts all three (it strips the padding
+        // to build, so nothing is dialled and refusing boot would protect
+        // nothing. `reqwest::Url` accepts all three (it strips the padding
         // and the tab, and tolerates the extra slash), so a guard that parsed
         // with it would certify a string the exporter rejects. With a bearer
-        // attached that is refused; without one it is not this guard's
-        // question, so it cannot drift into a URL validator.
+        // attached the exporter is never built; without one it is not this
+        // guard's question, so it cannot drift into a URL validator.
         for bad in [
             " http://collector:4318 ",
             "https:///collector.example.com",
             "https://collector\t.example.com",
         ] {
-            let err = guard(bad, None, BEARER, None).unwrap_err();
-            assert!(err.contains("refuse to build"), "{bad:?}: {err}");
-            assert!(guard(bad, None, None, None).is_ok(), "{bad:?}");
+            assert_eq!(
+                guard(bad, None, BEARER, None),
+                Ok(Skip("OTEL_EXPORTER_OTLP_ENDPOINT")),
+                "{bad:?}"
+            );
+            assert_eq!(
+                guard(bad, None, None, None),
+                Ok(Export(bad.into())),
+                "{bad:?}"
+            );
         }
     }
 
@@ -367,13 +397,12 @@ mod tests {
     fn exporter_build_errors_are_logged_without_the_endpoint() {
         // The real exporter, not a stand-in: it quotes the endpoint it
         // rejects, so what reaches the log must be the setting name only.
-        use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig};
+        use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 
         let bad = " https://user:PASS@collector.example.com/v1/traces?api_key=SECRET ";
         let Err(e) = SpanExporter::builder()
             .with_http()
             .with_endpoint(bad)
-            .with_http_client(super::otlp_http_client())
             .build()
         else {
             panic!("the exporter accepted an unparseable endpoint");
@@ -394,7 +423,10 @@ mod tests {
         let odd = opentelemetry_otlp::ExporterBuildError::InvalidConfiguration(format!(
             "invalid endpoint '{bad}'"
         ));
-        assert!(!super::log_safe_build_error(&odd).contains("SECRET"));
+        assert_eq!(
+            super::log_safe_build_error(&odd),
+            "invalid exporter configuration in unknown setting"
+        );
     }
 
     #[test]
