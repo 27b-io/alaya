@@ -20,7 +20,10 @@ fn qdrant_url() -> String {
 fn memory(content: &str, memory_type: &str) -> Memory {
     Memory {
         content: content.into(),
-        content_hash: format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(content)),
+        content_hash: <sha2::Sha256 as sha2::Digest>::digest(content)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
         tags: vec![],
         memory_type: memory_type.into(),
         metadata: None,

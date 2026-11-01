@@ -302,7 +302,7 @@ fn record_rpc_span(req: &JsonRpcRequest) -> &'static str {
     let method = known(KNOWN_METHODS, &req.method);
     span.record("mcp.method.name", method);
     if method != "tools/call" {
-        span.record("otel.name", method);
+        rename_span(&span, method);
         return method;
     }
     let tool = req
@@ -312,8 +312,23 @@ fn record_rpc_span(req: &JsonRpcRequest) -> &'static str {
         .and_then(Value::as_str)
         .map_or("unknown", |n| known(TOOL_NAMES, n));
     span.record("gen_ai.tool.name", tool);
-    span.record("otel.name", format!("tools/call {tool}"));
+    rename_span(&span, format!("tools/call {tool}"));
     method
+}
+
+/// Rename the exported OTel span, not only the tracing field: since 0.32,
+/// tracing-opentelemetry starts the OTel span when the tracing span is first
+/// entered, and drops an `otel.name` recorded after that. The request span is
+/// entered by the time a handler runs, so the name goes through the OTel API.
+/// The field is still recorded so the fmt log keeps showing it. A no-op span
+/// (OTLP off) ignores the rename.
+fn rename_span(span: &tracing::Span, name: impl Into<std::borrow::Cow<'static, str>>) {
+    use opentelemetry::trace::TraceContextExt;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    let name = name.into();
+    span.record("otel.name", name.as_ref());
+    span.context().span().update_name(name);
 }
 
 /// Format response as SSE or plain JSON depending on client preference, and

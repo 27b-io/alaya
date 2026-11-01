@@ -31,12 +31,13 @@ const BREAKER_COOLDOWN_SECS: f64 = 30.0;
 /// <10ms; SaaS WAN round-trips hundreds of ms — ops in a batch run
 /// concurrently, so the batch wall clock stays ~this bound either way).
 ///
-/// cachekit-rs sets no fred command timeout (default = wait forever) and
-/// no reconnect policy, so a blackholed connection — e.g. the Redis pod IP
-/// vanishing without an RST — hangs `get`/`set` awaits indefinitely. That
-/// silence never trips the circuit breaker (it only counts errors) and wedged
-/// the whole service for 25h (#63). This timeout converts the hang into a
-/// failure the breaker can act on, degrading to L1-only.
+/// A blackholed connection — e.g. the Redis pod IP vanishing without an RST —
+/// used to hang `get`/`set` awaits indefinitely: cachekit-rs set no fred
+/// command timeout before 0.13. That silence never trips the circuit breaker
+/// (it only counts errors) and wedged the whole service for 25h (#63).
+/// cachekit's own 5s command timeout now bounds a Redis op too, but this
+/// deadline is shorter, also covers the SaaS backend, and converts the hang
+/// into a failure the breaker can act on, degrading to L1-only.
 const L2_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn now_secs() -> f64 {
