@@ -4,13 +4,17 @@
 //! set the function returns `None` and the test prints a skip message and
 //! returns `Ok(())` immediately.
 //!
-//! Each context uses a graph name derived from the process-id plus a random
-//! suffix so parallel test runs don't collide.  Call `ctx.cleanup()` at the
+//! Each context uses a graph name derived from the process-id plus a
+//! per-process counter, so parallel tests (threads in one test binary) and
+//! separate test binaries never share a graph.  Call `ctx.cleanup()` at the
 //! end of every test to delete the ephemeral graph.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde_json::Value;
+
+static NEXT_GRAPH_ID: AtomicU32 = AtomicU32::new(0);
 
 pub struct TestContext {
     pub conn: redis::aio::ConnectionManager,
@@ -30,9 +34,9 @@ impl TestContext {
             }
         };
 
-        // Include a random u32 so multiple tests running in the same process
-        // don't stomp each other's graphs.
-        let suffix: u32 = rand_u32();
+        // Tests in one binary share the pid and run on parallel threads; a
+        // counter (not clock entropy) guarantees each gets its own graph.
+        let suffix = NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed);
         let graph_name = format!("test_{}_{}", std::process::id(), suffix);
 
         let client = redis::Client::open(redis_url.as_str()).expect("Invalid REDIS_URL");
@@ -92,17 +96,4 @@ pub fn build_state(
         // Tests call `exec_query` directly; the auth layer is not on this path.
         auth: alaya_bridge::BridgeAuth::Open,
     }
-}
-
-/// Tiny xorshift pseudo-random — avoids pulling in `rand` as a dev-dep.
-fn rand_u32() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(12345);
-    let mut x = seed ^ (seed << 13);
-    x ^= x >> 17;
-    x ^= x << 5;
-    x
 }
