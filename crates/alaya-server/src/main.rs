@@ -409,7 +409,10 @@ enum Transport {
 /// `Redis` takes only a cluster-local `redis://redis-svc:6379`. The credential
 /// is the API key when one is set, or URL-embedded credentials
 /// (`http://user:secret@host` sent as Basic auth by reqwest,
-/// `redis://user:pw@host` sent as `AUTH` by fred). Classified on the URL as the
+/// `redis://user:pw@host` sent as `AUTH` by fred), or any non-empty query
+/// string (`?api_key=…` rides every request line). The query counts whatever
+/// its parameter names, the same over-count as the OTLP header check: reading
+/// names would miss the ones nobody listed. Classified on the URL as the
 /// `url` crate parses it (lowercased
 /// scheme, real host), so the check and the transport cannot disagree about
 /// where the credential goes. Messages name the host, never the raw value: a
@@ -449,7 +452,8 @@ fn check_credential_transport(
         Err(e) => return Err(format!("{var} is not a valid URL ({e})")),
     };
     let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
-    if !has_api_key && !has_userinfo {
+    let has_query = parsed.query().is_some_and(|q| !q.is_empty());
+    if !has_api_key && !has_userinfo && !has_query {
         return Ok(());
     }
     match (transport, parsed.scheme()) {
@@ -5274,6 +5278,32 @@ mod tests {
                 "{bad} {has_key}: {err}"
             );
         }
+
+        // A query string is a credential too: `?api_key=…` is on every request
+        // line, so it faces the same policy as userinfo, key or no key.
+        for bad in [
+            format!("http://api.anthropic.com/v1/traces?api_key={FAKE_SECRET}"),
+            format!("HTTP://api.anthropic.com?{FAKE_SECRET}"),
+        ] {
+            let err = check_credential_transport("JUDGE_URL", bad.as_str(), false, Transport::Http)
+                .unwrap_err();
+            assert!(
+                err.contains("api.anthropic.com") && !err.contains(FAKE_SECRET),
+                "{bad}: {err}"
+            );
+        }
+        for ok in [
+            format!("https://api.anthropic.com/v1/traces?api_key={FAKE_SECRET}"),
+            format!("http://anthropic-lb:8082/v1/traces?api_key={FAKE_SECRET}"),
+            // An empty query carries nothing.
+            "http://api.anthropic.com/v1/traces?".to_string(),
+        ] {
+            assert!(
+                check_credential_transport("JUDGE_URL", ok.as_str(), false, Transport::Http)
+                    .is_ok(),
+                "{ok}"
+            );
+        }
     }
 
     #[test]
@@ -5321,6 +5351,15 @@ mod tests {
                 "{local}"
             );
         }
+
+        // A query alone holds redis to the cluster-local rule as well.
+        let off_query = format!("redis://redis.cloud.io:6379?token={FAKE_SECRET}");
+        let err = redis("REDIS_CACHE_URL", off_query.as_str(), false).unwrap_err();
+        assert!(
+            err.contains("redis.cloud.io") && !err.contains(FAKE_SECRET),
+            "{off_query}: {err}"
+        );
+        assert!(redis("REDIS_CACHE_URL", "redis://redis-svc:6379?node=a", false).is_ok());
 
         // Non-redis scheme with Redis transport: fred opens plain TCP
         // regardless, so `https` buys no encryption. The refusal must name
