@@ -42,12 +42,12 @@ impl TestContext {
         // counter (not clock entropy) guarantees each gets its own graph.
         // The per-process nonce stops a reused pid (fresh containers, pid
         // wrap) from landing on a graph a panicked earlier run never deleted.
+        // A pre-epoch clock still yields a distinct nonce: its distance from
+        // the epoch.
         let suffix = NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed);
-        let nonce = RUN_NONCE.get_or_init(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock before UNIX epoch")
-                .as_nanos()
+        let nonce = RUN_NONCE.get_or_init(|| match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => d.as_nanos(),
+            Err(e) => e.duration().as_nanos(),
         });
         let graph_name = format!("test_{}_{}_{}", std::process::id(), nonce, suffix);
 
