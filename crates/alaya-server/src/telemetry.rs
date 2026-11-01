@@ -225,10 +225,17 @@ fn log_safe_build_error(e: &opentelemetry_otlp::ExporterBuildError) -> String {
 /// reqwest's async client panics without a tokio reactor, so this is
 /// reqwest::blocking::Client, which works on any thread. No proxy: it dials
 /// the endpoint `checked_otlp_endpoint` certified, never an env proxy.
+///
+/// No redirects either, for the same reason: a redirect's destination is
+/// never certified, and reqwest strips `Authorization` on a cross-origin hop
+/// but not the custom headers `OTEL_EXPORTER_OTLP_HEADERS` may carry (an
+/// `x-api-key`). A 3xx fails that export instead (pinned by
+/// `redirecting_collector_never_forwards_the_credential`).
 #[allow(clippy::disallowed_methods, reason = "sets .no_proxy()")]
 pub(crate) fn otlp_http_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .expect("failed to build blocking reqwest client")
@@ -403,5 +410,110 @@ mod tests {
         // in-cluster path, and the reason `Transport::Http` is the right
         // column: `Redis` would refuse every endpoint the exporter can speak.
         assert!(guard("http://collector:4318", None, BEARER, None).is_ok());
+    }
+
+    use std::sync::{Arc, Mutex};
+
+    /// Lowercase, because reqwest keeps a header value's case.
+    const CANARY: &str = "otlp-redirect-canary";
+
+    /// A loopback HTTP/1.1 server that answers every request with `response`
+    /// and logs each request head, lowercased, before answering — so a client
+    /// that has its response has already been logged.
+    fn http_stub(response: String) -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let seen = log.clone();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut head = String::new();
+                while reader.read_line(&mut head).unwrap_or(0) > 2 {}
+                let head = head.to_ascii_lowercase();
+                let body_len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                let _ = reader.read_exact(&mut vec![0; body_len]);
+                seen.lock().unwrap().push(head);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (base, log)
+    }
+
+    fn reply(status: &str, extra: &str) -> String {
+        format!("HTTP/1.1 {status}\r\n{extra}content-length: 0\r\nconnection: close\r\n\r\n")
+    }
+
+    /// One real span through the production exporter and batch processor,
+    /// carrying a custom credential header, flushed to `endpoint`.
+    fn export_one_span(endpoint: &str, client: reqwest::blocking::Client) {
+        use opentelemetry::trace::{Tracer, TracerProvider};
+        use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig};
+
+        let exporter = SpanExporter::builder()
+            .with_http()
+            .with_endpoint(endpoint)
+            .with_headers([("x-api-key".to_string(), CANARY.to_string())].into())
+            .with_http_client(client)
+            .build()
+            .unwrap();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .build();
+        provider.tracer("redirect-test").in_span("probe", |_| {});
+        // A refused redirect fails the export; only the sockets are asserted.
+        let _ = provider.force_flush();
+        let _ = provider.shutdown();
+    }
+
+    #[test]
+    fn redirecting_collector_never_forwards_the_credential() {
+        let (sink, sink_log) = http_stub(reply("200 OK", ""));
+        let (collector, collector_log) = http_stub(reply(
+            "307 Temporary Redirect",
+            &format!("location: {sink}/stolen\r\n"),
+        ));
+        let (direct, direct_log) = http_stub(reply("200 OK", ""));
+        let carried = |head: &String| head.contains(&format!("x-api-key: {CANARY}"));
+
+        // Control: an export that reaches nothing — no client, no span, no
+        // flush — would pass the sink assertion below for free.
+        export_one_span(&format!("{direct}/v1/traces"), super::otlp_http_client());
+        let direct_log = direct_log.lock().unwrap().clone();
+        assert_eq!(direct_log.len(), 1, "{direct_log:?}");
+        assert!(
+            direct_log[0].starts_with("post /v1/traces "),
+            "{direct_log:?}"
+        );
+        assert!(carried(&direct_log[0]), "{direct_log:?}");
+
+        // The collector was configured, so it may see the key; the origin
+        // its 307 names was not, so it must see nothing at all.
+        export_one_span(&format!("{collector}/v1/traces"), super::otlp_http_client());
+        assert_eq!(collector_log.lock().unwrap().len(), 1);
+        assert!(carried(&collector_log.lock().unwrap()[0]));
+        assert!(sink_log.lock().unwrap().is_empty(), "redirect followed");
+
+        // Control: reqwest's default policy follows the same 307 and forwards
+        // the key, so the stub would catch a client that regressed to it.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "test-only control: reqwest's default redirect policy"
+        )]
+        let following = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        export_one_span(&format!("{collector}/v1/traces"), following);
+        let sink_log = sink_log.lock().unwrap().clone();
+        assert_eq!(sink_log.len(), 1, "{sink_log:?}");
+        assert!(sink_log[0].starts_with("post /stolen "), "{sink_log:?}");
+        assert!(carried(&sink_log[0]), "{sink_log:?}");
     }
 }
