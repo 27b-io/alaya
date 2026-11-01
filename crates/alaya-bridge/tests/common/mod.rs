@@ -4,17 +4,21 @@
 //! set the function returns `None` and the test prints a skip message and
 //! returns `Ok(())` immediately.
 //!
-//! Each context uses a graph name derived from the process-id plus a
-//! per-process counter, so parallel tests (threads in one test binary) and
-//! separate test binaries never share a graph.  Call `ctx.cleanup()` at the
+//! Each context uses a graph name derived from the process-id, a per-process
+//! start-time nonce and a per-process counter, so parallel tests (threads in
+//! one test binary), separate test binaries and later runs that reuse a pid
+//! never share a graph.  Call `ctx.cleanup()` at the
 //! end of every test to delete the ephemeral graph.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
 static NEXT_GRAPH_ID: AtomicU32 = AtomicU32::new(0);
+static RUN_NONCE: OnceLock<u128> = OnceLock::new();
 
 pub struct TestContext {
     pub conn: redis::aio::ConnectionManager,
@@ -36,8 +40,16 @@ impl TestContext {
 
         // Tests in one binary share the pid and run on parallel threads; a
         // counter (not clock entropy) guarantees each gets its own graph.
+        // The per-process nonce stops a reused pid (fresh containers, pid
+        // wrap) from landing on a graph a panicked earlier run never deleted.
         let suffix = NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed);
-        let graph_name = format!("test_{}_{}", std::process::id(), suffix);
+        let nonce = RUN_NONCE.get_or_init(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before UNIX epoch")
+                .as_nanos()
+        });
+        let graph_name = format!("test_{}_{}_{}", std::process::id(), nonce, suffix);
 
         let client = redis::Client::open(redis_url.as_str()).expect("Invalid REDIS_URL");
         let conn = alaya_bridge::connect(&client, alaya_bridge::query_config(), "test")
