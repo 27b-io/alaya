@@ -103,7 +103,8 @@ pub async fn exec_query(
 /// happens to contain "empty key" must never be swallowed as an empty graph —
 /// then substring-match the distinctive "empty key". (LAB-373)
 fn is_empty_graph_error(err: &redis::RedisError) -> bool {
-    err.kind() == redis::ErrorKind::ResponseError && err.to_string().contains("empty key")
+    err.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::ResponseError)
+        && err.to_string().contains("empty key")
 }
 
 // ─── Cypher literal serialization ────────────────────────────────────────────
@@ -185,7 +186,7 @@ mod tests {
         // LAB-373). redis-rs parses the `ERR` prefix as a ResponseError whose
         // detail carries the message — verified live against falkordb:v4.18.6.
         let err = redis::RedisError::from((
-            redis::ErrorKind::ResponseError,
+            redis::ErrorKind::Server(redis::ServerErrorKind::ResponseError),
             "response error",
             "Invalid graph operation on empty key".to_string(),
         ));
@@ -196,13 +197,13 @@ mod tests {
     fn genuine_errors_not_treated_as_empty_graph() {
         // A real query failure must still surface, not be swallowed as empty.
         let syntax = redis::RedisError::from((
-            redis::ErrorKind::ResponseError,
+            redis::ErrorKind::Server(redis::ServerErrorKind::ResponseError),
             "response error",
             "errMsg: Invalid input 'X': expected a query".to_string(),
         ));
         assert!(!is_empty_graph_error(&syntax));
 
-        let io = redis::RedisError::from((redis::ErrorKind::IoError, "connection reset by peer"));
+        let io = redis::RedisError::from((redis::ErrorKind::Io, "connection reset by peer"));
         assert!(!is_empty_graph_error(&io));
     }
 
@@ -212,7 +213,7 @@ mod tests {
         // non-response error whose message happens to contain "empty key"
         // (e.g. an I/O failure surfaced mid-read) must still propagate.
         let io = redis::RedisError::from((
-            redis::ErrorKind::IoError,
+            redis::ErrorKind::Io,
             "io error",
             "stream closed while reading empty key".to_string(),
         ));
