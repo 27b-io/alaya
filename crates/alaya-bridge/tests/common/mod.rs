@@ -4,13 +4,21 @@
 //! set the function returns `None` and the test prints a skip message and
 //! returns `Ok(())` immediately.
 //!
-//! Each context uses a graph name derived from the process-id plus a random
-//! suffix so parallel test runs don't collide.  Call `ctx.cleanup()` at the
+//! Each context uses a graph name derived from the process-id, a per-process
+//! start-time nonce and a per-process counter, so parallel tests (threads in
+//! one test binary), separate test binaries and later runs that reuse a pid
+//! never share a graph.  Call `ctx.cleanup()` at the
 //! end of every test to delete the ephemeral graph.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+
+static NEXT_GRAPH_ID: AtomicU32 = AtomicU32::new(0);
+static RUN_NONCE: OnceLock<u128> = OnceLock::new();
 
 pub struct TestContext {
     pub conn: redis::aio::ConnectionManager,
@@ -30,10 +38,18 @@ impl TestContext {
             }
         };
 
-        // Include a random u32 so multiple tests running in the same process
-        // don't stomp each other's graphs.
-        let suffix: u32 = rand_u32();
-        let graph_name = format!("test_{}_{}", std::process::id(), suffix);
+        // Tests in one binary share the pid and run on parallel threads; a
+        // counter (not clock entropy) guarantees each gets its own graph.
+        // The per-process nonce stops a reused pid (fresh containers, pid
+        // wrap) from landing on a graph a panicked earlier run never deleted.
+        // A pre-epoch clock still yields a distinct nonce: its distance from
+        // the epoch.
+        let suffix = NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed);
+        let nonce = RUN_NONCE.get_or_init(|| match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => d.as_nanos(),
+            Err(e) => e.duration().as_nanos(),
+        });
+        let graph_name = format!("test_{}_{}_{}", std::process::id(), nonce, suffix);
 
         let client = redis::Client::open(redis_url.as_str()).expect("Invalid REDIS_URL");
         let conn = alaya_bridge::connect(&client, alaya_bridge::query_config(), "test")
@@ -92,17 +108,4 @@ pub fn build_state(
         // Tests call `exec_query` directly; the auth layer is not on this path.
         auth: alaya_bridge::BridgeAuth::Open,
     }
-}
-
-/// Tiny xorshift pseudo-random — avoids pulling in `rand` as a dev-dep.
-fn rand_u32() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(12345);
-    let mut x = seed ^ (seed << 13);
-    x ^= x >> 17;
-    x ^= x << 5;
-    x
 }
