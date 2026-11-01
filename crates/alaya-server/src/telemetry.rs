@@ -66,8 +66,9 @@ where
 /// - `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `_HEADERS`: the signal-specific
 ///   twins, which take precedence over the pair above.
 ///
-/// Panics when `checked_otlp_endpoint` refuses — see it for which pair is
-/// checked and why.
+/// Panics when `checked_otlp_endpoint` refuses a parseable endpoint the
+/// credential would cross in plaintext — see it for which pair is checked and
+/// why. An endpoint that does not parse never stops boot.
 pub fn init_tracing() {
     // The generic var is the on-switch for the whole arm, so a
     // signal-specific-only config exports nothing at all (and leaks nothing).
@@ -79,7 +80,7 @@ pub fn init_tracing() {
     {
         // Checked before the exporter is built, so a refusal means the process
         // never starts rather than starting and posting the token.
-        let endpoint = checked_otlp_endpoint(
+        let endpoint = match checked_otlp_endpoint(
             &generic_endpoint,
             std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
                 .ok()
@@ -88,8 +89,17 @@ pub fn init_tracing() {
             std::env::var("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
                 .ok()
                 .as_deref(),
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
+        ) {
+            Ok(OtlpPlan::Export(endpoint)) => endpoint,
+            Ok(OtlpPlan::Skip(var)) => {
+                tracing_subscriber::registry().with(console_layer()).init();
+                tracing::warn!(
+                    "{var} is not a URI the OTLP exporter can parse; export skipped, tracing to stderr only"
+                );
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        };
 
         let service_name =
             std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "alaya-server".to_string());
@@ -151,8 +161,18 @@ pub fn init_tracing() {
     }
 }
 
-/// The endpoint the exporter will dial, after guarding it together with the
-/// headers it will send. The pair is selected from the same four raw values
+/// What `init_tracing` does with the OTLP config, after guarding the endpoint
+/// the exporter will dial together with the headers it will send.
+#[derive(Debug, PartialEq)]
+enum OtlpPlan {
+    /// Build the exporter. Carries the selected var's raw value, without the
+    /// signal path, for the origin log line only.
+    Export(String),
+    /// Build nothing and trace to stderr. Carries the selected var's name.
+    Skip(&'static str),
+}
+
+/// The plan for the selected endpoint and headers. The pair is selected from the same four raw values
 /// `opentelemetry-otlp` 0.33 reads, by its own rules (`resolve_http_endpoint`,
 /// `read_env_var` and `build_client` in `exporter/`):
 ///
@@ -181,7 +201,7 @@ fn checked_otlp_endpoint(
     traces_endpoint: Option<&str>,
     generic_headers: Option<&str>,
     traces_headers: Option<&str>,
-) -> Result<String, String> {
+) -> Result<OtlpPlan, String> {
     let has_credential = traces_headers
         .or(generic_headers)
         .is_some_and(|h| !h.trim().is_empty());
@@ -205,19 +225,20 @@ fn checked_otlp_endpoint(
     // own parser. `reqwest::Url` would not do: its WHATWG parser strips
     // whitespace and punycodes hosts that `http::Uri` rejects outright, so it
     // would certify a string the exporter refuses. A refused build dials
-    // nothing, but booting would hide that the credential's endpoint is
-    // broken, so a credential makes this fatal. The message never carries the
-    // value: an endpoint may hold a query-string token.
+    // nothing, so refusing boot over it protected nothing and turned a broken
+    // tracing config into an outage. With a credential the exporter is not
+    // built at all rather than left to refuse: if this emulation of its
+    // parse ever drifts, the credential stays unsent instead of reaching an
+    // endpoint the transport check never saw. Without one, the exporter's own
+    // build error reports it, through `log_safe_build_error`.
     if dialled.parse::<axum::http::Uri>().is_err() {
         if has_credential {
-            return Err(format!(
-                "{var} is not a URI the exporter can parse; it would refuse to build"
-            ));
+            return Ok(OtlpPlan::Skip(var));
         }
-        return Ok(endpoint.to_string());
+        return Ok(OtlpPlan::Export(endpoint.to_string()));
     }
     crate::check_credential_transport(var, endpoint, has_credential, crate::Transport::Http)?;
-    Ok(endpoint.to_string())
+    Ok(OtlpPlan::Export(endpoint.to_string()))
 }
 
 /// An exporter build error, minus the value it quotes. `opentelemetry-otlp`
@@ -244,10 +265,17 @@ fn log_safe_build_error(e: &opentelemetry_otlp::ExporterBuildError) -> String {
 /// reqwest's async client panics without a tokio reactor, so this is
 /// reqwest::blocking::Client, which works on any thread. No proxy: it dials
 /// the endpoint `checked_otlp_endpoint` certified, never an env proxy.
+///
+/// No redirects either, for the same reason: a redirect's destination is
+/// never certified, and reqwest strips `Authorization` on a cross-origin hop
+/// but not the custom headers `OTEL_EXPORTER_OTLP_HEADERS` may carry (an
+/// `x-api-key`). A 3xx fails that export instead (pinned by
+/// `redirecting_collector_never_forwards_the_credential`).
 #[allow(clippy::disallowed_methods, reason = "sets .no_proxy()")]
 pub(crate) fn otlp_http_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .expect("failed to build blocking reqwest client")
@@ -282,8 +310,9 @@ mod tests {
     /// a client, it does not dial), and substituting the async
     /// `reqwest::Client` leaves this test green, because a missing reactor
     /// panics at first export on the batch thread rather than at
-    /// construction. Reaching that needs a live span flushed to a real
-    /// endpoint, which is not a unit test's job.
+    /// construction. `redirecting_collector_never_forwards_the_credential`
+    /// is the test that flushes a live span through `otlp_http_client` on the
+    /// batch thread, off any runtime.
     #[test]
     fn installs_without_a_tokio_runtime() {
         assert!(tokio::runtime::Handle::try_current().is_err());
@@ -296,6 +325,7 @@ mod tests {
     // is pinned in `main.rs`. These pin which pair reaches it. Arguments are
     // the four raw env values in the order `init_tracing` reads them; `None`
     // is unset, `Some("")` is set-but-empty.
+    use super::OtlpPlan::{Export, Skip};
     use super::checked_otlp_endpoint as guard;
 
     const BEARER: Option<&str> = Some("Authorization=Bearer token");
@@ -310,7 +340,7 @@ mod tests {
             BEARER,
             BEARER,
         );
-        assert_eq!(ok.as_deref(), Ok("https://active.example.com"));
+        assert_eq!(ok, Ok(Export("https://active.example.com".into())));
         // The mirror image is the leak the guard exists for: the compliant
         // generic is the decoy, the plaintext signal-specific one is dialled.
         let err = guard(
@@ -327,19 +357,16 @@ mod tests {
     fn a_set_signal_specific_endpoint_is_selected_even_when_unparseable() {
         // 0.33's `resolve_http_endpoint` parses a non-empty signal-specific
         // value verbatim and fails the build on error, with no fallback to the
-        // generic one. With a bearer that is refused, naming the var and never
-        // quoting the value; without one, the build fails closed on its own.
+        // generic one. With a bearer the export is skipped under the var's
+        // name; without one, the exporter's build fails closed on its own.
         let secret = " https://collector.example.com/v1/traces?api_key=SECRET ";
-        let err = guard("https://legacy.example.com", Some(secret), BEARER, None).unwrap_err();
-        assert!(err.contains("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"), "{err}");
-        assert!(!err.contains("SECRET"), "{err}");
-        assert!(guard("https://legacy.example.com", Some(secret), None, None).is_ok());
-        // A plaintext generic behind it is not what gets dialled, so it
-        // cannot be the reason for the refusal.
-        assert!(
-            !guard("http://legacy.example.com", Some(secret), BEARER, None)
-                .unwrap_err()
-                .contains("OTEL_EXPORTER_OTLP_ENDPOINT:")
+        assert_eq!(
+            guard("https://legacy.example.com", Some(secret), BEARER, None),
+            Ok(Skip("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"))
+        );
+        assert_eq!(
+            guard("https://legacy.example.com", Some(secret), None, None),
+            Ok(Export(secret.into()))
         );
     }
 
@@ -364,21 +391,29 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_generic_endpoint_is_refused_only_when_a_credential_rides_on_it() {
+    fn unparseable_endpoint_with_a_credential_skips_export_instead_of_refusing_boot() {
         // `build_endpoint_uri` fails on each of these and the exporter refuses
-        // to build. `reqwest::Url` accepts all three (it strips the padding
+        // to build, so nothing is dialled and refusing boot would protect
+        // nothing. `reqwest::Url` accepts all three (it strips the padding
         // and the tab, and tolerates the extra slash), so a guard that parsed
         // with it would certify a string the exporter rejects. With a bearer
-        // attached that is refused; without one it is not this guard's
-        // question, so it cannot drift into a URL validator.
+        // attached the exporter is never built; without one it is not this
+        // guard's question, so it cannot drift into a URL validator.
         for bad in [
             " http://collector:4318 ",
             "https:///collector.example.com",
             "https://collector\t.example.com",
         ] {
-            let err = guard(bad, None, BEARER, None).unwrap_err();
-            assert!(err.contains("refuse to build"), "{bad:?}: {err}");
-            assert!(guard(bad, None, None, None).is_ok(), "{bad:?}");
+            assert_eq!(
+                guard(bad, None, BEARER, None),
+                Ok(Skip("OTEL_EXPORTER_OTLP_ENDPOINT")),
+                "{bad:?}"
+            );
+            assert_eq!(
+                guard(bad, None, None, None),
+                Ok(Export(bad.into())),
+                "{bad:?}"
+            );
         }
     }
 
@@ -386,13 +421,12 @@ mod tests {
     fn exporter_build_errors_are_logged_without_the_endpoint() {
         // The real exporter, not a stand-in: it quotes the endpoint it
         // rejects, so what reaches the log must be the setting name only.
-        use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig};
+        use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 
         let bad = " https://user:PASS@collector.example.com/v1/traces?api_key=SECRET ";
         let Err(e) = SpanExporter::builder()
             .with_http()
             .with_endpoint(bad)
-            .with_http_client(super::otlp_http_client())
             .build()
         else {
             panic!("the exporter accepted an unparseable endpoint");
@@ -413,7 +447,10 @@ mod tests {
         let odd = opentelemetry_otlp::ExporterBuildError::InvalidConfiguration(format!(
             "invalid endpoint '{bad}'"
         ));
-        assert!(!super::log_safe_build_error(&odd).contains("SECRET"));
+        assert_eq!(
+            super::log_safe_build_error(&odd),
+            "invalid exporter configuration in unknown setting"
+        );
     }
 
     #[test]
@@ -425,6 +462,10 @@ mod tests {
     }
 
     use std::sync::{Arc, Mutex};
+
+    /// Lowercase: `http_stub` lowercases the head it logs, so a mixed-case
+    /// needle would never match.
+    const CANARY: &str = "otlp-redirect-canary";
 
     /// A loopback HTTP/1.1 server that answers every request with `response`
     /// and logs each request head, lowercased, before answering — so a client
@@ -565,5 +606,75 @@ mod tests {
                 "{head}"
             );
         }
+    }
+
+    /// The one request `log` holds, which must carry the credential.
+    fn only_request(log: &Mutex<Vec<String>>) -> String {
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert!(log[0].contains(&format!("x-api-key: {CANARY}")), "{log:?}");
+        log[0].clone()
+    }
+
+    /// One real span through the production exporter and batch processor,
+    /// carrying a custom credential header, flushed to `endpoint`. Returns
+    /// the export's result; dropping the provider shuts it down.
+    fn export_one_span(
+        endpoint: &str,
+        client: reqwest::blocking::Client,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        use opentelemetry::trace::{Tracer, TracerProvider};
+        use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig};
+
+        let exporter = SpanExporter::builder()
+            .with_http()
+            .with_endpoint(endpoint)
+            .with_headers([("x-api-key".to_string(), CANARY.to_string())].into())
+            .with_http_client(client)
+            .build()
+            .unwrap();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .build();
+        provider.tracer("redirect-test").in_span("probe", |_| {});
+        provider.force_flush()
+    }
+
+    #[test]
+    fn redirecting_collector_never_forwards_the_credential() {
+        let (sink, sink_log) = http_stub(reply("200 OK", ""));
+        let (collector, collector_log) = http_stub(reply(
+            "307 Temporary Redirect",
+            &format!("location: {sink}/stolen\r\n"),
+        ));
+        let (direct, direct_log) = http_stub(reply("200 OK", ""));
+
+        // Control: an export that reaches nothing — no client, no span, no
+        // flush — would pass the sink assertion below for free.
+        let direct_export =
+            export_one_span(&format!("{direct}/v1/traces"), super::otlp_http_client());
+        assert!(direct_export.is_ok(), "{direct_export:?}");
+        assert!(only_request(&direct_log).starts_with("post /v1/traces "));
+
+        // The collector was configured, so it may see the key; the origin
+        // its 307 names was not, so it must see nothing, and the export fails.
+        let redirected =
+            export_one_span(&format!("{collector}/v1/traces"), super::otlp_http_client());
+        assert!(redirected.is_err(), "a 3xx counted as exported");
+        only_request(&collector_log);
+        assert!(sink_log.lock().unwrap().is_empty(), "redirect followed");
+
+        // Control: reqwest's default policy follows the same 307 and forwards
+        // the key, so the stub would catch a client that regressed to it.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "test-only control: reqwest's default redirect policy"
+        )]
+        let following = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let _ = export_one_span(&format!("{collector}/v1/traces"), following);
+        assert!(only_request(&sink_log).starts_with("post /stolen "));
     }
 }
