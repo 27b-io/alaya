@@ -20,7 +20,7 @@ tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 async-trait = { workspace = true }
-reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
+reqwest = { workspace = true, features = ["blocking", "rustls"] }
 mini-moka = { workspace = true }
 cachekit-rs = { workspace = true }
 futures = { workspace = true }
@@ -28,10 +28,10 @@ futures = { workspace = true }
 subtle = { workspace = true }
 
 # OpenTelemetry (optional — enabled when OTEL_ENDPOINT is set)
-opentelemetry = "0.29"
-opentelemetry_sdk = { version = "0.29", features = ["rt-tokio-current-thread"] }
-opentelemetry-otlp = { version = "0.29", default-features = false, features = ["http-proto", "reqwest-client", "trace"] }
-tracing-opentelemetry = "0.30"
+opentelemetry = "0.33"
+opentelemetry_sdk = "0.33"
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }
+tracing-opentelemetry = "0.34"
 
 [dev-dependencies]
 # Pre-seed the JWKS cache so `oidc`, `auth` and `wellknown` tests verify real
