@@ -505,8 +505,9 @@ async fn init_l2_redis(
     // not have finished installing network rules yet, causing ECONNREFUSED.
     // Each attempt is deadline-bounded (#63). fred 9.4 bounds the dial with
     // its 10s `connection_timeout` and the AUTH/HELLO setup after it with its
-    // separate 10s `internal_command_timeout`, so a blackholed target holds
-    // one attempt for up to 20s. This deadline caps the whole attempt at 10s.
+    // separate 10s `internal_command_timeout`, so a target that accepts the
+    // connection but never answers holds one attempt for up to 20s. This
+    // deadline caps the whole attempt at 10s.
     let mut last_err: Option<String> = None;
     for attempt in 0..L2_MAX_ATTEMPTS {
         let connected = tokio::time::timeout(

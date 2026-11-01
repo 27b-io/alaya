@@ -66,9 +66,9 @@ where
 /// - `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `_HEADERS`: the signal-specific
 ///   twins, which take precedence over the pair above.
 ///
-/// Panics when `checked_otlp_endpoint` refuses a parseable endpoint the
-/// credential would cross in plaintext — see it for which pair is checked and
-/// why. An endpoint that does not parse never stops boot.
+/// Panics whenever `check_credential_transport` refuses the selected endpoint
+/// — see `checked_otlp_endpoint` for which pair is checked and why. An
+/// endpoint `http::Uri` cannot parse never stops boot.
 pub fn init_tracing() {
     // The generic var is the on-switch for the whole arm, so a
     // signal-specific-only config exports nothing at all (and leaks nothing).
@@ -165,14 +165,14 @@ pub fn init_tracing() {
 /// the exporter will dial together with the headers it will send.
 #[derive(Debug, PartialEq)]
 enum OtlpPlan {
-    /// Build the exporter. Carries the selected var's raw value, without the
-    /// signal path, for the origin log line only.
+    /// Build the exporter. Carries the selected var's raw value as set (the
+    /// guard's appended signal path excluded), for the origin log line only.
     Export(String),
     /// Build nothing and trace to stderr. Carries the selected var's name.
     Skip(&'static str),
 }
 
-/// The plan for the selected endpoint and headers. The pair is selected from the same four raw values
+/// The endpoint and header pair is selected from the same four raw values
 /// `opentelemetry-otlp` 0.33 reads, by its own rules (`resolve_http_endpoint`,
 /// `read_env_var` and `build_client` in `exporter/`):
 ///
@@ -225,9 +225,8 @@ fn checked_otlp_endpoint(
     // own parser. `reqwest::Url` would not do: its WHATWG parser strips
     // whitespace and punycodes hosts that `http::Uri` rejects outright, so it
     // would certify a string the exporter refuses. A refused build dials
-    // nothing, so refusing boot over it protected nothing and turned a broken
-    // tracing config into an outage. With a credential the exporter is not
-    // built at all rather than left to refuse: if this emulation of its
+    // nothing, so this never refuses boot. With a credential the exporter is
+    // not built at all rather than left to refuse: if this emulation of its
     // parse ever drifts, the credential stays unsent instead of reaching an
     // endpoint the transport check never saw. Without one, the exporter's own
     // build error reports it, through `log_safe_build_error`.
@@ -667,7 +666,7 @@ mod tests {
         assert!(direct_export.is_ok(), "{direct_export:?}");
         assert!(only_request(&direct_log).starts_with("post /v1/traces "));
 
-        // The collector was configured, so it may see the key; the origin
+        // The collector was configured, so it must see the key; the origin
         // its 307 names was not, so it must see nothing, and the export fails.
         let redirected =
             export_one_span(&format!("{collector}/v1/traces"), super::otlp_http_client());
@@ -685,7 +684,8 @@ mod tests {
             .no_proxy()
             .build()
             .unwrap();
-        let _ = export_one_span(&format!("{collector}/v1/traces"), following);
+        let followed = export_one_span(&format!("{collector}/v1/traces"), following);
+        assert!(followed.is_ok(), "{followed:?}");
         assert!(only_request(&sink_log).starts_with("post /stolen "));
     }
 }
