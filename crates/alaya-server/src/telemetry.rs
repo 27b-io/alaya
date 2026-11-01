@@ -3,8 +3,9 @@
 //! If `OTEL_EXPORTER_OTLP_ENDPOINT` is set, configures OTLP HTTP exporter.
 //! If not set, tracing goes to stderr only.
 //!
-//! The filter is global, so the OTLP exporter sees exactly the spans the
-//! console does.
+//! Both layers filter on `RUST_LOG`, so the OTLP exporter sees exactly the
+//! spans the console does. The console alone also logs the SDK's own warnings
+//! (`console_layer`).
 
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_otlp::{SpanExporter, WithHttpConfig};
@@ -13,7 +14,13 @@ use opentelemetry_sdk::{
     trace::{Sampler, SdkTracerProvider},
 };
 use std::sync::OnceLock;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{
+    EnvFilter, Layer,
+    filter::{FilterExt, Targets},
+    layer::SubscriberExt,
+    registry::LookupSpan,
+    util::SubscriberInitExt,
+};
 
 /// Global tracer provider — stored here so `shutdown_tracing()` can flush it.
 static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
@@ -23,6 +30,30 @@ static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 /// `tower_http=info` governs only tower-http's own events.
 pub(crate) const DEFAULT_FILTER: &str =
     "alaya_server=info,alaya_core=info,alaya_backends=info,tower_http=info";
+
+/// `RUST_LOG`, or `DEFAULT_FILTER` when it is unset or does not parse.
+fn env_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER))
+}
+
+/// The console: `RUST_LOG`, plus `opentelemetry_sdk` at warn whatever it says.
+/// The SDK reports a failed span export (`BatchSpanProcessor.ExportError`,
+/// carrying the status code or "network error", never the URL or a header)
+/// and dropped spans only as events on that target, and neither the deployed
+/// nor the documented `RUST_LOG` names it, so without this floor a collector
+/// that is down or refuses every batch loses them all in silence. A union, so
+/// a `RUST_LOG` asking for more of the SDK still gets it. Console only: the
+/// OTLP layer filters on `RUST_LOG` alone, so a failure report never reaches
+/// the exporter it is about.
+fn console_layer<S>() -> impl Layer<S>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    let sdk_warnings = Targets::new().with_target("opentelemetry_sdk", tracing::Level::WARN);
+    tracing_subscriber::fmt::layer()
+        .with_target(true)
+        .with_filter(env_filter().or(sdk_warnings))
+}
 
 /// Initialize tracing with optional OTLP export.
 ///
@@ -38,11 +69,6 @@ pub(crate) const DEFAULT_FILTER: &str =
 /// Panics when `checked_otlp_endpoint` refuses — see it for which pair is
 /// checked and why.
 pub fn init_tracing() {
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_FILTER));
-
-    let fmt_layer = tracing_subscriber::fmt::layer().with_target(true);
-
     // The generic var is the on-switch for the whole arm, so a
     // signal-specific-only config exports nothing at all (and leaks nothing).
     // Raw, not trimmed, from here on: `opentelemetry-otlp` reads these with
@@ -88,10 +114,7 @@ pub fn init_tracing() {
         {
             Ok(e) => e,
             Err(e) => {
-                tracing_subscriber::registry()
-                    .with(env_filter)
-                    .with(fmt_layer)
-                    .init();
+                tracing_subscriber::registry().with(console_layer()).init();
                 tracing::warn!(
                     "OTLP exporter failed ({}), tracing to stderr only",
                     log_safe_build_error(&e)
@@ -110,9 +133,8 @@ pub fn init_tracing() {
         let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
         tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer)
-            .with(otel_layer)
+            .with(console_layer())
+            .with(otel_layer.with_filter(env_filter()))
             .init();
 
         // Store provider so shutdown can flush buffered spans
@@ -125,10 +147,7 @@ pub fn init_tracing() {
             crate::log_safe_origin(&endpoint)
         );
     } else {
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer)
-            .init();
+        tracing_subscriber::registry().with(console_layer()).init();
     }
 }
 
@@ -403,5 +422,139 @@ mod tests {
         // in-cluster path, and the reason `Transport::Http` is the right
         // column: `Redis` would refuse every endpoint the exporter can speak.
         assert!(guard("http://collector:4318", None, BEARER, None).is_ok());
+    }
+
+    use std::sync::{Arc, Mutex};
+
+    /// A loopback HTTP/1.1 server that answers every request with `response`
+    /// and logs each request head, lowercased, before answering — so a client
+    /// that has its response has already been logged.
+    fn http_stub(response: String) -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let seen = log.clone();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut head = String::new();
+                while reader.read_line(&mut head).unwrap_or(0) > 2 {}
+                let head = head.to_ascii_lowercase();
+                let body_len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                let _ = reader.read_exact(&mut vec![0; body_len]);
+                seen.lock().unwrap().push(head);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (base, log)
+    }
+
+    fn reply(status: &str, extra: &str) -> String {
+        format!("HTTP/1.1 {status}\r\n{extra}content-length: 0\r\nconnection: close\r\n\r\n")
+    }
+
+    /// Set only by `a_failed_export_reaches_the_console`, in the child it
+    /// spawns; unset, `export_failure_child` does nothing.
+    const EXPORT_FAILURE_CHILD: &str = "ALAYA_TEST_EXPORT_FAILURE_CHILD";
+
+    /// Lowercase: `http_stub` lowercases the head it logs.
+    const EXPORT_CANARY: &str = "otlp-export-canary";
+
+    /// The production boot path in a process of its own: `init_tracing`
+    /// installs the process-global subscriber, and the batch processor reports
+    /// a failed export on its worker thread, which sees only that global — a
+    /// thread-scoped capture (`testlog`) never receives it.
+    #[test]
+    fn export_failure_child() {
+        if std::env::var_os(EXPORT_FAILURE_CHILD).is_none() {
+            return;
+        }
+        super::init_tracing();
+        tracing::info_span!("export_probe").in_scope(|| {});
+        let provider = super::TRACER_PROVIDER
+            .get()
+            .expect("the OTLP arm was not taken");
+        assert!(
+            provider.force_flush().is_err(),
+            "the collector's 401 counted as exported"
+        );
+        // A failure report that reached the exporter would be a new span to
+        // export, and fail again: an export loop.
+        let again = provider.force_flush();
+        assert!(
+            again.is_ok(),
+            "the failure report was itself exported: {again:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_export_reaches_the_console() {
+        let (base, log) = http_stub(reply("401 Unauthorized", ""));
+        let authority = base.strip_prefix("http://").unwrap();
+        let (_crate, module) = module_path!().split_once("::").unwrap();
+        // The deployed `RUST_LOG` and the documented one, set as an operator
+        // would: neither names `opentelemetry_sdk`.
+        for filter in [super::DEFAULT_FILTER, "alaya_server=info"] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    &format!("{module}::export_failure_child"),
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(EXPORT_FAILURE_CHILD, "1")
+                .env("RUST_LOG", filter)
+                .env("NO_COLOR", "1")
+                .env("OTEL_EXPORTER_OTLP_ENDPOINT", &base)
+                .env(
+                    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                    format!(
+                        "http://user:{EXPORT_CANARY}@{authority}/v1/traces?key={EXPORT_CANARY}"
+                    ),
+                )
+                .env(
+                    "OTEL_EXPORTER_OTLP_HEADERS",
+                    format!("x-api-key={EXPORT_CANARY}"),
+                )
+                .env_remove("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+                .output()
+                .unwrap();
+            let console = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "{filter}: {console}");
+            let report = console
+                .lines()
+                .find(|l| l.contains("BatchSpanProcessor.ExportError"))
+                .unwrap_or_else(|| {
+                    panic!("{filter}: no export failure on the console:\n{console}")
+                });
+            assert!(report.contains("401"), "{filter}: {report}");
+            assert!(
+                !console.to_ascii_lowercase().contains(EXPORT_CANARY),
+                "{filter}: {console}"
+            );
+        }
+        // Control: the canary was really dialled, in the query and a header,
+        // so its absence above is the console withholding it.
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 2, "{log:?}");
+        for head in log.iter() {
+            assert!(
+                head.starts_with(&format!("post /v1/traces?key={EXPORT_CANARY} ")),
+                "{head}"
+            );
+            assert!(
+                head.contains(&format!("x-api-key: {EXPORT_CANARY}")),
+                "{head}"
+            );
+        }
     }
 }

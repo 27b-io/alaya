@@ -175,9 +175,9 @@ If your `RUST_LOG` is `my_crate=info` and you have `#[tracing::instrument]` on m
 RUST_LOG=my_crate=info,my_lib=info,tower_http=info
 ```
 
-To see OTLP internal errors (normally invisible):
+A failed export is reported only as an event on target `opentelemetry_sdk` (`BatchSpanProcessor.ExportError`), on the batch processor's thread, so a `RUST_LOG` that does not name that target drops every one. alaya-server's console layer adds `opentelemetry_sdk=warn` on top of whatever `RUST_LOG` says, and its OTLP layer does not (`console_layer` in `crates/alaya-server/src/telemetry.rs`), so a 401, a 5xx or an unreachable collector logs one ERROR line per failed batch with no setting. The line carries the status code or "network error", never the URL. For the SDK's debug detail on top:
 ```bash
-RUST_LOG=my_crate=info,opentelemetry=debug,opentelemetry_sdk=debug
+RUST_LOG=my_crate=info,opentelemetry_sdk=debug
 ```
 
 ## Cross-Thread Span Propagation
@@ -370,5 +370,5 @@ If traces don't show up:
 4. **Check RUST_LOG** — does it include every crate with `#[instrument]`?
 5. **Check TraceLayer level** — `DefaultMakeSpan` defaults to DEBUG, which gets filtered by `tower_http=info`
 6. **Check cross-thread** — are you using `parent: &span` for cross-thread? Contextual lookup doesn't work
-7. **Add `opentelemetry=debug,opentelemetry_sdk=debug`** to RUST_LOG to see export errors
+7. **Check for export errors** — `kubectl logs | grep BatchSpanProcessor.ExportError` (logged whatever `RUST_LOG` says); add `opentelemetry_sdk=debug` to RUST_LOG for more
 8. **Test from local** — `cargo run --release` with OTEL env vars, query BetterStack directly
