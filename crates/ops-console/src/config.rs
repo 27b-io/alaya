@@ -367,7 +367,8 @@ fn is_cluster_local(url: &url::Url) -> bool {
 /// LB_URL x-api-key, METRICS_URL): https anywhere, plain http only
 /// cluster-local — otherwise refuse startup. Deliberately STRICTER than
 /// alaya-server's `check_credential_transport`, which still returns early
-/// for a keyless URL: the two gates agree on every keyed URL and diverge
+/// for a URL with no key, userinfo or query: the two gates agree on every
+/// URL that carries a credential and diverge
 /// only here, on purpose.
 ///
 /// METRICS_URL is in scope despite carrying no key. A credential is not the
