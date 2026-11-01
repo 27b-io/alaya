@@ -501,7 +501,17 @@ mod tests {
         // The deployed `RUST_LOG` and the documented one, set as an operator
         // would: neither names `opentelemetry_sdk`.
         for filter in [super::DEFAULT_FILTER, "alaya_server=info"] {
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            // The SDK defaults, not the shell's: an inherited
+            // `OTEL_BSP_MAX_EXPORT_BATCH_SIZE=1` exports before the flush, a
+            // sampler or `OTEL_SDK_DISABLED` exports nothing, and either
+            // breaks the child's flush assertions.
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("OTEL_") {
+                    child.env_remove(key);
+                }
+            }
+            let out = child
                 .args([
                     &format!("{module}::export_failure_child"),
                     "--exact",
@@ -521,7 +531,6 @@ mod tests {
                     "OTEL_EXPORTER_OTLP_HEADERS",
                     format!("x-api-key={EXPORT_CANARY}"),
                 )
-                .env_remove("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
                 .output()
                 .unwrap();
             let console = format!(
