@@ -3,6 +3,6 @@
 # breakage into its own Renovate PR instead of turning main red. This file also
 # sets the compiler for the Docker builder and every CI cargo call.
 [toolchain]
-channel = "1.99.0"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
 targets = ["wasm32-unknown-unknown"]
