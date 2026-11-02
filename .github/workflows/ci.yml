@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       qdrant:
-        image: qdrant/qdrant:v1.19.1@sha256:12364fe851b9f17356fc88189fc06d1b521262e04659ec7345975b00c9246a10
+        image: qdrant/qdrant:v1.20.0@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2
         ports:
           - 6333:6333
     steps:
@@ -100,15 +100,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
-      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         id: meta
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -122,7 +122,7 @@ jobs:
         id: stamp
         run: echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         id: build
         with:
           context: .
@@ -163,10 +163,10 @@ jobs:
           BRANCH: ${{ github.ref_name }}
         run: .github/scripts/is-branch-head.sh
 
-      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
         if: steps.head.outputs.current == 'true'
 
-      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         if: steps.head.outputs.current == 'true'
         with:
           registry: ${{ env.REGISTRY }}
