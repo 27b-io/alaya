@@ -428,6 +428,9 @@ enum Transport {
 /// conventional `NO_PROXY=.svc,.cluster.local` does not exempt a single-label
 /// host like `anthropic-lb`. A client added behind this guard must set it too;
 /// `clippy.toml` refuses a reqwest builder outside the sanctioned sites.
+/// For `Redis` the URL's host is the only peer because the cluster and
+/// sentinel schemes are refused: those modes also dial each `node=` host in the
+/// query and the hosts the server announces, with the same `AUTH`.
 /// It does not promise the host is who it claims to be over plain `http`: that
 /// is what the cluster-local rule accepts.
 fn check_credential_transport(
@@ -461,11 +464,7 @@ fn check_credential_transport(
     match (transport, parsed.scheme()) {
         (Transport::Http, "https") => Ok(()),
         (Transport::Http, "http") if is_cluster_local(&parsed) => Ok(()),
-        // fred dispatches on scheme suffix (`redis-cluster`, `rediss-cluster`,
-        // `redis-sentinel`), all plaintext (no TLS compiled).
-        (Transport::Redis, scheme) if scheme.starts_with("redis") && is_cluster_local(&parsed) => {
-            Ok(())
-        }
+        (Transport::Redis, "redis" | "rediss") if is_cluster_local(&parsed) => Ok(()),
         // Unusable scheme: reqwest rejects non-http at `Client::execute`, so
         // nothing is ever dialled and "in the clear" would be false — the host
         // in `QDRANT_URL=redis://qdrant:6333` IS cluster-local. Off-cluster
@@ -474,12 +473,26 @@ fn check_credential_transport(
         (Transport::Http, scheme) if scheme != "http" => Err(format!(
             "{var}: unusable scheme {scheme}:// — this client speaks http and https only",
         )),
+        // fred dispatches on the scheme suffix: `-cluster` and `-sentinel` also
+        // dial every `node=` host in the query and every host the server
+        // announces (cluster redirects, the sentinel's primary), each with this
+        // URL's `AUTH`. Only the URL's own host is classified here, so those
+        // modes are refused rather than certified. The message omits the query:
+        // fred echoes a malformed `node=` value into its error.
+        (Transport::Redis, scheme)
+            if scheme.ends_with("-cluster") || scheme.ends_with("-sentinel") =>
+        {
+            Err(format!(
+                "{var}: refused scheme {scheme}:// — cluster and sentinel modes dial hosts \
+                 this guard cannot classify; use a centralized redis:// or rediss:// endpoint",
+            ))
+        }
         // fred opens plain TCP regardless of scheme, so `https://` buys no
         // encryption — it just makes fred dial port 6379 and send `AUTH` in
         // the clear.
-        (Transport::Redis, scheme) if !scheme.starts_with("redis") => Err(format!(
+        (Transport::Redis, scheme) if !matches!(scheme, "redis" | "rediss") => Err(format!(
             "{var}: unusable scheme {scheme}:// — this client speaks redis:// \
-             variants only (fred opens plain TCP regardless of scheme)",
+             and rediss:// only (fred opens plain TCP regardless of scheme)",
         )),
         (_, scheme) => Err(format!(
             "{var}: {scheme}://{} is not {}; an API key, URL userinfo or query \
@@ -5363,6 +5376,43 @@ mod tests {
             "{off_query}: {err}"
         );
         assert!(redis("REDIS_CACHE_URL", "redis://redis-svc:6379?timeout=5", false).is_ok());
+
+        // Cluster and sentinel modes dial `node=` hosts and server-announced
+        // hosts with the URL's `AUTH`, so a cluster-local URL host does not
+        // redeem them. The refusal carries neither the secret nor any query
+        // value: fred would echo a malformed `node=` value into its error.
+        for (url, query_value) in [
+            (
+                with_userinfo(
+                    "redis-cluster",
+                    "redis-svc:6379?node=redis.example.com:6379",
+                ),
+                "redis.example.com",
+            ),
+            (
+                "redis-cluster://redis-svc:6379?node=SECRET".to_string(),
+                "SECRET",
+            ),
+            (with_userinfo("rediss-cluster", "redis-svc:6379"), FAKE_USER),
+            (
+                with_userinfo("redis-sentinel", "redis-svc:26379?sentinelServiceName=m"),
+                "sentinelServiceName",
+            ),
+            (
+                "rediss-sentinel://redis-svc:26379?node=SECRET".to_string(),
+                "SECRET",
+            ),
+        ] {
+            let err = redis("REDIS_CACHE_URL", url.as_str(), false).unwrap_err();
+            assert!(
+                err.contains("refused scheme")
+                    && !err.contains(query_value)
+                    && !err.contains(FAKE_SECRET),
+                "{url}: {err}"
+            );
+        }
+        // Nothing to carry, nothing to refuse: a bare cluster URL is fred's business.
+        assert!(redis("REDIS_CACHE_URL", "redis-cluster://redis-svc:6379", false).is_ok());
 
         // Non-redis scheme with Redis transport: fred opens plain TCP
         // regardless, so `https` buys no encryption. The refusal must name
