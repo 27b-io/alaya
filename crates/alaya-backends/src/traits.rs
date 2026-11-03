@@ -359,6 +359,26 @@ pub trait EmbeddingProvider {
     }
 }
 
+/// The embedder's own tokenizer: how many tokens one input may hold, and
+/// where each token of a text sits. Lets a caller split a text the embedder
+/// would otherwise truncate at exact token boundaries, with no tokenizer of
+/// its own.
+///
+/// Contract: a text makes at most one token per byte of its normalized
+/// form, plus one leading word marker, and normalization leaves ASCII as is
+/// and grows other text no more than Unicode NFKC does (11x in UTF-8, at
+/// U+FDFA). Callers skip `token_spans` for a text that bound shows fits.
+#[async_trait(?Send)]
+pub trait Tokenizer {
+    /// Most tokens of passage text one input may hold: the embedder's input
+    /// window less what it adds around a passage (prompt prefix, special
+    /// tokens). The embedder truncates (or rejects) anything longer.
+    async fn passage_token_budget(&self) -> Result<usize>;
+    /// Byte range `start..stop` in `text` of each token, in order, special
+    /// tokens excluded. Every range sits on char boundaries.
+    async fn token_spans(&self, text: &str) -> Result<Vec<(usize, usize)>>;
+}
+
 /// Graph operations backend (calls alaya-bridge typed RPC).
 #[async_trait(?Send)]
 pub trait GraphService {
