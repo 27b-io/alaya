@@ -150,7 +150,7 @@ Copy `.env.example` to `.env`. All settings have sensible defaults for local dev
 | `QDRANT_URL` | — (required) | Qdrant HTTP endpoint. Qdrant **1.18 or newer**, **single node** (`replication_factor` 1): every memory write is conditional (`update_mode`, `update_filter`, 1.17), the server adds the BM25 keyword vector to an existing collection at startup (1.18), and it refuses to start against an older Qdrant, which would silently ignore the condition. Replicated collections are not supported: with default write ordering each replica evaluates the condition on its own |
 | `QDRANT_COLLECTION` | `memories_arctic1024` | Vector collection name |
 | `QDRANT_API_KEY` | — | Optional Qdrant auth |
-| `EMBEDDING_URL` | — (required) | OpenAI-compatible embeddings endpoint |
+| `EMBEDDING_URL` | — (required) | OpenAI-compatible embeddings endpoint. On a TEI endpoint, a stored memory longer than the model's input window is embedded as up to three overlapping windows (read from TEI's `/info` and `/tokenize`) instead of being truncated; elsewhere it is truncated and a warning logged |
 | `EMBEDDING_MODEL` | `Snowflake/snowflake-arctic-embed-l-v2.0` | Model name |
 | `EMBEDDING_DIMENSIONS` | `1024` | Vector dimensionality |
 | `GRAPH_URL` | — (required) | Bridge endpoint |

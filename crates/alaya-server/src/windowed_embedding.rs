@@ -28,8 +28,8 @@ use alaya_types::{AlayaError, Result};
 /// them, so the work per store stays bounded. A store runs inline on the
 /// worker loop, so every search sent to the same process waits for all of
 /// it. On a CPU embedder three `WINDOW_TOKENS` windows cost about what one
-/// 2048-token input did (~4.5 s), so the longest store holds searches no
-/// longer than the longest store did before windowing.
+/// 2048-token input does, so behind a 2048-token input window the longest
+/// store holds searches no longer than it did before windowing.
 pub const MAX_WINDOWS: usize = 3;
 /// Tokens per window, at most. Smaller windows cost less per token on CPU
 /// (attention grows with input length), and each one holds the embedder for
@@ -378,7 +378,7 @@ mod tests {
         assert_eq!(*words.calls.borrow(), vec![vec![long]]);
     }
 
-    /// The LAB-12564 pair: a long shared prefix, then two different tails.
+    /// A long shared prefix, then two different tails.
     /// Single-pass, the embedder truncates both to the same prefix; windowed,
     /// the tail window tells them apart.
     #[tokio::test]
