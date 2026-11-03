@@ -22,6 +22,7 @@ mod testkit;
 #[cfg(test)]
 mod testlog;
 mod wellknown;
+mod windowed_embedding;
 
 use axum::{
     Json, Router,
@@ -40,7 +41,7 @@ use tower_http::trace::TraceLayer;
 
 use alaya_backends::{
     Provider, clip_for_log,
-    embedding::EmbeddingClient,
+    embedding::{EmbeddingClient, TeiTokenizer},
     graph::GraphHttpClient,
     graph_ref::{ConsolidationRef, GraphRef, HebbianRef},
     judge::JudgeClient,
@@ -3204,6 +3205,9 @@ fn main() {
                 // Fresh-deploy bootstrap: create the memory collection if it is
                 // absent so the first write doesn't 404 (#31).
                 ensure_qdrant_collection(&qdrant, cfg_clone.embedding_dimensions).await;
+                // The tokenizer reads the same endpoint's input window and
+                // token layout; see `windowed_embedding`.
+                let tokenizer = TeiTokenizer::new(cfg_clone.embedding_url.clone());
                 let embeddings = EmbeddingClient::new(
                     cfg_clone.embedding_url,
                     cfg_clone.embedding_model,
@@ -3225,6 +3229,12 @@ fn main() {
                     10_000, // L1 max cached embeddings (~40 MB at 1024 dims)
                     l2_cache,
                 );
+                // Above the cache: windows cache under their own keys, and a
+                // long passage's truncated whole-text entry is never read.
+                let embeddings = windowed_embedding::WindowedEmbedding::new(
+                    Box::new(cached_embeddings),
+                    Box::new(tokenizer),
+                );
                 let graph = std::rc::Rc::new(graph);
 
                 let summary: Option<Box<dyn alaya_backends::SummaryProvider>> =
@@ -3232,7 +3242,7 @@ fn main() {
 
                 let mut svc = MemoryService::new(
                     Box::new(qdrant),
-                    Box::new(cached_embeddings),
+                    Box::new(embeddings),
                     Box::new(GraphRef(graph.clone())),
                     Box::new(HebbianRef(graph.clone())),
                     Box::new(ConsolidationRef(graph)),

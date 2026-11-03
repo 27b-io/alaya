@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use alaya_types::{AlayaError, Result, memory::HealthStatus, search::PromptName};
 
-use crate::EmbeddingProvider;
+use crate::{EmbeddingProvider, Tokenizer};
 
 /// TEI hard-rejects client batches larger than this with HTTP 422 (no silent
 /// truncation), so the configured batch size is clamped to it. Batch size does
@@ -167,6 +167,87 @@ impl EmbeddingProvider for EmbeddingClient {
     }
 }
 
+/// [`Tokenizer`] over TEI's `GET /info` and `POST /tokenize`, at the same
+/// base URL as the [`EmbeddingClient`] it describes.
+pub struct TeiTokenizer {
+    client: Client,
+    base_url: String,
+}
+
+impl TeiTokenizer {
+    pub fn new(base_url: String) -> Self {
+        #[allow(clippy::disallowed_methods, reason = "sets .no_proxy() below")]
+        let builder = Client::builder();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let builder = builder
+            // Same host as `EmbeddingClient`, dialled the same way.
+            .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10));
+
+        let client = builder.build().expect("failed to build reqwest client");
+        Self { client, base_url }
+    }
+
+    async fn send(&self, req: reqwest::RequestBuilder, what: &str) -> Result<reqwest::Response> {
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AlayaError::Embedding(crate::redact_reqwest_error(e)))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = crate::error_body(resp).await;
+            return Err(AlayaError::Embedding(format!(
+                "{what} returned {status}: {body}"
+            )));
+        }
+        Ok(resp)
+    }
+}
+
+#[async_trait(?Send)]
+impl Tokenizer for TeiTokenizer {
+    async fn max_input_tokens(&self) -> Result<usize> {
+        let req = self.client.get(format!("{}/info", self.base_url));
+        let info: TeiInfo = self
+            .send(req, "embedding /info")
+            .await?
+            .json()
+            .await
+            .map_err(|e| {
+                AlayaError::Embedding(format!(
+                    "failed to parse /info: {}",
+                    crate::redact_reqwest_error(e)
+                ))
+            })?;
+        Ok(info.max_input_length)
+    }
+
+    async fn token_spans(&self, text: &str) -> Result<Vec<(usize, usize)>> {
+        let req = self
+            .client
+            .post(format!("{}/tokenize", self.base_url))
+            .json(&serde_json::json!({ "inputs": text, "add_special_tokens": false }));
+        let parsed: Vec<Vec<TeiToken>> = self
+            .send(req, "embedding /tokenize")
+            .await?
+            .json()
+            .await
+            .map_err(|e| {
+                AlayaError::Embedding(format!(
+                    "failed to parse /tokenize: {}",
+                    crate::redact_reqwest_error(e)
+                ))
+            })?;
+        let tokens = parsed.into_iter().next().unwrap_or_default();
+        Ok(tokens
+            .into_iter()
+            .filter_map(|t| Some((t.start?, t.stop?)))
+            .collect())
+    }
+}
+
 fn prefix_text(prompt_name: PromptName, text: &str) -> String {
     match prompt_name {
         PromptName::Query => format!("search_query: {text}"),
@@ -185,6 +266,18 @@ struct EmbeddingResponse {
 struct EmbeddingDatum {
     embedding: Vec<f32>,
     index: usize,
+}
+
+#[derive(Deserialize)]
+struct TeiInfo {
+    max_input_length: usize,
+}
+
+/// One `/tokenize` token. Special tokens carry no span.
+#[derive(Deserialize)]
+struct TeiToken {
+    start: Option<usize>,
+    stop: Option<usize>,
 }
 
 #[cfg(test)]
@@ -245,6 +338,68 @@ mod tests {
         assert_eq!(items[0].embedding, vec![0.4, 0.5, 0.6]);
         assert_eq!(items[1].index, 1);
         assert_eq!(items[1].embedding, vec![0.1, 0.2, 0.3]);
+    }
+
+    /// `/info` gives the window; `/tokenize` gives byte spans with the
+    /// special tokens, which carry none, dropped. The response is TEI 1.9's
+    /// shape, multibyte text included.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn tei_tokenizer_reads_the_window_and_byte_spans() {
+        use serde_json::json;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model_id": "m", "max_input_length": 2048, "max_batch_tokens": 2048,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/tokenize"))
+            .and(body_json(
+                json!({ "inputs": "Ālaya café", "add_special_tokens": false }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([[
+                { "id": 0, "text": "<s>", "special": true, "start": null, "stop": null },
+                { "id": 1, "text": "Ā", "special": false, "start": 0, "stop": 2 },
+                { "id": 2, "text": "laya", "special": false, "start": 2, "stop": 6 },
+                { "id": 3, "text": " café", "special": false, "start": 6, "stop": 12 },
+            ]])))
+            .mount(&server)
+            .await;
+
+        let t = TeiTokenizer::new(server.uri());
+        assert_eq!(t.max_input_tokens().await.unwrap(), 2048);
+        assert_eq!(
+            t.token_spans("Ālaya café").await.unwrap(),
+            vec![(0, 2), (2, 6), (6, 12)]
+        );
+    }
+
+    /// TEI refuses to tokenize past its own length limit with a 422; that
+    /// must surface as an error, never as an empty layout.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn tei_tokenizer_surfaces_a_refusal() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tokenize"))
+            .respond_with(ResponseTemplate::new(422).set_body_string("too long"))
+            .mount(&server)
+            .await;
+
+        let err = TeiTokenizer::new(server.uri())
+            .token_spans("x")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("422"), "{err}");
     }
 
     #[test]

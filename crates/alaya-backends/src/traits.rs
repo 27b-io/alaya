@@ -359,6 +359,20 @@ pub trait EmbeddingProvider {
     }
 }
 
+/// The embedder's own tokenizer: how many tokens one input may hold, and
+/// where each token of a text sits. Lets a caller split a text the embedder
+/// would otherwise truncate at exact token boundaries, with no tokenizer of
+/// its own.
+#[async_trait(?Send)]
+pub trait Tokenizer {
+    /// Most tokens one input may hold, special tokens included. The embedder
+    /// truncates (or rejects) anything longer.
+    async fn max_input_tokens(&self) -> Result<usize>;
+    /// Byte range `start..stop` in `text` of each token, in order, special
+    /// tokens excluded. Every range sits on char boundaries.
+    async fn token_spans(&self, text: &str) -> Result<Vec<(usize, usize)>>;
+}
+
 /// Graph operations backend (calls alaya-bridge typed RPC).
 #[async_trait(?Send)]
 pub trait GraphService {
