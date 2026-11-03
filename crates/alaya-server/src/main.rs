@@ -41,7 +41,7 @@ use tower_http::trace::TraceLayer;
 
 use alaya_backends::{
     Provider, clip_for_log,
-    embedding::{EmbeddingClient, TeiTokenizer},
+    embedding::EmbeddingClient,
     graph::GraphHttpClient,
     graph_ref::{ConsolidationRef, GraphRef, HebbianRef},
     judge::JudgeClient,
@@ -3205,9 +3205,6 @@ fn main() {
                 // Fresh-deploy bootstrap: create the memory collection if it is
                 // absent so the first write doesn't 404 (#31).
                 ensure_qdrant_collection(&qdrant, cfg_clone.embedding_dimensions).await;
-                // The tokenizer reads the same endpoint's input window and
-                // token layout; see `windowed_embedding`.
-                let tokenizer = TeiTokenizer::new(cfg_clone.embedding_url.clone());
                 let embeddings = EmbeddingClient::new(
                     cfg_clone.embedding_url,
                     cfg_clone.embedding_model,
@@ -3218,6 +3215,9 @@ fn main() {
                     // passing a key here means updating that row too.
                     None,
                 );
+                // The same endpoint's input window and token layout; see
+                // `windowed_embedding`.
+                let tokenizer = embeddings.tokenizer();
                 // L2 embedding cache via cachekit-rs (optional) — backend
                 // selected by CACHE_BACKEND (redis default, saas).
                 let l2_cache = init_l2_cache().await;

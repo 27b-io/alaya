@@ -9,14 +9,15 @@
 //! untouched, so their vectors and cache keys stay as they were.
 //!
 //! Windows are cut on the embedder's own token boundaries (its `/tokenize`),
-//! so each one fits exactly. When the window size or a token layout cannot
-//! be read, the text is embedded single-pass, truncated as before, and a
-//! warning is logged.
+//! so each one fits exactly. When the budget or a token layout cannot be
+//! read, the text is sent whole, as before (the embedder truncates it), and
+//! a warning is logged.
 
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::StreamExt;
 
 use alaya_backends::traits::{EmbeddingProvider, Tokenizer};
 use alaya_types::memory::HealthStatus;
@@ -30,30 +31,41 @@ use alaya_types::{AlayaError, Result};
 /// it. On a CPU embedder three `WINDOW_TOKENS` windows cost about what one
 /// 2048-token input does, so behind a 2048-token input window the longest
 /// store holds searches no longer than it did before windowing.
-pub const MAX_WINDOWS: usize = 3;
+const MAX_WINDOWS: usize = 3;
 /// Tokens per window, at most. Smaller windows cost less per token on CPU
 /// (attention grows with input length), and each one holds the embedder for
-/// less time, so a query queued there behind a long store waits less.
+/// less time, so a query from another process queued there behind a long
+/// store waits less.
 const WINDOW_TOKENS: usize = 1024;
 /// Neighbouring windows share `1 / OVERLAP_DIVISOR` of a window, so a
 /// sentence cut at one window's edge appears whole in the next.
 const OVERLAP_DIVISOR: usize = 8;
-/// Tokens kept free in every input for what the embedder adds around the
-/// text: the passage prompt prefix and the special tokens (7 in all for the
-/// default model), plus re-tokenisation drift at a window's cut edges.
-const RESERVED_TOKENS: usize = 16;
-/// How long a read of the embedder's input window, or a failure to read it,
+/// Tokens kept free below the embedder's passage budget: a window's text,
+/// tokenized on its own, can split a few tokens differently at its cut edges.
+const DRIFT_TOKENS: usize = 8;
+/// `/tokenize` calls one batch keeps in flight. A dedup scan embeds up to
+/// a few hundred passages in one batch; this bounds the requests, and the
+/// replies held in memory, at once.
+const TOKENIZE_CONCURRENCY: usize = 4;
+/// How long a read of the embedder's budget, or a failure to read it,
 /// stands. Bounded so a redeployed embedder with a different window is
 /// picked up without a restart; a failure is retried, and warned about, at
 /// most this often.
-const MAX_INPUT_TTL: Duration = Duration::from_secs(60);
+const BUDGET_TTL: Duration = Duration::from_secs(60);
+
+/// One read of the embedder's passage budget.
+#[derive(Clone, Copy)]
+struct BudgetRead {
+    /// Tokens of text a window may hold; `None`: the read failed, or left
+    /// no room for a window.
+    tokens: Option<usize>,
+    at: Instant,
+}
 
 pub struct WindowedEmbedding {
     inner: Box<dyn EmbeddingProvider>,
     tokenizer: Box<dyn Tokenizer>,
-    /// The last read of the embedder's input window (`None` inside: it
-    /// failed) and when it was made.
-    max_input: Cell<Option<(Option<usize>, Instant)>>,
+    budget: Cell<Option<BudgetRead>>,
 }
 
 impl WindowedEmbedding {
@@ -61,33 +73,42 @@ impl WindowedEmbedding {
         Self {
             inner,
             tokenizer,
-            max_input: Cell::new(None),
+            budget: Cell::new(None),
         }
     }
 
-    /// The embedder's input window in tokens, or `None` when it cannot be
-    /// read (logged): passages then embed single-pass.
-    async fn max_input_tokens(&self) -> Option<usize> {
-        if let Some((n, at)) = self.max_input.get()
-            && at.elapsed() < MAX_INPUT_TTL
+    /// Tokens of passage text one input may hold, or `None` when that cannot
+    /// be read or leaves no room (logged): passages are then sent whole.
+    async fn budget(&self) -> Option<usize> {
+        if let Some(read) = self.budget.get()
+            && read.at.elapsed() < BUDGET_TTL
         {
-            return n;
+            return read.tokens;
         }
-        let n = match self.tokenizer.max_input_tokens().await {
-            Ok(n) => Some(n),
+        let tokens = match self.tokenizer.passage_token_budget().await {
+            Ok(n) if n > DRIFT_TOKENS => Some(n - DRIFT_TOKENS),
+            Ok(n) => {
+                tracing::warn!(
+                    budget = n,
+                    "embedder input window too small to split, long passages embed truncated"
+                );
+                None
+            }
             Err(e) => {
                 tracing::warn!("embedder input window unknown, long passages embed truncated: {e}");
                 None
             }
         };
-        self.max_input.set(Some((n, Instant::now())));
-        n
+        self.budget.set(Some(BudgetRead {
+            tokens,
+            at: Instant::now(),
+        }));
+        tokens
     }
 
-    /// The windows `text` embeds as, or `None` when it embeds single-pass:
-    /// it fits `max_input`, or its token layout could not be read (logged).
-    async fn windows<'t>(&self, text: &'t str, max_input: usize) -> Option<Vec<&'t str>> {
-        let budget = max_input.saturating_sub(RESERVED_TOKENS);
+    /// The windows `text` embeds as, or `None` when it is sent whole: it
+    /// fits `budget`, or its token layout could not be read (logged).
+    async fn windows<'t>(&self, text: &'t str, budget: usize) -> Option<Vec<&'t str>> {
         // Every token spans at least one byte, so this text fits unread.
         if text.len() <= budget {
             return None;
@@ -106,13 +127,6 @@ impl WindowedEmbedding {
             return None;
         }
         let size = WINDOW_TOKENS.min(budget);
-        if size == 0 {
-            tracing::warn!(
-                max_input,
-                "embedder input window too small to split into, passage embeds truncated"
-            );
-            return None;
-        }
         let windows: Option<Vec<&str>> = window_starts(spans.len(), size)
             .into_iter()
             .map(|s| text.get(spans[s].0..spans[s + size - 1].1))
@@ -134,8 +148,8 @@ impl WindowedEmbedding {
 
     /// The L2-normalised mean of the windows' vectors. One window per
     /// request, in order: the embedder serves requests first come, first
-    /// served, so a query that arrives mid-passage waits for one window, not
-    /// the whole passage.
+    /// served, so a query another process sends mid-passage waits there for
+    /// one window, not the whole passage.
     async fn pooled(&self, windows: &[&str]) -> Result<Vec<f32>> {
         let dims = self.inner.dimensions();
         let mut sum = vec![0.0_f32; dims];
@@ -165,7 +179,7 @@ impl WindowedEmbedding {
 }
 
 /// First-token index of each window over `n` tokens, `size` tokens a window,
-/// for `n > size`. Consecutive windows overlap by at least
+/// for `n > size > 0`. Consecutive windows overlap by at least
 /// `size / OVERLAP_DIVISOR` tokens unless that takes more than
 /// [`MAX_WINDOWS`]; then `MAX_WINDOWS` windows spread evenly. The first
 /// window starts at the head and the last ends at the tail either way.
@@ -182,15 +196,15 @@ impl EmbeddingProvider for WindowedEmbedding {
         if prompt_name == PromptName::Query {
             return self.inner.embed_batch(texts, prompt_name).await;
         }
-        let Some(max_input) = self.max_input_tokens().await else {
+        let Some(budget) = self.budget().await else {
             return self.inner.embed_batch(texts, prompt_name).await;
         };
 
-        let plans =
-            futures::future::join_all(texts.iter().map(|t| self.windows(t, max_input))).await;
-        if plans.iter().all(Option::is_none) {
-            return self.inner.embed_batch(texts, prompt_name).await;
-        }
+        let plans: Vec<Option<Vec<&str>>> = futures::stream::iter(texts)
+            .map(|t| self.windows(t, budget))
+            .buffered(TOKENIZE_CONCURRENCY)
+            .collect()
+            .await;
 
         let single: Vec<&str> = texts
             .iter()
@@ -312,7 +326,7 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Tokenizer for Shared {
-        async fn max_input_tokens(&self) -> Result<usize> {
+        async fn passage_token_budget(&self) -> Result<usize> {
             Ok(self.0.max_input)
         }
         async fn token_spans(&self, text: &str) -> Result<Vec<(usize, usize)>> {
@@ -420,7 +434,7 @@ mod tests {
         assert!(windows[0].starts_with("w0 "));
         assert!(windows.last().unwrap().ends_with(" w2999"));
         for w in &windows {
-            assert_eq!(token_count(w), WINDOW_TOKENS.min(1040 - RESERVED_TOKENS));
+            assert_eq!(token_count(w), WINDOW_TOKENS.min(1040 - DRIFT_TOKENS));
         }
     }
 
@@ -492,7 +506,7 @@ mod tests {
         struct NoInfo(std::rc::Rc<Cell<u32>>);
         #[async_trait(?Send)]
         impl Tokenizer for NoInfo {
-            async fn max_input_tokens(&self) -> Result<usize> {
+            async fn passage_token_budget(&self) -> Result<usize> {
                 self.0.set(self.0.get() + 1);
                 Err(AlayaError::Embedding("404".into()))
             }

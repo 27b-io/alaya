@@ -365,9 +365,10 @@ pub trait EmbeddingProvider {
 /// its own.
 #[async_trait(?Send)]
 pub trait Tokenizer {
-    /// Most tokens one input may hold, special tokens included. The embedder
-    /// truncates (or rejects) anything longer.
-    async fn max_input_tokens(&self) -> Result<usize>;
+    /// Most tokens of passage text one input may hold: the embedder's input
+    /// window less what it adds around a passage (prompt prefix, special
+    /// tokens). The embedder truncates (or rejects) anything longer.
+    async fn passage_token_budget(&self) -> Result<usize>;
     /// Byte range `start..stop` in `text` of each token, in order, special
     /// tokens excluded. Every range sits on char boundaries.
     async fn token_spans(&self, text: &str) -> Result<Vec<(usize, usize)>>;
