@@ -66,6 +66,10 @@ const OVERLAP_DIVISOR: usize = 8;
 /// Tokens kept free below the embedder's passage budget: a window's text,
 /// tokenized on its own, can split a few tokens differently at its cut edges.
 const DRIFT_TOKENS: usize = 8;
+/// Most UTF-8 bytes one byte of text can grow into under Unicode
+/// normalization: NFKC turns U+FDFA, 3 bytes, into 33 (Unicode's
+/// normalization FAQ lists this as the worst case).
+const MAX_NORMALIZED_GROWTH: usize = 11;
 /// `/tokenize` calls one batch keeps in flight. A dedup scan embeds up to
 /// a few hundred passages in one batch; this bounds the requests, and the
 /// replies held in memory, at once.
@@ -132,12 +136,17 @@ impl WindowedEmbedding {
     /// The windows `text` embeds as, or `None` when it is sent whole: it
     /// fits `budget`, or its token layout could not be read (logged).
     async fn windows<'t>(&self, text: &'t str, budget: usize) -> Option<Vec<&'t str>> {
-        // ASCII is untouched by the tokenizer's Unicode normalization, so it
-        // makes at most one token per byte plus a leading word marker, and a
-        // short ASCII text fits unread. Any other text can grow under
-        // normalization (NFKC turns U+FDFA, 3 bytes, into four tokens), so
-        // only the tokenizer can say whether it fits.
-        if text.is_ascii() && text.len() < budget {
+        // A token holds at least one byte of normalized text, plus one
+        // leading word marker. Normalization leaves ASCII alone and grows any
+        // other byte to at most MAX_NORMALIZED_GROWTH bytes, so a text whose
+        // bound is under the budget fits unread, and a few em dashes cost no
+        // round trip, even on a cache hit. Past the bound only the tokenizer
+        // can say (NFKC turns U+FDFA, 3 bytes, into four tokens).
+        let ascii = text.bytes().filter(u8::is_ascii).count();
+        let bound = (text.len() - ascii)
+            .saturating_mul(MAX_NORMALIZED_GROWTH)
+            .saturating_add(ascii);
+        if bound < budget {
             return None;
         }
         let spans = match self.tokenizer.token_spans(text).await {
@@ -618,6 +627,38 @@ mod tests {
             "tokenizer was asked"
         );
         assert_eq!(*words.calls.borrow(), vec![vec![short]]);
+    }
+
+    /// An em dash does not send a short passage to the tokenizer: each
+    /// non-ASCII byte counts as `MAX_NORMALIZED_GROWTH` toward the budget,
+    /// and only a passage whose count reaches it is tokenized.
+    #[tokio::test]
+    async fn a_non_ascii_passage_skips_the_tokenizer_while_its_bound_fits() {
+        let budget = 2048 - DRIFT_TOKENS;
+        let dash = "\u{2014}";
+        let fits = format!(
+            "{dash}{}",
+            "x".repeat(budget - 1 - dash.len() * MAX_NORMALIZED_GROWTH)
+        );
+        let reaches = format!("{fits}x");
+        let words = Words::new(2048);
+        words.tokenize_failures.set(u32::MAX);
+        let e = windowed(&words);
+
+        e.embed_batch(&[&fits], PromptName::Passage).await.unwrap();
+        assert_eq!(
+            words.tokenize_failures.get(),
+            u32::MAX,
+            "tokenizer was asked"
+        );
+        e.embed_batch(&[&reaches], PromptName::Passage)
+            .await
+            .unwrap();
+        assert_eq!(
+            words.tokenize_failures.get(),
+            u32::MAX - 1,
+            "tokenizer was not asked"
+        );
     }
 
     /// Windowing must sit above the cache. A tokenizer failure sends a long
