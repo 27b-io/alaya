@@ -14,15 +14,38 @@
 //! a warning is logged.
 
 use std::cell::Cell;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
 
 use alaya_backends::traits::{EmbeddingProvider, Tokenizer};
+use alaya_core::vitals::{CountingEmbedding, Vitals};
 use alaya_types::memory::HealthStatus;
 use alaya_types::search::PromptName;
 use alaya_types::{AlayaError, Result};
+
+use crate::cached_embedding::CachedEmbedding;
+
+/// L1 embedding-cache entries (~40 MB at 1024 dims).
+const L1_CAPACITY: u64 = 10_000;
+
+/// The embedding stack every store and search goes through, outermost
+/// first: windowing, the cache, the failure counter, the endpoint. The
+/// counter sits under the cache because a cache hit is not an embed call
+/// that could fail. Windowing sits above the cache because below it, a long
+/// passage's truncated whole-text entry would keep answering for it.
+pub fn embedding_stack(
+    endpoint: Box<dyn EmbeddingProvider>,
+    tokenizer: Box<dyn Tokenizer>,
+    l2: Option<cachekit::CacheKit>,
+    vitals: Arc<Vitals>,
+) -> WindowedEmbedding {
+    let counted = CountingEmbedding::new(endpoint, vitals);
+    let cached = CachedEmbedding::new(Box::new(counted), L1_CAPACITY, l2);
+    WindowedEmbedding::new(Box::new(cached), tokenizer)
+}
 
 /// Most windows one passage is embedded as, however long it is. Past this
 /// the windows spread evenly from the head to the tail, leaving gaps between
@@ -109,8 +132,12 @@ impl WindowedEmbedding {
     /// The windows `text` embeds as, or `None` when it is sent whole: it
     /// fits `budget`, or its token layout could not be read (logged).
     async fn windows<'t>(&self, text: &'t str, budget: usize) -> Option<Vec<&'t str>> {
-        // Every token spans at least one byte, so this text fits unread.
-        if text.len() <= budget {
+        // ASCII is untouched by the tokenizer's Unicode normalization, so it
+        // makes at most one token per byte plus a leading word marker, and a
+        // short ASCII text fits unread. Any other text can grow under
+        // normalization (NFKC turns U+FDFA, 3 bytes, into four tokens), so
+        // only the tokenizer can say whether it fits.
+        if text.is_ascii() && text.len() < budget {
             return None;
         }
         let spans = match self.tokenizer.token_spans(text).await {
@@ -262,12 +289,37 @@ mod tests {
 
     const DIMS: usize = 16;
 
-    /// Splits on spaces, one token per word, and truncates input past
-    /// `max_input` words when embedding, as the real embedder does.
+    /// Expands under the stub tokenizer as U+FDFA does under the real one:
+    /// one 3-byte character, four tokens, all over the same bytes.
+    const EXPANDS: char = '\u{FDFA}';
+
+    /// Byte spans of the stub's tokens: one per space-separated word, and
+    /// four per [`EXPANDS`].
+    fn spans(text: &str) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        let mut start = None;
+        for (i, c) in text.char_indices().chain([(text.len(), ' ')]) {
+            if c == ' ' || c == EXPANDS {
+                if let Some(s) = start.take() {
+                    spans.push((s, i));
+                }
+                if c == EXPANDS {
+                    spans.extend([(i, i + c.len_utf8()); 4]);
+                }
+            } else if start.is_none() {
+                start = Some(i);
+            }
+        }
+        spans
+    }
+
+    /// Tokenizes with [`spans`] and truncates input past `max_input` tokens
+    /// when embedding, as the real embedder does.
     struct Words {
         max_input: usize,
         calls: RefCell<Vec<Vec<String>>>,
-        tokenize_fails: bool,
+        /// How many of the next `/tokenize` calls fail.
+        tokenize_failures: Cell<u32>,
     }
 
     impl Words {
@@ -275,19 +327,15 @@ mod tests {
             std::rc::Rc::new(Self {
                 max_input,
                 calls: RefCell::default(),
-                tokenize_fails: false,
+                tokenize_failures: Cell::new(0),
             })
         }
 
-        /// Each word adds 1 to a dimension picked by its hash.
+        /// Each token adds 1 to a dimension picked by its hash.
         fn vector(&self, text: &str) -> Vec<f32> {
             let mut v = vec![0.0_f32; DIMS];
-            for word in text
-                .split(' ')
-                .filter(|w| !w.is_empty())
-                .take(self.max_input)
-            {
-                let h = word
+            for (start, stop) in spans(text).into_iter().take(self.max_input) {
+                let h = text[start..stop]
                     .bytes()
                     .fold(7_usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize));
                 v[h % DIMS] += 1.0;
@@ -330,22 +378,12 @@ mod tests {
             Ok(self.0.max_input)
         }
         async fn token_spans(&self, text: &str) -> Result<Vec<(usize, usize)>> {
-            if self.0.tokenize_fails {
+            let failures = self.0.tokenize_failures.get();
+            if failures > 0 {
+                self.0.tokenize_failures.set(failures - 1);
                 return Err(AlayaError::Embedding("down".into()));
             }
-            let mut spans = Vec::new();
-            let mut start = None;
-            for (i, c) in text.char_indices().chain([(text.len(), ' ')]) {
-                match (c == ' ', start) {
-                    (false, None) => start = Some(i),
-                    (true, Some(s)) => {
-                        spans.push((s, i));
-                        start = None;
-                    }
-                    _ => {}
-                }
-            }
-            Ok(spans)
+            Ok(spans(text))
         }
     }
 
@@ -365,7 +403,7 @@ mod tests {
     }
 
     fn token_count(s: &str) -> usize {
-        s.split(' ').filter(|w| !w.is_empty()).count()
+        spans(s).len()
     }
 
     fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -488,11 +526,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_tokenize_falls_back_to_single_pass() {
-        let words = std::rc::Rc::new(Words {
-            max_input: 1040,
-            calls: RefCell::default(),
-            tokenize_fails: true,
-        });
+        let words = Words::new(1040);
+        words.tokenize_failures.set(u32::MAX);
         let e = windowed(&words);
         let long = text(3000);
         e.embed_batch(&[&long], PromptName::Passage).await.unwrap();
@@ -526,6 +561,95 @@ mod tests {
         }
         assert_eq!(reads.get(), 1);
         assert_eq!(*words.calls.borrow(), vec![vec![long]; 3]);
+    }
+
+    /// A passage shorter in bytes than the budget can still hold more
+    /// tokens than it: Unicode normalization expands U+FDFA, 3 bytes, into
+    /// four tokens. Such a pair, sent whole, truncates to the same vector;
+    /// it must be windowed instead, every window must fit, and the tails
+    /// must reach the vectors.
+    #[tokio::test]
+    async fn a_short_passage_that_normalization_expands_is_windowed() {
+        let prefix = EXPANDS.to_string().repeat(600);
+        let a = format!("{prefix} the deploy failed on staging");
+        let b = format!("{prefix} grandma lemon cake needs zest");
+        let budget = 2048 - DRIFT_TOKENS;
+        assert!(a.len() < budget && b.len() < budget);
+        assert!(token_count(&a) > budget);
+
+        let words = Words::new(2048);
+        let truncated = Shared(words.clone());
+        let ta = truncated
+            .embed_batch(&[&a], PromptName::Passage)
+            .await
+            .unwrap();
+        let tb = truncated
+            .embed_batch(&[&b], PromptName::Passage)
+            .await
+            .unwrap();
+        assert_eq!(ta, tb, "sent whole, the pair must truncate alike");
+        words.calls.borrow_mut().clear();
+
+        let e = windowed(&words);
+        let out = e.embed_batch(&[&a, &b], PromptName::Passage).await.unwrap();
+        assert_ne!(out[0], out[1], "tails must reach the vectors");
+        let calls = words.calls.borrow();
+        assert!(
+            calls.iter().all(|c| c.len() == 1),
+            "windows only, nothing whole"
+        );
+        assert!(calls.iter().all(|c| token_count(&c[0]) <= budget));
+        assert!(calls.iter().any(|c| c[0].ends_with(" staging")));
+        assert!(calls.iter().any(|c| c[0].ends_with(" zest")));
+    }
+
+    /// ASCII under the budget is never sent to the tokenizer: its behaviour,
+    /// and its cost, are what they were before windowing.
+    #[tokio::test]
+    async fn a_short_ascii_passage_skips_the_tokenizer() {
+        let words = Words::new(2048);
+        words.tokenize_failures.set(u32::MAX);
+        let e = windowed(&words);
+        let short = "x".repeat(2048 - DRIFT_TOKENS - 1);
+        e.embed_batch(&[&short], PromptName::Passage).await.unwrap();
+        assert_eq!(
+            words.tokenize_failures.get(),
+            u32::MAX,
+            "tokenizer was asked"
+        );
+        assert_eq!(*words.calls.borrow(), vec![vec![short]]);
+    }
+
+    /// Windowing must sit above the cache. A tokenizer failure sends a long
+    /// passage whole once, which caches its truncated vector under the
+    /// whole-text key; once the tokenizer is back, the same passage must be
+    /// windowed again, not answered from that entry.
+    #[tokio::test]
+    async fn the_stack_windows_past_a_cached_truncated_vector() {
+        let words = Words::new(1040);
+        words.tokenize_failures.set(1);
+        let stack = embedding_stack(
+            Box::new(Shared(words.clone())),
+            Box::new(Shared(words.clone())),
+            None,
+            Arc::new(Vitals::default()),
+        );
+        let long = text(3000);
+        let whole = stack
+            .embed_batch(&[&long], PromptName::Passage)
+            .await
+            .unwrap();
+        assert_eq!(whole[0], words.vector(&long), "first pass is sent whole");
+
+        let pooled = stack
+            .embed_batch(&[&long], PromptName::Passage)
+            .await
+            .unwrap();
+        assert_ne!(
+            pooled[0], whole[0],
+            "the truncated whole-text entry answered"
+        );
+        assert_eq!(words.calls.borrow().len(), 1 + MAX_WINDOWS);
     }
 
     #[test]
