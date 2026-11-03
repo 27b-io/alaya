@@ -13,14 +13,17 @@
 //! read, the text is sent whole, as before (the embedder truncates it), and
 //! a warning is logged.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use mini_moka::unsync::Cache;
 
 use alaya_backends::traits::{EmbeddingProvider, Tokenizer};
+use alaya_core::hashing::generate_content_hash;
 use alaya_core::vitals::{CountingEmbedding, Vitals};
 use alaya_types::memory::HealthStatus;
 use alaya_types::search::PromptName;
@@ -74,11 +77,18 @@ const MAX_NORMALIZED_GROWTH: usize = 11;
 /// a few hundred passages in one batch; this bounds the requests, and the
 /// replies held in memory, at once.
 const TOKENIZE_CONCURRENCY: usize = 4;
+/// Window plans kept in memory, by text hash. A plan is a few byte ranges,
+/// so this costs well under 2 MB.
+const PLAN_CAPACITY: u64 = 10_000;
 /// How long a read of the embedder's budget, or a failure to read it,
 /// stands. Bounded so a redeployed embedder with a different window is
 /// picked up without a restart; a failure is retried, and warned about, at
 /// most this often.
 const BUDGET_TTL: Duration = Duration::from_secs(60);
+
+/// Byte ranges of the windows a passage embeds as; empty when it fits and
+/// is sent whole.
+type Plan = Rc<[(usize, usize)]>;
 
 /// One read of the embedder's passage budget.
 #[derive(Clone, Copy)]
@@ -93,6 +103,13 @@ pub struct WindowedEmbedding {
     inner: Box<dyn EmbeddingProvider>,
     tokenizer: Box<dyn Tokenizer>,
     budget: Cell<Option<BudgetRead>>,
+    /// Plans read from the tokenizer, keyed by (text hash, budget). A
+    /// passage embedded before (a re-store, a dedup scan, a cache hit) is
+    /// planned from here, so it neither pays for nor waits on `/tokenize`
+    /// again. Only plans the tokenizer answered are kept; a failure is
+    /// asked again next time. In memory only: after a restart each passage
+    /// is planned once more.
+    plans: RefCell<Cache<(String, usize), Plan>>,
 }
 
 impl WindowedEmbedding {
@@ -101,6 +118,7 @@ impl WindowedEmbedding {
             inner,
             tokenizer,
             budget: Cell::new(None),
+            plans: RefCell::new(Cache::new(PLAN_CAPACITY)),
         }
     }
 
@@ -150,6 +168,27 @@ impl WindowedEmbedding {
         if bound < budget {
             return None;
         }
+        let key = (generate_content_hash(text), budget);
+        let cached = self.plans.borrow_mut().get(&key).cloned();
+        let plan = match cached {
+            Some(plan) => plan,
+            None => {
+                let plan = self.plan(text, budget).await?;
+                self.plans.borrow_mut().insert(key, plan.clone());
+                plan
+            }
+        };
+        if plan.is_empty() {
+            return None;
+        }
+        plan.iter()
+            .map(|&(start, stop)| text.get(start..stop))
+            .collect()
+    }
+
+    /// Asks the tokenizer for `text`'s windows: an empty plan when it fits
+    /// `budget`, or `None` when its token layout could not be read (logged).
+    async fn plan(&self, text: &str, budget: usize) -> Option<Plan> {
         let spans = match self.tokenizer.token_spans(text).await {
             Ok(spans) => spans,
             Err(e) => {
@@ -161,26 +200,29 @@ impl WindowedEmbedding {
             }
         };
         if spans.len() <= budget {
-            return None;
+            return Some(Rc::from([]));
         }
         let size = WINDOW_TOKENS.min(budget);
-        let windows: Option<Vec<&str>> = window_starts(spans.len(), size)
+        let ranges: Vec<(usize, usize)> = window_starts(spans.len(), size)
             .into_iter()
-            .map(|s| text.get(spans[s].0..spans[s + size - 1].1))
+            .map(|s| (spans[s].0, spans[s + size - 1].1))
             .collect();
-        let Some(windows) = windows else {
+        if ranges
+            .iter()
+            .any(|&(start, stop)| text.get(start..stop).is_none())
+        {
             tracing::warn!(
                 bytes = text.len(),
                 "tokenize spans off char boundaries, passage embeds truncated"
             );
             return None;
-        };
+        }
         tracing::info!(
             tokens = spans.len(),
-            windows = windows.len(),
+            windows = ranges.len(),
             "embedding long passage as windows"
         );
-        Some(windows)
+        Some(ranges.into())
     }
 
     /// The L2-normalised mean of the windows' vectors. One window per
@@ -330,6 +372,9 @@ mod tests {
         calls: RefCell<Vec<Vec<String>>>,
         /// How many of the next `/tokenize` calls fail.
         tokenize_failures: Cell<u32>,
+        /// `/tokenize` calls hang, as against a stalled endpoint.
+        tokenize_stalls: Cell<bool>,
+        tokenize_calls: Cell<u32>,
     }
 
     impl Words {
@@ -338,6 +383,8 @@ mod tests {
                 max_input,
                 calls: RefCell::default(),
                 tokenize_failures: Cell::new(0),
+                tokenize_stalls: Cell::new(false),
+                tokenize_calls: Cell::new(0),
             })
         }
 
@@ -388,6 +435,10 @@ mod tests {
             Ok(self.0.max_input)
         }
         async fn token_spans(&self, text: &str) -> Result<Vec<(usize, usize)>> {
+            self.0.tokenize_calls.set(self.0.tokenize_calls.get() + 1);
+            if self.0.tokenize_stalls.get() {
+                futures::future::pending::<()>().await;
+            }
             let failures = self.0.tokenize_failures.get();
             if failures > 0 {
                 self.0.tokenize_failures.set(failures - 1);
@@ -692,6 +743,53 @@ mod tests {
             "the truncated whole-text entry answered"
         );
         assert_eq!(words.calls.borrow().len(), 1 + MAX_WINDOWS);
+    }
+
+    /// A passage the stack has planned once is planned from memory after:
+    /// with `/tokenize` hung, a fitting passage above the growth bound and
+    /// a windowed one both come back at once from the cache below, with no
+    /// tokenizer call and no new embed.
+    #[tokio::test]
+    async fn a_planned_passage_does_not_wait_on_a_stalled_tokenizer() {
+        let words = Words::new(2048);
+        let stack = embedding_stack(
+            Box::new(Shared(words.clone())),
+            Box::new(Shared(words.clone())),
+            None,
+            Arc::new(Vitals::default()),
+        );
+        let fits = "Ж".repeat(93);
+        let budget = 2048 - DRIFT_TOKENS;
+        assert!(
+            fits.len() * MAX_NORMALIZED_GROWTH >= budget,
+            "must be past the bound"
+        );
+        let long = text(3000);
+        let texts = [fits.as_str(), long.as_str()];
+
+        let warm = stack
+            .embed_batch(&texts, PromptName::Passage)
+            .await
+            .unwrap();
+        let tokenized = words.tokenize_calls.get();
+        let embeds = words.calls.borrow().len();
+        assert_eq!(tokenized, 2);
+
+        words.tokenize_stalls.set(true);
+        let again = tokio::time::timeout(
+            Duration::from_secs(1),
+            stack.embed_batch(&texts, PromptName::Passage),
+        )
+        .await
+        .expect("waited on the stalled tokenizer")
+        .unwrap();
+        assert_eq!(again, warm);
+        assert_eq!(
+            words.tokenize_calls.get(),
+            tokenized,
+            "tokenizer asked again"
+        );
+        assert_eq!(words.calls.borrow().len(), embeds, "embedder asked again");
     }
 
     #[test]
