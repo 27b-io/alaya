@@ -42,15 +42,18 @@ const OVERLAP_DIVISOR: usize = 8;
 /// text: the passage prompt prefix and the special tokens (7 in all for the
 /// default model), plus re-tokenisation drift at a window's cut edges.
 const RESERVED_TOKENS: usize = 16;
-/// How long a read of the embedder's input window is trusted. Bounded so a
-/// redeployed embedder with a different window is picked up without a
-/// restart.
+/// How long a read of the embedder's input window, or a failure to read it,
+/// stands. Bounded so a redeployed embedder with a different window is
+/// picked up without a restart; a failure is retried, and warned about, at
+/// most this often.
 const MAX_INPUT_TTL: Duration = Duration::from_secs(60);
 
 pub struct WindowedEmbedding {
     inner: Box<dyn EmbeddingProvider>,
     tokenizer: Box<dyn Tokenizer>,
-    max_input: Cell<Option<(usize, Instant)>>,
+    /// The last read of the embedder's input window (`None` inside: it
+    /// failed) and when it was made.
+    max_input: Cell<Option<(Option<usize>, Instant)>>,
 }
 
 impl WindowedEmbedding {
@@ -68,18 +71,17 @@ impl WindowedEmbedding {
         if let Some((n, at)) = self.max_input.get()
             && at.elapsed() < MAX_INPUT_TTL
         {
-            return Some(n);
+            return n;
         }
-        match self.tokenizer.max_input_tokens().await {
-            Ok(n) => {
-                self.max_input.set(Some((n, Instant::now())));
-                Some(n)
-            }
+        let n = match self.tokenizer.max_input_tokens().await {
+            Ok(n) => Some(n),
             Err(e) => {
                 tracing::warn!("embedder input window unknown, long passages embed truncated: {e}");
                 None
             }
-        }
+        };
+        self.max_input.set(Some((n, Instant::now())));
+        n
     }
 
     /// The windows `text` embeds as, or `None` when it embeds single-pass:
@@ -481,6 +483,35 @@ mod tests {
         let long = text(3000);
         e.embed_batch(&[&long], PromptName::Passage).await.unwrap();
         assert_eq!(*words.calls.borrow(), vec![vec![long]]);
+    }
+
+    /// A non-TEI endpoint has no `/info`: passages embed single-pass, and
+    /// the failed read is not retried (or warned about) on every embed.
+    #[tokio::test]
+    async fn an_unreadable_window_passes_through_and_is_not_reread_each_embed() {
+        struct NoInfo(std::rc::Rc<Cell<u32>>);
+        #[async_trait(?Send)]
+        impl Tokenizer for NoInfo {
+            async fn max_input_tokens(&self) -> Result<usize> {
+                self.0.set(self.0.get() + 1);
+                Err(AlayaError::Embedding("404".into()))
+            }
+            async fn token_spans(&self, _: &str) -> Result<Vec<(usize, usize)>> {
+                unreachable!("no window, no tokenize")
+            }
+        }
+        let words = Words::new(1040);
+        let reads = std::rc::Rc::new(Cell::new(0));
+        let e = WindowedEmbedding::new(
+            Box::new(Shared(words.clone())),
+            Box::new(NoInfo(reads.clone())),
+        );
+        let long = text(3000);
+        for _ in 0..3 {
+            e.embed_batch(&[&long], PromptName::Passage).await.unwrap();
+        }
+        assert_eq!(reads.get(), 1);
+        assert_eq!(*words.calls.borrow(), vec![vec![long]; 3]);
     }
 
     #[test]
