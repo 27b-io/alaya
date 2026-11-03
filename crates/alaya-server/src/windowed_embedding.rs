@@ -25,13 +25,15 @@ use alaya_types::{AlayaError, Result};
 
 /// Most windows one passage is embedded as, however long it is. Past this
 /// the windows spread evenly from the head to the tail, leaving gaps between
-/// them, so the work per store stays bounded: on a CPU embedder one
-/// `WINDOW_TOKENS` window costs about 1.5 s, and the store must finish
-/// inside its callers' timeouts.
-pub const MAX_WINDOWS: usize = 5;
+/// them, so the work per store stays bounded. A store runs inline on the
+/// worker loop, so every search sent to the same process waits for all of
+/// it. On a CPU embedder three `WINDOW_TOKENS` windows cost about what one
+/// 2048-token input did (~4.5 s), so the longest store holds searches no
+/// longer than the longest store did before windowing.
+pub const MAX_WINDOWS: usize = 3;
 /// Tokens per window, at most. Smaller windows cost less per token on CPU
 /// (attention grows with input length), and each one holds the embedder for
-/// less time, so a query queued behind a long store waits less.
+/// less time, so a query queued there behind a long store waits less.
 const WINDOW_TOKENS: usize = 1024;
 /// Neighbouring windows share `1 / OVERLAP_DIVISOR` of a window, so a
 /// sentence cut at one window's edge appears whole in the next.
@@ -488,9 +490,9 @@ mod tests {
         // Just past one window: two, head and tail.
         assert_eq!(window_starts(1025, size), vec![0, 1]);
         // Within the cap: contiguous, every neighbour overlapping.
-        let starts = window_starts(3000, size);
+        let starts = window_starts(2500, size);
         assert_eq!(starts.first(), Some(&0));
-        assert_eq!(starts.last().map(|s| s + size), Some(3000));
+        assert_eq!(starts.last().map(|s| s + size), Some(2500));
         assert!(starts.windows(2).all(|p| p[0] + size >= p[1] + overlap));
         // Past the cap: exactly MAX_WINDOWS, still head to tail.
         let starts = window_starts(1_000_000, size);
