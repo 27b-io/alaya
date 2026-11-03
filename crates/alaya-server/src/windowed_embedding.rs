@@ -136,12 +136,13 @@ impl WindowedEmbedding {
     /// The windows `text` embeds as, or `None` when it is sent whole: it
     /// fits `budget`, or its token layout could not be read (logged).
     async fn windows<'t>(&self, text: &'t str, budget: usize) -> Option<Vec<&'t str>> {
-        // A token holds at least one byte of normalized text, plus one
-        // leading word marker. Normalization leaves ASCII alone and grows any
-        // other byte to at most MAX_NORMALIZED_GROWTH bytes, so a text whose
-        // bound is under the budget fits unread, and a few em dashes cost no
-        // round trip, even on a cache hit. Past the bound only the tokenizer
-        // can say (NFKC turns U+FDFA, 3 bytes, into four tokens).
+        // Per the `Tokenizer` contract, a token holds at least one byte of
+        // normalized text, plus one leading word marker. Normalization leaves
+        // ASCII alone and grows any other byte to at most
+        // MAX_NORMALIZED_GROWTH bytes, so a text whose bound is under the
+        // budget fits unread, and a few em dashes cost no round trip, even on
+        // a cache hit. Past the bound only the tokenizer can say (NFKC turns
+        // U+FDFA, 3 bytes, into four tokens).
         let ascii = text.bytes().filter(u8::is_ascii).count();
         let bound = (text.len() - ascii)
             .saturating_mul(MAX_NORMALIZED_GROWTH)

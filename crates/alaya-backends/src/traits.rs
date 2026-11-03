@@ -363,6 +363,11 @@ pub trait EmbeddingProvider {
 /// where each token of a text sits. Lets a caller split a text the embedder
 /// would otherwise truncate at exact token boundaries, with no tokenizer of
 /// its own.
+///
+/// Contract: a text makes at most one token per byte of its normalized
+/// form, plus one leading word marker, and normalization leaves ASCII as is
+/// and grows other text no more than Unicode NFKC does (11x in UTF-8, at
+/// U+FDFA). Callers skip `token_spans` for a text that bound shows fits.
 #[async_trait(?Send)]
 pub trait Tokenizer {
     /// Most tokens of passage text one input may hold: the embedder's input
