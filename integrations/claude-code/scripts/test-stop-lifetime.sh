@@ -109,6 +109,10 @@ else
   echo "skip  setsid: not installed here (the no-setsid fallback runs below)"
 fi
 run no-setsid "$T/path-nosetsid"
+# Windows (Git Bash) has no setsid(1) and its Python has no os.setsid: a
+# sitecustomize that deletes os.setsid stands in for that Python here
+mkdir -p "$T/py-no-setsid"; printf 'import os\ndel os.setsid\n' > "$T/py-no-setsid/sitecustomize.py"
+run no-os-setsid "$T/path-nosetsid" PYTHONPATH="$T/py-no-setsid"
 # /tmp not writable (a read-only root, a sandbox) and the caller's TMPDIR
 # deleted: the save can only succeed through the state-dir fallback
 if [[ $EUID -eq 0 ]]; then

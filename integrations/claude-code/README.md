@@ -165,7 +165,9 @@ Starts the real Stop hook the way a CLI exit treats it: the parent closes the ho
 kills the hook's process group the moment the hook returns (or after a second if it does not),
 while the stub extractor takes two seconds. It
 proves the store call still happens and the state file is written, with and without `setsid(1)`
-on `PATH`, even though the caller's `TMPDIR` is deleted the moment the hook returns (as an agent
+on `PATH` and with neither it nor Python's `os.setsid` (as on Windows, where bash job control
+gives the copy a process group of its own), even though the caller's `TMPDIR` is deleted the
+moment the hook returns (as an agent
 runner's per-task temp dir is, and again with `/tmp` not writable, when the work dir must fall
 back to the state dir), that the hook's output pipe closes as soon as the hook returns (the
 detached copy holds neither stdout nor stderr, so it cannot hold the CLI), that a work dir lost
