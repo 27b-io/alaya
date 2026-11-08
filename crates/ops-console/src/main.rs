@@ -4905,9 +4905,7 @@ mod tests {
         /// reports the store edited cannot be told. Typed, the write goes.
         #[tokio::test]
         async fn a_dark_metrics_store_refuses_restore_and_asks_to_confirm_the_rest() {
-            let mut world = World::new(vec![]);
-            world.history = vec![(V0, "0".repeat(64)), (V0 - 5, D1.into())];
-            let store = FakeStore::new(&world);
+            let store = FakeStore::new(&World::new(vec![]));
             store.answer_post(StatusCode::OK, committed(V0 + 1, D1, json!([])));
             let mut config = test_config();
             config.lb = Some(config::LbConfig {
@@ -4999,7 +4997,7 @@ mod tests {
             .await;
             let html = body_string(resp).await;
             assert!(
-                html.contains("export no store_behind or store_edited series (k3s/lb-b)"),
+                html.contains("k3s/lb-b exports no store_behind or store_edited"),
                 "{html}"
             );
             assert!(html.contains("name=\"confirm_signal\""), "{html}");
@@ -5123,7 +5121,7 @@ mod tests {
             // A restore naming no row digest did not come from its preview.
             let (posts, msg) = run(vec![pair(old, D1)], None, true).await;
             assert!(
-                posts.is_empty() && msg.contains("names no row digest"),
+                posts.is_empty() && msg.contains("names no digest for the row it restores"),
                 "{msg}"
             );
         }
@@ -5234,17 +5232,28 @@ mod tests {
                 store.posts()[0]["document"]["ops"],
                 json!([{"op": "restore", "version": old}])
             );
-            // A store whose dry run names no digest: no commit form at all.
+            // A store whose dry run names no digest: no commit form at all,
+            // in the wording the commit uses for a form that carries none.
             store.answer_post(
                 StatusCode::OK,
                 dry_run(json!([{"client": "acme", "change": "deleted"}])),
             );
             let html = body_string(preview().await).await;
             assert!(
-                html.contains("cannot be bound to the row it restores"),
+                html.contains("names no digest for the row it restores"),
                 "{html}"
             );
             assert!(!html.contains("action=\"/lb/clients/commit\""), "{html}");
+            // One that names a malformed digest is named as such, and offers
+            // nothing to commit.
+            let mut malformed = dry_run(json!([{"client": "acme", "change": "deleted"}]));
+            malformed["restore_digest"] = json!("abc");
+            store.answer_post(StatusCode::OK, malformed);
+            let resp = preview().await;
+            assert_eq!(location(&resp), "/lb/clients");
+            let msg = flash_of(&state, &resp).msg;
+            assert!(msg.contains("named a malformed digest"), "{msg}");
+            assert!(!msg.contains("names no digest"), "{msg}");
         }
 
         /// A preview from a stale page gets 409: the console re-reads the
@@ -5294,8 +5303,7 @@ mod tests {
         #[tokio::test]
         async fn delete_and_restore_previews_warn_on_a_name_still_in_a_stacks_toml() {
             let old = V0 - 5;
-            let mut world = World::new(vec![]);
-            world.history = vec![(V0, "0".repeat(64)), (old, D1.into())];
+            let world = World::new(vec![]);
             let metrics = quiet_fleet();
             metrics.set(
                 "anthropic_client_store_toml_client",

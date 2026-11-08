@@ -487,15 +487,11 @@ fn stacks_card(
         .iter()
         .map(|(stack, sight)| {
             let restrictions = match part {
-                Ok(p) => effect::steady(effect::holds(p, sight), r.tag_stable, effect::MOVED),
+                Ok(p) => effect::holds(p, sight, r.tag_stable),
                 Err(e) => Verdict::Unknown(format!("the served part is unreadable: {e}")),
             };
             let held_doc = match doc {
-                Ok(Some(d)) => effect::steady(
-                    effect::holds_doc(&d.digest, sight),
-                    r.doc_stable,
-                    effect::DOC_MOVED,
-                ),
+                Ok(Some(d)) => effect::holds_doc(&d.digest, sight, r.doc_stable),
                 Ok(None) => Verdict::Unknown("the store holds no document".into()),
                 Err(e) => Verdict::Unknown(e.clone()),
             };
@@ -956,8 +952,8 @@ enum Outcome {
     Unknown(String),
     /// A 4xx: the store refused, and wrote nothing.
     Refused { status: StatusCode, body: Value },
-    /// A 200.
-    Committed(Value),
+    /// A 200: a commit, or a dry run's answer to a preview.
+    Accepted(Value),
 }
 
 fn outcome(answer: Result<Answer, AppError>) -> Outcome {
@@ -968,7 +964,7 @@ fn outcome(answer: Result<Answer, AppError>) -> Outcome {
             a.status.as_u16(),
             refusal_lines(&a.body).join("; ")
         )),
-        Ok(a) if a.status == StatusCode::OK => Outcome::Committed(a.body),
+        Ok(a) if a.status == StatusCode::OK => Outcome::Accepted(a.body),
         Ok(a) => Outcome::Refused {
             status: a.status,
             body: a.body,
@@ -1048,7 +1044,7 @@ async fn restrict_outcome(
     let back = "/lb/clients".to_string();
     match outcome(answer) {
         Outcome::Unknown(why) => ("error", unknown_outcome(m, ops, &why).await, back),
-        Outcome::Committed(body) => {
+        Outcome::Accepted(body) => {
             let done = match written_ops(&body, ops) {
                 Ok(done) => done,
                 Err(e) => {

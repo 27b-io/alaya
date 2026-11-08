@@ -182,12 +182,6 @@ impl StoreClient {
         json_body("client store", req).await
     }
 
-    /// `POST /_clients/admin` with `{"document": request}`: a document op,
-    /// the preview's dry run included.
-    pub async fn document(&self, request: &DocRequest<'_>) -> Result<Answer, AppError> {
-        self.post(&json!({ "document": request })).await
-    }
-
     /// `POST /_clients/admin` with a whole request: `{"restrictions": ops}`
     /// or `{"document": request}`. Returns the store's answer whatever its
     /// status, because 409, 422 and 503 each carry the store's own account

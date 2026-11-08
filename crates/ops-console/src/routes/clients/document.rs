@@ -326,9 +326,11 @@ async fn gate(m: &StoreModule, op: &DocOp) -> Gate {
     let (fleet, check) = tokio::join!(fleet::read(&m.metrics), async {
         match &restore {
             Some((version, Some(digest))) => Some(restore_check(m, *version, digest).await),
+            // True at both steps: a preview whose dry run named no digest,
+            // and a commit whose form carries none.
             Some((_, None)) => Some(Err(
-                "it names no row digest; a restore is sent only from its preview, which names the \
-                 row it restores"
+                "it names no digest for the row it restores, so the store could not refuse that row \
+                 if it changed before the commit"
                     .to_string(),
             )),
             None => None,
@@ -428,14 +430,14 @@ pub async fn preview(
     };
     let actor = actor_of(&session);
     let ops = [op];
-    let request = DocRequest {
+    let request = json!({ "document": DocRequest {
         expected_version: expected,
         actor: &actor,
         reason: &reason,
         dry_run: true,
         ops: &ops,
-    };
-    let answer = m.client.document(&request).await;
+    } });
+    let answer = m.client.post(&request).await;
     // A preview is shown only for an answer that is a dry run's. One that
     // carries a version or keys is a commit: the store wrote something the
     // operator never confirmed, so it is logged and reported like any write
@@ -449,17 +451,12 @@ pub async fn preview(
         && a.status == StatusCode::OK
         && commit_like(&a.body)
     {
-        write_log(
-            &session.sub,
-            DOCUMENT,
-            &json!({ "document": request }),
-            Ok(a),
-        );
+        write_log(&session.sub, DOCUMENT, &request, Ok(a));
         let why = "the store answered the preview as if it were a commit";
         return Ok(back(jar, unknown(m, &ops[0], why).await));
     }
     let body = match outcome(answer) {
-        Outcome::Committed(body) => body,
+        Outcome::Accepted(body) => body,
         Outcome::Unknown(why) => return Ok(back(jar, format!("The preview failed: {why}."))),
         Outcome::Refused { status, body } => {
             let mut msg = refused_text("The store refused the preview", status, &body);
@@ -471,30 +468,30 @@ pub async fn preview(
     };
     // A restore commits only the row its preview showed: the digest the
     // store's dry run names for that row rides the commit form, and the
-    // store refuses the commit if the row changed since.
+    // store refuses the commit if the row changed since. A dry run that
+    // names none leaves the op without one, which `gate` refuses; one that
+    // names something that is not a digest is the store's answer gone wrong.
     let op = match &ops[0] {
-        DocOp::Restore { version, .. } => DocOp::Restore {
-            version: *version,
-            expected_digest: body
-                .get("restore_digest")
-                .and_then(Value::as_str)
-                .filter(|d| is_hex64(d))
-                .map(str::to_string),
-        },
+        DocOp::Restore { version, .. } => {
+            let named = body.get("restore_digest");
+            let expected_digest = match named.and_then(Value::as_str) {
+                Some(d) if is_hex64(d) => Some(d.to_string()),
+                None if named.is_none() => None,
+                _ => {
+                    let why = "The store's dry run named a malformed digest for the row the \
+                               restore would restore, so the restore cannot be bound to that row: \
+                               nothing can be committed.";
+                    return Ok(back(jar, why.into()));
+                }
+            };
+            DocOp::Restore {
+                version: *version,
+                expected_digest,
+            }
+        }
         op => op.clone(),
     };
-    let mut gate = gate(m, &op).await;
-    if let DocOp::Restore {
-        expected_digest: None,
-        ..
-    } = op
-    {
-        gate.refused = Some(
-            "The restore cannot be bound to the row it restores: the store's dry run named no \
-             digest for that row, so it cannot refuse the row if it changes before the commit."
-                .into(),
-        );
-    }
+    let gate = gate(m, &op).await;
     let content = preview_view(&op, expected, &reason, &body, &gate, &session.csrf);
     Ok((jar, Html(page_html(&session, None, content))).into_response())
 }
@@ -656,7 +653,7 @@ pub async fn commit(
     let answer = send_recorded(m, &session.sub, DOCUMENT, body, export).await;
     let op = &ops[0];
     let body = match outcome(answer) {
-        Outcome::Committed(body) => body,
+        Outcome::Accepted(body) => body,
         Outcome::Unknown(why) => return Ok(back(jar, unknown(m, op, &why).await)),
         Outcome::Refused { status, body } => {
             let mut msg = refused_text("The store refused the write", status, &body);
