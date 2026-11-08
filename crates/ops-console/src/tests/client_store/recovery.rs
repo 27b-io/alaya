@@ -1836,8 +1836,24 @@ async fn a_reseed_form_is_sent_once_over_the_table_it_was_filled_in_over() {
         assert!(msg.contains(says), "{says}: {msg}");
     }
     assert_eq!(store.posts().len(), 1);
-    // Filled in again, it goes.
+    // A change made outside the console writes no line: the table's digest
+    // tells it, a record or the integrity record alone.
     let again = reseed_form(&csrf, &fresh, &sets, &[("override", phrase)]);
+    let mut recorded = World::new(vec![("acme", RecordState::Disabled, T0)]);
+    recorded.full = false;
+    let mut marked = world.get_body();
+    marked["restrictions"]["integrity"]["matches"] = json!(true);
+    for changed in [recorded.get_body(), marked] {
+        *store.gets.lock().unwrap() = vec![changed];
+        let msg = send(restarted.clone(), again.clone()).await;
+        assert!(
+            msg.contains("changed since this form was filled in"),
+            "{msg}"
+        );
+    }
+    assert_eq!(store.posts().len(), 1);
+    // Filled in again, over the table as it was, it goes.
+    *store.gets.lock().unwrap() = vec![world.get_body()];
     assert_eq!(send(restarted.clone(), again).await, "sent");
     assert_eq!(store.posts().len(), 2);
 }
