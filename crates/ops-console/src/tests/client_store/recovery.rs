@@ -1302,7 +1302,7 @@ async fn a_recovery_is_exported_as_committed_only_once_accepted() {
         ("row", &rows[0]),
         ("row", &rows[1]),
     ]);
-    let (_, failed) = captured(post_form(
+    let (resp, failed) = captured(post_form(
         &unread,
         &cookie,
         "/lb/clients/pitr/accept",
@@ -1311,8 +1311,16 @@ async fn a_recovery_is_exported_as_committed_only_once_accepted() {
     .await;
     assert_eq!(documents(&failed), 0, "{failed}");
     assert!(
-        failed.contains("not logged: the write log could not be read"),
+        failed.contains("the write log could not be read"),
         "{failed}"
+    );
+    // The operator is told, since accepting again logs it once the write log
+    // answers.
+    let msg = flash_of(&unread, &resp).msg;
+    assert!(
+        msg.contains("Its document is not on the write log: the write log could not be read")
+            && msg.contains("accepting again logs it"),
+        "{msg}"
     );
     metrics.failing.lock().unwrap().clear();
     // A recovery that is not done has nothing to accept.

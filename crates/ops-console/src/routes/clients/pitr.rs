@@ -1293,13 +1293,19 @@ pub async fn pitr_accept(
         versions = %now.join(","),
         "client-store recovery accepted"
     );
-    log_recovery(m, &store, newest).await;
+    let unlogged = match log_recovery(m, &store, newest).await {
+        Ok(()) => String::new(),
+        Err(why) => format!(
+            " Its document is not on the write log: {why}. An instance's install log holds it, \
+             and accepting again logs it while the store still serves it."
+        ),
+    };
     let doc = Doc {
         version: newest.version,
         digest: newest.digest.clone(),
     };
     let msg = format!(
-        "Accepted recovery {id}: version {} is exported as committed. Confirming on every stack…",
+        "Accepted recovery {id}: version {} is exported as committed.{unlogged} Confirming on every stack…",
         newest.version
     );
     Ok(flash_redirect(
@@ -1316,23 +1322,24 @@ pub async fn pitr_accept(
 /// with the rest, and three of the largest document run past what one read
 /// takes, so it is logged only when the write log holds no whole copy, and
 /// only once while that copy settles. A read that fails, or a copy no further
-/// copy can mend, logs nothing: another copy could only add to the read. An
-/// acceptance whose copy never landed logs it on a later one.
-async fn log_recovery(m: &StoreModule, store: &Value, newest: &RecoveryRow) {
+/// copy can mend, logs nothing: another copy could only add to the read.
+/// Returns why the write log holds no copy after this acceptance, which the
+/// operator is told: accepting again logs it while the store still serves it.
+async fn log_recovery(m: &StoreModule, store: &Value, newest: &RecoveryRow) -> Result<(), String> {
     let (version, digest) = (newest.version, newest.digest.as_str());
-    match writelog::held(&m.metrics, version, digest).await {
-        Ok(Held::Readable) => tracing::info!(
-            target: "ops_console::write_log",
-            version,
-            digest = %digest,
-            "client-store document not logged again: it is already on the write log"
-        ),
-        Ok(Held::Absent | Held::Partial) if !serves(store, newest) => tracing::warn!(
-            target: "ops_console::write_log",
-            version,
-            digest = %digest,
-            "client-store document not logged: the store has moved on from the recovery's commit"
-        ),
+    let why = match writelog::held(&m.metrics, version, digest).await {
+        Ok(Held::Readable) => {
+            tracing::info!(
+                target: "ops_console::write_log",
+                version,
+                digest = %digest,
+                "client-store document not logged again: it is already on the write log"
+            );
+            return Ok(());
+        }
+        Ok(Held::Absent | Held::Partial) if !serves(store, newest) => {
+            "the store has moved on from the recovery's commit".to_string()
+        }
         Ok(Held::Absent | Held::Partial) if !m.settling.claim(version, digest, now_epoch()) => {
             tracing::info!(
                 target: "ops_console::write_log",
@@ -1340,22 +1347,27 @@ async fn log_recovery(m: &StoreModule, store: &Value, newest: &RecoveryRow) {
                 digest = %digest,
                 "client-store document not logged again: this process logged it moments ago, \
                  and the log store is still indexing it"
-            )
+            );
+            return Ok(());
         }
         Ok(Held::Absent | Held::Partial) => {
             let text = store.pointer("/document/text").and_then(Value::as_str);
-            if !writelog::log_committed(version, digest, text) {
-                m.settling.release(version, digest);
+            if writelog::log_committed(version, digest, text) {
+                return Ok(());
             }
+            m.settling.release(version, digest);
+            "the store's view carries no bytes that hash to it".to_string()
         }
-        Err(e) => tracing::warn!(
-            target: "ops_console::write_log",
-            version,
-            digest = %digest,
-            error = %writelog::bounded(&e, 1024),
-            "client-store document not logged: the write log could not be read"
-        ),
-    }
+        Err(e) => format!("the write log could not be read ({})", clip(&e, 300)),
+    };
+    tracing::warn!(
+        target: "ops_console::write_log",
+        version,
+        digest = %digest,
+        why = %why,
+        "client-store document not logged"
+    );
+    Err(why)
 }
 
 #[cfg(test)]
