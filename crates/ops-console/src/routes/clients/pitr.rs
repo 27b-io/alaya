@@ -670,7 +670,12 @@ pub async fn pitr_send(
     let m = store_of(&state)?;
     guard(&state, &session, &form.csrf, PITR)?;
     let secure = state.secure_cookies();
-    let back_to = format!("/lb/clients/pitr?target={}#pick", form.target.trim());
+    // Back to the pick only as parsed: the raw field could carry anything,
+    // and a redirect's location must be a valid header value.
+    let back_to = match parse_target(&form.target) {
+        Some((v, d)) => format!("/lb/clients/pitr?target={v}.{d}#pick"),
+        None => "/lb/clients/pitr".to_string(),
+    };
     let back = |jar, msg: String, to: &str| flash_redirect(jar, secure, "error", msg, to);
     let refuse = |jar, msg: String| {
         refused_locally(&session, PITR, &msg);
@@ -1289,8 +1294,22 @@ pub async fn pitr_accept(
         "client-store recovery accepted"
     );
     // The recovery commit's bytes reach the console only through the store's
-    // view: logged whole when they are the newest row's.
-    if serves(&store, newest) {
+    // view: logged whole when they are the newest row's, and only while the
+    // write log holds no readable copy. Every copy is read back with the
+    // rest, and three of the largest document run past what a read takes,
+    // so accepting again must not log it again; an acceptance whose copy
+    // never became readable logs it on the next.
+    let logged = writelog::document(&m.metrics, newest.version, &newest.digest)
+        .await
+        .is_ok();
+    if logged {
+        tracing::info!(
+            target: "ops_console::write_log",
+            version = newest.version,
+            digest = %newest.digest,
+            "client-store document already on the write log"
+        );
+    } else if serves(&store, newest) {
         let text = store.pointer("/document/text").and_then(Value::as_str);
         writelog::log_committed(newest.version, &newest.digest, text);
     } else {

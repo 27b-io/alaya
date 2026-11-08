@@ -42,8 +42,10 @@ const DOCUMENT_LINE: &str = "client-store document";
 /// Most documents the import page lists.
 const LISTED: usize = 50;
 
-/// More lines than any document has: a 2 MiB document is under 300 parts,
-/// and a document logged twice repeats each.
+/// More lines than any document has: a 2 MiB document is 304 parts, and a
+/// document logged twice repeats each. Two copies of the largest one fit the
+/// response cap of a read; a third does not, so nothing logs a document the
+/// write log already holds readably.
 const MAX_LINES: usize = 1000;
 
 /// The hex SHA-256 of `text`.

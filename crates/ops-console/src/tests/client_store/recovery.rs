@@ -1057,6 +1057,21 @@ async fn pitr_is_not_sent_while_the_window_cannot_return_to_the_pick() {
         msg.contains("Nothing was scheduled") && msg.contains("pitr.failed"),
         "{msg}"
     );
+    // A target that is no pick, even one no header can carry, is refused
+    // back to the page itself.
+    let resp = post_form(
+        &state,
+        &cookie,
+        "/lb/clients/pitr",
+        pitr_form(&csrf, "1\nabc", &[]),
+    )
+    .await;
+    assert_eq!(location(&resp), "/lb/clients/pitr");
+    assert!(
+        flash_of(&state, &resp)
+            .msg
+            .contains("names no document to return to")
+    );
 }
 
 fn marker(id: &str, state: &str, reason: Option<&str>) -> serde_json::Value {
@@ -1229,7 +1244,7 @@ async fn a_recovery_is_exported_as_committed_only_once_accepted() {
         &state,
         &cookie,
         "/lb/clients/pitr/accept",
-        accept,
+        accept.clone(),
     ))
     .await;
     assert_eq!(
@@ -1247,12 +1262,29 @@ async fn a_recovery_is_exported_as_committed_only_once_accepted() {
         lines.contains("client-store recovery accepted") && lines.contains("admin-sub"),
         "{lines}"
     );
-    let metrics = FakeMetrics::default();
     metrics.ship(&lines);
     let back = writelog::document(&metrics_client(&metrics).await, V0 + 2, &newest)
         .await
         .unwrap();
     assert_eq!(back, text);
+    // Accepted again, it is not logged again: every copy is read back with
+    // the rest, and three of the largest run past what a read takes.
+    let (_, again) = captured(post_form(
+        &state,
+        &cookie,
+        "/lb/clients/pitr/accept",
+        accept,
+    ))
+    .await;
+    let documents = log_records(&again)
+        .into_iter()
+        .filter(|r| r["fields.message"] == "client-store document")
+        .count();
+    assert_eq!(documents, 0, "{again}");
+    assert!(
+        again.contains("client-store document already on the write log"),
+        "{again}"
+    );
     // A recovery that is not done has nothing to accept.
     let pending = store_with(&World::new(vec![]), |b| {
         b["restrictions"]["markers"] = json!([marker(&id, "pending", None)]);
