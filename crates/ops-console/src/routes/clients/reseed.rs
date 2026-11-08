@@ -8,11 +8,20 @@
 //! the answer's names to re-enable by hand are shown in full, on the page
 //! that answers the form. That page cannot be a redirect: the names can run
 //! past what a flash cookie holds. So a reloaded answer re-sends the form,
-//! and the override marks whatever the table holds at that time complete. A
-//! form is therefore bound to the table it was filled in over (`table_of`),
-//! and refused over any other, a console restart between them included.
+//! and the override marks whatever the table holds at that time complete.
+//!
+//! A form is therefore sent once, and only over the table it was filled in
+//! over. It carries a digest of that table (`table_of`) and the time it was
+//! filled in. It is refused when the table differs, or when anything may
+//! have been written to the store since that time, its own send included:
+//! a write and a wipe can bring the table back to the very state it was
+//! filled in over, and the form would then be sent over a write its
+//! operator never saw. Writes since are read from this process's own mark
+//! and from the write log, which survives a restart; a write log that
+//! cannot be read refuses the form, and leaves the table as it is.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::Ordering;
 
 use axum::extract::State;
 use axum::response::{Html, IntoResponse, Response};
@@ -28,7 +37,7 @@ use super::{
 use crate::effect::{self, is_hex64};
 use crate::error::AppError;
 use crate::routes::clip;
-use crate::session::{Session, flash_redirect, take_flash};
+use crate::session::{Session, flash_redirect, now_us, take_flash};
 use crate::state::{AppState, StoreModule};
 use crate::store::Answer;
 use crate::ui::*;
@@ -44,6 +53,15 @@ const OVERRIDE: &str = "mark the restrictions complete without the CF set";
 /// Set slots on the reseed form: CF's set and the newest of each other
 /// reader's, with room to spare.
 const SLOTS: usize = 8;
+
+/// How long a form stays good: a day, well inside the write log's 30 days,
+/// whose lines are what tells a write since it was filled in.
+const MAX_AGE_US: u64 = 24 * 3600 * 1_000_000;
+
+/// Why a form that something was written after is refused.
+const WROTE_SINCE: &str = "Something may have been written to the store since this form was filled \
+     in, this form's own send included: nothing was sent. Review the table below and fill the form \
+     in again.";
 
 /// The restrictions table a reseed form is filled in over, as a digest of
 /// what the store's view says of it: every record, every revoked digest and
@@ -65,7 +83,7 @@ fn table_of(store: &Value) -> Result<String, String> {
 
 // ─── The reseed ─────────────────────────────────────────────────────────────
 
-const RESEED_ABOUT: &str = "restrictions_import: the break-glass after the restrictions table was wiped or partly lost. Supply every set marked complete that a reader logged, CF's above all. The store merges them name by name as readers do, never below a name's current record, writes only denials, and marks the table complete again when one set matches CF's latest complete report and survives whole. It never lifts a disable. A form is sent only over the table it was filled in over: after any change, fill it in again.";
+const RESEED_ABOUT: &str = "restrictions_import: the break-glass after the restrictions table was wiped or partly lost. Supply every set marked complete that a reader logged, CF's above all. The store merges them name by name as readers do, never below a name's current record, writes only denials, and marks the table complete again when one set matches CF's latest complete report and survives whole. It never lifts a disable. A form is sent once, within a day, and only over the table it was filled in over with nothing written since: otherwise, fill it in again.";
 
 pub async fn reseed_page(
     State(state): State<AppState>,
@@ -80,7 +98,7 @@ pub async fn reseed_page(
     let body = match m.client.read().await {
         Ok(store) => {
             let form = match table_of(&store) {
-                Ok(table) => reseed_form(&session.csrf, &table).into_any(),
+                Ok(table) => reseed_form(&session.csrf, &table, now_us()).into_any(),
                 Err(why) => {
                     let why =
                         format!("No form can be bound to the table, so none is offered: {why}.");
@@ -156,7 +174,7 @@ fn reseed_state(store: &Value) -> impl IntoView + use<> {
     }
 }
 
-fn reseed_form(csrf: &str, table: &str) -> impl IntoView + use<> {
+fn reseed_form(csrf: &str, table: &str, issued: u64) -> impl IntoView + use<> {
     let slots = (1..=SLOTS)
         .map(|i| {
             let title = format!("Set {i}");
@@ -177,7 +195,7 @@ fn reseed_form(csrf: &str, table: &str) -> impl IntoView + use<> {
     let override_label = format!(
         "Only when no complete CF report exists, or its set can no longer be rebuilt from the logs: type \"{OVERRIDE}\" to mark the table complete without CF's set."
     );
-    let (csrf, table) = (csrf.to_string(), table.to_string());
+    let (csrf, table, issued) = (csrf.to_string(), table.to_string(), issued.to_string());
     view! {
         <Card>
             <CardHeader>
@@ -188,6 +206,7 @@ fn reseed_form(csrf: &str, table: &str) -> impl IntoView + use<> {
                 <form method="post" action="/lb/clients/reseed" class="space-y-3">
                     <input type="hidden" name="csrf" value=csrf />
                     <input type="hidden" name="table" value=table />
+                    <input type="hidden" name="issued" value=issued />
                     <div class="grid gap-3 md:grid-cols-2">{slots}</div>
                     <div class="space-y-1">
                         <Notice status=Status::Warn label="override">"The override marks the table complete while disables may be missing: fresh readers then serve those names until someone finds the gap, and running readers keep raising restrictions-behind meanwhile. Every use is recorded."</Notice>
@@ -220,6 +239,9 @@ pub struct ReseedForm {
     /// The table the form was filled in over (`table_of`).
     #[serde(default)]
     table: String,
+    /// When the form was filled in, in Unix microseconds.
+    #[serde(default)]
+    issued: String,
 }
 
 /// The sets a reseed form supplies, as the store takes them. A form sends
@@ -294,6 +316,19 @@ pub async fn reseed(
             format!("The override is typed exactly: \"{OVERRIDE}\". Nothing was sent."),
         ));
     }
+    let Ok(issued) = form.issued.trim().parse::<u64>() else {
+        return Ok(refuse(
+            jar,
+            "The form carries no time it was filled in: reload the page and fill it in again."
+                .into(),
+        ));
+    };
+    if now_us().saturating_sub(issued) > MAX_AGE_US {
+        return Ok(refuse(
+            jar,
+            "The form was filled in more than a day ago: fill it in again.".into(),
+        ));
+    }
     // Read again: the form is sent only over the table it was filled in over.
     let now = match m.client.read().await {
         Ok(store) => table_of(&store),
@@ -316,6 +351,23 @@ pub async fn reseed(
                 format!(
                     "The table this form was filled in over cannot be checked, so nothing was \
                      sent: {}.",
+                    clip(&why, 300)
+                ),
+            ));
+        }
+    }
+    if m.wrote_at.load(Ordering::Relaxed) >= issued {
+        return Ok(refuse(jar, WROTE_SINCE.into()));
+    }
+    match writelog::wrote_since(&m.metrics, issued).await {
+        Ok(false) => {}
+        Ok(true) => return Ok(refuse(jar, WROTE_SINCE.into())),
+        Err(why) => {
+            return Ok(refuse(
+                jar,
+                format!(
+                    "Whether anything was written to the store since this form was filled in \
+                     cannot be read from the write log, so nothing was sent: {}.",
                     clip(&why, 300)
                 ),
             ));

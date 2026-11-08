@@ -32,6 +32,10 @@ pub struct StoreModule {
     pub client: StoreClient,
     pub metrics: MetricsClient,
     pub committed: Arc<Committed>,
+    /// When this process last sent a request the store may have applied, in
+    /// Unix microseconds: what a reseed form is checked against before the
+    /// write log has the line.
+    pub wrote_at: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -95,6 +99,7 @@ impl AppState {
                 client: StoreClient::new(s.url.clone(), s.token.clone()),
                 metrics: l.metrics.clone(),
                 committed: Arc::new(Committed::default()),
+                wrote_at: Arc::default(),
             });
         let oidc = Arc::new(OidcRp::new(
             config.oidc_issuer.clone(),

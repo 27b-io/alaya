@@ -464,9 +464,10 @@ pub(crate) fn log_records(json_lines: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Whether a record passes every `field:=value` filter before the query's
-/// first pipe: the only filters the console's write-log reads use. A quoted
-/// value may hold spaces.
+/// Whether a record passes every filter before the query's first pipe, of
+/// the three the console's write-log reads use: `field:=value`, exact;
+/// `field:in("a","b")`, any of them; and `_time:>=t`, logged at or after the
+/// RFC 3339 time `t`. A quoted value may hold spaces.
 fn logsql_matches(query: &str, record: &Value) -> bool {
     let filters = query.split('|').next().unwrap_or_default();
     let mut tokens = Vec::new();
@@ -479,9 +480,22 @@ fn logsql_matches(query: &str, record: &Value) -> bool {
         }
     }
     tokens.push(token);
-    tokens.iter().all(|t| match t.split_once(":=") {
-        Some((field, want)) => record.get(field).and_then(Value::as_str) == Some(want),
-        None => true,
+    let text = |field: &str| record.get(field).and_then(Value::as_str);
+    let at = |s: &str| {
+        time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
+    };
+    tokens.iter().all(|t| {
+        if let Some((field, list)) = t.split_once(":in(") {
+            let list = list.strip_suffix(')').unwrap_or(list);
+            return text(field).is_some_and(|v| list.split(',').any(|w| w == v));
+        }
+        if let Some((field, since)) = t.split_once(":>=") {
+            return matches!((text(field).and_then(at), at(since)), (Some(r), Some(s)) if r >= s);
+        }
+        match t.split_once(":=") {
+            Some((field, want)) => text(field) == Some(want),
+            None => true,
+        }
     })
 }
 

@@ -389,8 +389,12 @@ struct Conditions {
 impl Conditions {
     /// The reasons it refuses document writes, as one sentence.
     fn frozen_line(&self) -> Option<String> {
-        (!self.frozen.is_empty())
-            .then(|| format!("It refuses document writes: {}.", self.frozen.join("; ")))
+        (!self.frozen.is_empty()).then(|| {
+            format!(
+                "The store refuses document writes: {}.",
+                self.frozen.join("; ")
+            )
+        })
     }
 }
 
@@ -523,14 +527,8 @@ fn warnings(r: &Reading, part: &Result<ServedPart, String>) -> impl IntoView + u
         ));
     }
     let c = store_conditions(&r.store);
-    if !c.frozen.is_empty() {
-        items.push((
-            Status::Warn,
-            format!(
-                "The store refuses document writes: {}. Restriction ops still work.",
-                c.frozen.join("; ")
-            ),
-        ));
+    if let Some(line) = c.frozen_line() {
+        items.push((Status::Warn, format!("{line} Restriction ops still work.")));
     }
     if c.window_open {
         items.push((
@@ -916,7 +914,8 @@ fn write_log(sub: &str, kind: &str, request: &Value, outcome: Result<&Answer, &A
             request = %request,
             status = a.status.as_u16(),
             answer = %answer(a),
-            "client-store write accepted: its recovery marker says how it ends"
+            "{}",
+            writelog::ACCEPTED
         ),
         Ok(a) if outcome_unknown(a) => tracing::warn!(
             target: "ops_console::write_log",
@@ -925,7 +924,8 @@ fn write_log(sub: &str, kind: &str, request: &Value, outcome: Result<&Answer, &A
             request = %request,
             status = a.status.as_u16(),
             answer = %answer(a),
-            "client-store write outcome unknown"
+            "{}",
+            writelog::UNKNOWN
         ),
         Ok(a) if a.status.is_success() => tracing::info!(
             target: "ops_console::write_log",
@@ -934,7 +934,8 @@ fn write_log(sub: &str, kind: &str, request: &Value, outcome: Result<&Answer, &A
             request = %request,
             status = a.status.as_u16(),
             answer = %answer(a),
-            "client-store write committed"
+            "{}",
+            writelog::COMMITTED
         ),
         Ok(a) => tracing::warn!(
             target: "ops_console::write_log",
@@ -951,7 +952,8 @@ fn write_log(sub: &str, kind: &str, request: &Value, outcome: Result<&Answer, &A
             kind,
             request = %request,
             error = %writelog::bounded(e.detail(), MAX_LOGGED_BYTES),
-            "client-store write outcome unknown"
+            "{}",
+            writelog::UNKNOWN
         ),
     }
 }
@@ -1036,6 +1038,13 @@ async fn send_recorded(
     tokio::spawn(async move {
         let answer = m.client.post(&body).await;
         write_log(&sub, kind, &body, answer.as_ref());
+        // Anything but a refusal may have changed the store.
+        if !matches!(&answer, Ok(a) if a.status.is_client_error()) {
+            m.wrote_at.fetch_max(
+                crate::session::now_us(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         if let Ok(a) = &answer
             && a.status == StatusCode::OK
         {

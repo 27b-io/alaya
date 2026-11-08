@@ -141,6 +141,86 @@ async fn every_committed_document_is_logged_whole_in_lines_under_16_kib() {
     assert_eq!(back, text);
 }
 
+/// An older document this process exported never stands for a newer one a
+/// committed label names. After a restart, accepting an old recovery again
+/// exports only that recovery; the import preview still diffs against the
+/// newer commit, and says only a label names it.
+#[tokio::test]
+async fn an_older_export_never_stands_for_a_newer_labelled_commit() {
+    let id = "ef".repeat(16);
+    let (older, latest) = (doc_text(V0 + 1, 1_000), doc_text(V0 + 2, 50));
+    let (old_digest, latest_digest) = (digest_of(&older), digest_of(&latest));
+    let metrics = quiet_fleet();
+    log_and_ship(&metrics, V0 + 1, &older);
+    log_and_ship(&metrics, V0 + 2, &latest);
+    metrics.set_30d(
+        "ops_console_committed_document",
+        vec![
+            committed_label(V0 + 1, &old_digest),
+            committed_label(V0 + 2, &latest_digest),
+        ],
+    );
+    metrics.set_30d(
+        "anthropic_client_store_document",
+        vec![installed(V0 + 2, &latest_digest)],
+    );
+    let store = store_with(&World::new(vec![]), |b| {
+        b["restrictions"]["markers"] = json!([marker(&id, "done", None)]);
+        b["document"]["version"] = json!(V0 + 2);
+        b["document"]["digest"] = json!(latest_digest);
+        b["document"]["text"] = json!(latest);
+        b["document"]["history"] = json!([
+            {"version": V0 + 2, "digest": latest_digest, "role": "writer", "at": "2026-11-08T12:01:00.000Z", "diff": []},
+            {"version": V0 + 1, "digest": old_digest, "role": "recovery", "recovery_id": id, "at": "2026-11-08T12:00:00.000Z", "diff": []},
+            row(V0, D1, "2026-11-08T11:59:00.000Z"),
+        ]);
+    });
+    // A restarted console: no exports of its own, both labels still there.
+    let state = store_state(&store, &metrics, &["admin-sub"]).await;
+    let (cookie, csrf) = cookie_for(&state, "admin-sub");
+    let accept = form(&[
+        ("csrf", &csrf),
+        ("id", &id),
+        ("row", &format!("{}.{old_digest}", V0 + 1)),
+    ]);
+    let resp = post_form(&state, &cookie, "/lb/clients/pitr/accept", accept).await;
+    assert!(flash_of(&state, &resp).msg.starts_with("Accepted recovery"));
+    assert_eq!(
+        state.store.as_ref().unwrap().committed.newest(),
+        Some((V0 + 1, old_digest))
+    );
+    // A later wipe, and an import of the older document.
+    let mut wiped = World::new(vec![]);
+    wiped.doc = (0, "0".repeat(64));
+    store.answer_gets(&[&wiped]);
+    store.answer_post(StatusCode::OK, dry_run(json!([])));
+    let preview = import_form(&csrf, 0, &[("source", "paste"), ("document", &older)]);
+    let html = body_string(post_form(&state, &cookie, "/lb/clients/preview", preview).await).await;
+    assert!(
+        html.contains(&format!(
+            "Against the newest document the console committed: version {}.",
+            V0 + 2
+        )) && html.contains("acme: daily_budget 50 → 1000"),
+        "{html}"
+    );
+    assert!(
+        !html.contains("No change from the newest document the console committed"),
+        "{html}"
+    );
+    assert!(
+        html.contains(&format!(
+            "names version {}: the newest document this console has exported since it started is \
+             version {}, and the diff against it follows.",
+            V0 + 2,
+            V0 + 1
+        )) && html.contains(&format!(
+            "No change from the newest document this console has exported since it started: version {}.",
+            V0 + 1
+        )),
+        "{html}"
+    );
+}
+
 /// A document logged again, by a second acceptance or another process,
 /// adds nothing to a read: the largest, logged four times, more lines than a
 /// read takes, still reads back whole.
@@ -626,9 +706,10 @@ async fn an_import_from_the_write_log_names_the_logged_digest_and_diffs_against_
 /// committed label confirms is never what an import is diffed against,
 /// however new its version or its lines: a forged copy of the newest
 /// document with one key added would otherwise be diffed against itself
-/// and show nothing. This process's own exports come before any label. The
-/// page flags an unconfirmed copy, and a version the log names with two
-/// digests.
+/// and show nothing. A label that outranks this process's own newest export
+/// is named as untrusted, and the diff against that export follows, which
+/// no label can stand in for. The page flags an unconfirmed copy, and a
+/// version the log names with two digests.
 #[tokio::test]
 async fn a_logged_copy_nothing_confirms_is_never_the_diff_base() {
     let store = FakeStore::new(&World::new(vec![]));
@@ -696,7 +777,8 @@ async fn a_logged_copy_nothing_confirms_is_never_the_diff_base() {
     );
     assert!(html.contains("name=\"confirm_version\""), "{html}");
     // The console commits a document itself; then a forged label and a forged
-    // copy name a higher version. This process's own export stays the base.
+    // copy name a higher version. The diff against this process's own export
+    // still shows the planted key.
     let committed_text = doc_text(V0 + 7, 1_000);
     store.answer_post(
         StatusCode::OK,
@@ -723,9 +805,22 @@ async fn a_logged_copy_nothing_confirms_is_never_the_diff_base() {
     let html = from_log(V0, digest_of(&planted)).await;
     assert!(
         html.contains(&format!(
-            "Against the newest document the console committed: version {}",
+            "Only a committed label, which is untrusted input, names version {}: the newest \
+             document this console has exported since it started is version {}",
+            V0 + 50,
             V0 + 7
         )),
+        "{html}"
+    );
+    let exported = html
+        .split(&format!(
+            "Against the newest document this console has exported since it started: version {}.",
+            V0 + 7
+        ))
+        .nth(1)
+        .unwrap_or_else(|| panic!("no diff against the export: {html}"));
+    assert!(
+        exported.contains("acme: key added k-planted (planted)"),
         "{html}"
     );
 }
@@ -1570,28 +1665,43 @@ async fn every_page_reports_the_stores_conditions_alike() {
 
 // ─── The reseed ─────────────────────────────────────────────────────────────
 
-/// The table a reseed page binds its form to, as a browser reads it off the
-/// page.
-async fn table_on_page(state: &AppState, cookie: &str) -> String {
-    let (_, page) = get_page(state, cookie, "/lb/clients/reseed").await;
-    page.split("name=\"table\" value=\"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-        .expect("the reseed form is bound to a table")
-        .to_string()
+/// What a reseed form is bound to: the table it was filled in over, and
+/// when.
+#[derive(Clone, Default)]
+struct Bound {
+    table: String,
+    issued: String,
 }
 
-/// A reseed form as its page renders one, bound to `table`.
+/// The binding a reseed page renders into its form, as a browser reads it
+/// off the page.
+async fn bound_on_page(state: &AppState, cookie: &str) -> Bound {
+    let (_, page) = get_page(state, cookie, "/lb/clients/reseed").await;
+    let hidden = |name: &str| {
+        page.split(&format!("name=\"{name}\" value=\""))
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("the reseed form is bound")
+            .to_string()
+    };
+    Bound {
+        table: hidden("table"),
+        issued: hidden("issued"),
+    }
+}
+
+/// A reseed form as its page renders one, bound to `bound`.
 fn reseed_form(
     csrf: &str,
-    table: &str,
+    bound: &Bound,
     sets: &[(&str, &str, bool)],
     extra: &[(&str, &str)],
 ) -> String {
     let mut pairs: Vec<(String, String)> = vec![
         ("csrf".into(), csrf.into()),
         ("reason".into(), "reseed after the wipe".into()),
-        ("table".into(), table.into()),
+        ("table".into(), bound.table.clone()),
+        ("issued".into(), bound.issued.clone()),
     ];
     for (i, (text, hash, complete)) in sets.iter().enumerate() {
         pairs.push(("set_text".into(), text.to_string()));
@@ -1613,99 +1723,123 @@ fn reseed_form(
 const CF_SET: &str = "r acme disabled 1791700000123000\nr beta enabled 1791700000124000\n";
 const K3S_SET: &str = "r acme disabled 1791700000123000\nr gamma disabled 1791700000125000\n";
 
-/// A reseed form is bound to the restrictions table it was filled in over,
-/// and is refused over any other: the override marks whatever the table
-/// holds complete. So an answer page reloaded after the reseed changed the
-/// table is refused, and so is one reloaded after a console restart and a
-/// later wipe, which an in-process record could not tell; a form bound to
-/// no table is refused too. Over an unchanged table it goes again, which can
-/// change nothing.
+/// A reseed form is sent once, and only over the restrictions table it was
+/// filled in over: the override marks whatever the table holds complete. It
+/// is refused once its table changed, and once anything may have been
+/// written since it was filled in, its own send included, even after a wipe
+/// brought the table back to the very state it was filled in over. After a
+/// restart the write log tells what this process no longer knows, and a
+/// write log that cannot be read refuses the form. A form filled in again
+/// goes.
 #[tokio::test]
-async fn a_reseed_form_is_bound_to_the_table_it_was_filled_in_over() {
-    let world = World::new(vec![("acme", RecordState::Disabled, 1_791_700_000_123_000)]);
+async fn a_reseed_form_is_sent_once_over_the_table_it_was_filled_in_over() {
+    // A wiped table: no records, no integrity record.
+    let mut world = World::new(vec![]);
+    world.full = false;
     let store = FakeStore::new(&world);
     store.answer_post(
         StatusCode::OK,
         json!({"status": 200, "written": [], "digests_added": 0, "digests_ignored": [], "integrity": "override", "cf_set_found": false, "reenable_by_hand": [], "client_store": "answered"}),
     );
-    let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
+    let metrics = quiet_fleet();
+    let state = store_state(&store, &metrics, &["admin-sub"]).await;
     let (cookie, csrf) = cookie_for(&state, "admin-sub");
-    let table = table_on_page(&state, &cookie).await;
+    let bound = bound_on_page(&state, &cookie).await;
     let phrase = "mark the restrictions complete without the CF set";
-    let sent = reseed_form(
-        &csrf,
-        &table,
-        &[("", &digest_of(""), true)],
-        &[("override", phrase)],
-    );
+    let sets = [("", digest_of(""), true)];
+    let sets: Vec<(&str, &str, bool)> = sets.iter().map(|(t, h, c)| (*t, h.as_str(), *c)).collect();
+    let sent = reseed_form(&csrf, &bound, &sets, &[("override", phrase)]);
     let send = |state: AppState, form: String| {
         let cookie = cookie.clone();
-        async move { post_form(&state, &cookie, "/lb/clients/reseed", form).await }
+        async move {
+            let resp = post_form(&state, &cookie, "/lb/clients/reseed", form).await;
+            match resp.status() {
+                StatusCode::OK => "sent".to_string(),
+                _ => flash_of(&state, &resp).msg,
+            }
+        }
     };
-    assert_eq!(
-        send(state.clone(), sent.clone()).await.status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        send(state.clone(), sent.clone()).await.status(),
-        StatusCode::OK
-    );
-    assert_eq!(store.posts().len(), 2, "over an unchanged table");
-    // A disable lands while the form is open: the table it was filled in
-    // over is gone, though the integrity record still matches.
-    let mut disabled = world.clone();
-    disabled
-        .records
-        .push(("beta", RecordState::Disabled, 1_791_700_000_124_000));
-    store.answer_gets(&[&disabled]);
-    let resp = send(state.clone(), sent.clone()).await;
+    let restart = |state: &AppState| {
+        let mut restarted = state.clone();
+        let old = state.store.as_ref().unwrap();
+        restarted.store = Some(crate::state::StoreModule {
+            client: old.client.clone(),
+            metrics: old.metrics.clone(),
+            committed: std::sync::Arc::default(),
+            wrote_at: std::sync::Arc::default(),
+        });
+        restarted
+    };
+    let (first, lines) = captured(send(state.clone(), sent.clone())).await;
+    assert_eq!(first, "sent");
+    // Sent again over the same table: its own send is a write since.
     assert!(
-        flash_of(&state, &resp)
-            .msg
-            .contains("changed since this form was filled in")
+        send(state.clone(), sent.clone())
+            .await
+            .starts_with("Something may have been written")
     );
-    assert_eq!(store.posts().len(), 2);
-    // The reseed marked the table complete: its answer page reloaded is refused.
-    let mut reseeded = world.get_body();
-    reseeded["restrictions"]["integrity"]["established"] = json!({"via": "override",
+    // The override marked the table complete and a disable landed.
+    let mut middle = World::new(vec![("acme", RecordState::Disabled, T0)]).get_body();
+    middle["restrictions"]["integrity"]["established"] = json!({"via": "override",
         "actor": "ops@example.test", "reason": "reseed after the wipe",
         "at": "2026-11-08T12:00:00.000Z", "sets": [digest_of("")]});
-    *store.gets.lock().unwrap() = vec![reseeded.clone()];
-    let resp = send(state.clone(), sent.clone()).await;
+    *store.gets.lock().unwrap() = vec![middle];
+    let msg = send(state.clone(), sent.clone()).await;
     assert!(
-        flash_of(&state, &resp)
-            .msg
-            .contains("changed since this form was filled in"),
-        "{}",
-        flash_of(&state, &resp).msg
+        msg.contains("changed since this form was filled in"),
+        "{msg}"
     );
-    // The console restarts, and a later wipe takes acme's disable: the old
-    // page's form, with the browser's session, is refused still.
-    let mut wiped = reseeded;
-    wiped["restrictions"]["records"] = json!([]);
-    wiped["restrictions"]["integrity"]["matches"] = json!(false);
-    *store.gets.lock().unwrap() = vec![wiped];
-    let mut restarted = state.clone();
-    let old = state.store.as_ref().unwrap();
-    restarted.store = Some(crate::state::StoreModule {
-        client: old.client.clone(),
-        metrics: old.metrics.clone(),
-        committed: std::sync::Arc::default(),
-    });
-    let resp = send(restarted.clone(), sent.clone()).await;
-    assert!(
-        flash_of(&restarted, &resp)
-            .msg
-            .contains("changed since this form was filled in")
-    );
-    let unbound = reseed_form(&csrf, "", &[("", &digest_of(""), true)], &[]);
-    let resp = send(restarted.clone(), unbound).await;
-    assert!(
-        flash_of(&restarted, &resp)
-            .msg
-            .contains("changed since this form was filled in")
-    );
-    assert_eq!(store.posts().len(), 2, "nothing more was sent");
+    // A wipe takes the disable and the integrity record: the table is back
+    // to the very state the form was filled in over, and it is refused still.
+    *store.gets.lock().unwrap() = vec![world.get_body()];
+    let msg = send(state.clone(), sent.clone()).await;
+    assert!(msg.starts_with("Something may have been written"), "{msg}");
+    assert_eq!(store.posts().len(), 1, "sent once");
+    // After a restart, the write log holds the first send.
+    metrics.ship(&lines);
+    let restarted = restart(&state);
+    let msg = send(restarted.clone(), sent.clone()).await;
+    assert!(msg.starts_with("Something may have been written"), "{msg}");
+    // A write log that cannot be read refuses it too.
+    metrics.failing.lock().unwrap().push("write-log".into());
+    let msg = send(restart(&state), sent.clone()).await;
+    assert!(msg.contains("cannot be read from the write log"), "{msg}");
+    metrics.failing.lock().unwrap().clear();
+    assert_eq!(store.posts().len(), 1, "nothing more was sent");
+    // Bound to no table, to no time, or to a time more than a day back.
+    let fresh = bound_on_page(&restarted, &cookie).await;
+    let day_ago = (crate::session::now_us() - 24 * 3600 * 1_000_000 - 1).to_string();
+    for (bound, says) in [
+        (
+            Bound {
+                table: String::new(),
+                ..fresh.clone()
+            },
+            "changed since this form was filled in",
+        ),
+        (
+            Bound {
+                issued: String::new(),
+                ..fresh.clone()
+            },
+            "carries no time it was filled in",
+        ),
+        (
+            Bound {
+                issued: day_ago,
+                ..fresh.clone()
+            },
+            "more than a day ago",
+        ),
+    ] {
+        let msg = send(restarted.clone(), reseed_form(&csrf, &bound, &sets, &[])).await;
+        assert!(msg.contains(says), "{says}: {msg}");
+    }
+    assert_eq!(store.posts().len(), 1);
+    // Filled in again, it goes.
+    let again = reseed_form(&csrf, &fresh, &sets, &[("override", phrase)]);
+    assert_eq!(send(restarted.clone(), again).await, "sent");
+    assert_eq!(store.posts().len(), 2);
 }
 
 /// The form sends the sets as supplied, their line breaks as LF, each
@@ -1722,7 +1856,7 @@ async fn the_reseed_sends_the_supplied_sets() {
     let (status, page) = get_page(&state, &cookie, "/lb/clients/reseed").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(page.matches("name=\"set_text\"").count(), 8, "{page}");
-    let table = table_on_page(&state, &cookie).await;
+    let bound = bound_on_page(&state, &cookie).await;
     let crlf = CF_SET.replace('\n', "\r\n");
     let (cf, k3s) = (digest_of(CF_SET), digest_of(K3S_SET));
     let resp = post_form(
@@ -1731,7 +1865,7 @@ async fn the_reseed_sends_the_supplied_sets() {
         "/lb/clients/reseed",
         reseed_form(
             &csrf,
-            &table,
+            &bound,
             &[(&crlf, &cf, true), ("", "", false), (K3S_SET, &k3s, true)],
             &[],
         ),
@@ -1760,7 +1894,7 @@ async fn the_reseed_override_is_typed_exactly_and_recorded_on_the_write_log() {
     );
     let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
     let (cookie, csrf) = cookie_for(&state, "admin-sub");
-    let table = table_on_page(&state, &cookie).await;
+    let bound = bound_on_page(&state, &cookie).await;
     let empty = digest_of("");
     let resp = post_form(
         &state,
@@ -1768,7 +1902,7 @@ async fn the_reseed_override_is_typed_exactly_and_recorded_on_the_write_log() {
         "/lb/clients/reseed",
         reseed_form(
             &csrf,
-            &table,
+            &bound,
             &[("", &empty, true)],
             &[("override", "mark it complete")],
         ),
@@ -1783,7 +1917,7 @@ async fn the_reseed_override_is_typed_exactly_and_recorded_on_the_write_log() {
         "/lb/clients/reseed",
         reseed_form(
             &csrf,
-            &table,
+            &bound,
             &[(K3S_SET, &digest_of(K3S_SET), true)],
             &[("override", phrase)],
         ),
@@ -1825,12 +1959,12 @@ async fn the_reseed_answer_lists_the_names_to_re_enable() {
     );
     let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
     let (cookie, csrf) = cookie_for(&state, "admin-sub");
-    let table = table_on_page(&state, &cookie).await;
+    let bound = bound_on_page(&state, &cookie).await;
     let resp = post_form(
         &state,
         &cookie,
         "/lb/clients/reseed",
-        reseed_form(&csrf, &table, &[(CF_SET, &digest_of(K3S_SET), true)], &[]),
+        reseed_form(&csrf, &bound, &[(CF_SET, &digest_of(K3S_SET), true)], &[]),
     )
     .await;
     assert!(flash_of(&state, &resp).msg.contains("does not hash"));
@@ -1839,7 +1973,7 @@ async fn the_reseed_answer_lists_the_names_to_re_enable() {
         &state,
         &cookie,
         "/lb/clients/reseed",
-        reseed_form(&csrf, &table, &[(CF_SET, &digest_of(CF_SET), true)], &[]),
+        reseed_form(&csrf, &bound, &[(CF_SET, &digest_of(CF_SET), true)], &[]),
     )
     .await;
     let html = body_string(resp).await;
@@ -1886,12 +2020,12 @@ async fn a_reseed_answer_never_reads_a_missing_count_as_zero() {
         store.answer_post(StatusCode::OK, answer);
         let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
         let (cookie, csrf) = cookie_for(&state, "admin-sub");
-        let table = table_on_page(&state, &cookie).await;
+        let bound = bound_on_page(&state, &cookie).await;
         let resp = post_form(
             &state,
             &cookie,
             "/lb/clients/reseed",
-            reseed_form(&csrf, &table, &[(CF_SET, &digest_of(CF_SET), true)], &[]),
+            reseed_form(&csrf, &bound, &[(CF_SET, &digest_of(CF_SET), true)], &[]),
         )
         .await;
         let html = body_string(resp).await;

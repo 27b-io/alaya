@@ -75,6 +75,14 @@ pub fn now_epoch() -> i64 {
         .unwrap_or(0)
 }
 
+/// Now, in Unix microseconds.
+pub fn now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 /// 32 bytes of CSPRNG, base64url — used for state, nonce, CSRF, PKCE verifier.
 pub fn random_token() -> String {
     let mut b = [0u8; 32];

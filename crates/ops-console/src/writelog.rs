@@ -41,6 +41,14 @@ const DOCUMENT_LINE: &str = "client-store document";
 /// Most documents the import page lists.
 const LISTED: usize = 50;
 
+/// The messages of the write log's lines for a request the store may have
+/// applied: one it committed, one whose outcome nobody knows, and a pitr it
+/// accepted. `routes/clients.rs` logs every request it sends with one of
+/// these, or as a refusal, which wrote nothing.
+pub const COMMITTED: &str = "client-store write committed";
+pub const UNKNOWN: &str = "client-store write outcome unknown";
+pub const ACCEPTED: &str = "client-store write accepted: its recovery marker says how it ends";
+
 /// More lines than any document has: a 2 MiB document is 304 parts. A read
 /// takes each distinct line once, so a document logged again adds nothing to
 /// it; only a line that differs, a damaged or forged one, can.
@@ -73,16 +81,26 @@ pub fn log_document(version: u64, digest: &str, text: &str) {
     }
 }
 
+/// `text`, when it is the exact bytes of the document `digest` names.
+pub fn carried<'a>(text: Option<&'a str>, digest: &str) -> Option<&'a str> {
+    text.filter(|t| digest_of(t) == digest)
+}
+
+/// What the operator is told of a document the write log holds no copy of.
+pub fn unlogged(why: &str) -> String {
+    format!("Its document is not on the write log: {why}.")
+}
+
 /// Log the document a store answer carries as committed, once its bytes hash
-/// to the digest the answer reports. Otherwise say why the write log holds no
-/// copy of it: a store from before it returned the bytes sends none. True
-/// when it logged the document.
+/// to the digest the answer reports (`carried`). Otherwise say why the write
+/// log holds no copy of it: a store from before it returned the bytes sends
+/// none. True when it logged the document.
 pub fn log_committed(version: u64, digest: &str, text: Option<&str>) -> bool {
+    if let Some(t) = carried(text, digest) {
+        log_document(version, digest, t);
+        return true;
+    }
     match text {
-        Some(t) if digest_of(t) == digest => {
-            log_document(version, digest, t);
-            return true;
-        }
         Some(_) => tracing::warn!(
             target: "ops_console::write_log",
             version,
@@ -183,7 +201,9 @@ pub struct Listing {
 }
 
 /// The documents the write log holds from the last 30 days, each once,
-/// highest version first: the newest is the last one the console committed.
+/// highest version first. Which of them is the newest commit is never read
+/// from this listing: the document ops name it from the console's own
+/// exports and its committed labels (`newest_known`).
 pub async fn logged(metrics: &MetricsClient) -> Result<Listing, String> {
     let query = format!(
         "_time:30d target:=\"ops_console::write_log\" fields.message:=\"{DOCUMENT_LINE}\" \
@@ -218,6 +238,29 @@ pub async fn logged(metrics: &MetricsClient) -> Result<Listing, String> {
     }
     out.docs.sort_by_key(|d| std::cmp::Reverse(d.version));
     Ok(out)
+}
+
+/// Whether the write log holds a request the store may have applied, logged
+/// at or after `since_us`, in Unix microseconds.
+pub async fn wrote_since(metrics: &MetricsClient, since_us: u64) -> Result<bool, String> {
+    let since = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(since_us) * 1000)
+        .ok()
+        .and_then(|t| {
+            t.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .ok_or("the time is past what the console can name")?;
+    // An RFC 3339 time and three fixed messages: nothing in either can
+    // change the query.
+    let query = format!(
+        "_time:>={since} target:=\"ops_console::write_log\" \
+         fields.message:in(\"{COMMITTED}\",\"{UNKNOWN}\",\"{ACCEPTED}\") | limit 1"
+    );
+    let lines = metrics
+        .write_log(&query, 1)
+        .await
+        .map_err(|e| e.detail().to_string())?;
+    Ok(!lines.is_empty())
 }
 
 /// One logged document's exact bytes, joined from its lines and checked.

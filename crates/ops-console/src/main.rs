@@ -4172,12 +4172,14 @@ mod tests {
                 let empty_set = crate::writelog::digest_of("");
                 // A form bound to the page it was rendered on carries that
                 // binding back, as a browser would.
-                let table = page
-                    .split("name=\"table\" value=\"")
-                    .nth(1)
-                    .and_then(|s| s.split('"').next())
-                    .unwrap_or_default()
-                    .to_string();
+                let hidden = |name: &str| {
+                    page.split(&format!("name=\"{name}\" value=\""))
+                        .nth(1)
+                        .and_then(|s| s.split('"').next())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let (table, issued) = (hidden("table"), hidden("issued"));
                 let sink = form(&[
                     ("csrf", &csrf),
                     ("target", &target),
@@ -4187,6 +4189,7 @@ mod tests {
                     ("set_hash", &empty_set),
                     ("set_complete", "1"),
                     ("table", &table),
+                    ("issued", &issued),
                     ("action", "disable"),
                     ("op", "delete"),
                     ("confirm_signal", "write anyway"),

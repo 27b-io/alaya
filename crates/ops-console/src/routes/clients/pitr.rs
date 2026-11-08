@@ -943,9 +943,9 @@ async fn rewound(m: &StoreModule, store: &Value, id: &str) -> Option<Against> {
     })
 }
 
-/// A document's diff against the newest document the console committed, by
-/// that document's version, or why there is none.
-type Against = Result<(u64, Vec<Value>), String>;
+/// A document's diff against the newest document the console committed, or
+/// why there is none.
+type Against = Result<super::document::NewestDiff, String>;
 
 /// The marker's page body, and whether it may still change on its own.
 fn marker_view(r: &Reading, id: &str, rewound: Option<&Against>, csrf: &str) -> (AnyView, bool) {
@@ -1259,8 +1259,9 @@ pub async fn pitr_accept(
     let unlogged = match log_recovery(m, &store, newest).await {
         Ok(()) => String::new(),
         Err(why) => format!(
-            " Its document is not on the write log: {why}. An instance's install log holds it, \
-             and accepting again logs it while the store still serves it."
+            " {} An instance's install log holds it, and accepting again logs it while the store \
+             still serves it.",
+            writelog::unlogged(&why)
         ),
     };
     let doc = Doc {

@@ -35,8 +35,6 @@
 //! write-log line alone.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -652,7 +650,7 @@ pub async fn preview(
 /// committed. Both `None` for every other op.
 struct Imported<'a> {
     source: Option<String>,
-    against: Option<&'a Result<(u64, Vec<Value>), String>>,
+    against: Option<&'a Result<NewestDiff, String>>,
 }
 
 fn preview_view(
@@ -824,17 +822,14 @@ pub async fn commit(
     // (`merged_after_commit`), the answer carries the catch-up's version,
     // digest and bytes, which readers converge on. The first is not
     // exported: an instance that installed it in between raises the
-    // unmatched-install alert, which is the safe side. Whether its document
-    // reached the write log comes back for the operator.
-    let logged = Arc::new(AtomicBool::new(false));
+    // unmatched-install alert, which is the safe side.
     let export = {
-        let (ops, logged) = (ops.clone(), Arc::clone(&logged));
+        let ops = ops.clone();
         move |m: &StoreModule, body: &Value| {
             if let Ok(c) = commit_of(body, &ops) {
                 m.committed.document(c.version, &c.digest);
                 let text = body.get("text").and_then(Value::as_str);
-                let done = writelog::log_committed(c.version, &c.digest, text);
-                logged.store(done, Ordering::Relaxed);
+                writelog::log_committed(c.version, &c.digest, text);
             }
         }
     };
@@ -879,10 +874,19 @@ pub async fn commit(
         digest: c.digest.clone(),
     };
     let to = effect_href(&[], Some(&doc));
-    // The task that sent the write has finished, so its answer is final.
-    let unlogged = (!logged.load(Ordering::Relaxed)).then_some(UNLOGGED);
+    // The export logged the document from this same answer exactly when it
+    // carries the document's bytes. Without them, an import after a wipe,
+    // which looks on the write log first, needs them pasted.
+    let unlogged = writelog::carried(body.get("text").and_then(Value::as_str), &c.digest)
+        .is_none()
+        .then(|| {
+            format!(
+                "{} Should an import need it, paste it from an instance's install log.",
+                writelog::unlogged("the store's answer carries no bytes that hash to it")
+            )
+        });
     if !c.keys.is_empty() {
-        return Ok(key_page(&session, &c, &to, unlogged));
+        return Ok(key_page(&session, &c, &to, unlogged.as_deref()));
     }
     let msg = format!(
         "Committed document version {}: {}.{} Confirming on every stack…",
@@ -892,11 +896,6 @@ pub async fn commit(
     );
     Ok(flash_redirect(jar, secure, "ok", msg, &to))
 }
-
-/// What the operator is told of a commit whose document is not on the write
-/// log, where an import after a wipe looks for it first.
-const UNLOGGED: &str = "Its document is not on the write log: the store's answer carries no bytes \
-     that hash to it. Should an import need it, paste it from an instance's install log.";
 
 /// A write that may or may not have applied. Nothing is exported as
 /// committed: an unmatched-install alert on the console's own write is the
@@ -1089,51 +1088,113 @@ fn pasted(raw: &str) -> Result<(String, String), String> {
     Ok((text, from.into()))
 }
 
+/// A document's diff against the newest document the console committed.
+pub(super) struct NewestDiff {
+    /// The newest document's version.
+    pub(super) version: u64,
+    /// What the document changes against it, or why that cannot be shown.
+    pub(super) changes: Result<Vec<Value>, String>,
+    /// When only a committed label names `version`, newer than every document
+    /// this process exported: the newest export's version, and the
+    /// document's diff against it, which no label can stand in for.
+    pub(super) exported: Option<(u64, Result<Vec<Value>, String>)>,
+}
+
 /// A document's diff against the newest document the console committed, as
 /// its write log holds it: anything this diff shows, the document changes.
 /// An import is checked against it, and so is a finished point-in-time
 /// recovery. The newest commit is named first, and only its own bytes are
 /// the base: an older copy standing in for a missing one would show no
 /// change for a document that undoes the newest commit.
-pub(super) async fn against_newest(
-    m: &StoreModule,
-    text: &str,
-) -> Result<(u64, Vec<Value>), String> {
+pub(super) async fn against_newest(m: &StoreModule, text: &str) -> Result<NewestDiff, String> {
     let labels = committed::read(&m.metrics).await;
-    let (version, digest) =
-        newest_known(m, labels.as_deref().unwrap_or_default()).ok_or_else(|| match &labels {
-            Ok(_) => "no document the console committed is known: this process exported none, \
+    let Newest {
+        version,
+        digest,
+        outranked,
+    } = newest_known(m, labels.as_deref().unwrap_or_default()).ok_or_else(|| match &labels {
+        Ok(_) => "no document the console committed is known: this process exported none, \
                       and the metrics store shows no committed label from the last 30 days"
-                .to_string(),
-            Err(e) => format!(
-                "no document the console committed is known: this process exported none, and \
+            .to_string(),
+        Err(e) => format!(
+            "no document the console committed is known: this process exported none, and \
                  the committed labels could not be read ({e})"
-            ),
-        })?;
-    let base = writelog::document(&m.metrics, version, &digest)
-        .await
-        .map_err(|e| {
-            format!(
-                "the newest document the console committed, version {version}, cannot be read \
-                 from the write log ({e}), and no older copy stands in for it"
-            )
-        })?;
+        ),
+    })?;
+    let changes = diff_with(m, version, &digest, text).await.map_err(|e| {
+        format!(
+            "the newest document the console committed, version {version}, cannot be read from \
+             the write log ({e}), and no older copy stands in for it"
+        )
+    });
+    let exported = match outranked {
+        Some((v, d)) => Some((
+            v,
+            diff_with(m, v, &d, text)
+                .await
+                .map_err(|e| format!("its copy cannot be read from the write log ({e})")),
+        )),
+        None => None,
+    };
+    Ok(NewestDiff {
+        version,
+        changes,
+        exported,
+    })
+}
+
+/// `text`'s diff against the logged copy of one document.
+async fn diff_with(
+    m: &StoreModule,
+    version: u64,
+    digest: &str,
+    text: &str,
+) -> Result<Vec<Value>, String> {
+    let base = writelog::document(&m.metrics, version, digest).await?;
     let json = |t: &str| {
         serde_json::from_str::<Value>(t).map_err(|_| "a document is not JSON".to_string())
     };
-    let changes = client_diff(&json(&base)?, &json(text)?);
-    Ok((version, changes))
+    Ok(client_diff(&json(&base)?, &json(text)?))
 }
 
-/// The newest document the console committed, by version and digest: the
-/// newest this process exported, or else the newest a committed label names.
-fn newest_known(m: &StoreModule, labels: &[committed::Label]) -> Option<(u64, String)> {
-    m.committed.newest().or_else(|| {
-        labels
-            .iter()
-            .max_by_key(|l| l.version)
-            .map(|l| (l.version, l.digest.clone()))
-    })
+/// The newest document the console committed, by version and digest.
+#[derive(Debug, PartialEq, Eq)]
+struct Newest {
+    version: u64,
+    digest: String,
+    /// This process's newest export, when only a committed label names the
+    /// newer document: its version and digest.
+    outranked: Option<(u64, String)>,
+}
+
+fn newest_known(m: &StoreModule, labels: &[committed::Label]) -> Option<Newest> {
+    newest_of(m.committed.newest(), labels)
+}
+
+/// The higher of this process's newest export and the newest committed
+/// label, the export on a tie, since a label is untrusted input. Neither
+/// alone is the newest: a restart empties the exports, and accepting a
+/// recovery again puts an older version back in them. An export a label
+/// outranks is kept, and the page shows the diff against it too.
+fn newest_of(exported: Option<(u64, String)>, labels: &[committed::Label]) -> Option<Newest> {
+    let labelled = labels.iter().max_by_key(|l| l.version);
+    match (exported, labelled) {
+        (Some(e), Some(l)) if l.version > e.0 => Some(Newest {
+            version: l.version,
+            digest: l.digest.clone(),
+            outranked: Some(e),
+        }),
+        (Some((version, digest)), _) => Some(Newest {
+            version,
+            digest,
+            outranked: None,
+        }),
+        (None, l) => l.map(|l| Newest {
+            version: l.version,
+            digest: l.digest.clone(),
+            outranked: None,
+        }),
+    }
 }
 
 fn labelled(labels: &[committed::Label], d: &writelog::Logged) -> bool {
@@ -1143,42 +1204,30 @@ fn labelled(labels: &[committed::Label], d: &writelog::Logged) -> bool {
 }
 
 /// The diff against the newest document the console committed, with a
-/// warning for each name it drops that is still in a stack's TOML.
+/// warning for each name it drops that is still in a stack's TOML. When only
+/// a label names that document, the diff against this process's own newest
+/// export follows it.
 pub(super) fn against_view(
-    against: &Result<(u64, Vec<Value>), String>,
+    against: &Result<NewestDiff, String>,
     toml: &Result<BTreeMap<String, BTreeSet<String>>, String>,
 ) -> AnyView {
+    const NEWEST: &str = "the newest document the console committed";
     let body = match against {
-        Ok((version, changes)) if changes.is_empty() => view! {
-            <p class="text-sm">{format!(
-                "No change from the newest document the console committed: version {version}."
-            )}</p>
-        }
-        .into_any(),
-        Ok((version, changes)) => {
-            let items = diff_lines(changes)
-                .into_iter()
-                .map(|l| view! { <li class="font-mono text-xs break-all">{l}</li> })
-                .collect_view();
-            let what =
-                format!("Against the newest document the console committed: version {version}.");
-            let notes = toml_notes(changes, toml)
-                .into_iter()
-                .map(|n| view! { <Notice status=Status::Warn label="toml">{n}</Notice> })
-                .collect_view();
-            view! {
-                <p class="text-sm">{what}</p>
-                <ul class="space-y-1">{items}</ul>
-                <div class="space-y-2">{notes}</div>
-            }
-            .into_any()
-        }
-        Err(why) => {
-            let why = format!(
-                "No diff against the newest document the console committed: {why}. Check the \
-                 document against the store's history and the instances' install logs."
-            );
-            view! { <Notice status=Status::Warn label="no diff">{why}</Notice> }.into_any()
+        Err(why) => diff_block(NEWEST, None, &Err(why.clone()), toml),
+        Ok(a) => {
+            let exported = a.exported.as_ref().map(|(e, changes)| {
+                let text = format!(
+                    "Only a committed label, which is untrusted input, names version {}: the \
+                     newest document this console has exported since it started is version {e}, \
+                     and the diff against it follows.",
+                    a.version
+                );
+                view! {
+                    <Notice status=Status::Warn label="newest">{text}</Notice>
+                    {diff_block("the newest document this console has exported since it started", Some(*e), changes, toml)}
+                }
+            });
+            view! { {diff_block(NEWEST, Some(a.version), &a.changes, toml)} {exported} }.into_any()
         }
     };
     view! {
@@ -1188,6 +1237,47 @@ pub(super) fn against_view(
         </div>
     }
     .into_any()
+}
+
+/// A document's diff against `base`, at `version` when one is known: its
+/// changes, or why none can be shown.
+fn diff_block(
+    base: &str,
+    version: Option<u64>,
+    changes: &Result<Vec<Value>, String>,
+    toml: &Result<BTreeMap<String, BTreeSet<String>>, String>,
+) -> AnyView {
+    let at = version
+        .map(|v| format!(": version {v}"))
+        .unwrap_or_default();
+    match changes {
+        Ok(changes) if changes.is_empty() => {
+            view! { <p class="text-sm">{format!("No change from {base}{at}.")}</p> }.into_any()
+        }
+        Ok(changes) => {
+            let items = diff_lines(changes)
+                .into_iter()
+                .map(|l| view! { <li class="font-mono text-xs break-all">{l}</li> })
+                .collect_view();
+            let notes = toml_notes(changes, toml)
+                .into_iter()
+                .map(|n| view! { <Notice status=Status::Warn label="toml">{n}</Notice> })
+                .collect_view();
+            view! {
+                <p class="text-sm">{format!("Against {base}{at}.")}</p>
+                <ul class="space-y-1">{items}</ul>
+                <div class="space-y-2">{notes}</div>
+            }
+            .into_any()
+        }
+        Err(why) => {
+            let why = format!(
+                "No diff against {base}: {why}. Check the document against the store's history \
+                 and the instances' install logs."
+            );
+            view! { <Notice status=Status::Warn label="no diff">{why}</Notice> }.into_any()
+        }
+    }
 }
 
 /// What changed from one document to another, in the shape of the store's
@@ -1273,7 +1363,8 @@ pub async fn import_page(
     );
     // Each logged copy, marked as the console committed it or not, and the
     // newest commit, whose copy every preview diffs against.
-    let newest = newest_known(m, labels.as_deref().unwrap_or_default());
+    let newest =
+        newest_known(m, labels.as_deref().unwrap_or_default()).map(|n| (n.version, n.digest));
     let logged = logged.map(|l| {
         let labels = labels.as_deref().unwrap_or_default();
         let offered = l
@@ -2228,5 +2319,44 @@ mod tests {
         );
         // Nothing dropped: nothing to say, readable or not.
         assert!(toml_notes(&diff[2..], &Err("down".into())).is_empty());
+    }
+
+    /// The newest is the higher of this process's newest export and the
+    /// newest label: a label outranks an export only when strictly newer,
+    /// and then the export it outranked is named.
+    #[test]
+    fn the_newest_is_the_higher_of_the_newest_export_and_the_newest_label() {
+        let (d, e) = ("d".repeat(64), "e".repeat(64));
+        let label = |version: u64, digest: &str| committed::Label {
+            version,
+            digest: digest.to_string(),
+            secs: 1_794_000_000,
+        };
+        let newest = |version: u64, digest: &str, outranked: Option<(u64, String)>| {
+            Some(Newest {
+                version,
+                digest: digest.to_string(),
+                outranked,
+            })
+        };
+        assert_eq!(newest_of(None, &[]), None);
+        assert_eq!(newest_of(Some((9, d.clone())), &[]), newest(9, &d, None));
+        let labels = [label(8, &e), label(10, &e)];
+        assert_eq!(newest_of(None, &labels), newest(10, &e, None));
+        // An older export, as accepting an old recovery again leaves one.
+        assert_eq!(
+            newest_of(Some((9, d.clone())), &labels),
+            newest(10, &e, Some((9, d.clone())))
+        );
+        // A newer export, and a tie, which the export wins whatever the
+        // label's digest.
+        assert_eq!(
+            newest_of(Some((11, d.clone())), &labels),
+            newest(11, &d, None)
+        );
+        assert_eq!(
+            newest_of(Some((10, d.clone())), &labels),
+            newest(10, &d, None)
+        );
     }
 }
