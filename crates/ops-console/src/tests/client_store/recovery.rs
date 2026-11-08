@@ -1745,6 +1745,10 @@ async fn a_reseed_form_is_sent_once_over_the_table_it_was_filled_in_over() {
     let state = store_state(&store, &metrics, &["admin-sub"]).await;
     let (cookie, csrf) = cookie_for(&state, "admin-sub");
     let bound = bound_on_page(&state, &cookie).await;
+    // The time a form names comes before the table it was read with: a write
+    // answered after the read shows in it, or came after that time.
+    let read_at = store.answered_gets.lock().unwrap()[0];
+    assert!(bound.issued.parse::<u64>().unwrap() <= read_at);
     let phrase = "mark the restrictions complete without the CF set";
     let sets = [("", digest_of(""), true)];
     let sets: Vec<(&str, &str, bool)> = sets.iter().map(|(t, h, c)| (*t, h.as_str(), *c)).collect();
@@ -1809,6 +1813,7 @@ async fn a_reseed_form_is_sent_once_over_the_table_it_was_filled_in_over() {
     // Bound to no table, to no time, or to a time more than a day back.
     let fresh = bound_on_page(&restarted, &cookie).await;
     let day_ago = (crate::session::now_us() - 24 * 3600 * 1_000_000 - 1).to_string();
+    let to_come = (crate::session::now_us() + 60_000_000).to_string();
     for (bound, says) in [
         (
             Bound {
@@ -1830,6 +1835,13 @@ async fn a_reseed_form_is_sent_once_over_the_table_it_was_filled_in_over() {
                 ..fresh.clone()
             },
             "more than a day ago",
+        ),
+        (
+            Bound {
+                issued: to_come,
+                ..fresh.clone()
+            },
+            "has not come yet",
         ),
     ] {
         let msg = send(restarted.clone(), reseed_form(&csrf, &bound, &sets, &[])).await;
@@ -1856,6 +1868,75 @@ async fn a_reseed_form_is_sent_once_over_the_table_it_was_filled_in_over() {
     *store.gets.lock().unwrap() = vec![world.get_body()];
     assert_eq!(send(restarted.clone(), again).await, "sent");
     assert_eq!(store.posts().len(), 2);
+}
+
+/// Two sends of one form at once, as a double click makes, go once: the form
+/// is claimed in one atomic step just before it is sent.
+#[tokio::test]
+async fn a_reseed_form_sent_twice_at_once_goes_once() {
+    let mut world = World::new(vec![]);
+    world.full = false;
+    let store = FakeStore::new(&world);
+    store.answer_post(
+        StatusCode::OK,
+        json!({"status": 200, "written": [], "digests_added": 0, "digests_ignored": [], "integrity": "override", "cf_set_found": false, "reenable_by_hand": [], "client_store": "answered"}),
+    );
+    let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
+    let (cookie, csrf) = cookie_for(&state, "admin-sub");
+    let bound = bound_on_page(&state, &cookie).await;
+    let form = reseed_form(
+        &csrf,
+        &bound,
+        &[("", &digest_of(""), true)],
+        &[(
+            "override",
+            "mark the restrictions complete without the CF set",
+        )],
+    );
+    let (a, b) = tokio::join!(
+        post_form(&state, &cookie, "/lb/clients/reseed", form.clone()),
+        post_form(&state, &cookie, "/lb/clients/reseed", form),
+    );
+    let statuses = [a.status(), b.status()];
+    assert_eq!(store.posts().len(), 1, "{statuses:?}");
+    assert!(
+        statuses.contains(&StatusCode::OK) && statuses.contains(&StatusCode::SEE_OTHER),
+        "{statuses:?}"
+    );
+}
+
+/// A write this process sent after a form was filled in refuses the form,
+/// before the write log has its line: the table it touched need not be the
+/// restrictions table at all.
+#[tokio::test]
+async fn a_write_answered_after_the_form_was_filled_in_refuses_it() {
+    let mut world = World::new(vec![]);
+    world.full = false;
+    let store = FakeStore::new(&world);
+    store.answer_post(
+        StatusCode::OK,
+        json!({"status": 200, "version": V0 + 1, "digest": D1, "diff": [], "keys": []}),
+    );
+    let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
+    let (cookie, csrf) = cookie_for(&state, "admin-sub");
+    let bound = bound_on_page(&state, &cookie).await;
+    let delete = doc_form(&csrf, &[("op", "delete"), ("name", "acme")]);
+    let resp = post_form(&state, &cookie, "/lb/clients/commit", delete).await;
+    assert!(
+        flash_of(&state, &resp)
+            .msg
+            .starts_with("Committed document version")
+    );
+    let form = reseed_form(&csrf, &bound, &[("", &digest_of(""), true)], &[]);
+    let resp = post_form(&state, &cookie, "/lb/clients/reseed", form).await;
+    assert!(
+        flash_of(&state, &resp)
+            .msg
+            .starts_with("Something may have been written"),
+        "{}",
+        flash_of(&state, &resp).msg
+    );
+    assert_eq!(store.posts().len(), 1, "only the document write");
 }
 
 /// The form sends the sets as supplied, their line breaks as LF, each

@@ -244,6 +244,8 @@ pub(crate) struct FakeStore {
     pub posts: Arc<Mutex<Vec<(StatusCode, Value)>>>,
     pub post_page: Arc<Mutex<Option<StatusCode>>>,
     pub log: Log,
+    /// When each `GET` was answered, in Unix microseconds.
+    pub answered_gets: Arc<Mutex<Vec<u64>>>,
 }
 
 impl FakeStore {
@@ -256,6 +258,7 @@ impl FakeStore {
                 json!({"status": 200, "results": [], "records_version": 0}),
             )])),
             log: Log::default(),
+            answered_gets: Arc::default(),
         }
     }
 
@@ -317,7 +320,12 @@ impl FakeStore {
                     );
                 }
                 if method == "GET" {
-                    return (StatusCode::OK, axum::Json(next(&me.gets)));
+                    let body = next(&me.gets);
+                    me.answered_gets
+                        .lock()
+                        .unwrap()
+                        .push(crate::session::now_us());
+                    return (StatusCode::OK, axum::Json(body));
                 }
                 if let Some(status) = *me.post_page.lock().unwrap() {
                     return (status, axum::Json(Value::Null));

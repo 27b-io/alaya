@@ -12,13 +12,14 @@
 //!
 //! A form is therefore sent once, and only over the table it was filled in
 //! over. It carries a digest of that table (`table_of`) and the time it was
-//! filled in. It is refused when the table differs, or when anything may
-//! have been written to the store since that time, its own send included:
-//! a write and a wipe can bring the table back to the very state it was
-//! filled in over, and the form would then be sent over a write its
-//! operator never saw. Writes since are read from this process's own mark
-//! and from the write log, which survives a restart; a write log that
-//! cannot be read refuses the form, and leaves the table as it is.
+//! filled in, taken before the table was read. It is refused when the table
+//! differs, or when a write the store may have applied was answered since
+//! that time, its own send included: a write and a wipe can bring the table
+//! back to the very state it was filled in over, and the form would then be
+//! sent over a write its operator never saw. Such writes are read from this
+//! process's own mark, which a form claims in one atomic step just before
+//! it is sent, and from the write log, which survives a restart; a write
+//! log that cannot be read refuses the form, and leaves the table as it is.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
@@ -95,10 +96,13 @@ pub async fn reseed_page(
         return Ok((jar, Html(page_html(&session, flash, not_configured()))));
     };
     let header = sub_header("Reseed the restrictions".into(), RESEED_ABOUT.into());
+    // Before the read: a write answered after it shows in the table read, or
+    // came after this time.
+    let issued = now_us();
     let body = match m.client.read().await {
         Ok(store) => {
             let form = match table_of(&store) {
-                Ok(table) => reseed_form(&session.csrf, &table, now_us()).into_any(),
+                Ok(table) => reseed_form(&session.csrf, &table, issued).into_any(),
                 Err(why) => {
                     let why =
                         format!("No form can be bound to the table, so none is offered: {why}.");
@@ -323,7 +327,16 @@ pub async fn reseed(
                 .into(),
         ));
     };
-    if now_us().saturating_sub(issued) > MAX_AGE_US {
+    let at = now_us();
+    if issued > at {
+        return Ok(refuse(
+            jar,
+            "The form names a time it was filled in that has not come yet: reload the page and \
+             fill it in again."
+                .into(),
+        ));
+    }
+    if at - issued > MAX_AGE_US {
         return Ok(refuse(
             jar,
             "The form was filled in more than a day ago: fill it in again.".into(),
@@ -356,9 +369,6 @@ pub async fn reseed(
             ));
         }
     }
-    if m.wrote_at.load(Ordering::Relaxed) >= issued {
-        return Ok(refuse(jar, WROTE_SINCE.into()));
-    }
     match writelog::wrote_since(&m.metrics, issued).await {
         Ok(false) => {}
         Ok(true) => return Ok(refuse(jar, WROTE_SINCE.into())),
@@ -372,6 +382,20 @@ pub async fn reseed(
                 ),
             ));
         }
+    }
+    // This process's own mark, read and claimed in one atomic step just before
+    // the send: refused when a write was answered since the form was filled
+    // in, and otherwise marked, so that of two sends of one form at once the
+    // second is refused. A send the store then refuses spends the form all
+    // the same.
+    let now = now_us();
+    let claimed = m
+        .wrote_at
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |mark| {
+            (mark < issued).then_some(now.max(mark))
+        });
+    if claimed.is_err() {
+        return Ok(refuse(jar, WROTE_SINCE.into()));
     }
     let mut import = json!({ "actor": actor_of(&session), "reason": reason, "sets": sets });
     if !typed.is_empty() {
