@@ -102,6 +102,8 @@ async fn every_committed_document_is_logged_whole_in_lines_under_16_kib() {
     );
     let (resp, lines) = captured(post_form(&state, &cookie, "/lb/clients/commit", update)).await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let msg = flash_of(&state, &resp).msg;
+    assert!(!msg.contains("not on the write log"), "{msg}");
     for line in lines.lines() {
         assert!(
             line.len() < 16 * 1024,
@@ -139,8 +141,27 @@ async fn every_committed_document_is_logged_whole_in_lines_under_16_kib() {
     assert_eq!(back, text);
 }
 
+/// A document logged again, by a second acceptance or another process,
+/// adds nothing to a read: the largest, logged four times, more lines than a
+/// read takes, still reads back whole.
+#[tokio::test]
+async fn a_document_logged_again_still_reads_back_whole() {
+    let text = json!({"schema": 1, "version": V0 + 1, "updated_at": "2026-10-11T06:00:00.000Z",
+        "clients": [{"name": "acme", "models": ["x".repeat(2_000_000)]}], "revoked_digests": []})
+    .to_string();
+    let metrics = FakeMetrics::default();
+    for _ in 0..4 {
+        log_and_ship(&metrics, V0 + 1, &text);
+    }
+    assert!(metrics.write_log.lock().unwrap().len() > 1000);
+    let back = writelog::document(&metrics_client(&metrics).await, V0 + 1, &digest_of(&text))
+        .await
+        .unwrap();
+    assert_eq!(back, text);
+}
+
 /// An answer whose bytes do not hash to its digest, or that carries none,
-/// puts no document on the write log, and says why.
+/// puts no document on the write log, says why, and tells the operator.
 #[tokio::test]
 async fn a_commit_without_matching_bytes_logs_no_document() {
     for (text, why) in [
@@ -160,8 +181,17 @@ async fn a_commit_without_matching_bytes_logs_no_document() {
         let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
         let (cookie, csrf) = cookie_for(&state, "admin-sub");
         let delete = doc_form(&csrf, &[("op", "delete"), ("name", "acme")]);
-        let (_, lines) = captured(post_form(&state, &cookie, "/lb/clients/commit", delete)).await;
+        let (resp, lines) =
+            captured(post_form(&state, &cookie, "/lb/clients/commit", delete)).await;
         assert!(lines.contains(why), "{lines}");
+        let msg = flash_of(&state, &resp).msg;
+        assert!(
+            msg.starts_with(&format!("Committed document version {}", V0 + 1))
+                && msg.contains(
+                    "Its document is not on the write log: the store's answer carries no bytes that hash to it."
+                ),
+            "{msg}"
+        );
         assert!(
             !lines.contains("\"message\":\"client-store document\""),
             "{lines}"
@@ -596,9 +626,9 @@ async fn an_import_from_the_write_log_names_the_logged_digest_and_diffs_against_
 /// committed label confirms is never what an import is diffed against,
 /// however new its version or its lines: a forged copy of the newest
 /// document with one key added would otherwise be diffed against itself
-/// and show nothing. This process's own exports, which nothing outside it
-/// can write, come before any label. The page flags an unconfirmed copy,
-/// and a version the log names with two digests.
+/// and show nothing. This process's own exports come before any label. The
+/// page flags an unconfirmed copy, and a version the log names with two
+/// digests.
 #[tokio::test]
 async fn a_logged_copy_nothing_confirms_is_never_the_diff_base() {
     let store = FakeStore::new(&World::new(vec![]));
@@ -696,6 +726,86 @@ async fn a_logged_copy_nothing_confirms_is_never_the_diff_base() {
             "Against the newest document the console committed: version {}",
             V0 + 7
         )),
+        "{html}"
+    );
+}
+
+/// The diff base is the newest document the console committed, named before
+/// its bytes are looked for. When its copy is not on the write log, the
+/// preview says the diff cannot be shown: an older copy standing in for it
+/// would report no change for an import that undoes the newest commit. The
+/// import page names the missing copy.
+#[tokio::test]
+async fn a_missing_newest_copy_leaves_no_diff_rather_than_an_older_base() {
+    let store = FakeStore::new(&World::new(vec![]));
+    store.answer_post(StatusCode::OK, dry_run(json!([])));
+    let metrics = quiet_fleet();
+    let (older, newest) = (doc_text(V0, 1_000), doc_text(V0 + 1, 50));
+    // Both are known commits; only the older one's copy is on the write log.
+    log_and_ship(&metrics, V0, &older);
+    metrics.set_30d(
+        "ops_console_committed_document",
+        vec![
+            committed_label(V0, &digest_of(&older)),
+            committed_label(V0 + 1, &digest_of(&newest)),
+        ],
+    );
+    metrics.set_30d(
+        "anthropic_client_store_document",
+        vec![installed(V0 + 1, &digest_of(&newest))],
+    );
+    let state = store_state(&store, &metrics, &["admin-sub"]).await;
+    let (cookie, csrf) = cookie_for(&state, "admin-sub");
+    let html = body_string(
+        post_form(
+            &state,
+            &cookie,
+            "/lb/clients/preview",
+            import_form(&csrf, V0, &[("source", "paste"), ("document", &older)]),
+        )
+        .await,
+    )
+    .await;
+    assert!(!html.contains("No change from the newest"), "{html}");
+    assert!(
+        html.contains(&format!(
+            "the newest document the console committed, version {}, cannot be read from the write log",
+            V0 + 1
+        )),
+        "{html}"
+    );
+    // The import still goes behind its guard: the newer version is typed.
+    assert!(html.contains("name=\"confirm_discard\""), "{html}");
+    let (_, page) = get_page(&state, &cookie, "/lb/clients/import").await;
+    assert!(
+        page.contains(&format!(
+            "The newest document the console committed, version {}, is not among the documents the write log lists",
+            V0 + 1
+        )),
+        "{page}"
+    );
+    assert!(!page.contains("newest committed"), "{page}");
+    // This process's own export names the newest too, labels or not.
+    metrics.set_30d("ops_console_committed_document", vec![]);
+    state
+        .store
+        .as_ref()
+        .unwrap()
+        .committed
+        .document(V0 + 1, &digest_of(&newest));
+    store.answer_post(StatusCode::OK, dry_run(json!([])));
+    let html = body_string(
+        post_form(
+            &state,
+            &cookie,
+            "/lb/clients/preview",
+            import_form(&csrf, V0, &[("source", "paste"), ("document", &older)]),
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        html.contains(&format!("version {}, cannot be read", V0 + 1)),
         "{html}"
     );
 }
@@ -910,6 +1020,44 @@ async fn the_pitr_page_lists_labels_and_history_and_times_the_restore_from_the_c
     );
     assert!(html.contains("action=\"/lb/clients/pitr\""), "{html}");
     assert!(!html.contains("name=\"confirm_version\""), "{html}");
+    assert!(!html.contains("too close"), "{html}");
+    // A later commit only a label names, a second on: too close for a
+    // restore time to be sure to fall before it. It bounds nothing, but it is
+    // named, and the suggestion is the nearest time after the pick.
+    let crowded = quiet_fleet();
+    labelled(&crowded);
+    crowded
+        .series
+        .lock()
+        .unwrap()
+        .get_mut("ops_console_committed_document[30d]")
+        .unwrap()
+        .push(series(
+            &[
+                ("version", &(T10 + AHEAD + 1).to_string()),
+                ("digest", &"4".repeat(64)),
+            ],
+            "1794132001",
+        ));
+    let state = store_state(&store, &crowded, &["admin-sub"]).await;
+    let (cookie, _) = cookie_for(&state, "admin-sub");
+    let (_, html) = get_page(
+        &state,
+        &cookie,
+        &format!("/lb/clients/pitr?target={target}"),
+    )
+    .await;
+    assert!(
+        html.contains(&format!(
+            "Version {}, a later commit found only in the console",
+            T10 + AHEAD + 1
+        )),
+        "{html}"
+    );
+    assert!(
+        html.contains("-f pitr_at=2026-11-08T10:00:00.001Z -f pitr_until="),
+        "{html}"
+    );
     // A window outside the pick's times offers no send.
     let store = pitr_store(Some("2026-11-08T10:05:00.000Z"));
     let state = store_state(&store, &metrics, &["admin-sub"]).await;
@@ -971,17 +1119,26 @@ async fn pitr_goes_ahead_on_an_empty_metrics_answer_and_names_the_picked_digest(
         "{html}"
     );
     assert!(html.contains("name=\"confirm_version\""), "{html}");
-    // Not typed: nothing sent.
-    let resp = post_form(
-        &state,
-        &cookie,
-        "/lb/clients/pitr",
-        pitr_form(&csrf, &target, &[]),
-    )
-    .await;
-    assert!(flash_of(&state, &resp).msg.contains("type"));
-    assert!(store.posts().is_empty());
     let version = (T10 + 3_600_000 + AHEAD).to_string();
+    // Not typed, or typed wrong: nothing sent.
+    for typed in ["", "1"] {
+        let resp = post_form(
+            &state,
+            &cookie,
+            "/lb/clients/pitr",
+            pitr_form(&csrf, &target, &[("confirm_version", typed)]),
+        )
+        .await;
+        let msg = flash_of(&state, &resp).msg;
+        assert_eq!(
+            msg,
+            format!(
+                "Version {version} cannot be checked: it is found only in the store's history, \
+                 which an edit could have rewritten. Nothing was sent: type {version} to confirm."
+            )
+        );
+    }
+    assert!(store.posts().is_empty());
     let (resp, lines) = captured(post_form(
         &state,
         &cookie,
@@ -1174,19 +1331,24 @@ async fn a_recovery_is_exported_as_committed_only_once_accepted() {
         )],
     );
     let (newest, first) = (digest_of(&text), D2);
-    let store = store_with(&World::new(vec![]), |b| {
-        b["restrictions"]["markers"] = json!([marker(&id, "done", None)]);
-        b["document"]["version"] = json!(V0 + 2);
-        b["document"]["digest"] = json!(newest);
-        b["document"]["text"] = json!(text);
-        b["document"]["history"] = json!([
-            {"version": V0 + 2, "digest": newest, "at": "2026-11-08T12:00:06.000Z", "role": "store", "actor": "client-store",
-             "reason": "revoked digests", "ops": [], "recovery_id": id, "diff": [{"change": "digest revoked", "digest": D3}]},
-            {"version": V0 + 1, "digest": first, "at": "2026-11-08T12:00:05.000Z", "role": "recovery", "actor": "client-store",
-             "reason": "point-in-time recovery", "ops": [], "recovery_id": id, "diff": [{"client": "acme", "change": "created"}]},
-            row(V0 - 9, D1, "2026-11-08T09:00:00.000Z"),
-        ]);
-    });
+    // The store after the recovery, its view carrying `served` as the bytes
+    // of its document.
+    let recovered = |served: &str| {
+        store_with(&World::new(vec![]), |b| {
+            b["restrictions"]["markers"] = json!([marker(&id, "done", None)]);
+            b["document"]["version"] = json!(V0 + 2);
+            b["document"]["digest"] = json!(newest);
+            b["document"]["text"] = json!(served);
+            b["document"]["history"] = json!([
+                {"version": V0 + 2, "digest": newest, "at": "2026-11-08T12:00:06.000Z", "role": "store", "actor": "client-store",
+                 "reason": "revoked digests", "ops": [], "recovery_id": id, "diff": [{"change": "digest revoked", "digest": D3}]},
+                {"version": V0 + 1, "digest": first, "at": "2026-11-08T12:00:05.000Z", "role": "recovery", "actor": "client-store",
+                 "reason": "point-in-time recovery", "ops": [], "recovery_id": id, "diff": [{"client": "acme", "change": "created"}]},
+                row(V0 - 9, D1, "2026-11-08T09:00:00.000Z"),
+            ]);
+        })
+    };
+    let store = recovered(&text);
     let state = store_state(&store, &metrics, &["admin-sub"]).await;
     let (cookie, csrf) = cookie_for(&state, "admin-sub");
     let committed = || state.store.as_ref().unwrap().committed.render();
@@ -1262,64 +1424,50 @@ async fn a_recovery_is_exported_as_committed_only_once_accepted() {
         lines.contains("client-store recovery accepted") && lines.contains("admin-sub"),
         "{lines}"
     );
-    // Accepted again, it is not logged again: every copy is read back with
-    // the rest, and three of the largest run past what a read takes. Not
-    // while the log store is still indexing the first copy, which reads as
-    // absent meanwhile, and not once that copy reads back whole.
+    // The store's view logged it, whole. Accepted again, it is logged again:
+    // the read takes each distinct line once, so the second copy costs it
+    // nothing, and no read of the write log comes first to fail.
     let documents = |lines: &str| {
         log_records(lines)
             .into_iter()
             .filter(|r| r["fields.message"] == "client-store document")
             .count()
     };
-    let accept_again = || {
-        captured(post_form(
-            &state,
-            &cookie,
-            "/lb/clients/pitr/accept",
-            accept.clone(),
-        ))
-    };
-    let (_, settling) = accept_again().await;
-    assert_eq!(documents(&settling), 0, "{settling}");
-    assert!(settling.contains("logged it moments ago"), "{settling}");
+    let parts = documents(&lines);
+    assert!(parts > 0, "{lines}");
+    assert!(!flash_of(&state, &resp).msg.contains("not on the write log"));
+    metrics.failing.lock().unwrap().push("write-log".into());
+    let (msg, again) = accept_recovery(&store, &metrics, &id, &rows).await;
+    assert_eq!(documents(&again), parts, "{again}");
+    assert!(!msg.contains("not on the write log"), "{msg}");
+    metrics.failing.lock().unwrap().clear();
     metrics.ship(&lines);
+    metrics.ship(&again);
     let back = writelog::document(&metrics_client(&metrics).await, V0 + 2, &newest)
         .await
         .unwrap();
     assert_eq!(back, text);
-    let (_, held) = accept_again().await;
-    assert_eq!(documents(&held), 0, "{held}");
-    assert!(held.contains("it is already on the write log"), "{held}");
-    // A write log that cannot be read gets no copy: one more could only add
-    // to a read that already fails.
-    metrics.failing.lock().unwrap().push("write-log".into());
-    let unread = store_state(&store, &metrics, &["admin-sub"]).await;
-    let (cookie, csrf) = cookie_for(&unread, "admin-sub");
-    let fields = form(&[
-        ("csrf", &csrf),
-        ("id", &id),
-        ("row", &rows[0]),
-        ("row", &rows[1]),
-    ]);
-    let (resp, failed) = captured(post_form(
-        &unread,
-        &cookie,
-        "/lb/clients/pitr/accept",
-        fields,
-    ))
-    .await;
-    assert_eq!(documents(&failed), 0, "{failed}");
+    // A store that has moved on sends no bytes that hash to the recovery's
+    // commit, so nothing is logged; the copy already on the write log is
+    // enough.
+    let moved = recovered(&doc_text(V0 + 3, 8));
+    let (msg, logged) = accept_recovery(&moved, &metrics, &id, &rows).await;
+    assert_eq!(documents(&logged), 0, "{logged}");
+    assert!(logged.contains("does not hash to its digest"), "{logged}");
+    assert!(!msg.contains("not on the write log"), "{msg}");
+    // With no copy there, or none that can be read, the operator is told.
+    let (msg, _) = accept_recovery(&moved, &quiet_fleet(), &id, &rows).await;
     assert!(
-        failed.contains("the write log could not be read"),
-        "{failed}"
+        msg.contains(
+            "Its document is not on the write log: the store's view carries no bytes that hash to \
+             it, and no whole copy reads back from the write log (the write log holds no line of it)"
+        ) && msg.contains("accepting again logs it"),
+        "{msg}"
     );
-    // The operator is told, since accepting again logs it once the write log
-    // answers.
-    let msg = flash_of(&unread, &resp).msg;
+    metrics.failing.lock().unwrap().push("write-log".into());
+    let (msg, _) = accept_recovery(&moved, &metrics, &id, &rows).await;
     assert!(
-        msg.contains("Its document is not on the write log: the write log could not be read")
-            && msg.contains("accepting again logs it"),
+        msg.contains("no whole copy reads back from the write log (write log"),
         "{msg}"
     );
     metrics.failing.lock().unwrap().clear();
@@ -1370,18 +1518,81 @@ async fn a_recovery_is_exported_as_committed_only_once_accepted() {
     );
 }
 
+/// Accept recovery `id` with the rows `rows` on a console over `store` and
+/// `metrics`: the flash it answers with, and the lines it logged.
+async fn accept_recovery(
+    store: &FakeStore,
+    metrics: &FakeMetrics,
+    id: &str,
+    rows: &[String],
+) -> (String, String) {
+    let state = store_state(store, metrics, &["admin-sub"]).await;
+    let (cookie, csrf) = cookie_for(&state, "admin-sub");
+    let mut pairs = vec![("csrf", csrf.as_str()), ("id", id)];
+    pairs.extend(rows.iter().map(|r| ("row", r.as_str())));
+    let (resp, lines) = captured(post_form(
+        &state,
+        &cookie,
+        "/lb/clients/pitr/accept",
+        form(&pairs),
+    ))
+    .await;
+    (flash_of(&state, &resp).msg, lines)
+}
+
+/// Every page that reports the store says what limits document writes the
+/// same way, from one reading of its view.
+#[tokio::test]
+async fn every_page_reports_the_stores_conditions_alike() {
+    let store = store_with(&World::new(vec![]), |b| {
+        b["document"]["frozen"] = json!(["the restrictions are not marked complete"]);
+        b["document"]["recovery_refused"] = json!(true);
+        b["pitr_window"] = json!(true);
+    });
+    let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
+    let (cookie, _) = cookie_for(&state, "admin-sub");
+    let refused = "A recovery was refused: the store serves no document to readers until an import or another recovery commits.";
+    let window =
+        "A point-in-time recovery window is open: the store takes no document write but pitr.";
+    let frozen = "refuses document writes: the restrictions are not marked complete.";
+    for (uri, says) in [
+        ("/lb/clients/import", vec![refused, window, frozen]),
+        ("/lb/clients/pitr", vec![refused, frozen]),
+        ("/lb/clients", vec![refused, window, frozen]),
+    ] {
+        let (status, html) = get_page(&state, &cookie, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        for s in says {
+            assert!(html.contains(s), "{uri}: {s}: {html}");
+        }
+    }
+}
+
 // ─── The reseed ─────────────────────────────────────────────────────────────
 
-/// A reseed form as its page renders one: a fresh one-time token, unless
-/// `extra` names one.
-fn reseed_form(csrf: &str, sets: &[(&str, &str, bool)], extra: &[(&str, &str)]) -> String {
+/// The table a reseed page binds its form to, as a browser reads it off the
+/// page.
+async fn table_on_page(state: &AppState, cookie: &str) -> String {
+    let (_, page) = get_page(state, cookie, "/lb/clients/reseed").await;
+    page.split("name=\"table\" value=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("the reseed form is bound to a table")
+        .to_string()
+}
+
+/// A reseed form as its page renders one, bound to `table`.
+fn reseed_form(
+    csrf: &str,
+    table: &str,
+    sets: &[(&str, &str, bool)],
+    extra: &[(&str, &str)],
+) -> String {
     let mut pairs: Vec<(String, String)> = vec![
         ("csrf".into(), csrf.into()),
         ("reason".into(), "reseed after the wipe".into()),
+        ("table".into(), table.into()),
     ];
-    if !extra.iter().any(|(k, _)| *k == "once") {
-        pairs.push(("once".into(), crate::session::random_token()));
-    }
     for (i, (text, hash, complete)) in sets.iter().enumerate() {
         pairs.push(("set_text".into(), text.to_string()));
         pairs.push(("set_hash".into(), hash.to_string()));
@@ -1402,43 +1613,99 @@ fn reseed_form(csrf: &str, sets: &[(&str, &str, bool)], extra: &[(&str, &str)]) 
 const CF_SET: &str = "r acme disabled 1791700000123000\nr beta enabled 1791700000124000\n";
 const K3S_SET: &str = "r acme disabled 1791700000123000\nr gamma disabled 1791700000125000\n";
 
-/// Each reseed form is sent once. Its answer page reloaded, or the form sent
-/// twice, is refused, since an override sent again would mark whatever the
-/// table holds by then complete; so is a form with no token.
+/// A reseed form is bound to the restrictions table it was filled in over,
+/// and is refused over any other: the override marks whatever the table
+/// holds complete. So an answer page reloaded after the reseed changed the
+/// table is refused, and so is one reloaded after a console restart and a
+/// later wipe, which an in-process record could not tell; a form bound to
+/// no table is refused too. Over an unchanged table it goes again, which can
+/// change nothing.
 #[tokio::test]
-async fn a_reseed_form_is_sent_once() {
-    let store = FakeStore::new(&World::new(vec![]));
+async fn a_reseed_form_is_bound_to_the_table_it_was_filled_in_over() {
+    let world = World::new(vec![("acme", RecordState::Disabled, 1_791_700_000_123_000)]);
+    let store = FakeStore::new(&world);
     store.answer_post(
         StatusCode::OK,
         json!({"status": 200, "written": [], "digests_added": 0, "digests_ignored": [], "integrity": "override", "cf_set_found": false, "reenable_by_hand": [], "client_store": "answered"}),
     );
     let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
     let (cookie, csrf) = cookie_for(&state, "admin-sub");
-    let (_, page) = get_page(&state, &cookie, "/lb/clients/reseed").await;
-    let once = page
-        .split("name=\"once\" value=\"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-        .expect("the form carries a one-time token")
-        .to_string();
+    let table = table_on_page(&state, &cookie).await;
     let phrase = "mark the restrictions complete without the CF set";
     let sent = reseed_form(
         &csrf,
-        &[(K3S_SET, &digest_of(K3S_SET), true)],
-        &[("override", phrase), ("once", &once)],
+        &table,
+        &[("", &digest_of(""), true)],
+        &[("override", phrase)],
     );
-    let resp = post_form(&state, &cookie, "/lb/clients/reseed", sent.clone()).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let resp = post_form(&state, &cookie, "/lb/clients/reseed", sent).await;
-    assert!(flash_of(&state, &resp).msg.contains("already sent"));
-    let tokenless = reseed_form(
-        &csrf,
-        &[(K3S_SET, &digest_of(K3S_SET), true)],
-        &[("once", "")],
+    let send = |state: AppState, form: String| {
+        let cookie = cookie.clone();
+        async move { post_form(&state, &cookie, "/lb/clients/reseed", form).await }
+    };
+    assert_eq!(
+        send(state.clone(), sent.clone()).await.status(),
+        StatusCode::OK
     );
-    let resp = post_form(&state, &cookie, "/lb/clients/reseed", tokenless).await;
-    assert!(flash_of(&state, &resp).msg.contains("already sent"));
-    assert_eq!(store.posts().len(), 1, "sent once");
+    assert_eq!(
+        send(state.clone(), sent.clone()).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(store.posts().len(), 2, "over an unchanged table");
+    // A disable lands while the form is open: the table it was filled in
+    // over is gone, though the integrity record still matches.
+    let mut disabled = world.clone();
+    disabled
+        .records
+        .push(("beta", RecordState::Disabled, 1_791_700_000_124_000));
+    store.answer_gets(&[&disabled]);
+    let resp = send(state.clone(), sent.clone()).await;
+    assert!(
+        flash_of(&state, &resp)
+            .msg
+            .contains("changed since this form was filled in")
+    );
+    assert_eq!(store.posts().len(), 2);
+    // The reseed marked the table complete: its answer page reloaded is refused.
+    let mut reseeded = world.get_body();
+    reseeded["restrictions"]["integrity"]["established"] = json!({"via": "override",
+        "actor": "ops@example.test", "reason": "reseed after the wipe",
+        "at": "2026-11-08T12:00:00.000Z", "sets": [digest_of("")]});
+    *store.gets.lock().unwrap() = vec![reseeded.clone()];
+    let resp = send(state.clone(), sent.clone()).await;
+    assert!(
+        flash_of(&state, &resp)
+            .msg
+            .contains("changed since this form was filled in"),
+        "{}",
+        flash_of(&state, &resp).msg
+    );
+    // The console restarts, and a later wipe takes acme's disable: the old
+    // page's form, with the browser's session, is refused still.
+    let mut wiped = reseeded;
+    wiped["restrictions"]["records"] = json!([]);
+    wiped["restrictions"]["integrity"]["matches"] = json!(false);
+    *store.gets.lock().unwrap() = vec![wiped];
+    let mut restarted = state.clone();
+    let old = state.store.as_ref().unwrap();
+    restarted.store = Some(crate::state::StoreModule {
+        client: old.client.clone(),
+        metrics: old.metrics.clone(),
+        committed: std::sync::Arc::default(),
+    });
+    let resp = send(restarted.clone(), sent.clone()).await;
+    assert!(
+        flash_of(&restarted, &resp)
+            .msg
+            .contains("changed since this form was filled in")
+    );
+    let unbound = reseed_form(&csrf, "", &[("", &digest_of(""), true)], &[]);
+    let resp = send(restarted.clone(), unbound).await;
+    assert!(
+        flash_of(&restarted, &resp)
+            .msg
+            .contains("changed since this form was filled in")
+    );
+    assert_eq!(store.posts().len(), 2, "nothing more was sent");
 }
 
 /// The form sends the sets as supplied, their line breaks as LF, each
@@ -1455,6 +1722,7 @@ async fn the_reseed_sends_the_supplied_sets() {
     let (status, page) = get_page(&state, &cookie, "/lb/clients/reseed").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(page.matches("name=\"set_text\"").count(), 8, "{page}");
+    let table = table_on_page(&state, &cookie).await;
     let crlf = CF_SET.replace('\n', "\r\n");
     let (cf, k3s) = (digest_of(CF_SET), digest_of(K3S_SET));
     let resp = post_form(
@@ -1463,6 +1731,7 @@ async fn the_reseed_sends_the_supplied_sets() {
         "/lb/clients/reseed",
         reseed_form(
             &csrf,
+            &table,
             &[(&crlf, &cf, true), ("", "", false), (K3S_SET, &k3s, true)],
             &[],
         ),
@@ -1491,6 +1760,7 @@ async fn the_reseed_override_is_typed_exactly_and_recorded_on_the_write_log() {
     );
     let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
     let (cookie, csrf) = cookie_for(&state, "admin-sub");
+    let table = table_on_page(&state, &cookie).await;
     let empty = digest_of("");
     let resp = post_form(
         &state,
@@ -1498,6 +1768,7 @@ async fn the_reseed_override_is_typed_exactly_and_recorded_on_the_write_log() {
         "/lb/clients/reseed",
         reseed_form(
             &csrf,
+            &table,
             &[("", &empty, true)],
             &[("override", "mark it complete")],
         ),
@@ -1512,6 +1783,7 @@ async fn the_reseed_override_is_typed_exactly_and_recorded_on_the_write_log() {
         "/lb/clients/reseed",
         reseed_form(
             &csrf,
+            &table,
             &[(K3S_SET, &digest_of(K3S_SET), true)],
             &[("override", phrase)],
         ),
@@ -1553,11 +1825,12 @@ async fn the_reseed_answer_lists_the_names_to_re_enable() {
     );
     let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
     let (cookie, csrf) = cookie_for(&state, "admin-sub");
+    let table = table_on_page(&state, &cookie).await;
     let resp = post_form(
         &state,
         &cookie,
         "/lb/clients/reseed",
-        reseed_form(&csrf, &[(CF_SET, &digest_of(K3S_SET), true)], &[]),
+        reseed_form(&csrf, &table, &[(CF_SET, &digest_of(K3S_SET), true)], &[]),
     )
     .await;
     assert!(flash_of(&state, &resp).msg.contains("does not hash"));
@@ -1566,7 +1839,7 @@ async fn the_reseed_answer_lists_the_names_to_re_enable() {
         &state,
         &cookie,
         "/lb/clients/reseed",
-        reseed_form(&csrf, &[(CF_SET, &digest_of(CF_SET), true)], &[]),
+        reseed_form(&csrf, &table, &[(CF_SET, &digest_of(CF_SET), true)], &[]),
     )
     .await;
     let html = body_string(resp).await;
@@ -1586,4 +1859,44 @@ async fn the_reseed_answer_lists_the_names_to_re_enable() {
             .render()
             .contains(&format!("name=\"gamma\",version=\"{T0}\""))
     );
+}
+
+/// A count the store's answer does not name reads as no count, never as
+/// zero, and an entry the console cannot read is counted, not dropped.
+#[tokio::test]
+async fn a_reseed_answer_never_reads_a_missing_count_as_zero() {
+    for (answer, says) in [
+        (
+            json!({"status": 200, "integrity": "cf_set",
+                   "written": [{"name": "gamma", "version": T0}, {"name": "", "version": 1}]}),
+            vec![
+                format!("It wrote 2: gamma at {T0}, 1 the console cannot read."),
+                "Its answer names no count of the revoked digests it added.".to_string(),
+            ],
+        ),
+        (
+            json!({"status": 200, "integrity": "cf_set", "digests_added": 0}),
+            vec![
+                "Its answer names no count of the records it wrote.".to_string(),
+                "It added 0 revoked digests.".to_string(),
+            ],
+        ),
+    ] {
+        let store = FakeStore::new(&World::new(vec![]));
+        store.answer_post(StatusCode::OK, answer);
+        let state = store_state(&store, &quiet_fleet(), &["admin-sub"]).await;
+        let (cookie, csrf) = cookie_for(&state, "admin-sub");
+        let table = table_on_page(&state, &cookie).await;
+        let resp = post_form(
+            &state,
+            &cookie,
+            "/lb/clients/reseed",
+            reseed_form(&csrf, &table, &[(CF_SET, &digest_of(CF_SET), true)], &[]),
+        )
+        .await;
+        let html = body_string(resp).await;
+        for s in says {
+            assert!(html.contains(&s), "{s}: {html}");
+        }
+    }
 }

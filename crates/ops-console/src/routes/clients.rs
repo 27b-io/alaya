@@ -363,6 +363,56 @@ fn kill_switch_card(csrf: &str, prefill: &str) -> impl IntoView + use<> {
     }
 }
 
+/// The version every recovery and import form pins: the store's addressable
+/// version, 0 when it holds none.
+fn pinned_version(store: &Value) -> Result<u64, String> {
+    effect::served_doc(store).map(|d| d.map(|d| d.version).unwrap_or(0))
+}
+
+/// What a refused recovery means, wherever the console says it.
+const RECOVERY_REFUSED: &str = "A recovery was refused: the store serves no document to readers until an import or another recovery commits.";
+
+/// What an open recovery window means, wherever the console says it.
+const WINDOW_OPEN: &str =
+    "A point-in-time recovery window is open: the store takes no document write but pitr.";
+
+/// What the store's view says limits document writes: each reason it gives
+/// for refusing them, whether a recovery was refused, and whether a
+/// point-in-time recovery window is open. Every page that reports the store
+/// reads them here, and words them with `RECOVERY_REFUSED` and `WINDOW_OPEN`.
+struct Conditions {
+    frozen: Vec<String>,
+    recovery_refused: bool,
+    window_open: bool,
+}
+
+impl Conditions {
+    /// The reasons it refuses document writes, as one sentence.
+    fn frozen_line(&self) -> Option<String> {
+        (!self.frozen.is_empty())
+            .then(|| format!("It refuses document writes: {}.", self.frozen.join("; ")))
+    }
+}
+
+fn store_conditions(store: &Value) -> Conditions {
+    let doc = store.get("document");
+    Conditions {
+        frozen: doc
+            .and_then(|d| d.get("frozen"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|f| clip(f, 160))
+            .collect(),
+        recovery_refused: doc
+            .and_then(|d| d.get("recovery_refused"))
+            .and_then(Value::as_bool)
+            == Some(true),
+        window_open: store.get("pitr_window").and_then(Value::as_bool) == Some(true),
+    }
+}
+
 fn capitalise(s: &str) -> String {
     let mut c = s.chars();
     c.next()
@@ -472,33 +522,27 @@ fn warnings(r: &Reading, part: &Result<ServedPart, String>) -> impl IntoView + u
             ),
         ));
     }
-    if let Some(frozen) = doc
-        .and_then(|d| d.get("frozen"))
-        .and_then(Value::as_array)
-        .filter(|f| !f.is_empty())
-    {
-        let reasons: Vec<String> = frozen
-            .iter()
-            .filter_map(Value::as_str)
-            .map(|s| clip(s, 160))
-            .collect();
+    let c = store_conditions(&r.store);
+    if !c.frozen.is_empty() {
         items.push((
             Status::Warn,
             format!(
                 "The store refuses document writes: {}. Restriction ops still work.",
-                reasons.join("; ")
+                c.frozen.join("; ")
             ),
         ));
     }
-    if r.store.get("pitr_window").and_then(Value::as_bool) == Some(true) {
-        items.push((Status::Warn, "A point-in-time recovery window is open: the store takes no document write but pitr. Restriction ops still work.".into()));
+    if c.window_open {
+        items.push((
+            Status::Warn,
+            format!("{WINDOW_OPEN} Restriction ops still work."),
+        ));
     }
-    if doc
-        .and_then(|d| d.get("recovery_refused"))
-        .and_then(Value::as_bool)
-        == Some(true)
-    {
-        items.push((Status::Error, "A recovery was refused: the store serves no document to readers until an import or another recovery commits. Restriction ops still work.".into()));
+    if c.recovery_refused {
+        items.push((
+            Status::Error,
+            format!("{RECOVERY_REFUSED} Restriction ops still work."),
+        ));
     }
     match &r.fleet.store_alerts {
         Ok(who) if !who.is_empty() => items.push((
@@ -863,8 +907,9 @@ fn write_log(sub: &str, kind: &str, request: &Value, outcome: Result<&Answer, &A
     let answer = |a: &Answer| writelog::bounded(&loggable(&a.body).to_string(), MAX_LOGGED_BYTES);
     match outcome {
         // Only a pitr gets 202: the store restarted to finish or refuse the
-        // recovery, and the marker in the answer says how it ends.
-        Ok(a) if a.status == StatusCode::ACCEPTED => tracing::info!(
+        // recovery, and the marker in the answer says how it ends. A 202 to
+        // any other write is an answer none gets: unknown, as its page says.
+        Ok(a) if a.status == StatusCode::ACCEPTED && kind == pitr::PITR => tracing::info!(
             target: "ops_console::write_log",
             sub = ?sub,
             kind,

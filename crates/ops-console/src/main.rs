@@ -4160,16 +4160,24 @@ mod tests {
                     .await
                     .unwrap();
                 // The router's own 404 has no body; a handler's 404 renders a page.
-                let routed =
-                    get.status() != StatusCode::NOT_FOUND || !body_string(get).await.is_empty();
-                assert!(routed, "{route} did not route");
+                let status = get.status();
+                let page = body_string(get).await;
+                assert!(
+                    status != StatusCode::NOT_FOUND || !page.is_empty(),
+                    "{route} did not route"
+                );
                 let (cookie, csrf) = cookie_for(&state, "admin-sub");
                 let pair = format!("{h1}:{h2}");
                 let (target, recovery) = (format!("7.{h1}"), "ab".repeat(16));
-                let (empty_set, once) = (
-                    crate::writelog::digest_of(""),
-                    crate::session::random_token(),
-                );
+                let empty_set = crate::writelog::digest_of("");
+                // A form bound to the page it was rendered on carries that
+                // binding back, as a browser would.
+                let table = page
+                    .split("name=\"table\" value=\"")
+                    .nth(1)
+                    .and_then(|s| s.split('"').next())
+                    .unwrap_or_default()
+                    .to_string();
                 let sink = form(&[
                     ("csrf", &csrf),
                     ("target", &target),
@@ -4178,7 +4186,7 @@ mod tests {
                     ("set_text", ""),
                     ("set_hash", &empty_set),
                     ("set_complete", "1"),
-                    ("once", &once),
+                    ("table", &table),
                     ("action", "disable"),
                     ("op", "delete"),
                     ("confirm_signal", "write anyway"),
@@ -4286,6 +4294,43 @@ mod tests {
             assert!(
                 html.contains(">unknown<") && html.contains("lb-b"),
                 "{html}"
+            );
+        }
+
+        /// Only a pitr gets 202. A 202 to any other write is an answer the
+        /// store never gives it: the write log and the page both read it as
+        /// unknown.
+        #[tokio::test]
+        async fn a_202_to_any_write_but_a_pitr_is_an_unknown_outcome() {
+            let store = FakeStore::new(&World::new(vec![("acme", RecordState::Enabled, T0)]));
+            store.answer_post(StatusCode::ACCEPTED, json!({"status": 202}));
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let buf = testlog::LogBuf::default();
+            let _guard = buf.capture();
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/restrict",
+                form(&[
+                    ("csrf", &csrf),
+                    ("action", "enable"),
+                    ("name", "acme"),
+                    ("expected_version", "1"),
+                    ("reason", "ok"),
+                ]),
+            )
+            .await;
+            let line = buf.record("client-store write outcome unknown");
+            assert!(line.contains("\"status\":202"), "{line}");
+            assert!(!buf.text().contains("recovery marker"), "{}", buf.text());
+            let flash = flash_of(&state, &resp);
+            assert!(
+                flash
+                    .msg
+                    .starts_with("Whether the request applied is unknown"),
+                "{}",
+                flash.msg
             );
         }
 
@@ -4793,6 +4838,11 @@ mod tests {
             let html = body_string(resp).await;
             assert!(html.contains(&key), "{html}");
             assert!(html.contains("1Password"), "{html}");
+            // An answer with no document bytes: the page says it is not logged.
+            assert!(
+                html.contains("Its document is not on the write log"),
+                "{html}"
+            );
             assert!(
                 html.contains(&format!("/lb/clients/effect?doc={}.{D1}", V0 + 1)),
                 "{html}"

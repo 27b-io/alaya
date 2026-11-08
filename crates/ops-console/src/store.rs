@@ -137,6 +137,13 @@ pub struct DocRequest<'a> {
     pub ops: &'a [DocOp],
 }
 
+impl DocRequest<'_> {
+    /// The body the store takes it in.
+    pub fn body(&self) -> Value {
+        json!({ "document": self })
+    }
+}
+
 /// A committed document write, read strictly from the store's 200.
 #[derive(Debug)]
 pub struct Commit {

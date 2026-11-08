@@ -7,9 +7,10 @@
 //! CF's set, is recorded on the write log (`writelog::logged_request`), and
 //! the answer's names to re-enable by hand are shown in full, on the page
 //! that answers the form. That page cannot be a redirect: the names can run
-//! past what a flash cookie holds. So each form is sent once, and a reloaded
-//! answer is refused rather than sent again: the override marks whatever the
-//! table holds at the time complete, and a table damaged since must not be.
+//! past what a flash cookie holds. So a reloaded answer re-sends the form,
+//! and the override marks whatever the table holds at that time complete. A
+//! form is therefore bound to the table it was filled in over (`table_of`),
+//! and refused over any other, a console restart between them included.
 
 use std::collections::BTreeSet;
 
@@ -44,26 +45,27 @@ const OVERRIDE: &str = "mark the restrictions complete without the CF set";
 /// reader's, with room to spare.
 const SLOTS: usize = 8;
 
-/// How many sent reseed forms are remembered: far more than are ever open.
-const SENT_KEPT: usize = 256;
-
-/// Spend a reseed form's one-time token; true only the first time. Tested
-/// and recorded under one lock, so a double submit sends once.
-fn spend(m: &StoreModule, once: &str) -> bool {
-    let mut sent = m.sent_reseeds.lock().expect("reseed lock poisoned");
-    if sent.iter().any(|s| s == once) {
-        return false;
-    }
-    if sent.len() == SENT_KEPT {
-        sent.pop_front();
-    }
-    sent.push_back(once.to_string());
-    true
+/// The restrictions table a reseed form is filled in over, as a digest of
+/// what the store's view says of it: every record, every revoked digest and
+/// the integrity record. Any write, wipe or reseed changes it, the reseed's
+/// own included, so a form sent again over a table its operator did not see
+/// is refused. The store holds it, so a console restart loses nothing.
+fn table_of(store: &Value) -> Result<String, String> {
+    let r = store
+        .get("restrictions")
+        .filter(|r| r.get("status").and_then(Value::as_str) == Some("ok"))
+        .ok_or("the restrictions side of the store did not answer")?;
+    let table = json!({
+        "records": r.get("records"),
+        "revoked_digests": r.get("revoked_digests"),
+        "integrity": r.get("integrity"),
+    });
+    Ok(writelog::digest_of(&table.to_string()))
 }
 
 // ─── The reseed ─────────────────────────────────────────────────────────────
 
-const RESEED_ABOUT: &str = "restrictions_import: the break-glass after the restrictions table was wiped or partly lost. Supply every set marked complete that a reader logged, CF's above all. The store merges them name by name as readers do, never below a name's current record, writes only denials, and marks the table complete again when one set matches CF's latest complete report and survives whole. It never lifts a disable. Each form is sent once: to send another, reload this page.";
+const RESEED_ABOUT: &str = "restrictions_import: the break-glass after the restrictions table was wiped or partly lost. Supply every set marked complete that a reader logged, CF's above all. The store merges them name by name as readers do, never below a name's current record, writes only denials, and marks the table complete again when one set matches CF's latest complete report and survives whole. It never lifts a disable. A form is sent only over the table it was filled in over: after any change, fill it in again.";
 
 pub async fn reseed_page(
     State(state): State<AppState>,
@@ -75,15 +77,24 @@ pub async fn reseed_page(
         return Ok((jar, Html(page_html(&session, flash, not_configured()))));
     };
     let header = sub_header("Reseed the restrictions".into(), RESEED_ABOUT.into());
-    let state_view = match m.client.read().await {
-        Ok(store) => reseed_state(&store).into_any(),
+    let body = match m.client.read().await {
+        Ok(store) => {
+            let form = match table_of(&store) {
+                Ok(table) => reseed_form(&session.csrf, &table).into_any(),
+                Err(why) => {
+                    let why =
+                        format!("No form can be bound to the table, so none is offered: {why}.");
+                    view! { <Notice status=Status::Error label="reseed">{why}</Notice> }.into_any()
+                }
+            };
+            view! { {reseed_state(&store)} {form} }.into_any()
+        }
         Err(e) => unavailable("client store", e.detail()).into_any(),
     };
     let content = view! {
         <div class="space-y-6">
             {header}
-            {state_view}
-            {reseed_form(&session.csrf)}
+            {body}
         </div>
     };
     Ok((jar, Html(page_html(&session, flash, content))))
@@ -145,7 +156,7 @@ fn reseed_state(store: &Value) -> impl IntoView + use<> {
     }
 }
 
-fn reseed_form(csrf: &str) -> impl IntoView + use<> {
+fn reseed_form(csrf: &str, table: &str) -> impl IntoView + use<> {
     let slots = (1..=SLOTS)
         .map(|i| {
             let title = format!("Set {i}");
@@ -166,7 +177,7 @@ fn reseed_form(csrf: &str) -> impl IntoView + use<> {
     let override_label = format!(
         "Only when no complete CF report exists, or its set can no longer be rebuilt from the logs: type \"{OVERRIDE}\" to mark the table complete without CF's set."
     );
-    let (csrf, once) = (csrf.to_string(), crate::session::random_token());
+    let (csrf, table) = (csrf.to_string(), table.to_string());
     view! {
         <Card>
             <CardHeader>
@@ -176,7 +187,7 @@ fn reseed_form(csrf: &str) -> impl IntoView + use<> {
             <CardContent>
                 <form method="post" action="/lb/clients/reseed" class="space-y-3">
                     <input type="hidden" name="csrf" value=csrf />
-                    <input type="hidden" name="once" value=once />
+                    <input type="hidden" name="table" value=table />
                     <div class="grid gap-3 md:grid-cols-2">{slots}</div>
                     <div class="space-y-1">
                         <Notice status=Status::Warn label="override">"The override marks the table complete while disables may be missing: fresh readers then serve those names until someone finds the gap, and running readers keep raising restrictions-behind meanwhile. Every use is recorded."</Notice>
@@ -206,9 +217,9 @@ pub struct ReseedForm {
     override_phrase: String,
     #[serde(default)]
     reason: String,
-    /// The form's one-time token (`spend`).
+    /// The table the form was filled in over (`table_of`).
     #[serde(default)]
-    once: String,
+    table: String,
 }
 
 /// The sets a reseed form supplies, as the store takes them. A form sends
@@ -283,13 +294,32 @@ pub async fn reseed(
             format!("The override is typed exactly: \"{OVERRIDE}\". Nothing was sent."),
         ));
     }
-    if form.once.is_empty() || !spend(m, &form.once) {
-        return Ok(refuse(
-            jar,
-            "This reseed form was already sent, and its answer shown then: nothing was sent \
-             again. To send another, fill in the form below."
-                .into(),
-        ));
+    // Read again: the form is sent only over the table it was filled in over.
+    let now = match m.client.read().await {
+        Ok(store) => table_of(&store),
+        Err(e) => Err(format!("the store could not be read ({})", e.detail())),
+    };
+    match now {
+        Ok(table) if !form.table.is_empty() && table == form.table => {}
+        Ok(_) => {
+            return Ok(refuse(
+                jar,
+                "The restrictions table changed since this form was filled in: a write, a wipe \
+                 or another reseed came between. Nothing was sent: review the table below and \
+                 fill the form in again."
+                    .into(),
+            ));
+        }
+        Err(why) => {
+            return Ok(refuse(
+                jar,
+                format!(
+                    "The table this form was filled in over cannot be checked, so nothing was \
+                     sent: {}.",
+                    clip(&why, 300)
+                ),
+            ));
+        }
     }
     let mut import = json!({ "actor": actor_of(&session), "reason": reason, "sets": sets });
     if !typed.is_empty() {
@@ -298,20 +328,9 @@ pub async fn reseed(
     // The records it writes are the console's to export as committed: an
     // instance installs any it did not hold, re-stamped ones included.
     let export = |m: &StoreModule, body: &Value| {
-        for w in body
-            .get("written")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if let (Some(name), Some(version)) = (
-                w.get("name")
-                    .and_then(Value::as_str)
-                    .filter(|n| effect::is_name(n)),
-                w.get("version").and_then(Value::as_u64),
-            ) {
-                m.committed.record(name, version);
-            }
+        let (written, _) = written_of(body).unwrap_or_default();
+        for (name, version) in written {
+            m.committed.record(&name, version);
         }
     };
     let body = json!({ "restrictions_import": import });
@@ -346,6 +365,22 @@ fn reseed_result(answer: Result<Answer, AppError>) -> impl IntoView + use<> {
     }
 }
 
+/// The records a reseed's answer lists as written, each a name and its
+/// version, and how many of its entries name neither. `None` when the answer
+/// holds no list.
+fn written_of(body: &Value) -> Option<(Vec<(String, u64)>, usize)> {
+    let list = body.get("written")?.as_array()?;
+    let read: Vec<(String, u64)> = list
+        .iter()
+        .filter_map(|w| {
+            let name = w.get("name")?.as_str().filter(|n| effect::is_name(n))?;
+            Some((name.to_string(), w.get("version")?.as_u64()?))
+        })
+        .collect();
+    let unread = list.len() - read.len();
+    Some((read, unread))
+}
+
 fn reseed_answer(body: &Value) -> impl IntoView + use<> {
     let strs = |k: &str| -> Vec<String> {
         body.get(k)
@@ -369,38 +404,34 @@ fn reseed_answer(body: &Value) -> impl IntoView + use<> {
         );
         view! { <Notice status=Status::Error label="re-enable">{text}</Notice> }
     });
-    let written: Vec<String> = body
-        .get("written")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|w| {
-            Some(format!(
-                "{} at {}",
-                clip(w.get("name")?.as_str()?, 63),
-                w.get("version")?.as_u64()?
-            ))
-        })
-        .collect();
-    let written = if written.is_empty() {
-        "It wrote no record: every disable it was given was already in the table.".to_string()
-    } else {
-        format!(
-            "It wrote {}: {}.",
-            written.len(),
-            clip(&written.join(", "), 2000)
-        )
+    // A count the answer does not name is never read as zero.
+    let written = match written_of(body) {
+        None => "Its answer names no count of the records it wrote.".to_string(),
+        Some((w, 0)) if w.is_empty() => {
+            "It wrote no record: every disable it was given was already in the table.".into()
+        }
+        Some((w, unread)) => {
+            let mut names: Vec<String> = w.iter().map(|(n, v)| format!("{n} at {v}")).collect();
+            if unread > 0 {
+                names.push(format!("{unread} the console cannot read"));
+            }
+            format!(
+                "It wrote {}: {}.",
+                w.len() + unread,
+                clip(&names.join(", "), 2000)
+            )
+        }
     };
-    let added = body
-        .get("digests_added")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let added = match body.get("digests_added").and_then(Value::as_u64) {
+        Some(n) => format!("It added {n} revoked digests"),
+        None => "Its answer names no count of the revoked digests it added".into(),
+    };
     let ignored = strs("digests_ignored");
     let digests = if ignored.is_empty() {
-        format!("It added {added} revoked digests.")
+        format!("{added}.")
     } else {
         format!(
-            "It added {added} revoked digests, and ignored {} found in neither the document nor its history: {}.",
+            "{added}, and ignored {} found in neither the document nor its history: {}.",
             ignored.len(),
             clip(&ignored.join(", "), 1000)
         )

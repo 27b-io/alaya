@@ -11,18 +11,16 @@
 //! its part out of how many.
 //!
 //! The log is read back through the metrics proxy's write-log route, which
-//! pins every query to the console's own log stream. The console does not
-//! guard the log store, so what it reads back is untrusted input: a document
-//! read back is checked against its digest, which catches damage and nothing
-//! more. A forged copy can be
-//! offered for import, flagged as no document the console committed, but is
-//! never what an import is diffed against: that is a copy this process
-//! exported or a committed label names. The import's guard judges its bytes
-//! against what instances installed, and the store merges every revoked key
-//! into an import, so no forgery can bring a revoked key back.
+//! pins every query to the console's own log stream. What it reads back is
+//! untrusted input, checked against its digest, which catches damage and
+//! nothing more. A forged copy can be offered for import, flagged as no
+//! document the console committed, but is never what an import is diffed
+//! against: that is a copy this process exported or a committed label names.
+//! The import's guard judges its bytes against what instances installed, and
+//! the store merges every revoked key into an import, so no forgery can bring
+//! a revoked key back.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::sync::Mutex;
+use std::collections::BTreeMap;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -43,19 +41,10 @@ const DOCUMENT_LINE: &str = "client-store document";
 /// Most documents the import page lists.
 const LISTED: usize = 50;
 
-/// More lines than any document has: a 2 MiB document is 304 parts, and a
-/// document logged twice repeats each. Two copies of the largest one fit the
-/// response cap of a read; a third does not, so a recovery's document is
-/// logged again only when the write log holds no whole copy (`held`).
+/// More lines than any document has: a 2 MiB document is 304 parts. A read
+/// takes each distinct line once, so a document logged again adds nothing to
+/// it; only a line that differs, a damaged or forged one, can.
 const MAX_LINES: usize = 1000;
-
-/// How long a copy this process logged may take to read back whole. The log
-/// shipper and the log store index a line within seconds; inside this, a
-/// copy that reads as absent or partial is still on its way.
-const SETTLING_SECS: i64 = 600;
-
-/// Most claims `Settling` keeps.
-const SETTLING_KEPT: usize = 64;
 
 /// The hex SHA-256 of `text`.
 pub fn digest_of(text: &str) -> String {
@@ -108,39 +97,6 @@ pub fn log_committed(version: u64, digest: &str, text: Option<&str>) -> bool {
         ),
     }
     false
-}
-
-/// The recovery documents this process is logging, each with when it claimed
-/// it (epoch seconds). A copy the log store has not finished indexing reads
-/// as absent or partial, so a document claimed in the last `SETTLING_SECS` is
-/// not logged again: every copy is read back with the rest.
-#[derive(Default)]
-pub struct Settling(Mutex<VecDeque<(u64, String, i64)>>);
-
-impl Settling {
-    /// Claim the logging of a document as of `now`: true unless this process
-    /// claimed it in the last `SETTLING_SECS`. Tested and recorded under one
-    /// lock, so two acceptances at once log one copy.
-    pub fn claim(&self, version: u64, digest: &str, now: i64) -> bool {
-        let mut claims = self.0.lock().expect("settling lock poisoned");
-        claims.retain(|(_, _, at)| now - *at < SETTLING_SECS);
-        if claims.iter().any(|(v, d, _)| *v == version && d == digest) {
-            return false;
-        }
-        if claims.len() == SETTLING_KEPT {
-            claims.pop_front();
-        }
-        claims.push_back((version, digest.to_string(), now));
-        true
-    }
-
-    /// Give back a claim under which nothing was logged.
-    pub fn release(&self, version: u64, digest: &str) {
-        self.0
-            .lock()
-            .expect("settling lock poisoned")
-            .retain(|(v, d, _)| !(*v == version && d == digest));
-    }
 }
 
 /// A write's request as the write log keeps it. An import's document becomes
@@ -265,95 +221,40 @@ pub async fn logged(metrics: &MetricsClient) -> Result<Listing, String> {
 }
 
 /// One logged document's exact bytes, joined from its lines and checked.
+/// The read takes each distinct line once, however often the document was
+/// logged, so two different copies of a part still read as damage.
 pub async fn document(
     metrics: &MetricsClient,
     version: u64,
     digest: &str,
 ) -> Result<String, String> {
-    read(metrics, version, digest)
-        .await
-        .map_err(Unreadable::into_text)
-}
-
-/// What the write log holds of one document.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Held {
-    /// A whole copy that reads back to its exact bytes.
-    Readable,
-    /// No line of it.
-    Absent,
-    /// Lines that agree, with parts missing: a whole copy logged again
-    /// completes it.
-    Partial,
-}
-
-/// What the write log holds of one document, or why that cannot be told:
-/// a read that failed, or lines no further copy can mend. Then another copy
-/// could only add to what a read takes, so none is logged.
-pub async fn held(metrics: &MetricsClient, version: u64, digest: &str) -> Result<Held, String> {
-    held_of(read(metrics, version, digest).await)
-}
-
-fn held_of(read: Result<String, Unreadable>) -> Result<Held, String> {
-    match read {
-        Ok(_) => Ok(Held::Readable),
-        Err(Unreadable::Absent) => Ok(Held::Absent),
-        Err(Unreadable::Missing(_)) => Ok(Held::Partial),
-        Err(Unreadable::Damaged(why)) => Err(why),
-    }
-}
-
-/// Why the write log yields no document.
-#[derive(Debug, PartialEq, Eq)]
-enum Unreadable {
-    /// It holds no line of it.
-    Absent,
-    /// Its lines agree, but some parts are missing.
-    Missing(String),
-    /// Anything else, a read that failed included.
-    Damaged(String),
-}
-
-impl Unreadable {
-    fn into_text(self) -> String {
-        match self {
-            Unreadable::Absent => "the write log holds no line of it".into(),
-            Unreadable::Missing(why) | Unreadable::Damaged(why) => why,
-        }
-    }
-}
-
-async fn read(metrics: &MetricsClient, version: u64, digest: &str) -> Result<String, Unreadable> {
     // A u64 and 64 hex characters: nothing in either can change the query.
     if !crate::effect::is_hex64(digest) {
-        return Err(Unreadable::Damaged(
-            "a document is named by its 64 hex digest".into(),
-        ));
+        return Err("a document is named by its 64 hex digest".into());
     }
     let query = format!(
         "_time:30d target:=\"ops_console::write_log\" fields.message:=\"{DOCUMENT_LINE}\" \
          fields.version:={version} fields.digest:=\"{digest}\" \
-         | fields fields.part, fields.parts, fields.b64 | limit {MAX_LINES}"
+         | uniq by (fields.part, fields.parts, fields.b64) limit {MAX_LINES}"
     );
     let lines = metrics
         .write_log(&query, MAX_LINES)
         .await
-        .map_err(|e| Unreadable::Damaged(e.detail().to_string()))?;
+        .map_err(|e| e.detail().to_string())?;
     assemble(version, digest, &lines)
 }
 
 /// A document from its lines: every part present, each copy of a part the
 /// same, the bytes hashing to the digest, and the document naming the
 /// version its lines do.
-fn assemble(version: u64, digest: &str, lines: &[Value]) -> Result<String, Unreadable> {
-    use Unreadable::{Absent, Damaged, Missing};
+fn assemble(version: u64, digest: &str, lines: &[Value]) -> Result<String, String> {
     if lines.is_empty() {
-        return Err(Absent);
+        return Err("the write log holds no line of it".into());
     }
     if lines.len() >= MAX_LINES {
-        return Err(Damaged(format!(
-            "the write log holds {MAX_LINES} or more lines of it, more than any document has"
-        )));
+        return Err(format!(
+            "the write log holds {MAX_LINES} or more distinct lines of it, more than any document has"
+        ));
     }
     let mut parts: BTreeMap<u64, &str> = BTreeMap::new();
     let mut total: Option<u64> = None;
@@ -365,52 +266,48 @@ fn assemble(version: u64, digest: &str, lines: &[Value]) -> Result<String, Unrea
             number("fields.parts"),
             field("fields.b64"),
         ) else {
-            return Err(Damaged(
-                "a line of it names no part, part count or text".into(),
-            ));
+            return Err("a line of it names no part, part count or text".into());
         };
         if *total.get_or_insert(count) != count {
-            return Err(Damaged(
-                "its lines disagree on how many parts it has".into(),
-            ));
+            return Err("its lines disagree on how many parts it has".into());
         }
         if parts.insert(part, b64).is_some_and(|seen| seen != b64) {
-            return Err(Damaged(format!(
+            return Err(format!(
                 "the write log holds two different copies of part {part}"
-            )));
+            ));
         }
     }
     let total = total.unwrap_or_default();
     if parts.keys().any(|p| !(1..=total).contains(p)) {
-        return Err(Damaged(format!(
-            "a line of it names a part outside its {total}"
-        )));
+        return Err(format!("a line of it names a part outside its {total}"));
     }
     if parts.len() as u64 != total {
-        return Err(Missing(format!(
+        return Err(format!(
             "the write log holds {} of its {total} parts",
             parts.len()
-        )));
+        ));
     }
     let joined: String = parts.into_values().collect();
     let bytes = STANDARD
         .decode(joined)
-        .map_err(|_| Damaged("its parts do not join into base64".into()))?;
-    let text = String::from_utf8(bytes).map_err(|_| Damaged("its bytes are not UTF-8".into()))?;
+        .map_err(|_| "its parts do not join into base64".to_string())?;
+    let text = String::from_utf8(bytes).map_err(|_| "its bytes are not UTF-8".to_string())?;
     if digest_of(&text) != digest {
-        return Err(Damaged(
-            "its bytes do not hash to the digest its lines name".into(),
-        ));
+        return Err("its bytes do not hash to the digest its lines name".into());
     }
-    let named = serde_json::from_str::<Value>(&text)
-        .ok()
-        .and_then(|d| d.get("version")?.as_u64());
-    if named != Some(version) {
-        return Err(Damaged(
-            "the document names another version than its lines do".into(),
-        ));
+    if document_version(&text) != Some(version) {
+        return Err("the document names another version than its lines do".into());
     }
     Ok(text)
+}
+
+/// The version a document's text names, or `None` when it is no JSON object
+/// with a whole-number version.
+pub fn document_version(text: &str) -> Option<u64> {
+    serde_json::from_str::<Value>(text)
+        .ok()?
+        .get("version")?
+        .as_u64()
 }
 
 #[cfg(test)]
@@ -460,7 +357,7 @@ mod tests {
         let d = digest_of(&text);
         let lines = lines_of(9, &d, &text);
         let refused = |lines: &[Value], version: u64, digest: &str| {
-            assemble(version, digest, lines).unwrap_err().into_text()
+            assemble(version, digest, lines).unwrap_err()
         };
         assert!(refused(&lines[1..], 9, &d).contains("parts"));
         let mut other = lines.clone();
@@ -475,42 +372,11 @@ mod tests {
         let mut bare = lines.clone();
         bare[0].as_object_mut().unwrap().remove("fields.b64");
         assert!(refused(&bare, 9, &d).contains("names no part"));
-    }
-
-    /// Only a copy with parts missing, or none at all, is one another copy
-    /// can mend; a copy damaged any other way, or a read that failed, is not.
-    #[test]
-    fn what_the_write_log_holds_is_told_apart() {
-        let text = doc(9, 40_000);
-        let d = digest_of(&text);
-        let lines = lines_of(9, &d, &text);
-        let held = |lines: &[Value]| held_of(assemble(9, &d, lines));
-        assert_eq!(held(&lines), Ok(Held::Readable));
-        assert_eq!(held(&[]), Ok(Held::Absent));
-        assert_eq!(held(&lines[1..]), Ok(Held::Partial));
         let mut stray = lines.clone();
         stray[0]["fields.part"] = json!("99");
-        assert!(held(&stray).unwrap_err().contains("outside"));
-        let mut other = lines.clone();
-        other.push(json!({"fields.part": "1", "fields.parts": lines.len().to_string(), "fields.b64": "QUJD"}));
-        assert!(held(&other).is_err());
-        assert_eq!(
-            held_of(Err(Unreadable::Damaged("metrics 500".into()))),
-            Err("metrics 500".into())
-        );
-    }
-
-    /// A claim holds for the settling time, once however often it is asked
-    /// for, and a released one can be claimed again at once.
-    #[test]
-    fn a_document_is_claimed_once_while_it_settles() {
-        let (s, d) = (Settling::default(), "d".repeat(64));
-        assert!(s.claim(9, &d, 1_000));
-        assert!(!s.claim(9, &d, 1_000 + SETTLING_SECS - 1));
-        assert!(s.claim(9, &"e".repeat(64), 1_000) && s.claim(10, &d, 1_000));
-        assert!(s.claim(9, &d, 1_000 + SETTLING_SECS));
-        s.release(9, &d);
-        assert!(s.claim(9, &d, 1_000 + SETTLING_SECS));
+        assert!(refused(&stray, 9, &d).contains("outside"));
+        let many = vec![lines[0].clone(); MAX_LINES];
+        assert!(refused(&many, 9, &d).contains("distinct lines"));
     }
 
     #[test]

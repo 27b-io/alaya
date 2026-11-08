@@ -35,6 +35,8 @@
 //! write-log line alone.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -48,8 +50,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 
 use super::{
-    Outcome, actor_of, clean_reason, effect_href, guard, not_configured, outcome, page_html,
-    refused_locally, refused_text, send_recorded, store_of, sub_header, write_log,
+    Outcome, RECOVERY_REFUSED, WINDOW_OPEN, actor_of, clean_reason, effect_href, guard,
+    not_configured, outcome, page_html, pinned_version, refused_locally, refused_text,
+    send_recorded, store_conditions, store_of, sub_header, write_log,
 };
 use crate::committed;
 use crate::confirm::{self, ImportCheck, Needed, RowCheck};
@@ -347,9 +350,7 @@ fn op_title(op: &DocOp) -> String {
 
 /// The version a document to import names, which the guard compares.
 fn import_version(text: &str) -> Result<u64, String> {
-    serde_json::from_str::<Value>(text)
-        .ok()
-        .and_then(|d| d.get("version")?.as_u64())
+    writelog::document_version(text)
         .ok_or_else(|| "the document names no version the guard can compare".to_string())
 }
 
@@ -564,13 +565,14 @@ pub async fn preview(
     };
     let actor = actor_of(&session);
     let ops = [op];
-    let request = json!({ "document": DocRequest {
+    let request = DocRequest {
         expected_version: expected,
         actor: &actor,
         reason: &reason,
         dry_run: true,
         ops: &ops,
-    } });
+    }
+    .body();
     let answer = m.client.post(&request).await;
     // A preview is shown only for an answer that is a dry run's. One that
     // carries a version or keys is a commit: the store wrote something the
@@ -650,7 +652,7 @@ pub async fn preview(
 /// committed. Both `None` for every other op.
 struct Imported<'a> {
     source: Option<String>,
-    against: Option<&'a Result<(writelog::Logged, Vec<Value>), String>>,
+    against: Option<&'a Result<(u64, Vec<Value>), String>>,
 }
 
 fn preview_view(
@@ -736,20 +738,7 @@ fn commit_form(
         .into_iter()
         .map(|(k, v)| view! { <input type="hidden" name=k value=v /> })
         .collect_view();
-    let confirms = needed
-        .iter()
-        .map(|n| {
-            let (warning, field, phrase) = (n.warning(), n.field(), n.phrase());
-            let label = format!("Type {phrase} to confirm.");
-            view! {
-                <div class="space-y-1">
-                    <Notice status=Status::Error label="confirm">{warning}</Notice>
-                    <label class="text-xs text-muted-foreground" for=field>{label}</label>
-                    <input class=INPUT_CLASS id=field name=field required autocomplete="off" />
-                </div>
-            }
-        })
-        .collect_view();
+    let confirms = confirm_inputs(needed);
     let style = match op {
         DocOp::Delete { .. }
         | DocOp::RevokeKey { .. }
@@ -768,6 +757,24 @@ fn commit_form(
             <button type="submit" class=btn(style)>"Commit"</button>
         </form>
     }
+}
+
+/// A form's typed confirmations, each under its warning.
+pub(super) fn confirm_inputs(needed: &[Needed]) -> impl IntoView + use<> {
+    needed
+        .iter()
+        .map(|n| {
+            let (warning, field, phrase) = (n.warning(), n.field(), n.phrase());
+            let label = format!("Type {phrase} to confirm.");
+            view! {
+                <div class="space-y-1">
+                    <Notice status=Status::Error label="confirm">{warning}</Notice>
+                    <label class="text-xs text-muted-foreground" for=field>{label}</label>
+                    <input class=INPUT_CLASS id=field name=field required autocomplete="off" />
+                </div>
+            }
+        })
+        .collect_view()
 }
 
 // ─── Commit ─────────────────────────────────────────────────────────────────
@@ -817,19 +824,21 @@ pub async fn commit(
     // (`merged_after_commit`), the answer carries the catch-up's version,
     // digest and bytes, which readers converge on. The first is not
     // exported: an instance that installed it in between raises the
-    // unmatched-install alert, which is the safe side.
+    // unmatched-install alert, which is the safe side. Whether its document
+    // reached the write log comes back for the operator.
+    let logged = Arc::new(AtomicBool::new(false));
     let export = {
-        let ops = ops.clone();
+        let (ops, logged) = (ops.clone(), Arc::clone(&logged));
         move |m: &StoreModule, body: &Value| {
             if let Ok(c) = commit_of(body, &ops) {
                 m.committed.document(c.version, &c.digest);
                 let text = body.get("text").and_then(Value::as_str);
-                writelog::log_committed(c.version, &c.digest, text);
+                let done = writelog::log_committed(c.version, &c.digest, text);
+                logged.store(done, Ordering::Relaxed);
             }
         }
     };
-    let body = json!({ "document": request });
-    let answer = send_recorded(m, &session.sub, DOCUMENT, body, export).await;
+    let answer = send_recorded(m, &session.sub, DOCUMENT, request.body(), export).await;
     let op = &ops[0];
     let body = match outcome(answer) {
         Outcome::Accepted(body) => body,
@@ -870,16 +879,24 @@ pub async fn commit(
         digest: c.digest.clone(),
     };
     let to = effect_href(&[], Some(&doc));
+    // The task that sent the write has finished, so its answer is final.
+    let unlogged = (!logged.load(Ordering::Relaxed)).then_some(UNLOGGED);
     if !c.keys.is_empty() {
-        return Ok(key_page(&session, &c, &to));
+        return Ok(key_page(&session, &c, &to, unlogged));
     }
     let msg = format!(
-        "Committed document version {}: {}. Confirming on every stack…",
+        "Committed document version {}: {}.{} Confirming on every stack…",
         c.version,
-        op_title(op)
+        op_title(op),
+        unlogged.map(|u| format!(" {u}")).unwrap_or_default()
     );
     Ok(flash_redirect(jar, secure, "ok", msg, &to))
 }
+
+/// What the operator is told of a commit whose document is not on the write
+/// log, where an import after a wipe looks for it first.
+const UNLOGGED: &str = "Its document is not on the write log: the store's answer carries no bytes \
+     that hash to it. Should an import need it, paste it from an instance's install log.";
 
 /// A write that may or may not have applied. Nothing is exported as
 /// committed: an unmatched-install alert on the console's own write is the
@@ -916,25 +933,19 @@ pub(super) async fn doc_now(m: &StoreModule) -> String {
         .and_then(Value::as_u64)
         .map(|v| v.to_string())
         .unwrap_or_else(|| "unreadable".into());
-    let mut out = format!(" Re-read the store: it is at document version {version}");
-    let frozen: Vec<String> = doc
-        .get("frozen")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(|f| clip(f, 160))
-        .collect();
-    if !frozen.is_empty() {
-        out.push_str(&format!(
-            ", and refuses document writes: {}",
-            frozen.join("; ")
-        ));
+    let mut out = format!(" Re-read the store: it is at document version {version}.");
+    let c = store_conditions(&store);
+    for line in [
+        c.frozen_line(),
+        c.recovery_refused.then(|| RECOVERY_REFUSED.to_string()),
+        c.window_open.then(|| WINDOW_OPEN.to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        out.push(' ');
+        out.push_str(&line);
     }
-    if store.get("pitr_window").and_then(Value::as_bool) == Some(true) {
-        out.push_str(", with a point-in-time recovery window open");
-    }
-    out.push('.');
     out
 }
 
@@ -942,7 +953,7 @@ pub(super) async fn doc_now(m: &StoreModule) -> String {
 /// redirect, so the key reaches no URL and no cookie; `no-store` keeps it out
 /// of every cache. Reloading re-sends the commit, which the store refuses
 /// with 409 because its pinned version is gone.
-fn key_page(session: &Session, c: &Commit, effect: &str) -> Response {
+fn key_page(session: &Session, c: &Commit, effect: &str, unlogged: Option<&str>) -> Response {
     let rows = c
         .keys
         .iter()
@@ -964,6 +975,9 @@ fn key_page(session: &Session, c: &Commit, effect: &str) -> Response {
         })
         .collect_view();
     let committed = format!("Committed document version {}.", c.version);
+    let unlogged = unlogged
+        .map(str::to_string)
+        .map(|u| view! { <Notice status=Status::Warn label="write log">{u}</Notice> });
     let effect = effect.to_string();
     let content = view! {
         <div class="space-y-6">
@@ -984,6 +998,7 @@ fn key_page(session: &Session, c: &Commit, effect: &str) -> Response {
                             <TableBody>{rows}</TableBody>
                         </Table></TableWrapper>
                         <p class="text-sm">{committed}" Rotation with overlap: once every consumer reads the new key, revoke the old one from the client's row."</p>
+                        {unlogged}
                         <p class="text-sm"><Link href=effect>"Confirm the new document is in effect"</Link></p>
                     </div>
                 </CardContent>
@@ -1077,59 +1092,48 @@ fn pasted(raw: &str) -> Result<(String, String), String> {
 /// A document's diff against the newest document the console committed, as
 /// its write log holds it: anything this diff shows, the document changes.
 /// An import is checked against it, and so is a finished point-in-time
-/// recovery.
+/// recovery. The newest commit is named first, and only its own bytes are
+/// the base: an older copy standing in for a missing one would show no
+/// change for a document that undoes the newest commit.
 pub(super) async fn against_newest(
     m: &StoreModule,
     text: &str,
-) -> Result<(writelog::Logged, Vec<Value>), String> {
-    let (listing, labels) = tokio::join!(writelog::logged(&m.metrics), committed::read(&m.metrics));
-    let docs = listing
-        .map_err(|e| format!("the write log could not be read ({e})"))?
-        .docs;
-    if docs.is_empty() {
-        return Err("the write log holds no document from the last 30 days".into());
-    }
-    let labels_read = labels.as_ref().map_err(Clone::clone);
-    let newest = newest_committed(m, &docs, labels.as_deref().unwrap_or_default())
-        .cloned()
-        .ok_or_else(|| match labels_read {
-            Ok(_) => "no document in the write log from the last 30 days is one the console \
-                      exported as committed"
+) -> Result<(u64, Vec<Value>), String> {
+    let labels = committed::read(&m.metrics).await;
+    let (version, digest) =
+        newest_known(m, labels.as_deref().unwrap_or_default()).ok_or_else(|| match &labels {
+            Ok(_) => "no document the console committed is known: this process exported none, \
+                      and the metrics store shows no committed label from the last 30 days"
                 .to_string(),
             Err(e) => format!(
-                "no document in the write log is one this console process exported, and the \
-                 committed labels could not be read ({e})"
+                "no document the console committed is known: this process exported none, and \
+                 the committed labels could not be read ({e})"
             ),
         })?;
-    let base = writelog::document(&m.metrics, newest.version, &newest.digest)
+    let base = writelog::document(&m.metrics, version, &digest)
         .await
         .map_err(|e| {
             format!(
-                "the newest logged document, version {}, cannot be read: {e}",
-                newest.version
+                "the newest document the console committed, version {version}, cannot be read \
+                 from the write log ({e}), and no older copy stands in for it"
             )
         })?;
     let json = |t: &str| {
         serde_json::from_str::<Value>(t).map_err(|_| "a document is not JSON".to_string())
     };
     let changes = client_diff(&json(&base)?, &json(text)?);
-    Ok((newest, changes))
+    Ok((version, changes))
 }
 
-/// The newest logged document the console committed, `docs` being highest
-/// version first: the newest this process exported as committed, which
-/// nothing outside it can write, or else the newest a committed label names.
-/// A copy neither confirms is never the base. Only a fault, or a write to
-/// the log store from outside the console, makes one, and a base it chose
-/// could hide the very change the diff is there to show.
-fn newest_committed<'a>(
-    m: &StoreModule,
-    docs: &'a [writelog::Logged],
-    labels: &[committed::Label],
-) -> Option<&'a writelog::Logged> {
-    docs.iter()
-        .find(|d| m.committed.holds(d.version, &d.digest))
-        .or_else(|| docs.iter().find(|d| labelled(labels, d)))
+/// The newest document the console committed, by version and digest: the
+/// newest this process exported, or else the newest a committed label names.
+fn newest_known(m: &StoreModule, labels: &[committed::Label]) -> Option<(u64, String)> {
+    m.committed.newest().or_else(|| {
+        labels
+            .iter()
+            .max_by_key(|l| l.version)
+            .map(|l| (l.version, l.digest.clone()))
+    })
 }
 
 fn labelled(labels: &[committed::Label], d: &writelog::Logged) -> bool {
@@ -1141,26 +1145,23 @@ fn labelled(labels: &[committed::Label], d: &writelog::Logged) -> bool {
 /// The diff against the newest document the console committed, with a
 /// warning for each name it drops that is still in a stack's TOML.
 pub(super) fn against_view(
-    against: &Result<(writelog::Logged, Vec<Value>), String>,
+    against: &Result<(u64, Vec<Value>), String>,
     toml: &Result<BTreeMap<String, BTreeSet<String>>, String>,
 ) -> AnyView {
     let body = match against {
-        Ok((newest, changes)) if changes.is_empty() => view! {
+        Ok((version, changes)) if changes.is_empty() => view! {
             <p class="text-sm">{format!(
-                "No change from the newest document the console committed: version {}, logged {}.",
-                newest.version, newest.at
+                "No change from the newest document the console committed: version {version}."
             )}</p>
         }
         .into_any(),
-        Ok((newest, changes)) => {
+        Ok((version, changes)) => {
             let items = diff_lines(changes)
                 .into_iter()
                 .map(|l| view! { <li class="font-mono text-xs break-all">{l}</li> })
                 .collect_view();
-            let what = format!(
-                "Against the newest document the console committed: version {}, logged {}.",
-                newest.version, newest.at
-            );
+            let what =
+                format!("Against the newest document the console committed: version {version}.");
             let notes = toml_notes(changes, toml)
                 .into_iter()
                 .map(|n| view! { <Notice status=Status::Warn label="toml">{n}</Notice> })
@@ -1270,16 +1271,19 @@ pub async fn import_page(
         fleet::installed(&m.metrics),
         committed::read(&m.metrics)
     );
-    // Each logged copy, marked as the console committed it or not.
+    // Each logged copy, marked as the console committed it or not, and the
+    // newest commit, whose copy every preview diffs against.
+    let newest = newest_known(m, labels.as_deref().unwrap_or_default());
     let logged = logged.map(|l| {
         let labels = labels.as_deref().unwrap_or_default();
-        let newest = newest_committed(m, &l.docs, labels).cloned();
         let offered = l
             .docs
             .iter()
             .map(|d| Offered {
                 committed: m.committed.holds(d.version, &d.digest) || labelled(labels, d),
-                newest: newest.as_ref() == Some(d),
+                newest: newest
+                    .as_ref()
+                    .is_some_and(|(v, g)| *v == d.version && *g == d.digest),
                 twin: l
                     .docs
                     .iter()
@@ -1290,7 +1294,7 @@ pub async fn import_page(
         (offered, l.malformed)
     });
     let labels = labels.map(|_| ());
-    let content = import_view(store, logged, labels, installed, &session.csrf);
+    let content = import_view(store, logged, labels, newest, installed, &session.csrf);
     Ok((jar, Html(page_html(&session, flash, content))))
 }
 
@@ -1310,41 +1314,27 @@ fn import_view(
     store: Result<Value, AppError>,
     logged: Result<(Vec<Offered>, usize), String>,
     labels: Result<(), String>,
+    newest: Option<(u64, String)>,
     installed: Result<BTreeMap<u64, BTreeSet<String>>, String>,
     csrf: &str,
 ) -> impl IntoView + use<> {
     let header = sub_header("Import a document".into(), IMPORT.into());
     // The version every import form pins: the store's addressable version,
     // 0 when it holds none. Unknown, and no form is offered.
-    let expected = match store
+    let expected = store
         .as_ref()
         .map_err(|e| e.detail().to_string())
-        .and_then(effect::served_doc)
-    {
-        Ok(d) => Ok(d.map(|d| d.version).unwrap_or(0)),
-        Err(e) => Err(e),
-    };
+        .and_then(pinned_version);
     let state = match (&store, &expected) {
         (Ok(s), Ok(v)) => {
+            let c = store_conditions(s);
             let mut lines = vec![format!("The store is at document version {v}.")];
-            let doc = s.get("document");
-            lines.extend(
-                doc.and_then(|d| d.get("frozen"))
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(|f| format!("It refuses document writes: {}.", clip(f, 160))),
-            );
-            if doc
-                .and_then(|d| d.get("recovery_refused"))
-                .and_then(Value::as_bool)
-                == Some(true)
-            {
-                lines.push("A recovery was refused: an import that commits clears it.".into());
+            lines.extend(c.frozen_line());
+            if c.recovery_refused {
+                lines.push(RECOVERY_REFUSED.into());
             }
-            if s.get("pitr_window").and_then(Value::as_bool) == Some(true) {
-                lines.push("A point-in-time recovery window is open: the store refuses an import until it closes.".into());
+            if c.window_open {
+                lines.push(WINDOW_OPEN.into());
             }
             let items = lines
                 .into_iter()
@@ -1392,6 +1382,19 @@ fn import_view(
             clip(&e, 200)
         );
         view! { <div class="mb-3"><Notice status=Status::Warn label="labels">{text}</Notice></div> }
+    });
+    // The newest commit's copy missing from the list: no preview can diff
+    // against it, and nothing older stands in for it.
+    let listed = |v: u64, d: &str| {
+        logged
+            .as_ref()
+            .is_ok_and(|l| l.0.iter().any(|o| o.doc.version == v && o.doc.digest == d))
+    };
+    let unlisted = newest.filter(|(v, d)| logged.is_ok() && !listed(*v, d)).map(|(v, _)| {
+        let text = format!(
+            "The newest document the console committed, version {v}, is not among the documents the write log lists: no import preview can show its diff against it. Paste it from an instance's install log if you have it."
+        );
+        view! { <div class="mb-3"><Notice status=Status::Warn label="newest">{text}</Notice></div> }
     });
     let rows = match logged.map(|l| l.0) {
         Err(e) => view! {
@@ -1456,7 +1459,7 @@ fn import_view(
                     <CardTitle>"Documents the console committed"</CardTitle>
                     <CardDescription>"From the console's write log, highest version first. The newest the console committed is the one to import, unless it is the damage being recovered from, and every preview diffs against it. A copy without a committed label, or whose version the log names with another digest too, is not one the console committed as it stands: only a fault, or a write to the log store from outside the console, makes one."</CardDescription>
                 </CardHeader>
-                <CardContent>{labels}{malformed}{rows}</CardContent>
+                <CardContent>{labels}{unlisted}{malformed}{rows}</CardContent>
             </Card>
             <Card>
                 <CardHeader>

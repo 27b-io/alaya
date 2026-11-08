@@ -16,10 +16,9 @@
 //!
 //! The document labels are read back too, through the metrics proxy's route
 //! pinned to their series: the documents to return to by point-in-time
-//! recovery, and the write-log copies an import may diff against. Anything on
-//! the host can write the metrics store, so a label read back is a claim, and
-//! this process's own list, which nothing outside it can write, is checked
-//! first where it can answer.
+//! recovery, and the newest commit an import is diffed against. Like every
+//! metrics value, a label read back is untrusted input, a claim, so this
+//! process's own list is checked first where it can answer.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -105,6 +104,16 @@ impl Committed {
                 at,
             },
         );
+    }
+
+    /// The newest document this process exported as committed, by version.
+    pub fn newest(&self) -> Option<(u64, String)> {
+        self.documents
+            .lock()
+            .expect("committed lock poisoned")
+            .iter()
+            .max_by_key(|d| d.version)
+            .map(|d| (d.version, d.digest.clone()))
     }
 
     /// Whether this process exported this document as committed.

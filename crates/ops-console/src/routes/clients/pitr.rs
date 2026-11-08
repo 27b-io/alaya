@@ -22,14 +22,16 @@ use axum::response::{Html, IntoResponse, Response};
 use axum_extra::extract::cookie::PrivateCookieJar;
 use leptos::prelude::*;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::{
-    Block, Outcome, REFRESH_EVERY, REFRESH_FOR_SECS, Reading, actor_of, capitalise, clean_reason,
-    effect_card, effect_href, guard, not_configured, outcome, page_html, read_all, refused_locally,
-    refused_text, send_recorded, sights, store_of, sub_header,
+    Block, Outcome, RECOVERY_REFUSED, REFRESH_EVERY, REFRESH_FOR_SECS, Reading, actor_of,
+    capitalise, clean_reason, effect_card, effect_href, guard, not_configured, outcome, page_html,
+    pinned_version, read_all, refused_locally, refused_text, send_recorded, sights,
+    store_conditions, store_of, sub_header,
 };
 use crate::committed::{self, Label};
+use crate::confirm::{self, Needed};
 use crate::effect::{self, Doc, is_hex64};
 use crate::error::AppError;
 use crate::routes::{clip, short_digest};
@@ -37,10 +39,10 @@ use crate::session::{Session, flash_redirect, now_epoch, take_flash};
 use crate::state::{AppState, StoreModule};
 use crate::store::{Answer, DocOp, DocRequest, has_code, refusal_lines};
 use crate::ui::*;
-use crate::writelog::{self, Held};
+use crate::writelog;
 
 /// The write log's kinds for a pitr and its acceptance.
-const PITR: &str = "pitr";
+pub(super) const PITR: &str = "pitr";
 const PITR_ACCEPT: &str = "pitr_accept";
 
 /// How long after the dispatch the window's deadline is suggested. The store
@@ -49,52 +51,12 @@ const UNTIL_MINUTES: u64 = 50;
 
 // ─── Times ──────────────────────────────────────────────────────────────────
 
-/// A UTC time as the store writes its `at` fields and its window's times,
-/// `YYYY-MM-DDTHH:MM:SS[.fff]Z`, in Unix milliseconds. Anything else is
-/// `None`: a time the console cannot read bounds no restore.
+/// A time as the store writes its `at` fields and its window's times, RFC
+/// 3339 in UTC, in Unix milliseconds. Anything that is no RFC 3339 time at or
+/// after the epoch is `None`: a time the console cannot read bounds no
+/// restore.
 fn parse_ms(s: &str) -> Option<u64> {
-    let b = s.as_bytes();
-    let shape = b.len() >= 20
-        && [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':')]
-            .iter()
-            .all(|&(i, c)| b[i] == c)
-        && b.last() == Some(&b'Z');
-    if !shape {
-        return None;
-    }
-    let num = |from: usize, to: usize| -> Option<u32> {
-        let part = s.get(from..to)?;
-        part.bytes()
-            .all(|c| c.is_ascii_digit())
-            .then(|| part.parse().ok())?
-    };
-    let millis = match s.get(19..s.len() - 1)? {
-        "" => 0,
-        f if f.starts_with('.') && (2..=4).contains(&f.len()) => {
-            let digits = &f[1..];
-            let n: u32 = digits
-                .bytes()
-                .all(|c| c.is_ascii_digit())
-                .then(|| digits.parse().ok())??;
-            n * 10u32.pow(4 - f.len() as u32)
-        }
-        _ => return None,
-    };
-    let month = time::Month::try_from(u8::try_from(num(5, 7)?).ok()?).ok()?;
-    let date = time::Date::from_calendar_date(
-        i32::try_from(num(0, 4)?).ok()?,
-        month,
-        u8::try_from(num(8, 10)?).ok()?,
-    )
-    .ok()?;
-    let clock = time::Time::from_hms_milli(
-        u8::try_from(num(11, 13)?).ok()?,
-        u8::try_from(num(14, 16)?).ok()?,
-        u8::try_from(num(17, 19)?).ok()?,
-        u16::try_from(millis).ok()?,
-    )
-    .ok()?;
-    let t = time::PrimitiveDateTime::new(date, clock).assume_utc();
+    let t = time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()?;
     u64::try_from(t.unix_timestamp_nanos() / 1_000_000).ok()
 }
 
@@ -202,6 +164,10 @@ fn targets(labels: &[Label], store: &Value) -> Vec<Target> {
 struct Interval {
     after: u64,
     before: Option<u64>,
+    /// A later version found only in the labels, committed too close to the
+    /// pick for any restore time to be sure to fall between them. It bounds
+    /// nothing, since no label shuts an interval, but it moves the suggestion.
+    crowded: Option<u64>,
 }
 
 impl Interval {
@@ -212,11 +178,14 @@ impl Interval {
     /// The restore time to dispatch: midway to the next commit, so a
     /// bookmark the platform takes only approximately still lands on the
     /// pick; a second after the commit when no later commit is known, since
-    /// the wipe or edit being recovered from came later.
+    /// the wipe or edit being recovered from came later. Beside a crowded
+    /// label, a millisecond after the commit: the best chance of landing
+    /// before that label's commit.
     fn suggested(&self) -> u64 {
-        match self.before {
-            Some(b) => self.after + (b - self.after) / 2,
-            None => self.after + 1000,
+        match (self.crowded, self.before) {
+            (Some(_), _) => self.after + 1,
+            (None, Some(b)) => self.after + (b - self.after) / 2,
+            (None, None) => self.after + 1000,
         }
     }
 }
@@ -228,18 +197,27 @@ impl Interval {
 /// labels count too, since a commit a recovery rewound away has left the
 /// history but not the store's past. A later version found only in the
 /// labels, which are untrusted input like every metrics value, narrows the
-/// interval but never shuts it: no metrics value can stop a pitr.
+/// interval but never shuts it: no metrics value can stop a pitr. One too
+/// close to narrow it is named instead (`crowded`).
 fn interval(targets: &[Target], i: usize) -> Option<Interval> {
     let pick = &targets[i];
     let after = pick.committed.1;
-    let before = targets
-        .iter()
-        .filter(|n| n.version > pick.version && (n.in_history || n.committed.0 > after + 1))
+    let later = || targets.iter().filter(|n| n.version > pick.version);
+    let before = later()
+        .filter(|n| n.in_history || n.committed.0 > after + 1)
         .map(|n| n.committed.0)
+        .min();
+    let crowded = later()
+        .filter(|n| !n.in_history && n.committed.0 <= after + 1)
+        .map(|n| n.version)
         .min();
     match before {
         Some(b) if b <= after + 1 => None,
-        _ => Some(Interval { after, before }),
+        _ => Some(Interval {
+            after,
+            before,
+            crowded,
+        }),
     }
 }
 
@@ -322,12 +300,6 @@ fn query_param(raw: Option<&str>, key: &str) -> Option<String> {
         .map(|(_, v)| v.into_owned())
 }
 
-/// The version every recovery form pins: the store's addressable version, 0
-/// when it holds none.
-fn pinned_version(store: &Value) -> Result<u64, String> {
-    effect::served_doc(store).map(|d| d.map(|d| d.version).unwrap_or(0))
-}
-
 // ─── The PITR page ──────────────────────────────────────────────────────────
 
 const PITR_ABOUT: &str = "Rewinds the store's document to one the console committed, after a wipe, a rollback or an edit made outside the API, up to 30 days back. It never touches the restrictions, so no disable is lifted. Pick the document to return to; the console derives the restore time from when it was committed, never from its version. Open the recovery window with the inputs shown, then send pitr. The store finishes or refuses the recovery itself.";
@@ -379,28 +351,10 @@ fn recovery_state(store: &Value) -> impl IntoView + use<> {
             format!("The store's document cannot be read: {}.", clip(&e, 160)),
         )),
     }
-    let doc = store.get("document");
-    for f in doc
-        .and_then(|d| d.get("frozen"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-    {
-        lines.push((
-            Status::Warn,
-            format!("It refuses document writes: {}.", clip(f, 160)),
-        ));
-    }
-    if doc
-        .and_then(|d| d.get("recovery_refused"))
-        .and_then(Value::as_bool)
-        == Some(true)
-    {
-        lines.push((
-            Status::Error,
-            "A recovery was refused: the store serves no document to readers until an import or another recovery commits.".into(),
-        ));
+    let c = store_conditions(store);
+    lines.extend(c.frozen_line().map(|l| (Status::Warn, l)));
+    if c.recovery_refused {
+        lines.push((Status::Error, RECOVERY_REFUSED.into()));
     }
     match window(store) {
         Some(w) if w.open => {
@@ -559,6 +513,7 @@ fn pick_card(
         Some(Interval {
             after,
             before: Some(b),
+            ..
         }) => format!(
             "The restore time must fall after {} and before the next commit, at {}, and before the wipe or edit being recovered from if that came first.",
             iso_ms(after),
@@ -567,6 +522,7 @@ fn pick_card(
         Some(Interval {
             after,
             before: None,
+            ..
         }) => format!(
             "The restore time must fall after {}. No later commit is known, so it must also fall before the wipe or edit being recovered from.",
             iso_ms(after)
@@ -574,6 +530,15 @@ fn pick_card(
         None => "The next commit is too close to this one for a restore time to fall between them."
             .into(),
     };
+    let crowded = iv.and_then(|iv| iv.crowded).map(|v| {
+        let text = format!(
+            "Version {v}, a later commit found only in the console's labels, was committed within \
+             a second of this one: no restore time is sure to fall between them. The suggested \
+             time is the nearest after this commit; if the restore lands on version {v}, the \
+             store refuses the recovery."
+        );
+        view! { <Notice status=Status::Warn label="too close">{text}</Notice> }
+    });
     let dispatch = iv.map(|iv| {
         let until = (now_epoch().max(0) as u64 + UNTIL_MINUTES * 60) * 1000;
         let inputs = format!(
@@ -608,6 +573,7 @@ fn pick_card(
                 <div class="space-y-3" id="pick">
                     <p class="text-sm">{what}</p>
                     <p class="text-sm">{times}</p>
+                    {crowded}
                     {dispatch}
                     {action}
                 </div>
@@ -617,21 +583,21 @@ fn pick_card(
     .into_any()
 }
 
+/// What a pick needs typed: its version, when it is found only in the
+/// store's history, which an edit could have rewritten.
+fn needed(t: &Target) -> Vec<Needed> {
+    (!t.labelled)
+        .then(|| Needed::Unchecked {
+            version: t.version,
+            why: "it is found only in the store's history, which an edit could have rewritten"
+                .into(),
+        })
+        .into_iter()
+        .collect()
+}
+
 fn send_form(csrf: &str, t: &Target, expected: u64) -> impl IntoView + use<> {
-    let confirm = (!t.labelled).then(|| {
-        let warning = format!(
-            "Version {} is found only in the store's history, which an edit could have rewritten.",
-            t.version
-        );
-        let label = format!("Type {} to confirm.", t.version);
-        view! {
-            <div class="space-y-1">
-                <Notice status=Status::Error label="confirm">{warning}</Notice>
-                <label class="text-xs text-muted-foreground" for="confirm_version">{label}</label>
-                <input class=INPUT_CLASS id="confirm_version" name="confirm_version" required autocomplete="off" />
-            </div>
-        }
-    });
+    let confirm = super::document::confirm_inputs(&needed(t));
     let (csrf, target, expected) = (csrf.to_string(), t.key(), expected.to_string());
     view! {
         <form method="post" action="/lb/clients/pitr" class="space-y-3">
@@ -721,12 +687,18 @@ pub async fn pitr_send(
     if let Some(why) = window_fault(window(&store).as_ref(), interval(&list, i)) {
         return Ok(refuse(jar, format!("Nothing was sent. {why}")));
     }
-    if !list[i].labelled && form.confirm_version.trim() != version.to_string() {
+    let needed = needed(&list[i]);
+    let typed = |field: &str| match field {
+        "confirm_version" => form.confirm_version.as_str(),
+        _ => "",
+    };
+    if let Some(n) = confirm::missing(&needed, typed) {
         return Ok(refuse(
             jar,
             format!(
-                "Version {version} is found only in the store's history. Nothing was sent: type \
-                 {version} to confirm."
+                "{} Nothing was sent: type {} to confirm.",
+                n.warning(),
+                n.phrase()
             ),
         ));
     }
@@ -734,13 +706,14 @@ pub async fn pitr_send(
     let ops = [DocOp::Pitr {
         expected_restore_digest: digest,
     }];
-    let body = json!({ "document": DocRequest {
+    let body = DocRequest {
         expected_version: expected,
         actor: &actor,
         reason: &reason,
         dry_run: false,
         ops: &ops,
-    } });
+    }
+    .body();
     // Nothing is exported as committed here: the recovery commit is exported
     // only once the operator accepts its diff.
     let answer = send_recorded(m, &session.sub, PITR, body, |_, _| {}).await;
@@ -960,7 +933,7 @@ async fn rewound(m: &StoreModule, store: &Value, id: &str) -> Option<Against> {
     let newest = rows.last()?;
     let text = store.pointer("/document/text").and_then(Value::as_str);
     Some(match text {
-        Some(t) if serves(store, newest) && writelog::digest_of(t) == newest.digest => {
+        Some(t) if writelog::digest_of(t) == newest.digest => {
             super::document::against_newest(m, t).await
         }
         _ => Err(
@@ -970,19 +943,9 @@ async fn rewound(m: &StoreModule, store: &Value, id: &str) -> Option<Against> {
     })
 }
 
-/// A document's diff against the newest document the console committed, or
-/// why there is none.
-type Against = Result<(writelog::Logged, Vec<Value>), String>;
-
-/// Whether the store's document is this recovery row's.
-fn serves(store: &Value, row: &RecoveryRow) -> bool {
-    let doc = store.get("document");
-    let current = (
-        doc.and_then(|d| d.get("version")).and_then(Value::as_u64),
-        doc.and_then(|d| d.get("digest")).and_then(Value::as_str),
-    );
-    current == (Some(row.version), Some(row.digest.as_str()))
-}
+/// A document's diff against the newest document the console committed, by
+/// that document's version, or why there is none.
+type Against = Result<(u64, Vec<Value>), String>;
 
 /// The marker's page body, and whether it may still change on its own.
 fn marker_view(r: &Reading, id: &str, rewound: Option<&Against>, csrf: &str) -> (AnyView, bool) {
@@ -1318,60 +1281,34 @@ pub async fn pitr_accept(
 }
 
 /// Log an accepted recovery's newest commit, whose bytes reach the console
-/// only through the store's view. Every copy on the write log is read back
-/// with the rest, and three of the largest document run past what one read
-/// takes, so it is logged only when the write log holds no whole copy, and
-/// only once while that copy settles. A read that fails, or a copy no further
-/// copy can mend, logs nothing: another copy could only add to the read.
-/// Returns why the write log holds no copy after this acceptance, which the
-/// operator is told: accepting again logs it while the store still serves it.
+/// only through the store's view. It is logged on every acceptance: a read
+/// takes each distinct line once, so another copy costs it nothing, and the
+/// copy's 30 days start again. When the store's view carries no bytes that
+/// hash to it, an earlier copy may still be on the write log. Returns why
+/// none is, which the operator is told: accepting again logs it while the
+/// store still serves it.
 async fn log_recovery(m: &StoreModule, store: &Value, newest: &RecoveryRow) -> Result<(), String> {
     let (version, digest) = (newest.version, newest.digest.as_str());
-    let why = match writelog::held(&m.metrics, version, digest).await {
-        Ok(Held::Readable) => {
-            tracing::info!(
-                target: "ops_console::write_log",
-                version,
-                digest = %digest,
-                "client-store document not logged again: it is already on the write log"
-            );
-            return Ok(());
-        }
-        Ok(Held::Absent | Held::Partial) if !serves(store, newest) => {
-            "the store has moved on from the recovery's commit".to_string()
-        }
-        Ok(Held::Absent | Held::Partial) if !m.settling.claim(version, digest, now_epoch()) => {
-            tracing::info!(
-                target: "ops_console::write_log",
-                version,
-                digest = %digest,
-                "client-store document not logged again: this process logged it moments ago, \
-                 and the log store is still indexing it"
-            );
-            return Ok(());
-        }
-        Ok(Held::Absent | Held::Partial) => {
-            let text = store.pointer("/document/text").and_then(Value::as_str);
-            if writelog::log_committed(version, digest, text) {
-                return Ok(());
-            }
-            m.settling.release(version, digest);
-            "the store's view carries no bytes that hash to it".to_string()
-        }
-        Err(e) => format!("the write log could not be read ({})", clip(&e, 300)),
-    };
-    tracing::warn!(
-        target: "ops_console::write_log",
-        version,
-        digest = %digest,
-        why = %why,
-        "client-store document not logged"
-    );
-    Err(why)
+    let text = store.pointer("/document/text").and_then(Value::as_str);
+    if writelog::log_committed(version, digest, text) {
+        return Ok(());
+    }
+    writelog::document(&m.metrics, version, digest)
+        .await
+        .map(drop)
+        .map_err(|e| {
+            format!(
+                "the store's view carries no bytes that hash to it, and no whole copy reads back \
+                 from the write log ({})",
+                clip(&e, 300)
+            )
+        })
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     const D1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -1444,7 +1381,8 @@ mod tests {
             iv,
             Interval {
                 after: at_ms,
-                before: Some(at_ms + 60_000)
+                before: Some(at_ms + 60_000),
+                crowded: None
             }
         );
         assert_eq!(iv.suggested(), at_ms + 30_000);
@@ -1480,24 +1418,29 @@ mod tests {
             interval(&t, pick),
             Some(Interval {
                 after: (secs + 1) * 1000,
-                before: None
+                before: None,
+                crowded: None
             })
         );
         // A label-only version a second on would shut the interval: it does
-        // not bound it.
+        // not bound it, but it is named, and the suggestion moves as close to
+        // the pick as it can.
         let history = store_with(json!([
             {"version": 7, "digest": D2, "at": later},
             {"version": 5, "digest": D1, "at": at},
         ]));
         let t = targets(&[label(6, D3, secs + 1)], &history);
         let pick = t.iter().position(|t| t.version == 5).unwrap();
+        let iv = interval(&t, pick).unwrap();
         assert_eq!(
-            interval(&t, pick),
-            Some(Interval {
+            iv,
+            Interval {
                 after: at_ms,
-                before: parse_ms(later)
-            })
+                before: parse_ms(later),
+                crowded: Some(6)
+            }
         );
+        assert_eq!(iv.suggested(), at_ms + 1);
         // A minute on, it is a commit a recovery rewound away, gone from the
         // history: it bounds the pick.
         let t = targets(&[label(6, D3, secs + 61)], &history);
@@ -1506,7 +1449,8 @@ mod tests {
             interval(&t, pick),
             Some(Interval {
                 after: at_ms,
-                before: Some((secs + 60) * 1000)
+                before: Some((secs + 60) * 1000),
+                crowded: None
             })
         );
         // The same holds for a pick found only in the labels.
@@ -1516,7 +1460,8 @@ mod tests {
             interval(&t, 0),
             Some(Interval {
                 after: (secs + 1) * 1000,
-                before: None
+                before: None,
+                crowded: Some(6)
             })
         );
         // A history version that close does shut it.
@@ -1532,6 +1477,7 @@ mod tests {
         let iv = Some(Interval {
             after: 1_000,
             before: Some(5_000),
+            crowded: None,
         });
         let w = |open, usable, to: Option<u64>| Window {
             open,
@@ -1604,21 +1550,25 @@ mod tests {
         assert!(!is_marker_id(&"0F".repeat(16)) && !is_marker_id("abc"));
     }
 
-    /// A time the store writes reads back exactly, and anything else is no
-    /// time at all.
+    /// A time the store writes reads back exactly, an offset reads as the
+    /// same instant, and anything that is no RFC 3339 time at or after the
+    /// epoch is no time at all.
     #[test]
-    fn times_read_only_the_stores_shape() {
+    fn times_read_as_rfc_3339() {
         assert_eq!(parse_ms("1970-01-01T00:00:01Z"), Some(1_000));
         assert_eq!(
             parse_ms("2026-11-08T10:00:00.5Z"),
             parse_ms("2026-11-08T10:00:00.500Z")
         );
+        assert_eq!(
+            parse_ms("2026-11-08T11:00:00.250+01:00"),
+            parse_ms("2026-11-08T10:00:00.250Z")
+        );
         for bad in [
-            "2026-11-08 10:00:00Z",
-            "2026-11-08T10:00:00+00:00",
             "2026-13-08T10:00:00Z",
-            "2026-11-08T10:00:00.1234Z",
+            "2026-11-08T10:00Z",
             "2026-11-08T1+:00:00Z",
+            "1969-12-31T23:59:59Z",
             "",
         ] {
             assert_eq!(parse_ms(bad), None, "{bad}");

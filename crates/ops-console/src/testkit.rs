@@ -342,7 +342,9 @@ fn next<T: Clone>(queue: &Mutex<Vec<T>>) -> T {
 /// A fake metrics proxy: `/m/<metric>/api/v1/query` answers that metric's
 /// series, or its 30-day series when the query holds a `[30d]` range, and
 /// `/logs/write-log/select/logsql/query` answers the write log's records
-/// that match the query's exact filters; anything else is a missing route.
+/// that match the query's exact filters, each distinct combination of a
+/// `uniq by` pipe's fields once, at most `limit` of them; anything else is a
+/// missing route.
 #[derive(Clone, Default)]
 pub(crate) struct FakeMetrics {
     pub series: Arc<Mutex<BTreeMap<String, Vec<Value>>>>,
@@ -382,19 +384,23 @@ impl FakeMetrics {
             let me = me.clone();
             async move {
                 let path = req.uri().path().to_string();
-                let query = url::form_urlencoded::parse(req.uri().query().unwrap_or("").as_bytes())
-                    .find(|(k, _)| k == "query")
-                    .map(|(_, v)| v.into_owned())
-                    .unwrap_or_default();
+                let param = |name: &str| {
+                    url::form_urlencoded::parse(req.uri().query().unwrap_or("").as_bytes())
+                        .find(|(k, _)| k == name)
+                        .map(|(_, v)| v.into_owned())
+                };
+                let query = param("query").unwrap_or_default();
+                let limit = param("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(usize::MAX);
                 me.log.lock().unwrap().push((req.method().to_string(), req.uri().to_string(), String::new()));
                 if path == "/logs/write-log/select/logsql/query" {
                     if me.failing.lock().unwrap().iter().any(|f| f == "write-log") {
                         return (StatusCode::INTERNAL_SERVER_ERROR, "query failed".to_string()).into_response();
                     }
-                    let lines: String = me.write_log.lock().unwrap().iter().rev()
+                    let matching: Vec<Value> = me.write_log.lock().unwrap().iter().rev()
                         .filter(|r| logsql_matches(&query, r))
-                        .map(|r| format!("{r}\n"))
+                        .cloned()
                         .collect();
+                    let lines: String = uniq(&query, matching).iter().take(limit).map(|r| format!("{r}\n")).collect();
                     return (StatusCode::OK, lines).into_response();
                 }
                 let metric = path.strip_prefix("/m/").and_then(|p| p.strip_suffix("/api/v1/query"));
@@ -477,6 +483,39 @@ fn logsql_matches(query: &str, record: &Value) -> bool {
         Some((field, want)) => record.get(field).and_then(Value::as_str) == Some(want),
         None => true,
     })
+}
+
+/// `records` through the query's `uniq by (…)` pipe, when it has one: each
+/// distinct combination of its fields once, a missing field read as empty,
+/// as the log store answers it.
+fn uniq(query: &str, records: Vec<Value>) -> Vec<Value> {
+    let fields = query
+        .split('|')
+        .skip(1)
+        .find_map(|p| p.trim().strip_prefix("uniq by"))
+        .and_then(|p| p.trim_start().strip_prefix('('))
+        .and_then(|p| p.split_once(')'))
+        .map(|(inner, _)| inner.split(',').map(str::trim).collect::<Vec<_>>());
+    let Some(fields) = fields else {
+        return records;
+    };
+    let mut out: Vec<Value> = Vec::new();
+    for r in records {
+        let row: serde_json::Map<String, Value> = fields
+            .iter()
+            .map(|f| {
+                (
+                    f.to_string(),
+                    r.get(*f).cloned().unwrap_or_else(|| json!("")),
+                )
+            })
+            .collect();
+        let row = Value::Object(row);
+        if !out.contains(&row) {
+            out.push(row);
+        }
+    }
+    out
 }
 
 pub(crate) fn series(labels: &[(&str, &str)], value: &str) -> Value {
