@@ -101,6 +101,17 @@ pub enum DocOp {
         #[serde(skip_serializing_if = "Option::is_none")]
         expected_digest: Option<String>,
     },
+    /// Replaces the document with `text`, the last resort when point-in-time
+    /// recovery cannot help. `expected_digest` is the SHA-256 of its exact
+    /// bytes, which the store checks before anything else.
+    Import {
+        text: String,
+        expected_digest: String,
+    },
+    /// Rewinds the document to the open recovery window's time. The store
+    /// restarts to restore, and on its next start commits the recovery only
+    /// if it landed on the document with `expected_restore_digest`.
+    Pitr { expected_restore_digest: String },
 }
 
 /// A client's policy. `None` is no budget or no ceiling; an empty list is
@@ -241,8 +252,10 @@ pub fn refusal_lines(answer: &Value) -> Vec<String> {
 
 /// The members of a store answer the write log keeps. Anything else is left
 /// out, so a member the store might add later can never carry key material
-/// into a log line.
-const LOGGED: [&str; 11] = [
+/// into a log line. A commit's `text` is left out too: the committed
+/// document goes on the write log whole, in lines of its own
+/// (`writelog::log_document`).
+const LOGGED: [&str; 19] = [
     "status",
     "errors",
     "error",
@@ -254,6 +267,16 @@ const LOGGED: [&str; 11] = [
     "results",
     "records_version",
     "message",
+    // A pitr's 202: the recovery marker it left.
+    "marker",
+    // A restrictions_import's answer.
+    "written",
+    "digests_added",
+    "digests_ignored",
+    "integrity",
+    "cf_set_found",
+    "reenable_by_hand",
+    "client_store",
 ];
 
 /// The answer as the write log may hold it: the members in `LOGGED`, and
@@ -430,6 +453,13 @@ mod tests {
                 version: 7,
                 expected_digest: Some("b".repeat(64)),
             },
+            DocOp::Import {
+                text: "{}".into(),
+                expected_digest: "c".repeat(64),
+            },
+            DocOp::Pitr {
+                expected_restore_digest: "d".repeat(64),
+            },
         ];
         let req = DocRequest {
             expected_version: 1_791_700_000_123,
@@ -452,7 +482,9 @@ mod tests {
                     {"op": "add_key", "name": "acme", "label": "2026-10"},
                     {"op": "revoke_key", "digest": "a".repeat(64)},
                     {"op": "restore", "version": 7},
-                    {"op": "restore", "version": 7, "expected_digest": "b".repeat(64)}
+                    {"op": "restore", "version": 7, "expected_digest": "b".repeat(64)},
+                    {"op": "import", "text": "{}", "expected_digest": "c".repeat(64)},
+                    {"op": "pitr", "expected_restore_digest": "d".repeat(64)}
                 ]
             }})
         );

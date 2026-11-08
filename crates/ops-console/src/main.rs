@@ -32,6 +32,7 @@ mod testkit;
 mod testlog;
 mod theme;
 mod ui;
+mod writelog;
 
 use axum::Router;
 use axum::extract::{FromRef, Request, State};
@@ -221,15 +222,44 @@ fn routes() -> Vec<(&'static str, axum::routing::MethodRouter<AppState>)> {
         ("/lb/clients", get(routes::clients::pane)),
         ("/lb/clients/disable", get(routes::clients::disable_page)),
         ("/lb/clients/restrict", post(routes::clients::restrict)),
-        ("/lb/clients/preview", post(routes::clients::preview)),
-        ("/lb/clients/commit", post(routes::clients::commit)),
+        (
+            "/lb/clients/preview",
+            post(routes::clients::preview).layer(document_form_limit()),
+        ),
+        (
+            "/lb/clients/commit",
+            post(routes::clients::commit).layer(document_form_limit()),
+        ),
         ("/lb/clients/effect", get(routes::clients::effect)),
         ("/lb/clients/history", get(routes::clients::history)),
+        ("/lb/clients/import", get(routes::clients::import_page)),
+        (
+            "/lb/clients/pitr",
+            get(routes::clients::pitr_page).post(routes::clients::pitr_send),
+        ),
+        ("/lb/clients/pitr/marker", get(routes::clients::pitr_marker)),
+        (
+            "/lb/clients/pitr/accept",
+            post(routes::clients::pitr_accept),
+        ),
+        (
+            "/lb/clients/reseed",
+            get(routes::clients::reseed_page)
+                .post(routes::clients::reseed)
+                .layer(document_form_limit()),
+        ),
         // selecta module: GET only, by design. The console holds a read-only
         // selecta credential and no POST route to selecta may be added here.
         ("/selecta", get(routes::selecta::pane)),
         ("/selecta/task/{id}", get(routes::selecta::task)),
     ]
+}
+
+/// The body limit of the routes that take a whole document or a reseed's
+/// sets (`routes::clients::DOCUMENT_FORM_LIMIT`); every other route keeps
+/// axum's default.
+fn document_form_limit() -> axum::extract::DefaultBodyLimit {
+    axum::extract::DefaultBodyLimit::max(routes::clients::DOCUMENT_FORM_LIMIT)
 }
 
 fn app(state: AppState) -> Router {
@@ -4135,8 +4165,20 @@ mod tests {
                 assert!(routed, "{route} did not route");
                 let (cookie, csrf) = cookie_for(&state, "admin-sub");
                 let pair = format!("{h1}:{h2}");
+                let (target, recovery) = (format!("7.{h1}"), "ab".repeat(16));
+                let (empty_set, once) = (
+                    crate::writelog::digest_of(""),
+                    crate::session::random_token(),
+                );
                 let sink = form(&[
                     ("csrf", &csrf),
+                    ("target", &target),
+                    ("id", &recovery),
+                    ("row", &target),
+                    ("set_text", ""),
+                    ("set_hash", &empty_set),
+                    ("set_complete", "1"),
+                    ("once", &once),
                     ("action", "disable"),
                     ("op", "delete"),
                     ("confirm_signal", "write anyway"),
@@ -5680,9 +5722,9 @@ mod tests {
                 assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{route}");
                 checked += 1;
             }
-            // Ten memory-curation writes, three client-store writes and the
+            // Ten memory-curation writes, six client-store writes and the
             // theme switch.
-            assert!(checked >= 14, "only {checked} write routes were driven");
+            assert!(checked >= 17, "only {checked} write routes were driven");
             assert!(
                 alaya.lock().unwrap().is_empty(),
                 "{:?}",
@@ -5690,6 +5732,8 @@ mod tests {
             );
             assert!(store.requests().is_empty(), "{:?}", store.requests());
         }
+
+        mod recovery;
     }
 
     mod snapshot;

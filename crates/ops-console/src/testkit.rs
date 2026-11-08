@@ -135,6 +135,7 @@ use std::sync::{Arc, Mutex};
 use axum::Router;
 use axum::extract::Request;
 use axum::http::{StatusCode, header};
+use axum::response::IntoResponse;
 use serde_json::{Value, json};
 use sha2::Digest;
 
@@ -339,13 +340,17 @@ fn next<T: Clone>(queue: &Mutex<Vec<T>>) -> T {
 }
 
 /// A fake metrics proxy: `/m/<metric>/api/v1/query` answers that metric's
-/// series, or its 30-day series when the query holds a `[30d]` range;
-/// anything else is a missing route.
+/// series, or its 30-day series when the query holds a `[30d]` range, and
+/// `/logs/write-log/select/logsql/query` answers the write log's records
+/// that match the query's exact filters; anything else is a missing route.
 #[derive(Clone, Default)]
 pub(crate) struct FakeMetrics {
     pub series: Arc<Mutex<BTreeMap<String, Vec<Value>>>>,
-    /// Routes that answer 500, as a failed query would.
+    /// Routes that answer 500, as a failed query would: a metric's name, or
+    /// `write-log`.
     pub failing: Arc<Mutex<Vec<String>>>,
+    /// The write log as the log store holds it (`log_records`), oldest first.
+    pub write_log: Arc<Mutex<Vec<Value>>>,
     pub log: Log,
 }
 
@@ -362,6 +367,15 @@ impl FakeMetrics {
         self.set(&format!("{metric}[30d]"), series);
     }
 
+    /// Put the console's own log lines on the write log, as the log shipper
+    /// would (`log_records`).
+    pub(crate) fn ship(&self, json_lines: &str) {
+        self.write_log
+            .lock()
+            .unwrap()
+            .extend(log_records(json_lines));
+    }
+
     pub(crate) fn router(&self) -> Router {
         let me = self.clone();
         Router::new().fallback(move |req: Request| {
@@ -373,19 +387,96 @@ impl FakeMetrics {
                     .map(|(_, v)| v.into_owned())
                     .unwrap_or_default();
                 me.log.lock().unwrap().push((req.method().to_string(), req.uri().to_string(), String::new()));
+                if path == "/logs/write-log/select/logsql/query" {
+                    if me.failing.lock().unwrap().iter().any(|f| f == "write-log") {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "query failed".to_string()).into_response();
+                    }
+                    let lines: String = me.write_log.lock().unwrap().iter().rev()
+                        .filter(|r| logsql_matches(&query, r))
+                        .map(|r| format!("{r}\n"))
+                        .collect();
+                    return (StatusCode::OK, lines).into_response();
+                }
                 let metric = path.strip_prefix("/m/").and_then(|p| p.strip_suffix("/api/v1/query"));
                 let Some(metric) = metric else {
-                    return (StatusCode::BAD_REQUEST, axum::Json(json!({"error": "missing route"})));
+                    return (StatusCode::BAD_REQUEST, axum::Json(json!({"error": "missing route"}))).into_response();
                 };
                 if me.failing.lock().unwrap().iter().any(|f| f == metric) {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": "query failed"})));
+                    return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": "query failed"}))).into_response();
                 }
                 let key = if query.contains("[30d]") { format!("{metric}[30d]") } else { metric.to_string() };
                 let series = me.series.lock().unwrap().get(&key).cloned().unwrap_or_default();
-                (StatusCode::OK, axum::Json(json!({"status": "success", "data": {"resultType": "vector", "result": series}})))
+                (StatusCode::OK, axum::Json(json!({"status": "success", "data": {"resultType": "vector", "result": series}}))).into_response()
             }
         })
     }
+}
+
+/// Log a document as the console does, through the binary's own JSON
+/// subscriber, and ship the lines to `metrics`' write log.
+pub(crate) fn log_and_ship(metrics: &FakeMetrics, version: u64, text: &str) {
+    let buf = crate::testlog::LogBuf::default();
+    {
+        let filter = tracing_subscriber::EnvFilter::new("ops_console=info");
+        let _guard = crate::testlog::scoped(crate::log_subscriber(filter, buf.clone()));
+        crate::writelog::log_document(version, &crate::writelog::digest_of(text), text);
+    }
+    metrics.ship(&buf.text());
+}
+
+/// The console's JSON log lines as the log store holds them: the shipper
+/// merges each line's JSON into the record, and the store flattens its
+/// `fields` object to `fields.<name>`, every value a string.
+pub(crate) fn log_records(json_lines: &str) -> Vec<Value> {
+    json_lines
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|line| {
+            let text = |v: &Value| {
+                v.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string())
+            };
+            let mut r = serde_json::Map::new();
+            r.insert(
+                "_time".into(),
+                json!(line["timestamp"].as_str().unwrap_or_default()),
+            );
+            r.insert(
+                "target".into(),
+                json!(line["target"].as_str().unwrap_or_default()),
+            );
+            r.insert(
+                "level".into(),
+                json!(line["level"].as_str().unwrap_or_default()),
+            );
+            for (k, v) in line["fields"].as_object().into_iter().flatten() {
+                r.insert(format!("fields.{k}"), json!(text(v)));
+            }
+            Value::Object(r)
+        })
+        .collect()
+}
+
+/// Whether a record passes every `field:=value` filter before the query's
+/// first pipe: the only filters the console's write-log reads use. A quoted
+/// value may hold spaces.
+fn logsql_matches(query: &str, record: &Value) -> bool {
+    let filters = query.split('|').next().unwrap_or_default();
+    let mut tokens = Vec::new();
+    let (mut token, mut quoted) = (String::new(), false);
+    for c in filters.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => tokens.push(std::mem::take(&mut token)),
+            c => token.push(c),
+        }
+    }
+    tokens.push(token);
+    tokens.iter().all(|t| match t.split_once(":=") {
+        Some((field, want)) => record.get(field).and_then(Value::as_str) == Some(want),
+        None => true,
+    })
 }
 
 pub(crate) fn series(labels: &[(&str, &str)], value: &str) -> Value {

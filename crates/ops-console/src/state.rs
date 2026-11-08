@@ -1,6 +1,6 @@
 //! Shared application state.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::FromRef;
@@ -32,6 +32,10 @@ pub struct StoreModule {
     pub client: StoreClient,
     pub metrics: MetricsClient,
     pub committed: Arc<Committed>,
+    /// The reseed forms already sent, newest last: each is sent once
+    /// (`routes::clients::reseed`).
+    // ponytail: in-memory, per-replica, same as `revoked`.
+    pub sent_reseeds: Arc<Mutex<VecDeque<String>>>,
 }
 
 #[derive(Clone)]
@@ -95,6 +99,7 @@ impl AppState {
                 client: StoreClient::new(s.url.clone(), s.token.clone()),
                 metrics: l.metrics.clone(),
                 committed: Arc::new(Committed::default()),
+                sent_reseeds: Arc::new(Mutex::new(VecDeque::new())),
             });
         let oidc = Arc::new(OidcRp::new(
             config.oidc_issuer.clone(),
