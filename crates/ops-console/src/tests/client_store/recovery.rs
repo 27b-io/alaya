@@ -1262,29 +1262,59 @@ async fn a_recovery_is_exported_as_committed_only_once_accepted() {
         lines.contains("client-store recovery accepted") && lines.contains("admin-sub"),
         "{lines}"
     );
+    // Accepted again, it is not logged again: every copy is read back with
+    // the rest, and three of the largest run past what a read takes. Not
+    // while the log store is still indexing the first copy, which reads as
+    // absent meanwhile, and not once that copy reads back whole.
+    let documents = |lines: &str| {
+        log_records(lines)
+            .into_iter()
+            .filter(|r| r["fields.message"] == "client-store document")
+            .count()
+    };
+    let accept_again = || {
+        captured(post_form(
+            &state,
+            &cookie,
+            "/lb/clients/pitr/accept",
+            accept.clone(),
+        ))
+    };
+    let (_, settling) = accept_again().await;
+    assert_eq!(documents(&settling), 0, "{settling}");
+    assert!(settling.contains("logged it moments ago"), "{settling}");
     metrics.ship(&lines);
     let back = writelog::document(&metrics_client(&metrics).await, V0 + 2, &newest)
         .await
         .unwrap();
     assert_eq!(back, text);
-    // Accepted again, it is not logged again: every copy is read back with
-    // the rest, and three of the largest run past what a read takes.
-    let (_, again) = captured(post_form(
-        &state,
+    let (_, held) = accept_again().await;
+    assert_eq!(documents(&held), 0, "{held}");
+    assert!(held.contains("it is already on the write log"), "{held}");
+    // A write log that cannot be read gets no copy: one more could only add
+    // to a read that already fails.
+    metrics.failing.lock().unwrap().push("write-log".into());
+    let unread = store_state(&store, &metrics, &["admin-sub"]).await;
+    let (cookie, csrf) = cookie_for(&unread, "admin-sub");
+    let fields = form(&[
+        ("csrf", &csrf),
+        ("id", &id),
+        ("row", &rows[0]),
+        ("row", &rows[1]),
+    ]);
+    let (_, failed) = captured(post_form(
+        &unread,
         &cookie,
         "/lb/clients/pitr/accept",
-        accept,
+        fields,
     ))
     .await;
-    let documents = log_records(&again)
-        .into_iter()
-        .filter(|r| r["fields.message"] == "client-store document")
-        .count();
-    assert_eq!(documents, 0, "{again}");
+    assert_eq!(documents(&failed), 0, "{failed}");
     assert!(
-        again.contains("client-store document already on the write log"),
-        "{again}"
+        failed.contains("not logged: the write log could not be read"),
+        "{failed}"
     );
+    metrics.failing.lock().unwrap().clear();
     // A recovery that is not done has nothing to accept.
     let pending = store_with(&World::new(vec![]), |b| {
         b["restrictions"]["markers"] = json!([marker(&id, "pending", None)]);

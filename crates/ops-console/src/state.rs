@@ -36,6 +36,8 @@ pub struct StoreModule {
     /// (`routes::clients::reseed`).
     // ponytail: in-memory, per-replica, same as `revoked`.
     pub sent_reseeds: Arc<Mutex<VecDeque<String>>>,
+    /// The recovery documents this process is logging to the write log.
+    pub settling: Arc<crate::writelog::Settling>,
 }
 
 #[derive(Clone)]
@@ -100,6 +102,7 @@ impl AppState {
                 metrics: l.metrics.clone(),
                 committed: Arc::new(Committed::default()),
                 sent_reseeds: Arc::new(Mutex::new(VecDeque::new())),
+                settling: Arc::default(),
             });
         let oidc = Arc::new(OidcRp::new(
             config.oidc_issuer.clone(),

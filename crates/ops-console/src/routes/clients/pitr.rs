@@ -37,7 +37,7 @@ use crate::session::{Session, flash_redirect, now_epoch, take_flash};
 use crate::state::{AppState, StoreModule};
 use crate::store::{Answer, DocOp, DocRequest, has_code, refusal_lines};
 use crate::ui::*;
-use crate::writelog;
+use crate::writelog::{self, Held};
 
 /// The write log's kinds for a pitr and its acceptance.
 const PITR: &str = "pitr";
@@ -1293,33 +1293,7 @@ pub async fn pitr_accept(
         versions = %now.join(","),
         "client-store recovery accepted"
     );
-    // The recovery commit's bytes reach the console only through the store's
-    // view: logged whole when they are the newest row's, and only while the
-    // write log holds no readable copy. Every copy is read back with the
-    // rest, and three of the largest document run past what a read takes,
-    // so accepting again must not log it again; an acceptance whose copy
-    // never became readable logs it on the next.
-    let logged = writelog::document(&m.metrics, newest.version, &newest.digest)
-        .await
-        .is_ok();
-    if logged {
-        tracing::info!(
-            target: "ops_console::write_log",
-            version = newest.version,
-            digest = %newest.digest,
-            "client-store document already on the write log"
-        );
-    } else if serves(&store, newest) {
-        let text = store.pointer("/document/text").and_then(Value::as_str);
-        writelog::log_committed(newest.version, &newest.digest, text);
-    } else {
-        tracing::warn!(
-            target: "ops_console::write_log",
-            version = newest.version,
-            digest = %newest.digest,
-            "client-store document not logged: the store has moved on from the recovery's commit"
-        );
-    }
+    log_recovery(m, &store, newest).await;
     let doc = Doc {
         version: newest.version,
         digest: newest.digest.clone(),
@@ -1335,6 +1309,53 @@ pub async fn pitr_accept(
         msg,
         &effect_href(&[], Some(&doc)),
     ))
+}
+
+/// Log an accepted recovery's newest commit, whose bytes reach the console
+/// only through the store's view. Every copy on the write log is read back
+/// with the rest, and three of the largest document run past what one read
+/// takes, so it is logged only when the write log holds no whole copy, and
+/// only once while that copy settles. A read that fails, or a copy no further
+/// copy can mend, logs nothing: another copy could only add to the read. An
+/// acceptance whose copy never landed logs it on a later one.
+async fn log_recovery(m: &StoreModule, store: &Value, newest: &RecoveryRow) {
+    let (version, digest) = (newest.version, newest.digest.as_str());
+    match writelog::held(&m.metrics, version, digest).await {
+        Ok(Held::Readable) => tracing::info!(
+            target: "ops_console::write_log",
+            version,
+            digest = %digest,
+            "client-store document not logged again: it is already on the write log"
+        ),
+        Ok(Held::Absent | Held::Partial) if !serves(store, newest) => tracing::warn!(
+            target: "ops_console::write_log",
+            version,
+            digest = %digest,
+            "client-store document not logged: the store has moved on from the recovery's commit"
+        ),
+        Ok(Held::Absent | Held::Partial) if !m.settling.claim(version, digest, now_epoch()) => {
+            tracing::info!(
+                target: "ops_console::write_log",
+                version,
+                digest = %digest,
+                "client-store document not logged again: this process logged it moments ago, \
+                 and the log store is still indexing it"
+            )
+        }
+        Ok(Held::Absent | Held::Partial) => {
+            let text = store.pointer("/document/text").and_then(Value::as_str);
+            if !writelog::log_committed(version, digest, text) {
+                m.settling.release(version, digest);
+            }
+        }
+        Err(e) => tracing::warn!(
+            target: "ops_console::write_log",
+            version,
+            digest = %digest,
+            error = %writelog::bounded(&e, 1024),
+            "client-store document not logged: the write log could not be read"
+        ),
+    }
 }
 
 #[cfg(test)]
