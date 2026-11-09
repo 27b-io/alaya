@@ -22,7 +22,7 @@ ENV ALAYA_GIT_SHA=${GIT_SHA}
 ENV ALAYA_BUILT_AT=${BUILT_AT}
 RUN cargo build --release -p alaya-bridge -p alaya-server -p ops-console
 
-FROM docker.io/library/debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+FROM docker.io/library/debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
