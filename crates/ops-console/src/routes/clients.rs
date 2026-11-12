@@ -15,8 +15,12 @@
 //! store first.
 
 mod document;
+mod pitr;
+mod reseed;
 
-pub use document::{commit, history, preview};
+pub use document::{commit, history, import_page, preview};
+pub use pitr::{pitr_accept, pitr_marker, pitr_page, pitr_send};
+pub use reseed::{reseed, reseed_page};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -40,6 +44,7 @@ use crate::session::{Flash, Session, flash_redirect, take_flash};
 use crate::state::{AppState, StoreModule};
 use crate::store::{Answer, RestrictionOp, has_code, loggable, refusal_lines};
 use crate::ui::*;
+use crate::writelog;
 
 const TITLE: &str = "LB clients — ops console";
 
@@ -63,9 +68,24 @@ const NO_STACKS: &str = "the store's answer named no stacks, so nothing can be c
 const REFRESH_FOR_SECS: i64 = 120;
 const REFRESH_EVERY: &str = "5";
 
-/// Ceiling on a write-log field built from a request or an answer. The
-/// answer is upstream text bounded only by the body cap.
-const MAX_LOGGED_CHARS: usize = 16 * 1024;
+/// The largest form a document write or a reseed takes, in bytes. A document
+/// is up to 2 MiB, and form encoding can triple a pasted one: each quote,
+/// brace and colon of its JSON takes three bytes. The commit form carries it
+/// as base64, a third larger, with each `+` and `/` taking three bytes. A
+/// reseed carries up to `reseed::SLOTS` sets. axum's 2 MB default would
+/// refuse them well below the store's own limit.
+pub const DOCUMENT_FORM_LIMIT: usize = 8 * 1024 * 1024;
+
+/// Ceiling on a write-log field built from a request or an answer, in the
+/// bytes a log line writes for it. Two of them, the subject and the rest of
+/// the line stay under the container runtime's 16 KiB line limit, past which
+/// it splits the line and the log shipper can drop it. The answer is
+/// upstream text bounded only by the body cap.
+const MAX_LOGGED_BYTES: usize = 6 * 1024;
+
+/// Ceiling on the subject a write-log line names, in chars. The IdP's
+/// subjects are far shorter; this only bounds the line.
+const MAX_SUB_CHARS: usize = 256;
 
 // ─── One judgement-grade read ───────────────────────────────────────────────
 
@@ -343,6 +363,60 @@ fn kill_switch_card(csrf: &str, prefill: &str) -> impl IntoView + use<> {
     }
 }
 
+/// The version every recovery and import form pins: the store's addressable
+/// version, 0 when it holds none.
+fn pinned_version(store: &Value) -> Result<u64, String> {
+    effect::served_doc(store).map(|d| d.map(|d| d.version).unwrap_or(0))
+}
+
+/// What a refused recovery means, wherever the console says it.
+const RECOVERY_REFUSED: &str = "A recovery was refused: the store serves no document to readers until an import or another recovery commits.";
+
+/// What an open recovery window means, wherever the console says it.
+const WINDOW_OPEN: &str =
+    "A point-in-time recovery window is open: the store takes no document write but pitr.";
+
+/// What the store's view says limits document writes: each reason it gives
+/// for refusing them, whether a recovery was refused, and whether a
+/// point-in-time recovery window is open. Every page that reports the store
+/// reads them here, and words them with `RECOVERY_REFUSED` and `WINDOW_OPEN`.
+struct Conditions {
+    frozen: Vec<String>,
+    recovery_refused: bool,
+    window_open: bool,
+}
+
+impl Conditions {
+    /// The reasons it refuses document writes, as one sentence.
+    fn frozen_line(&self) -> Option<String> {
+        (!self.frozen.is_empty()).then(|| {
+            format!(
+                "The store refuses document writes: {}.",
+                self.frozen.join("; ")
+            )
+        })
+    }
+}
+
+fn store_conditions(store: &Value) -> Conditions {
+    let doc = store.get("document");
+    Conditions {
+        frozen: doc
+            .and_then(|d| d.get("frozen"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|f| clip(f, 160))
+            .collect(),
+        recovery_refused: doc
+            .and_then(|d| d.get("recovery_refused"))
+            .and_then(Value::as_bool)
+            == Some(true),
+        window_open: store.get("pitr_window").and_then(Value::as_bool) == Some(true),
+    }
+}
+
 fn capitalise(s: &str) -> String {
     let mut c = s.chars();
     c.next()
@@ -380,7 +454,28 @@ fn store_view(r: &Reading, csrf: &str, prefill: &str) -> impl IntoView + use<> {
             {stacks_card(&part, &doc, &sights, r)}
             {restrictions_card(&rows, &part, &unmatched, csrf, prefill)}
             {document::clients_card(&r.store, csrf)}
+            {recovery_card()}
         </div>
+    }
+}
+
+/// The ways back from a wiped, rolled-back or edited store, each on a page
+/// of its own.
+fn recovery_card() -> impl IntoView {
+    view! {
+        <Card>
+            <CardHeader>
+                <CardTitle>"Recovery"</CardTitle>
+                <CardDescription>"For a store wiped, rolled back or edited outside its write path. None of these touches a restriction op, and none can lift a disable."</CardDescription>
+            </CardHeader>
+            <CardContent>
+                <ul class="text-sm space-y-2">
+                    <li><Link href="/lb/clients/pitr">"Point-in-time recovery"</Link>": rewind the document to one the console committed. The first choice after a wipe or an edit."</li>
+                    <li><Link href="/lb/clients/import">"Import a document"</Link>": the last resort, when point-in-time recovery cannot help."</li>
+                    <li><Link href="/lb/clients/reseed">"Reseed the restrictions"</Link>": restrictions_import, after the restrictions table was wiped or partly lost."</li>
+                </ul>
+            </CardContent>
+        </Card>
     }
 }
 
@@ -431,33 +526,21 @@ fn warnings(r: &Reading, part: &Result<ServedPart, String>) -> impl IntoView + u
             ),
         ));
     }
-    if let Some(frozen) = doc
-        .and_then(|d| d.get("frozen"))
-        .and_then(Value::as_array)
-        .filter(|f| !f.is_empty())
-    {
-        let reasons: Vec<String> = frozen
-            .iter()
-            .filter_map(Value::as_str)
-            .map(|s| clip(s, 160))
-            .collect();
+    let c = store_conditions(&r.store);
+    if let Some(line) = c.frozen_line() {
+        items.push((Status::Warn, format!("{line} Restriction ops still work.")));
+    }
+    if c.window_open {
         items.push((
             Status::Warn,
-            format!(
-                "The store refuses document writes: {}. Restriction ops still work.",
-                reasons.join("; ")
-            ),
+            format!("{WINDOW_OPEN} Restriction ops still work."),
         ));
     }
-    if r.store.get("pitr_window").and_then(Value::as_bool) == Some(true) {
-        items.push((Status::Warn, "A point-in-time recovery window is open: the store takes no document write but pitr. Restriction ops still work.".into()));
-    }
-    if doc
-        .and_then(|d| d.get("recovery_refused"))
-        .and_then(Value::as_bool)
-        == Some(true)
-    {
-        items.push((Status::Error, "A recovery was refused: the store serves no document to readers until an import or another recovery commits. Restriction ops still work.".into()));
+    if c.recovery_refused {
+        items.push((
+            Status::Error,
+            format!("{RECOVERY_REFUSED} Restriction ops still work."),
+        ));
     }
     match &r.fleet.store_alerts {
         Ok(who) if !who.is_empty() => items.push((
@@ -487,15 +570,11 @@ fn stacks_card(
         .iter()
         .map(|(stack, sight)| {
             let restrictions = match part {
-                Ok(p) => effect::steady(effect::holds(p, sight), r.tag_stable, effect::MOVED),
+                Ok(p) => effect::holds(p, sight, r.tag_stable),
                 Err(e) => Verdict::Unknown(format!("the served part is unreadable: {e}")),
             };
             let held_doc = match doc {
-                Ok(Some(d)) => effect::steady(
-                    effect::holds_doc(&d.digest, sight),
-                    r.doc_stable,
-                    effect::DOC_MOVED,
-                ),
+                Ok(Some(d)) => effect::holds_doc(&d.digest, sight, r.doc_stable),
                 Ok(None) => Verdict::Unknown("the store holds no document".into()),
                 Err(e) => Verdict::Unknown(e.clone()),
             };
@@ -814,12 +893,30 @@ fn outcome_unknown(a: &Answer) -> bool {
 }
 
 /// One line per write attempt, refusals and upstream failures included, with
-/// the user's subject. Request and answer are re-serialised and clipped, and
-/// the answer passes through `loggable`, so no minted key is ever logged.
+/// the user's subject. The request is logged as `writelog::logged_request`
+/// keeps it, the answer passes through `loggable`, so no minted key is ever
+/// logged, and both are re-serialised and bounded, so the line stays whole.
 fn write_log(sub: &str, kind: &str, request: &Value, outcome: Result<&Answer, &AppError>) {
-    let request = clip(&request.to_string(), MAX_LOGGED_CHARS);
-    let answer = |a: &Answer| clip(&loggable(&a.body).to_string(), MAX_LOGGED_CHARS);
+    let sub = clip(sub, MAX_SUB_CHARS);
+    let request = writelog::bounded(
+        &writelog::logged_request(request).to_string(),
+        MAX_LOGGED_BYTES,
+    );
+    let answer = |a: &Answer| writelog::bounded(&loggable(&a.body).to_string(), MAX_LOGGED_BYTES);
     match outcome {
+        // Only a pitr gets 202: the store restarted to finish or refuse the
+        // recovery, and the marker in the answer says how it ends. A 202 to
+        // any other write is an answer none gets: unknown, as its page says.
+        Ok(a) if a.status == StatusCode::ACCEPTED && kind == pitr::PITR => tracing::info!(
+            target: "ops_console::write_log",
+            sub = ?sub,
+            kind,
+            request = %request,
+            status = a.status.as_u16(),
+            answer = %answer(a),
+            "{}",
+            writelog::ACCEPTED
+        ),
         Ok(a) if outcome_unknown(a) => tracing::warn!(
             target: "ops_console::write_log",
             sub = ?sub,
@@ -827,7 +924,8 @@ fn write_log(sub: &str, kind: &str, request: &Value, outcome: Result<&Answer, &A
             request = %request,
             status = a.status.as_u16(),
             answer = %answer(a),
-            "client-store write outcome unknown"
+            "{}",
+            writelog::UNKNOWN
         ),
         Ok(a) if a.status.is_success() => tracing::info!(
             target: "ops_console::write_log",
@@ -836,7 +934,8 @@ fn write_log(sub: &str, kind: &str, request: &Value, outcome: Result<&Answer, &A
             request = %request,
             status = a.status.as_u16(),
             answer = %answer(a),
-            "client-store write committed"
+            "{}",
+            writelog::COMMITTED
         ),
         Ok(a) => tracing::warn!(
             target: "ops_console::write_log",
@@ -852,8 +951,9 @@ fn write_log(sub: &str, kind: &str, request: &Value, outcome: Result<&Answer, &A
             sub = ?sub,
             kind,
             request = %request,
-            error = %e.detail(),
-            "client-store write outcome unknown"
+            error = %writelog::bounded(e.detail(), MAX_LOGGED_BYTES),
+            "{}",
+            writelog::UNKNOWN
         ),
     }
 }
@@ -938,6 +1038,13 @@ async fn send_recorded(
     tokio::spawn(async move {
         let answer = m.client.post(&body).await;
         write_log(&sub, kind, &body, answer.as_ref());
+        // Anything but a refusal may have changed the store.
+        if !matches!(&answer, Ok(a) if a.status.is_client_error()) {
+            m.wrote_at.fetch_max(
+                crate::session::now_us(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         if let Ok(a) = &answer
             && a.status == StatusCode::OK
         {
@@ -956,8 +1063,8 @@ enum Outcome {
     Unknown(String),
     /// A 4xx: the store refused, and wrote nothing.
     Refused { status: StatusCode, body: Value },
-    /// A 200.
-    Committed(Value),
+    /// A 200: a commit, or a dry run's answer to a preview.
+    Accepted(Value),
 }
 
 fn outcome(answer: Result<Answer, AppError>) -> Outcome {
@@ -968,7 +1075,7 @@ fn outcome(answer: Result<Answer, AppError>) -> Outcome {
             a.status.as_u16(),
             refusal_lines(&a.body).join("; ")
         )),
-        Ok(a) if a.status == StatusCode::OK => Outcome::Committed(a.body),
+        Ok(a) if a.status == StatusCode::OK => Outcome::Accepted(a.body),
         Ok(a) => Outcome::Refused {
             status: a.status,
             body: a.body,
@@ -1048,7 +1155,7 @@ async fn restrict_outcome(
     let back = "/lb/clients".to_string();
     match outcome(answer) {
         Outcome::Unknown(why) => ("error", unknown_outcome(m, ops, &why).await, back),
-        Outcome::Committed(body) => {
+        Outcome::Accepted(body) => {
             let done = match written_ops(&body, ops) {
                 Ok(done) => done,
                 Err(e) => {
