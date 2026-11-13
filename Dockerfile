@@ -2,7 +2,7 @@
 # installs it on first cargo call), so the base tag names none. Keep that file
 # in the build context — .dockerignore must not exclude it. Both FROM lines pin
 # a digest so one commit always builds on the same bases; Renovate refreshes it.
-FROM docker.io/library/rust:bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS builder
+FROM docker.io/library/rust:bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS builder
 
 # Build identity surfaced by GET /health/detail and MCP serverInfo (#70). Both are
 # optional: an unset arg yields a null git_sha/built_at, never a build or
