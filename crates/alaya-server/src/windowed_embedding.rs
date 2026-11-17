@@ -8,10 +8,9 @@
 //! truncated one, is never read. Queries and passages that fit pass through
 //! untouched, so their vectors and cache keys stay as they were.
 //!
-//! Windows are cut on the embedder's own token boundaries (its `/tokenize`),
-//! so each one fits exactly. When the budget or a token layout cannot be
-//! read, the text is sent whole, as before (the embedder truncates it), and
-//! a warning is logged.
+//! Windows are cut on the embedder's own token boundaries (its `/tokenize`).
+//! When the budget or a token layout cannot be read, the text is sent whole,
+//! as before (the embedder truncates it), and a warning is logged.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -22,7 +21,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use mini_moka::unsync::Cache;
 
-use alaya_backends::traits::{EmbeddingProvider, Tokenizer};
+use alaya_backends::traits::{EmbeddingProvider, MAX_NORMALIZED_GROWTH, Tokenizer};
 use alaya_core::hashing::generate_content_hash;
 use alaya_core::vitals::{CountingEmbedding, Vitals};
 use alaya_types::memory::HealthStatus;
@@ -54,9 +53,7 @@ pub fn embedding_stack(
 /// the windows spread evenly from the head to the tail, leaving gaps between
 /// them, so the work per store stays bounded. A store runs inline on the
 /// worker loop, so every search sent to the same process waits for all of
-/// it. On a CPU embedder three `WINDOW_TOKENS` windows cost about what one
-/// 2048-token input does, so behind a 2048-token input window the longest
-/// store holds searches no longer than it did before windowing.
+/// it.
 const MAX_WINDOWS: usize = 3;
 /// Tokens per window, at most. Smaller windows cost less per token on CPU
 /// (attention grows with input length), and each one holds the embedder for
@@ -69,10 +66,6 @@ const OVERLAP_DIVISOR: usize = 8;
 /// Tokens kept free below the embedder's passage budget: a window's text,
 /// tokenized on its own, can split a few tokens differently at its cut edges.
 const DRIFT_TOKENS: usize = 8;
-/// Most UTF-8 bytes one byte of text can grow into under Unicode
-/// normalization: NFKC turns U+FDFA, 3 bytes, into 33 (Unicode's
-/// normalization FAQ lists this as the worst case).
-const MAX_NORMALIZED_GROWTH: usize = 11;
 /// `/tokenize` calls one batch keeps in flight. A dedup scan embeds up to
 /// a few hundred passages in one batch; this bounds the requests, and the
 /// replies held in memory, at once.
@@ -154,13 +147,7 @@ impl WindowedEmbedding {
     /// The windows `text` embeds as, or `None` when it is sent whole: it
     /// fits `budget`, or its token layout could not be read (logged).
     async fn windows<'t>(&self, text: &'t str, budget: usize) -> Option<Vec<&'t str>> {
-        // Per the `Tokenizer` contract, a token holds at least one byte of
-        // normalized text, plus one leading word marker. Normalization leaves
-        // ASCII alone and grows any other byte to at most
-        // MAX_NORMALIZED_GROWTH bytes, so a text whose bound is under the
-        // budget fits unread, and a few em dashes cost no round trip, even on
-        // a cache hit. Past the bound only the tokenizer can say (NFKC turns
-        // U+FDFA, 3 bytes, into four tokens).
+        // The `Tokenizer` contract: a text whose bound is under the budget fits.
         let ascii = text.bytes().filter(u8::is_ascii).count();
         let bound = (text.len() - ascii)
             .saturating_mul(MAX_NORMALIZED_GROWTH)
@@ -173,7 +160,7 @@ impl WindowedEmbedding {
         let plan = match cached {
             Some(plan) => plan,
             None => {
-                let plan = self.plan(text, budget).await?;
+                let plan = self.plan(text, budget, bound).await?;
                 self.plans.borrow_mut().insert(key, plan.clone());
                 plan
             }
@@ -188,7 +175,8 @@ impl WindowedEmbedding {
 
     /// Asks the tokenizer for `text`'s windows: an empty plan when it fits
     /// `budget`, or `None` when its token layout could not be read (logged).
-    async fn plan(&self, text: &str, budget: usize) -> Option<Plan> {
+    /// `bound` is the `Tokenizer` contract's bound for `text`, less its `+ 1`.
+    async fn plan(&self, text: &str, budget: usize, bound: usize) -> Option<Plan> {
         let spans = match self.tokenizer.token_spans(text).await {
             Ok(spans) => spans,
             Err(e) => {
@@ -199,6 +187,13 @@ impl WindowedEmbedding {
                 return None;
             }
         };
+        if spans.len() > bound.saturating_add(1) {
+            tracing::warn!(
+                tokens = spans.len(),
+                bound = bound.saturating_add(1),
+                "tokenizer broke its contract's bound, passages under the bound may embed truncated"
+            );
+        }
         if spans.len() <= budget {
             return Some(Rc::from([]));
         }
@@ -341,12 +336,14 @@ mod tests {
 
     const DIMS: usize = 16;
 
-    /// Expands under the stub tokenizer as U+FDFA does under the real one:
-    /// one 3-byte character, four tokens, all over the same bytes.
+    /// The `Tokenizer` contract's worst case under the stub tokenizer: one
+    /// 3-byte character, a token per byte of its NFKC form, all over the
+    /// same bytes.
     const EXPANDS: char = '\u{FDFA}';
+    const EXPANDS_TOKENS: usize = 33;
 
     /// Byte spans of the stub's tokens: one per space-separated word, and
-    /// four per [`EXPANDS`].
+    /// [`EXPANDS_TOKENS`] per [`EXPANDS`].
     fn spans(text: &str) -> Vec<(usize, usize)> {
         let mut spans = Vec::new();
         let mut start = None;
@@ -356,7 +353,7 @@ mod tests {
                     spans.push((s, i));
                 }
                 if c == EXPANDS {
-                    spans.extend([(i, i + c.len_utf8()); 4]);
+                    spans.extend([(i, i + c.len_utf8()); EXPANDS_TOKENS]);
                 }
             } else if start.is_none() {
                 start = Some(i);
@@ -625,13 +622,16 @@ mod tests {
     }
 
     /// A passage shorter in bytes than the budget can still hold more
-    /// tokens than it: Unicode normalization expands U+FDFA, 3 bytes, into
-    /// four tokens. Such a pair, sent whole, truncates to the same vector;
-    /// it must be windowed instead, every window must fit, and the tails
-    /// must reach the vectors.
+    /// tokens than it: normalization can expand a byte into
+    /// `MAX_NORMALIZED_GROWTH` tokens. Such a pair, sent whole, truncates to
+    /// the same vector; it must be windowed instead, every window must fit,
+    /// and the tails must reach the vectors.
+    ///
+    /// Pins `MAX_NORMALIZED_GROWTH`: the prefix is sized so that any
+    /// smaller factor puts the pair under the bound, and it is sent whole.
     #[tokio::test]
     async fn a_short_passage_that_normalization_expands_is_windowed() {
-        let prefix = EXPANDS.to_string().repeat(600);
+        let prefix = EXPANDS.to_string().repeat(63);
         let a = format!("{prefix} the deploy failed on staging");
         let b = format!("{prefix} grandma lemon cake needs zest");
         let budget = 2048 - DRIFT_TOKENS;
@@ -711,6 +711,40 @@ mod tests {
             u32::MAX - 1,
             "tokenizer was not asked"
         );
+    }
+
+    /// A tokenizer that answers with more tokens than its contract allows
+    /// is warned about: the skip trusts that bound for every text under it.
+    #[tokio::test]
+    async fn a_tokenizer_past_its_contract_bound_is_warned_about() {
+        /// Two tokens per byte.
+        struct Overcounts;
+        #[async_trait(?Send)]
+        impl Tokenizer for Overcounts {
+            async fn passage_token_budget(&self) -> Result<usize> {
+                Ok(2048)
+            }
+            async fn token_spans(&self, text: &str) -> Result<Vec<(usize, usize)>> {
+                Ok((0..text.len()).flat_map(|i| [(i, i + 1); 2]).collect())
+            }
+        }
+        let words = Words::new(2048);
+        let e = WindowedEmbedding::new(Box::new(Shared(words.clone())), Box::new(Overcounts));
+        let log = crate::testlog::LogBuf::default();
+        let _guard = log.capture();
+
+        let within = "x ".repeat(1500);
+        windowed(&words)
+            .embed_batch(&[&within], PromptName::Passage)
+            .await
+            .unwrap();
+        assert!(!log.text().contains("broke its contract"), "{}", log.text());
+
+        let past = "x".repeat(2048 - DRIFT_TOKENS);
+        e.embed_batch(&[&past], PromptName::Passage).await.unwrap();
+        let text = log.text();
+        assert!(text.contains("WARN") && text.contains("broke its contract"));
+        assert!(text.contains("tokens=4080") && text.contains("bound=2041"));
     }
 
     /// Windowing must sit above the cache. A tokenizer failure sends a long

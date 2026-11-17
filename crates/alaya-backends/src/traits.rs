@@ -359,15 +359,27 @@ pub trait EmbeddingProvider {
     }
 }
 
+/// Most UTF-8 bytes one non-ASCII byte of text grows into under Unicode
+/// normalization: NFKC turns U+FDFA, 3 bytes, into 33 (Unicode's
+/// normalization FAQ lists this as the worst case). The factor in the
+/// [`Tokenizer`] contract.
+pub const MAX_NORMALIZED_GROWTH: usize = 11;
+
 /// The embedder's own tokenizer: how many tokens one input may hold, and
 /// where each token of a text sits. Lets a caller split a text the embedder
 /// would otherwise truncate at exact token boundaries, with no tokenizer of
 /// its own.
 ///
-/// Contract: a text makes at most one token per byte of its normalized
-/// form, plus one leading word marker, and normalization leaves ASCII as is
-/// and grows other text no more than Unicode NFKC does (11x in UTF-8, at
-/// U+FDFA). Callers skip `token_spans` for a text that bound shows fits.
+/// Contract, for a text of `ascii` ASCII bytes and `other` other bytes:
+///
+/// `token_spans(text).len() <= ascii + MAX_NORMALIZED_GROWTH * other + 1`
+///
+/// Callers skip `token_spans` for a text that bound shows fits, so a
+/// tokenizer that breaks it gets such a text truncated. The bound is a fact
+/// about the model the endpoint serves (`EMBEDDING_MODEL`), which an
+/// implementation relays and cannot check: it holds where normalization
+/// never grows ASCII and each token holds at least one byte of normalized
+/// text, after at most one leading word marker.
 #[async_trait(?Send)]
 pub trait Tokenizer {
     /// Most tokens of passage text one input may hold: the embedder's input
