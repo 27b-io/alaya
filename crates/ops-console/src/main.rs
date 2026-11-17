@@ -32,6 +32,7 @@ mod testkit;
 mod testlog;
 mod theme;
 mod ui;
+mod writelog;
 
 use axum::Router;
 use axum::extract::{FromRef, Request, State};
@@ -221,15 +222,44 @@ fn routes() -> Vec<(&'static str, axum::routing::MethodRouter<AppState>)> {
         ("/lb/clients", get(routes::clients::pane)),
         ("/lb/clients/disable", get(routes::clients::disable_page)),
         ("/lb/clients/restrict", post(routes::clients::restrict)),
-        ("/lb/clients/preview", post(routes::clients::preview)),
-        ("/lb/clients/commit", post(routes::clients::commit)),
+        (
+            "/lb/clients/preview",
+            post(routes::clients::preview).layer(document_form_limit()),
+        ),
+        (
+            "/lb/clients/commit",
+            post(routes::clients::commit).layer(document_form_limit()),
+        ),
         ("/lb/clients/effect", get(routes::clients::effect)),
         ("/lb/clients/history", get(routes::clients::history)),
+        ("/lb/clients/import", get(routes::clients::import_page)),
+        (
+            "/lb/clients/pitr",
+            get(routes::clients::pitr_page).post(routes::clients::pitr_send),
+        ),
+        ("/lb/clients/pitr/marker", get(routes::clients::pitr_marker)),
+        (
+            "/lb/clients/pitr/accept",
+            post(routes::clients::pitr_accept),
+        ),
+        (
+            "/lb/clients/reseed",
+            get(routes::clients::reseed_page)
+                .post(routes::clients::reseed)
+                .layer(document_form_limit()),
+        ),
         // selecta module: GET only, by design. The console holds a read-only
         // selecta credential and no POST route to selecta may be added here.
         ("/selecta", get(routes::selecta::pane)),
         ("/selecta/task/{id}", get(routes::selecta::task)),
     ]
+}
+
+/// The body limit of the routes that take a whole document or a reseed's
+/// sets (`routes::clients::DOCUMENT_FORM_LIMIT`); every other route keeps
+/// axum's default.
+fn document_form_limit() -> axum::extract::DefaultBodyLimit {
+    axum::extract::DefaultBodyLimit::max(routes::clients::DOCUMENT_FORM_LIMIT)
 }
 
 fn app(state: AppState) -> Router {
@@ -4130,13 +4160,36 @@ mod tests {
                     .await
                     .unwrap();
                 // The router's own 404 has no body; a handler's 404 renders a page.
-                let routed =
-                    get.status() != StatusCode::NOT_FOUND || !body_string(get).await.is_empty();
-                assert!(routed, "{route} did not route");
+                let status = get.status();
+                let page = body_string(get).await;
+                assert!(
+                    status != StatusCode::NOT_FOUND || !page.is_empty(),
+                    "{route} did not route"
+                );
                 let (cookie, csrf) = cookie_for(&state, "admin-sub");
                 let pair = format!("{h1}:{h2}");
+                let (target, recovery) = (format!("7.{h1}"), "ab".repeat(16));
+                let empty_set = crate::writelog::digest_of("");
+                // A form bound to the page it was rendered on carries that
+                // binding back, as a browser would.
+                let hidden = |name: &str| {
+                    page.split(&format!("name=\"{name}\" value=\""))
+                        .nth(1)
+                        .and_then(|s| s.split('"').next())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let (table, issued) = (hidden("table"), hidden("issued"));
                 let sink = form(&[
                     ("csrf", &csrf),
+                    ("target", &target),
+                    ("id", &recovery),
+                    ("row", &target),
+                    ("set_text", ""),
+                    ("set_hash", &empty_set),
+                    ("set_complete", "1"),
+                    ("table", &table),
+                    ("issued", &issued),
                     ("action", "disable"),
                     ("op", "delete"),
                     ("confirm_signal", "write anyway"),
@@ -4244,6 +4297,43 @@ mod tests {
             assert!(
                 html.contains(">unknown<") && html.contains("lb-b"),
                 "{html}"
+            );
+        }
+
+        /// Only a pitr gets 202. A 202 to any other write is an answer the
+        /// store never gives it: the write log and the page both read it as
+        /// unknown.
+        #[tokio::test]
+        async fn a_202_to_any_write_but_a_pitr_is_an_unknown_outcome() {
+            let store = FakeStore::new(&World::new(vec![("acme", RecordState::Enabled, T0)]));
+            store.answer_post(StatusCode::ACCEPTED, json!({"status": 202}));
+            let state = store_state(&store, &FakeMetrics::default(), &["admin-sub"]).await;
+            let (cookie, csrf) = cookie_for(&state, "admin-sub");
+            let buf = testlog::LogBuf::default();
+            let _guard = buf.capture();
+            let resp = post_form(
+                &state,
+                &cookie,
+                "/lb/clients/restrict",
+                form(&[
+                    ("csrf", &csrf),
+                    ("action", "enable"),
+                    ("name", "acme"),
+                    ("expected_version", "1"),
+                    ("reason", "ok"),
+                ]),
+            )
+            .await;
+            let line = buf.record("client-store write outcome unknown");
+            assert!(line.contains("\"status\":202"), "{line}");
+            assert!(!buf.text().contains("recovery marker"), "{}", buf.text());
+            let flash = flash_of(&state, &resp);
+            assert!(
+                flash
+                    .msg
+                    .starts_with("Whether the request applied is unknown"),
+                "{}",
+                flash.msg
             );
         }
 
@@ -4751,6 +4841,11 @@ mod tests {
             let html = body_string(resp).await;
             assert!(html.contains(&key), "{html}");
             assert!(html.contains("1Password"), "{html}");
+            // An answer with no document bytes: the page says it is not logged.
+            assert!(
+                html.contains("Its document is not on the write log"),
+                "{html}"
+            );
             assert!(
                 html.contains(&format!("/lb/clients/effect?doc={}.{D1}", V0 + 1)),
                 "{html}"
@@ -4905,9 +5000,7 @@ mod tests {
         /// reports the store edited cannot be told. Typed, the write goes.
         #[tokio::test]
         async fn a_dark_metrics_store_refuses_restore_and_asks_to_confirm_the_rest() {
-            let mut world = World::new(vec![]);
-            world.history = vec![(V0, "0".repeat(64)), (V0 - 5, D1.into())];
-            let store = FakeStore::new(&world);
+            let store = FakeStore::new(&World::new(vec![]));
             store.answer_post(StatusCode::OK, committed(V0 + 1, D1, json!([])));
             let mut config = test_config();
             config.lb = Some(config::LbConfig {
@@ -4999,7 +5092,7 @@ mod tests {
             .await;
             let html = body_string(resp).await;
             assert!(
-                html.contains("export no store_behind or store_edited series (k3s/lb-b)"),
+                html.contains("k3s/lb-b exports no store_behind or store_edited"),
                 "{html}"
             );
             assert!(html.contains("name=\"confirm_signal\""), "{html}");
@@ -5123,7 +5216,7 @@ mod tests {
             // A restore naming no row digest did not come from its preview.
             let (posts, msg) = run(vec![pair(old, D1)], None, true).await;
             assert!(
-                posts.is_empty() && msg.contains("names no row digest"),
+                posts.is_empty() && msg.contains("names no digest for the row it restores"),
                 "{msg}"
             );
         }
@@ -5234,17 +5327,28 @@ mod tests {
                 store.posts()[0]["document"]["ops"],
                 json!([{"op": "restore", "version": old}])
             );
-            // A store whose dry run names no digest: no commit form at all.
+            // A store whose dry run names no digest: no commit form at all,
+            // in the wording the commit uses for a form that carries none.
             store.answer_post(
                 StatusCode::OK,
                 dry_run(json!([{"client": "acme", "change": "deleted"}])),
             );
             let html = body_string(preview().await).await;
             assert!(
-                html.contains("cannot be bound to the row it restores"),
+                html.contains("names no digest for the row it restores"),
                 "{html}"
             );
             assert!(!html.contains("action=\"/lb/clients/commit\""), "{html}");
+            // One that names a malformed digest is named as such, and offers
+            // nothing to commit.
+            let mut malformed = dry_run(json!([{"client": "acme", "change": "deleted"}]));
+            malformed["restore_digest"] = json!("abc");
+            store.answer_post(StatusCode::OK, malformed);
+            let resp = preview().await;
+            assert_eq!(location(&resp), "/lb/clients");
+            let msg = flash_of(&state, &resp).msg;
+            assert!(msg.contains("named a malformed digest"), "{msg}");
+            assert!(!msg.contains("names no digest"), "{msg}");
         }
 
         /// A preview from a stale page gets 409: the console re-reads the
@@ -5294,8 +5398,7 @@ mod tests {
         #[tokio::test]
         async fn delete_and_restore_previews_warn_on_a_name_still_in_a_stacks_toml() {
             let old = V0 - 5;
-            let mut world = World::new(vec![]);
-            world.history = vec![(V0, "0".repeat(64)), (old, D1.into())];
+            let world = World::new(vec![]);
             let metrics = quiet_fleet();
             metrics.set(
                 "anthropic_client_store_toml_client",
@@ -5672,9 +5775,9 @@ mod tests {
                 assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{route}");
                 checked += 1;
             }
-            // Ten memory-curation writes, three client-store writes and the
+            // Ten memory-curation writes, six client-store writes and the
             // theme switch.
-            assert!(checked >= 14, "only {checked} write routes were driven");
+            assert!(checked >= 17, "only {checked} write routes were driven");
             assert!(
                 alaya.lock().unwrap().is_empty(),
                 "{:?}",
@@ -5682,6 +5785,8 @@ mod tests {
             );
             assert!(store.requests().is_empty(), "{:?}", store.requests());
         }
+
+        mod recovery;
     }
 
     mod snapshot;

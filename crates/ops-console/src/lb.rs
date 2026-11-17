@@ -19,7 +19,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::error::AppError;
-use crate::http::{self, join, json_body};
+use crate::http::{self, join, json_body, text_body};
 
 /// Columns in the burn history: today plus the six preceding UTC days.
 const DAYS: usize = 7;
@@ -204,6 +204,35 @@ impl MetricsClient {
             return Err(AppError::Upstream("metrics: query did not succeed".into()));
         }
         Ok(parse_vector(&body))
+    }
+
+    /// A LogsQL query on the proxy's write-log route,
+    /// `{base}/logs/write-log/select/logsql/query`, which pins every query to
+    /// the console's own log stream, so `query` can only narrow it. The log
+    /// store answers one JSON object per line, at most `limit` of them.
+    pub async fn write_log(&self, query: &str, limit: usize) -> Result<Vec<Value>, AppError> {
+        const WHAT: &str = "write log";
+        let req = self
+            .http
+            .get(join(&self.base, "/logs/write-log/select/logsql/query"))
+            .query(&[("query", query), ("limit", &limit.to_string())]);
+        let (status, text) = text_body(WHAT, req).await?;
+        if !status.is_success() {
+            return Err(AppError::non_success(WHAT, status, &text));
+        }
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                serde_json::from_str::<Value>(l)
+                    .ok()
+                    .filter(Value::is_object)
+                    .ok_or_else(|| {
+                        AppError::Upstream(format!(
+                            "{WHAT} returned a line that is not a JSON object"
+                        ))
+                    })
+            })
+            .collect()
     }
 
     pub async fn daily_burn(&self) -> Result<DailyBurn, AppError> {

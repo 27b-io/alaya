@@ -142,21 +142,25 @@ fn heard(up: &[Series], alerts: &[Series], names: &[&str]) -> Result<(), String>
             exporting.entry(place(s)).or_default().insert(name.as_str());
         }
     }
-    let silent: Vec<&str> = live
+    // Each reader is named with the alerts it lacks, not every alert read.
+    let silent: Vec<String> = live
         .iter()
-        .filter(|i| {
-            let heard = exporting.get(*i);
-            !names.iter().all(|n| heard.is_some_and(|h| h.contains(n)))
+        .filter_map(|i| {
+            let heard = exporting.get(i);
+            let lacking: Vec<&str> = names
+                .iter()
+                .copied()
+                .filter(|n| !heard.is_some_and(|h| h.contains(n)))
+                .collect();
+            (!lacking.is_empty()).then(|| format!("{i} exports no {}", lacking.join(" or ")))
         })
-        .map(String::as_str)
         .collect();
     if silent.is_empty() {
         return Ok(());
     }
     Err(format!(
-        "readers that are up export no {} series ({}), so they cannot be read",
-        names.join(" or "),
-        clip(&silent.join(", "), 300)
+        "readers that are up export no series for alerts they raise, so they cannot be read: {}",
+        clip(&silent.join("; "), 300)
     ))
 }
 
@@ -442,7 +446,9 @@ mod tests {
             ])
             .collect();
         let err = heard(&up, &partial, &STORE_ALERTS).unwrap_err();
-        assert!(err.contains("k3s/lb-b"), "{err}");
+        assert!(err.contains("k3s/lb-b exports no store_edited"), "{err}");
+        assert!(!err.contains("store_behind"), "{err}");
+        assert!(!err.contains("lb-a"), "{err}");
         assert_eq!(heard(&up, &partial, &["restrictions_behind"]), Ok(()));
 
         let none = Ok(BTreeSet::new());

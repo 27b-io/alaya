@@ -285,7 +285,9 @@ pub fn carried(part: &ServedPart, op: &Op) -> Carried {
 
 /// Whether a stack holds the served part: the instance half of the rule,
 /// which is all there is to say about every record the part carries.
-pub fn holds(part: &ServedPart, sight: &Sight) -> Verdict {
+/// `stable` is whether the part's tag stayed put across the two `GET`s
+/// around the metrics read (`steady`).
+pub fn holds(part: &ServedPart, sight: &Sight, stable: bool) -> Verdict {
     use Verdict::*;
     if !part.full {
         return NotInEffect(PARTIAL.into());
@@ -295,7 +297,8 @@ pub fn holds(part: &ServedPart, sight: &Sight) -> Verdict {
         Some(_) => NotInEffect("CF holds a different set".into()),
         None => NotInEffect("CF reports no set".into()),
     };
-    judge_sight(sight, cf, |i| Ok(set_fault(i, &part.set_hash)))
+    let v = judge_sight(sight, cf, |i| Ok(set_fault(i, &part.set_hash)));
+    steady(v, stable, MOVED)
 }
 
 /// What keeps an instance that is up from holding the served set.
@@ -397,8 +400,9 @@ fn joined(faults: Vec<String>) -> String {
 
 /// Withhold "in effect" when what was judged moved between the two `GET`s
 /// that bracket the metrics read: the instances were then compared with
-/// something the store no longer serves. `moved` says what moved.
-pub fn steady(v: Verdict, stable: bool, moved: &str) -> Verdict {
+/// something the store no longer serves. `moved` says what moved: each
+/// judgement passes its own, so a caller cannot pair the wrong one.
+fn steady(v: Verdict, stable: bool, moved: &str) -> Verdict {
     match v {
         Verdict::InEffect if !stable => Verdict::Unknown(moved.into()),
         v => v,
@@ -422,7 +426,7 @@ pub fn judge_op(
         .iter()
         .map(|(stack, sight)| {
             let v = match &carried {
-                Carried::Yes => steady(holds(part, sight), tag_stable, MOVED),
+                Carried::Yes => holds(part, sight, tag_stable),
                 Carried::Superseded(v) => Verdict::NotInEffect(format!("superseded at {v}")),
                 Carried::No(why) => Verdict::NotInEffect(why.clone()),
             };
@@ -490,15 +494,20 @@ pub fn doc_carried(served: Option<&Doc>, write: &Doc) -> Carried {
 }
 
 /// Whether a stack holds the document with this digest: the instance half.
-/// An instance's restrictions play no part.
-pub fn holds_doc(digest: &str, sight: &Sight) -> Verdict {
+/// An instance's restrictions play no part. `stable` is whether the store's
+/// document stayed put across the two `GET`s around the metrics read.
+pub fn holds_doc(digest: &str, sight: &Sight, stable: bool) -> Verdict {
     use Verdict::*;
     let cf = |r: &Report| match &r.digest {
         Some(d) if d == digest => InEffect,
         Some(_) => NotInEffect("CF holds another document".into()),
         None => NotInEffect("CF reports no document".into()),
     };
-    judge_sight(sight, cf, |i| doc_fault(i, digest))
+    steady(
+        judge_sight(sight, cf, |i| doc_fault(i, digest)),
+        stable,
+        DOC_MOVED,
+    )
 }
 
 /// What keeps an instance that is up from holding the document; an error
@@ -534,7 +543,7 @@ pub fn judge_doc(
         .iter()
         .map(|(stack, sight)| {
             let v = match &carried {
-                Carried::Yes => steady(holds_doc(&write.digest, sight), stable, DOC_MOVED),
+                Carried::Yes => holds_doc(&write.digest, sight, stable),
                 Carried::Superseded(v) => {
                     Verdict::NotInEffect(format!("superseded by version {v}"))
                 }
@@ -714,9 +723,9 @@ mod tests {
     #[test]
     fn cf_is_in_effect_only_running_and_on_the_served_set() {
         let p = part(&[("acme", Disabled, T0)]);
-        assert_eq!(holds(&p, &running(&p.set_hash)), Verdict::InEffect);
+        assert_eq!(holds(&p, &running(&p.set_hash), true), Verdict::InEffect);
         assert!(matches!(
-            holds(&p, &running(&set_hash([], []))),
+            holds(&p, &running(&set_hash([], [])), true),
             Verdict::NotInEffect(_)
         ));
         let stale = Sight::Report(Some(Report {
@@ -724,15 +733,15 @@ mod tests {
             set_hash: Some(p.set_hash.clone()),
             digest: None,
         }));
-        assert!(matches!(holds(&p, &stale), Verdict::NotInEffect(_)));
+        assert!(matches!(holds(&p, &stale, true), Verdict::NotInEffect(_)));
         let none = Sight::Report(Some(Report {
             running: true,
             set_hash: None,
             digest: None,
         }));
-        assert!(matches!(holds(&p, &none), Verdict::NotInEffect(_)));
+        assert!(matches!(holds(&p, &none, true), Verdict::NotInEffect(_)));
         assert!(matches!(
-            holds(&p, &Sight::Report(None)),
+            holds(&p, &Sight::Report(None), true),
             Verdict::Unknown(_)
         ));
     }
@@ -746,7 +755,7 @@ mod tests {
         let p = part(&[("acme", Disabled, T0)]);
         let h = p.set_hash.as_str();
         let other = set_hash([], []);
-        let ok = |list: Vec<Instance>| holds(&p, &Sight::Instances(Ok(list)));
+        let ok = |list: Vec<Instance>| holds(&p, &Sight::Instances(Ok(list)), true);
         assert_eq!(
             ok(vec![pod("a", true, &[h]), pod("b", true, &[h])]),
             Verdict::InEffect
@@ -782,7 +791,7 @@ mod tests {
         );
         assert!(matches!(ok(vec![]), Verdict::Unknown(_)));
         assert!(matches!(
-            holds(&p, &Sight::Instances(Err("timeout".into()))),
+            holds(&p, &Sight::Instances(Err("timeout".into())), true),
             Verdict::Unknown(_)
         ));
     }
@@ -793,22 +802,31 @@ mod tests {
         let p = parse_part(Some(&raw)).unwrap();
         assert!(!p.full);
         assert_eq!(
-            holds(&p, &running(&p.set_hash)),
+            holds(&p, &running(&p.set_hash), true),
             Verdict::NotInEffect(PARTIAL.into())
         );
         let pods = Sight::Instances(Ok(vec![pod("a", true, &[&p.set_hash])]));
-        assert_eq!(holds(&p, &pods), Verdict::NotInEffect(PARTIAL.into()));
+        assert_eq!(holds(&p, &pods, true), Verdict::NotInEffect(PARTIAL.into()));
     }
 
+    /// Each judgement withholds only its confirmation, and with its own
+    /// message, when what it judged moved during the read.
     #[test]
-    fn a_moved_part_withholds_only_the_confirmation() {
-        assert_eq!(steady(Verdict::InEffect, true, MOVED), Verdict::InEffect);
+    fn a_moved_read_withholds_only_the_confirmation() {
+        let p = part(&[("acme", Disabled, T0)]);
         assert_eq!(
-            steady(Verdict::InEffect, false, MOVED),
+            holds(&p, &running(&p.set_hash), false),
             Verdict::Unknown(MOVED.into())
         );
-        let no = Verdict::NotInEffect("x".into());
-        assert_eq!(steady(no.clone(), false, MOVED), no);
+        let other = running(&set_hash([], []));
+        assert_eq!(holds(&p, &other, false), holds(&p, &other, true));
+        let d = "d".repeat(64);
+        assert_eq!(
+            holds_doc(&d, &cf_holding(Some(&d), true), false),
+            Verdict::Unknown(DOC_MOVED.into())
+        );
+        let stale = cf_holding(Some(&d), false);
+        assert_eq!(holds_doc(&d, &stale, false), holds_doc(&d, &stale, true));
     }
 
     /// The clock step-back the set hash exists for: readers hold a record at
@@ -913,27 +931,27 @@ mod tests {
     fn a_document_is_in_effect_where_every_instance_holds_its_digest() {
         let (d, other) = ("d".repeat(64), "e".repeat(64));
         assert_eq!(
-            holds_doc(&d, &cf_holding(Some(&d), true)),
+            holds_doc(&d, &cf_holding(Some(&d), true), true),
             Verdict::InEffect
         );
         assert!(matches!(
-            holds_doc(&d, &cf_holding(Some(&other), true)),
+            holds_doc(&d, &cf_holding(Some(&other), true), true),
             Verdict::NotInEffect(_)
         ));
         assert!(matches!(
-            holds_doc(&d, &cf_holding(Some(&d), false)),
+            holds_doc(&d, &cf_holding(Some(&d), false), true),
             Verdict::NotInEffect(_)
         ));
         assert!(matches!(
-            holds_doc(&d, &cf_holding(None, true)),
+            holds_doc(&d, &cf_holding(None, true), true),
             Verdict::NotInEffect(_)
         ));
         assert!(matches!(
-            holds_doc(&d, &Sight::Report(None)),
+            holds_doc(&d, &Sight::Report(None), true),
             Verdict::Unknown(_)
         ));
 
-        let k3s = |list: Vec<Instance>| holds_doc(&d, &Sight::Instances(Ok(list)));
+        let k3s = |list: Vec<Instance>| holds_doc(&d, &Sight::Instances(Ok(list)), true);
         assert_eq!(
             k3s(vec![doc_pod("a", true, &[&d]), doc_pod("b", true, &[&d])]),
             Verdict::InEffect

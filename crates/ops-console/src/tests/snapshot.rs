@@ -145,6 +145,34 @@ fn pages() -> Vec<Page> {
             "/lb/clients/history".into(),
             "lb-clients-history",
         ),
+        page(
+            "/lb/clients/import",
+            "/lb/clients",
+            "/lb/clients/import".into(),
+            "lb-clients-import",
+        ),
+        page(
+            "/lb/clients/pitr",
+            "/lb/clients",
+            format!(
+                "/lb/clients/pitr?target={}.{}",
+                V0 - DAY_MS,
+                doc_digest(V0 - DAY_MS)
+            ),
+            "lb-clients-pitr",
+        ),
+        page(
+            "/lb/clients/pitr/marker",
+            "/lb/clients",
+            format!("/lb/clients/pitr/marker?id={RECOVERY_ID}&at=0"),
+            "lb-clients-pitr-marker",
+        ),
+        page(
+            "/lb/clients/reseed",
+            "/lb/clients",
+            "/lb/clients/reseed".into(),
+            "lb-clients-reseed",
+        ),
         page("/selecta", "/selecta", "/selecta".into(), "selecta"),
         page(
             "/selecta/task/{id}",
@@ -284,6 +312,11 @@ async fn every_get_page_renders_in_the_snapshot_world() {
             continue;
         }
         let path = route.replace("{hash}", &hm(0)).replace("{id}", FAILED_ID);
+        // A query-less marker page is a bad request, never a page to skip.
+        let path = match route {
+            "/lb/clients/pitr/marker" => format!("{path}?id={RECOVERY_ID}"),
+            _ => path,
+        };
         let (status, _) = get_page(state, &cookie, &path).await;
         if status == StatusCode::METHOD_NOT_ALLOWED {
             continue;
@@ -1357,9 +1390,43 @@ const HISTORY_AGES_MS: [u64; 10] = [
     0,
 ];
 
-/// The digest of the document the store committed at `version`.
+/// The digest of the document the store committed at `version`: of the
+/// write log's bytes for the two it holds, so every page agrees on them.
 fn doc_digest(version: u64) -> String {
-    hash_of(&format!("document version {version}"))
+    match logged_text(version) {
+        Some(text) => crate::writelog::digest_of(&text),
+        None => hash_of(&format!("document version {version}")),
+    }
+}
+
+/// The bytes the write log holds for `version`: the two newest documents the
+/// console committed, which the import page lists.
+fn logged_text(version: u64) -> Option<String> {
+    let budget = match version {
+        v if v == V0 => 2_000_000_000_u64,
+        v if v == V0 - 2 * HOUR_MS => 3_000_000_000,
+        _ => return None,
+    };
+    let clients: Vec<serde_json::Value> = doc_clients()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            let mut c = c.clone();
+            if c["name"] == "nightly-evals" {
+                c["daily_budget"] = json!(budget);
+            }
+            c
+        })
+        .collect();
+    Some(
+        json!({
+            "schema": 1, "version": version, "updated_at": iso(version / 1_000),
+            "clients": clients,
+            "revoked_digests": [hash_of("key ci-review-bot 2026-09")],
+        })
+        .to_string(),
+    )
 }
 
 /// A Unix time in seconds as the store writes its `at` fields.
@@ -1369,6 +1436,10 @@ fn iso(secs: u64) -> String {
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap()
 }
+
+/// The recovery the history holds: a point-in-time recovery four days ago,
+/// done, which returned the store to the document of six days ago.
+const RECOVERY_ID: &str = "5e1f0a7c3b9d24e8a6c0f1b2d3e4f5a6";
 
 /// The client store's world: CF caught up on both the restrictions and the
 /// document, with a history to restore from.
@@ -1389,11 +1460,25 @@ fn client_store(world: &World) -> FakeStore {
     let mut body = world.get_body();
     body["document"]["clients"] = doc_clients();
     body["document"]["history"] = doc_history();
+    // The window restores to an hour after the document of a day ago was
+    // committed: inside that pick's restore times, so its page offers pitr.
     body["document"]["pitr_window"] = json!({
         "open": true, "usable": true,
-        "restore_to": iso((V0 - DAY_MS) / 1_000), "closes": iso((V0 + DAY_MS) / 1_000),
+        "restore_to": iso((V0 - DAY_MS + HOUR_MS) / 1_000), "closes": iso((V0 + DAY_MS) / 1_000),
     });
     body["pitr_window"] = json!(true);
+    body["document"]["cf"]["complete"] = json!({
+        "set_hash": world.set_hash(), "set_complete": true, "at": iso(V0 / 1_000),
+    });
+    body["restrictions"]["markers"] = json!([{
+        "id": RECOVERY_ID, "state": "done", "expected_restore_digest": doc_digest(V0 - 6 * DAY_MS),
+        "floor": V0 - 5 * DAY_MS, "created_at": iso((V0 - 4 * DAY_MS) / 1_000),
+        "updated_at": iso((V0 - 4 * DAY_MS) / 1_000), "reason": null,
+    }]);
+    body["restrictions"]["integrity"]["established"] = json!({
+        "via": "override", "actor": "ops@example.test", "reason": "the first restrictions record",
+        "at": iso((V0 - 30 * DAY_MS) / 1_000), "sets": [],
+    });
     body["restrictions"]["records"] = RECORDS
         .iter()
         .map(|(name, state, version, actor, reason)| {
@@ -1435,7 +1520,8 @@ fn doc_clients() -> Value {
     ])
 }
 
-/// The newest history rows, newest first, one of each op kind.
+/// The newest history rows, newest first, one of each op kind, and a
+/// point-in-time recovery's commit.
 fn doc_history() -> Value {
     let row = |age: u64, actor: &str, reason: &str, ops: Value, diff: Value| {
         let version = V0 - age;
@@ -1443,6 +1529,14 @@ fn doc_history() -> Value {
             "version": version, "digest": doc_digest(version), "at": iso(version / 1_000),
             "role": "writer", "actor": actor, "reason": reason, "ops": ops,
             "recovery_id": null, "diff": diff,
+        })
+    };
+    let recovery_row = |age: u64, diff: Value| {
+        let version = V0 - age;
+        json!({
+            "version": version, "digest": doc_digest(version), "at": iso(version / 1_000),
+            "role": "recovery", "actor": "client-store", "reason": format!("point-in-time recovery {RECOVERY_ID}"),
+            "ops": [], "recovery_id": RECOVERY_ID, "diff": diff,
         })
     };
     let rotated = doc_key("alaya", "2026-10 rotation", "");
@@ -1481,6 +1575,10 @@ fn doc_history() -> Value {
                 { "client": "support-triage", "change": "created" },
                 { "client": "support-triage", "change": "policy", "field": "daily_budget", "from": null, "to": 5_000_000 },
             ])
+        ),
+        recovery_row(
+            4 * DAY_MS,
+            json!([{ "client": "legacy-importer", "change": "created" }])
         ),
         row(
             6 * DAY_MS,
@@ -1525,6 +1623,27 @@ fn fleet_metrics(world: &World) -> FakeMetrics {
             "1",
         )],
     );
+    // The install record, and the console's committed labels: the three
+    // newest documents, which the import guard and the PITR targets read.
+    let newest = [V0, V0 - 2 * HOUR_MS, V0 - DAY_MS];
+    let pair = |v: u64, d: &str| {
+        series(
+            &[("version", &v.to_string()), ("digest", d)],
+            &(v / 1_000).to_string(),
+        )
+    };
+    metrics.set_30d(
+        "anthropic_client_store_document",
+        newest.iter().map(|v| pair(*v, &doc_digest(*v))).collect(),
+    );
+    metrics.set_30d(
+        "ops_console_committed_document",
+        newest.iter().map(|v| pair(*v, &doc_digest(*v))).collect(),
+    );
+    for version in [V0 - 2 * HOUR_MS, V0] {
+        let text = logged_text(version).expect("the write log holds it");
+        crate::testkit::log_and_ship(&metrics, version, &text);
+    }
     metrics
 }
 

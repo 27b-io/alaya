@@ -30,7 +30,7 @@ axum-extra = { version = "0.12", features = ["cookie-private", "form"] }
 base64 = "0.23"
 rand = "0.10"
 url = "2"
-time = { version = "0.3", features = ["formatting"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 
 [dev-dependencies]
 # Pre-seed discovery so the authorize-URL test never touches the network.
