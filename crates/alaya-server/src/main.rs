@@ -22,6 +22,7 @@ mod testkit;
 #[cfg(test)]
 mod testlog;
 mod wellknown;
+mod windowed_embedding;
 
 use axum::{
     Json, Router,
@@ -54,7 +55,7 @@ use alaya_core::service::{
     JudgeOutcome, MemoryService, OutputMode, RankingFlags, Refutation, RefuteStage, RelationParams,
     SearchParams, StoreParams, current_timestamp, parse_user_relation, validate_as_of,
 };
-use alaya_core::vitals::{CountingEmbedding, SelfCheckOutcome, Vitals};
+use alaya_core::vitals::{SelfCheckOutcome, Vitals};
 use alaya_types::graph::{Contradiction, ContradictionQuery, Resolution};
 use alaya_types::memory::{PatchMemoryRequest, VALID_MEMORY_TYPES};
 
@@ -3214,16 +3215,17 @@ fn main() {
                     // passing a key here means updating that row too.
                     None,
                 );
+                // The same endpoint's input window and token layout; see
+                // `windowed_embedding`.
+                let tokenizer = embeddings.tokenizer();
                 // L2 embedding cache via cachekit-rs (optional) — backend
                 // selected by CACHE_BACKEND (redis default, saas).
                 let l2_cache = init_l2_cache().await;
-                // Counted under the cache: a cache hit is not an embed call
-                // that could fail.
-                let embeddings = CountingEmbedding::new(Box::new(embeddings), vitals_for_worker.clone());
-                let cached_embeddings = cached_embedding::CachedEmbedding::new(
+                let embeddings = windowed_embedding::embedding_stack(
                     Box::new(embeddings),
-                    10_000, // L1 max cached embeddings (~40 MB at 1024 dims)
+                    Box::new(tokenizer),
                     l2_cache,
+                    vitals_for_worker.clone(),
                 );
                 let graph = std::rc::Rc::new(graph);
 
@@ -3232,7 +3234,7 @@ fn main() {
 
                 let mut svc = MemoryService::new(
                     Box::new(qdrant),
-                    Box::new(cached_embeddings),
+                    Box::new(embeddings),
                     Box::new(GraphRef(graph.clone())),
                     Box::new(HebbianRef(graph.clone())),
                     Box::new(ConsolidationRef(graph)),
@@ -8324,25 +8326,19 @@ mod wedge_tests {
     /// LAB-4026 AC-3: with the embedder unreachable, one self-check run makes
     /// `/health/detail` and `GET /stats` name the broken step, while the
     /// probe Kubernetes uses still answers 200 with its status alone. The
-    /// embedder sits under the production chain (cache over counter over
-    /// client). The cache bypass itself is `probe_bypasses_the_cache`.
+    /// embedder sits under the production chain (`embedding_stack`:
+    /// windowing over cache over counter over client). The cache bypass itself is `probe_bypasses_the_cache`.
     #[tokio::test]
     async fn embed_outage_shows_on_detail_and_stats_while_the_probe_stays_green() {
         let vitals = Arc::new(Vitals::new("alaya-server-test".into(), 1_700_000_000, true));
-        let embeddings = cached_embedding::CachedEmbedding::new(
-            Box::new(CountingEmbedding::new(
-                // Port 1 refuses immediately — models an unreachable embedder.
-                Box::new(EmbeddingClient::new(
-                    "http://127.0.0.1:1".into(),
-                    "m".into(),
-                    4,
-                    1,
-                    None,
-                )),
-                vitals.clone(),
-            )),
-            10,
+        // Port 1 refuses immediately — models an unreachable embedder.
+        let client = EmbeddingClient::new("http://127.0.0.1:1".into(), "m".into(), 4, 1, None);
+        let tokenizer = client.tokenizer();
+        let embeddings = windowed_embedding::embedding_stack(
+            Box::new(client),
+            Box::new(tokenizer),
             None,
+            vitals.clone(),
         );
         let svc = MemoryService::new(
             Box::new(HangVectors { batch: None }),

@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use alaya_types::{AlayaError, Result, memory::HealthStatus, search::PromptName};
 
-use crate::EmbeddingProvider;
+use crate::{EmbeddingProvider, Tokenizer};
 
 /// TEI hard-rejects client batches larger than this with HTTP 422 (no silent
 /// truncation), so the configured batch size is clamped to it. Batch size does
@@ -167,6 +167,96 @@ impl EmbeddingProvider for EmbeddingClient {
     }
 }
 
+impl EmbeddingClient {
+    /// The [`Tokenizer`] of this client's endpoint, sharing its connection
+    /// pool, headers and transport settings.
+    pub fn tokenizer(&self) -> TeiTokenizer {
+        TeiTokenizer {
+            client: self.client.clone(),
+            base_url: self.base_url.clone(),
+        }
+    }
+}
+
+/// [`Tokenizer`] over TEI's `GET /info` and `POST /tokenize`. Built by
+/// [`EmbeddingClient::tokenizer`].
+pub struct TeiTokenizer {
+    client: Client,
+    base_url: String,
+}
+
+/// Per-request bound for `/info` and `/tokenize`, inside the client's own
+/// embed timeout: neither does model work.
+const TOKENIZER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl TeiTokenizer {
+    async fn send_json<T: serde::de::DeserializeOwned>(
+        &self,
+        req: reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<T> {
+        let resp = req
+            .timeout(TOKENIZER_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| AlayaError::Embedding(crate::redact_reqwest_error(e)))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = crate::error_body(resp).await;
+            return Err(AlayaError::Embedding(format!(
+                "embedding {what} returned {status}: {body}"
+            )));
+        }
+        resp.json().await.map_err(|e| {
+            AlayaError::Embedding(format!(
+                "failed to parse embedding {what}: {}",
+                crate::redact_reqwest_error(e)
+            ))
+        })
+    }
+
+    async fn tokenize(&self, text: &str, add_special_tokens: bool) -> Result<Vec<TeiToken>> {
+        let req = self
+            .client
+            .post(format!("{}/tokenize", self.base_url))
+            .json(&serde_json::json!({ "inputs": text, "add_special_tokens": add_special_tokens }));
+        let parsed: Vec<Vec<TeiToken>> = self.send_json(req, "/tokenize").await?;
+        parsed.into_iter().next().ok_or_else(|| {
+            AlayaError::Embedding("embedding /tokenize returned no token list".into())
+        })
+    }
+}
+
+#[async_trait(?Send)]
+impl Tokenizer for TeiTokenizer {
+    /// `max_input_length` from `/info`, less the tokens of the passage
+    /// prompt prefix with the special tokens around it. The prefix alone
+    /// tokenizes to at least as many tokens as it takes before text.
+    async fn passage_token_budget(&self) -> Result<usize> {
+        let req = self.client.get(format!("{}/info", self.base_url));
+        let info: TeiInfo = self.send_json(req, "/info").await?;
+        let wrapper = self
+            .tokenize(&prefix_text(PromptName::Passage, ""), true)
+            .await?
+            .len();
+        Ok(info.max_input_length.saturating_sub(wrapper))
+    }
+
+    async fn token_spans(&self, text: &str) -> Result<Vec<(usize, usize)>> {
+        self.tokenize(text, false)
+            .await?
+            .into_iter()
+            .filter(|t| !t.special)
+            .map(|t| match (t.start, t.stop) {
+                (Some(start), Some(stop)) => Ok((start, stop)),
+                _ => Err(AlayaError::Embedding(
+                    "embedding /tokenize returned a token without a span".into(),
+                )),
+            })
+            .collect()
+    }
+}
+
 fn prefix_text(prompt_name: PromptName, text: &str) -> String {
     match prompt_name {
         PromptName::Query => format!("search_query: {text}"),
@@ -185,6 +275,19 @@ struct EmbeddingResponse {
 struct EmbeddingDatum {
     embedding: Vec<f32>,
     index: usize,
+}
+
+#[derive(Deserialize)]
+struct TeiInfo {
+    max_input_length: usize,
+}
+
+/// One `/tokenize` token. Special tokens carry no span.
+#[derive(Deserialize)]
+struct TeiToken {
+    special: bool,
+    start: Option<usize>,
+    stop: Option<usize>,
 }
 
 #[cfg(test)]
@@ -245,6 +348,106 @@ mod tests {
         assert_eq!(items[0].embedding, vec![0.4, 0.5, 0.6]);
         assert_eq!(items[1].index, 1);
         assert_eq!(items[1].embedding, vec![0.1, 0.2, 0.3]);
+    }
+
+    fn tokenizer_at(uri: String) -> TeiTokenizer {
+        EmbeddingClient::new(uri, "m".into(), 1024, 32, None).tokenizer()
+    }
+
+    /// The budget is `/info`'s window less the prefix with its special
+    /// tokens; `/tokenize` gives byte spans with the special tokens, which
+    /// carry none, dropped. Responses are TEI 1.9's shape, multibyte text
+    /// included.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn tei_tokenizer_reads_the_budget_and_byte_spans() {
+        use serde_json::json;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model_id": "m", "max_input_length": 2048, "max_batch_tokens": 2048,
+            })))
+            .mount(&server)
+            .await;
+        let special = |id: u32, text: &str| json!({ "id": id, "text": text, "special": true, "start": null, "stop": null });
+        let token = |id: u32, text: &str, start: usize, stop: usize| json!({ "id": id, "text": text, "special": false, "start": start, "stop": stop });
+        Mock::given(method("POST"))
+            .and(path("/tokenize"))
+            .and(body_json(
+                json!({ "inputs": "search_document: ", "add_special_tokens": true }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([[
+                special(0, "<s>"),
+                token(1, "search", 0, 6),
+                token(2, "_document", 6, 15),
+                token(3, ":", 15, 16),
+                token(4, " ", 16, 17),
+                special(2, "</s>"),
+            ]])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/tokenize"))
+            .and(body_json(
+                json!({ "inputs": "Ālaya café", "add_special_tokens": false }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([[
+                token(5, "Ā", 0, 2),
+                token(6, "laya", 2, 6),
+                token(7, " café", 6, 12),
+            ]])))
+            .mount(&server)
+            .await;
+
+        let t = tokenizer_at(server.uri());
+        assert_eq!(t.passage_token_budget().await.unwrap(), 2048 - 6);
+        assert_eq!(
+            t.token_spans("Ālaya café").await.unwrap(),
+            vec![(0, 2), (2, 6), (6, 12)]
+        );
+    }
+
+    /// A refusal (TEI's 422 past its length limit), an empty answer, or a
+    /// text token with no span must surface as an error, never as an empty
+    /// or short layout that would read as "fits".
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn tei_tokenizer_surfaces_a_refusal_or_a_malformed_layout() {
+        use serde_json::json;
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        for (inputs, resp) in [
+            (
+                "refused",
+                ResponseTemplate::new(422).set_body_string("too long"),
+            ),
+            ("empty", ResponseTemplate::new(200).set_body_json(json!([]))),
+            (
+                "spanless",
+                ResponseTemplate::new(200).set_body_json(json!([[
+                    { "id": 1, "text": "x", "special": false, "start": null, "stop": null }
+                ]])),
+            ),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/tokenize"))
+                .and(body_partial_json(json!({ "inputs": inputs })))
+                .respond_with(resp)
+                .mount(&server)
+                .await;
+        }
+
+        let t = tokenizer_at(server.uri());
+        let err = t.token_spans("refused").await.unwrap_err();
+        assert!(err.to_string().contains("422"), "{err}");
+        assert!(t.token_spans("empty").await.is_err());
+        assert!(t.token_spans("spanless").await.is_err());
     }
 
     #[test]
