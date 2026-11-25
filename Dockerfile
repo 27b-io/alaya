@@ -2,7 +2,7 @@
 # installs it on first cargo call), so the base tag names none. Keep that file
 # in the build context — .dockerignore must not exclude it. Both FROM lines pin
 # a digest so one commit always builds on the same bases; Renovate refreshes it.
-FROM docker.io/library/rust:bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS builder
+FROM docker.io/library/rust:bookworm@sha256:75d26c23c24cc6ea1cdabf0714a6bff8fd7bf3248716043fd7ae86dac7f41b94 AS builder
 
 # Build identity surfaced by GET /health/detail and MCP serverInfo (#70). Both are
 # optional: an unset arg yields a null git_sha/built_at, never a build or
@@ -22,7 +22,7 @@ ENV ALAYA_GIT_SHA=${GIT_SHA}
 ENV ALAYA_BUILT_AT=${BUILT_AT}
 RUN cargo build --release -p alaya-bridge -p alaya-server -p ops-console
 
-FROM docker.io/library/debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+FROM docker.io/library/debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
