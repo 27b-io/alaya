@@ -1,7 +1,7 @@
 # Ālaya Memory Hooks (Claude Code plugin)
 
-Two hooks that make Claude Code sessions persist into an [Ālaya](../../README.md) long-term
-memory server:
+Hooks that make Claude Code sessions persist into an [Ālaya](../../README.md) long-term
+memory server, and one that holds Multica agent runs to their memory rule:
 
 - **Stop** (`scripts/alaya-session-save.sh`) — after each turn ends. Extracts 0–3
   memories from the transcript via an LLM and POSTs them to Ālaya's `/store` endpoint, with
@@ -22,6 +22,23 @@ memory server:
   be read or parsed — treated the same as "no recent save." Individual malformed transcript
   lines are skipped, not fatal, but one that follows the marker clears it, so a parse error
   can only block.
+
+- **PreToolUse** (`scripts/alaya-enforcer-line.sh`) — on `mcp__alaya__store_memory`,
+  `mcp__unified-memory__store` and `mcp__alaya__memory_refute` only (a refute stores its
+  correction as a memory). In a Multica agent run it refuses (exit 2) a call whose
+  `content` has no line starting `Enforcer:`, and the refusal tells Claude how to add one. The
+  Multica agent skills require every stored memory to name the check that enforces it; the hook
+  makes that a refusal at store time instead of a rule to remember. A run is recognised by
+  `MULTICA_TASK_ID` or `MULTICA_AGENT_ID` in the environment, which the Multica daemon exports
+  into every run it starts: a hook inherits them whichever prompt started the run and whichever
+  agent in it makes the call, so subagent calls and scheduled runs are covered. Every other
+  session passes untouched, and so does a store made straight to the REST endpoint. Fails open:
+  when the hook input cannot be read or parsed, or `jq` is missing, the store goes through and
+  one line lands in `failures.log`, because failing closed would stop every memory store of
+  every Multica run on a hook fault.
+
+The Stop hook's extractor is asked for the same line on every memory it writes: the check the
+session named, or `Enforcer: none named`.
 
 ## Prerequisites
 
@@ -201,6 +218,19 @@ result, a user turn, a tool input, a quoted file, a thinking block or a subagent
 transcript is missing or holds no parseable line, and when the marker has scrolled out of the
 window (with a control showing the same marker passes inside it).
 
+```bash
+scripts/test-enforcer-line.sh
+```
+
+Runs the real PreToolUse hook on fixture tool calls. It proves that in a Multica run a store
+with no line starting `Enforcer:` is refused for the two store tools and `memory_refute`, with a message naming the
+rule and the `Enforcer: LAB-N (none yet)` escape, that a store with the line passes, and that
+outside a Multica run every store passes. The word inside a sentence, indented, in lower case,
+without its colon or only in `summary` is not the line. Unreadable input, a `content` that is
+not a string and a missing `jq` all pass and log one line. It also proves `hooks.json` sends
+exactly those three tools to the hook, that the Stop hook's extractor prompt asks for the
+line, and that a reply carrying it reaches the store call with the line intact.
+
 ## Troubleshooting
 
 - **No memories are showing up** — check `$ALAYA_HOOK_STATE_DIR/failures.log` (default
@@ -220,5 +250,8 @@ window (with a control showing the same marker passes inside it).
   hook's automatic REST extraction satisfies neither and is not meant to. Ask Claude to save or
   to state the marker (the block message, shown to you on a manual `/compact`, says how), or disable the gate by removing the
   PreCompact hook if you don't run the Ālaya MCP server.
+- **A memory store is refused for a missing Enforcer line** — the session has
+  `MULTICA_TASK_ID` or `MULTICA_AGENT_ID` set, so the PreToolUse hook treats it as a Multica
+  run. Add a line starting `Enforcer:` to the memory's content, as the refusal says.
 - **`claude plugin validate` fails** — run it with `--strict` locally before pushing; it flags
   unrecognized fields and missing metadata that the runtime otherwise tolerates silently.
