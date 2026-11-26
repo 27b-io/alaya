@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The Enforcer line, on both paths a memory takes. The PreToolUse hook
-# (alaya-enforcer-line.sh) must refuse (exit 2) a memory store with no line
+# (alaya-enforcer-line.sh) must refuse (exit 2) a memory store or refute with no line
 # starting "Enforcer:" in a Multica run, pass one that has the line, and pass
 # every store outside a Multica run. When it cannot read its input it must pass
 # and log, never refuse. The Stop hook's extractor must be asked for the line,
@@ -38,10 +38,11 @@ expect() {
 
 ALAYA=mcp__alaya__store_memory
 UNIFIED=mcp__unified-memory__store
+REFUTE=mcp__alaya__memory_refute # its correction is stored like any other memory
 WITH=$'A lesson, with its evidence.\nEnforcer: scripts/test-enforcer-line.sh'
 WITHOUT='A lesson, with its evidence.'
 
-for tool in "$ALAYA" "$UNIFIED"; do
+for tool in "$ALAYA" "$UNIFIED" "$REFUTE"; do
   expect "Multica run, $tool, no line: refused" 2 0 "$(store "$tool" "$WITHOUT")" MULTICA_TASK_ID=t1 MULTICA_AGENT_ID=a1
   expect "Multica run, $tool, with the line: passes" 0 0 "$(store "$tool" "$WITH")" MULTICA_TASK_ID=t1 MULTICA_AGENT_ID=a1
   expect "outside a Multica run, $tool, no line: passes" 0 0 "$(store "$tool" "$WITHOUT")"
@@ -72,12 +73,13 @@ GATE_PATH="$T/nojq" expect "jq missing: passes, logged" 0 1 "$(store "$ALAYA" "$
 GATE_PATH="$T/nojq" expect "jq missing outside a Multica run: passes, nothing logged" 0 0 "$(store "$ALAYA" "$WITHOUT")"
 # any other tool is not this hook's business, whatever its input holds
 expect "another tool, no line: passes" 0 0 "$(store mcp__alaya__search "$WITHOUT")" "${M[@]}"
+expect "a tool whose name only starts like a store's: passes" 0 0 "$(store mcp__alaya__store "$WITHOUT")" "${M[@]}"
 
-# hooks.json sends both store tools, and nothing else, to the hook
+# hooks.json sends the three tools that write a memory, and nothing else, to the hook
 if jq -e '[.hooks.PreToolUse[] | select(.hooks | any(.command | contains("alaya-enforcer-line.sh"))) | .matcher] | sort
-    == ["mcp__alaya__store_memory", "mcp__unified-memory__store"]' "$HERE/../hooks/hooks.json" >/dev/null
-then ok "hooks.json: PreToolUse sends both store tools to the hook"
-else fail "hooks.json: PreToolUse does not match exactly the two store tools"; fi
+    == ["mcp__alaya__memory_refute", "mcp__alaya__store_memory", "mcp__unified-memory__store"]' "$HERE/../hooks/hooks.json" >/dev/null
+then ok "hooks.json: PreToolUse sends the three memory-writing tools to the hook"
+else fail "hooks.json: PreToolUse does not match exactly the three memory-writing tools"; fi
 
 # --- Stop hook extractor ---
 # stub curl: keep the extraction request and answer it with the reply in

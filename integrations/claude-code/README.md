@@ -23,8 +23,9 @@ memory server, and one that holds Multica agent runs to their memory rule:
   lines are skipped, not fatal, but one that follows the marker clears it, so a parse error
   can only block.
 
-- **PreToolUse** (`scripts/alaya-enforcer-line.sh`) — on `mcp__alaya__store_memory` and
-  `mcp__unified-memory__store` only. In a Multica agent run it refuses (exit 2) a store whose
+- **PreToolUse** (`scripts/alaya-enforcer-line.sh`) — on `mcp__alaya__store_memory`,
+  `mcp__unified-memory__store` and `mcp__alaya__memory_refute` only (a refute stores its
+  correction as a memory). In a Multica agent run it refuses (exit 2) a call whose
   `content` has no line starting `Enforcer:`, and the refusal tells Claude how to add one. The
   Multica agent skills require every stored memory to name the check that enforces it; the hook
   makes that a refusal at store time instead of a rule to remember. A run is recognised by
@@ -222,12 +223,12 @@ scripts/test-enforcer-line.sh
 ```
 
 Runs the real PreToolUse hook on fixture tool calls. It proves that in a Multica run a store
-with no line starting `Enforcer:` is refused for both store tools, with a message naming the
+with no line starting `Enforcer:` is refused for the two store tools and `memory_refute`, with a message naming the
 rule and the `Enforcer: LAB-N (none yet)` escape, that a store with the line passes, and that
 outside a Multica run every store passes. The word inside a sentence, indented, in lower case,
 without its colon or only in `summary` is not the line. Unreadable input, a `content` that is
 not a string and a missing `jq` all pass and log one line. It also proves `hooks.json` sends
-exactly the two store tools to the hook, that the Stop hook's extractor prompt asks for the
+exactly those three tools to the hook, that the Stop hook's extractor prompt asks for the
 line, and that a reply carrying it reaches the store call with the line intact.
 
 ## Troubleshooting

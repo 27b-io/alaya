@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# PreToolUse hook: in a Multica agent run, refuse a memory store whose content
-# has no line starting "Enforcer:".
+# PreToolUse hook: in a Multica agent run, refuse a memory store, or a refute's
+# correction, whose content has no line starting "Enforcer:".
 #
 # The Multica agent skills require every stored memory to name the check that
 # enforces its lesson. A rule that lives only in skill text is forgotten; this
@@ -32,10 +32,13 @@ _pass_logged() {
 
 command -v jq >/dev/null 2>&1 || _pass_logged "config: jq not found on PATH"
 
-# has-line | no-line | not-a-store (hooks.json matches the two store tools, so
-# the last is a guard against a widened matcher, not an expected path)
+# has-line | no-line | not-a-store. The three tools that write a new memory all
+# carry its text in "content": the two stores, and memory_refute, whose
+# correction is stored like any other memory. hooks.json matches exactly these,
+# so not-a-store is a guard against a widened matcher, not an expected path.
 verdict=$(jq -r '
-    if (.tool_name == "mcp__alaya__store_memory" or .tool_name == "mcp__unified-memory__store" | not) then "not-a-store"
+    if .tool_name | IN("mcp__alaya__store_memory", "mcp__alaya__memory_refute", "mcp__unified-memory__store") | not
+    then "not-a-store"
     elif (.tool_input.content | type) != "string" then error("tool_input.content is not a string")
     elif .tool_input.content | test("(^|\n)Enforcer:") then "has-line"
     else "no-line" end' 2>/dev/null) || _pass_logged "cannot read the hook input"

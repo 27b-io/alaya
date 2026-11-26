@@ -12,6 +12,16 @@
         ]
       },
       {
+        "matcher": "mcp__alaya__memory_refute",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/alaya-enforcer-line.sh\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
         "matcher": "mcp__unified-memory__store",
         "hooks": [
           {
