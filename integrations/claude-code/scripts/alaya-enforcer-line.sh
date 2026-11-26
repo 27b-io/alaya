@@ -37,7 +37,8 @@ command -v jq >/dev/null 2>&1 || _pass_logged "config: jq not found on PATH"
 # correction is stored like any other memory. hooks.json matches exactly these,
 # so not-a-store is a guard against a widened matcher, not an expected path.
 verdict=$(jq -r '
-    if .tool_name | IN("mcp__alaya__store_memory", "mcp__alaya__memory_refute", "mcp__unified-memory__store") | not
+    .tool_name as $t
+    | if $t != "mcp__alaya__store_memory" and $t != "mcp__alaya__memory_refute" and $t != "mcp__unified-memory__store"
     then "not-a-store"
     elif (.tool_input.content | type) != "string" then error("tool_input.content is not a string")
     elif .tool_input.content | test("(^|\n)Enforcer:") then "has-line"
