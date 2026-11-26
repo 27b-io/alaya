@@ -349,6 +349,7 @@ Each object: {"content":"self-contained description","memory_type":"decision|ref
 
 Rules:
 - One lesson or decision per memory; content cites its evidence (a file:line, command or link)
+- Content ends with a line of its own starting "Enforcer:" that names the check the session named for this lesson or decision (a test, hook, lint rule, CI gate or ticket), or exactly "Enforcer: none named" when the session named none; never invent one
 - Never store run state: skip ticket status, PR state, progress, blockers and follow-up work — the issue tracker holds those
 - Only extract NEW information — skip topics likely already saved from earlier in this session
 - Skip routine work, greetings, process narration, code dumps
