@@ -18,7 +18,7 @@ services:
   # ── External backends ────────────────────────────────────────────
 
   falkordb:
-    image: falkordb/falkordb:v4.22.3@sha256:725b74d400124862c9e0f318c56bfb3c55b97cd7f301d9dfe8685980fb3c8195
+    image: falkordb/falkordb:6.2.0@sha256:491d8eee0b6a746d5786a86b365356cb324d8096e8abffdd279e172328a33652
     restart: unless-stopped
     ports:
       - "${FALKORDB_PORT:-6379}:6379"
